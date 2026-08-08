@@ -1,0 +1,26 @@
+{
+  "name": "solana-meme-coin-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram bot that scans Solana meme coins via DexScreener and pushes qualifying coins to subscribers",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --env-file-if-exists=.env.local dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/test-filters.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.14.0",
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
