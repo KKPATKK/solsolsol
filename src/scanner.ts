@@ -441,7 +441,7 @@ function renderMessage(
   const proTradersLine =
     proTraders === null
       ? "🧑‍💻 Pro 交易者: —（未检测）"
-      : `🧑‍💻 Pro 交易者: ${proTraders}`;
+      : `🧑‍💻 Pro 交易者: ${proTraders} (smart)`;
   const sniperLine =
     sniperPct === null
       ? "🎯 Sniper 買入: —（未檢測）"

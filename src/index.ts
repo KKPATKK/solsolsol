@@ -9,11 +9,41 @@ import { Scanner } from "./scanner";
 
 const config = loadConfig();
 
+// Process-level guards: transient async failures must not silently kill the
+// bot. unhandledRejection is logged and tolerated (grammY/scanner already
+// catch most), while uncaughtException logs loudly and exits so the health
+// monitor / restart flow can recover deterministically instead of running
+// in a corrupted state.
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    "[app] unhandledRejection:",
+    reason instanceof Error ? reason.stack ?? reason.message : String(reason),
+  );
+});
+process.on("uncaughtException", (err) => {
+  console.error("[app] uncaughtException (exiting):", err.stack ?? err.message);
+  process.exit(1);
+});
+
+// Last-scan telemetry exposed via /health so external uptime monitors can
+// distinguish "process up" from "scanner working".
+let lastScanAt: number | null = null;
+let lastScanOk = false;
+let scanCount = 0;
+
 function startHealthServer(): http.Server {
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("ok");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          uptimeSec: Math.round(process.uptime()),
+          scanCount,
+          lastScanOk,
+          lastScanAt: lastScanAt ? new Date(lastScanAt).toISOString() : null,
+        }),
+      );
       return;
     }
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -78,12 +108,23 @@ async function main(): Promise<void> {
         new RugcheckClient(config),
       );
 
+      const runScan = async (initial: boolean) => {
+        try {
+          await scanner.runOnce();
+          lastScanOk = true;
+        } catch (err) {
+          lastScanOk = false;
+          console.error(`[scanner] ${initial ? "initial run" : "scan"} failed:`, err);
+        } finally {
+          lastScanAt = Date.now();
+          scanCount++;
+        }
+      };
+
       // First scan right away, then on the configured interval.
-      void scanner.runOnce().catch((err) => {
-        console.error("[scanner] initial run failed:", err);
-      });
+      void runScan(true);
       const timer = setInterval(() => {
-        void scanner.runOnce();
+        void runScan(false);
       }, config.scanIntervalSeconds * 1000);
       timer.unref();
     }

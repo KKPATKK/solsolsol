@@ -54,7 +54,10 @@ export interface TokenStats {
   rugcheckBundlerPct: number | null;
   /** Top-10 holder concentration in percent from RugCheck (null = unknown). */
   rugcheckTop10Pct: number | null;
-  /** Estimated pro-trader count from Birdeye (null = unknown). */
+  /**
+   * Count of wallets Birdeye tags as smart_trader among the top traders
+   * (excluding bundler/dev-tagged wallets), null = unknown.
+   */
   birdeyeProTraders: number | null;
   /** Sniper buy share of supply in percent from Birdeye (null = unknown). */
   birdeyeSniperPct: number | null;

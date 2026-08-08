@@ -105,8 +105,12 @@ export class BirdeyeClient {
 
   /**
    * Trader insights from a single top-traders fetch:
-   * - proTraders: how many of the top traders (by 24h volume) have positive
-   *   realized PnL,
+   * - proTraders: how many wallets among the top traders Birdeye tags as
+   *   smart_trader (its smart-money label), excluding wallets also tagged as
+   *   bundler or dev — those are not genuine pro traders. Counting the
+   *   explicit label is far more accurate than inferring "pro" from positive
+   *   PnL, which counts nearly every profitable wallet (bots included) and
+   *   overstates the number.
    * - sniperPct: share of the token's total supply that wallets Birdeye tags
    *   as snipers bought (sum of their buy volume ÷ supply × 100). This
    *   measures sniper *participation* — it stays meaningful after snipers
@@ -145,8 +149,17 @@ export class BirdeyeClient {
     let pro = 0;
     let sniperBuy = 0;
     for (const trader of items) {
-      if (Number(trader.realizedPnl ?? 0) > 0) pro++;
-      if ((trader.tags ?? []).includes("sniper")) {
+      const tags = trader.tags ?? [];
+      // Birdeye's explicit smart-money label; bundler/dev wallets are tagged
+      // separately and are not genuine "pro" traders.
+      if (
+        tags.includes("smart_trader") &&
+        !tags.includes("bundler") &&
+        !tags.includes("dev")
+      ) {
+        pro++;
+      }
+      if (tags.includes("sniper")) {
         const buy = Number(trader.volumeBuy ?? 0);
         if (Number.isFinite(buy) && buy > 0) sniperBuy += buy;
       }
