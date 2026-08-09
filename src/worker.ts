@@ -1,4 +1,4 @@
-import { webhookCallback } from "grammy";
+import { webhookCallback, type Bot } from "grammy";
 import { BirdeyeClient } from "./birdeye";
 import { createBot } from "./bot";
 import { loadConfig } from "./config";
@@ -41,6 +41,7 @@ interface ScheduledEventLike {
 // --- Module-scoped state (warm-isolate lifetime) ---
 let db: Db | null = null;
 let scanner: Scanner | null = null;
+let bot: Bot | null = null;
 let webhook: ((req: Request) => Promise<Response>) | null = null;
 let lastScanAt: number | null = null;
 let lastScanOk = false;
@@ -57,6 +58,11 @@ let lastScanMs: number | null = null;
 let lastScanError: string | null = null;
 let scheduledTicks = 0;
 let scanRunning = false;
+
+/** Alert when the previous scan finished more than this long ago (missed ticks). */
+const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
+/** Don't re-alert within this window for the same continuing outage. */
+const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
 
 async function ensureInitialized(env: Env): Promise<void> {
   if (initPromise) return initPromise;
@@ -78,7 +84,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     }
 
     if (config.telegramBotToken) {
-      const bot = createBot(config.telegramBotToken, db, config.scanIntervalSeconds);
+      bot = createBot(config.telegramBotToken, db, config.scanIntervalSeconds);
       webhook = webhookCallback(bot, "cloudflare-mod");
       botReady = true;
 
@@ -120,11 +126,11 @@ async function runScan(): Promise<void> {
   } catch (err) {
     lastScanOk = false;
     lastScanError = err instanceof Error ? err.message : String(err);
-    console.error("[worker] scheduled scan failed:", lastScanError);
-  } finally {
+    console.error("[worker] scheduled scan failed:", lastScanError);    } finally {
     lastScanMs = Date.now() - startedAt;
     lastScanAt = Date.now();
     scanCount++;
+    const summary = scanner?.lastSummary ?? null;
     // Persist the heartbeat so any isolate (e.g. the one serving /health)
     // can observe scanner liveness via the shared database.
     try {
@@ -136,13 +142,66 @@ async function runScan(): Promise<void> {
           count: scanCount,
           ms: lastScanMs,
           err: lastScanError,
-          summary: scanner?.lastSummary ?? null,
+          summary,
         }),
       );
     } catch (err) {
       console.error("[worker] heartbeat write failed:", err);
     }
+    // Permanent per-tick history row (queryable for gap analysis later).
+    try {
+      await db?.recordScanHistory({
+        at: lastScanAt,
+        ok: lastScanOk,
+        ms: lastScanMs,
+        err: lastScanError,
+        profiles: summary?.profiles ?? null,
+        pool: summary?.pool ?? null,
+        candidates: summary?.candidates ?? null,
+        pushed: summary?.pushed ?? null,
+      });
+    } catch (err) {
+      console.error("[worker] history write failed:", err);
+    }
   }
+}
+
+/**
+ * Outage detection: when a scheduled tick fires and the previous scan
+ * finished more than OUTAGE_ALERT_GAP_MS ago, the scanner was down or
+ * stuck. Alert each enabled chat once per episode (cooldown-bounded).
+ */
+async function checkOutageAndAlert(): Promise<void> {
+  if (!db || !bot) return;
+  const raw = await db.getWorkerState("scan_heartbeat");
+  if (!raw) return; // first ever run — no history yet
+  let hb: { at?: number };
+  try {
+    hb = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  const lastScanAt = typeof hb.at === "number" ? hb.at : 0;
+  const gapMs = Date.now() - lastScanAt;
+  if (gapMs < OUTAGE_ALERT_GAP_MS) return;
+  const lastAlertRaw = await db.getWorkerState("outage_alert_at");
+  const lastAlertAt = lastAlertRaw ? Number(lastAlertRaw) : 0;
+  if (Date.now() - lastAlertAt < OUTAGE_ALERT_COOLDOWN_MS) return;
+  const chats = await db.listEnabledChats();
+  if (chats.length === 0) return;
+  const minutes = Math.round(gapMs / 60_000);
+  const recoveredAt = new Date(lastScanAt).toISOString();
+  const text =
+    `⚠️ 扫描器曾中断约 ${minutes} 分钟（上次扫描 ${recoveredAt}，现已恢复）\n` +
+    `状态页: https://solana-meme-bot.cool1999k.workers.dev/health`;
+  for (const chat of chats) {
+    try {
+      await bot.api.sendMessage(chat.chatId, text);
+    } catch (err) {
+      console.error("[worker] outage alert failed:", err);
+    }
+  }
+  await db.setWorkerState("outage_alert_at", String(Date.now()));
 }
 
 export default {
@@ -153,9 +212,12 @@ export default {
     // UptimeRobot target: distinguishes "worker up" from "scanner working".
     if (url.pathname === "/health") {
       let heartbeat: unknown = null;
+      let lastScanGapMs: number | null = null;
       try {
         const raw = await db?.getWorkerState("scan_heartbeat");
         heartbeat = raw ? JSON.parse(raw) : null;
+        const at = (heartbeat as { at?: number } | null)?.at;
+        if (typeof at === "number") lastScanGapMs = Date.now() - at;
       } catch {
         heartbeat = null;
       }
@@ -173,6 +235,7 @@ export default {
         scheduledTicks,
         scanRunning,
         heartbeat,
+        lastScanGapMs,
         summary: scanner?.lastSummary ?? null,
         now: new Date().toISOString(),
       });
@@ -189,6 +252,12 @@ export default {
     scheduledTicks++;
     await ensureInitialized(env);
     if (!scanner) return;
+    // Detect missed ticks (previous scan finished too long ago) and alert.
+    try {
+      await checkOutageAndAlert();
+    } catch (err) {
+      console.error("[worker] outage check failed:", err);
+    }
     scanRunning = true;
     try {
       await runScan();

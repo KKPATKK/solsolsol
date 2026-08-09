@@ -147,6 +147,24 @@ export class Db {
         min_mcap_observed REAL
       );
     `);
+    // Permanent per-tick scan history, so interruptions are visible long
+    // after the fact (the scan_heartbeat row only keeps the latest value).
+    await this.client.execute(`
+      CREATE TABLE IF NOT EXISTS scan_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at INTEGER NOT NULL,
+        ok INTEGER NOT NULL,
+        ms INTEGER NOT NULL,
+        err TEXT,
+        profiles INTEGER,
+        pool INTEGER,
+        candidates INTEGER,
+        pushed INTEGER
+      );
+    `);
+    await this.client.execute(
+      `CREATE INDEX IF NOT EXISTS idx_scan_history_at ON scan_history(at)`,
+    );
     await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");
@@ -288,6 +306,45 @@ export class Db {
     if (!row) return null;
     const v = (row as Record<string, unknown>).value;
     return v === null || v === undefined ? null : String(v);
+  }
+
+  /**
+   * Append one permanent scan-history row per tick (survives isolate
+   * evictions, unlike the in-memory counters). History is bounded: rows
+   * older than 30 days are pruned, at most once per hour.
+   */
+  async recordScanHistory(entry: {
+    at: number;
+    ok: boolean;
+    ms: number;
+    err: string | null;
+    profiles: number | null;
+    pool: number | null;
+    candidates: number | null;
+    pushed: number | null;
+  }): Promise<void> {
+    await this.get().execute({
+      sql: `INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        entry.at,
+        entry.ok ? 1 : 0,
+        entry.ms,
+        entry.err,
+        entry.profiles,
+        entry.pool,
+        entry.candidates,
+        entry.pushed,
+      ],
+    });
+    const lastPrune = await this.getWorkerState("history_last_prune");
+    if (!lastPrune || Date.now() - Number(lastPrune) > 60 * 60_000) {
+      await this.get().execute({
+        sql: "DELETE FROM scan_history WHERE at < ?",
+        args: [Date.now() - 30 * 24 * 3600_000],
+      });
+      await this.setWorkerState("history_last_prune", String(Date.now()));
+    }
   }
 
   async markTokenSeen(chatId: string, token: string): Promise<void> {
