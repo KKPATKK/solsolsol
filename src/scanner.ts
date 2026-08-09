@@ -204,7 +204,8 @@ export class Scanner {
       diag.candidates = candidates.length;
       let pushed = 0;
       for (const coin of candidates) {
-        // Push each coin at most once per chat.
+        // Fast path: skip coins already pushed to this chat before doing the
+        // (slow) RugCheck/Birdeye lookups for them again.
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
           continue;
         }
@@ -250,6 +251,11 @@ export class Scanner {
         }
         if (trader.sniperPct >= coin.maxSniperPct) {
           diag.holds.sniperHigh++;
+          continue;
+        }
+        // Re-check right before sending: a concurrent scan (rare, only when
+        // a scan outlives the 1-min cron) could have pushed it meanwhile.
+        if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
           continue;
         }
         try {
