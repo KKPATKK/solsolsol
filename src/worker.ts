@@ -136,6 +136,7 @@ async function runScan(): Promise<void> {
           count: scanCount,
           ms: lastScanMs,
           err: lastScanError,
+          summary: scanner?.lastSummary ?? null,
         }),
       );
     } catch (err) {
