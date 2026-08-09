@@ -21,6 +21,10 @@ const RUGCHECK_REFRESH_MS = 15 * 60_000;
  * a waiting coin would hammer the endpoint on every 20s scan.
  */
 const BIRDEYE_NEGATIVE_CACHE_MS = 5 * 60_000;
+/** Re-evaluate tokens first seen within this window until their data arrives. */
+const RE_EVAL_WINDOW_MS = 60 * 60_000;
+/** Re-evaluation pool cap (keeps the pairs re-fetch + JSON parse small). */
+const RE_EVAL_POOL_SIZE = 20;
 
 /** One qualifying coin, prepared for a specific chat. */
 interface QualifyingCoin {
@@ -45,8 +49,39 @@ interface OpeningVolume {
   source: "birdeye" | "proxy" | "unknown";
 }
 
+/** Rejection reasons from the last completed scan (surfaced via /health). */
+export interface ScanSummary {
+  profiles: number;
+  pool: number;
+  candidates: number;
+  pushed: number;
+  holds: {
+    /** Opening volume known and too hot (>= chat max). */
+    opening: number;
+    /** Bundler share known and too high. */
+    bundler: number;
+    /** RugCheck report not ready yet (re-check next scan). */
+    rugcheck: number;
+    /** Top-10 holder concentration known and too high. */
+    top10: number;
+    /** Birdeye trader data not ready yet (re-check next scan). */
+    sniper: number;
+    /** Sniper share known and too high. */
+    sniperHigh: number;
+  };
+  fails: {
+    mcap: number;
+    chg: number;
+    vol5: number;
+    age: number;
+    other: number;
+  };
+}
+
 export class Scanner {
   private running = false;
+  /** Summary of the last completed scan, persisted into the heartbeat. */
+  lastSummary: ScanSummary | null = null;
   /** When each token's RugCheck report was last fetched (in-memory TTL). */
   private readonly rugcheckFetchedAt = new Map<string, number>();
   /**
@@ -81,6 +116,21 @@ export class Scanner {
     }
     this.running = true;
     const startedAt = Date.now();
+    const diag: ScanSummary = {
+      profiles: 0,
+      pool: 0,
+      candidates: 0,
+      pushed: 0,
+      holds: {
+        opening: 0,
+        bundler: 0,
+        rugcheck: 0,
+        top10: 0,
+        sniper: 0,
+        sniperHigh: 0,
+      },
+      fails: { mcap: 0, chg: 0, vol5: 0, age: 0, other: 0 },
+    };
     try {
       const chats = await this.db.listEnabledChats();
       if (chats.length === 0) {
@@ -89,11 +139,27 @@ export class Scanner {
       }
 
       const profiles = await this.dex.fetchLatestSolanaProfiles();
-      if (profiles.length === 0) {
-        console.log("[scanner] no Solana profiles returned");
+      diag.profiles = profiles.length;
+      // Re-evaluation pool: tokens seen recently that were never pushed, so a
+      // coin held while RugCheck/Birdeye data arrives — or seen too young to
+      // qualify on first sight — keeps being retried instead of rotating out
+      // of the "latest profiles" feed and being lost forever.
+      const recentStats = await this.db.getRecentTokenStats(
+        Date.now() - RE_EVAL_WINDOW_MS,
+        RE_EVAL_POOL_SIZE,
+      );
+      if (profiles.length === 0 && recentStats.length === 0) {
+        console.log("[scanner] no Solana profiles or re-eval candidates returned");
         return;
       }
-      const addresses = [...new Set(profiles.map((p) => p.tokenAddress))];
+      const poolProfiles: TokenProfile[] = [
+        ...profiles,
+        ...recentStats
+          .filter((s) => !profiles.some((p) => p.tokenAddress === s.token))
+          .map((s) => ({ tokenAddress: s.token })),
+      ];
+      diag.pool = poolProfiles.length;
+      const addresses = [...new Set(poolProfiles.map((p) => p.tokenAddress))];
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
 
       // Capture each token's opening volume the first time we ever see it
@@ -123,26 +189,44 @@ export class Scanner {
         await this.db.recordTokenStats(stats);
         statsByToken.set(profile.tokenAddress, stats);
       }
+      // Pool-only tokens (not in the current feed) reuse their cached stats.
+      for (const stats of recentStats) {
+        if (!statsByToken.has(stats.token)) statsByToken.set(stats.token, stats);
+      }
 
-      const candidates = this.matchCoins(profiles, pairsByToken, statsByToken, chats);
+      const candidates = this.matchCoins(
+        poolProfiles,
+        pairsByToken,
+        statsByToken,
+        chats,
+        diag.fails,
+      );
+      diag.candidates = candidates.length;
       let pushed = 0;
       for (const coin of candidates) {
+        // Push each coin at most once per chat.
+        if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
+          continue;
+        }
         const opening = await this.resolveOpeningVolume(coin);
         // Strict opening-volume filter: exclude only when we know the value
         // and it is too hot. Unknown values (or known-low values) pass.
         if (opening.value !== null && opening.value >= coin.max1mVolUsd) {
+          diag.holds.opening++;
           continue;
         }
         const rugcheck = await this.resolveRugcheckData(coin);
         // Bundler filter: skip coins whose bundled/insider supply share is
         // known and too high. Unknown (null) means no bundlers detected — pass.
         if (rugcheck.bundlerPct !== null && rugcheck.bundlerPct >= coin.maxBundlerPct) {
+          diag.holds.bundler++;
           continue;
         }
         // Top-10 holder data must be ready before pushing: when RugCheck has
         // not produced the report yet, hold the coin and re-check it on the
         // next scan instead of pushing a card with "未检测".
         if (rugcheck.top10Pct === null) {
+          diag.holds.rugcheck++;
           console.log(
             `[scanner] holding ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (RugCheck report not ready)`,
           );
@@ -150,6 +234,7 @@ export class Scanner {
         }
         // Top-10 holder concentration filter.
         if (rugcheck.top10Pct >= coin.maxTop10HolderPct) {
+          diag.holds.top10++;
           continue;
         }
         const trader = await this.resolveTraderData(coin);
@@ -157,12 +242,14 @@ export class Scanner {
         // and too high. When Birdeye has no trader data yet, hold the coin
         // and re-check on the next scan (same policy as the top-10 metric).
         if (trader.sniperPct === null) {
+          diag.holds.sniper++;
           console.log(
             `[scanner] holding ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (sniper data not ready)`,
           );
           continue;
         }
         if (trader.sniperPct >= coin.maxSniperPct) {
+          diag.holds.sniperHigh++;
           continue;
         }
         try {
@@ -199,8 +286,9 @@ export class Scanner {
           );
         }
       }
+      diag.pushed = pushed;
       console.log(
-        `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${candidates.length} candidates, ${pushed} pushed` +
+        `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${poolProfiles.length} pooled, ${candidates.length} candidates, ${pushed} pushed` +
           (this.birdeye ? "" : " (Birdeye not configured)"),
       );
     } catch (err) {
@@ -209,6 +297,7 @@ export class Scanner {
         err instanceof Error ? err.message : err,
       );
     } finally {
+      this.lastSummary = diag;
       this.running = false;
     }
   }
@@ -375,6 +464,7 @@ export class Scanner {
       maxTop10HolderPct: number;
       maxSniperPct: number;
     }[],
+    fails: ScanSummary["fails"],
   ): QualifyingCoin[] {
     const out: QualifyingCoin[] = [];
     for (const profile of profiles) {
@@ -387,13 +477,34 @@ export class Scanner {
       const ageMs = Date.now() - pair.pairCreatedAt;
 
       for (const chat of chats) {
-        if (liquidityUsd < chat.minLiquidityUsd) continue;
-        if (volume24h < chat.minVolume24hUsd) continue;
-        if (pair.marketCap < chat.minMarketCapUsd) continue;
-        if (ageMs < chat.minAgeMinutes * 60_000) continue; // too fresh
-        if (ageMs > chat.maxAgeMinutes * 60_000) continue; // too old
-        if (pair.volume.m5 < chat.min5mVolUsd) continue;
-        if (pair.priceChange.m5 < chat.min5mChgPct) continue;
+        if (liquidityUsd < chat.minLiquidityUsd) {
+          fails.other++;
+          continue;
+        }
+        if (volume24h < chat.minVolume24hUsd) {
+          fails.other++;
+          continue;
+        }
+        if (pair.marketCap < chat.minMarketCapUsd) {
+          fails.mcap++;
+          continue;
+        }
+        if (ageMs < chat.minAgeMinutes * 60_000) {
+          fails.age++;
+          continue; // too fresh
+        }
+        if (ageMs > chat.maxAgeMinutes * 60_000) {
+          fails.age++;
+          continue; // too old
+        }
+        if (pair.volume.m5 < chat.min5mVolUsd) {
+          fails.vol5++;
+          continue;
+        }
+        if (pair.priceChange.m5 < chat.min5mChgPct) {
+          fails.chg++;
+          continue;
+        }
         out.push({
           chatId: chat.chatId,
           profile,

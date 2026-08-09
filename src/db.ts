@@ -297,13 +297,7 @@ export class Db {
     });
   }
 
-  async getTokenStats(token: string): Promise<TokenStats | null> {
-    const res = await this.get().execute({
-      sql: "SELECT * FROM token_stats WHERE token = ?",
-      args: [token],
-    });
-    const row = res.rows[0];
-    if (!row) return null;
+  private statsFromRow(row: Record<string, unknown>): TokenStats {
     const birdeye = row.birdeye_1m_vol;
     const rugcheck = row.rugcheck_bundler_pct;
     const top10 = row.rugcheck_top10_pct;
@@ -327,6 +321,36 @@ export class Db {
       minMcapObserved:
         minMcap === null || minMcap === undefined ? null : Number(minMcap),
     };
+  }
+
+  async getTokenStats(token: string): Promise<TokenStats | null> {
+    const res = await this.get().execute({
+      sql: "SELECT * FROM token_stats WHERE token = ?",
+      args: [token],
+    });
+    const row = res.rows[0];
+    if (!row) return null;
+    return this.statsFromRow(row);
+  }
+
+  /**
+   * Tokens first observed within the window that have never been pushed to
+   * any chat. This is the re-evaluation pool: coins held while their
+   * RugCheck / Birdeye data arrives (or seen too young to qualify on first
+   * sight) keep being retried until they qualify or age out, instead of
+   * rotating out of the "latest profiles" feed and being lost forever.
+   * Capped to the most recent `limit` to keep the pairs re-fetch cheap.
+   */
+  async getRecentTokenStats(sinceMs: number, limit = 20): Promise<TokenStats[]> {
+    const res = await this.get().execute({
+      sql: `SELECT * FROM token_stats
+            WHERE first_seen_at > ?
+              AND token NOT IN (SELECT token FROM seen_tokens)
+            ORDER BY first_seen_at DESC
+            LIMIT ?`,
+      args: [sinceMs, limit],
+    });
+    return res.rows.map((row) => this.statsFromRow(row));
   }
 
   async recordTokenStats(stats: TokenStats): Promise<void> {

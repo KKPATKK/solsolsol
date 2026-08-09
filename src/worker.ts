@@ -172,6 +172,7 @@ export default {
         scheduledTicks,
         scanRunning,
         heartbeat,
+        summary: scanner?.lastSummary ?? null,
         now: new Date().toISOString(),
       });
     }
