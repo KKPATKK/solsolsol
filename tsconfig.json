@@ -11,7 +11,10 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "@libsql/client/web": ["./node_modules/@libsql/client/lib-esm/web.d.ts"]
+    }
   },
   "include": ["src"]
 }

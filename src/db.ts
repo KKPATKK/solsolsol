@@ -1,4 +1,10 @@
-import { createClient, type Client } from "@libsql/client";
+// Use the Web-standard (HTTP/fetch-based) build explicitly: on Cloudflare
+// Workers the main entry would resolve to the Node/WebSocket client (tsconfig
+// is CommonJS, so wrangler picks the "require" condition), which cannot
+// connect there. `@libsql/client/web` ships CJS + ESM variants, so the same
+// import works in Node and on Workers. https:// URLs additionally force the
+// pure-HTTP transport everywhere.
+import { createClient, type Client } from "@libsql/client/web";
 
 export interface ChatSettings {
   chatId: string;
@@ -83,7 +89,10 @@ export class Db {
   }
 
   async init(): Promise<void> {
-    this.client = createClient({ url: this.url, authToken: this.authToken });
+    // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
+    // which works reliably on Workers (fetch) and in Node alike.
+    const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
+    this.client = createClient({ url: httpUrl, authToken: this.authToken });
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS chat_settings (
         chat_id TEXT PRIMARY KEY,
@@ -110,6 +119,12 @@ export class Db {
     await this.addColumnIfMissing("chat_settings", "max_bundler_pct", "REAL NOT NULL DEFAULT 24");
     await this.addColumnIfMissing("chat_settings", "max_top10_holder_pct", "REAL NOT NULL DEFAULT 27");
     await this.addColumnIfMissing("chat_settings", "max_sniper_pct", "REAL NOT NULL DEFAULT 5");
+    await this.client.execute(`
+      CREATE TABLE IF NOT EXISTS worker_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS seen_tokens (
         chat_id TEXT NOT NULL,
@@ -249,6 +264,30 @@ export class Db {
       args: [chatId, token],
     });
     return res.rows.length > 0;
+  }
+
+  /**
+   * Cross-isolate telemetry: Cloudflare Workers isolates have independent
+   * module state, so /health on one isolate cannot see counters living on
+   * the isolate that ran the scheduled scanner. Persisting the scan
+   * heartbeat in Turso makes the scanner observable from anywhere.
+   */
+  async setWorkerState(key: string, value: string): Promise<void> {
+    await this.get().execute({
+      sql: "INSERT INTO worker_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      args: [key, value],
+    });
+  }
+
+  async getWorkerState(key: string): Promise<string | null> {
+    const res = await this.get().execute({
+      sql: "SELECT value FROM worker_state WHERE key = ?",
+      args: [key],
+    });
+    const row = res.rows[0];
+    if (!row) return null;
+    const v = (row as Record<string, unknown>).value;
+    return v === null || v === undefined ? null : String(v);
   }
 
   async markTokenSeen(chatId: string, token: string): Promise<void> {

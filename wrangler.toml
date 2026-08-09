@@ -1,0 +1,19 @@
+name = "solana-meme-bot"
+main = "src/worker.ts"
+compatibility_date = "2026-08-09"
+compatibility_flags = ["nodejs_compat"]
+
+# Scanner runs every minute — the free-tier minimum for cron triggers.
+[triggers]
+crons = ["* * * * *"]
+
+# Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
+# TURSO_AUTH_TOKEN, BIRDEYE_API_KEY) must NOT live here — set them in the
+# Cloudflare dashboard (Workers > solana-meme-bot > Settings > Variables and
+# Secrets) or via `wrangler secret put <NAME>`.
+[vars]
+SCAN_INTERVAL_SECONDS = "60"
+SCAN_PROFILE_LIMIT = "20"
+DEX_REQUEST_INTERVAL_MS = "350"
+BIRDEYE_REQUEST_INTERVAL_MS = "1100"
+RUGCHECK_REQUEST_INTERVAL_MS = "800"
