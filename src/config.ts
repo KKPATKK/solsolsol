@@ -52,8 +52,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     rugcheckRequestIntervalMs: Number.isFinite(Number(env.RUGCHECK_REQUEST_INTERVAL_MS ?? 800))
       ? Math.max(0, Number(env.RUGCHECK_REQUEST_INTERVAL_MS ?? 800))
       : 800,
-    heliusRequestIntervalMs: Number.isFinite(Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 300))
-      ? Math.max(0, Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 300))
-      : 300,
+    // 100ms (was 300ms) so a hot coin's opening-minute enumeration (~150 txs)
+    // fits inside Cloudflare's 30s wall-clock limit; the keyed Helius
+    // endpoint handles 10 req/s comfortably. Public-RPC fallback relies on
+    // the circuit breaker instead.
+    heliusRequestIntervalMs: Number.isFinite(Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 100))
+      ? Math.max(0, Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 100))
+      : 100,
   };
 }

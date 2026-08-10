@@ -64,13 +64,19 @@ const CIRCUIT_BREAK_MS = 5 * 60_000;
 /**
  * More trades than this in the opening minute means the coin is too hot to
  * enumerate cheaply — treat the volume as unknown (proxy decides) instead of
- * spending 25+ credits fetching the whole window. 50 covers moderately hot
- * coins (~1 tx / 1.2 s) — up to 50 getTransaction calls per coin, cached in
- * the DB afterwards.
+ * spending hundreds of credits fetching the whole window. 150 covers busy
+ * coins; WINDOW_ENUM_BUDGET_MS keeps a scan tick inside Cloudflare's 30s
+ * wall-clock limit (results are cached in the DB afterwards).
  */
-const MAX_WINDOW_TRADES = 50;
+const MAX_WINDOW_TRADES = 150;
 /** Page limit when hunting back for the launch minute in a busy account. */
-const WINDOW_PAGE_LIMIT = 5;
+const WINDOW_PAGE_LIMIT = 8;
+/**
+ * Hard time budget per coin for enumerating opening-minute transactions.
+ * Abort to proxy when exceeded so one hot coin can never stall (or get the
+ * whole scheduled invocation killed by) the 30s worker wall-clock limit.
+ */
+const WINDOW_ENUM_BUDGET_MS = 16_000;
 /**
  * Reject a candidate launch market whose chain history starts well before
  * DexScreener's recorded creation time (wrongly associated pair address).
@@ -399,7 +405,9 @@ export class HeliusClient {
     if (inWindow.length > MAX_WINDOW_TRADES) return null; // too hot to enumerate cheaply
 
     let volLamports = 0;
+    const enumStartedAt = Date.now();
     for (const sig of inWindow) {
+      if (Date.now() - enumStartedAt > WINDOW_ENUM_BUDGET_MS) return null;
       const tx = await this.rpc<TxLike>("getTransaction", [
         sig.signature,
         { maxSupportedTransactionVersion: 0, encoding: "json" },
