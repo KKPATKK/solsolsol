@@ -18,14 +18,20 @@ import type { AppConfig } from "./config";
  *        (the account owned by the pump.fun program with a BondingCurve
  *        discriminator, or the closed account at the curve's fixed position
  *        once the token has graduated).
- *   2. For transactions in the window [pairCreatedAt, +60s), sum the SOL that
+ *   2. The opening window is anchored to the market's own earliest chain
+ *      signature (paged back past busy history) rather than DexScreener's
+ *      pairCreatedAt, which on fresh pump pairs can precede on-chain
+ *      activity by minutes. DexScreener's time still bounds the identity
+ *      check: an account whose history starts long before it is not this
+ *      token's launch market.
+ *   3. For transactions in the opening window [t0, t0 + 60s), sum the SOL that
  *      moved into/out of that account: native lamport balance deltas (bonding
  *      curve) and/or WSOL token-balance deltas (AMM pools hold SOL as SPL).
  *      This is layout-independent — no event decoding — and works even for
  *      accounts that have since been closed (ledger balances persist).
- *   3. Convert SOL → USD using the DexScreener pair (priceUsd / priceNative),
+ *   4. Convert SOL → USD using the DexScreener pair (priceUsd / priceNative),
  *      falling back to a cached GeckoTerminal SOL price.
- *
+
  * Cost: ~10-14 RPC calls per coin, once per coin (result cached in the DB).
  * Every failure mode falls back gracefully: non-pump tokens, graduated
  * markets whose history is unreachable, and RPC outages all return null, and
@@ -61,6 +67,13 @@ const CIRCUIT_BREAK_MS = 5 * 60_000;
  * spending 25+ credits fetching the whole window.
  */
 const MAX_WINDOW_TRADES = 12;
+/** Page limit when hunting back for the launch minute in a busy account. */
+const WINDOW_PAGE_LIMIT = 5;
+/**
+ * Reject a candidate launch market whose chain history starts well before
+ * DexScreener's recorded creation time (wrongly associated pair address).
+ */
+const LAUNCH_ANCHOR_TOLERANCE_S = 15 * 60;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -299,11 +312,11 @@ export class HeliusClient {
     mint: string,
     input: OpeningVolumeInput,
   ): Promise<number | null> {
-    // Only compute once the opening minute has fully elapsed; a partial
-    // window would under-report and could let a hot coin pass the filter.
+    // Cheap pre-guard: never compute before the opening minute could have
+    // elapsed on the DexScreener clock. The precise guard lives in
+    // computeWindowVolumeLamports, anchored to the chain's own launch time.
     if (Date.now() - input.pairCreatedAt < 75_000) return null;
-    const fromSec = Math.floor(input.pairCreatedAt / 1000);
-    const toSec = fromSec + 60;
+    const dexCreatedSec = Math.floor(input.pairCreatedAt / 1000);
 
     // Fast path: the DexScreener pair address. Window-verified, so it works
     // for both the classic curve (owner 6EF8, possibly closed after
@@ -311,43 +324,77 @@ export class HeliusClient {
     if (input.pairAddress) {
       const solVol = await this.computeWindowVolumeLamports(
         input.pairAddress,
-        fromSec,
-        toSec,
+        dexCreatedSec,
       );
-      if (solVol !== null) return this.solLamportsToUsd(solVol, input);
+      if (solVol !== null) return this.solLamportsToUsd(solVol.lamports, input);
     }
 
     // Fallback: find the bonding curve via the mint's create transaction
     // (covers tokens whose DexScreener pair address is unusable).
     const curve = await this.findCurveAddress(mint);
     if (curve && curve !== input.pairAddress) {
-      const solVol = await this.computeWindowVolumeLamports(curve, fromSec, toSec);
-      if (solVol !== null) return this.solLamportsToUsd(solVol, input);
+      const solVol = await this.computeWindowVolumeLamports(curve, dexCreatedSec);
+      if (solVol !== null) return this.solLamportsToUsd(solVol.lamports, input);
     }
     return null;
   }
 
   /**
-   * Sum the SOL (in lamports) that moved through `addr` during [fromSec, toSec):
-   * native balance deltas (bonding curve) plus WSOL token-balance deltas
+   * Sum the SOL (in lamports) that moved through `addr` during its opening
+   * minute [t0, t0 + 60s), where t0 is the account's own earliest signature
+   * (paged back far enough to reach it). Returns { lamports, t0Sec }, or null
+   * when the window cannot be determined — callers fall back to the proxy.
+   *
+   * Native balance deltas (bonding curve) plus WSOL token-balance deltas
    * (PumpSwap pools hold SOL as an SPL token account owned by the pool).
    */
   private async computeWindowVolumeLamports(
     addr: string,
-    fromSec: number,
-    toSec: number,
-  ): Promise<number | null> {
-    const sigs = await this.rpc<SigInfo[]>("getSignaturesForAddress", [
-      addr,
-      { limit: 100 },
-    ]);
-    if (!sigs || sigs.length === 0) return null;
-    const inWindow = sigs.filter(
-      (s) => typeof s.blockTime === "number" && s.blockTime >= fromSec && s.blockTime < toSec,
+    dexCreatedSec: number,
+  ): Promise<{ lamports: number; t0Sec: number } | null> {
+    // Page back so busy tokens' launch minute is reachable: a fresh coin can
+    // push its earliest signatures beyond the newest-100 page within minutes.
+    const sigs: SigInfo[] = [];
+    let before: string | undefined;
+    let exhausted = false;
+    for (let page = 0; page < WINDOW_PAGE_LIMIT; page++) {
+      const batch = await this.rpc<SigInfo[]>("getSignaturesForAddress", [
+        addr,
+        { limit: 100, ...(before ? { before } : {}) },
+      ]);
+      if (!batch || batch.length === 0) return null;
+      sigs.push(...batch);
+      if (batch.length < 100) {
+        exhausted = true; // reached the account's first signature
+        break;
+      }
+      before = batch[batch.length - 1].signature;
+    }
+
+    const timed = sigs.filter(
+      (s): s is SigInfo & { blockTime: number } =>
+        typeof s.blockTime === "number",
+    );
+    if (timed.length === 0) return null;
+    timed.sort((a, b) => a.blockTime - b.blockTime);
+    const t0 = timed[0].blockTime;
+
+    // Identity check: chain activity long before DexScreener's creation time
+    // means this address is not the token's launch market.
+    if (t0 < dexCreatedSec - LAUNCH_ANCHOR_TOLERANCE_S) return null;
+    // Still paging at the cap: if the earliest signature we reached disagrees
+    // with DexScreener's clock by a lot, the launch minute is unreachable —
+    // don't guess, let the proxy decide.
+    if (!exhausted && Math.abs(t0 - dexCreatedSec) > 10 * 60) return null;
+    // Never compute a partial opening minute (under-reports, could pass a
+    // hot coin through the filter).
+    if (Date.now() - t0 * 1000 < 75_000) return null;
+
+    const inWindow = timed.filter(
+      (s) => s.blockTime >= t0 && s.blockTime < t0 + 60,
     );
     if (inWindow.length === 0) return null;
     if (inWindow.length > MAX_WINDOW_TRADES) return null; // too hot to enumerate cheaply
-    inWindow.sort((a, b) => (a.blockTime ?? 0) - (b.blockTime ?? 0));
 
     let volLamports = 0;
     for (const sig of inWindow) {
@@ -385,7 +432,7 @@ export class HeliusClient {
       const wsolDelta = wsolPre > wsolPost ? wsolPre - wsolPost : wsolPost - wsolPre;
       if (wsolDelta > 0n) volLamports += Number(wsolDelta);
     }
-    return volLamports > 0 ? volLamports : null;
+    return volLamports > 0 ? { lamports: volLamports, t0Sec: t0 } : null;
   }
 
   private async solLamportsToUsd(
