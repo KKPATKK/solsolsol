@@ -25,6 +25,24 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Write HELIUS_API_KEY as a Worker secret so the on-chain volume
+      # resolver runs at full speed. Guarded: if the GitHub Actions secret is
+      # not set yet, this step is skipped and the deploy still succeeds
+      # (graceful fallback to public RPC). GitHub forbids referencing secrets
+      # in `if:` conditions, hence the shell guard.
+      - name: Set HELIUS_API_KEY worker secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+        run: |
+          if [ -n "$HELIUS_API_KEY" ]; then
+            echo "$HELIUS_API_KEY" | npx wrangler secret put HELIUS_API_KEY
+            echo "::notice::HELIUS_API_KEY written to Worker secret"
+          else
+            echo "::warning::HELIUS_API_KEY not set as a GitHub Actions secret — skipping (fallback to public RPC)"
+          fi
+
       - name: Deploy to Cloudflare Workers
         run: npx wrangler deploy
         env:

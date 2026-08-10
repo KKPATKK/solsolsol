@@ -60,6 +60,8 @@ let lastScanMs: number | null = null;
 let lastScanError: string | null = null;
 let scheduledTicks = 0;
 let scanRunning = false;
+// Whether the HELIUS_API_KEY secret reached the Worker (presence only — never the value).
+let heliusConfigured = false;
 
 /** Alert when the previous scan finished more than this long ago (missed ticks). */
 const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
@@ -70,6 +72,7 @@ async function ensureInitialized(env: Env): Promise<void> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
     const config = loadConfig(env);
+    heliusConfigured = Boolean(config.heliusApiKey);
 
     if (config.tursoUrl) {
       try {
@@ -234,6 +237,7 @@ export default {
         dbReady,
         botReady,
         scannerReady,
+        heliusConfigured,
         initError,
         lastScanMs,
         lastScanError,
