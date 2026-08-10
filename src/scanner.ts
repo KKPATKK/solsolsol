@@ -23,6 +23,14 @@ const RUGCHECK_REFRESH_MS = 15 * 60_000;
  * on every scan.
  */
 const DATA_NEGATIVE_CACHE_MS = 5 * 60_000;
+/**
+ * Max wall-clock time for one scan pass. A hung/slow upstream call must not
+ * wedge the scanner forever: the Worker isolate keeps module state between
+ * ticks, so a scan that never resolves (e.g. killed by Cloudflare's ~30s
+ * invocation limit mid-flight) would make every later tick skip and the bot
+ * go silent. Released well before that wall-clock limit.
+ */
+const SCAN_TIMEOUT_MS = 25_000;
 /** Re-evaluate tokens first seen within this window until their data arrives. */
 const RE_EVAL_WINDOW_MS = 60 * 60_000;
 /** Re-evaluation pool cap (keeps the pairs re-fetch + JSON parse small). */
@@ -82,6 +90,8 @@ export interface ScanSummary {
 
 export class Scanner {
   private running = false;
+  /** Monotonic scan id: a timed-out scan must not clobber a newer scan's state. */
+  private scanSeq = 0;
   /** Summary of the last completed scan, persisted into the heartbeat. */
   lastSummary: ScanSummary | null = null;
   /** When each token's RugCheck report was last fetched (in-memory TTL). */
@@ -117,6 +127,7 @@ export class Scanner {
       console.log("[scanner] previous scan still running, skipping this tick");
       return;
     }
+    const seq = ++this.scanSeq;
     this.running = true;
     const startedAt = Date.now();
     const diag: ScanSummary = {
@@ -134,6 +145,16 @@ export class Scanner {
       },
       fails: { mcap: 0, chg: 0, vol5: 0, age: 0, other: 0 },
     };
+    // Watchdog: if the scan outlives its budget, release the lock so the next
+    // tick can retry instead of the isolate wedging in a permanent skip loop.
+    const watchdog = setTimeout(() => {
+      if (seq === this.scanSeq) {
+        console.error(
+          `[scanner] scan exceeded ${SCAN_TIMEOUT_MS}ms — releasing lock; next tick will retry`,
+        );
+        this.running = false;
+      }
+    }, SCAN_TIMEOUT_MS);
     try {
       const chats = await this.db.listEnabledChats();
       if (chats.length === 0) {
@@ -306,8 +327,13 @@ export class Scanner {
         err instanceof Error ? err.message : err,
       );
     } finally {
-      this.lastSummary = diag;
-      this.running = false;
+      clearTimeout(watchdog);
+      // Only a still-current scan may publish summary/state; a timed-out scan
+      // that eventually settles must not clobber a newer scan's results.
+      if (seq === this.scanSeq) {
+        this.lastSummary = diag;
+        this.running = false;
+      }
     }
   }
 
