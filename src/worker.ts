@@ -62,6 +62,8 @@ let scheduledTicks = 0;
 let scanRunning = false;
 // Whether the HELIUS_API_KEY secret reached the Worker (presence only — never the value).
 let heliusConfigured = false;
+// Whether the BIRDEYE_API_KEY secret reached the Worker (presence only — never the value).
+let birdeyeConfigured = false;
 
 /** Alert when the previous scan finished more than this long ago (missed ticks). */
 const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
@@ -73,6 +75,7 @@ async function ensureInitialized(env: Env): Promise<void> {
   initPromise = (async () => {
     const config = loadConfig(env);
     heliusConfigured = Boolean(config.heliusApiKey);
+    birdeyeConfigured = Boolean(config.birdeyeApiKey);
 
     if (config.tursoUrl) {
       try {
@@ -238,6 +241,7 @@ export default {
         botReady,
         scannerReady,
         heliusConfigured,
+        birdeyeConfigured,
         initError,
         lastScanMs,
         lastScanError,
