@@ -64,10 +64,11 @@ const CIRCUIT_BREAK_MS = 5 * 60_000;
 /**
  * More trades than this in the opening minute means the coin is too hot to
  * enumerate cheaply — treat the volume as unknown (proxy decides) instead of
- * spending 25+ credits fetching the whole window. 20 balances coverage of
- * moderately active coins (~1 tx / 3 s) against RPC cost.
+ * spending 25+ credits fetching the whole window. 50 covers moderately hot
+ * coins (~1 tx / 1.2 s) — up to 50 getTransaction calls per coin, cached in
+ * the DB afterwards.
  */
-const MAX_WINDOW_TRADES = 20;
+const MAX_WINDOW_TRADES = 50;
 /** Page limit when hunting back for the launch minute in a busy account. */
 const WINDOW_PAGE_LIMIT = 5;
 /**
