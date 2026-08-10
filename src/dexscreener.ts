@@ -16,6 +16,8 @@ export interface PairInfo {
   pairAddress: string;
   baseToken: { address: string; name: string; symbol: string };
   priceUsd: string;
+  /** Price of 1 base token in native quote (e.g. SOL) — used for SOL/USD. */
+  priceNative?: number;
   marketCap: number;
   volume: { h24: number; m5: number };
   priceChange: { m5: number };
@@ -131,6 +133,7 @@ export class DexScreenerClient {
             symbol: baseToken.symbol ?? "",
           },
           priceUsd: String(raw.priceUsd ?? "0"),
+          priceNative: Number(raw.priceNative),
           marketCap: Number(raw.marketCap ?? 0),
           volume: {
             h24: Number(volume?.h24 ?? 0),

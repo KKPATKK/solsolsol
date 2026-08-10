@@ -5,8 +5,10 @@ export interface AppConfig {
   tursoUrl?: string;
   /** Turso auth token (required for hosted Turso). */
   tursoAuthToken?: string;
-  /** Birdeye API key for exact minute-level volume (optional). */
+  /** Birdeye API key for trader/sniper insights (optional). */
   birdeyeApiKey?: string;
+  /** Helius RPC API key for on-chain first-minute volume (optional; without it the public Solana RPC is used). */
+  heliusApiKey?: string;
   /** How often the scanner runs, in seconds (SCAN_INTERVAL_SECONDS, else SCAN_INTERVAL_MINUTES×60). */
   scanIntervalSeconds: number;
   /** Port the /health HTTP server binds to (Freebuff injects PORT). */
@@ -19,6 +21,8 @@ export interface AppConfig {
   birdeyeRequestIntervalMs: number;
   /** Minimum spacing between RugCheck HTTP requests (rate limiting). */
   rugcheckRequestIntervalMs: number;
+  /** Minimum spacing between Solana RPC requests (rate limiting). */
+  heliusRequestIntervalMs: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -34,6 +38,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     tursoUrl: env.TURSO_DATABASE_URL || undefined,
     tursoAuthToken: env.TURSO_AUTH_TOKEN || undefined,
     birdeyeApiKey: env.BIRDEYE_API_KEY || undefined,
+    heliusApiKey: env.HELIUS_API_KEY || undefined,
     scanIntervalSeconds:
       Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 300,
     port: Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 3000,
@@ -47,5 +52,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     rugcheckRequestIntervalMs: Number.isFinite(Number(env.RUGCHECK_REQUEST_INTERVAL_MS ?? 800))
       ? Math.max(0, Number(env.RUGCHECK_REQUEST_INTERVAL_MS ?? 800))
       : 800,
+    heliusRequestIntervalMs: Number.isFinite(Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 300))
+      ? Math.max(0, Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 300))
+      : 300,
   };
 }

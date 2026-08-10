@@ -5,6 +5,7 @@ import type { AppConfig } from "./config";
 import type { Db, TokenStats } from "./db";
 import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreener";
 import { fmtAge, fmtUsd } from "./format";
+import type { HeliusClient } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
@@ -15,12 +16,13 @@ const MAX_MEASURABLE_AGE_MIN = 5;
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
 const RUGCHECK_REFRESH_MS = 15 * 60_000;
 /**
- * After a Birdeye lookup comes back empty/failed, do not re-query the same
- * token for this long. Every retry costs 35 CU on the free tier, and empty
- * results (data not indexed yet) are not cached in the DB, so without this
- * a waiting coin would hammer the endpoint on every 20s scan.
+ * After an on-chain (Helius) or Birdeye lookup comes back empty/failed, do
+ * not re-query the same token for this long. Every RPC retry costs credits on
+ * the Helius free tier, and empty results (data not indexed yet) are not
+ * cached in the DB, so without this a waiting coin would hammer the endpoint
+ * on every scan.
  */
-const BIRDEYE_NEGATIVE_CACHE_MS = 5 * 60_000;
+const DATA_NEGATIVE_CACHE_MS = 5 * 60_000;
 /** Re-evaluate tokens first seen within this window until their data arrives. */
 const RE_EVAL_WINDOW_MS = 60 * 60_000;
 /** Re-evaluation pool cap (keeps the pairs re-fetch + JSON parse small). */
@@ -46,7 +48,7 @@ interface QualifyingCoin {
 interface OpeningVolume {
   /** Exact volume in USD, or null when it could not be determined. */
   value: number | null;
-  source: "birdeye" | "proxy" | "unknown";
+  source: "helius" | "proxy" | "unknown";
 }
 
 /** Rejection reasons from the last completed scan (surfaced via /health). */
@@ -85,10 +87,10 @@ export class Scanner {
   /** When each token's RugCheck report was last fetched (in-memory TTL). */
   private readonly rugcheckFetchedAt = new Map<string, number>();
   /**
-   * When Birdeye last returned empty/failed for a token, so we can skip
-   * re-querying it for a while (in-memory negative cache).
+   * When Helius/Birdeye last returned empty/failed for a token, so we can
+   * skip re-querying it for a while (in-memory negative cache).
    */
-  private readonly birdeyeFailedAt = new Map<string, number>();
+  private readonly dataFailedAt = new Map<string, number>();
 
   constructor(
     private readonly db: Db,
@@ -97,14 +99,15 @@ export class Scanner {
     private readonly config: AppConfig,
     private readonly birdeye: BirdeyeClient | null,
     private readonly rugcheck: RugcheckClient | null,
+    private readonly helius: HeliusClient | null,
   ) {}
 
-  /** True while a Birdeye retry for this token should be skipped (negative cache). */
-  private birdeyeNegativeCached(token: string): boolean {
-    const at = this.birdeyeFailedAt.get(token);
+  /** True while an on-chain/Birdeye retry for this token should be skipped. */
+  private dataNegativeCached(token: string): boolean {
+    const at = this.dataFailedAt.get(token);
     if (at === undefined) return false;
-    if (Date.now() - at < BIRDEYE_NEGATIVE_CACHE_MS) return true;
-    this.birdeyeFailedAt.delete(token); // prune stale entries
+    if (Date.now() - at < DATA_NEGATIVE_CACHE_MS) return true;
+    this.dataFailedAt.delete(token); // prune stale entries
     return false;
   }
 
@@ -310,10 +313,13 @@ export class Scanner {
 
   /**
    * Resolve the coin's opening volume:
-   *  1. cached exact value from Birdeye,
-   *  2. fresh fetch from Birdeye (cached afterwards),
+   *  1. cached exact value (computed on-chain via Helius),
+   *  2. fresh on-chain computation from the pump.fun bonding curve,
    *  3. DexScreener proxy (m5 at first sight, when seen young),
    *  4. unknown → the coin is pushed (no way to measure).
+   * Birdeye is deliberately NOT consulted here anymore: its OHLCV endpoint
+   * (35 CU/call) was the main free-tier budget burner, and the on-chain
+   * computation is free (1 credit/call on Helius' plan).
    */
   private async resolveOpeningVolume(
     coin: QualifyingCoin,
@@ -321,28 +327,30 @@ export class Scanner {
     const { stats, pair } = coin;
 
     if (stats.birdeye1mVol !== null) {
-      return { value: stats.birdeye1mVol, source: "birdeye" };
+      return { value: stats.birdeye1mVol, source: "helius" };
     }
 
-    if (this.birdeye && !this.birdeyeNegativeCached(stats.token)) {
+    if (this.helius && !this.dataNegativeCached(stats.token)) {
       try {
-        const vol = await this.birdeye.getFirstMinuteVolume(
-          stats.token,
-          Math.floor(pair.pairCreatedAt / 1000),
-        );
+        const vol = await this.helius.getFirstMinuteVolumeUsd(stats.token, {
+          priceUsd: pair.priceUsd,
+          priceNative: pair.priceNative,
+          pairCreatedAt: pair.pairCreatedAt,
+          pairAddress: pair.pairAddress,
+        });
         if (vol !== null) {
-          this.birdeyeFailedAt.delete(stats.token);
+          this.dataFailedAt.delete(stats.token);
           await this.db.updateTokenBirdeyeVol(stats.token, vol);
           stats.birdeye1mVol = vol;
-          return { value: vol, source: "birdeye" };
+          return { value: vol, source: "helius" };
         }
-        // Empty result (candles not indexed yet): back off instead of
-        // re-querying the same coin on every 20s scan.
-        this.birdeyeFailedAt.set(stats.token, Date.now());
+        // Empty result (curve not indexed / first minute not complete / not a
+        // pump token): back off instead of re-querying every scan.
+        this.dataFailedAt.set(stats.token, Date.now());
       } catch (err) {
-        this.birdeyeFailedAt.set(stats.token, Date.now());
+        this.dataFailedAt.set(stats.token, Date.now());
         console.error(
-          `[scanner] Birdeye lookup failed for ${stats.token}:`,
+          `[scanner] on-chain volume lookup failed for ${stats.token}:`,
           err instanceof Error ? err.message : err,
         );
       }
@@ -422,7 +430,7 @@ export class Scanner {
         sniperPct: stats.birdeyeSniperPct,
       };
     }
-    if (this.birdeye && !this.birdeyeNegativeCached(stats.token)) {
+    if (this.birdeye && !this.dataNegativeCached(stats.token)) {
       try {
         const info = await this.birdeye.getTraderInfo(
           stats.token,
@@ -430,19 +438,19 @@ export class Scanner {
           coin.pair.priceUsd,
         );
         if (info.proTraders !== null && info.sniperPct !== null) {
-          this.birdeyeFailedAt.delete(stats.token);
+          this.dataFailedAt.delete(stats.token);
           await this.db.updateTokenProTraders(stats.token, info.proTraders);
           await this.db.updateTokenSniperPct(stats.token, info.sniperPct);
           stats.birdeyeProTraders = info.proTraders;
           stats.birdeyeSniperPct = info.sniperPct;
         } else {
           // Trader data not available yet: back off instead of re-querying
-          // the same coin on every 20s scan.
-          this.birdeyeFailedAt.set(stats.token, Date.now());
+          // the same coin on every scan.
+          this.dataFailedAt.set(stats.token, Date.now());
         }
         return info;
       } catch (err) {
-        this.birdeyeFailedAt.set(stats.token, Date.now());
+        this.dataFailedAt.set(stats.token, Date.now());
         console.error(
           `[scanner] Birdeye trader lookup failed for ${stats.token}:`,
           err instanceof Error ? err.message : err,
@@ -546,7 +554,7 @@ function renderMessage(
   const openingLine =
     opening.value === null
       ? "🌱 首分钟量: —（无法测量）"
-      : `🌱 首分钟量: ${fmtUsd(opening.value)}${opening.source === "birdeye" ? " (Birdeye)" : ""}`;
+      : `🌱 首分钟量: ${fmtUsd(opening.value)}${opening.source === "helius" ? " (链上)" : ""}`;
   const bundlerLine =
     bundlerPct === null
       ? "🛡 Bundler: 0.0%（未检测到捆绑网络）"

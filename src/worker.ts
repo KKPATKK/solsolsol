@@ -4,6 +4,7 @@ import { createBot } from "./bot";
 import { loadConfig } from "./config";
 import { Db } from "./db";
 import { DexScreenerClient } from "./dexscreener";
+import { HeliusClient } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 
@@ -29,6 +30,7 @@ interface Env {
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
   BIRDEYE_API_KEY?: string;
+  HELIUS_API_KEY?: string;
   SCAN_INTERVAL_SECONDS?: string;
   SCAN_PROFILE_LIMIT?: string;
 }
@@ -100,6 +102,8 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
 
+      const helius = new HeliusClient(config);
+
       if (db) {
         scanner = new Scanner(
           db,
@@ -108,6 +112,7 @@ async function ensureInitialized(env: Env): Promise<void> {
           config,
           birdeye,
           new RugcheckClient(config),
+          helius,
         );
         scannerReady = true;
       }

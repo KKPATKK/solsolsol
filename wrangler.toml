@@ -8,12 +8,13 @@ compatibility_flags = ["nodejs_compat"]
 crons = ["* * * * *"]
 
 # Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
-# TURSO_AUTH_TOKEN, BIRDEYE_API_KEY) must NOT live here — set them in the
-# Cloudflare dashboard (Workers > solana-meme-bot > Settings > Variables and
-# Secrets) or via `wrangler secret put <NAME>`.
+# TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY) must NOT live here — set
+# them in the Cloudflare dashboard (Workers > solana-meme-bot > Settings >
+# Variables and Secrets) or via `wrangler secret put <NAME>`.
 [vars]
 SCAN_INTERVAL_SECONDS = "60"
 SCAN_PROFILE_LIMIT = "15"
 DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
+HELIUS_REQUEST_INTERVAL_MS = "300"

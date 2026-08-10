@@ -4,6 +4,7 @@ import { createBot } from "./bot";
 import { loadConfig } from "./config";
 import { Db } from "./db";
 import { DexScreenerClient } from "./dexscreener";
+import { HeliusClient } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 
@@ -97,8 +98,14 @@ async function main(): Promise<void> {
           );
         }
       } else {
-        console.log("[birdeye] BIRDEYE_API_KEY not set — using DexScreener proxy for opening volume");
+        console.log("[birdeye] BIRDEYE_API_KEY not set — trader insights disabled");
       }
+      const helius = new HeliusClient(config);
+      console.log(
+        config.heliusApiKey
+          ? "[helius] client ready (on-chain volume)"
+          : "[helius] no API key — on-chain volume via public RPC (rate-limited)",
+      );
       const scanner = new Scanner(
         db,
         bot,
@@ -106,6 +113,7 @@ async function main(): Promise<void> {
         config,
         birdeye,
         new RugcheckClient(config),
+        helius,
       );
 
       const runScan = async (initial: boolean) => {
