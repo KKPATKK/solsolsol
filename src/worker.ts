@@ -505,6 +505,7 @@ export default {
         jupiterKeyed,
         tradeMode: effectiveTradeMode,
         tradeModeOverride,
+        adminConfigured: (cfg?.adminIds.length ?? 0) > 0,
         initError,
         lastScanMs,
         lastScanError,
