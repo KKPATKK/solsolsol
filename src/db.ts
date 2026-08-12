@@ -427,6 +427,28 @@ export class Db {
   }
 
   /**
+   * Fetch stats for many tokens in ONE query. The scanner calls this once
+   * per tick for the whole profiles feed; with per-token queries the tick
+   * would make ~20 sequential Turso round trips, which dominates the scan
+   * time whenever the database is slow (observed: ~5s per round trip).
+   */
+  async getTokenStatsMany(tokens: string[]): Promise<Map<string, TokenStats>> {
+    const out = new Map<string, TokenStats>();
+    if (tokens.length === 0) return out;
+    const res = await this.get().execute({
+      sql: `SELECT * FROM token_stats WHERE token IN (${tokens
+        .map(() => "?")
+        .join(",")})`,
+      args: tokens,
+    });
+    for (const row of res.rows) {
+      const stats = this.statsFromRow(row);
+      out.set(stats.token, stats);
+    }
+    return out;
+  }
+
+  /**
    * Tokens that have never been pushed to any chat and are nearing or inside
    * the qualifying age window. This is the re-evaluation pool: DexScreener's
    * profiles feed only ever contains young tokens, so coins that must age
@@ -473,6 +495,35 @@ export class Db {
     await this.get().execute({
       sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       args: [stats.token, stats.firstSeenAt, stats.firstM5Vol, stats.firstSeenAgeMin, stats.birdeye1mVol, stats.rugcheckBundlerPct, stats.rugcheckTop10Pct, stats.birdeyeProTraders, stats.birdeyeSniperPct, stats.minMcapObserved],
+    });
+  }
+
+  /**
+   * Record stats for several first-seen tokens in ONE multi-row insert.
+   * Same rationale as getTokenStatsMany: batch to keep the tick's Turso
+   * round trips low when the database is slow.
+   */
+  async recordTokenStatsMany(statsList: TokenStats[]): Promise<void> {
+    if (statsList.length === 0) return;
+    const placeholders = statsList.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",");
+    const args: Array<string | number | null> = [];
+    for (const s of statsList) {
+      args.push(
+        s.token,
+        s.firstSeenAt,
+        s.firstM5Vol,
+        s.firstSeenAgeMin,
+        s.birdeye1mVol,
+        s.rugcheckBundlerPct,
+        s.rugcheckTop10Pct,
+        s.birdeyeProTraders,
+        s.birdeyeSniperPct,
+        s.minMcapObserved,
+      );
+    }
+    await this.get().execute({
+      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES ${placeholders}`,
+      args,
     });
   }
 

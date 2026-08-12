@@ -226,11 +226,19 @@ export class Scanner {
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
 
       // Capture each token's opening stats the first time we ever see it.
+      // One batched lookup for the whole feed, then one batched insert for
+      // the new tokens — keeps the tick's Turso round trips to 2 instead of
+      // ~2×profiles (per-round-trip latency is the tick's biggest cost when
+      // the database is slow, observed ~5s/call).
       const statsByToken = new Map<string, TokenStats>();
+      const existingStats = await this.db.getTokenStatsMany(
+        profiles.map((p) => p.tokenAddress),
+      );
+      const newStats: TokenStats[] = [];
       for (const profile of profiles) {
         const pair = pairsByToken.get(profile.tokenAddress);
         if (!pair) continue;
-        const existing = await this.db.getTokenStats(profile.tokenAddress);
+        const existing = existingStats.get(profile.tokenAddress);
         if (existing) {
           statsByToken.set(profile.tokenAddress, existing);
           continue;
@@ -247,8 +255,11 @@ export class Scanner {
           birdeyeSniperPct: null,
           minMcapObserved: null,
         };
-        await this.db.recordTokenStats(stats);
+        newStats.push(stats);
         statsByToken.set(profile.tokenAddress, stats);
+      }
+      if (newStats.length > 0) {
+        await this.db.recordTokenStatsMany(newStats);
       }
       // Pool-only tokens (not in the current feed) reuse their cached stats.
       for (const stats of recentStats) {
