@@ -54,8 +54,8 @@ SUPPLY_FLOW_CHECK_INFLOW = "true"
 # Dashboard changes to these trade settings (including adding/removing
 # BOT_WALLET_PRIVATE_KEY and flipping TRADE_MODE) take effect WITHOUT a
 # redeploy: the worker detects the binding change and re-initializes.
-TRADE_MODE = "off"
-TRADE_AMOUNT_SOL = "0.1"
+TRADE_MODE = "manual"
+TRADE_AMOUNT_SOL = "0.01"
 TRADE_SLIPPAGE_PCT = "25"
 TRADE_PRIORITY_FEE_SOL = "0.001"
 TRADE_MAX_DAILY_BUYS = "5"
