@@ -6,9 +6,11 @@
  *     node scripts/test-filters.js
  *
  * Phases:
- *   1. Config sanity: DEFAULT_SETTINGS + /help text contain all 8 filters.
- *   2. Per-coin diagnosis: replicate scanner.ts logic on LIVE market data,
- *      print every condition's verdict for each candidate coin.
+ *   1. Config sanity: DEFAULT_SETTINGS + /help text contain the 8 filters
+ *      (min/max market cap, min/max age, 5m volume, 5m change, bundler,
+ *      top-10). The first-minute-volume and sniper filters were removed.
+ *   2. Per-coin diagnosis: replicate scanner.ts logic on LIVE market data
+ *      (feed + re-evaluation pool), print every condition's verdict.
  *   3. End-to-end: run the REAL Scanner.runOnce with a mock bot, capture the
  *      exact messages it would push, then undo the seen_tokens side effects.
  */
@@ -24,6 +26,11 @@ const URL = process.env.TURSO_DATABASE_URL;
 const TOKEN = process.env.TURSO_AUTH_TOKEN;
 const BKEY = process.env.BIRDEYE_API_KEY;
 
+// Mirrors scanner.ts constants so the diagnosis runs the same bounds.
+const RE_EVAL_WINDOW_MS = 42 * 3600e3;
+const RE_EVAL_AGE_MARGIN_MIN = 180;
+const RE_EVAL_POOL_SIZE = 80;
+
 const USD = (n) => {
   if (n === null || n === undefined) return "—";
   if (n >= 1000000) return "$" + (n / 1000000).toFixed(1) + "M";
@@ -31,37 +38,41 @@ const USD = (n) => {
   return "$" + Number(n).toFixed(2);
 };
 
-function verdict(mark, detail) {
-  return (mark ? "✅" : "❌") + (detail !== undefined ? " " + detail : "");
-}
-
 async function phase1() {
   console.log("\n===== PHASE 1: 配置完整性 =====\n");
   const checks = [
-    ["DEFAULT_SETTINGS.minMarketCapUsd", DEFAULT_SETTINGS.minMarketCapUsd, 10000],
-    ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 6.3],
-    ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 1800],
-    ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 18],
-    ["DEFAULT_SETTINGS.max1mVolUsd", DEFAULT_SETTINGS.max1mVolUsd, 10000],
-    ["DEFAULT_SETTINGS.maxBundlerPct", DEFAULT_SETTINGS.maxBundlerPct, 24],
-    ["DEFAULT_SETTINGS.maxTop10HolderPct", DEFAULT_SETTINGS.maxTop10HolderPct, 27],
-    ["DEFAULT_SETTINGS.maxSniperPct", DEFAULT_SETTINGS.maxSniperPct, 5],
+    ["DEFAULT_SETTINGS.minMarketCapUsd", DEFAULT_SETTINGS.minMarketCapUsd, 40000],
+    ["DEFAULT_SETTINGS.maxMarketCapUsd", DEFAULT_SETTINGS.maxMarketCapUsd, 300000],
+    ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 360],
+    ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 2400],
+    ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 6000],
+    ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 30],
+    ["DEFAULT_SETTINGS.maxBundlerPct", DEFAULT_SETTINGS.maxBundlerPct, 15],
+    ["DEFAULT_SETTINGS.maxTop10HolderPct", DEFAULT_SETTINGS.maxTop10HolderPct, 23],
   ];
   let allOk = true;
-  for (const [name, actual] of checks) {
-    const ok = actual !== undefined && actual !== null;
+  for (const [name, actual, expected] of checks) {
+    const ok = actual === expected;
     if (!ok) allOk = false;
-    console.log(`  ${ok ? "✅" : "❌"} ${name} = ${actual}`);
+    console.log(`  ${ok ? "✅" : "❌"} ${name} = ${actual}${ok ? "" : `（期望 ${expected}）`}`);
   }
 
   // /help & /filter usage text (compiled bot module) mentions all 8 conditions.
   const fs = require("fs");
   const botSrc = fs.readFileSync(require.resolve("../dist/bot.js"), "utf8");
-  const textChecks = ["Sniper", "Top10", "Bundler", "首分钟量", "5m 涨幅", "5m 量", "最短上线", "最低市值"];
+  const textChecks = ["最低市值", "最高市值", "最短上线", "最长上线", "5m 量", "5m 涨幅", "Bundler", "Top10"];
   for (const t of textChecks) {
     const ok = botSrc.includes(t);
     if (!ok) allOk = false;
     console.log(`  ${ok ? "✅" : "❌"} /help 文案包含 "${t}"`);
+  }
+  // Removed filters must no longer gate: the bot must not mention them as
+  // /filter arguments anymore.
+  const removedChecks = ["首分钟量", "Sniper"];
+  for (const t of removedChecks) {
+    const ok = !botSrc.includes(t);
+    if (!ok) allOk = false;
+    console.log(`  ${ok ? "✅" : "❌"} /help 文案不再包含 "${t}"（已移除该 filter）`);
   }
 
   // Real chat settings from the database.
@@ -72,7 +83,7 @@ async function phase1() {
     console.log(`\n  📋 已开启推送的 chat 数量: ${chats.length}`);
     for (const c of chats) {
       console.log(
-        `  chat=${c.chatId} | 市值≥${USD(c.minMarketCapUsd)} | 上线≥${c.minAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 5m涨幅≥${c.min5mChgPct}% | 开盘量<${USD(c.max1mVolUsd)} | Bundler<${c.maxBundlerPct}% | Top10<${c.maxTop10HolderPct}% | Sniper<${c.maxSniperPct}%`,
+        `  chat=${c.chatId} | 市值 ${USD(c.minMarketCapUsd)}–${USD(c.maxMarketCapUsd)} | 上线 ${c.minAgeMinutes}–${c.maxAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 5m涨幅≥${c.min5mChgPct}% | Bundler<${c.maxBundlerPct}% | Top10<${c.maxTop10HolderPct}%`,
       );
     }
     return db;
@@ -93,12 +104,28 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
   const s = chat ?? DEFAULT_SETTINGS;
 
   const profiles = await dex.fetchLatestSolanaProfiles();
-  const pairs = await dex.fetchPairsForTokens([...new Set(profiles.map((p) => p.tokenAddress))]);
+  // Mirror the scanner: also pull the age-aware re-evaluation pool, since the
+  // qualifying age window (6–40h) is beyond what the profiles feed covers.
   const now = Date.now();
+  let poolTokens = [];
+  if (db) {
+    const recent = await db.getReevalPool({
+      sinceMs: now - RE_EVAL_WINDOW_MS,
+      minLaunchMs: now - (s.maxAgeMinutes + RE_EVAL_AGE_MARGIN_MIN) * 60000,
+      maxLaunchMs: now - (s.minAgeMinutes - RE_EVAL_AGE_MARGIN_MIN) * 60000,
+      windowEntryLaunchMs: now - s.minAgeMinutes * 60000,
+      limit: RE_EVAL_POOL_SIZE,
+    });
+    poolTokens = recent
+      .filter((st) => !profiles.some((p) => p.tokenAddress === st.token))
+      .map((st) => ({ tokenAddress: st.token }));
+  }
+  const allProfiles = [...profiles, ...poolTokens];
+  const pairs = await dex.fetchPairsForTokens([...new Set(allProfiles.map((p) => p.tokenAddress))]);
 
   const rows = [];
   let passed = 0;
-  for (const profile of profiles) {
+  for (const profile of allProfiles) {
     const pair = pairs.get(profile.tokenAddress);
     if (!pair) continue;
     const ageMin = (now - pair.pairCreatedAt) / 60000;
@@ -112,12 +139,18 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
     // F2 24h volume
     const f2 = pair.volume.h24 >= s.minVolume24hUsd;
     if (!f2) c.reasons.push(`24h量 ${USD(pair.volume.h24)}`);
-    // F3 market cap
-    const f3 = pair.marketCap >= s.minMarketCapUsd;
-    if (!f3) c.reasons.push(`市值 ${USD(pair.marketCap)} < ${USD(s.minMarketCapUsd)}`);
-    // F4 age
+    // F3 market cap range
+    const f3 = pair.marketCap >= s.minMarketCapUsd && pair.marketCap <= s.maxMarketCapUsd;
+    if (!f3) {
+      c.reasons.push(
+        pair.marketCap < s.minMarketCapUsd
+          ? `市值 ${USD(pair.marketCap)} < ${USD(s.minMarketCapUsd)}`
+          : `市值 ${USD(pair.marketCap)} > ${USD(s.maxMarketCapUsd)}`,
+      );
+    }
+    // F4 age window
     const f4 = ageMin >= s.minAgeMinutes && ageMin <= s.maxAgeMinutes;
-    if (!f4) c.reasons.push(`上线 ${ageMin.toFixed(1)}m`);
+    if (!f4) c.reasons.push(`上线 ${ageMin.toFixed(1)}m（窗口 ${s.minAgeMinutes}–${s.maxAgeMinutes}m）`);
     // F5 5m volume
     const f5 = pair.volume.m5 >= s.min5mVolUsd;
     if (!f5) c.reasons.push(`5m量 ${USD(pair.volume.m5)}`);
@@ -130,25 +163,9 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
       continue;
     }
     // Candidate — expensive lookups (mirrors production, caches via db).
-    // Opening volume (F7)
-    let opening = null;
     let stats = db ? await db.getTokenStats(profile.tokenAddress) : null;
-    if (stats && stats.birdeye1mVol !== null) {
-      opening = { value: stats.birdeye1mVol, src: "cache(birdeye)" };
-    } else if (birdeye) {
-      try {
-        const v = await birdeye.getFirstMinuteVolume(profile.tokenAddress, Math.floor(pair.pairCreatedAt / 1000));
-        if (v !== null && db) await db.updateTokenBirdeyeVol(profile.tokenAddress, v);
-        opening = v !== null ? { value: v, src: "birdeye" } : null;
-      } catch (e) { /* ignore */ }
-    }
-    if (!opening && stats && stats.firstSeenAgeMin <= 5) {
-      opening = { value: stats.firstM5Vol, src: "proxy" };
-    }
-    const f7 = opening === null || opening.value < s.max1mVolUsd;
-    if (!f7) c.reasons.push(`首分钟量 ${USD(opening.value)} ≥ ${USD(s.max1mVolUsd)}`);
 
-    // RugCheck (F8 bundler, F9/F10 top10)
+    // RugCheck (F7 bundler, F8 top10)
     let rug = null;
     if (stats && stats.rugcheckTop10Pct !== null) {
       rug = { bundler: stats.rugcheckBundlerPct, top10: stats.rugcheckTop10Pct, src: "cache" };
@@ -159,17 +176,18 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
         rug = { bundler: r.bundlerPct, top10: r.top10HolderPct, src: "live" };
       } catch (e) { /* ignore */ }
     }
-    const f8 = rug === null || rug.bundler === null || rug.bundler < s.maxBundlerPct;
-    if (!f8) c.reasons.push(`Bundler ${rug.bundler.toFixed(1)}% ≥ ${s.maxBundlerPct}%`);
+    const f7 = rug === null || rug.bundler === null || rug.bundler < s.maxBundlerPct;
+    if (!f7) c.reasons.push(`Bundler ${rug.bundler.toFixed(1)}% ≥ ${s.maxBundlerPct}%`);
     let holdTop10 = false;
     if (rug === null || rug.top10 === null) {
       holdTop10 = true; // 数据未就绪 → 顺延
     } else {
-      const f9 = rug.top10 < s.maxTop10HolderPct;
-      if (!f9) c.reasons.push(`Top10 ${rug.top10.toFixed(1)}% ≥ ${s.maxTop10HolderPct}%`);
+      const f8 = rug.top10 < s.maxTop10HolderPct;
+      if (!f8) c.reasons.push(`Top10 ${rug.top10.toFixed(1)}% ≥ ${s.maxTop10HolderPct}%`);
     }
 
-    // Birdeye trader data (F11/F12 sniper) + pro traders display
+    // Birdeye trader data: display only — the sniper filter was removed, so
+    // coins push even when the data is not ready yet.
     let trader = null;
     if (stats && stats.birdeyeProTraders !== null && stats.birdeyeSniperPct !== null) {
       trader = { pro: stats.birdeyeProTraders, sniper: stats.birdeyeSniperPct, src: "cache" };
@@ -182,13 +200,6 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
         }
         trader = { pro: t.proTraders, sniper: t.sniperPct, src: "live" };
       } catch (e) { /* ignore */ }
-    }
-    let holdSniper = false;
-    if (trader === null || trader.sniper === null) {
-      holdSniper = true; // 数据未就绪 → 顺延
-    } else {
-      const f10 = trader.sniper < s.maxSniperPct;
-      if (!f10) c.reasons.push(`Sniper ${trader.sniper.toFixed(1)}% ≥ ${s.maxSniperPct}%`);
     }
 
     // Min market cap (display only)
@@ -207,22 +218,19 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
       } catch (e) { /* ignore */ }
     }
 
-    const finalOk = f7 && f8 && !holdTop10 && !holdSniper && c.reasons.length === 0;
+    const finalOk = f7 && !holdTop10 && c.reasons.length === 0;
     if (finalOk) passed++;
     rows.push({
       symbol,
       age: ageMin,
       mc: pair.marketCap,
       cheap: true,
-      f7: f7,
-      opening: opening ? USD(opening.value) : "未知(放行)",
       bundler: rug ? (rug.bundler === null ? "无" : rug.bundler.toFixed(1) + "%") : "—",
       top10: rug ? (rug.top10 === null ? "空" : rug.top10.toFixed(1) + "%") : "—",
       sniper: trader ? (trader.sniper === null ? "空" : trader.sniper.toFixed(1) + "%") : "—",
       pro: trader ? (trader.pro === null ? "—" : trader.pro) : "—",
       minMcap: minMcap === null ? "—" : USD(minMcap),
       holdTop10,
-      holdSniper,
       finalOk,
       detail: c.reasons.join("; "),
     });
@@ -231,9 +239,8 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
   // Print table
   console.log(
     "  币种".padEnd(14) +
-      "上线".padEnd(7) +
+      "上线".padEnd(12) +
       "市值".padEnd(8) +
-      "开盘量".padEnd(11) +
       "Bundler".padEnd(9) +
       "Top10".padEnd(8) +
       "Sniper".padEnd(8) +
@@ -243,21 +250,19 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
   );
   for (const r of rows) {
     if (!r.cheap) {
-      console.log(`  ${r.symbol.padEnd(14)}${r.age.toFixed(1) + "m".padEnd(5)}${USD(r.mc).padEnd(8)}—${"".padEnd(50)}❌ 前置条件未过 (${r.detail})`);
+      console.log(`  ${r.symbol.padEnd(14)}${(r.age.toFixed(1) + "m").padEnd(10)}${USD(r.mc).padEnd(8)}—${"".padEnd(38)}❌ 前置条件未过 (${r.detail})`);
       continue;
     }
     const result = r.holdTop10
       ? "⏳ Top10待就绪"
-      : r.holdSniper
-        ? "⏳ Sniper待就绪"
-        : r.finalOk
-          ? "✅ 全部通过 → 推送"
-          : "❌ " + (r.detail || "被过滤");
+      : r.finalOk
+        ? "✅ 全部通过 → 推送"
+        : "❌ " + (r.detail || "被过滤");
     console.log(
-      `  ${r.symbol.padEnd(14)}${(r.age.toFixed(1) + "m").padEnd(6)}${USD(r.mc).padEnd(8)}${(r.opening || "—").padEnd(11)}${(r.bundler || "—").padEnd(9)}${(r.top10 || "—").padEnd(8)}${(r.sniper || "—").padEnd(8)}${String(r.pro || "—").padEnd(5)}${(r.minMcap || "—").padEnd(10)}${result}`,
+      `  ${r.symbol.padEnd(14)}${(r.age.toFixed(1) + "m").padEnd(10)}${USD(r.mc).padEnd(8)}${(r.bundler || "—").padEnd(9)}${(r.top10 || "—").padEnd(8)}${(r.sniper || "—").padEnd(8)}${String(r.pro || "—").padEnd(5)}${(r.minMcap || "—").padEnd(10)}${result}`,
     );
   }
-  console.log(`\n  📊 汇总: 扫描 ${profiles.length} 个 profile → 候选 ${rows.filter((r) => r.cheap).length} 枚 → 全部通过 ${passed} 枚`);
+  console.log(`\n  📊 汇总: 扫描 ${allProfiles.length} 个 profile（feed ${profiles.length} + 池 ${poolTokens.length}）→ 候选 ${rows.filter((r) => r.cheap).length} 枚 → 全部通过 ${passed} 枚`);
   return { passed, total: rows.filter((r) => r.cheap).length };
 }
 

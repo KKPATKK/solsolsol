@@ -31,10 +31,21 @@ const DATA_NEGATIVE_CACHE_MS = 5 * 60_000;
  * go silent. Released well before that wall-clock limit.
  */
 const SCAN_TIMEOUT_MS = 25_000;
-/** Re-evaluate tokens first seen within this window until their data arrives. */
-const RE_EVAL_WINDOW_MS = 60 * 60_000;
+/**
+ * How long a first-seen token stays eligible for re-evaluation. Must cover
+ * the qualifying age window (max 40h) plus margin: coins age into the
+ * window while sitting in the pool, since the DexScreener profiles feed
+ * only ever contains young tokens.
+ */
+const RE_EVAL_WINDOW_MS = 42 * 60 * 60_000;
 /** Re-evaluation pool cap (keeps the pairs re-fetch + JSON parse small). */
-const RE_EVAL_POOL_SIZE = 20;
+const RE_EVAL_POOL_SIZE = 80;
+/**
+ * Margin (minutes) around the qualifying age window: the pool also holds
+ * coins that will enter the window within 3h, so they are pushed the moment
+ * they qualify instead of being picked up only after a later scan.
+ */
+const RE_EVAL_AGE_MARGIN_MIN = 180;
 
 /** One qualifying coin, prepared for a specific chat. */
 interface QualifyingCoin {
@@ -42,14 +53,10 @@ interface QualifyingCoin {
   profile: TokenProfile;
   pair: PairInfo;
   stats: TokenStats;
-  /** The chat's opening-volume threshold, used at push time. */
-  max1mVolUsd: number;
   /** The chat's bundler threshold, used at push time. */
   maxBundlerPct: number;
   /** The chat's top-10 holder threshold, used at push time. */
   maxTop10HolderPct: number;
-  /** The chat's sniper-holder threshold, used at push time. */
-  maxSniperPct: number;
 }
 
 /** Resolved opening (first-minute) volume for a coin. */
@@ -164,14 +171,23 @@ export class Scanner {
 
       const profiles = await this.dex.fetchLatestSolanaProfiles();
       diag.profiles = profiles.length;
-      // Re-evaluation pool: tokens seen recently that were never pushed, so a
-      // coin held while RugCheck/Birdeye data arrives — or seen too young to
-      // qualify on first sight — keeps being retried instead of rotating out
-      // of the "latest profiles" feed and being lost forever.
-      const recentStats = await this.db.getRecentTokenStats(
-        Date.now() - RE_EVAL_WINDOW_MS,
-        RE_EVAL_POOL_SIZE,
-      );
+      const now = Date.now();
+      // Re-evaluation pool: tokens never pushed that are nearing or inside
+      // the qualifying age window. The profiles feed only ever contains young
+      // tokens, so without this pool a coin would rotate out of the feed
+      // before reaching the minimum age (6h) and be lost forever. Bounds use
+      // the widest age window across enabled chats plus a margin, so coins
+      // are picked up shortly before they qualify and pushed the moment they
+      // do.
+      const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
+      const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
+      const recentStats = await this.db.getReevalPool({
+        sinceMs: now - RE_EVAL_WINDOW_MS,
+        minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+        maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+        windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
+        limit: RE_EVAL_POOL_SIZE,
+      });
       if (profiles.length === 0 && recentStats.length === 0) {
         console.log("[scanner] no Solana profiles or re-eval candidates returned");
         return;
@@ -186,9 +202,7 @@ export class Scanner {
       const addresses = [...new Set(poolProfiles.map((p) => p.tokenAddress))];
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
 
-      // Capture each token's opening volume the first time we ever see it
-      // (while it is still young, its m5 volume ≈ its opening volume).
-      const now = Date.now();
+      // Capture each token's opening stats the first time we ever see it.
       const statsByToken = new Map<string, TokenStats>();
       for (const profile of profiles) {
         const pair = pairsByToken.get(profile.tokenAddress);
@@ -233,13 +247,9 @@ export class Scanner {
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
           continue;
         }
+        // Opening volume is resolved for the message card but no longer
+        // filters — the first-minute-volume filter was removed.
         const opening = await this.resolveOpeningVolume(coin);
-        // Strict opening-volume filter: exclude only when we know the value
-        // and it is too hot. Unknown values (or known-low values) pass.
-        if (opening.value !== null && opening.value >= coin.max1mVolUsd) {
-          diag.holds.opening++;
-          continue;
-        }
         const rugcheck = await this.resolveRugcheckData(coin);
         // Bundler filter: skip coins whose bundled/insider supply share is
         // known and too high. Unknown (null) means no bundlers detected — pass.
@@ -262,21 +272,10 @@ export class Scanner {
           diag.holds.top10++;
           continue;
         }
+        // Trader data is resolved for the message card but no longer
+        // filters — the sniper filter was removed, so coins push even when
+        // the data is not ready yet.
         const trader = await this.resolveTraderData(coin);
-        // Sniper filter: skip coins whose sniper buy share of supply is known
-        // and too high. When Birdeye has no trader data yet, hold the coin
-        // and re-check on the next scan (same policy as the top-10 metric).
-        if (trader.sniperPct === null) {
-          diag.holds.sniper++;
-          console.log(
-            `[scanner] holding ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (sniper data not ready)`,
-          );
-          continue;
-        }
-        if (trader.sniperPct >= coin.maxSniperPct) {
-          diag.holds.sniperHigh++;
-          continue;
-        }
         // Re-check right before sending: a concurrent scan (rare, only when
         // a scan outlives the 1-min cron) could have pushed it meanwhile.
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
@@ -494,15 +493,14 @@ export class Scanner {
       chatId: string;
       minLiquidityUsd: number;
       minVolume24hUsd: number;
-      maxAgeMinutes: number;
       minMarketCapUsd: number;
+      maxMarketCapUsd: number;
       minAgeMinutes: number;
+      maxAgeMinutes: number;
       min5mVolUsd: number;
       min5mChgPct: number;
-      max1mVolUsd: number;
       maxBundlerPct: number;
       maxTop10HolderPct: number;
-      maxSniperPct: number;
     }[],
     fails: ScanSummary["fails"],
   ): QualifyingCoin[] {
@@ -527,7 +525,11 @@ export class Scanner {
         }
         if (pair.marketCap < chat.minMarketCapUsd) {
           fails.mcap++;
-          continue;
+          continue; // too small
+        }
+        if (pair.marketCap > chat.maxMarketCapUsd) {
+          fails.mcap++;
+          continue; // too big — mid-cap range only
         }
         if (ageMs < chat.minAgeMinutes * 60_000) {
           fails.age++;
@@ -550,10 +552,8 @@ export class Scanner {
           profile,
           pair,
           stats,
-          max1mVolUsd: chat.max1mVolUsd,
           maxBundlerPct: chat.maxBundlerPct,
           maxTop10HolderPct: chat.maxTop10HolderPct,
-          maxSniperPct: chat.maxSniperPct,
         });
       }
     }

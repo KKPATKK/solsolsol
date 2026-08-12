@@ -10,39 +10,40 @@ export interface ChatSettings {
   chatId: string;
   minLiquidityUsd: number;
   minVolume24hUsd: number;
-  maxAgeMinutes: number;
   /** Minimum market cap in USD. */
   minMarketCapUsd: number;
-  /** Minimum token age in minutes (skip instant-fade scams). */
+  /** Maximum market cap in USD (coins above are skipped — mid-cap range). */
+  maxMarketCapUsd: number;
+  /** Minimum token age in minutes. */
   minAgeMinutes: number;
+  /** Maximum token age in minutes (coins older than this are skipped). */
+  maxAgeMinutes: number;
   /** Minimum 5-minute volume in USD. */
   min5mVolUsd: number;
   /** Minimum 5-minute price change in percent (e.g. 18 = +18%). */
   min5mChgPct: number;
-  /** Maximum opening (first-observed) volume in USD; only coins that opened under this qualify. */
-  max1mVolUsd: number;
   /** Maximum bundler/insider supply share in percent; coins above are skipped. */
   maxBundlerPct: number;
   /** Maximum top-10 holder concentration in percent; coins above are skipped. */
   maxTop10HolderPct: number;
-  /** Maximum sniper buy share of supply in percent; coins above are skipped. */
-  maxSniperPct: number;
   enabled: boolean;
 }
 
-/** Defaults mirror the DexScreener pumpfun filter URL the user specified. */
+/**
+ * Current filter profile: mid-cap coins ($40K–$300K) aged 6–40 hours with a
+ * hot 5m tape. The first-minute-volume and sniper filters were removed.
+ */
 export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minLiquidityUsd: 0,
   minVolume24hUsd: 0,
-  maxAgeMinutes: 1440, // 24h
-  minMarketCapUsd: 10000, // user: market cap must exceed $10k
-  minAgeMinutes: 6.3, // URL: minAge=0.105 hours
-  min5mVolUsd: 1800, // URL: min5MVol=1800
-  min5mChgPct: 18, // URL: min5MChg=18
-  max1mVolUsd: 10000, // user: opening volume must be under $10k
-  maxBundlerPct: 24, // user: skip coins with bundlers over 24%
-  maxTop10HolderPct: 27, // user: skip coins with top-10 holders over 27%
-  maxSniperPct: 5, // user: skip coins whose sniper buy share of supply is over 5%
+  minMarketCapUsd: 40000,
+  maxMarketCapUsd: 300000,
+  minAgeMinutes: 360, // 6h
+  maxAgeMinutes: 2400, // 40h
+  min5mVolUsd: 6000,
+  min5mChgPct: 30,
+  maxBundlerPct: 15,
+  maxTop10HolderPct: 23,
   enabled: false,
 };
 
@@ -98,33 +99,62 @@ export class Db {
         chat_id TEXT PRIMARY KEY,
         min_liquidity_usd REAL NOT NULL DEFAULT 0,
         min_volume_24h_usd REAL NOT NULL DEFAULT 0,
-        max_age_minutes INTEGER NOT NULL DEFAULT 1440,
-        min_market_cap_usd REAL NOT NULL DEFAULT 7800,
-        min_age_minutes REAL NOT NULL DEFAULT 6.3,
-        min_5m_vol_usd REAL NOT NULL DEFAULT 1800,
-        min_5m_chg_pct REAL NOT NULL DEFAULT 18,
-        max_1m_vol_usd REAL NOT NULL DEFAULT 10000,
-        max_bundler_pct REAL NOT NULL DEFAULT 24,
-        max_top10_holder_pct REAL NOT NULL DEFAULT 27,
-        max_sniper_pct REAL NOT NULL DEFAULT 5,
+        min_market_cap_usd REAL NOT NULL DEFAULT 40000,
+        max_market_cap_usd REAL NOT NULL DEFAULT 300000,
+        min_age_minutes REAL NOT NULL DEFAULT 360,
+        max_age_minutes REAL NOT NULL DEFAULT 2400,
+        min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
+        min_5m_chg_pct REAL NOT NULL DEFAULT 30,
+        max_bundler_pct REAL NOT NULL DEFAULT 15,
+        max_top10_holder_pct REAL NOT NULL DEFAULT 23,
         enabled INTEGER NOT NULL DEFAULT 0
       );
     `);
     // Migrations for databases created before these columns existed.
-    await this.addColumnIfMissing("chat_settings", "min_market_cap_usd", "REAL NOT NULL DEFAULT 7800");
-    await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 6.3");
-    await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 1800");
-    await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 18");
-    await this.addColumnIfMissing("chat_settings", "max_1m_vol_usd", "REAL NOT NULL DEFAULT 10000");
-    await this.addColumnIfMissing("chat_settings", "max_bundler_pct", "REAL NOT NULL DEFAULT 24");
-    await this.addColumnIfMissing("chat_settings", "max_top10_holder_pct", "REAL NOT NULL DEFAULT 27");
-    await this.addColumnIfMissing("chat_settings", "max_sniper_pct", "REAL NOT NULL DEFAULT 5");
+    await this.addColumnIfMissing("chat_settings", "min_market_cap_usd", "REAL NOT NULL DEFAULT 40000");
+    await this.addColumnIfMissing("chat_settings", "max_market_cap_usd", "REAL NOT NULL DEFAULT 300000");
+    await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 360");
+    await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 2400");
+    await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
+    await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
+    await this.addColumnIfMissing("chat_settings", "max_bundler_pct", "REAL NOT NULL DEFAULT 15");
+    await this.addColumnIfMissing("chat_settings", "max_top10_holder_pct", "REAL NOT NULL DEFAULT 23");
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS worker_state (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
     `);
+    // One-time migration: existing chats keep their old filter values unless
+    // reset. The operator specified a new filter profile, so apply it to all
+    // chats once; future /filter customizations are preserved after this.
+    const d = DEFAULT_SETTINGS;
+    const settingsV2 = await this.getWorkerState("settings_v2_applied");
+    if (!settingsV2) {
+      await this.get().execute({
+        sql: `UPDATE chat_settings SET
+          min_market_cap_usd = ?,
+          max_market_cap_usd = ?,
+          min_age_minutes = ?,
+          max_age_minutes = ?,
+          min_5m_vol_usd = ?,
+          min_5m_chg_pct = ?,
+          max_bundler_pct = ?,
+          max_top10_holder_pct = ?`,
+        args: [
+          d.minMarketCapUsd,
+          d.maxMarketCapUsd,
+          d.minAgeMinutes,
+          d.maxAgeMinutes,
+          d.min5mVolUsd,
+          d.min5mChgPct,
+          d.maxBundlerPct,
+          d.maxTop10HolderPct,
+        ],
+      });
+      await this.setWorkerState("settings_v2_applied", "1");
+      console.log("[db] applied new filter defaults to existing chats (settings_v2)");
+    }
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS seen_tokens (
         chat_id TEXT NOT NULL,
@@ -205,15 +235,14 @@ export class Db {
       chatId: String(row.chat_id),
       minLiquidityUsd: Number(row.min_liquidity_usd ?? 0),
       minVolume24hUsd: Number(row.min_volume_24h_usd ?? 0),
-      maxAgeMinutes: Number(row.max_age_minutes ?? DEFAULT_SETTINGS.maxAgeMinutes),
       minMarketCapUsd: Number(row.min_market_cap_usd ?? DEFAULT_SETTINGS.minMarketCapUsd),
+      maxMarketCapUsd: Number(row.max_market_cap_usd ?? DEFAULT_SETTINGS.maxMarketCapUsd),
       minAgeMinutes: Number(row.min_age_minutes ?? DEFAULT_SETTINGS.minAgeMinutes),
+      maxAgeMinutes: Number(row.max_age_minutes ?? DEFAULT_SETTINGS.maxAgeMinutes),
       min5mVolUsd: Number(row.min_5m_vol_usd ?? DEFAULT_SETTINGS.min5mVolUsd),
       min5mChgPct: Number(row.min_5m_chg_pct ?? DEFAULT_SETTINGS.min5mChgPct),
-      max1mVolUsd: Number(row.max_1m_vol_usd ?? DEFAULT_SETTINGS.max1mVolUsd),
       maxBundlerPct: Number(row.max_bundler_pct ?? DEFAULT_SETTINGS.maxBundlerPct),
       maxTop10HolderPct: Number(row.max_top10_holder_pct ?? DEFAULT_SETTINGS.maxTop10HolderPct),
-      maxSniperPct: Number(row.max_sniper_pct ?? DEFAULT_SETTINGS.maxSniperPct),
       enabled: Number(row.enabled) === 1,
     };
   }
@@ -232,37 +261,35 @@ export class Db {
     await this.get().execute({
       sql: `
         INSERT INTO chat_settings
-          (chat_id, min_liquidity_usd, min_volume_24h_usd, max_age_minutes,
-           min_market_cap_usd, min_age_minutes, min_5m_vol_usd, min_5m_chg_pct,
-           max_1m_vol_usd, max_bundler_pct, max_top10_holder_pct, max_sniper_pct, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (chat_id, min_liquidity_usd, min_volume_24h_usd,
+           min_market_cap_usd, max_market_cap_usd, min_age_minutes, max_age_minutes,
+           min_5m_vol_usd, min_5m_chg_pct, max_bundler_pct, max_top10_holder_pct, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
           min_liquidity_usd = excluded.min_liquidity_usd,
           min_volume_24h_usd = excluded.min_volume_24h_usd,
-          max_age_minutes = excluded.max_age_minutes,
           min_market_cap_usd = excluded.min_market_cap_usd,
+          max_market_cap_usd = excluded.max_market_cap_usd,
           min_age_minutes = excluded.min_age_minutes,
+          max_age_minutes = excluded.max_age_minutes,
           min_5m_vol_usd = excluded.min_5m_vol_usd,
           min_5m_chg_pct = excluded.min_5m_chg_pct,
-          max_1m_vol_usd = excluded.max_1m_vol_usd,
           max_bundler_pct = excluded.max_bundler_pct,
           max_top10_holder_pct = excluded.max_top10_holder_pct,
-          max_sniper_pct = excluded.max_sniper_pct,
           enabled = excluded.enabled
       `,
       args: [
         settings.chatId,
         settings.minLiquidityUsd,
         settings.minVolume24hUsd,
-        settings.maxAgeMinutes,
         settings.minMarketCapUsd,
+        settings.maxMarketCapUsd,
         settings.minAgeMinutes,
+        settings.maxAgeMinutes,
         settings.min5mVolUsd,
         settings.min5mChgPct,
-        settings.max1mVolUsd,
         settings.maxBundlerPct,
         settings.maxTop10HolderPct,
-        settings.maxSniperPct,
         settings.enabled ? 1 : 0,
       ],
     });
@@ -391,21 +418,44 @@ export class Db {
   }
 
   /**
-   * Tokens first observed within the window that have never been pushed to
-   * any chat. This is the re-evaluation pool: coins held while their
-   * RugCheck / Birdeye data arrives (or seen too young to qualify on first
-   * sight) keep being retried until they qualify or age out, instead of
-   * rotating out of the "latest profiles" feed and being lost forever.
-   * Capped to the most recent `limit` to keep the pairs re-fetch cheap.
+   * Tokens that have never been pushed to any chat and are nearing or inside
+   * the qualifying age window. This is the re-evaluation pool: DexScreener's
+   * profiles feed only ever contains young tokens, so coins that must age
+   * into the window (e.g. 6h minimum) would otherwise rotate out of the feed
+   * and be lost forever. The pool instead keeps them until they qualify.
+   *
+   * `first_seen_age_min` records the token's age at first observation, so
+   * `first_seen_at - first_seen_age_min * 60_000` is an accurate estimate of
+   * the launch time (pairCreatedAt). The query returns only tokens whose
+   * launch falls within [now - (maxAge + margin), now - (minAge - margin)],
+   * ordered by distance to the window entry point — tokens that can qualify
+   * right now (or within minutes) are always evaluated first.
    */
-  async getRecentTokenStats(sinceMs: number, limit = 20): Promise<TokenStats[]> {
+  async getReevalPool(opts: {
+    /** first_seen_at >= this (drops tokens whose launch is too far in the past). */
+    sinceMs: number;
+    /** Estimated launch must be >= this (age <= maxAgeMinutes + margin). */
+    minLaunchMs: number;
+    /** Estimated launch must be <= this (age >= minAgeMinutes - margin). */
+    maxLaunchMs: number;
+    /** Estimated launch of a token that just entered the window (age == minAgeMinutes). */
+    windowEntryLaunchMs: number;
+    limit: number;
+  }): Promise<TokenStats[]> {
     const res = await this.get().execute({
       sql: `SELECT * FROM token_stats
             WHERE first_seen_at > ?
               AND token NOT IN (SELECT token FROM seen_tokens)
-            ORDER BY first_seen_at DESC
+              AND (first_seen_at - first_seen_age_min * 60000) BETWEEN ? AND ?
+            ORDER BY ABS((first_seen_at - first_seen_age_min * 60000) - ?)
             LIMIT ?`,
-      args: [sinceMs, limit],
+      args: [
+        opts.sinceMs,
+        opts.minLaunchMs,
+        opts.maxLaunchMs,
+        opts.windowEntryLaunchMs,
+        opts.limit,
+      ],
     });
     return res.rows.map((row) => this.statsFromRow(row));
   }
