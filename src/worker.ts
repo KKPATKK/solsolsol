@@ -1,10 +1,10 @@
 import { webhookCallback, type Bot } from "grammy";
 import { BirdeyeClient } from "./birdeye";
-import { createBot } from "./bot";
-import { loadConfig } from "./config";
+import { createBot, type FlowCheckResult } from "./bot";
+import { loadConfig, type AppConfig } from "./config";
 import { Db } from "./db";
 import { DexScreenerClient } from "./dexscreener";
-import { HeliusClient } from "./helius";
+import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 
@@ -45,6 +45,13 @@ let db: Db | null = null;
 let scanner: Scanner | null = null;
 let bot: Bot | null = null;
 let webhook: ((req: Request) => Promise<Response>) | null = null;
+let dex: DexScreenerClient | null = null;
+let helius: HeliusClient | null = null;
+let cfg: AppConfig | null = null;
+/** Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
+ * expensive (~150–300 Helius credits), so throttle manual triggers. */
+const FLOW_DEBUG_COOLDOWN_MS = 30_000;
+const flowDebugLastRunAt = new Map<string, number>();
 let lastScanAt: number | null = null;
 let lastScanOk = false;
 let scanCount = 0;
@@ -84,6 +91,7 @@ async function ensureInitialized(env: Env): Promise<void> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
     const config = loadConfig(env);
+    cfg = config;
     tursoConfigured = Boolean(config.tursoUrl);
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
@@ -102,11 +110,9 @@ async function ensureInitialized(env: Env): Promise<void> {
       console.warn("[worker] TURSO_DATABASE_URL missing — persistence disabled");
     }
 
-    if (config.telegramBotToken) {
-      bot = createBot(config.telegramBotToken, db, config.scanIntervalSeconds);
-      webhook = webhookCallback(bot, "cloudflare-mod");
-      botReady = true;
+    dex = new DexScreenerClient(config);
 
+    if (config.telegramBotToken) {
       let birdeye: BirdeyeClient | null = null;
       if (config.birdeyeApiKey) {
         try {
@@ -119,13 +125,22 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
 
-      const helius = new HeliusClient(config);
+      helius = new HeliusClient(config);
+
+      bot = createBot(
+        config.telegramBotToken,
+        db,
+        config.scanIntervalSeconds,
+        analyzeMintFlow,
+      );
+      webhook = webhookCallback(bot, "cloudflare-mod");
+      botReady = true;
 
       if (db) {
         scanner = new Scanner(
           db,
           bot,
-          new DexScreenerClient(config),
+          dex,
           config,
           birdeye,
           new RugcheckClient(config),
@@ -253,6 +268,102 @@ async function checkOutageAndAlert(): Promise<void> {
   await db.setWorkerState("outage_alert_at", String(Date.now()));
 }
 
+/**
+ * Manual on-chain supply-flow check for one mint — the engine behind both
+ * the Telegram /flow command and the /debug/flow endpoint. Uses the exact
+ * production code path (DexScreener pair lookup → Helius analyzeSupplyFlow
+ * with the configured SUPPLY_FLOW_* thresholds) and caches the result in
+ * Turso so a subsequent scanner pass on the same coin reuses it instead of
+ * re-spending credits.
+ */
+async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
+  const t0 = Date.now();
+  if (!helius || !cfg?.heliusApiKey) {
+    return { ok: false, error: "HELIUS_API_KEY 未配置" };
+  }
+  if (!dex) {
+    return { ok: false, error: "数据源未就绪" };
+  }
+  try {
+    const pairs = await dex.fetchPairsForTokens([mint]);
+    const pair = pairs.get(mint);
+    if (!pair) {
+      return { ok: false, error: "DexScreener 查无此币的交易对" };
+    }
+    const price = Number(pair.priceUsd);
+    const supply =
+      Number.isFinite(price) && price > 0 ? pair.marketCap / price : 0;
+    if (supply <= 0) {
+      return { ok: false, error: "无法由价格推算供应量" };
+    }
+    const sf = cfg.supplyFlow;
+    const result = await Promise.race([
+      helius.analyzeSupplyFlow(mint, pair.pairAddress, supply, {
+        windowMs: sf.windowMs,
+        minFeeders: sf.minFeeders,
+        minFedPct: sf.minFedPct,
+        minSells: sf.minSells,
+        topAccounts: sf.topAccounts,
+        now: Date.now(),
+      }),
+      // Hard cap: a slow/stuck gTFA must not hang the webhook request.
+      new Promise<SupplyFlowResult>((resolve) =>
+        setTimeout(
+          () =>
+            resolve({
+              ok: false,
+              flagged: false,
+              feeders: 0,
+              fedPct: 0,
+              sells: 0,
+              collector: null,
+              analyzedAt: Date.now(),
+              windowMs: sf.windowMs,
+            }),
+          25_000,
+        ),
+      ),
+    ]);
+    const ageMin = Math.round((Date.now() - pair.pairCreatedAt) / 60_000);
+    // Cache for the scanner (best-effort): INSERT OR IGNORE the stats row so
+    // the coin joins the re-eval pool, then store the fresh flow verdict.
+    if (result.ok && db) {
+      try {
+        await db.recordTokenStats({
+          token: mint,
+          firstSeenAt: Date.now(),
+          firstM5Vol: pair.volume.m5,
+          firstSeenAgeMin: Math.max(0, ageMin),
+          birdeye1mVol: null,
+          rugcheckBundlerPct: null,
+          rugcheckTop10Pct: null,
+          birdeyeProTraders: null,
+          birdeyeSniperPct: null,
+          minMcapObserved: null,
+          supplyFlowJson: null,
+          supplyFlowAt: null,
+        });
+        await db.updateTokenSupplyFlow(mint, JSON.stringify(result));
+      } catch {
+        // A failed cache write must not fail the check itself.
+      }
+    }
+    return {
+      ok: true,
+      symbol: pair.baseToken.symbol,
+      marketCapUsd: pair.marketCap,
+      ageMin,
+      ms: Date.now() - t0,
+      result,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     await ensureInitialized(env);
@@ -290,6 +401,31 @@ export default {
         summary: scanner?.lastSummary ?? null,
         now: new Date().toISOString(),
       });
+    }
+
+    // Manual on-chain supply-flow check (same engine as Telegram /flow) —
+    // diagnostic route for verifying the production Helius gTFA path on any
+    // real coin. Cooldown-bounded per mint to protect the credit budget.
+    if (url.pathname === "/debug/flow") {
+      const mint = (url.searchParams.get("mint") ?? "").trim();
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+        return Response.json({ ok: false, error: "invalid mint" }, { status: 400 });
+      }
+      const last = flowDebugLastRunAt.get(mint) ?? 0;
+      const wait = FLOW_DEBUG_COOLDOWN_MS - (Date.now() - last);
+      if (wait > 0) {
+        return Response.json(
+          {
+            ok: false,
+            error: "cooldown — re-analysis is credit-expensive",
+            retryAfterSec: Math.ceil(wait / 1000),
+          },
+          { status: 429 },
+        );
+      }
+      flowDebugLastRunAt.set(mint, Date.now());
+      const res = await analyzeMintFlow(mint);
+      return Response.json({ mint, ...res });
     }
 
     // Telegram webhook (grammY registers commands on this bot instance).

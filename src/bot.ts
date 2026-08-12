@@ -1,6 +1,7 @@
 import { Bot, type Context } from "grammy";
 import { DEFAULT_SETTINGS, type Db } from "./db";
 import { fmtUsd, parseNumber } from "./format";
+import type { SupplyFlowResult } from "./helius";
 
 function formatInterval(seconds: number): string {
   return seconds % 60 === 0 ? `每 ${seconds / 60} 分钟` : `每 ${seconds} 秒`;
@@ -14,6 +15,7 @@ function buildUsage(scanIntervalSeconds: number): string {
     "",
     "*命令*",
     "`/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>` — 设置筛选条件",
+    "`/flow <合约地址>` — 手动检查某币的链上供应流（多钱包喂给同一接收者再卖出）",
     "`/status` — 查看当前条件",
     "`/on` — 开启推送",
     "`/off` — 关闭推送",
@@ -87,14 +89,33 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
   };
 }
 
+/** Result of a manual on-chain supply-flow check (see /flow). */
+export interface FlowCheckResult {
+  ok: boolean;
+  /** Human-readable failure reason (ok:false). */
+  error?: string;
+  symbol?: string;
+  marketCapUsd?: number;
+  ageMin?: number;
+  /** Wall-clock ms of the check itself (excluding Telegram). */
+  ms?: number;
+  result?: SupplyFlowResult;
+}
+
+/** Base58 mint address (32–44 chars, no 0/O/I/l). */
+const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
 /**
  * createBot accepts a nullable database: without it the bot still runs
  * (welcome/help work), but settings-related commands degrade gracefully.
+ * `flowAnalyzer` (optional) enables /flow — a manual on-chain supply-flow
+ * check for any mint, run with the production Helius key.
  */
 export function createBot(
   token: string,
   db: Db | null,
   scanIntervalSeconds: number = 300,
+  flowAnalyzer?: (mint: string) => Promise<FlowCheckResult>,
 ): Bot {
   const bot = new Bot(token);
   const USAGE = buildUsage(scanIntervalSeconds);
@@ -208,6 +229,47 @@ export function createBot(
         : `✅ 推送已开启（默认条件: 市值 $40K–$300K，上线 360–2400 分钟，5m 量 ≥ ${fmtUsd(
             DEFAULT_SETTINGS.min5mVolUsd,
           )}，5m 涨幅 ≥ ${DEFAULT_SETTINGS.min5mChgPct}%）。用 /filter 自定义条件。`,
+    );
+  });
+
+  bot.command("flow", async (ctx) => {
+    if (!flowAnalyzer) {
+      await ctx.reply("🕸 供应流分析未启用（Worker 需要配置 HELIUS_API_KEY）。");
+      return;
+    }
+    const mint = ctx.match.trim();
+    if (!MINT_RE.test(mint)) {
+      await ctx.reply(
+        "用法: `/flow <合约地址>` — 手动检查某币的链上供应流（多钱包喂给同一接收者再卖出）\n" +
+          "例如: `/flow Cqs2xNRMCSMDpGzRZ5x225kjM9dhcnTFExiu5Hf6pump`",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+    const startedAt = Date.now();
+    const res = await flowAnalyzer(mint);
+    const elapsedMs = Date.now() - startedAt;
+    if (!res.ok || !res.result) {
+      await ctx.reply(
+        `🕸 供应流分析失败（${elapsedMs}ms）: ${res.error ?? "未知错误"}`,
+      );
+      return;
+    }
+    const r = res.result;
+    const verdict = r.flagged
+      ? `⚠️ 检测到集中出货: ${r.feeders} 个持仓钱包喂给同一接收者，累积 ${r.fedPct.toFixed(
+          2,
+        )}% 供应，该接收者卖出 ${r.sells} 次`
+      : r.ok
+        ? "✅ 未检测到集中出货（分析完成）"
+        : "⏳ 分析未完成（数据不足），请稍后重试";
+    await ctx.reply(
+      [
+        `🕸 供应流分析: ${res.symbol ?? mint.slice(0, 12)}`,
+        `💰 市值: ${fmtUsd(res.marketCapUsd ?? 0)} | ⏱ 上线: ${res.ageMin ?? "?"} 分钟`,
+        verdict,
+        `⚙️ 分析窗口: ${Math.round(r.windowMs / 3600e3)}h | 耗时: ${res.ms ?? elapsedMs}ms`,
+      ].join("\n"),
     );
   });
 
