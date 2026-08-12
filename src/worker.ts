@@ -102,6 +102,7 @@ export function tradeFingerprint(env: Env): string {
     env.JUPITER_API_BASE ?? "",
     env.JUPITER_API_KEY ? "jkey:1" : "jkey:0",
     env.TRADE_RPC_URL ?? "",
+    env.BOT_ADMIN_IDS ?? "",
   ].join("|");
 }
 
@@ -189,6 +190,7 @@ async function ensureInitialized(env: Env): Promise<void> {
         config.scanIntervalSeconds,
         analyzeMintFlow,
         trade ?? undefined,
+        config.adminIds,
       );
       webhook = webhookCallback(bot, "cloudflare-mod");
       botReady = true;
@@ -480,6 +482,15 @@ export default {
       } catch {
         heartbeat = null;
       }
+      // Effective trade mode: Telegram /setmode override wins over env.
+      let effectiveTradeMode: string = cfg?.trade.mode ?? "off";
+      let tradeModeOverride: string | null = null;
+      try {
+        effectiveTradeMode = (await trade?.effectiveMode()) ?? effectiveTradeMode;
+        tradeModeOverride = (await db?.getTradeModeOverride()) ?? null;
+      } catch {
+        // telemetry only — never fail /health over the mode read
+      }
       return Response.json({
         ok: true,
         scanCount,
@@ -492,7 +503,8 @@ export default {
         birdeyeConfigured,
         tradeConfigured,
         jupiterKeyed,
-        tradeMode: cfg?.trade.mode ?? "off",
+        tradeMode: effectiveTradeMode,
+        tradeModeOverride,
         initError,
         lastScanMs,
         lastScanError,

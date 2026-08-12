@@ -25,6 +25,26 @@ import type { Db } from "./db";
  * burns priority fees on a wallet that cannot afford it.
  */
 
+/** Trade modes: off = disabled, manual = button on push cards, auto = buy on push. */
+export type TradeMode = "off" | "manual" | "auto";
+
+/**
+ * Resolve the EFFECTIVE trade mode (pure — unit-tested): a Telegram
+ * /setmode override stored in the DB wins over the env-config mode; an
+ * invalid override value is ignored. Every money-moving path resolves
+ * through here so a live /setmode flip applies immediately, and flipping
+ * back to the env value (override cleared) restores the env config.
+ */
+export function resolveTradeMode(
+  cfgMode: TradeMode,
+  override: string | null,
+): TradeMode {
+  if (override === "off" || override === "manual" || override === "auto") {
+    return override;
+  }
+  return cfgMode;
+}
+
 /** Normalized buy result. */
 export interface TradeOrderResult {
   ok: boolean;
@@ -361,6 +381,30 @@ export class TradeService {
     private readonly db: Db,
   ) {}
 
+  /**
+   * Effective trade mode: the Telegram /setmode override (worker_state) when
+   * set, otherwise the env-config mode. Reads the DB each call so a live
+   * /setmode flip applies immediately; a DB read failure falls back to the
+   * env config (fail-safe: never trades on a mode we could not verify).
+   */
+  async effectiveMode(): Promise<TradeMode> {
+    let override: string | null = null;
+    try {
+      override = await this.db.getTradeModeOverride();
+    } catch (err) {
+      console.error(
+        "[trade] override read failed — using env mode:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    return resolveTradeMode(this.cfg.mode, override);
+  }
+
+  /** Persist (or clear, when null) the Telegram trade-mode override. */
+  async setModeOverride(mode: TradeMode | null): Promise<void> {
+    await this.db.setTradeModeOverride(mode);
+  }
+
   get mode(): TradeConfigSettings["mode"] {
     return this.cfg.mode;
   }
@@ -378,11 +422,15 @@ export class TradeService {
 
   /** Whether a buy is allowed for this token right now. */
   async shouldBuy(token: string): Promise<TradeDecision> {
-    const [alreadyTraded, todayCount] = await Promise.all([
+    const [alreadyTraded, todayCount, mode] = await Promise.all([
       this.db.hasTraded(token),
       this.db.countTradesSince(Date.now() - 24 * 3600_000),
+      this.effectiveMode(),
     ]);
-    return tradeDecision(this.cfg, { alreadyTraded, todayCount });
+    return tradeDecision(
+      { mode, maxDailyBuys: this.cfg.maxDailyBuys },
+      { alreadyTraded, todayCount },
+    );
   }
 
   /**
@@ -430,7 +478,7 @@ export class TradeService {
     const v = await this.client.verify();
     return {
       ok: v.ok,
-      mode: this.cfg.mode,
+      mode: await this.effectiveMode(),
       wallet: v.wallet,
       balanceSol: v.balanceSol,
       quoteOk: v.quoteOk,
@@ -443,6 +491,7 @@ export class TradeService {
   /** Read-only status for /trade and /health. */
   async status(): Promise<{
     mode: string;
+    overrideActive: boolean;
     wallet?: string;
     amountSol: number;
     buyBalancePct: number;
@@ -451,7 +500,10 @@ export class TradeService {
     maxDailyBuys: number;
     todayCount: number;
   }> {
-    const todayCount = await this.db.countTradesSince(Date.now() - 24 * 3600_000);
+    const [todayCount, mode] = await Promise.all([
+      this.db.countTradesSince(Date.now() - 24 * 3600_000),
+      this.effectiveMode(),
+    ]);
     let wallet: string | undefined;
     try {
       wallet = this.client.walletPublicKey;
@@ -459,7 +511,8 @@ export class TradeService {
       // wallet secret missing → wallet stays undefined
     }
     return {
-      mode: this.cfg.mode,
+      mode,
+      overrideActive: mode !== this.cfg.mode,
       wallet,
       amountSol: this.cfg.amountSol,
       buyBalancePct: this.cfg.buyBalancePct,

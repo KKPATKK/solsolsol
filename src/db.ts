@@ -486,6 +486,32 @@ export class Db {
     return row ? Number(row.n ?? 0) : 0;
   }
 
+  /**
+   * Telegram-set trade-mode override (worker_state key trade_mode_override).
+   * Takes precedence over the env TRADE_MODE var in every money-moving path;
+   * null means "no override — use the env config". Invalid stored values
+   * (e.g. a stale hand edit) are ignored and treated as no override.
+   */
+  async getTradeModeOverride(): Promise<"off" | "manual" | "auto" | null> {
+    const v = await this.getWorkerState("trade_mode_override");
+    if (v === "off" || v === "manual" || v === "auto") return v;
+    return null;
+  }
+
+  /** Persist (or clear, when null) the Telegram trade-mode override. */
+  async setTradeModeOverride(
+    mode: "off" | "manual" | "auto" | null,
+  ): Promise<void> {
+    if (mode === null) {
+      await this.get().execute({
+        sql: "DELETE FROM worker_state WHERE key = ?",
+        args: ["trade_mode_override"],
+      });
+      return;
+    }
+    await this.setWorkerState("trade_mode_override", mode);
+  }
+
   /** Most recent trade attempts (newest first) for diagnostics. */
   async latestTrades(
     limit: number,

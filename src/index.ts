@@ -98,6 +98,7 @@ async function main(): Promise<void> {
       config.scanIntervalSeconds,
       undefined,
       trade ?? undefined,
+      config.adminIds,
     );
 
     // Scanner needs both the bot and the database to run.

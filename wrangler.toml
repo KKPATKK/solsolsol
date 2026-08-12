@@ -64,6 +64,11 @@ TRADE_SLIPPAGE_PCT = "25"
 TRADE_PRIORITY_FEE_SOL = "0.001"
 TRADE_MAX_DAILY_BUYS = "5"
 TRADE_TIMEOUT_MS = "15000"
+# Telegram user IDs (comma-separated) allowed to run /setmode and tap the
+# 🛒 buy button. Leave empty (or unset) to lock both (fail-closed). Find
+# your ID with @userinfobot. NOTE: /setmode stores a durable override in the
+# DB that wins over TRADE_MODE until it is changed again.
+BOT_ADMIN_IDS = ""
 # Jupiter Swap API v1 (Metis) — the old v6 quote-api.jup.ag endpoints are
 # retired. Keyless works at 0.5 RPS; set JUPITER_API_KEY (a SECRET, via the
 # dashboard or `wrangler secret put`) as the x-api-key header to unlock

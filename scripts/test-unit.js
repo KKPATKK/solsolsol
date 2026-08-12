@@ -11,8 +11,9 @@ const os = require("os");
 const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
+const { parseAdminIds, isAdmin } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
-const { tradeDecision, parseQuote, parseSendResponse, buyAmountLamports } = require("../dist/jupiter.js");
+const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports } = require("../dist/jupiter.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -397,6 +398,65 @@ async function main() {
     assert.equal(parseSendResponse({}).ok, false);
   });
 
+  // ---------- config.ts (admin allowlist) ----------
+
+  await test("parseAdminIds parses comma-separated IDs, drops junk", () => {
+    assert.deepEqual(parseAdminIds(undefined), []);
+    assert.deepEqual(parseAdminIds(""), []);
+    assert.deepEqual(parseAdminIds("   "), []);
+    assert.deepEqual(parseAdminIds("12345"), [12345]);
+    assert.deepEqual(parseAdminIds(" 111 , 222 , 333 "), [111, 222, 333]);
+    // Non-numeric and non-positive entries are dropped.
+    assert.deepEqual(parseAdminIds("111,abc,-5,0,222"), [111, 222]);
+  });
+
+  await test("isAdmin gates users; empty allowlist is fail-closed", () => {
+    assert.equal(isAdmin(123, [123, 456]), true);
+    assert.equal(isAdmin(999, [123, 456]), false);
+    assert.equal(isAdmin(undefined, [123]), false); // no from.id → denied
+    assert.equal(isAdmin(123, []), false); // no admins configured → locked
+  });
+
+  // ---------- jupiter.ts (trade-mode override) ----------
+
+  await test("resolveTradeMode: override wins, invalid/null fall back to env mode", () => {
+    assert.equal(resolveTradeMode("off", "manual"), "manual");
+    assert.equal(resolveTradeMode("manual", "auto"), "auto");
+    assert.equal(resolveTradeMode("auto", "off"), "off");
+    // Invalid stored values are ignored → env mode.
+    assert.equal(resolveTradeMode("manual", "hack"), "manual");
+    assert.equal(resolveTradeMode("auto", null), "auto");
+    assert.equal(resolveTradeMode("off", ""), "off");
+  });
+
+  await test("db trade-mode override round-trips, validates and clears", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      assert.equal(await db.getTradeModeOverride(), null); // none set
+      await db.setTradeModeOverride("manual");
+      assert.equal(await db.getTradeModeOverride(), "manual");
+      await db.setTradeModeOverride("auto");
+      assert.equal(await db.getTradeModeOverride(), "auto");
+      // A stale/hand-edited invalid value is treated as no override.
+      await t.client.execute({
+        sql: "UPDATE worker_state SET value = 'bogus' WHERE key = 'trade_mode_override'",
+        args: [],
+      });
+      assert.equal(await db.getTradeModeOverride(), null);
+      // Clearing removes the row entirely.
+      await db.setTradeModeOverride(null);
+      assert.equal(await db.getTradeModeOverride(), null);
+      assert.equal(
+        (await t.client.execute("SELECT COUNT(*) AS n FROM worker_state WHERE key = 'trade_mode_override'")).rows[0].n,
+        0,
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   // ---------- worker.ts ----------
 
   await test("tradeFingerprint detects binding changes without leaking values", () => {
@@ -409,6 +469,7 @@ async function main() {
       TRADE_MAX_DAILY_BUYS: "5",
       TRADE_TIMEOUT_MS: "15000",
       JUPITER_API_BASE: "https://quote-api.jup.ag",
+      BOT_ADMIN_IDS: "",
     };
     const fp1 = tradeFingerprint(base);
     // Adding the wallet secret flips the fingerprint…
@@ -418,6 +479,8 @@ async function main() {
     );
     // …and so does flipping TRADE_MODE (must take effect without redeploy).
     assert.notEqual(tradeFingerprint({ ...base, TRADE_MODE: "auto" }), fp1);
+    // Adding admin IDs also re-initializes the bot (new /setmode allowlist).
+    assert.notEqual(tradeFingerprint({ ...base, BOT_ADMIN_IDS: "12345" }), fp1);
     // The secret VALUE never appears in the fingerprint.
     assert.equal(fp1.includes("secret"), false);
     // Stable for identical input.

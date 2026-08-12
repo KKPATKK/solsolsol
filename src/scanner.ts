@@ -337,9 +337,14 @@ export class Scanner {
               url: `${AXIOM_BASE_URL}${tokenAddress}`,
             } as InlineKeyboardButton,
           ];
-          if (this.trade && this.trade.mode === "manual") {
+          // Live mode read: /setmode flips apply to the very next card (and
+          // the buy button only renders in manual mode).
+          const tradeMode = this.trade
+            ? await this.trade.effectiveMode()
+            : "off";
+          if (tradeMode === "manual") {
             buttons.push({
-              text: `🛒 買入 ${this.trade.buySizeLabel}`,
+              text: `🛒 買入 ${this.trade!.buySizeLabel}`,
               callback_data: `buy:${tokenAddress}`,
             });
           }
@@ -358,10 +363,12 @@ export class Scanner {
           );
           await this.db.markTokenSeen(coin.chatId, coin.profile.tokenAddress);
           pushed++;
-          // Auto trading mode: buy immediately after the push. Dedupe is
-          // guaranteed twice over — the coin is already in seen_tokens, and
-          // trade_log has UNIQUE(token) — so a slow buy can never double-spend.
-          if (this.trade && this.trade.mode === "auto") {
+          // Auto trading mode: buy immediately after the push. The mode is
+          // read live (a /setmode flip applies right away); executeBuy also
+          // re-checks the mode gate internally. Dedupe is guaranteed twice
+          // over — the coin is already in seen_tokens, and trade_log has
+          // UNIQUE(token) — so a slow buy can never double-spend.
+          if (this.trade && (await this.trade.effectiveMode()) === "auto") {
             await this.autoBuy(coin);
           }
         } catch (err) {

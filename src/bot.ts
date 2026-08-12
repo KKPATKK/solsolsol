@@ -1,4 +1,5 @@
 import { Bot, type Context } from "grammy";
+import { isAdmin } from "./config";
 import { DEFAULT_SETTINGS, type Db } from "./db";
 import { fmtUsd, parseNumber } from "./format";
 import type { SupplyFlowResult } from "./helius";
@@ -18,6 +19,7 @@ function buildUsage(scanIntervalSeconds: number): string {
     "`/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>` — 设置筛选条件",
     "`/flow <合约地址>` — 手动检查某币的链上供应流（多钱包喂给同一接收者再卖出）",
     "`/trade` — 查看 Jupiter 自动买入设置",
+    "`/setmode <manual|auto|off>` — 切换交易模式（仅管理员）",
     "`/status` — 查看当前条件",
     "`/on` — 开启推送",
     "`/off` — 关闭推送",
@@ -125,6 +127,7 @@ export function createBot(
   scanIntervalSeconds: number = 300,
   flowAnalyzer?: (mint: string) => Promise<FlowCheckResult>,
   trade?: TradeService,
+  adminIds: number[] = [],
 ): Bot {
   const bot = new Bot(token);
   const USAGE = buildUsage(scanIntervalSeconds);
@@ -300,22 +303,75 @@ export function createBot(
     const s = await trade.status();
     const modeLine =
       s.mode === "off"
-        ? "⛔ 关闭（TRADE_MODE=off — 不会下单）"
+        ? "⛔ 关闭（不会下单）"
         : s.mode === "manual"
           ? "🔘 手动（推送卡片带购买按钮，点击后下单）"
           : "🤖 自动（符合条件的币推送后立即下单）";
+    const sourceLine = s.overrideActive
+      ? "📌 当前模式由 Telegram `/setmode` 指令设定（覆盖 Cloudflare 的 TRADE_MODE）"
+      : "📌 当前模式由 Cloudflare 的 TRADE_MODE 变量设定（可用 `/setmode` 指令覆盖）";
     await ctx.reply(
       [
         "⚙️ Jupiter 自动买入设置:",
         `模式: ${modeLine}`,
+        sourceLine,
         `钱包: ${s.wallet ? `\`${s.wallet.slice(0, 8)}…${s.wallet.slice(-6)}\`` : "（未配置）"}`,
         `每笔金额: ${s.buySizeLabel}`,
         `滑点: ${s.slippagePct}%`,
         `每日上限: ${s.todayCount}/${s.maxDailyBuys} 笔（24h 滚动）`,
         "",
-        "设置方式: TRADE_MODE=manual 或 auto（Cloudflare 变量）",
+        "切换: `/setmode manual|auto|off`（仅管理员）",
       ].join("\n"),
+      { parse_mode: "Markdown" },
     );
+  });
+
+  // Live trade-mode switch (admin only): stores a durable override in the DB
+  // that takes precedence over the env TRADE_MODE var in every money-moving
+  // path (decision gate, buy button, auto trigger) — no redeploy needed.
+  bot.command("setmode", async (ctx) => {
+    if (!trade) {
+      await ctx.reply(
+        "⚙️ 交易未启用（Worker 未配置 BOT_WALLET_PRIVATE_KEY），无法切换模式。",
+      );
+      return;
+    }
+    if (adminIds.length === 0) {
+      await ctx.reply(
+        "⛔ 尚未配置管理员（BOT_ADMIN_IDS）。请在 wrangler.toml 设置你的 Telegram user ID（在 @userinfobot 查询），部署后再用 /setmode。",
+      );
+      return;
+    }
+    if (!isAdmin(ctx.from?.id, adminIds)) {
+      await ctx.reply("⛔ 你不是本 bot 的管理员，无法切换交易模式。");
+      return;
+    }
+    const arg = ctx.match.trim().toLowerCase();
+    if (arg !== "manual" && arg !== "auto" && arg !== "off") {
+      await ctx.reply(
+        "用法: `/setmode manual|auto|off`\n" +
+          "- `manual` — 推送卡片带 🛒 买按钮，点击后下单\n" +
+          "- `auto` — 符合条件的币推送后立即自动下单\n" +
+          "- `off` — 关闭交易（一分钱都不会动）",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+    const label =
+      arg === "off" ? "⛔ 关闭" : arg === "manual" ? "🔘 手动" : "🤖 自动";
+    try {
+      await trade.setModeOverride(arg);
+      await ctx.reply(
+        `✅ 交易模式已切换: ${label}\n` +
+          `📌 该设定立即生效，并覆盖 Cloudflare 的 TRADE_MODE（用 \`/setmode off\` 或改回 env 后可恢复）。\n` +
+          `用 /trade 查看当前状态。`,
+        { parse_mode: "Markdown" },
+      );
+    } catch (err) {
+      await ctx.reply(
+        `❌ 切换失败: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   });
 
   // Manual-mode buy button (callback data `buy:<mint>`). Executes exactly
@@ -332,8 +388,14 @@ export function createBot(
       await ctx.answerCallbackQuery({ text: "交易未启用（缺 BOT_WALLET_PRIVATE_KEY）" });
       return;
     }
-    if (trade.mode !== "manual") {
+    const mode = await trade.effectiveMode();
+    if (mode !== "manual") {
       await ctx.answerCallbackQuery({ text: "当前非手动模式，请用 /trade 查看" });
+      return;
+    }
+    // Real-money gate: when admins are configured, only they can tap buy.
+    if (adminIds.length > 0 && !isAdmin(ctx.from?.id, adminIds)) {
+      await ctx.answerCallbackQuery({ text: "你不是本 bot 的管理员，无法下单" });
       return;
     }
     await ctx.answerCallbackQuery({ text: `下单中 ${trade.buySizeLabel}…` });

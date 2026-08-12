@@ -24,6 +24,30 @@ export interface SupplyFlowConfig {
   budgetMs: number;
 }
 
+/**
+ * Parse BOT_ADMIN_IDS (comma-separated Telegram user IDs) into a number
+ * list, dropping empty/garbage entries (pure — unit-tested). Empty string
+ * or missing → [] (no admins: /setmode stays locked).
+ */
+export function parseAdminIds(raw: string | undefined): number[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+}
+
+/**
+ * Whether a Telegram user may run money-affecting commands (pure —
+ * unit-tested). When no admins are configured every call is denied
+ * (fail-closed: /setmode and the buy button stay locked).
+ */
+export function isAdmin(userId: number | undefined, adminIds: number[]): boolean {
+  return userId !== undefined && adminIds.includes(userId);
+}
+
 export interface TradeConfigSettings {
   /**
    * Base58 private key of the dedicated trading wallet (secret, from
@@ -88,6 +112,11 @@ export interface AppConfig {
   supplyFlow: SupplyFlowConfig;
   /** Jupiter direct trading settings (off by default — see TradeConfigSettings). */
   trade: TradeConfigSettings;
+  /**
+   * Telegram user IDs allowed to run /setmode (and tap the buy button when
+   * non-empty). Money-affecting commands are denied when this is empty.
+   */
+  adminIds: number[];
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -174,5 +203,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         ? `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`
         : undefined,
     },
+    adminIds: parseAdminIds(env.BOT_ADMIN_IDS),
   };
 }
