@@ -11,7 +11,7 @@ const os = require("os");
 const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
-const { detectSupplyFlow } = require("../dist/helius.js");
+const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
 
 let passed = 0;
 let failed = 0;
@@ -423,6 +423,26 @@ async function main() {
     } finally {
       await t.cleanup();
     }
+  });
+
+  await test("selectTopAccounts excludes pair + LP vault, keeps real holders, respects topN", () => {
+    const largest = [
+      { address: "VAULT" }, // pool-owned vault (PDA) — must be excluded
+      { address: "PAIR" }, // pair address itself — must be excluded
+      { address: "HOLDER1" },
+      { address: "HOLDER2" },
+      { address: "HOLDER3" },
+      { address: "HOLDER4" },
+    ];
+    // Pool with a vault: both pair and vault drop out.
+    const picked = selectTopAccounts(largest, "PAIR", [{ pubkey: "VAULT" }], 3);
+    assert.deepEqual(picked, ["HOLDER1", "HOLDER2", "HOLDER3"]);
+    // No vault info (lookup failed): falls back to pair-only exclusion.
+    const fallback = selectTopAccounts(largest, "PAIR", [], 2);
+    assert.deepEqual(fallback, ["VAULT", "HOLDER1"]);
+    // Vault entries without a pubkey are ignored safely.
+    const safe = selectTopAccounts(largest, "PAIR", [{ pubkey: undefined }, {}], 4);
+    assert.deepEqual(safe, ["VAULT", "HOLDER1", "HOLDER2", "HOLDER3"]);
   });
 
   // ---------- summary ----------

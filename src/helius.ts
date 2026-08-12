@@ -570,48 +570,7 @@ export class HeliusClient {
     ]);
     const data = res?.data;
     if (!Array.isArray(data)) return [];
-
-    const out: TransferEntry[] = [];
-    for (const tx of data) {
-      const atMs = typeof tx.blockTime === "number" ? tx.blockTime * 1000 : 0;
-      const ixs = [
-        ...(tx.transaction?.message?.instructions ?? []),
-        ...(tx.meta?.innerInstructions ?? []).flatMap(
-          (ii) => ii.instructions ?? [],
-        ),
-      ];
-      for (const ix of ixs) {
-        const parsed = ix.parsed;
-        if (
-          !parsed ||
-          (parsed.type !== "transfer" && parsed.type !== "transferChecked")
-        ) {
-          continue;
-        }
-        const info = parsed.info ?? {};
-        const from = String(info.source ?? "");
-        const to = String(info.destination ?? "");
-        // Only outbound movements of the queried account; the gTFA filter
-        // already guarantees mint involvement, so plain `transfer` (no mint
-        // field in the ix) is trusted.
-        if (!from || !to || from !== addr) continue;
-        const tokenAmount = info.tokenAmount as
-          | { uiAmount?: number; amount?: string; decimals?: number }
-          | undefined;
-        let uiAmount = Number(tokenAmount?.uiAmount);
-        if (!Number.isFinite(uiAmount) || uiAmount <= 0) {
-          const raw = Number(tokenAmount?.amount ?? info.amount ?? NaN);
-          const dec = Number(tokenAmount?.decimals ?? 6);
-          uiAmount =
-            Number.isFinite(raw) && Number.isFinite(dec) && dec >= 0
-              ? raw / 10 ** dec
-              : 0;
-        }
-        if (!Number.isFinite(uiAmount) || uiAmount <= 0) continue;
-        out.push({ from, to, uiAmount, atMs });
-      }
-    }
-    return out;
+    return extractOutboundTransfers(data, addr);
   }
 
   /**
@@ -653,10 +612,24 @@ export class HeliusClient {
     }
     const largest = await this.getTokenLargestAccounts(mint);
     if (!largest || largest.length === 0) return fail();
-    const topAccounts = largest
-      .filter((a) => a.address !== pairAddress)
-      .slice(0, opts.topAccounts)
-      .map((a) => a.address);
+    // Exclude LP vaults, not just the pair address: AMM pools hold the token
+    // in PDAs owned by the pair (e.g. a PumpSwap pool owns its vault), so the
+    // vault would otherwise top the holder list and its sell-side outbound
+    // transfers (every trade) would pollute the flow graph as a "feeder". A
+    // failed vault lookup falls back to the pair-only exclusion.
+    const ownedRes = await this.rpc<{
+      value?: Array<{ pubkey?: string }>;
+    }>("getTokenAccountsByOwner", [
+      pairAddress,
+      { mint },
+      { encoding: "jsonParsed" },
+    ]);
+    const topAccounts = selectTopAccounts(
+      largest,
+      pairAddress,
+      ownedRes?.value ?? [],
+      opts.topAccounts,
+    );
     if (topAccounts.length === 0) return fail();
     const sinceSec = Math.floor((now - opts.windowMs) / 1000);
     return detectSupplyFlow({
@@ -671,6 +644,77 @@ export class HeliusClient {
         this.getOutTransfersForMint(addr, mint, sinceSec),
     });
   }
+}
+
+/** Transaction-like shape shared by gTFA full mode and getTransaction (jsonParsed). */
+export interface ParsedTxLike {
+  blockTime?: number | null;
+  transaction?: {
+    message?: {
+      instructions?: Array<{
+        parsed?: { type?: string; info?: Record<string, unknown> };
+      }>;
+    };
+  };
+  meta?: {
+    innerInstructions?: Array<{
+      instructions?: Array<{
+        parsed?: { type?: string; info?: Record<string, unknown> };
+      }>;
+    }>;
+  };
+}
+
+/**
+ * Extract outbound SPL token transfers from parsed transactions. Pure and
+ * unit-tested — jsonParsed instruction shape is identical between gTFA full
+ * mode and getTransaction, so the same code serves both (and the offline
+ * diagnostic). Plain `transfer` (no mint field) is trusted to involve the
+ * queried mint when it comes from gTFA's tokenTransfer filter; the
+ * diagnostics pass a mint to filter transferChecked.
+ */
+export function extractOutboundTransfers(
+  txs: ParsedTxLike[],
+  addr: string,
+): TransferEntry[] {
+  const out: TransferEntry[] = [];
+  for (const tx of txs) {
+    const atMs = typeof tx.blockTime === "number" ? tx.blockTime * 1000 : 0;
+    const ixs = [
+      ...(tx.transaction?.message?.instructions ?? []),
+      ...(tx.meta?.innerInstructions ?? []).flatMap(
+        (ii) => ii.instructions ?? [],
+      ),
+    ];
+    for (const ix of ixs) {
+      const parsed = ix.parsed;
+      if (
+        !parsed ||
+        (parsed.type !== "transfer" && parsed.type !== "transferChecked")
+      ) {
+        continue;
+      }
+      const info = parsed.info ?? {};
+      const from = String(info.source ?? "");
+      const to = String(info.destination ?? "");
+      if (!from || !to || from !== addr) continue;
+      const tokenAmount = info.tokenAmount as
+        | { uiAmount?: number; amount?: string; decimals?: number }
+        | undefined;
+      let uiAmount = Number(tokenAmount?.uiAmount);
+      if (!Number.isFinite(uiAmount) || uiAmount <= 0) {
+        const raw = Number(tokenAmount?.amount ?? info.amount ?? NaN);
+        const dec = Number(tokenAmount?.decimals ?? 6);
+        uiAmount =
+          Number.isFinite(raw) && Number.isFinite(dec) && dec >= 0
+            ? raw / 10 ** dec
+            : 0;
+      }
+      if (!Number.isFinite(uiAmount) || uiAmount <= 0) continue;
+      out.push({ from, to, uiAmount, atMs });
+    }
+  }
+  return out;
 }
 
 /** One on-chain token transfer (already reduced to UI units). */
@@ -698,6 +742,27 @@ export interface SupplyFlowResult {
   /** When this analysis ran (epoch ms). */
   analyzedAt: number;
   windowMs: number;
+}
+
+/**
+ * Pick the top holder token accounts for flow analysis, excluding the LP:
+ * the pair address itself plus any token accounts the pair owns for the
+ * mint (PumpSwap pools hold liquidity in pair-owned vault PDAs whose
+ * address differs from the pair). Pure and unit-tested — mirrors the
+ * RPC-side selection in analyzeSupplyFlow.
+ */
+export function selectTopAccounts(
+  largest: Array<{ address: string }>,
+  pairAddress: string,
+  pairOwnedVaults: Array<{ pubkey?: string }>,
+  topN: number,
+): string[] {
+  const exclude = new Set<string>([pairAddress]);
+  for (const v of pairOwnedVaults) if (v.pubkey) exclude.add(v.pubkey);
+  return largest
+    .filter((a) => !exclude.has(a.address))
+    .slice(0, topN)
+    .map((a) => a.address);
 }
 
 export interface SupplyFlowDeps {
