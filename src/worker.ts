@@ -77,6 +77,32 @@ let birdeyeConfigured = false;
 // Whether the BOT_WALLET_PRIVATE_KEY secret reached the Worker (presence only).
 let tradeConfigured = false;
 
+/**
+ * Fingerprint of the env-derived trade settings (presence only — never the
+ * secret VALUE). Cloudflare delivers fresh bindings to warm isolates on
+ * every invocation, but cfg is loaded once per isolate; comparing this
+ * fingerprint lets ensureInitialized detect dashboard changes (secret added,
+ * TRADE_MODE flipped, amount changed) and re-initialize so they take effect
+ * WITHOUT a redeploy. Safety property for a money-moving bot: flipping
+ * TRADE_MODE to off in the dashboard must stop trading immediately.
+ */
+export function tradeFingerprint(env: Env): string {
+  return [
+    env.BOT_WALLET_PRIVATE_KEY ? "key:1" : "key:0",
+    env.TRADE_MODE ?? "",
+    env.TRADE_AMOUNT_SOL ?? "",
+    env.TRADE_SLIPPAGE_PCT ?? "",
+    env.TRADE_PRIORITY_FEE_SOL ?? "",
+    env.TRADE_MAX_DAILY_BUYS ?? "",
+    env.TRADE_TIMEOUT_MS ?? "",
+    env.JUPITER_API_BASE ?? "",
+    env.TRADE_RPC_URL ?? "",
+  ].join("|");
+}
+
+/** Last trade-settings fingerprint applied at init (see tradeFingerprint). */
+let lastTradeFp = "";
+
 /** Alert when the previous scan finished more than this long ago (missed ticks). */
 const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
 /** Don't re-alert within this window for the same continuing outage. */
@@ -92,10 +118,20 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
 const SCAN_TICK_BUDGET_MS = 26_000;
 
 async function ensureInitialized(env: Env): Promise<void> {
+  const fp = tradeFingerprint(env);
+  if (initPromise && fp !== lastTradeFp) {
+    // Trade bindings changed since init (e.g. the wallet secret was added or
+    // TRADE_MODE was flipped in the dashboard) — re-initialize so the change
+    // takes effect without a redeploy. Turso/scan state survive: db is
+    // module-level and re-init only overwrites the clients, bot and trade.
+    console.log("[worker] trade bindings changed — re-initializing");
+    initPromise = null;
+  }
   if (initPromise) return initPromise;
   initPromise = (async () => {
     const config = loadConfig(env);
     cfg = config;
+    lastTradeFp = fp;
     tursoConfigured = Boolean(config.tursoUrl);
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);

@@ -51,6 +51,9 @@ SUPPLY_FLOW_CHECK_INFLOW = "true"
 # TRADE_AMOUNT_SOL is the SOL size per buy (input side of the swap). Start
 # tiny (e.g. 0.01) and verify with /debug/trade (read-only: wallet balance +
 # a tiny SOL→USDC quote, no spend) before going live.
+# Dashboard changes to these trade settings (including adding/removing
+# BOT_WALLET_PRIVATE_KEY and flipping TRADE_MODE) take effect WITHOUT a
+# redeploy: the worker detects the binding change and re-initializes.
 TRADE_MODE = "off"
 TRADE_AMOUNT_SOL = "0.1"
 TRADE_SLIPPAGE_PCT = "25"

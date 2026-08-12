@@ -13,6 +13,7 @@ const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
 const { tradeDecision, parseQuote, parseSendResponse } = require("../dist/jupiter.js");
+const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
 let failed = 0;
@@ -361,6 +362,33 @@ async function main() {
     assert.equal(err.error, "Transaction simulation failed");
     assert.equal(parseSendResponse(null).ok, false);
     assert.equal(parseSendResponse({}).ok, false);
+  });
+
+  // ---------- worker.ts ----------
+
+  await test("tradeFingerprint detects binding changes without leaking values", () => {
+    const base = {
+      BOT_WALLET_PRIVATE_KEY: undefined,
+      TRADE_MODE: "off",
+      TRADE_AMOUNT_SOL: "0.1",
+      TRADE_SLIPPAGE_PCT: "25",
+      TRADE_PRIORITY_FEE_SOL: "0.001",
+      TRADE_MAX_DAILY_BUYS: "5",
+      TRADE_TIMEOUT_MS: "15000",
+      JUPITER_API_BASE: "https://quote-api.jup.ag",
+    };
+    const fp1 = tradeFingerprint(base);
+    // Adding the wallet secret flips the fingerprint…
+    assert.notEqual(
+      tradeFingerprint({ ...base, BOT_WALLET_PRIVATE_KEY: "some-secret-value" }),
+      fp1,
+    );
+    // …and so does flipping TRADE_MODE (must take effect without redeploy).
+    assert.notEqual(tradeFingerprint({ ...base, TRADE_MODE: "auto" }), fp1);
+    // The secret VALUE never appears in the fingerprint.
+    assert.equal(fp1.includes("secret"), false);
+    // Stable for identical input.
+    assert.equal(tradeFingerprint(base), tradeFingerprint({ ...base }));
   });
 
   // ---------- bot.ts ----------
