@@ -195,6 +195,15 @@ export class Db {
     await this.client.execute(
       `CREATE INDEX IF NOT EXISTS idx_scan_history_at ON scan_history(at)`,
     );
+    // The re-eval pool query filters token_stats by first_seen_at and
+    // anti-joins seen_tokens every tick; these indexes keep it fast as both
+    // tables grow (token_stats is never pruned).
+    await this.client.execute(
+      `CREATE INDEX IF NOT EXISTS idx_token_stats_first_seen ON token_stats(first_seen_at)`,
+    );
+    await this.client.execute(
+      `CREATE INDEX IF NOT EXISTS idx_seen_tokens_token ON seen_tokens(token)`,
+    );
     await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");

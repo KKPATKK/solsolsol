@@ -40,6 +40,15 @@ class Throttle {
   }
 }
 
+/**
+ * Hard wall-clock budget for one fetchPairsForTokens call. A slow/limited
+ * batch endpoint must not eat the whole scan tick (observed: 87s of retries
+ * for 4 batches of 30 addresses, when the tick's heartbeat budget is 26s).
+ * Batches past the deadline are skipped; their tokens simply stay in the
+ * re-evaluation pool and are retried next tick.
+ */
+const PAIRS_FETCH_BUDGET_MS = 10_000;
+
 export class DexScreenerClient {
   private readonly throttle: Throttle;
 
@@ -47,31 +56,42 @@ export class DexScreenerClient {
     this.throttle = new Throttle(config.dexRequestIntervalMs);
   }
 
-  private async getJson(path: string): Promise<unknown> {
+  /**
+   * GET JSON with retries for transient errors (429/5xx). Deterministic
+   * client errors (4xx) return null immediately — retrying a 404 for a
+   * delisted token never helps, and the re-evaluation pool regularly
+   * contains delisted coins, so this saves ~8s per failing batch.
+   * `deadline` (optional, ms epoch) bounds the whole attempt loop: once the
+   * budget is exhausted, in-flight requests abort quickly and the call
+   * returns null instead of throwing.
+   */
+  private async getJson(path: string, deadline?: number): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
+      const remaining =
+        deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
+      if (remaining <= 0) return null; // budget exhausted — stop trying
       try {
         const res = await this.throttle.run(() =>
           fetch(`${BASE_URL}${path}`, {
             headers: { Accept: "application/json" },
-            signal: AbortSignal.timeout(15_000),
+            signal: AbortSignal.timeout(
+              Math.max(1_000, Math.min(15_000, remaining)),
+            ),
           }),
         );
         if (res.status === 429 || res.status >= 500) {
           throw new Error(`DexScreener HTTP ${res.status}`);
         }
         if (!res.ok) {
-          // Deterministic client errors (e.g. 404/400: a token without pairs
-          // or a bad batch) will never succeed on retry — treat as empty
-          // instead of burning 3 attempts × backoff per dead token. The
-          // re-evaluation pool regularly contains delisted coins, so this
-          // saves ~8s per failing batch.
-          return null;
+          return null; // deterministic client error — retrying won't help
         }
         return await res.json();
       } catch (err) {
         lastError = err;
-        if (attempt < 3) await sleep(attempt * 2000);
+        if (attempt < 3 && Date.now() < (deadline ?? Number.POSITIVE_INFINITY)) {
+          await sleep(attempt * 2000);
+        }
       }
     }
     throw lastError instanceof Error
@@ -108,13 +128,19 @@ export class DexScreenerClient {
    * Fetch live pair data for up to 30 addresses per request.
    * The /latest/dex/tokens endpoint returns a flat `pairs` array, so we
    * group pairs by baseToken.address and keep the first Solana pair per token.
+   * Bounded by PAIRS_FETCH_BUDGET_MS so a slow/limited endpoint cannot eat
+   * the whole scan tick: batches past the deadline are skipped and their
+   * tokens are simply re-tried on the next scan.
    */
   async fetchPairsForTokens(addresses: string[]): Promise<Map<string, PairInfo>> {
     const result = new Map<string, PairInfo>();
+    const deadline = Date.now() + PAIRS_FETCH_BUDGET_MS;
     for (let i = 0; i < addresses.length; i += 30) {
+      if (Date.now() > deadline) break; // keep the tick inside its budget
       const batch = addresses.slice(i, i + 30);
       const data = (await this.getJson(
         `/latest/dex/tokens/${batch.join(",")}`,
+        deadline,
       )) as { pairs?: Array<Record<string, unknown>> } | null;
       const pairs = data?.pairs;
       if (!Array.isArray(pairs)) continue;
