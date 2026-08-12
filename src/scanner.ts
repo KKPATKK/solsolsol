@@ -88,6 +88,21 @@ interface OpeningVolume {
   source: "helius" | "proxy" | "unknown";
 }
 
+/**
+ * Why a single coin was rejected for one chat (surfaced via /health so the
+ * operator can see exactly which filter blocked which coin). Only the coin's
+ * first failing gate is recorded, and the list is bounded to keep the
+ * heartbeat JSON small.
+ */
+export interface RejectionEntry {
+  symbol: string;
+  ageMin: number;
+  mcapUsd: number;
+  vol5Usd: number;
+  chgPct: number;
+  reason: string;
+}
+
 /** Rejection reasons from the last completed scan (surfaced via /health). */
 export interface ScanSummary {
   profiles: number;
@@ -109,7 +124,12 @@ export interface ScanSummary {
     age: number;
     other: number;
   };
+  /** Per-coin rejection trace for the last scan (bounded). */
+  rejects: RejectionEntry[];
 }
+
+/** Cap on per-coin rejection entries kept in the scan summary/heartbeat. */
+const REJECT_LOG_MAX = 50;
 
 export class Scanner {
   private running = false;
@@ -165,6 +185,7 @@ export class Scanner {
         top10: 0,
       },
       fails: { mcap: 0, chg: 0, vol5: 0, age: 0, other: 0 },
+      rejects: [],
     };
     // Watchdog: if the scan outlives its budget, release the lock so the next
     // tick can retry instead of the isolate wedging in a permanent skip loop.
@@ -263,6 +284,7 @@ export class Scanner {
         statsByToken,
         chats,
         diag.fails,
+        diag.rejects,
       );
       diag.candidates = candidates.length;
       let pushed = 0;
@@ -550,6 +572,7 @@ export class Scanner {
       maxTop10HolderPct: number;
     }[],
     fails: ScanSummary["fails"],
+    rejects: RejectionEntry[],
   ): QualifyingCoin[] {
     const out: QualifyingCoin[] = [];
     for (const profile of profiles) {
@@ -560,38 +583,59 @@ export class Scanner {
       const liquidityUsd = pair.liquidity.usd ?? 0;
       const volume24h = pair.volume.h24;
       const ageMs = Date.now() - pair.pairCreatedAt;
+      // Log the coin's first failing gate for this chat (bounded — the feed
+      // + pool can be 60+ coins, but 50 entries keep the heartbeat small).
+      const reject = (reason: string) => {
+        if (rejects.length >= REJECT_LOG_MAX) return;
+        rejects.push({
+          symbol: pair.baseToken.symbol || profile.symbol || "?",
+          ageMin: Math.round(ageMs / 60_000),
+          mcapUsd: Math.round(pair.marketCap),
+          vol5Usd: Math.round(pair.volume.m5),
+          chgPct: Math.round(pair.priceChange.m5 * 10) / 10,
+          reason,
+        });
+      };
 
       for (const chat of chats) {
         if (liquidityUsd < chat.minLiquidityUsd) {
           fails.other++;
+          reject(`流动性 ${fmtUsd(liquidityUsd)} < ${fmtUsd(chat.minLiquidityUsd)}`);
           continue;
         }
         if (volume24h < chat.minVolume24hUsd) {
           fails.other++;
+          reject(`24h量 ${fmtUsd(volume24h)} < ${fmtUsd(chat.minVolume24hUsd)}`);
           continue;
         }
         if (pair.marketCap < chat.minMarketCapUsd) {
           fails.mcap++;
+          reject(`市值 ${fmtUsd(pair.marketCap)} < ${fmtUsd(chat.minMarketCapUsd)}`);
           continue; // too small
         }
         if (pair.marketCap > chat.maxMarketCapUsd) {
           fails.mcap++;
+          reject(`市值 ${fmtUsd(pair.marketCap)} > ${fmtUsd(chat.maxMarketCapUsd)}`);
           continue; // too big — mid-cap range only
         }
         if (ageMs < chat.minAgeMinutes * 60_000) {
           fails.age++;
+          reject(`上線 ${Math.round(ageMs / 60_000)}m < ${chat.minAgeMinutes}m`);
           continue; // too fresh
         }
         if (ageMs > chat.maxAgeMinutes * 60_000) {
           fails.age++;
+          reject(`上線 ${Math.round(ageMs / 60_000)}m > ${chat.maxAgeMinutes}m`);
           continue; // too old
         }
         if (pair.volume.m5 < chat.min5mVolUsd) {
           fails.vol5++;
+          reject(`5m量 ${fmtUsd(pair.volume.m5)} < ${fmtUsd(chat.min5mVolUsd)}`);
           continue;
         }
         if (pair.priceChange.m5 < chat.min5mChgPct) {
           fails.chg++;
+          reject(`5m涨幅 ${pair.priceChange.m5.toFixed(1)}% < ${chat.min5mChgPct}%`);
           continue;
         }
         out.push({
