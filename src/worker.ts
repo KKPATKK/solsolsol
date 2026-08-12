@@ -298,6 +298,16 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
     }
     const sf = cfg.supplyFlow;
     const ageMin = Math.round((Date.now() - pair.pairCreatedAt) / 60_000);
+    // Has the bot pushed this coin before? (seen_tokens, read live so a
+    // push that happened after a cached flow verdict still shows.)
+    let pushedInfo: { pushed: boolean; at?: number } = { pushed: false };
+    if (db) {
+      try {
+        pushedInfo = await db.getTokenPushedInfo(mint);
+      } catch {
+        // best-effort — missing marker is harmless
+      }
+    }
     // Fresh cached verdict (same window the scanner uses) → reuse instead of
     // re-spending ~150–300 Helius credits on a coin just checked.
     if (db) {
@@ -317,6 +327,8 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
             ageMin,
             ms: Date.now() - t0,
             cached: true,
+            pushed: pushedInfo.pushed,
+            pushedAt: pushedInfo.at,
             result: parsed,
           };
         }
@@ -380,6 +392,8 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
       marketCapUsd: pair.marketCap,
       ageMin,
       ms: Date.now() - t0,
+      pushed: pushedInfo.pushed,
+      pushedAt: pushedInfo.at,
       result,
     };
   } catch (err) {

@@ -163,6 +163,32 @@ async function main() {
     }
   });
 
+  await test("getTokenPushedInfo reports never-pushed and first-push time", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const unknown = await db.getTokenPushedInfo("NEVER");
+      assert.deepEqual(unknown, { pushed: false });
+      // Two pushes across chats: earliest first_seen_at wins.
+      const early = Date.now() - 60_000;
+      const late = Date.now();
+      await t.client.execute({
+        sql: "INSERT INTO seen_tokens (chat_id, token, first_seen_at) VALUES ('chat-b', 'TOK-PUSHED', ?)",
+        args: [late],
+      });
+      await t.client.execute({
+        sql: "INSERT INTO seen_tokens (chat_id, token, first_seen_at) VALUES ('chat-a', 'TOK-PUSHED', ?)",
+        args: [early],
+      });
+      const info = await db.getTokenPushedInfo("TOK-PUSHED");
+      assert.equal(info.pushed, true);
+      assert.equal(info.at, early);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("listEnabledChats returns only enabled chats", async () => {
     const t = tmpDb();
     try {

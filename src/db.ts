@@ -337,6 +337,26 @@ export class Db {
   }
 
   /**
+   * Whether a token was ever pushed to any chat, and when the first push
+   * happened (seen_tokens rows are written by markTokenSeen on every push).
+   * Used by /flow to mark coins the bot has already alerted on.
+   */
+  async getTokenPushedInfo(
+    token: string,
+  ): Promise<{ pushed: boolean; at?: number }> {
+    const res = await this.get().execute({
+      sql: "SELECT first_seen_at FROM seen_tokens WHERE token = ? ORDER BY first_seen_at LIMIT 1",
+      args: [token],
+    });
+    const row = res.rows[0];
+    if (!row) return { pushed: false };
+    const at = Number((row as Record<string, unknown>).first_seen_at);
+    return Number.isFinite(at) && at > 0
+      ? { pushed: true, at }
+      : { pushed: true };
+  }
+
+  /**
    * Cross-isolate telemetry: Cloudflare Workers isolates have independent
    * module state, so /health on one isolate cannot see counters living on
    * the isolate that ran the scheduled scanner. Persisting the scan

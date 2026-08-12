@@ -101,6 +101,10 @@ export interface FlowCheckResult {
   ms?: number;
   /** True when a fresh verdict was reused from the DB cache (no re-spend). */
   cached?: boolean;
+  /** True when the bot has already pushed this coin to some chat. */
+  pushed?: boolean;
+  /** First-push time (epoch ms) when pushed is true. */
+  pushedAt?: number;
   result?: SupplyFlowResult;
 }
 
@@ -265,11 +269,15 @@ export function createBot(
       : r.ok
         ? "✅ 未检测到集中出货（分析完成）"
         : "⏳ 分析未完成（数据不足），请稍后重试";
+    const pushedLine = res.pushed
+      ? `📤 推送记录: 已被本 bot 推过${res.pushedAt ? `（${new Date(res.pushedAt).toISOString().replace("T", " ").slice(0, 16)} UTC）` : ""}`
+      : "📤 推送记录: 未曾推送";
     await ctx.reply(
       [
         `🕸 供应流分析: ${res.symbol ?? mint.slice(0, 12)}`,
         `💰 市值: ${fmtUsd(res.marketCapUsd ?? 0)} | ⏱ 上线: ${res.ageMin ?? "?"} 分钟`,
         verdict,
+        pushedLine,
         `⚙️ 分析窗口: ${Math.round(r.windowMs / 3600e3)}h | 耗时: ${res.ms ?? elapsedMs}ms${res.cached ? "（缓存，30 分钟内未重新分析）" : ""}`,
       ].join("\n"),
     );
