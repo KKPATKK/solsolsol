@@ -39,20 +39,22 @@ SUPPLY_FLOW_TOP_ACCOUNTS = "10"
 # credits); set to false if the credit budget gets tight.
 SUPPLY_FLOW_CHECK_INFLOW = "true"
 # ---------------------------------------------------------------------------
-# Trojan auto-trading (REAL MONEY — off by default, nothing ever buys until
-# you opt in). The API key (TROJAN_API_KEY) is a SECRET: set it in the
-# Cloudflare dashboard, never here.
-#   TROJAN_MODE:
+# Jupiter direct trading (REAL MONEY — off by default, nothing ever buys
+# until you opt in). The trading wallet's base58 private key
+# (BOT_WALLET_PRIVATE_KEY) is a SECRET: set it in the Cloudflare dashboard,
+# never here. Use a NEW dedicated wallet funded with a small SOL amount —
+# never the main wallet.
+#   TRADE_MODE:
 #     off    = disabled (default)
 #     manual = push cards get a "🛒 買入" button; one tap = one buy
 #     auto   = buy immediately after a qualifying coin is pushed
-# TROJAN_AMOUNT_SOL is the SOL size per buy. Start tiny (e.g. 0.01) and
-# verify with /debug/trade (read-only wallet check) before going live.
-# Get the key: Telegram @TrojanOnSolBot -> /api (or the Trojan terminal).
-TROJAN_MODE = "off"
-TROJAN_API_BASE = "https://api.trojan.app"
-TROJAN_AMOUNT_SOL = "0.1"
-TROJAN_SLIPPAGE_PCT = "25"
-TROJAN_PRIORITY_FEE_SOL = "0.001"
-TROJAN_MAX_DAILY_BUYS = "5"
-TROJAN_TIMEOUT_MS = "15000"
+# TRADE_AMOUNT_SOL is the SOL size per buy (input side of the swap). Start
+# tiny (e.g. 0.01) and verify with /debug/trade (read-only: wallet balance +
+# a tiny SOL→USDC quote, no spend) before going live.
+TRADE_MODE = "off"
+TRADE_AMOUNT_SOL = "0.1"
+TRADE_SLIPPAGE_PCT = "25"
+TRADE_PRIORITY_FEE_SOL = "0.001"
+TRADE_MAX_DAILY_BUYS = "5"
+TRADE_TIMEOUT_MS = "15000"
+JUPITER_API_BASE = "https://quote-api.jup.ag"

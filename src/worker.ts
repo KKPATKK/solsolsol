@@ -7,7 +7,7 @@ import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
-import { TradeService, TrojanClient } from "./trojan";
+import { JupiterClient, TradeService } from "./jupiter";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -74,8 +74,8 @@ let scanRunning = false;
 let heliusConfigured = false;
 // Whether the BIRDEYE_API_KEY secret reached the Worker (presence only — never the value).
 let birdeyeConfigured = false;
-// Whether the TROJAN_API_KEY secret reached the Worker (presence only).
-let trojanConfigured = false;
+// Whether the BOT_WALLET_PRIVATE_KEY secret reached the Worker (presence only).
+let tradeConfigured = false;
 
 /** Alert when the previous scan finished more than this long ago (missed ticks). */
 const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
@@ -99,7 +99,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     tursoConfigured = Boolean(config.tursoUrl);
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
-    trojanConfigured = Boolean(config.trojan.apiKey);
+    tradeConfigured = Boolean(config.trade.walletSecret);
 
     if (config.tursoUrl) {
       try {
@@ -132,15 +132,12 @@ async function ensureInitialized(env: Env): Promise<void> {
 
       helius = new HeliusClient(config);
 
-      // Trojan trading (off by default; only constructed when a key exists).
-      if (config.trojan.apiKey && db) {
-        trade = new TradeService(
-          config.trojan,
-          new TrojanClient(config.trojan),
-          db,
-        );
+      // Jupiter direct trading (off by default; only constructed when the
+      // wallet secret exists).
+      if (config.trade.walletSecret && db) {
+        trade = new TradeService(config.trade, new JupiterClient(config.trade), db);
         console.log(
-          `[worker] Trojan trading ready (mode=${config.trojan.mode}, ${config.trojan.amountSol} SOL/buy)`,
+          `[worker] Jupiter trading ready (mode=${config.trade.mode}, ${config.trade.amountSol} SOL/buy)`,
         );
       }
 
@@ -451,8 +448,8 @@ export default {
         scannerReady,
         heliusConfigured,
         birdeyeConfigured,
-        trojanConfigured,
-        trojanMode: cfg?.trojan.mode ?? "off",
+        tradeConfigured,
+        tradeMode: cfg?.trade.mode ?? "off",
         initError,
         lastScanMs,
         lastScanError,
@@ -490,24 +487,26 @@ export default {
       return Response.json({ mint, ...res });
     }
 
-    // Read-only Trojan connection check (no money moves): verifies the API
-    // key + linked wallet so a key can be validated before enabling any
-    // real-money mode.
+    // Read-only Jupiter connection check (no money moves): derives the
+    // trading wallet, checks its SOL balance, and runs one tiny SOL→USDC
+    // quote to prove the full swap path works before any real-money mode.
     if (url.pathname === "/debug/trade") {
       if (!trade) {
         return Response.json({
           ok: false,
-          error: "TROJAN_API_KEY 未配置（或数据库未就绪）",
-          mode: cfg?.trojan.mode ?? "off",
+          error: "BOT_WALLET_PRIVATE_KEY 未配置（或数据库未就绪）",
+          mode: cfg?.trade.mode ?? "off",
         });
       }
       const v = await trade.verify();
       return Response.json({
         ok: v.ok,
         mode: v.mode,
-        amountSol: cfg!.trojan.amountSol,
-        slippagePct: cfg!.trojan.slippagePct,
         wallet: v.wallet,
+        balanceSol: v.balanceSol ?? null,
+        quoteOk: v.quoteOk ?? false,
+        amountSol: cfg!.trade.amountSol,
+        slippagePct: cfg!.trade.slippagePct,
         error: v.error,
       });
     }

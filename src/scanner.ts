@@ -7,7 +7,7 @@ import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreen
 import { fmtAge, fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
-import type { TradeService } from "./trojan";
+import type { TradeService } from "./jupiter";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
 /** Axiom trade token page (mint address appended). */
@@ -414,7 +414,7 @@ export class Scanner {
               resolve({
                 decision: { ok: false, reason: "超时（Trojan 无响应）" },
               }),
-            this.config.trojan.timeoutMs + 3_000,
+            this.config.trade.timeoutMs + 3_000,
           ),
         ),
       ]);

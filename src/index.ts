@@ -7,7 +7,7 @@ import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
-import { TradeService, TrojanClient } from "./trojan";
+import { JupiterClient, TradeService } from "./jupiter";
 
 const config = loadConfig();
 
@@ -83,16 +83,13 @@ async function main(): Promise<void> {
 
   // Telegram bot — needs TELEGRAM_BOT_TOKEN from @BotFather.
   if (config.telegramBotToken) {
-    // Trojan trading (off by default; only constructed when a key exists).
+    // Jupiter direct trading (off by default; only constructed when the
+    // wallet secret exists).
     let trade: TradeService | null = null;
-    if (config.trojan.apiKey && db) {
-      trade = new TradeService(
-        config.trojan,
-        new TrojanClient(config.trojan),
-        db,
-      );
+    if (config.trade.walletSecret && db) {
+      trade = new TradeService(config.trade, new JupiterClient(config.trade), db);
       console.log(
-        `[trojan] trading ready (mode=${config.trojan.mode}, ${config.trojan.amountSol} SOL/buy)`,
+        `[jupiter] trading ready (mode=${config.trade.mode}, ${config.trade.amountSol} SOL/buy)`,
       );
     }
     const bot = createBot(

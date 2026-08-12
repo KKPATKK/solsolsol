@@ -12,7 +12,7 @@ const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
-const { tradeDecision, parseBuyResponse } = require("../dist/trojan.js");
+const { tradeDecision, parseQuote, parseSendResponse } = require("../dist/jupiter.js");
 
 let passed = 0;
 let failed = 0;
@@ -339,27 +339,28 @@ async function main() {
     assert.equal(tradeDecision(cfg, { alreadyTraded: true, todayCount: 5 }).ok, false);
   });
 
-  await test("parseBuyResponse normalizes Trojan buy responses", () => {
-    // Common documented shape: { success, txHash }
-    const a = parseBuyResponse({ success: true, txHash: "SIG1" });
-    assert.deepEqual(a, { ok: true, txHash: "SIG1" });
-    // data.signature variant
-    const b = parseBuyResponse({ status: "success", data: { signature: "SIG2" } });
-    assert.deepEqual(b, { ok: true, txHash: "SIG2" });
-    // success with no hash is still ok
-    assert.deepEqual(parseBuyResponse({ success: true }), { ok: true });
-    // explicit failure surfaces the message
-    const c = parseBuyResponse({ error: "insufficient balance" });
-    assert.equal(c.ok, false);
-    assert.equal(c.error, "insufficient balance");
-    // wrapped failure (data.message)
-    const d = parseBuyResponse({ data: { message: "token not found" } });
-    assert.equal(d.ok, false);
-    assert.equal(d.error, "token not found");
-    // junk
-    assert.equal(parseBuyResponse(null).ok, false);
-    assert.equal(parseBuyResponse("nope").ok, false);
-    assert.equal(parseBuyResponse(42).ok, false);
+  await test("parseQuote accepts quoteResponse and surfaces route errors", () => {
+    const ok = parseQuote({ quoteResponse: { outAmount: "123" } });
+    assert.equal(ok.ok, true);
+    assert.equal(ok.quote.outAmount, "123");
+    // Direct-route shape (outAmount on the top level) is accepted too.
+    const direct = parseQuote({ outAmount: "456" });
+    assert.equal(direct.ok, true);
+    // No route / explicit error
+    assert.equal(parseQuote({ error: "No routes found" }).ok, false);
+    assert.equal(parseQuote({}).ok, false);
+    assert.equal(parseQuote(null).ok, false);
+    assert.equal(parseQuote("nope").ok, false);
+  });
+
+  await test("parseSendResponse normalizes RPC send results", () => {
+    const ok = parseSendResponse({ jsonrpc: "2.0", id: 1, result: "SIG1" });
+    assert.deepEqual(ok, { ok: true, txHash: "SIG1" });
+    const err = parseSendResponse({ jsonrpc: "2.0", id: 1, error: { code: -32002, message: "Transaction simulation failed" } });
+    assert.equal(err.ok, false);
+    assert.equal(err.error, "Transaction simulation failed");
+    assert.equal(parseSendResponse(null).ok, false);
+    assert.equal(parseSendResponse({}).ok, false);
   });
 
   // ---------- bot.ts ----------

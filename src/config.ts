@@ -24,14 +24,14 @@ export interface SupplyFlowConfig {
   budgetMs: number;
 }
 
-export interface TrojanConfigSettings {
+export interface TradeConfigSettings {
   /**
-   * Trojan private API key (from @TrojanOnSolBot /api or the Trojan
-   * terminal). Without it trading is disabled regardless of mode.
+   * Base58 private key of the dedicated trading wallet (secret, from
+   * BOT_WALLET_PRIVATE_KEY). Without it trading is disabled regardless of
+   * mode. Use a NEW wallet funded with a small amount of SOL — never the
+   * main wallet.
    */
-  apiKey?: string;
-  /** Base URL of the Trojan API (override if the endpoint has moved). */
-  baseUrl: string;
+  walletSecret?: string;
   /**
    * off = trading disabled (default). manual = the push card gets a
    * "🛒 買入" button that executes one buy when tapped. auto = buy
@@ -39,7 +39,7 @@ export interface TrojanConfigSettings {
    * the user explicitly sets this.
    */
   mode: "off" | "manual" | "auto";
-  /** SOL amount per buy. */
+  /** SOL amount per buy (input side of the swap). */
   amountSol: number;
   /** Slippage tolerance in percent (memecoins move fast — default 25). */
   slippagePct: number;
@@ -47,8 +47,12 @@ export interface TrojanConfigSettings {
   priorityFeeSol: number;
   /** Max buys per rolling 24h window (daily budget guard). */
   maxDailyBuys: number;
-  /** Hard timeout for each Trojan API call (ms). */
+  /** Hard timeout for each quote/swap/RPC call (ms). */
   timeoutMs: number;
+  /** Jupiter Swap API base (quotes + swap-tx building). */
+  jupiterApiBase: string;
+  /** RPC used to send the signed swap (defaults to Helius when keyed). */
+  rpcUrl?: string;
 }
 
 export interface AppConfig {
@@ -78,8 +82,8 @@ export interface AppConfig {
   heliusRequestIntervalMs: number;
   /** On-chain supply-flow (rug/distribution) detector tuning. */
   supplyFlow: SupplyFlowConfig;
-  /** Trojan auto-trading settings (off by default — see TrojanConfigSettings). */
-  trojan: TrojanConfigSettings;
+  /** Jupiter direct trading settings (off by default — see TradeConfigSettings). */
+  trade: TradeConfigSettings;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -89,12 +93,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawPort = Number(env.PORT ?? 3000);
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
-  const rawTrojanMode = (env.TROJAN_MODE ?? "off").toLowerCase();
-  const trojanAmount = Number(env.TROJAN_AMOUNT_SOL ?? 0.1);
-  const trojanSlippage = Number(env.TROJAN_SLIPPAGE_PCT ?? 25);
-  const trojanFee = Number(env.TROJAN_PRIORITY_FEE_SOL ?? 0.001);
-  const trojanMaxBuys = Number(env.TROJAN_MAX_DAILY_BUYS ?? 5);
-  const trojanTimeout = Number(env.TROJAN_TIMEOUT_MS ?? 15_000);
+  const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
+  const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
+  const tradeSlippage = Number(env.TRADE_SLIPPAGE_PCT ?? 25);
+  const tradeFee = Number(env.TRADE_PRIORITY_FEE_SOL ?? 0.001);
+  const tradeMaxBuys = Number(env.TRADE_MAX_DAILY_BUYS ?? 5);
+  const tradeTimeout = Number(env.TRADE_TIMEOUT_MS ?? 15_000);
 
   return {
     telegramBotToken: env.TELEGRAM_BOT_TOKEN || undefined,
@@ -133,31 +137,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       checkInflow: (env.SUPPLY_FLOW_CHECK_INFLOW ?? "true") !== "false",
       budgetMs: Number(env.SUPPLY_FLOW_BUDGET_MS ?? 15_000),
     },
-    trojan: {
-      apiKey: env.TROJAN_API_KEY || undefined,
-      baseUrl: env.TROJAN_API_BASE || "https://api.trojan.app",
+    trade: {
+      walletSecret: env.BOT_WALLET_PRIVATE_KEY || undefined,
       mode:
-        rawTrojanMode === "auto"
+        rawTradeMode === "auto"
           ? "auto"
-          : rawTrojanMode === "manual"
+          : rawTradeMode === "manual"
             ? "manual"
             : "off",
       amountSol:
-        Number.isFinite(trojanAmount) && trojanAmount > 0 ? trojanAmount : 0.1,
+        Number.isFinite(tradeAmount) && tradeAmount > 0 ? tradeAmount : 0.1,
       slippagePct:
-        Number.isFinite(trojanSlippage) && trojanSlippage >= 0
-          ? trojanSlippage
+        Number.isFinite(tradeSlippage) && tradeSlippage >= 0
+          ? tradeSlippage
           : 25,
       priorityFeeSol:
-        Number.isFinite(trojanFee) && trojanFee >= 0 ? trojanFee : 0.001,
+        Number.isFinite(tradeFee) && tradeFee >= 0 ? tradeFee : 0.001,
       maxDailyBuys:
-        Number.isFinite(trojanMaxBuys) && trojanMaxBuys >= 0
-          ? Math.floor(trojanMaxBuys)
+        Number.isFinite(tradeMaxBuys) && tradeMaxBuys >= 0
+          ? Math.floor(tradeMaxBuys)
           : 5,
       timeoutMs:
-        Number.isFinite(trojanTimeout) && trojanTimeout > 0
-          ? trojanTimeout
-          : 15_000,
+        Number.isFinite(tradeTimeout) && tradeTimeout > 0 ? tradeTimeout : 15_000,
+      jupiterApiBase: env.JUPITER_API_BASE || "https://quote-api.jup.ag",
+      rpcUrl: env.HELIUS_API_KEY
+        ? `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`
+        : undefined,
     },
   };
 }
