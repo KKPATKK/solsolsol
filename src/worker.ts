@@ -56,6 +56,7 @@ let dbReady = false;
 let botReady = false;
 let scannerReady = false;
 let initError: string | null = null;
+let tursoConfigured = false;
 let lastScanMs: number | null = null;
 let lastScanError: string | null = null;
 let scheduledTicks = 0;
@@ -83,6 +84,7 @@ async function ensureInitialized(env: Env): Promise<void> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
     const config = loadConfig(env);
+    tursoConfigured = Boolean(config.tursoUrl);
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
 
@@ -133,7 +135,15 @@ async function ensureInitialized(env: Env): Promise<void> {
       }
     }
   })();
-  return initPromise;
+  await initPromise;
+  // A failed Turso init (transient 522 / timeout) must not stick forever:
+  // reset so the next tick re-attempts init and the isolate self-heals
+  // once the database recovers, instead of staying scanner-less until
+  // Cloudflare evicts it.
+  if (tursoConfigured && !dbReady) {
+    console.warn("[worker] Turso init failed — will retry on the next tick");
+    initPromise = null;
+  }
 }
 
 async function runScan(): Promise<void> {

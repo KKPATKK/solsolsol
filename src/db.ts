@@ -6,6 +6,15 @@
 // pure-HTTP transport everywhere.
 import { createClient, type Client } from "@libsql/client/web";
 
+/**
+ * Hard timeout for every Turso HTTP request. The database has been
+ * intermittently degraded (5s+ round trips, occasional 522s and hangs); a
+ * hung request must fail fast and be retried next tick instead of wedging
+ * the scan (DB calls have no timeout by default). Healthy round trips are
+ * ~100-300ms, so 15s only ever cuts off genuine hangs.
+ */
+const DB_REQUEST_TIMEOUT_MS = 15_000;
+
 export interface ChatSettings {
   chatId: string;
   minLiquidityUsd: number;
@@ -93,7 +102,17 @@ export class Db {
     // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
     // which works reliably on Workers (fetch) and in Node alike.
     const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
-    this.client = createClient({ url: httpUrl, authToken: this.authToken });
+    this.client = createClient({
+      url: httpUrl,
+      authToken: this.authToken,
+      // Bound every request (see DB_REQUEST_TIMEOUT_MS): a stalled Turso
+      // call aborts instead of hanging the tick indefinitely.
+      fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+        fetch(input, {
+          ...init,
+          signal: AbortSignal.timeout(DB_REQUEST_TIMEOUT_MS),
+        }),
+    });
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS chat_settings (
         chat_id TEXT PRIMARY KEY,
