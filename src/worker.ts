@@ -96,6 +96,7 @@ export function tradeFingerprint(env: Env): string {
     env.TRADE_MAX_DAILY_BUYS ?? "",
     env.TRADE_TIMEOUT_MS ?? "",
     env.JUPITER_API_BASE ?? "",
+    env.JUPITER_API_KEY ? "jkey:1" : "jkey:0",
     env.TRADE_RPC_URL ?? "",
   ].join("|");
 }

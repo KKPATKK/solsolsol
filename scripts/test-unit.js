@@ -354,6 +354,23 @@ async function main() {
     assert.equal(parseQuote("nope").ok, false);
   });
 
+  await test("parseQuote accepts the new Metis /swap/v1 shape (routePlan)", () => {
+    const metis = parseQuote({
+      inputMint: "So11111111111111111111111111111111111111112",
+      inAmount: "100000000",
+      outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      outAmount: "17057460",
+      otherAmountThreshold: "16886885",
+      swapMode: "ExactIn",
+      slippageBps: 100,
+      priceImpactPct: "0",
+      routePlan: [{ swapInfo: { label: "Meteora DLMM" }, percent: 100 }],
+      contextSlot: 299283763,
+    });
+    assert.equal(metis.ok, true);
+    assert.equal(metis.quote.outAmount, "17057460");
+  });
+
   await test("parseSendResponse normalizes RPC send results", () => {
     const ok = parseSendResponse({ jsonrpc: "2.0", id: 1, result: "SIG1" });
     assert.deepEqual(ok, { ok: true, txHash: "SIG1" });

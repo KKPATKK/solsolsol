@@ -51,6 +51,8 @@ export interface TradeConfigSettings {
   timeoutMs: number;
   /** Jupiter Swap API base (quotes + swap-tx building). */
   jupiterApiBase: string;
+  /** Optional Jupiter API key (x-api-key header, unlocks higher rate limits). */
+  jupiterApiKey?: string;
   /** RPC used to send the signed swap (defaults to Helius when keyed). */
   rpcUrl?: string;
 }
@@ -159,7 +161,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
           : 5,
       timeoutMs:
         Number.isFinite(tradeTimeout) && tradeTimeout > 0 ? tradeTimeout : 15_000,
-      jupiterApiBase: env.JUPITER_API_BASE || "https://quote-api.jup.ag",
+      jupiterApiBase: env.JUPITER_API_BASE || "https://api.jup.ag",
+      jupiterApiKey: env.JUPITER_API_KEY || undefined,
       rpcUrl: env.HELIUS_API_KEY
         ? `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`
         : undefined,

@@ -9,10 +9,13 @@ import type { Db } from "./db";
  * Swap API, signs it with the operator's dedicated wallet (base58 secret in
  * BOT_WALLET_PRIVATE_KEY — never logged) and submits it via the Helius RPC.
  *
- * Flow (Jupiter v6 Swap API):
- *   1. GET  /v6/quote?inputMint=SOL&outputMint=<token>&amount=<lamports>
- *            &slippageBps=<pct*100>                  → quoteResponse
- *   2. POST /v6/swap { quoteResponse, userPublicKey, wrapAndUnwrapSol,
+ * Flow (Jupiter Swap API v1 / Metis — the v6 quote-api.jup.ag endpoints were
+ * retired; the current base is api.jup.ag, keyless at 0.5 RPS or with an
+ * optional x-api-key header):
+ *   1. GET  /swap/v1/quote?inputMint=SOL&outputMint=<token>&amount=<lamports>
+ *            &slippageBps=<pct*100>&restrictIntermediateTokens=true
+ *            &instructionVersion=V2                 → route quote (Metis)
+ *   2. POST /swap/v1/swap { quoteResponse, userPublicKey, wrapAndUnwrapSol,
  *            dynamicComputeUnitLimit, prioritizationFeeLamports }
  *                                                    → { swapTransaction: b64 }
  *   3. deserialize → sign with wallet → serialize → sendTransaction (RPC)
@@ -114,10 +117,11 @@ async function jsonFetch<T>(
   url: string,
   timeoutMs: number,
   body?: unknown,
+  extraHeaders?: Record<string, string>,
 ): Promise<T> {
   const res = await fetch(url, {
     method: body === undefined ? "GET" : "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -147,6 +151,12 @@ export class JupiterClient {
   private rpcUrl(): string {
     if (this.cfg.rpcUrl) return this.cfg.rpcUrl;
     return "https://api.mainnet-beta.solana.com";
+  }
+
+  /** Optional x-api-key header — unlocks higher rate limits on the new
+   * developer platform; keyless still works at 0.5 RPS. */
+  private apiHeaders(): Record<string, string> {
+    return this.cfg.jupiterApiKey ? { "x-api-key": this.cfg.jupiterApiKey } : {};
   }
 
   /** Read-only SOL balance in lamports (null when the RPC is unreachable). */
@@ -184,12 +194,15 @@ export class JupiterClient {
       outputMint,
       amount: String(Math.floor(inputLamports)),
       slippageBps: String(Math.floor(slippageBps)),
-      onlyDirectRoutes: "false",
+      restrictIntermediateTokens: "true",
+      instructionVersion: "V2",
     });
     try {
       const raw = await jsonFetch<unknown>(
-        `${this.cfg.jupiterApiBase}/v6/quote?${params.toString()}`,
+        `${this.cfg.jupiterApiBase}/swap/v1/quote?${params.toString()}`,
         this.cfg.timeoutMs,
+        undefined,
+        this.apiHeaders(),
       );
       return parseQuote(raw);
     } catch (err) {
@@ -226,15 +239,22 @@ export class JupiterClient {
       }
 
       const swap = await jsonFetch<{ swapTransaction?: string }>(
-        `${this.cfg.jupiterApiBase}/v6/swap`,
+        `${this.cfg.jupiterApiBase}/swap/v1/swap`,
         this.cfg.timeoutMs,
         {
           quoteResponse: quote.quote,
           userPublicKey: this.walletPublicKey,
           wrapAndUnwrapSol: true,
           dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: feeLamports,
+          // New-platform fee shape: cap the priority fee at the configured lamports.
+          prioritizationFeeLamports: {
+            priorityLevelWithMaxLamports: {
+              priorityLevel: "veryHigh",
+              maxLamports: feeLamports,
+            },
+          },
         },
+        this.apiHeaders(),
       );
       if (!swap.swapTransaction) {
         return { ok: false, error: "Jupiter 未返回 swap 交易（可能是该币不可交易或参数错误）" };
