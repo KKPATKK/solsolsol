@@ -13,14 +13,14 @@ function buildUsage(scanIntervalSeconds: number): string {
     `${formatInterval(scanIntervalSeconds)}扫描一次 Solana 新上线的 meme coin，符合条件的自动推送到这里。`,
     "",
     "*命令*",
-    "`/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [Bundler%] [Top10%]` — 设置筛选条件",
+    "`/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>` — 设置筛选条件",
     "`/status` — 查看当前条件",
     "`/on` — 开启推送",
     "`/off` — 关闭推送",
     "`/help` — 帮助",
     "",
-    "默认条件: 市值 $40K–$300K，上线 360–2400 分钟，5m 量 ≥ $6,000，5m 涨幅 ≥ 30%，Bundler ≤ 15%，Top10 持仓 ≤ 23%",
-    "例子: `/filter 40000 300000 360 2400 6000 30 15 23`",
+    "默认条件: 市值 $40K–$300K，上线 360–2400 分钟，5m 量 ≥ $6,000，5m 涨幅 ≥ 30%",
+    "例子: `/filter 40000 300000 360 2400 6000 30`",
   ].join("\n");
 }
 
@@ -28,8 +28,8 @@ const DB_MISSING_REPLY =
   "⛔ 数据库未配置（缺少 TURSO_DATABASE_URL / TURSO_AUTH_TOKEN），暂时无法保存条件。配置后重启即可使用全部功能。";
 
 /**
- * Parsed /filter arguments (pure — unit-tested). Bounds are inclusive per
- * the operator's spec ("≤ 15%" means exactly 15% is allowed).
+ * Parsed /filter arguments (pure — unit-tested). The bundler and top-10
+ * holder filters were removed, so /filter takes exactly 6 arguments.
  */
 export type ParsedFilter =
   | {
@@ -40,17 +40,13 @@ export type ParsedFilter =
       maxAgeMinutes: number;
       min5mVolUsd: number;
       min5mChgPct: number;
-      /** null = not provided → keep the chat's current value. */
-      maxBundlerPct: number | null;
-      /** null = not provided → keep the chat's current value. */
-      maxTop10HolderPct: number | null;
     }
   | { ok: false; error: string };
 
 export function parseFilterArgs(parts: string[]): ParsedFilter {
   const USAGE =
-    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [Bundler%] [Top10%]`\n例如: `/filter 40000 300000 360 2400 6000 30 15 23`";
-  if (parts.length < 6 || parts.length > 8) {
+    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>`\n例如: `/filter 40000 300000 360 2400 6000 30`";
+  if (parts.length !== 6) {
     return { ok: false, error: USAGE };
   }
   const minMarketCapUsd = parseNumber(parts[0]);
@@ -59,8 +55,6 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
   const maxAgeMinutes = parseNumber(parts[3]);
   const min5mVolUsd = parseNumber(parts[4]);
   const min5mChgPct = parseNumber(parts[5]);
-  const maxBundlerPct = parts[6] !== undefined ? parseNumber(parts[6]) : null;
-  const maxTop10HolderPct = parts[7] !== undefined ? parseNumber(parts[7]) : null;
   if (
     minMarketCapUsd === null ||
     maxMarketCapUsd === null ||
@@ -73,15 +67,13 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     minAgeMinutes <= 0 ||
     maxAgeMinutes <= 0 ||
     min5mVolUsd < 0 ||
-    (maxBundlerPct !== null && maxBundlerPct <= 0) ||
-    (maxTop10HolderPct !== null && maxTop10HolderPct <= 0) ||
     maxMarketCapUsd < minMarketCapUsd ||
     maxAgeMinutes < minAgeMinutes
   ) {
     return {
       ok: false,
       error:
-        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [Bundler%] [Top10%]`",
+        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>`",
     };
   }
   return {
@@ -92,8 +84,6 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     maxAgeMinutes,
     min5mVolUsd,
     min5mChgPct,
-    maxBundlerPct,
-    maxTop10HolderPct,
   };
 }
 
@@ -151,9 +141,6 @@ export function createBot(
       maxAgeMinutes: parsed.maxAgeMinutes,
       min5mVolUsd: parsed.min5mVolUsd,
       min5mChgPct: parsed.min5mChgPct,
-      maxBundlerPct: parsed.maxBundlerPct ?? existing?.maxBundlerPct ?? DEFAULT_SETTINGS.maxBundlerPct,
-      maxTop10HolderPct:
-        parsed.maxTop10HolderPct ?? existing?.maxTop10HolderPct ?? DEFAULT_SETTINGS.maxTop10HolderPct,
       enabled: existing?.enabled ?? false,
     });
     await ctx.reply(
@@ -165,8 +152,6 @@ export function createBot(
         `⏱️ 最长上线: ${parsed.maxAgeMinutes} 分钟`,
         `📊 最低 5m 量: ${fmtUsd(parsed.min5mVolUsd)}`,
         `⚡ 最低 5m 涨幅: ${parsed.min5mChgPct}%`,
-        `🛡 最大 Bundler: ${parsed.maxBundlerPct ?? existing?.maxBundlerPct ?? DEFAULT_SETTINGS.maxBundlerPct}%`,
-        `👥 最大 Top10 持仓: ${parsed.maxTop10HolderPct ?? existing?.maxTop10HolderPct ?? DEFAULT_SETTINGS.maxTop10HolderPct}%`,
         `推送状态: ${existing?.enabled ?? false ? "已开启" : "已关闭（用 /on 开启）"}`,
       ].join("\n"),
     );
@@ -180,7 +165,7 @@ export function createBot(
     const settings = await chatDb.getChatSettings(String(chatId));
     if (!settings) {
       await ctx.reply(
-        "还没有设置过筛选条件。用 `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [Bundler%] [Top10%]` 设置。",
+        "还没有设置过筛选条件。用 `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>` 设置。",
         { parse_mode: "Markdown" },
       );
       return;
@@ -194,8 +179,6 @@ export function createBot(
         `⏱️ 最长上线: ${settings.maxAgeMinutes} 分钟`,
         `📊 最低 5m 量: ${fmtUsd(settings.min5mVolUsd)}`,
         `⚡ 最低 5m 涨幅: ${settings.min5mChgPct}%`,
-        `🛡 最大 Bundler: ${settings.maxBundlerPct}%`,
-        `👥 最大 Top10 持仓: ${settings.maxTop10HolderPct}%`,
         `推送状态: ${settings.enabled ? "✅ 已开启" : "⛔ 已关闭"}`,
       ].join("\n"),
     );
@@ -217,9 +200,6 @@ export function createBot(
       maxAgeMinutes: existing?.maxAgeMinutes ?? DEFAULT_SETTINGS.maxAgeMinutes,
       min5mVolUsd: existing?.min5mVolUsd ?? DEFAULT_SETTINGS.min5mVolUsd,
       min5mChgPct: existing?.min5mChgPct ?? DEFAULT_SETTINGS.min5mChgPct,
-      maxBundlerPct: existing?.maxBundlerPct ?? DEFAULT_SETTINGS.maxBundlerPct,
-      maxTop10HolderPct:
-        existing?.maxTop10HolderPct ?? DEFAULT_SETTINGS.maxTop10HolderPct,
       enabled: true,
     });
     await ctx.reply(
@@ -227,7 +207,7 @@ export function createBot(
         ? "✅ 推送已开启，开始监控 Solana 新币。"
         : `✅ 推送已开启（默认条件: 市值 $40K–$300K，上线 360–2400 分钟，5m 量 ≥ ${fmtUsd(
             DEFAULT_SETTINGS.min5mVolUsd,
-          )}，5m 涨幅 ≥ ${DEFAULT_SETTINGS.min5mChgPct}%，Bundler ≤ ${DEFAULT_SETTINGS.maxBundlerPct}%，Top10 持仓 ≤ ${DEFAULT_SETTINGS.maxTop10HolderPct}%）。用 /filter 自定义条件。`,
+          )}，5m 涨幅 ≥ ${DEFAULT_SETTINGS.min5mChgPct}%）。用 /filter 自定义条件。`,
     );
   });
 
@@ -247,9 +227,6 @@ export function createBot(
       maxAgeMinutes: existing?.maxAgeMinutes ?? DEFAULT_SETTINGS.maxAgeMinutes,
       min5mVolUsd: existing?.min5mVolUsd ?? DEFAULT_SETTINGS.min5mVolUsd,
       min5mChgPct: existing?.min5mChgPct ?? DEFAULT_SETTINGS.min5mChgPct,
-      maxBundlerPct: existing?.maxBundlerPct ?? DEFAULT_SETTINGS.maxBundlerPct,
-      maxTop10HolderPct:
-        existing?.maxTop10HolderPct ?? DEFAULT_SETTINGS.maxTop10HolderPct,
       enabled: false,
     });
     await ctx.reply("⛔ 推送已关闭。用 /on 重新开启。");

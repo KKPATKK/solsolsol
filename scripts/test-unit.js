@@ -59,8 +59,9 @@ async function main() {
     assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 2400);
     assert.equal(DEFAULT_SETTINGS.min5mVolUsd, 6000);
     assert.equal(DEFAULT_SETTINGS.min5mChgPct, 30);
-    assert.equal(DEFAULT_SETTINGS.maxBundlerPct, 15);
-    assert.equal(DEFAULT_SETTINGS.maxTop10HolderPct, 23);
+    // Bundler/top-10 filters were removed — no thresholds in defaults.
+    assert.equal("maxBundlerPct" in DEFAULT_SETTINGS, false);
+    assert.equal("maxTop10HolderPct" in DEFAULT_SETTINGS, false);
   });
 
   await test("getChatSettings maps NULL columns to defaults; save round-trips", async () => {
@@ -79,8 +80,6 @@ async function main() {
       assert.equal(d.maxAgeMinutes, 2400);
       assert.equal(d.min5mVolUsd, 6000);
       assert.equal(d.min5mChgPct, 30);
-      assert.equal(d.maxBundlerPct, 15);
-      assert.equal(d.maxTop10HolderPct, 23);
       assert.equal(d.enabled, true);
 
       // Full customized round-trip.
@@ -94,8 +93,6 @@ async function main() {
         maxAgeMinutes: 500,
         min5mVolUsd: 789,
         min5mChgPct: 12,
-        maxBundlerPct: 9,
-        maxTop10HolderPct: 8,
         enabled: true,
       });
       const got = await db.getChatSettings("chat-a");
@@ -109,8 +106,6 @@ async function main() {
         maxAgeMinutes: 500,
         min5mVolUsd: 789,
         min5mChgPct: 12,
-        maxBundlerPct: 9,
-        maxTop10HolderPct: 8,
         enabled: true,
       });
     } finally {
@@ -154,8 +149,6 @@ async function main() {
       assert.equal(s.maxAgeMinutes, 2400);
       assert.equal(s.min5mVolUsd, 6000);
       assert.equal(s.min5mChgPct, 30);
-      assert.equal(s.maxBundlerPct, 15);
-      assert.equal(s.maxTop10HolderPct, 23);
       assert.equal(s.enabled, true); // push state untouched by migration
       assert.equal(await db.getWorkerState("settings_v2_applied"), "1");
 
@@ -177,7 +170,7 @@ async function main() {
       const mk = (chatId, enabled) => ({
         chatId, minLiquidityUsd: 0, minVolume24hUsd: 0,
         minMarketCapUsd: 1, maxMarketCapUsd: 2, minAgeMinutes: 3, maxAgeMinutes: 4,
-        min5mVolUsd: 5, min5mChgPct: 6, maxBundlerPct: 7, maxTop10HolderPct: 8,
+        min5mVolUsd: 5, min5mChgPct: 6,
         enabled,
       });
       await db.saveChatSettings(mk("on", true));
@@ -288,24 +281,20 @@ async function main() {
       assert.equal(r.maxAgeMinutes, 2400);
       assert.equal(r.min5mVolUsd, 6000);
       assert.equal(r.min5mChgPct, 30);
-      assert.equal(r.maxBundlerPct, null);
-      assert.equal(r.maxTop10HolderPct, null);
     }
   });
 
-  await test("parseFilterArgs accepts the 8-arg form and thousands separators", () => {
-    const r = parseFilterArgs(["40,000", "300,000", "360", "2400", "6,000", "30", "15", "23"]);
+  await test("parseFilterArgs accepts thousands separators", () => {
+    const r = parseFilterArgs(["40,000", "300,000", "360", "2400", "6,000", "30"]);
     assert.equal(r.ok, true);
-    if (r.ok) {
-      assert.equal(r.minMarketCapUsd, 40000);
-      assert.equal(r.maxBundlerPct, 15);
-      assert.equal(r.maxTop10HolderPct, 23);
-    }
+    if (r.ok) assert.equal(r.minMarketCapUsd, 40000);
   });
 
-  await test("parseFilterArgs rejects wrong argument counts", () => {
+  await test("parseFilterArgs rejects wrong argument counts (bundler/top10 args removed)", () => {
     assert.equal(parseFilterArgs([]).ok, false);
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5"]).ok, false);
+    // 7/8-arg forms (old Bundler/Top10) must now be rejected.
+    assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7"]).ok, false);
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8", "9"]).ok, false);
   });
 
@@ -315,8 +304,6 @@ async function main() {
     assert.equal(parseFilterArgs(["40000", "300000", "-5", "2400", "6000", "30"]).ok, false);
     assert.equal(parseFilterArgs(["300000", "40000", "360", "2400", "6000", "30"]).ok, false); // max < min
     assert.equal(parseFilterArgs(["40000", "300000", "2400", "360", "6000", "30"]).ok, false); // maxAge < minAge
-    assert.equal(parseFilterArgs(["40000", "300000", "360", "2400", "6000", "30", "0", "23"]).ok, false); // bundler 0
-    assert.equal(parseFilterArgs(["40000", "300000", "360", "2400", "6000", "30", "15", "0"]).ok, false); // top10 0
   });
 
   await test("parseFilterArgs allows min mcap 0 and 5m volume 0 (no minimum)", () => {

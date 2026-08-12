@@ -31,16 +31,14 @@ export interface ChatSettings {
   min5mVolUsd: number;
   /** Minimum 5-minute price change in percent (e.g. 18 = +18%). */
   min5mChgPct: number;
-  /** Maximum bundler/insider supply share in percent; coins above are skipped. */
-  maxBundlerPct: number;
-  /** Maximum top-10 holder concentration in percent; coins above are skipped. */
-  maxTop10HolderPct: number;
   enabled: boolean;
 }
 
 /**
  * Current filter profile: mid-cap coins ($40K–$300K) aged 6–40 hours with a
- * hot 5m tape. The first-minute-volume and sniper filters were removed.
+ * hot 5m tape. The first-minute-volume, sniper, bundler and top-10 holder
+ * filters were removed (bundler/top-10 data is shown on the card for
+ * reference only).
  */
 export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minLiquidityUsd: 0,
@@ -51,8 +49,6 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   maxAgeMinutes: 2400, // 40h
   min5mVolUsd: 6000,
   min5mChgPct: 30,
-  maxBundlerPct: 15,
-  maxTop10HolderPct: 23,
   enabled: false,
 };
 
@@ -131,8 +127,6 @@ export class Db {
         max_age_minutes REAL NOT NULL DEFAULT 2400,
         min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
         min_5m_chg_pct REAL NOT NULL DEFAULT 30,
-        max_bundler_pct REAL NOT NULL DEFAULT 15,
-        max_top10_holder_pct REAL NOT NULL DEFAULT 23,
         enabled INTEGER NOT NULL DEFAULT 0
       );
     `);
@@ -143,8 +137,6 @@ export class Db {
     await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 2400");
     await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
     await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
-    await this.addColumnIfMissing("chat_settings", "max_bundler_pct", "REAL NOT NULL DEFAULT 15");
-    await this.addColumnIfMissing("chat_settings", "max_top10_holder_pct", "REAL NOT NULL DEFAULT 23");
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS worker_state (
         key TEXT PRIMARY KEY,
@@ -164,9 +156,7 @@ export class Db {
           min_age_minutes = ?,
           max_age_minutes = ?,
           min_5m_vol_usd = ?,
-          min_5m_chg_pct = ?,
-          max_bundler_pct = ?,
-          max_top10_holder_pct = ?`,
+          min_5m_chg_pct = ?`,
         args: [
           d.minMarketCapUsd,
           d.maxMarketCapUsd,
@@ -174,8 +164,6 @@ export class Db {
           d.maxAgeMinutes,
           d.min5mVolUsd,
           d.min5mChgPct,
-          d.maxBundlerPct,
-          d.maxTop10HolderPct,
         ],
       });
       await this.setWorkerState("settings_v2_applied", "1");
@@ -276,8 +264,6 @@ export class Db {
       maxAgeMinutes: Number(row.max_age_minutes ?? DEFAULT_SETTINGS.maxAgeMinutes),
       min5mVolUsd: Number(row.min_5m_vol_usd ?? DEFAULT_SETTINGS.min5mVolUsd),
       min5mChgPct: Number(row.min_5m_chg_pct ?? DEFAULT_SETTINGS.min5mChgPct),
-      maxBundlerPct: Number(row.max_bundler_pct ?? DEFAULT_SETTINGS.maxBundlerPct),
-      maxTop10HolderPct: Number(row.max_top10_holder_pct ?? DEFAULT_SETTINGS.maxTop10HolderPct),
       enabled: Number(row.enabled) === 1,
     };
   }
@@ -298,8 +284,8 @@ export class Db {
         INSERT INTO chat_settings
           (chat_id, min_liquidity_usd, min_volume_24h_usd,
            min_market_cap_usd, max_market_cap_usd, min_age_minutes, max_age_minutes,
-           min_5m_vol_usd, min_5m_chg_pct, max_bundler_pct, max_top10_holder_pct, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           min_5m_vol_usd, min_5m_chg_pct, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
           min_liquidity_usd = excluded.min_liquidity_usd,
           min_volume_24h_usd = excluded.min_volume_24h_usd,
@@ -309,8 +295,6 @@ export class Db {
           max_age_minutes = excluded.max_age_minutes,
           min_5m_vol_usd = excluded.min_5m_vol_usd,
           min_5m_chg_pct = excluded.min_5m_chg_pct,
-          max_bundler_pct = excluded.max_bundler_pct,
-          max_top10_holder_pct = excluded.max_top10_holder_pct,
           enabled = excluded.enabled
       `,
       args: [
@@ -323,8 +307,6 @@ export class Db {
         settings.maxAgeMinutes,
         settings.min5mVolUsd,
         settings.min5mChgPct,
-        settings.maxBundlerPct,
-        settings.maxTop10HolderPct,
         settings.enabled ? 1 : 0,
       ],
     });

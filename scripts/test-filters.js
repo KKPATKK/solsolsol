@@ -6,9 +6,10 @@
  *     node scripts/test-filters.js
  *
  * Phases:
- *   1. Config sanity: DEFAULT_SETTINGS + /help text contain the 8 filters
- *      (min/max market cap, min/max age, 5m volume, 5m change, bundler,
- *      top-10). The first-minute-volume and sniper filters were removed.
+ *   1. Config sanity: DEFAULT_SETTINGS + /help text contain the 6 filters
+ *      (min/max market cap, min/max age, 5m volume, 5m change). The
+ *      first-minute-volume, sniper, bundler and top-10 filters were removed
+ *      (bundler/top-10 data is shown on the push card for reference only).
  *   2. Per-coin diagnosis: replicate scanner.ts logic on LIVE market data
  *      (feed + re-evaluation pool), print every condition's verdict.
  *   3. End-to-end: run the REAL Scanner.runOnce with a mock bot, capture the
@@ -47,8 +48,6 @@ async function phase1() {
     ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 2400],
     ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 6000],
     ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 30],
-    ["DEFAULT_SETTINGS.maxBundlerPct", DEFAULT_SETTINGS.maxBundlerPct, 15],
-    ["DEFAULT_SETTINGS.maxTop10HolderPct", DEFAULT_SETTINGS.maxTop10HolderPct, 23],
   ];
   let allOk = true;
   for (const [name, actual, expected] of checks) {
@@ -57,18 +56,18 @@ async function phase1() {
     console.log(`  ${ok ? "✅" : "❌"} ${name} = ${actual}${ok ? "" : `（期望 ${expected}）`}`);
   }
 
-  // /help & /filter usage text (compiled bot module) mentions all 8 conditions.
+  // /help & /filter usage text (compiled bot module) mentions all 6 conditions.
   const fs = require("fs");
   const botSrc = fs.readFileSync(require.resolve("../dist/bot.js"), "utf8");
-  const textChecks = ["最低市值", "最高市值", "最短上线", "最长上线", "5m 量", "5m 涨幅", "Bundler", "Top10"];
+  const textChecks = ["最低市值", "最高市值", "最短上线", "最长上线", "5m 量", "5m 涨幅"];
   for (const t of textChecks) {
     const ok = botSrc.includes(t);
     if (!ok) allOk = false;
     console.log(`  ${ok ? "✅" : "❌"} /help 文案包含 "${t}"`);
   }
   // Removed filters must no longer gate: the bot must not mention them as
-  // /filter arguments anymore.
-  const removedChecks = ["首分钟量", "Sniper"];
+  // /filter arguments anymore (they may still appear in the push card).
+  const removedChecks = ["首分钟量", "Sniper", "Bundler", "Top10"];
   for (const t of removedChecks) {
     const ok = !botSrc.includes(t);
     if (!ok) allOk = false;
@@ -83,7 +82,7 @@ async function phase1() {
     console.log(`\n  📋 已开启推送的 chat 数量: ${chats.length}`);
     for (const c of chats) {
       console.log(
-        `  chat=${c.chatId} | 市值 ${USD(c.minMarketCapUsd)}–${USD(c.maxMarketCapUsd)} | 上线 ${c.minAgeMinutes}–${c.maxAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 5m涨幅≥${c.min5mChgPct}% | Bundler<${c.maxBundlerPct}% | Top10<${c.maxTop10HolderPct}%`,
+        `  chat=${c.chatId} | 市值 ${USD(c.minMarketCapUsd)}–${USD(c.maxMarketCapUsd)} | 上线 ${c.minAgeMinutes}–${c.maxAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 5m涨幅≥${c.min5mChgPct}%`,
       );
     }
     return db;
@@ -165,7 +164,8 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
     // Candidate — expensive lookups (mirrors production, caches via db).
     let stats = db ? await db.getTokenStats(profile.tokenAddress) : null;
 
-    // RugCheck (F7 bundler, F8 top10)
+    // RugCheck data: display only — bundler/top-10 are no longer filters, so
+    // they never block a push and "未检测" is fine when the report is not ready.
     let rug = null;
     if (stats && stats.rugcheckTop10Pct !== null) {
       rug = { bundler: stats.rugcheckBundlerPct, top10: stats.rugcheckTop10Pct, src: "cache" };
@@ -175,17 +175,6 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
         if (db) await db.updateTokenRugcheckData(profile.tokenAddress, r.bundlerPct, r.top10HolderPct);
         rug = { bundler: r.bundlerPct, top10: r.top10HolderPct, src: "live" };
       } catch (e) { /* ignore */ }
-    }
-    // Inclusive thresholds: exactly the max passes, only strictly-higher
-    // shares are rejected (mirrors scanner.ts).
-    const f7 = rug === null || rug.bundler === null || rug.bundler <= s.maxBundlerPct;
-    if (!f7) c.reasons.push(`Bundler ${rug.bundler.toFixed(1)}% > ${s.maxBundlerPct}%`);
-    let holdTop10 = false;
-    if (rug === null || rug.top10 === null) {
-      holdTop10 = true; // 数据未就绪 → 顺延
-    } else {
-      const f8 = rug.top10 <= s.maxTop10HolderPct;
-      if (!f8) c.reasons.push(`Top10 ${rug.top10.toFixed(1)}% > ${s.maxTop10HolderPct}%`);
     }
 
     // Birdeye trader data: display only — the sniper filter was removed, so
@@ -220,7 +209,8 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
       } catch (e) { /* ignore */ }
     }
 
-    const finalOk = f7 && !holdTop10 && c.reasons.length === 0;
+    // Bundler/top-10 are display-only: the coin passes on F1–F6 alone.
+    const finalOk = c.reasons.length === 0;
     if (finalOk) passed++;
     rows.push({
       symbol,
@@ -232,7 +222,6 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
       sniper: trader ? (trader.sniper === null ? "空" : trader.sniper.toFixed(1) + "%") : "—",
       pro: trader ? (trader.pro === null ? "—" : trader.pro) : "—",
       minMcap: minMcap === null ? "—" : USD(minMcap),
-      holdTop10,
       finalOk,
       detail: c.reasons.join("; "),
     });
@@ -255,11 +244,9 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
       console.log(`  ${r.symbol.padEnd(14)}${(r.age.toFixed(1) + "m").padEnd(10)}${USD(r.mc).padEnd(8)}—${"".padEnd(38)}❌ 前置条件未过 (${r.detail})`);
       continue;
     }
-    const result = r.holdTop10
-      ? "⏳ Top10待就绪"
-      : r.finalOk
-        ? "✅ 全部通过 → 推送"
-        : "❌ " + (r.detail || "被过滤");
+    const result = r.finalOk
+      ? "✅ 全部通过 → 推送"
+      : "❌ " + (r.detail || "被过滤");
     console.log(
       `  ${r.symbol.padEnd(14)}${(r.age.toFixed(1) + "m").padEnd(10)}${USD(r.mc).padEnd(8)}${(r.bundler || "—").padEnd(9)}${(r.top10 || "—").padEnd(8)}${(r.sniper || "—").padEnd(8)}${String(r.pro || "—").padEnd(5)}${(r.minMcap || "—").padEnd(10)}${result}`,
     );

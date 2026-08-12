@@ -75,10 +75,6 @@ interface QualifyingCoin {
   profile: TokenProfile;
   pair: PairInfo;
   stats: TokenStats;
-  /** The chat's bundler threshold, used at push time. */
-  maxBundlerPct: number;
-  /** The chat's top-10 holder threshold, used at push time. */
-  maxTop10HolderPct: number;
 }
 
 /** Resolved opening (first-minute) volume for a coin. */
@@ -109,14 +105,6 @@ export interface ScanSummary {
   pool: number;
   candidates: number;
   pushed: number;
-  holds: {
-    /** Bundler share known and too high. */
-    bundler: number;
-    /** RugCheck report not ready yet (re-check next scan). */
-    rugcheck: number;
-    /** Top-10 holder concentration known and too high. */
-    top10: number;
-  };
   fails: {
     mcap: number;
     chg: number;
@@ -179,11 +167,6 @@ export class Scanner {
       pool: 0,
       candidates: 0,
       pushed: 0,
-      holds: {
-        bundler: 0,
-        rugcheck: 0,
-        top10: 0,
-      },
       fails: { mcap: 0, chg: 0, vol5: 0, age: 0, other: 0 },
       rejects: [],
     };
@@ -307,31 +290,10 @@ export class Scanner {
         // Opening volume is resolved for the message card but no longer
         // filters — the first-minute-volume filter was removed.
         const opening = await this.resolveOpeningVolume(coin, tickDeadline);
+        // Bundler + top-10 holder share is resolved for the message card but
+        // no longer filters — those filters were removed, so coins push even
+        // when the RugCheck report is not ready yet (the card shows 未检测).
         const rugcheck = await this.resolveRugcheckData(coin);
-        // Bundler filter: skip coins whose bundled/insider supply share is
-        // known and above the threshold. The threshold is inclusive
-        // ("≤ 15%"): exactly 15% passes, only strictly-higher shares are
-        // rejected. Unknown (null) means no bundlers detected — pass.
-        if (rugcheck.bundlerPct !== null && rugcheck.bundlerPct > coin.maxBundlerPct) {
-          diag.holds.bundler++;
-          continue;
-        }
-        // Top-10 holder data must be ready before pushing: when RugCheck has
-        // not produced the report yet, hold the coin and re-check it on the
-        // next scan instead of pushing a card with "未检测".
-        if (rugcheck.top10Pct === null) {
-          diag.holds.rugcheck++;
-          console.log(
-            `[scanner] holding ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (RugCheck report not ready)`,
-          );
-          continue;
-        }
-        // Top-10 holder concentration filter (inclusive threshold: exactly
-        // the max passes, only strictly-higher concentration is rejected).
-        if (rugcheck.top10Pct > coin.maxTop10HolderPct) {
-          diag.holds.top10++;
-          continue;
-        }
         // Trader data is resolved for the message card but no longer
         // filters — the sniper filter was removed, so coins push even when
         // the data is not ready yet.
@@ -568,8 +530,6 @@ export class Scanner {
       maxAgeMinutes: number;
       min5mVolUsd: number;
       min5mChgPct: number;
-      maxBundlerPct: number;
-      maxTop10HolderPct: number;
     }[],
     fails: ScanSummary["fails"],
     rejects: RejectionEntry[],
@@ -643,8 +603,6 @@ export class Scanner {
           profile,
           pair,
           stats,
-          maxBundlerPct: chat.maxBundlerPct,
-          maxTop10HolderPct: chat.maxTop10HolderPct,
         });
       }
     }
