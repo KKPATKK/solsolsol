@@ -13,7 +13,7 @@ const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
-const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw } = require("../dist/jupiter.js");
+const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -439,6 +439,26 @@ async function main() {
     assert.equal(parseSellCallback(`sell:half:all:${mint}`), null);
     assert.equal(parseSellCallback(`sell:quarter:${mint}`), null);
     assert.equal(parseSellCallback(`sell:half:SHORT`), null);
+  });
+
+  await test("parseModeCallback accepts toggle/apply/cancel and rejects junk", () => {
+    const mint = "Cqs2xNRMCSMDpGzRZ5x225kjM9dhcnTFExiu5Hf6pump";
+    assert.deepEqual(parseModeCallback(`mode:toggle:${mint}`), { action: "toggle", token: mint });
+    assert.deepEqual(parseModeCallback(`mode:cancel:${mint}`), { action: "cancel", token: mint });
+    assert.deepEqual(parseModeCallback(`mode:apply:auto:${mint}`), { action: "apply", token: mint, mode: "auto" });
+    assert.deepEqual(parseModeCallback(`mode:apply:off:${mint}`), { action: "apply", token: mint, mode: "off" });
+    // Not mode callbacks / malformed.
+    assert.equal(parseModeCallback(`buy:${mint}`), null);
+    assert.equal(parseModeCallback(`sell:half:${mint}`), null);
+    assert.equal(parseModeCallback(`mode:toggle`), null); // no token
+    assert.equal(parseModeCallback(`mode:apply:ultra:${mint}`), null); // bad mode
+    assert.equal(parseModeCallback(`mode:apply:auto`), null);
+  });
+
+  await test("nextTradeMode cycles manual → auto → off → manual", () => {
+    assert.equal(nextTradeMode("manual"), "auto");
+    assert.equal(nextTradeMode("auto"), "off");
+    assert.equal(nextTradeMode("off"), "manual");
   });
 
   await test("sellAmountRaw: all sells everything, half floors at raw/2", () => {

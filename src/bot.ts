@@ -4,7 +4,13 @@ import { isAdmin } from "./config";
 import { DEFAULT_SETTINGS, type Db } from "./db";
 import { fmtUsd, parseNumber } from "./format";
 import type { SupplyFlowResult } from "./helius";
-import { parseSellCallback, type SellFraction, type TradeMode } from "./jupiter";
+import {
+  nextTradeMode,
+  parseModeCallback,
+  parseSellCallback,
+  type SellFraction,
+  type TradeMode,
+} from "./jupiter";
 import type { TradeService } from "./jupiter";
 
 function formatInterval(seconds: number): string {
@@ -131,6 +137,7 @@ export function tradeKeyboard(
   token: string,
   buySizeLabel: string,
   mode: TradeMode,
+  opts: { modeSwitch?: boolean } = {},
 ): InlineKeyboardButton[][] {
   const rows: InlineKeyboardButton[][] = [
     [{ text: "🔗 打开 Axiom 页面", url: `${AXIOM_BASE_URL}${token}` }],
@@ -146,6 +153,14 @@ export function tradeKeyboard(
     );
   }
   if (actions.length > 0) rows.push(actions);
+  // Global trade-mode switch (admin-only tap, two-step confirm) — shown on
+  // every card when trading is configured, in every mode (off included, so
+  // trading can be switched on straight from a card).
+  if (opts.modeSwitch) {
+    rows.push([
+      { text: `⚙️ 模式: ${mode}`, callback_data: `mode:toggle:${token}` },
+    ]);
+  }
   return rows;
 }
 
@@ -413,7 +428,73 @@ export function createBot(
   // edits keep the trade keyboard so the position can be managed in place.
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
-    if (!data || (!data.startsWith("buy:") && !data.startsWith("sell:"))) return;
+    if (
+      !data ||
+      (!data.startsWith("buy:") &&
+        !data.startsWith("sell:") &&
+        !data.startsWith("mode:"))
+    )
+      return;
+
+    // ⚙️ mode switch: toggle (asks for confirmation) / apply / cancel. Global
+    // action — the token only exists to re-render the right card.
+    const modeCb = parseModeCallback(data);
+    if (modeCb) {
+      if (!trade) {
+        await ctx.answerCallbackQuery({ text: "交易未启用（缺 BOT_WALLET_PRIVATE_KEY）" });
+        return;
+      }
+      if (adminIds.length === 0 || !isAdmin(ctx.from?.id, adminIds)) {
+        await ctx.answerCallbackQuery({ text: "你不是本 bot 的管理员，无法切换模式" });
+        return;
+      }
+      const token = modeCb.token;
+      const currentMode = await trade.effectiveMode();
+      const label = trade.buySizeLabel;
+      const modeLabel = (m: TradeMode) =>
+        m === "auto" ? "🤖 自動" : m === "manual" ? "🔘 手動" : "⛔ 關閉";
+      if (modeCb.action === "toggle") {
+        const next = nextTradeMode(currentMode);
+        const kb = tradeKeyboard(token, label, currentMode, { modeSwitch: true });
+        // Replace the mode row with the confirmation pair.
+        kb[kb.length - 1] = [
+          { text: `✅ 切換到 ${modeLabel(next)}`, callback_data: `mode:apply:${next}:${token}` },
+          { text: "❌ 取消", callback_data: `mode:cancel:${token}` },
+        ];
+        await ctx.answerCallbackQuery({ text: `確認切換到 ${modeLabel(next)}？` });
+        await ctx.editMessageReplyMarkup({
+          reply_markup: { inline_keyboard: kb },
+        });
+        return;
+      }
+      if (modeCb.action === "cancel") {
+        await ctx.answerCallbackQuery({ text: "已取消" });
+        await ctx.editMessageReplyMarkup({
+          reply_markup: {
+            inline_keyboard: tradeKeyboard(token, label, currentMode, { modeSwitch: true }),
+          },
+        });
+        return;
+      }
+      // apply: persist the override and re-render with the new mode.
+      const next = modeCb.mode ?? currentMode;
+      try {
+        await trade.setModeOverride(next);
+      } catch (err) {
+        await ctx.answerCallbackQuery({
+          text: `❌ 切换失败: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return;
+      }
+      await ctx.editMessageReplyMarkup({
+        reply_markup: {
+          inline_keyboard: tradeKeyboard(token, label, next, { modeSwitch: true }),
+        },
+      });
+      await ctx.answerCallbackQuery({ text: `✅ 已切換到 ${modeLabel(next)}` });
+      return;
+    }
+
     const sell = parseSellCallback(data);
     const token = sell ? sell.token : data.slice(4);
     if (!token || !MINT_RE.test(token)) {
@@ -439,7 +520,9 @@ export function createBot(
     );
     const baseText =
       ctx.callbackQuery.message?.text ?? (sell ? `📉 ${token}` : `🛒 ${token}`);
-    const keyboard = tradeKeyboard(token, trade.buySizeLabel, mode);
+    const keyboard = tradeKeyboard(token, trade.buySizeLabel, mode, {
+      modeSwitch: true,
+    });
 
     if (sell) {
       await ctx.answerCallbackQuery({

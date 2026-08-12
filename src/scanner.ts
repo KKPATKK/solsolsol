@@ -352,6 +352,7 @@ export class Scanner {
                   tokenAddress,
                   this.trade ? this.trade.buySizeLabel : "",
                   tradeMode,
+                  { modeSwitch: Boolean(this.trade) },
                 ),
               },
             },

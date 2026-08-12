@@ -141,6 +141,40 @@ export function sellAmountRaw(raw: bigint, mode: SellFraction): bigint {
   return raw / 2n;
 }
 
+/** Next mode in the card mode-button cycle: manual → auto → off → manual. */
+export function nextTradeMode(mode: TradeMode): TradeMode {
+  if (mode === "manual") return "auto";
+  if (mode === "auto") return "off";
+  return "manual";
+}
+
+/**
+ * Parse a `mode:<toggle|apply|cancel>[:<mode>]:<mint>` callback payload
+ * (pure — unit-tested). Returns null for buy/sell callbacks and junk.
+ */
+export function parseModeCallback(
+  data: string,
+): { action: "toggle" | "apply" | "cancel"; token: string; mode?: TradeMode } | null {
+  if (!data.startsWith("mode:")) return null;
+  const parts = data.split(":");
+  const token = parts[parts.length - 1];
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(token)) return null;
+  if (parts.length === 3 && parts[1] === "toggle") {
+    return { action: "toggle", token };
+  }
+  if (parts.length === 3 && parts[1] === "cancel") {
+    return { action: "cancel", token };
+  }
+  if (
+    parts.length === 4 &&
+    parts[1] === "apply" &&
+    (parts[2] === "manual" || parts[2] === "auto" || parts[2] === "off")
+  ) {
+    return { action: "apply", token, mode: parts[2] };
+  }
+  return null;
+}
+
 /**
  * Normalize a Jupiter /v6/quote response (unit-tested). Accepts the
  * documented shape defensively and always surfaces the raw payload.
