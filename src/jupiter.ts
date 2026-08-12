@@ -57,6 +57,34 @@ export function tradeDecision(
   return { ok: true };
 }
 
+/**
+ * Resolve the buy input size in lamports (unit-tested). When balancePct is
+ * set (>0) the size is that share of the CURRENT wallet balance, computed
+ * live at execution time — so the manual button's size never goes stale and
+ * auto mode always spends the same share. Otherwise the fixed amountSol is
+ * used. In percentage mode a missing or empty balance is an error: buying
+ * blind is never allowed.
+ */
+export function buyAmountLamports(
+  balanceLamports: number | null,
+  balancePct: number,
+  fixedAmountSol: number,
+): { amountLamports: number; source: "balance" | "fixed" } | { error: string } {
+  if (balancePct > 0) {
+    if (balanceLamports === null) {
+      return { error: "无法读取钱包余额，无法按比例下单" };
+    }
+    if (balanceLamports <= 0) {
+      return { error: "钱包余额为 0（请先入金）" };
+    }
+    return {
+      amountLamports: Math.floor(balanceLamports * (balancePct / 100)),
+      source: "balance",
+    };
+  }
+  return { amountLamports: Math.floor(fixedAmountSol * 1e9), source: "fixed" };
+}
+
 /** SOL mint on Solana (the input side of every buy). */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 /** USDC mint — used by verify() for a read-only quote sanity check. */
@@ -217,15 +245,22 @@ export class JupiterClient {
    */
   async buy(token: string, amountSol: number): Promise<TradeOrderResult> {
     try {
-      const amountLamports = Math.floor(amountSol * 1e9);
       const feeLamports = Math.floor(this.cfg.priorityFeeSol * 1e9);
 
-      // Balance pre-check: input + priority fee + ~0.005 SOL for tx rent/fees.
+      // Read the live balance once: used for amount sizing (percentage mode)
+      // AND the pre-check. Percentage sizing happens here so the amount is
+      // always fresh at execution time, never stale from the button label.
       const balance = await this.getSolBalanceLamports();
+      const sized = buyAmountLamports(balance, this.cfg.buyBalancePct, amountSol);
+      if ("error" in sized) {
+        return { ok: false, error: sized.error };
+      }
+      const amountLamports = sized.amountLamports;
+      // Balance pre-check: input + priority fee + ~0.005 SOL for tx rent/fees.
       if (balance !== null && balance < amountLamports + feeLamports + 5_000_000) {
         return {
           ok: false,
-          error: `钱包余额不足（${(balance / 1e9).toFixed(4)} SOL，需 ${amountSol + this.cfg.priorityFeeSol + 0.005} SOL）`,
+          error: `钱包余额不足（${(balance / 1e9).toFixed(4)} SOL，需 ${((amountLamports + feeLamports + 5_000_000) / 1e9).toFixed(4)} SOL）`,
         };
       }
 
@@ -334,6 +369,13 @@ export class TradeService {
     return this.cfg.amountSol;
   }
 
+  /** Human label for the buy size — "80% 餘額" (balance mode) or "0.01 SOL". */
+  get buySizeLabel(): string {
+    return this.cfg.buyBalancePct > 0
+      ? `${this.cfg.buyBalancePct}% 餘額`
+      : `${this.cfg.amountSol} SOL`;
+  }
+
   /** Whether a buy is allowed for this token right now. */
   async shouldBuy(token: string): Promise<TradeDecision> {
     const [alreadyTraded, todayCount] = await Promise.all([
@@ -382,6 +424,8 @@ export class TradeService {
     balanceSol?: number;
     quoteOk?: boolean;
     error?: string;
+    buyBalancePct: number;
+    buySizeLabel: string;
   }> {
     const v = await this.client.verify();
     return {
@@ -391,6 +435,8 @@ export class TradeService {
       balanceSol: v.balanceSol,
       quoteOk: v.quoteOk,
       error: v.error,
+      buyBalancePct: this.cfg.buyBalancePct,
+      buySizeLabel: this.buySizeLabel,
     };
   }
 
@@ -399,6 +445,8 @@ export class TradeService {
     mode: string;
     wallet?: string;
     amountSol: number;
+    buyBalancePct: number;
+    buySizeLabel: string;
     slippagePct: number;
     maxDailyBuys: number;
     todayCount: number;
@@ -414,6 +462,8 @@ export class TradeService {
       mode: this.cfg.mode,
       wallet,
       amountSol: this.cfg.amountSol,
+      buyBalancePct: this.cfg.buyBalancePct,
+      buySizeLabel: this.buySizeLabel,
       slippagePct: this.cfg.slippagePct,
       maxDailyBuys: this.cfg.maxDailyBuys,
       todayCount,

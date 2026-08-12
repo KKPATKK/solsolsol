@@ -339,7 +339,7 @@ export class Scanner {
           ];
           if (this.trade && this.trade.mode === "manual") {
             buttons.push({
-              text: `🛒 買入 ${this.trade.amountSol} SOL`,
+              text: `🛒 買入 ${this.trade.buySizeLabel}`,
               callback_data: `buy:${tokenAddress}`,
             });
           }

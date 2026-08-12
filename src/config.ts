@@ -39,8 +39,10 @@ export interface TradeConfigSettings {
    * the user explicitly sets this.
    */
   mode: "off" | "manual" | "auto";
-  /** SOL amount per buy (input side of the swap). */
+  /** SOL amount per buy (input side of the swap) — fixed-size fallback. */
   amountSol: number;
+  /** Buy with this % of the CURRENT wallet balance (0 = use amountSol). */
+  buyBalancePct: number;
   /** Slippage tolerance in percent (memecoins move fast — default 25). */
   slippagePct: number;
   /** Priority fee in SOL per buy. */
@@ -97,6 +99,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
   const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
   const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
+  const tradeBuyPct = Number(env.TRADE_BUY_BALANCE_PCT ?? 80);
   const tradeSlippage = Number(env.TRADE_SLIPPAGE_PCT ?? 25);
   const tradeFee = Number(env.TRADE_PRIORITY_FEE_SOL ?? 0.001);
   const tradeMaxBuys = Number(env.TRADE_MAX_DAILY_BUYS ?? 5);
@@ -149,6 +152,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
             : "off",
       amountSol:
         Number.isFinite(tradeAmount) && tradeAmount > 0 ? tradeAmount : 0.1,
+      buyBalancePct:
+        Number.isFinite(tradeBuyPct) && tradeBuyPct > 0 && tradeBuyPct <= 100
+          ? tradeBuyPct
+          : 0,
       slippagePct:
         Number.isFinite(tradeSlippage) && tradeSlippage >= 0
           ? tradeSlippage

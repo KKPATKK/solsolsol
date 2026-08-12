@@ -309,7 +309,7 @@ export function createBot(
         "⚙️ Jupiter 自动买入设置:",
         `模式: ${modeLine}`,
         `钱包: ${s.wallet ? `\`${s.wallet.slice(0, 8)}…${s.wallet.slice(-6)}\`` : "（未配置）"}`,
-        `每笔金额: ${s.amountSol} SOL`,
+        `每笔金额: ${s.buySizeLabel}`,
         `滑点: ${s.slippagePct}%`,
         `每日上限: ${s.todayCount}/${s.maxDailyBuys} 笔（24h 滚动）`,
         "",
@@ -336,7 +336,7 @@ export function createBot(
       await ctx.answerCallbackQuery({ text: "当前非手动模式，请用 /trade 查看" });
       return;
     }
-    await ctx.answerCallbackQuery({ text: `下单中 ${trade.amountSol} SOL…` });
+    await ctx.answerCallbackQuery({ text: `下单中 ${trade.buySizeLabel}…` });
     const chatId = String(
       ctx.chat?.id ?? ctx.callbackQuery.message?.chat.id ?? "",
     );
@@ -346,7 +346,7 @@ export function createBot(
     const baseText = ctx.callbackQuery.message?.text ?? `🛒 ${token}`;
     const line = result
       ? result.ok
-        ? `✅ 已下单 ${trade.amountSol} SOL${result.txHash ? `\n🔗 tx: ${result.txHash}` : ""}`
+        ? `✅ 已下单 ${trade.buySizeLabel}${result.txHash ? `\n🔗 tx: ${result.txHash}` : ""}`
         : `❌ 下单失败: ${result.error ?? "未知错误"}`
       : `⏭ 未下单: ${decision.reason}`;
     try {

@@ -12,7 +12,7 @@ const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
-const { tradeDecision, parseQuote, parseSendResponse } = require("../dist/jupiter.js");
+const { tradeDecision, parseQuote, parseSendResponse, buyAmountLamports } = require("../dist/jupiter.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -369,6 +369,22 @@ async function main() {
     });
     assert.equal(metis.ok, true);
     assert.equal(metis.quote.outAmount, "17057460");
+  });
+
+  await test("buyAmountLamports sizes by balance pct and falls back to fixed", () => {
+    // Balance mode: 80% of a 1.25 SOL balance.
+    assert.deepEqual(buyAmountLamports(1_250_000_000, 80, 0.01), {
+      amountLamports: 1_000_000_000,
+      source: "balance",
+    });
+    // Fixed mode (pct = 0): the configured amountSol wins.
+    assert.deepEqual(buyAmountLamports(5_000_000_000, 0, 0.01), {
+      amountLamports: 10_000_000,
+      source: "fixed",
+    });
+    // Percentage mode never buys blind: null balance and empty wallet are errors.
+    assert.ok("error" in buyAmountLamports(null, 80, 0.01));
+    assert.ok("error" in buyAmountLamports(0, 80, 0.01));
   });
 
   await test("parseSendResponse normalizes RPC send results", () => {

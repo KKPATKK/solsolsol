@@ -94,6 +94,7 @@ export function tradeFingerprint(env: Env): string {
     env.BOT_WALLET_PRIVATE_KEY ? "key:1" : "key:0",
     env.TRADE_MODE ?? "",
     env.TRADE_AMOUNT_SOL ?? "",
+    env.TRADE_BUY_BALANCE_PCT ?? "",
     env.TRADE_SLIPPAGE_PCT ?? "",
     env.TRADE_PRIORITY_FEE_SOL ?? "",
     env.TRADE_MAX_DAILY_BUYS ?? "",
@@ -548,6 +549,8 @@ export default {
         balanceSol: v.balanceSol ?? null,
         quoteOk: v.quoteOk ?? false,
         amountSol: cfg!.trade.amountSol,
+        buyBalancePct: cfg!.trade.buyBalancePct,
+        buySizeLabel: trade.buySizeLabel,
         slippagePct: cfg!.trade.slippagePct,
         error: v.error,
       });

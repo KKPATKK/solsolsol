@@ -55,6 +55,10 @@ SUPPLY_FLOW_CHECK_INFLOW = "true"
 # BOT_WALLET_PRIVATE_KEY and flipping TRADE_MODE) take effect WITHOUT a
 # redeploy: the worker detects the binding change and re-initializes.
 TRADE_MODE = "manual"
+# Buy size: TRADE_BUY_BALANCE_PCT (1–100) buys that % of the CURRENT wallet
+# balance, computed live at execution time (both manual button and auto).
+# Set to 0 to fall back to the fixed TRADE_AMOUNT_SOL size instead.
+TRADE_BUY_BALANCE_PCT = "80"
 TRADE_AMOUNT_SOL = "0.01"
 TRADE_SLIPPAGE_PCT = "25"
 TRADE_PRIORITY_FEE_SOL = "0.001"
