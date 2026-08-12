@@ -63,3 +63,24 @@ jobs:
           else
             echo "::warning::HELIUS_API_KEY not set as a GitHub Actions secret — skipping (fallback to public RPC)"
           fi
+
+      # Optional JUPITER_API_KEY (x-api-key header) for higher rate limits on
+      # the new developer platform. Keyless works at 0.5 RPS, so this is
+      # purely a headroom upgrade — best-effort, never blocks a release.
+      # Wired here (not the dashboard) to avoid the un-deployed-version draft
+      # trap of dashboard secret edits under Cloudflare versioning.
+      - name: Set JUPITER_API_KEY worker secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          JUPITER_API_KEY: ${{ secrets.JUPITER_API_KEY }}
+        run: |
+          if [ -n "$JUPITER_API_KEY" ]; then
+            if echo "$JUPITER_API_KEY" | npx wrangler secret put JUPITER_API_KEY; then
+              echo "::notice::JUPITER_API_KEY written to Worker secret"
+            else
+              echo "::warning::JUPITER_API_KEY secret update failed (see above) — continuing keyless (0.5 RPS)"
+            fi
+          else
+            echo "::warning::JUPITER_API_KEY not set as a GitHub Actions secret — skipping (keyless 0.5 RPS is fine)"
+          fi
