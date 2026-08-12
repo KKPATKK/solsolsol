@@ -7,6 +7,7 @@ import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
+import { TradeService, TrojanClient } from "./trojan";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -47,6 +48,7 @@ let bot: Bot | null = null;
 let webhook: ((req: Request) => Promise<Response>) | null = null;
 let dex: DexScreenerClient | null = null;
 let helius: HeliusClient | null = null;
+let trade: TradeService | null = null;
 let cfg: AppConfig | null = null;
 /** Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
  * expensive (~150–300 Helius credits), so throttle manual triggers. */
@@ -72,6 +74,8 @@ let scanRunning = false;
 let heliusConfigured = false;
 // Whether the BIRDEYE_API_KEY secret reached the Worker (presence only — never the value).
 let birdeyeConfigured = false;
+// Whether the TROJAN_API_KEY secret reached the Worker (presence only).
+let trojanConfigured = false;
 
 /** Alert when the previous scan finished more than this long ago (missed ticks). */
 const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
@@ -95,6 +99,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     tursoConfigured = Boolean(config.tursoUrl);
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
+    trojanConfigured = Boolean(config.trojan.apiKey);
 
     if (config.tursoUrl) {
       try {
@@ -127,11 +132,24 @@ async function ensureInitialized(env: Env): Promise<void> {
 
       helius = new HeliusClient(config);
 
+      // Trojan trading (off by default; only constructed when a key exists).
+      if (config.trojan.apiKey && db) {
+        trade = new TradeService(
+          config.trojan,
+          new TrojanClient(config.trojan),
+          db,
+        );
+        console.log(
+          `[worker] Trojan trading ready (mode=${config.trojan.mode}, ${config.trojan.amountSol} SOL/buy)`,
+        );
+      }
+
       bot = createBot(
         config.telegramBotToken,
         db,
         config.scanIntervalSeconds,
         analyzeMintFlow,
+        trade ?? undefined,
       );
       webhook = webhookCallback(bot, "cloudflare-mod");
       botReady = true;
@@ -145,6 +163,7 @@ async function ensureInitialized(env: Env): Promise<void> {
           birdeye,
           new RugcheckClient(config),
           helius,
+          trade ?? undefined,
         );
         scannerReady = true;
       }
@@ -432,6 +451,8 @@ export default {
         scannerReady,
         heliusConfigured,
         birdeyeConfigured,
+        trojanConfigured,
+        trojanMode: cfg?.trojan.mode ?? "off",
         initError,
         lastScanMs,
         lastScanError,
@@ -467,6 +488,28 @@ export default {
       flowDebugLastRunAt.set(mint, Date.now());
       const res = await analyzeMintFlow(mint);
       return Response.json({ mint, ...res });
+    }
+
+    // Read-only Trojan connection check (no money moves): verifies the API
+    // key + linked wallet so a key can be validated before enabling any
+    // real-money mode.
+    if (url.pathname === "/debug/trade") {
+      if (!trade) {
+        return Response.json({
+          ok: false,
+          error: "TROJAN_API_KEY 未配置（或数据库未就绪）",
+          mode: cfg?.trojan.mode ?? "off",
+        });
+      }
+      const v = await trade.verify();
+      return Response.json({
+        ok: v.ok,
+        mode: v.mode,
+        amountSol: cfg!.trojan.amountSol,
+        slippagePct: cfg!.trojan.slippagePct,
+        wallet: v.wallet,
+        error: v.error,
+      });
     }
 
     // Telegram webhook (grammY registers commands on this bot instance).

@@ -224,6 +224,25 @@ export class Db {
     await this.client.execute(
       `CREATE INDEX IF NOT EXISTS idx_seen_tokens_token ON seen_tokens(token)`,
     );
+    // Trade log: one row per bought token (UNIQUE(token) ⇒ a coin is bought
+    // at most once, enforced at the DB layer regardless of mode).
+    await this.client.execute(`
+      CREATE TABLE IF NOT EXISTS trade_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token TEXT NOT NULL UNIQUE,
+        chat_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        tx_hash TEXT,
+        amount_sol REAL NOT NULL,
+        slippage_pct REAL NOT NULL,
+        error TEXT,
+        created_at INTEGER NOT NULL
+      );
+    `);
+    await this.client.execute(
+      `CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at)`,
+    );
     await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");
@@ -417,6 +436,75 @@ export class Db {
       });
       await this.setWorkerState("history_last_prune", String(Date.now()));
     }
+  }
+
+  /** Record a Trojan buy attempt (UNIQUE(token): one row per coin). */
+  async recordTrade(entry: {
+    token: string;
+    chatId: string;
+    mode: "auto" | "manual";
+    status: "success" | "failed";
+    txHash: string | null;
+    amountSol: number;
+    slippagePct: number;
+    error: string | null;
+  }): Promise<void> {
+    await this.get().execute({
+      sql: `INSERT OR IGNORE INTO trade_log
+            (token, chat_id, mode, status, tx_hash, amount_sol, slippage_pct, error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        entry.token,
+        entry.chatId,
+        entry.mode,
+        entry.status,
+        entry.txHash,
+        entry.amountSol,
+        entry.slippagePct,
+        entry.error,
+        Date.now(),
+      ],
+    });
+  }
+
+  /** Whether a buy was ever attempted for this token (any chat, any mode). */
+  async hasTraded(token: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: "SELECT 1 AS seen FROM trade_log WHERE token = ? LIMIT 1",
+      args: [token],
+    });
+    return res.rows.length > 0;
+  }
+
+  /** Number of buy attempts since `sinceMs` (rolling daily-budget guard). */
+  async countTradesSince(sinceMs: number): Promise<number> {
+    const res = await this.get().execute({
+      sql: "SELECT COUNT(*) AS n FROM trade_log WHERE created_at >= ?",
+      args: [sinceMs],
+    });
+    const row = res.rows[0] as Record<string, unknown> | undefined;
+    return row ? Number(row.n ?? 0) : 0;
+  }
+
+  /** Most recent trade attempts (newest first) for diagnostics. */
+  async latestTrades(
+    limit: number,
+  ): Promise<Array<{ token: string; status: string; txHash: string | null; mode: string; error: string | null; createdAt: number }>> {
+    const res = await this.get().execute({
+      sql: "SELECT token, mode, status, tx_hash, error, created_at FROM trade_log ORDER BY created_at DESC LIMIT ?",
+      args: [Math.max(1, Math.min(limit, 50))],
+    });
+    return res.rows.map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        token: String(r.token),
+        mode: String(r.mode),
+        status: String(r.status),
+        txHash: r.tx_hash === null || r.tx_hash === undefined ? null : String(r.tx_hash),
+        error: r.error === null || r.error === undefined ? null : String(r.error),
+        createdAt: Number(r.created_at),
+      };
+    });
   }
 
   async markTokenSeen(chatId: string, token: string): Promise<void> {

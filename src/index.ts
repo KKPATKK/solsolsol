@@ -7,6 +7,7 @@ import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
+import { TradeService, TrojanClient } from "./trojan";
 
 const config = loadConfig();
 
@@ -82,7 +83,25 @@ async function main(): Promise<void> {
 
   // Telegram bot — needs TELEGRAM_BOT_TOKEN from @BotFather.
   if (config.telegramBotToken) {
-    const bot = createBot(config.telegramBotToken, db, config.scanIntervalSeconds);
+    // Trojan trading (off by default; only constructed when a key exists).
+    let trade: TradeService | null = null;
+    if (config.trojan.apiKey && db) {
+      trade = new TradeService(
+        config.trojan,
+        new TrojanClient(config.trojan),
+        db,
+      );
+      console.log(
+        `[trojan] trading ready (mode=${config.trojan.mode}, ${config.trojan.amountSol} SOL/buy)`,
+      );
+    }
+    const bot = createBot(
+      config.telegramBotToken,
+      db,
+      config.scanIntervalSeconds,
+      undefined,
+      trade ?? undefined,
+    );
 
     // Scanner needs both the bot and the database to run.
     if (db) {
@@ -114,6 +133,7 @@ async function main(): Promise<void> {
         birdeye,
         new RugcheckClient(config),
         helius,
+        trade ?? undefined,
       );
 
       const runScan = async (initial: boolean) => {

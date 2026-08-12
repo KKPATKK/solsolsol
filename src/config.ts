@@ -24,6 +24,33 @@ export interface SupplyFlowConfig {
   budgetMs: number;
 }
 
+export interface TrojanConfigSettings {
+  /**
+   * Trojan private API key (from @TrojanOnSolBot /api or the Trojan
+   * terminal). Without it trading is disabled regardless of mode.
+   */
+  apiKey?: string;
+  /** Base URL of the Trojan API (override if the endpoint has moved). */
+  baseUrl: string;
+  /**
+   * off = trading disabled (default). manual = the push card gets a
+   * "🛒 買入" button that executes one buy when tapped. auto = buy
+   * immediately after a qualifying coin is pushed. Never real-money until
+   * the user explicitly sets this.
+   */
+  mode: "off" | "manual" | "auto";
+  /** SOL amount per buy. */
+  amountSol: number;
+  /** Slippage tolerance in percent (memecoins move fast — default 25). */
+  slippagePct: number;
+  /** Priority fee in SOL per buy. */
+  priorityFeeSol: number;
+  /** Max buys per rolling 24h window (daily budget guard). */
+  maxDailyBuys: number;
+  /** Hard timeout for each Trojan API call (ms). */
+  timeoutMs: number;
+}
+
 export interface AppConfig {
   /** Telegram bot token from @BotFather. Bot won't start without it. */
   telegramBotToken?: string;
@@ -51,6 +78,8 @@ export interface AppConfig {
   heliusRequestIntervalMs: number;
   /** On-chain supply-flow (rug/distribution) detector tuning. */
   supplyFlow: SupplyFlowConfig;
+  /** Trojan auto-trading settings (off by default — see TrojanConfigSettings). */
+  trojan: TrojanConfigSettings;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -60,6 +89,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawPort = Number(env.PORT ?? 3000);
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
+  const rawTrojanMode = (env.TROJAN_MODE ?? "off").toLowerCase();
+  const trojanAmount = Number(env.TROJAN_AMOUNT_SOL ?? 0.1);
+  const trojanSlippage = Number(env.TROJAN_SLIPPAGE_PCT ?? 25);
+  const trojanFee = Number(env.TROJAN_PRIORITY_FEE_SOL ?? 0.001);
+  const trojanMaxBuys = Number(env.TROJAN_MAX_DAILY_BUYS ?? 5);
+  const trojanTimeout = Number(env.TROJAN_TIMEOUT_MS ?? 15_000);
 
   return {
     telegramBotToken: env.TELEGRAM_BOT_TOKEN || undefined,
@@ -97,6 +132,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       topAccounts: Number(env.SUPPLY_FLOW_TOP_ACCOUNTS ?? 10),
       checkInflow: (env.SUPPLY_FLOW_CHECK_INFLOW ?? "true") !== "false",
       budgetMs: Number(env.SUPPLY_FLOW_BUDGET_MS ?? 15_000),
+    },
+    trojan: {
+      apiKey: env.TROJAN_API_KEY || undefined,
+      baseUrl: env.TROJAN_API_BASE || "https://api.trojan.app",
+      mode:
+        rawTrojanMode === "auto"
+          ? "auto"
+          : rawTrojanMode === "manual"
+            ? "manual"
+            : "off",
+      amountSol:
+        Number.isFinite(trojanAmount) && trojanAmount > 0 ? trojanAmount : 0.1,
+      slippagePct:
+        Number.isFinite(trojanSlippage) && trojanSlippage >= 0
+          ? trojanSlippage
+          : 25,
+      priorityFeeSol:
+        Number.isFinite(trojanFee) && trojanFee >= 0 ? trojanFee : 0.001,
+      maxDailyBuys:
+        Number.isFinite(trojanMaxBuys) && trojanMaxBuys >= 0
+          ? Math.floor(trojanMaxBuys)
+          : 5,
+      timeoutMs:
+        Number.isFinite(trojanTimeout) && trojanTimeout > 0
+          ? trojanTimeout
+          : 15_000,
     },
   };
 }

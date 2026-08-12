@@ -12,6 +12,7 @@ const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
+const { tradeDecision, parseBuyResponse } = require("../dist/trojan.js");
 
 let passed = 0;
 let failed = 0;
@@ -45,7 +46,7 @@ async function main() {
       await db.init(); // second init must not throw (IF NOT EXISTS / guarded migrations)
       const r = await t.client.execute("SELECT name FROM sqlite_master WHERE type = 'table'");
       const names = r.rows.map((row) => row.name);
-      for (const table of ["chat_settings", "worker_state", "seen_tokens", "token_stats", "scan_history"]) {
+      for (const table of ["chat_settings", "worker_state", "seen_tokens", "token_stats", "scan_history", "trade_log"]) {
         assert.ok(names.includes(table), `missing table ${table}`);
       }
     } finally {
@@ -294,6 +295,71 @@ async function main() {
     } finally {
       await t.cleanup();
     }
+  });
+
+  await test("trade_log record/hasTraded/countTradesSince round-trips with UNIQUE dedupe", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const base = {
+        chatId: "chat-t",
+        mode: "auto",
+        status: "success",
+        amountSol: 0.1,
+        slippagePct: 25,
+      };
+      await db.recordTrade({ ...base, token: "TOK-A", txHash: "sigA", error: null });
+      // Same token again (any mode/status) must be ignored — one buy per coin.
+      await db.recordTrade({ ...base, token: "TOK-A", status: "failed", txHash: null, error: "dup" });
+      await db.recordTrade({ ...base, token: "TOK-B", txHash: null, error: "boom" });
+      assert.equal(await db.hasTraded("TOK-A"), true);
+      assert.equal(await db.hasTraded("TOK-B"), true);
+      assert.equal(await db.hasTraded("TOK-C"), false);
+      assert.equal(await db.countTradesSince(Date.now() - 60_000), 2);
+      assert.equal(await db.countTradesSince(Date.now() + 60_000), 0);
+      const latest = await db.latestTrades(10);
+      assert.equal(latest.length, 2);
+      assert.equal(latest[0].token, "TOK-B"); // newest first
+      assert.equal(latest[1].txHash, "sigA");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  // ---------- trojan.ts ----------
+
+  await test("tradeDecision gates on mode, dedupe and daily cap", () => {
+    const cfg = { mode: "auto", maxDailyBuys: 5 };
+    assert.equal(tradeDecision(cfg, { alreadyTraded: false, todayCount: 0 }).ok, true);
+    assert.equal(tradeDecision({ mode: "off", maxDailyBuys: 5 }, { alreadyTraded: false, todayCount: 0 }).ok, false);
+    assert.equal(tradeDecision(cfg, { alreadyTraded: true, todayCount: 0 }).ok, false);
+    assert.equal(tradeDecision(cfg, { alreadyTraded: false, todayCount: 5 }).ok, false);
+    assert.equal(tradeDecision(cfg, { alreadyTraded: false, todayCount: 4 }).ok, true);
+    assert.equal(tradeDecision(cfg, { alreadyTraded: true, todayCount: 5 }).ok, false);
+  });
+
+  await test("parseBuyResponse normalizes Trojan buy responses", () => {
+    // Common documented shape: { success, txHash }
+    const a = parseBuyResponse({ success: true, txHash: "SIG1" });
+    assert.deepEqual(a, { ok: true, txHash: "SIG1" });
+    // data.signature variant
+    const b = parseBuyResponse({ status: "success", data: { signature: "SIG2" } });
+    assert.deepEqual(b, { ok: true, txHash: "SIG2" });
+    // success with no hash is still ok
+    assert.deepEqual(parseBuyResponse({ success: true }), { ok: true });
+    // explicit failure surfaces the message
+    const c = parseBuyResponse({ error: "insufficient balance" });
+    assert.equal(c.ok, false);
+    assert.equal(c.error, "insufficient balance");
+    // wrapped failure (data.message)
+    const d = parseBuyResponse({ data: { message: "token not found" } });
+    assert.equal(d.ok, false);
+    assert.equal(d.error, "token not found");
+    // junk
+    assert.equal(parseBuyResponse(null).ok, false);
+    assert.equal(parseBuyResponse("nope").ok, false);
+    assert.equal(parseBuyResponse(42).ok, false);
   });
 
   // ---------- bot.ts ----------

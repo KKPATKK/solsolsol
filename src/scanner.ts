@@ -7,6 +7,7 @@ import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreen
 import { fmtAge, fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
+import type { TradeService } from "./trojan";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
 /** Axiom trade token page (mint address appended). */
@@ -143,6 +144,8 @@ export class Scanner {
     private readonly birdeye: BirdeyeClient | null,
     private readonly rugcheck: RugcheckClient | null,
     private readonly helius: HeliusClient | null,
+    /** Trojan trading (null = trading disabled — no key configured). */
+    private readonly trade: TradeService | null = null,
   ) {}
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -326,6 +329,20 @@ export class Scanner {
         }
         try {
           const tokenAddress = coin.pair.baseToken.address;
+          // Manual trading mode: add a one-tap buy button to the push card.
+          // Auto mode buys right after the push (below); off mode adds nothing.
+          const buttons: InlineKeyboardButton[] = [
+            {
+              text: "🔗 打开 Axiom 页面",
+              url: `${AXIOM_BASE_URL}${tokenAddress}`,
+            } as InlineKeyboardButton,
+          ];
+          if (this.trade && this.trade.mode === "manual") {
+            buttons.push({
+              text: `🛒 買入 ${this.trade.amountSol} SOL`,
+              callback_data: `buy:${tokenAddress}`,
+            });
+          }
           await this.bot.api.sendMessage(
             coin.chatId,
             renderMessage(
@@ -337,21 +354,16 @@ export class Scanner {
               trader.sniperPct,
               flow.status === "clean",
             ),
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    {
-                      text: "🔗 打开 Axiom 页面",
-                      url: `${AXIOM_BASE_URL}${tokenAddress}`,
-                    } as InlineKeyboardButton,
-                  ],
-                ],
-              },
-            },
+            { reply_markup: { inline_keyboard: [buttons] } },
           );
           await this.db.markTokenSeen(coin.chatId, coin.profile.tokenAddress);
           pushed++;
+          // Auto trading mode: buy immediately after the push. Dedupe is
+          // guaranteed twice over — the coin is already in seen_tokens, and
+          // trade_log has UNIQUE(token) — so a slow buy can never double-spend.
+          if (this.trade && this.trade.mode === "auto") {
+            await this.autoBuy(coin);
+          }
         } catch (err) {
           console.error(
             `[scanner] failed to push ${coin.profile.symbol ?? coin.profile.tokenAddress} to ${coin.chatId}:`,
@@ -377,6 +389,52 @@ export class Scanner {
         this.lastSummary = diag;
         this.running = false;
       }
+    }
+  }
+
+  /**
+   * Auto-mode buy for a just-pushed coin. Bounded by a hard timeout so a
+   * slow Trojan response can never wedge the tick; result is reported to the
+   * chat. Errors are logged, never thrown (a failed buy must not fail the
+   * scan).
+   */
+  private async autoBuy(coin: QualifyingCoin): Promise<void> {
+    const token = coin.pair.baseToken.address;
+    const symbol = coin.pair.baseToken.symbol || coin.profile.symbol || token.slice(0, 8);
+    const t0 = Date.now();
+    try {
+      const outcome = await Promise.race([
+        this.trade!.executeBuy(token, coin.chatId),
+        new Promise<{
+          decision: { ok: false; reason: string };
+          result?: undefined;
+        }>((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                decision: { ok: false, reason: "超时（Trojan 无响应）" },
+              }),
+            this.config.trojan.timeoutMs + 3_000,
+          ),
+        ),
+      ]);
+      const { decision, result } = outcome;
+      const lines = ["🛒 自动买入", `🪙 ${symbol}`];
+      if (!decision.ok) {
+        lines.push(`⏭ 未下单: ${decision.reason}`);
+      } else if (result && result.ok) {
+        lines.push(`✅ 成功: ${this.trade!.amountSol} SOL`);
+        if (result.txHash) lines.push(`🔗 tx: ${result.txHash}`);
+      } else {
+        lines.push(`❌ 失败: ${result?.error ?? "未知错误"}`);
+      }
+      lines.push(`⏱ ${Date.now() - t0}ms`);
+      await this.bot.api.sendMessage(coin.chatId, lines.join("\n"));
+    } catch (err) {
+      console.error(
+        `[scanner] auto-buy failed for ${symbol} (${token}):`,
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 

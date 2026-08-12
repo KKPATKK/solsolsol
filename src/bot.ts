@@ -2,6 +2,7 @@ import { Bot, type Context } from "grammy";
 import { DEFAULT_SETTINGS, type Db } from "./db";
 import { fmtUsd, parseNumber } from "./format";
 import type { SupplyFlowResult } from "./helius";
+import type { TradeService } from "./trojan";
 
 function formatInterval(seconds: number): string {
   return seconds % 60 === 0 ? `每 ${seconds / 60} 分钟` : `每 ${seconds} 秒`;
@@ -16,6 +17,7 @@ function buildUsage(scanIntervalSeconds: number): string {
     "*命令*",
     "`/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>` — 设置筛选条件",
     "`/flow <合约地址>` — 手动检查某币的链上供应流（多钱包喂给同一接收者再卖出）",
+    "`/trade` — 查看 Trojan 自动买入设置",
     "`/status` — 查看当前条件",
     "`/on` — 开启推送",
     "`/off` — 关闭推送",
@@ -122,6 +124,7 @@ export function createBot(
   db: Db | null,
   scanIntervalSeconds: number = 300,
   flowAnalyzer?: (mint: string) => Promise<FlowCheckResult>,
+  trade?: TradeService,
 ): Bot {
   const bot = new Bot(token);
   const USAGE = buildUsage(scanIntervalSeconds);
@@ -281,6 +284,75 @@ export function createBot(
         `⚙️ 分析窗口: ${Math.round(r.windowMs / 3600e3)}h | 耗时: ${res.ms ?? elapsedMs}ms${res.cached ? "（缓存，30 分钟内未重新分析）" : ""}`,
       ].join("\n"),
     );
+  });
+
+  bot.command("trade", async (ctx) => {
+    if (!trade) {
+      await ctx.reply(
+        "⚙️ 自动买入未启用（Worker 未配置 TROJAN_API_KEY）。\n\n" +
+          "启用步骤:\n" +
+          "1. 在 Telegram 打开 @TrojanOnSolBot，发送 /api 获取 Trojan API key\n" +
+          "2. 把 key 填入 Cloudflare 的 TROJAN_API_KEY 变量\n" +
+          "3. 设置 TROJAN_MODE（manual = 推送卡片加购买按钮 / auto = 自动下单）",
+      );
+      return;
+    }
+    const s = await trade.status();
+    const modeLine =
+      s.mode === "off"
+        ? "⛔ 关闭（TROJAN_MODE=off — 不会下单）"
+        : s.mode === "manual"
+          ? "🔘 手动（推送卡片带购买按钮，点击后下单）"
+          : "🤖 自动（符合条件的币推送后立即下单）";
+    await ctx.reply(
+      [
+        "⚙️ Trojan 自动买入设置:",
+        `模式: ${modeLine}`,
+        `每笔金额: ${s.amountSol} SOL`,
+        `滑点: ${s.slippagePct}%`,
+        `每日上限: ${s.todayCount}/${s.maxDailyBuys} 笔（24h 滚动）`,
+        "",
+        "设置方式: TROJAN_MODE=manual 或 auto（Cloudflare 变量）",
+      ].join("\n"),
+    );
+  });
+
+  // Manual-mode buy button (callback data `buy:<mint>`). Executes exactly
+  // one buy via TradeService; re-checks all gates (off/daily-cap/dedupe).
+  bot.on("callback_query:data", async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    if (!data || !data.startsWith("buy:")) return;
+    const token = data.slice(4);
+    if (!token || !MINT_RE.test(token)) {
+      await ctx.answerCallbackQuery({ text: "无效的合约地址" });
+      return;
+    }
+    if (!trade) {
+      await ctx.answerCallbackQuery({ text: "交易未启用（缺 TROJAN_API_KEY）" });
+      return;
+    }
+    if (trade.mode !== "manual") {
+      await ctx.answerCallbackQuery({ text: "当前非手动模式，请用 /trade 查看" });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: `下单中 ${trade.amountSol} SOL…` });
+    const chatId = String(
+      ctx.chat?.id ?? ctx.callbackQuery.message?.chat.id ?? "",
+    );
+    const { decision, result } = await trade.executeBuy(token, chatId, {
+      manual: true,
+    });
+    const baseText = ctx.callbackQuery.message?.text ?? `🛒 ${token}`;
+    const line = result
+      ? result.ok
+        ? `✅ 已下单 ${trade.amountSol} SOL${result.txHash ? `\n🔗 tx: ${result.txHash}` : ""}`
+        : `❌ 下单失败: ${result.error ?? "未知错误"}`
+      : `⏭ 未下单: ${decision.reason}`;
+    try {
+      await ctx.editMessageText(`${baseText}\n\n${line}`);
+    } catch {
+      await ctx.answerCallbackQuery({ text: line });
+    }
   });
 
   bot.command("off", async (ctx) => {
