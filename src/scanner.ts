@@ -1,5 +1,5 @@
 import type { Bot } from "grammy";
-import type { InlineKeyboardButton } from "grammy/types";
+import { tradeKeyboard } from "./bot";
 import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import type { Db, TokenStats } from "./db";
@@ -10,8 +10,6 @@ import type { RugcheckClient } from "./rugcheck";
 import type { TradeService } from "./jupiter";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
-/** Axiom trade token page (mint address appended). */
-const AXIOM_BASE_URL = "https://axiom.trade/t/";
 /** A token's opening volume (DexScreener proxy) is only meaningful if we saw it young. */
 const MAX_MEASURABLE_AGE_MIN = 5;
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -331,23 +329,12 @@ export class Scanner {
           const tokenAddress = coin.pair.baseToken.address;
           // Manual trading mode: add a one-tap buy button to the push card.
           // Auto mode buys right after the push (below); off mode adds nothing.
-          const buttons: InlineKeyboardButton[] = [
-            {
-              text: "🔗 打开 Axiom 页面",
-              url: `${AXIOM_BASE_URL}${tokenAddress}`,
-            } as InlineKeyboardButton,
-          ];
-          // Live mode read: /setmode flips apply to the very next card (and
-          // the buy button only renders in manual mode).
+          // Live mode read: /setmode flips apply to the very next card. Buy
+          // button renders in manual mode; sell buttons in any non-off mode
+          // (in auto the coin was already bought — exits are what matter).
           const tradeMode = this.trade
             ? await this.trade.effectiveMode()
             : "off";
-          if (tradeMode === "manual") {
-            buttons.push({
-              text: `🛒 買入 ${this.trade!.buySizeLabel}`,
-              callback_data: `buy:${tokenAddress}`,
-            });
-          }
           await this.bot.api.sendMessage(
             coin.chatId,
             renderMessage(
@@ -359,7 +346,15 @@ export class Scanner {
               trader.sniperPct,
               flow.status === "clean",
             ),
-            { reply_markup: { inline_keyboard: [buttons] } },
+            {
+              reply_markup: {
+                inline_keyboard: tradeKeyboard(
+                  tokenAddress,
+                  this.trade ? this.trade.buySizeLabel : "",
+                  tradeMode,
+                ),
+              },
+            },
           );
           await this.db.markTokenSeen(coin.chatId, coin.profile.tokenAddress);
           pushed++;

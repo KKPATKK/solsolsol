@@ -1,8 +1,10 @@
 import { Bot, type Context } from "grammy";
+import type { InlineKeyboardButton } from "grammy/types";
 import { isAdmin } from "./config";
 import { DEFAULT_SETTINGS, type Db } from "./db";
 import { fmtUsd, parseNumber } from "./format";
 import type { SupplyFlowResult } from "./helius";
+import { parseSellCallback, type SellFraction, type TradeMode } from "./jupiter";
 import type { TradeService } from "./jupiter";
 
 function formatInterval(seconds: number): string {
@@ -20,6 +22,7 @@ function buildUsage(scanIntervalSeconds: number): string {
     "`/flow <合约地址>` — 手动检查某币的链上供应流（多钱包喂给同一接收者再卖出）",
     "`/trade` — 查看 Jupiter 自动买入设置",
     "`/setmode <manual|auto|off>` — 切换交易模式（仅管理员）",
+    "`/sell <合约地址> <half|all>` — 卖出持仓（一半或全部，仅管理员）",
     "`/status` — 查看当前条件",
     "`/on` — 开启推送",
     "`/off` — 关闭推送",
@@ -114,6 +117,37 @@ export interface FlowCheckResult {
 
 /** Base58 mint address (32–44 chars, no 0/O/I/l). */
 const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+/** Axiom trade token page (mint address appended) — inline button on cards. */
+const AXIOM_BASE_URL = "https://axiom.trade/t/";
+
+/**
+ * Inline keyboard for a push card / bought card: the Axiom link plus the
+ * trade actions. Buy renders only in manual mode (auto already bought and
+ * dedupe blocks a second buy); sell buttons render in any non-off mode —
+ * they are exits, useful exactly when the bot auto-bought.
+ */
+export function tradeKeyboard(
+  token: string,
+  buySizeLabel: string,
+  mode: TradeMode,
+): InlineKeyboardButton[][] {
+  const rows: InlineKeyboardButton[][] = [
+    [{ text: "🔗 打开 Axiom 页面", url: `${AXIOM_BASE_URL}${token}` }],
+  ];
+  const actions: InlineKeyboardButton[] = [];
+  if (mode === "manual") {
+    actions.push({ text: `🛒 買入 ${buySizeLabel}`, callback_data: `buy:${token}` });
+  }
+  if (mode !== "off") {
+    actions.push(
+      { text: "📉 賣一半", callback_data: `sell:half:${token}` },
+      { text: "📉 全賣", callback_data: `sell:all:${token}` },
+    );
+  }
+  if (actions.length > 0) rows.push(actions);
+  return rows;
+}
 
 /**
  * createBot accepts a nullable database: without it the bot still runs
@@ -374,12 +408,14 @@ export function createBot(
     }
   });
 
-  // Manual-mode buy button (callback data `buy:<mint>`). Executes exactly
-  // one buy via TradeService; re-checks all gates (off/daily-cap/dedupe).
+  // Buy/sell buttons (callback data `buy:<mint>` / `sell:<half|all>:<mint>`).
+  // Every tap re-checks the gates (off mode, admin) before any money moves;
+  // edits keep the trade keyboard so the position can be managed in place.
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
-    if (!data || !data.startsWith("buy:")) return;
-    const token = data.slice(4);
+    if (!data || (!data.startsWith("buy:") && !data.startsWith("sell:"))) return;
+    const sell = parseSellCallback(data);
+    const token = sell ? sell.token : data.slice(4);
     if (!token || !MINT_RE.test(token)) {
       await ctx.answerCallbackQuery({ text: "无效的合约地址" });
       return;
@@ -389,32 +425,104 @@ export function createBot(
       return;
     }
     const mode = await trade.effectiveMode();
-    if (mode !== "manual") {
-      await ctx.answerCallbackQuery({ text: "当前非手动模式，请用 /trade 查看" });
+    if (mode === "off") {
+      await ctx.answerCallbackQuery({ text: "交易模式为关闭（off），请用 /setmode 开启" });
       return;
     }
-    // Real-money gate: when admins are configured, only they can tap buy.
+    // Real-money gate: when admins are configured, only they can tap.
     if (adminIds.length > 0 && !isAdmin(ctx.from?.id, adminIds)) {
-      await ctx.answerCallbackQuery({ text: "你不是本 bot 的管理员，无法下单" });
+      await ctx.answerCallbackQuery({ text: "你不是本 bot 的管理员，无法交易" });
       return;
     }
-    await ctx.answerCallbackQuery({ text: `下单中 ${trade.buySizeLabel}…` });
     const chatId = String(
       ctx.chat?.id ?? ctx.callbackQuery.message?.chat.id ?? "",
     );
+    const baseText =
+      ctx.callbackQuery.message?.text ?? (sell ? `📉 ${token}` : `🛒 ${token}`);
+    const keyboard = tradeKeyboard(token, trade.buySizeLabel, mode);
+
+    if (sell) {
+      await ctx.answerCallbackQuery({
+        text: `卖出中（${sell.mode === "all" ? "全部" : "一半"}）…`,
+      });
+      const out = await trade.sell(token, sell.mode, chatId);
+      const line =
+        out.ok && out.result?.ok
+          ? `✅ 已卖出 ${out.result.amountUi !== undefined ? `${out.result.amountUi.toFixed(4)} ` : ""}(${sell.mode === "all" ? "全部" : "一半"})${out.result.txHash ? `\n🔗 tx: ${out.result.txHash}` : ""}`
+          : `❌ 卖出失败: ${out.result?.error ?? out.reason ?? "未知错误"}`;
+      try {
+        await ctx.editMessageText(`${baseText}\n\n${line}`, {
+          reply_markup: { inline_keyboard: keyboard },
+        });
+      } catch {
+        await ctx.answerCallbackQuery({ text: line });
+      }
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: `下单中 ${trade.buySizeLabel}…` });
     const { decision, result } = await trade.executeBuy(token, chatId, {
       manual: true,
     });
-    const baseText = ctx.callbackQuery.message?.text ?? `🛒 ${token}`;
     const line = result
       ? result.ok
         ? `✅ 已下单 ${trade.buySizeLabel}${result.txHash ? `\n🔗 tx: ${result.txHash}` : ""}`
         : `❌ 下单失败: ${result.error ?? "未知错误"}`
       : `⏭ 未下单: ${decision.reason}`;
     try {
-      await ctx.editMessageText(`${baseText}\n\n${line}`);
+      // After a successful buy keep the trade keyboard so the position can
+      // be exited right from the card (editMessageText drops it otherwise).
+      await ctx.editMessageText(`${baseText}\n\n${line}`, {
+        ...(result?.ok ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+      });
     } catch {
       await ctx.answerCallbackQuery({ text: line });
+    }
+  });
+
+  // Sell by contract address (admin only) — works even when the push card is
+  // long gone. `half` sells 50% of the held balance, `all` sells everything.
+  bot.command("sell", async (ctx) => {
+    if (!trade) {
+      await ctx.reply("⚙️ 交易未启用（缺 BOT_WALLET_PRIVATE_KEY），无法卖出。");
+      return;
+    }
+    if (adminIds.length === 0 || !isAdmin(ctx.from?.id, adminIds)) {
+      await ctx.reply("⛔ 你不是本 bot 的管理员，无法卖出。");
+      return;
+    }
+    const mode = await trade.effectiveMode();
+    if (mode === "off") {
+      await ctx.reply("⛔ 交易模式为关闭（off），请先 /setmode manual 或 auto。");
+      return;
+    }
+    const parts = ctx.match.trim().split(/\s+/).filter(Boolean);
+    const fraction: SellFraction | null =
+      parts[1] === "half" || parts[1] === "all" ? parts[1] : null;
+    if (parts.length !== 2 || !fraction || !MINT_RE.test(parts[0])) {
+      await ctx.reply(
+        "用法: `/sell <合约地址> <half|all>`\n" +
+          "- `half` — 卖出持仓的一半\n" +
+          "- `all` — 卖出全部持仓\n" +
+          "例如: `/sell Cqs2xNRMCSMDpGzRZ5x225kjM9dhcnTFExiu5Hf6pump half`",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+    const token = parts[0];
+    const chatId = String(ctx.chat?.id ?? "");
+    await ctx.reply(
+      `📉 正在卖出 ${token.slice(0, 8)}…（${fraction === "all" ? "全部" : "一半"}）`,
+    );
+    const out = await trade.sell(token, fraction, chatId);
+    if (out.ok && out.result?.ok) {
+      await ctx.reply(
+        `✅ 已卖出 ${out.result.amountUi !== undefined ? `${out.result.amountUi.toFixed(4)} ` : ""}(${fraction === "all" ? "全部" : "一半"})${out.result.txHash ? `\n🔗 tx: ${out.result.txHash}` : ""}`,
+      );
+    } else {
+      await ctx.reply(
+        `❌ 卖出失败: ${out.result?.error ?? out.reason ?? "未知错误"}`,
+      );
     }
   });
 

@@ -105,10 +105,41 @@ export function buyAmountLamports(
   return { amountLamports: Math.floor(fixedAmountSol * 1e9), source: "fixed" };
 }
 
-/** SOL mint on Solana (the input side of every buy). */
+/** SOL mint on Solana (the input side of every buy, output of every sell). */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 /** USDC mint — used by verify() for a read-only quote sanity check. */
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+/** Standard SPL-Token program (pump.fun tokens use this). */
+const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/** Token-2022 program — queried too so newer tokens are still sellable. */
+const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+/** Sell fraction on the 🛒 card buttons / /sell command. */
+export type SellFraction = "half" | "all";
+
+/**
+ * Parse a `sell:<half|all>:<mint>` callback payload (pure — unit-tested).
+ * Returns null for anything else (buy:…, junk, malformed mint).
+ */
+export function parseSellCallback(
+  data: string,
+): { mode: SellFraction; token: string } | null {
+  if (!data.startsWith("sell:")) return null;
+  const parts = data.split(":");
+  if (parts.length !== 3) return null;
+  if (parts[1] !== "half" && parts[1] !== "all") return null;
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(parts[2])) return null;
+  return { mode: parts[1], token: parts[2] };
+}
+
+/**
+ * Token amount (raw units, incl. decimals) to sell for a fraction of the
+ * held balance (pure — unit-tested): all = everything, half = floor(raw/2).
+ */
+export function sellAmountRaw(raw: bigint, mode: SellFraction): bigint {
+  if (mode === "all") return raw;
+  return raw / 2n;
+}
 
 /**
  * Normalize a Jupiter /v6/quote response (unit-tested). Accepts the
@@ -237,10 +268,20 @@ export class JupiterClient {
     inputLamports: number,
     slippageBps: number,
   ): Promise<{ ok: boolean; quote?: unknown; error?: string }> {
+    return this.getQuoteRaw(SOL_MINT, outputMint, inputLamports, slippageBps);
+  }
+
+  /** Quote for an arbitrary input→output pair (buys: SOL→token, sells: token→SOL). */
+  private async getQuoteRaw(
+    inputMint: string,
+    outputMint: string,
+    amountRaw: number | bigint,
+    slippageBps: number,
+  ): Promise<{ ok: boolean; quote?: unknown; error?: string }> {
     const params = new URLSearchParams({
-      inputMint: SOL_MINT,
+      inputMint,
       outputMint,
-      amount: String(Math.floor(inputLamports)),
+      amount: String(amountRaw),
       slippageBps: String(Math.floor(slippageBps)),
       restrictIntermediateTokens: "true",
       instructionVersion: "V2",
@@ -255,6 +296,56 @@ export class JupiterClient {
       return parseQuote(raw);
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Read-only: the wallet's raw balance of a token (both SPL and Token-2022
+   * programs), plus its decimals/ui amount. null when the RPC is unreachable
+   * or the wallet has no account for the mint.
+   */
+  async getTokenBalance(
+    mint: string,
+  ): Promise<{ raw: bigint; uiAmount: number; decimals: number } | null> {
+    try {
+      let raw = 0n;
+      let decimals = 0;
+      let uiAmount = 0;
+      for (const program of [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]) {
+        const res = await jsonFetch<{
+          result?: { value?: Array<{ account?: { data?: { parsed?: { info?: { mint?: string; tokenAmount?: { amount?: string; decimals?: number; uiAmount?: number } } } } } }> };
+        }>(
+          this.rpcUrl(),
+          this.cfg.timeoutMs,
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getTokenAccountsByOwner",
+            params: [
+              this.walletPublicKey,
+              { programId: program },
+              { encoding: "jsonParsed" },
+            ],
+          },
+        );
+        for (const acc of res.result?.value ?? []) {
+          const info = acc.account?.data?.parsed?.info;
+          if (!info || info.mint !== mint) continue;
+          const amt = info.tokenAmount?.amount;
+          if (amt === undefined || amt === null) continue;
+          raw += BigInt(amt);
+          decimals = info.tokenAmount?.decimals ?? 0;
+          uiAmount += info.tokenAmount?.uiAmount ?? 0;
+        }
+      }
+      if (raw <= 0n) return null;
+      return { raw, uiAmount, decimals };
+    } catch (err) {
+      console.error(
+        "[jupiter] token balance check failed:",
+        err instanceof Error ? err.message : err,
+      );
+      return null;
     }
   }
 
@@ -292,6 +383,68 @@ export class JupiterClient {
       if (!quote.ok || !quote.quote) {
         return { ok: false, error: quote.error ?? "无可用路由" };
       }
+
+      return this.signAndSend(quote.quote as Record<string, unknown>);
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Full sell: read the held token balance → size by fraction (all/half) →
+   * quote (token→SOL) → swap tx → sign → send. Sells are exits, so they only
+   * need enough SOL for the priority fee + tx fees — never more.
+   */
+  async sell(
+    token: string,
+    fraction: SellFraction,
+  ): Promise<TradeOrderResult & { amountUi?: number }> {
+    try {
+      const balance = await this.getTokenBalance(token);
+      if (!balance) {
+        return { ok: false, error: "钱包没有该币持仓（可能未持有或 RPC 查询失败）" };
+      }
+      const amountRaw = sellAmountRaw(balance.raw, fraction);
+      if (amountRaw <= 0n) {
+        return { ok: false, error: "持仓不足，无法卖出" };
+      }
+      const amountUi = Number(amountRaw) / 10 ** balance.decimals;
+
+      // Fee pre-check: a sell costs SOL for priority fee + tx rent; an empty
+      // wallet would burn the priority fee on a simulation failure.
+      const feeLamports = Math.floor(this.cfg.priorityFeeSol * 1e9);
+      const sol = await this.getSolBalanceLamports();
+      if (sol !== null && sol < feeLamports + 5_000_000) {
+        return {
+          ok: false,
+          error: `钱包 SOL 不足支付交易费（${(sol / 1e9).toFixed(4)} SOL）`,
+        };
+      }
+
+      const quote = await this.getQuoteRaw(
+        token,
+        SOL_MINT,
+        amountRaw,
+        Math.round(this.cfg.slippagePct * 100),
+      );
+      if (!quote.ok || !quote.quote) {
+        return { ok: false, error: quote.error ?? "无可用路由" };
+      }
+
+      const result = await this.signAndSend(quote.quote as Record<string, unknown>);
+      return { ...result, amountUi };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Shared tail of buy/sell: ask Jupiter for the swap transaction for a
+   * quote, sign it with the trading wallet, and send it via the RPC.
+   */
+  private async signAndSend(quote: Record<string, unknown>): Promise<TradeOrderResult> {
+    try {
+      const feeLamports = Math.floor(this.cfg.priorityFeeSol * 1e9);
 
       const swap = await jsonFetch<{ swapTransaction?: string }>(
         `${this.cfg.jupiterApiBase}/swap/v1/swap`,
@@ -462,6 +615,38 @@ export class TradeService {
       console.error("[trade] failed to record trade log:", err);
     }
     return { decision, result };
+  }
+
+  /**
+   * Sell a share of the wallet's holdings in a token (half/all) and record
+   * the attempt in sell_log. Blocked when the effective mode is off (the
+   * same "nothing moves" guarantee as buys); no per-coin cap — you can only
+   * sell what you hold. Manual button taps and /sell both funnel here.
+   */
+  async sell(
+    token: string,
+    fraction: SellFraction,
+    chatId: string,
+  ): Promise<{ ok: boolean; result?: TradeOrderResult & { amountUi?: number }; reason?: string }> {
+    const mode = await this.effectiveMode();
+    if (mode === "off") {
+      return { ok: false, reason: "mode=off（交易未启用）" };
+    }
+    const result = await this.client.sell(token, fraction);
+    try {
+      await this.db.recordSell({
+        token,
+        chatId,
+        mode: fraction,
+        status: result.ok ? "success" : "failed",
+        txHash: result.txHash ?? null,
+        amountToken: result.amountUi ?? null,
+        error: result.error ?? null,
+      });
+    } catch (err) {
+      console.error("[trade] failed to record sell log:", err);
+    }
+    return { ok: result.ok, result };
   }
 
   /** Read-only verification (no money moves): wallet + balance + quote. */

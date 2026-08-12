@@ -13,7 +13,7 @@ const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
-const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports } = require("../dist/jupiter.js");
+const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw } = require("../dist/jupiter.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -427,6 +427,48 @@ async function main() {
     assert.equal(resolveTradeMode("manual", "hack"), "manual");
     assert.equal(resolveTradeMode("auto", null), "auto");
     assert.equal(resolveTradeMode("off", ""), "off");
+  });
+
+  await test("parseSellCallback accepts sell:half|all:<mint> and rejects junk", () => {
+    const mint = "Cqs2xNRMCSMDpGzRZ5x225kjM9dhcnTFExiu5Hf6pump";
+    assert.deepEqual(parseSellCallback(`sell:half:${mint}`), { mode: "half", token: mint });
+    assert.deepEqual(parseSellCallback(`sell:all:${mint}`), { mode: "all", token: mint });
+    // Not sell callbacks (buy prefix, wrong arity, bad fraction, bad mint).
+    assert.equal(parseSellCallback(`buy:${mint}`), null);
+    assert.equal(parseSellCallback(`sell:${mint}`), null);
+    assert.equal(parseSellCallback(`sell:half:all:${mint}`), null);
+    assert.equal(parseSellCallback(`sell:quarter:${mint}`), null);
+    assert.equal(parseSellCallback(`sell:half:SHORT`), null);
+  });
+
+  await test("sellAmountRaw: all sells everything, half floors at raw/2", () => {
+    assert.equal(sellAmountRaw(1_000_000n, "all"), 1_000_000n);
+    assert.equal(sellAmountRaw(1_000_001n, "half"), 500_000n); // floor
+    assert.equal(sellAmountRaw(1n, "half"), 0n);
+    assert.equal(sellAmountRaw(0n, "all"), 0n);
+  });
+
+  await test("sell_log records half/all attempts and lists newest first", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.recordSell({
+        token: "TOK-S1", chatId: "chat-x", mode: "half", status: "success", txHash: "sig1", amountToken: 500.5, error: null,
+      });
+      await db.recordSell({
+        token: "TOK-S1", chatId: "chat-x", mode: "all", status: "failed", txHash: null, amountToken: null, error: "route not found",
+      });
+      const sells = await db.latestSells(10);
+      assert.equal(sells.length, 2);
+      assert.equal(sells[0].token, "TOK-S1"); // newest first
+      assert.equal(sells[0].mode, "all");
+      assert.equal(sells[0].status, "failed");
+      assert.equal(sells[1].mode, "half");
+      assert.equal(sells[1].txHash, "sig1");
+    } finally {
+      await t.cleanup();
+    }
   });
 
   await test("db trade-mode override round-trips, validates and clears", async () => {

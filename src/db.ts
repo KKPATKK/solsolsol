@@ -243,6 +243,24 @@ export class Db {
     await this.client.execute(
       `CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at)`,
     );
+    // Sell log: every exit attempt (half/all). NOT unique on token — you can
+    // legitimately sell half now and the rest later. Mirrors trade_log.
+    await this.client.execute(`
+      CREATE TABLE IF NOT EXISTS sell_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        tx_hash TEXT,
+        amount_token REAL,
+        error TEXT,
+        created_at INTEGER NOT NULL
+      );
+    `);
+    await this.client.execute(
+      `CREATE INDEX IF NOT EXISTS idx_sell_log_created ON sell_log(created_at)`,
+    );
     await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
     await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");
@@ -510,6 +528,54 @@ export class Db {
       return;
     }
     await this.setWorkerState("trade_mode_override", mode);
+  }
+
+  /** Record a sell attempt (half/all) — no UNIQUE: sells can repeat. */
+  async recordSell(entry: {
+    token: string;
+    chatId: string;
+    mode: "half" | "all";
+    status: "success" | "failed";
+    txHash: string | null;
+    amountToken: number | null;
+    error: string | null;
+  }): Promise<void> {
+    await this.get().execute({
+      sql: `INSERT INTO sell_log
+            (token, chat_id, mode, status, tx_hash, amount_token, error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        entry.token,
+        entry.chatId,
+        entry.mode,
+        entry.status,
+        entry.txHash,
+        entry.amountToken,
+        entry.error,
+        Date.now(),
+      ],
+    });
+  }
+
+  /** Most recent sell attempts (newest first) for diagnostics. */
+  async latestSells(
+    limit: number,
+  ): Promise<Array<{ token: string; status: string; txHash: string | null; mode: string; error: string | null; createdAt: number }>> {
+    const res = await this.get().execute({
+      sql: "SELECT token, mode, status, tx_hash, error, created_at FROM sell_log ORDER BY created_at DESC LIMIT ?",
+      args: [Math.max(1, Math.min(limit, 50))],
+    });
+    return res.rows.map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        token: String(r.token),
+        mode: String(r.mode),
+        status: String(r.status),
+        txHash: r.tx_hash === null || r.tx_hash === undefined ? null : String(r.tx_hash),
+        error: r.error === null || r.error === undefined ? null : String(r.error),
+        createdAt: Number(r.created_at),
+      };
+    });
   }
 
   /** Most recent trade attempts (newest first) for diagnostics. */
