@@ -105,10 +105,6 @@ export interface ScanSummary {
   pool: number;
   candidates: number;
   pushed: number;
-  holds: {
-    /** Supply-flow analysis pending (not run yet / Helius unavailable). */
-    flow: number;
-  };
   fails: {
     mcap: number;
     chg: number;
@@ -173,7 +169,6 @@ export class Scanner {
       pool: 0,
       candidates: 0,
       pushed: 0,
-      holds: { flow: 0 },
       fails: { mcap: 0, chg: 0, vol5: 0, age: 0, flow: 0, other: 0 },
       rejects: [],
     };
@@ -296,16 +291,11 @@ export class Scanner {
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
           continue;
         }
-        // Supply-flow (rug/distribution) check — hard filter, run before the
-        // expensive display lookups so a flagged coin never wastes the tick.
+        // Supply-flow (rug/distribution) check — run before the expensive
+        // display lookups so a flagged coin never wastes the tick. Only a
+        // confirmed flag blocks the push; a pending/incomplete analysis
+        // (hold/unknown) pushes anyway with the card showing 未分析.
         const flow = await this.resolveSupplyFlow(coin, tickDeadline);
-        if (flow.status === "hold") {
-          diag.holds.flow++;
-          console.log(
-            `[scanner] holding ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (supply-flow analysis pending)`,
-          );
-          continue;
-        }
         if (flow.status === "flagged") {
           diag.fails.flow++;
           this.addReject(
@@ -510,13 +500,13 @@ export class Scanner {
    *     refreshMs),
    *  2. live analysis via Helius (getTokenLargestAccounts + gTFA
    *     out-transfers — ~1-3s, budget-guarded),
-   *  3. hold — analysis pending or failed; the coin is NOT pushed until the
-   *     analysis completes. Rug-prevention is best-effort: an unknown
-   *     verdict must not let a suspicious coin through, and the 5-min
-   *     negative cache + Helius circuit breaker keep a down endpoint from
-   *     stalling the tick.
-   * Returns "unknown" only when the check is disabled or Helius is not
-   * configured — the coin pushes with the card showing 未分析.
+   *  3. hold — analysis pending or failed. The coin is NOT blocked: it
+   *     pushes anyway with the card showing 未分析 (the detector is
+   *     best-effort — only a confirmed flag blocks). The 5-min negative
+   *     cache + Helius circuit breaker keep a down endpoint from stalling
+   *     the tick.
+   * Returns "unknown" when the check is disabled or Helius is not
+   * configured — also pushes with the card showing 未分析.
    */
   private async resolveSupplyFlow(
     coin: QualifyingCoin,
