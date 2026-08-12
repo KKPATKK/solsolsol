@@ -32,13 +32,23 @@ const DATA_NEGATIVE_CACHE_MS = 5 * 60_000;
  */
 const SCAN_TIMEOUT_MS = 25_000;
 /**
- * The opening-volume on-chain computation is display-only now that the
- * first-minute-volume filter was removed, but it can still burn up to
- * WINDOW_ENUM_BUDGET_MS (16s) per coin. Never attempt it once the tick is
- * this old — fall back to the cheap proxy/unknown path instead, so a
- * qualifying coin can never push the whole scan past the 30s wall clock.
+ * Hard wall-clock deadline for one scan pass, enforced inside runOnce (well
+ * before SCAN_TIMEOUT_MS releases the lock). Candidate processing is the
+ * expensive part — the Helius opening-volume enumeration alone can burn up
+ * to WINDOW_ENUM_BUDGET_MS (16s) per coin — so once the deadline is hit,
+ * remaining candidates are deferred to the next tick (they stay in the
+ * re-evaluation pool, nothing is lost). Keeps every tick comfortably inside
+ * the worker's 26s heartbeat budget and Cloudflare's ~30s wall clock.
  */
-const OPENING_VOLUME_TICK_BUDGET_MS = 6_000;
+const SCAN_TICK_DEADLINE_MS = 20_000;
+/**
+ * Room (ms) needed in the tick before attempting the on-chain opening-volume
+ * computation: its enumeration budget is 16s, so only start it when it can
+ * actually finish within the tick deadline. The computation is display-only
+ * (the first-minute-volume filter was removed) — never risk the whole tick
+ * for a message-card field; fall back to the cheap proxy/unknown path.
+ */
+const OPENING_VOLUME_ROOM_MS = 18_000;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 40h) plus margin: coins age into the
@@ -149,6 +159,7 @@ export class Scanner {
     const seq = ++this.scanSeq;
     this.running = true;
     const startedAt = Date.now();
+    const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
     const diag: ScanSummary = {
       profiles: 0,
       pool: 0,
@@ -253,7 +264,17 @@ export class Scanner {
       );
       diag.candidates = candidates.length;
       let pushed = 0;
-      for (const coin of candidates) {
+      for (const [candIdx, coin] of candidates.entries()) {
+        // Hard tick deadline: each candidate's expensive lookups (Helius up
+        // to 16s + RugCheck + Birdeye) can exceed the remaining budget fast.
+        // Defer the rest to the next tick — they stay in the re-evaluation
+        // pool, so this only delays a push by a minute, never loses it.
+        if (Date.now() > tickDeadline) {
+          console.log(
+            `[scanner] tick deadline reached — deferring ${candidates.length - candIdx} candidate(s) to next tick`,
+          );
+          break;
+        }
         // Fast path: skip coins already pushed to this chat before doing the
         // (slow) RugCheck/Birdeye lookups for them again.
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
@@ -261,7 +282,7 @@ export class Scanner {
         }
         // Opening volume is resolved for the message card but no longer
         // filters — the first-minute-volume filter was removed.
-        const opening = await this.resolveOpeningVolume(coin, startedAt);
+        const opening = await this.resolveOpeningVolume(coin, tickDeadline);
         const rugcheck = await this.resolveRugcheckData(coin);
         // Bundler filter: skip coins whose bundled/insider supply share is
         // known and too high. Unknown (null) means no bundlers detected — pass.
@@ -360,7 +381,7 @@ export class Scanner {
    */
   private async resolveOpeningVolume(
     coin: QualifyingCoin,
-    tickStartedAt: number,
+    tickDeadline: number,
   ): Promise<OpeningVolume> {
     const { stats, pair } = coin;
 
@@ -369,12 +390,13 @@ export class Scanner {
     }
 
     // Budget guard: the on-chain computation is display-only and can cost up
-    // to 16s per coin — skip it entirely once the tick is already old so a
-    // candidate never risks the 30s wall clock for a message-card field.
+    // to 16s per coin — only start it when it can finish within the tick
+    // deadline, so a candidate never risks the 30s wall clock for a
+    // message-card field.
     if (
       this.helius &&
       !this.dataNegativeCached(stats.token) &&
-      Date.now() - tickStartedAt < OPENING_VOLUME_TICK_BUDGET_MS
+      tickDeadline - Date.now() >= OPENING_VOLUME_ROOM_MS
     ) {
       try {
         const vol = await this.helius.getFirstMinuteVolumeUsd(stats.token, {
