@@ -297,6 +297,33 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
       return { ok: false, error: "无法由价格推算供应量" };
     }
     const sf = cfg.supplyFlow;
+    const ageMin = Math.round((Date.now() - pair.pairCreatedAt) / 60_000);
+    // Fresh cached verdict (same window the scanner uses) → reuse instead of
+    // re-spending ~150–300 Helius credits on a coin just checked.
+    if (db) {
+      try {
+        const cached = await db.getTokenStats(mint);
+        if (
+          cached &&
+          cached.supplyFlowJson &&
+          cached.supplyFlowAt !== null &&
+          Date.now() - cached.supplyFlowAt < sf.refreshMs
+        ) {
+          const parsed = JSON.parse(cached.supplyFlowJson) as SupplyFlowResult;
+          return {
+            ok: true,
+            symbol: pair.baseToken.symbol,
+            marketCapUsd: pair.marketCap,
+            ageMin,
+            ms: Date.now() - t0,
+            cached: true,
+            result: parsed,
+          };
+        }
+      } catch {
+        // cache read failed → analyze fresh
+      }
+    }
     const result = await Promise.race([
       helius.analyzeSupplyFlow(mint, pair.pairAddress, supply, {
         windowMs: sf.windowMs,
@@ -324,7 +351,6 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
         ),
       ),
     ]);
-    const ageMin = Math.round((Date.now() - pair.pairCreatedAt) / 60_000);
     // Cache for the scanner (best-effort): INSERT OR IGNORE the stats row so
     // the coin joins the re-eval pool, then store the fresh flow verdict.
     if (result.ok && db) {

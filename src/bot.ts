@@ -99,6 +99,8 @@ export interface FlowCheckResult {
   ageMin?: number;
   /** Wall-clock ms of the check itself (excluding Telegram). */
   ms?: number;
+  /** True when a fresh verdict was reused from the DB cache (no re-spend). */
+  cached?: boolean;
   result?: SupplyFlowResult;
 }
 
@@ -268,7 +270,7 @@ export function createBot(
         `🕸 供应流分析: ${res.symbol ?? mint.slice(0, 12)}`,
         `💰 市值: ${fmtUsd(res.marketCapUsd ?? 0)} | ⏱ 上线: ${res.ageMin ?? "?"} 分钟`,
         verdict,
-        `⚙️ 分析窗口: ${Math.round(r.windowMs / 3600e3)}h | 耗时: ${res.ms ?? elapsedMs}ms`,
+        `⚙️ 分析窗口: ${Math.round(r.windowMs / 3600e3)}h | 耗时: ${res.ms ?? elapsedMs}ms${res.cached ? "（缓存，30 分钟内未重新分析）" : ""}`,
       ].join("\n"),
     );
   });
