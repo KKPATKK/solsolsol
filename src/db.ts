@@ -92,27 +92,34 @@ export class Db {
   private client: Client | null = null;
   private readonly url: string;
   private readonly authToken?: string;
+  /** Pre-built client (unit tests: local `file:` libsql, no network). */
+  private readonly injectedClient?: Client;
 
-  constructor(url: string, authToken?: string) {
+  constructor(url: string, authToken?: string, injectedClient?: Client) {
     this.url = url;
     this.authToken = authToken;
+    this.injectedClient = injectedClient;
   }
 
   async init(): Promise<void> {
-    // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
-    // which works reliably on Workers (fetch) and in Node alike.
-    const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
-    this.client = createClient({
-      url: httpUrl,
-      authToken: this.authToken,
-      // Bound every request (see DB_REQUEST_TIMEOUT_MS): a stalled Turso
-      // call aborts instead of hanging the tick indefinitely.
-      fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
-        fetch(input, {
-          ...init,
-          signal: AbortSignal.timeout(DB_REQUEST_TIMEOUT_MS),
-        }),
-    });
+    if (this.injectedClient) {
+      this.client = this.injectedClient;
+    } else {
+      // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
+      // which works reliably on Workers (fetch) and in Node alike.
+      const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
+      this.client = createClient({
+        url: httpUrl,
+        authToken: this.authToken,
+        // Bound every request (see DB_REQUEST_TIMEOUT_MS): a stalled Turso
+        // call aborts instead of hanging the tick indefinitely.
+        fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+          fetch(input, {
+            ...init,
+            signal: AbortSignal.timeout(DB_REQUEST_TIMEOUT_MS),
+          }),
+      });
+    }
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS chat_settings (
         chat_id TEXT PRIMARY KEY,

@@ -29,7 +29,7 @@ const BKEY = process.env.BIRDEYE_API_KEY;
 // Mirrors scanner.ts constants so the diagnosis runs the same bounds.
 const RE_EVAL_WINDOW_MS = 42 * 3600e3;
 const RE_EVAL_AGE_MARGIN_MIN = 180;
-const RE_EVAL_POOL_SIZE = 80;
+const RE_EVAL_POOL_SIZE = 40;
 
 const USD = (n) => {
   if (n === null || n === undefined) return "—";
@@ -176,14 +176,16 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
         rug = { bundler: r.bundlerPct, top10: r.top10HolderPct, src: "live" };
       } catch (e) { /* ignore */ }
     }
-    const f7 = rug === null || rug.bundler === null || rug.bundler < s.maxBundlerPct;
-    if (!f7) c.reasons.push(`Bundler ${rug.bundler.toFixed(1)}% ≥ ${s.maxBundlerPct}%`);
+    // Inclusive thresholds: exactly the max passes, only strictly-higher
+    // shares are rejected (mirrors scanner.ts).
+    const f7 = rug === null || rug.bundler === null || rug.bundler <= s.maxBundlerPct;
+    if (!f7) c.reasons.push(`Bundler ${rug.bundler.toFixed(1)}% > ${s.maxBundlerPct}%`);
     let holdTop10 = false;
     if (rug === null || rug.top10 === null) {
       holdTop10 = true; // 数据未就绪 → 顺延
     } else {
-      const f8 = rug.top10 < s.maxTop10HolderPct;
-      if (!f8) c.reasons.push(`Top10 ${rug.top10.toFixed(1)}% ≥ ${s.maxTop10HolderPct}%`);
+      const f8 = rug.top10 <= s.maxTop10HolderPct;
+      if (!f8) c.reasons.push(`Top10 ${rug.top10.toFixed(1)}% > ${s.maxTop10HolderPct}%`);
     }
 
     // Birdeye trader data: display only — the sniper filter was removed, so

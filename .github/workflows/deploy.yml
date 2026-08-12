@@ -25,6 +25,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Offline unit tests (local libsql file: DB — no network, no secrets).
+      # Guards the settings schema/migration, the re-eval pool query, the
+      # batched token_stats methods and the /filter argument parser.
+      - name: Unit tests
+        run: npm run test:unit
+
       # Write HELIUS_API_KEY as a Worker secret so the on-chain volume
       # resolver runs at full speed. Guarded: if the GitHub Actions secret is
       # not set yet, this step is skipped and the deploy still succeeds

@@ -10,6 +10,7 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test-filters.js",
+    "test:unit": "npm run build && node scripts/test-unit.js",
     "deploy:worker": "wrangler deploy"
   },
   "engines": {

@@ -95,18 +95,12 @@ export interface ScanSummary {
   candidates: number;
   pushed: number;
   holds: {
-    /** Opening volume known and too hot (>= chat max). */
-    opening: number;
     /** Bundler share known and too high. */
     bundler: number;
     /** RugCheck report not ready yet (re-check next scan). */
     rugcheck: number;
     /** Top-10 holder concentration known and too high. */
     top10: number;
-    /** Birdeye trader data not ready yet (re-check next scan). */
-    sniper: number;
-    /** Sniper share known and too high. */
-    sniperHigh: number;
   };
   fails: {
     mcap: number;
@@ -166,12 +160,9 @@ export class Scanner {
       candidates: 0,
       pushed: 0,
       holds: {
-        opening: 0,
         bundler: 0,
         rugcheck: 0,
         top10: 0,
-        sniper: 0,
-        sniperHigh: 0,
       },
       fails: { mcap: 0, chg: 0, vol5: 0, age: 0, other: 0 },
     };
@@ -296,8 +287,10 @@ export class Scanner {
         const opening = await this.resolveOpeningVolume(coin, tickDeadline);
         const rugcheck = await this.resolveRugcheckData(coin);
         // Bundler filter: skip coins whose bundled/insider supply share is
-        // known and too high. Unknown (null) means no bundlers detected — pass.
-        if (rugcheck.bundlerPct !== null && rugcheck.bundlerPct >= coin.maxBundlerPct) {
+        // known and above the threshold. The threshold is inclusive
+        // ("≤ 15%"): exactly 15% passes, only strictly-higher shares are
+        // rejected. Unknown (null) means no bundlers detected — pass.
+        if (rugcheck.bundlerPct !== null && rugcheck.bundlerPct > coin.maxBundlerPct) {
           diag.holds.bundler++;
           continue;
         }
@@ -311,8 +304,9 @@ export class Scanner {
           );
           continue;
         }
-        // Top-10 holder concentration filter.
-        if (rugcheck.top10Pct >= coin.maxTop10HolderPct) {
+        // Top-10 holder concentration filter (inclusive threshold: exactly
+        // the max passes, only strictly-higher concentration is rejected).
+        if (rugcheck.top10Pct > coin.maxTop10HolderPct) {
           diag.holds.top10++;
           continue;
         }
