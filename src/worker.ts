@@ -76,6 +76,9 @@ let heliusConfigured = false;
 let birdeyeConfigured = false;
 // Whether the BOT_WALLET_PRIVATE_KEY secret reached the Worker (presence only).
 let tradeConfigured = false;
+// Whether the JUPITER_API_KEY secret reached the Worker (presence only —
+// requests then carry the x-api-key header for higher rate limits).
+let jupiterKeyed = false;
 
 /**
  * Fingerprint of the env-derived trade settings (presence only — never the
@@ -137,6 +140,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
     tradeConfigured = Boolean(config.trade.walletSecret);
+    jupiterKeyed = Boolean(config.trade.jupiterApiKey);
 
     if (config.tursoUrl) {
       try {
@@ -486,6 +490,7 @@ export default {
         heliusConfigured,
         birdeyeConfigured,
         tradeConfigured,
+        jupiterKeyed,
         tradeMode: cfg?.trade.mode ?? "off",
         initError,
         lastScanMs,
