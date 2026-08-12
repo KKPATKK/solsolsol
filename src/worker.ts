@@ -69,6 +69,15 @@ let birdeyeConfigured = false;
 const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
 /** Don't re-alert within this window for the same continuing outage. */
 const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
+/**
+ * Hard budget for the whole scheduled tick. Cloudflare kills the invocation
+ * at the ~30s wall-clock limit; if a slow scan crosses that, runScan's
+ * finally (which writes the heartbeat) never runs and the scan looks dead
+ * from the outside. Racing the scan against this budget — well under the
+ * wall clock — guarantees the heartbeat is written every tick, with a
+ * timeout flag, so a slow scan is visible instead of silent.
+ */
+const SCAN_TICK_BUDGET_MS = 26_000;
 
 async function ensureInitialized(env: Env): Promise<void> {
   if (initPromise) return initPromise;
@@ -130,14 +139,33 @@ async function ensureInitialized(env: Env): Promise<void> {
 async function runScan(): Promise<void> {
   if (!scanner) return;
   const startedAt = Date.now();
+  let timedOut = false;
   try {
-    await scanner.runOnce();
-    lastScanOk = true;
-    lastScanError = null;
+    // Race the scan against the tick budget. runOnce never rejects (it
+    // catches its own errors), so the first to settle wins; on timeout the
+    // background scan keeps going until Cloudflare kills it, and the seq
+    // guard in Scanner prevents it from clobbering the next tick's state.
+    await Promise.race([
+      scanner.runOnce(),
+      new Promise<void>((resolve) => {
+        setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, SCAN_TICK_BUDGET_MS);
+      }),
+    ]);
+    lastScanOk = !timedOut;
+    lastScanError = timedOut
+      ? `tick exceeded ${SCAN_TICK_BUDGET_MS}ms budget`
+      : null;
+    if (timedOut) {
+      console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — heartbeat written with timeout flag`);
+    }
   } catch (err) {
     lastScanOk = false;
     lastScanError = err instanceof Error ? err.message : String(err);
-    console.error("[worker] scheduled scan failed:", lastScanError);    } finally {
+    console.error("[worker] scheduled scan failed:", lastScanError);
+  } finally {
     lastScanMs = Date.now() - startedAt;
     lastScanAt = Date.now();
     scanCount++;

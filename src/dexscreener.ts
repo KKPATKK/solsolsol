@@ -61,7 +61,12 @@ export class DexScreenerClient {
           throw new Error(`DexScreener HTTP ${res.status}`);
         }
         if (!res.ok) {
-          throw new Error(`DexScreener HTTP ${res.status}`);
+          // Deterministic client errors (e.g. 404/400: a token without pairs
+          // or a bad batch) will never succeed on retry — treat as empty
+          // instead of burning 3 attempts × backoff per dead token. The
+          // re-evaluation pool regularly contains delisted coins, so this
+          // saves ~8s per failing batch.
+          return null;
         }
         return await res.json();
       } catch (err) {

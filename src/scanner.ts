@@ -32,6 +32,14 @@ const DATA_NEGATIVE_CACHE_MS = 5 * 60_000;
  */
 const SCAN_TIMEOUT_MS = 25_000;
 /**
+ * The opening-volume on-chain computation is display-only now that the
+ * first-minute-volume filter was removed, but it can still burn up to
+ * WINDOW_ENUM_BUDGET_MS (16s) per coin. Never attempt it once the tick is
+ * this old — fall back to the cheap proxy/unknown path instead, so a
+ * qualifying coin can never push the whole scan past the 30s wall clock.
+ */
+const OPENING_VOLUME_TICK_BUDGET_MS = 6_000;
+/**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 40h) plus margin: coins age into the
  * window while sitting in the pool, since the DexScreener profiles feed
@@ -249,7 +257,7 @@ export class Scanner {
         }
         // Opening volume is resolved for the message card but no longer
         // filters — the first-minute-volume filter was removed.
-        const opening = await this.resolveOpeningVolume(coin);
+        const opening = await this.resolveOpeningVolume(coin, startedAt);
         const rugcheck = await this.resolveRugcheckData(coin);
         // Bundler filter: skip coins whose bundled/insider supply share is
         // known and too high. Unknown (null) means no bundlers detected — pass.
@@ -348,6 +356,7 @@ export class Scanner {
    */
   private async resolveOpeningVolume(
     coin: QualifyingCoin,
+    tickStartedAt: number,
   ): Promise<OpeningVolume> {
     const { stats, pair } = coin;
 
@@ -355,7 +364,14 @@ export class Scanner {
       return { value: stats.birdeye1mVol, source: "helius" };
     }
 
-    if (this.helius && !this.dataNegativeCached(stats.token)) {
+    // Budget guard: the on-chain computation is display-only and can cost up
+    // to 16s per coin — skip it entirely once the tick is already old so a
+    // candidate never risks the 30s wall clock for a message-card field.
+    if (
+      this.helius &&
+      !this.dataNegativeCached(stats.token) &&
+      Date.now() - tickStartedAt < OPENING_VOLUME_TICK_BUDGET_MS
+    ) {
       try {
         const vol = await this.helius.getFirstMinuteVolumeUsd(stats.token, {
           priceUsd: pair.priceUsd,
