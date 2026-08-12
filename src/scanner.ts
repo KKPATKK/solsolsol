@@ -5,7 +5,7 @@ import type { AppConfig } from "./config";
 import type { Db, TokenStats } from "./db";
 import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreener";
 import { fmtAge, fmtUsd } from "./format";
-import type { HeliusClient } from "./helius";
+import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
@@ -105,11 +105,17 @@ export interface ScanSummary {
   pool: number;
   candidates: number;
   pushed: number;
+  holds: {
+    /** Supply-flow analysis pending (not run yet / Helius unavailable). */
+    flow: number;
+  };
   fails: {
     mcap: number;
     chg: number;
     vol5: number;
     age: number;
+    /** Supply-flow (rug/distribution) pattern detected on-chain. */
+    flow: number;
     other: number;
   };
   /** Per-coin rejection trace for the last scan (bounded). */
@@ -167,7 +173,8 @@ export class Scanner {
       pool: 0,
       candidates: 0,
       pushed: 0,
-      fails: { mcap: 0, chg: 0, vol5: 0, age: 0, other: 0 },
+      holds: { flow: 0 },
+      fails: { mcap: 0, chg: 0, vol5: 0, age: 0, flow: 0, other: 0 },
       rejects: [],
     };
     // Watchdog: if the scan outlives its budget, release the lock so the next
@@ -249,6 +256,8 @@ export class Scanner {
           birdeyeProTraders: null,
           birdeyeSniperPct: null,
           minMcapObserved: null,
+          supplyFlowJson: null,
+          supplyFlowAt: null,
         };
         newStats.push(stats);
         statsByToken.set(profile.tokenAddress, stats);
@@ -287,6 +296,28 @@ export class Scanner {
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
           continue;
         }
+        // Supply-flow (rug/distribution) check — hard filter, run before the
+        // expensive display lookups so a flagged coin never wastes the tick.
+        const flow = await this.resolveSupplyFlow(coin, tickDeadline);
+        if (flow.status === "hold") {
+          diag.holds.flow++;
+          console.log(
+            `[scanner] holding ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (supply-flow analysis pending)`,
+          );
+          continue;
+        }
+        if (flow.status === "flagged") {
+          diag.fails.flow++;
+          this.addReject(
+            diag,
+            coin,
+            `供應集中 ${flow.result.feeders}錢包→1接收者 (${flow.result.fedPct.toFixed(1)}%供應, 賣出${flow.result.sells}次)`,
+          );
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (supply-flow distribution detected)`,
+          );
+          continue;
+        }
         // Opening volume is resolved for the message card but no longer
         // filters — the first-minute-volume filter was removed.
         const opening = await this.resolveOpeningVolume(coin, tickDeadline);
@@ -314,6 +345,7 @@ export class Scanner {
               rugcheck.top10Pct,
               trader.proTraders,
               trader.sniperPct,
+              flow.status === "clean",
             ),
             {
               reply_markup: {
@@ -472,6 +504,122 @@ export class Scanner {
     return { bundlerPct: null, top10Pct: null };
   }
 
+  /**
+   * On-chain supply-flow (rug/distribution) verdict for a coin:
+   *  1. fresh cached result (token_stats.supply_flow, refreshed every
+   *     refreshMs),
+   *  2. live analysis via Helius (getTokenLargestAccounts + gTFA
+   *     out-transfers — ~1-3s, budget-guarded),
+   *  3. hold — analysis pending or failed; the coin is NOT pushed until the
+   *     analysis completes. Rug-prevention is best-effort: an unknown
+   *     verdict must not let a suspicious coin through, and the 5-min
+   *     negative cache + Helius circuit breaker keep a down endpoint from
+   *     stalling the tick.
+   * Returns "unknown" only when the check is disabled or Helius is not
+   * configured — the coin pushes with the card showing 未分析.
+   */
+  private async resolveSupplyFlow(
+    coin: QualifyingCoin,
+    tickDeadline: number,
+  ): Promise<
+    | { status: "clean"; result: SupplyFlowResult }
+    | { status: "flagged"; result: SupplyFlowResult }
+    | { status: "hold" }
+    | { status: "unknown" }
+  > {
+    const { stats, pair } = coin;
+    const cfg = this.config.supplyFlow;
+    if (!cfg.enabled || !this.config.heliusApiKey) return { status: "unknown" };
+
+    // Fresh cache → reuse (avoids re-analyzing the same coin every minute).
+    if (stats.supplyFlowJson && stats.supplyFlowAt !== null) {
+      try {
+        const parsed = JSON.parse(stats.supplyFlowJson) as SupplyFlowResult;
+        if (Date.now() - stats.supplyFlowAt < cfg.refreshMs) {
+          return parsed.flagged
+            ? { status: "flagged", result: parsed }
+            : { status: "clean", result: parsed };
+        }
+      } catch {
+        // stale/corrupt cache → re-analyze
+      }
+    }
+    // Recent empty/failed lookups: back off instead of hammering Helius.
+    if (this.dataNegativeCached(stats.token)) return { status: "hold" };
+    // Budget guard: the analysis makes ~10 RPC calls; only start it when it
+    // can finish within the tick deadline, else defer to the next tick.
+    if (tickDeadline - Date.now() < cfg.budgetMs) return { status: "hold" };
+
+    try {
+      const price = Number(pair.priceUsd);
+      const supply = Number.isFinite(price) && price > 0 ? pair.marketCap / price : 0;
+      if (supply <= 0) return { status: "hold" };
+      const result = await Promise.race([
+        this.helius!.analyzeSupplyFlow(stats.token, pair.pairAddress, supply, {
+          windowMs: cfg.windowMs,
+          minFeeders: cfg.minFeeders,
+          minFedPct: cfg.minFedPct,
+          minSells: cfg.minSells,
+          topAccounts: cfg.topAccounts,
+          now: Date.now(),
+        }),
+        // Hard cap: a slow/stuck gTFA must not wedge the tick — treat as
+        // pending and retry next tick (nothing is lost, the coin stays held).
+        new Promise<SupplyFlowResult>((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                ok: false,
+                flagged: false,
+                feeders: 0,
+                fedPct: 0,
+                sells: 0,
+                collector: null,
+                analyzedAt: Date.now(),
+                windowMs: cfg.windowMs,
+              }),
+            cfg.budgetMs,
+          ),
+        ),
+      ]);
+      if (!result.ok) return { status: "hold" };
+      this.dataFailedAt.delete(stats.token);
+      const json = JSON.stringify(result);
+      await this.db.updateTokenSupplyFlow(stats.token, json);
+      stats.supplyFlowJson = json;
+      stats.supplyFlowAt = result.analyzedAt;
+      return result.flagged
+        ? { status: "flagged", result }
+        : { status: "clean", result };
+    } catch (err) {
+      this.dataFailedAt.set(stats.token, Date.now());
+      console.error(
+        `[scanner] supply-flow lookup failed for ${stats.token}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return { status: "hold" };
+    }
+  }
+
+  /** Append a post-match rejection to the scan summary (bounded). */
+  private addReject(
+    diag: ScanSummary,
+    coin: QualifyingCoin,
+    reason: string,
+  ): void {
+    if (diag.rejects.length >= REJECT_LOG_MAX) return;
+    const pair = coin.pair;
+    const ageMs = Date.now() - pair.pairCreatedAt;
+    diag.rejects.push({
+      symbol: pair.baseToken.symbol || coin.profile.symbol || "?",
+      ageMin: Math.round(ageMs / 60_000),
+      mcapUsd: Math.round(pair.marketCap),
+      vol5Usd: Math.round(pair.volume.m5),
+      chgPct: Math.round(pair.priceChange.m5 * 10) / 10,
+      reason,
+    });
+  }
+
   /** Pro-trader count + sniper buy share: cached → single Birdeye fetch → unknown. */
   private async resolveTraderData(coin: QualifyingCoin): Promise<{
     proTraders: number | null;
@@ -617,6 +765,7 @@ function renderMessage(
   top10Pct: number | null,
   proTraders: number | null,
   sniperPct: number | null,
+  supplyFlowClean: boolean,
 ): string {
   const { pair, profile } = coin;
   const name = pair.baseToken.name || profile.name || "Unknown";
@@ -638,6 +787,9 @@ function renderMessage(
     top10Pct === null
       ? "👥 Top10 持仓: —（未检测）"
       : `👥 Top10 持仓: ${top10Pct.toFixed(1)}% (剔除LP)`;
+  const flowLine = supplyFlowClean
+    ? "🕸 供應流: ✅ 无集中出货（链上检查通过）"
+    : "🕸 供應流: —（未分析）";
   const proTradersLine =
     proTraders === null
       ? "🧑‍💻 Pro 交易者: —（未检测）"
@@ -656,6 +808,7 @@ function renderMessage(
     openingLine,
     bundlerLine,
     top10Line,
+    flowLine,
     proTradersLine,
     sniperLine,
     `📈 24h 量: ${fmtUsd(pair.volume.h24)}`,

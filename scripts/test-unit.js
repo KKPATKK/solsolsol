@@ -11,6 +11,7 @@ const os = require("os");
 const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
+const { detectSupplyFlow } = require("../dist/helius.js");
 
 let passed = 0;
 let failed = 0;
@@ -309,6 +310,119 @@ async function main() {
   await test("parseFilterArgs allows min mcap 0 and 5m volume 0 (no minimum)", () => {
     const r = parseFilterArgs(["0", "300000", "360", "2400", "0", "30"]);
     assert.equal(r.ok, true);
+  });
+
+  // ---------- supply-flow detector (pure logic, no network) ----------
+
+  const NOW = 1_800_000_000_000;
+  const baseDeps = (overrides = {}) => ({
+    topAccounts: ["A1", "A2", "A3", "A4"],
+    totalSupplyUi: 1000000,
+    minFeeders: 3,
+    minFedPct: 1,
+    minSells: 3,
+    windowMs: 12 * 3600e3,
+    now: NOW,
+    fetchOutTransfers: async () => [],
+    ...overrides,
+  });
+
+  const out = (from, to, uiAmount, atMs = NOW - 60e3) => ({ from, to, uiAmount, atMs });
+
+  await test("detectSupplyFlow flags 3+ feeders feeding a selling collector", async () => {
+    const history = {
+      A1: [out("A1", "C1", 8000)],
+      A2: [out("A2", "C1", 6000)],
+      A3: [out("A3", "C1", 9000)],
+      A4: [],
+      C1: [out("C1", "POOL", 5000), out("C1", "POOL", 4000), out("C1", "POOL", 3000), out("C1", "POOL", 1000)],
+    };
+    const r = await detectSupplyFlow(baseDeps({ fetchOutTransfers: async (a) => history[a] ?? [] }));
+    assert.equal(r.ok, true);
+    assert.equal(r.flagged, true);
+    assert.equal(r.feeders, 3);
+    assert.equal(r.collector, "C1");
+    assert.ok(r.fedPct >= 2.2 && r.fedPct <= 2.4, `fedPct=${r.fedPct}`); // 23000/1e6 = 2.3%
+    assert.equal(r.sells, 4);
+  });
+
+  await test("detectSupplyFlow ignores below-threshold feeder counts", async () => {
+    const history = {
+      A1: [out("A1", "C1", 8000)],
+      A2: [out("A2", "C1", 6000)],
+      A3: [],
+      A4: [],
+      C1: [out("C1", "POOL", 5000), out("C1", "POOL", 4000), out("C1", "POOL", 3000)],
+    };
+    const r = await detectSupplyFlow(baseDeps({ fetchOutTransfers: async (a) => history[a] ?? [] }));
+    assert.equal(r.flagged, false); // only 2 feeders < minFeeders 3
+    assert.equal(r.feeders, 0);
+  });
+
+  await test("detectSupplyFlow requires fedPct >= threshold", async () => {
+    const history = {
+      A1: [out("A1", "C1", 100)],
+      A2: [out("A2", "C1", 100)],
+      A3: [out("A3", "C1", 100)],
+      A4: [],
+      C1: [out("C1", "POOL", 100), out("C1", "POOL", 100), out("C1", "POOL", 100)],
+    };
+    const r = await detectSupplyFlow(baseDeps({ fetchOutTransfers: async (a) => history[a] ?? [] }));
+    assert.equal(r.flagged, false); // 300/1e6 = 0.03% < 1%
+  });
+
+  await test("detectSupplyFlow requires the collector to be selling", async () => {
+    const history = {
+      A1: [out("A1", "C1", 8000)],
+      A2: [out("A2", "C1", 6000)],
+      A3: [out("A3", "C1", 9000)],
+      A4: [],
+      C1: [], // collector not selling → consolidation without distribution
+    };
+    const r = await detectSupplyFlow(baseDeps({ fetchOutTransfers: async (a) => history[a] ?? [] }));
+    assert.equal(r.flagged, false);
+  });
+
+  await test("detectSupplyFlow ignores transfers outside the window", async () => {
+    const history = {
+      A1: [out("A1", "C1", 8000, NOW - 13 * 3600e3)],
+      A2: [out("A2", "C1", 6000, NOW - 13 * 3600e3)],
+      A3: [out("A3", "C1", 9000, NOW - 13 * 3600e3)],
+      A4: [],
+      C1: [out("C1", "POOL", 5000, NOW - 13 * 3600e3), out("C1", "POOL", 4000), out("C1", "POOL", 3000)],
+    };
+    const r = await detectSupplyFlow(baseDeps({ fetchOutTransfers: async (a) => history[a] ?? [] }));
+    assert.equal(r.flagged, false); // all feeds outside the 12h window
+  });
+
+  await test("db updateTokenSupplyFlow round-trips and caches", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.recordTokenStatsMany([{
+        token: "T-FLOW",
+        firstSeenAt: Date.now(),
+        firstM5Vol: 1,
+        firstSeenAgeMin: 2,
+        birdeye1mVol: null,
+        rugcheckBundlerPct: null,
+        rugcheckTop10Pct: null,
+        birdeyeProTraders: null,
+        birdeyeSniperPct: null,
+        minMcapObserved: null,
+        supplyFlowJson: null,
+        supplyFlowAt: null,
+      }]);
+      await db.updateTokenSupplyFlow("T-FLOW", JSON.stringify({ flagged: true, feeders: 4, fedPct: 2.5, sells: 6 }));
+      const got = await db.getTokenStats("T-FLOW");
+      const parsed = JSON.parse(got.supplyFlowJson);
+      assert.equal(parsed.flagged, true);
+      assert.equal(parsed.feeders, 4);
+      assert.ok(got.supplyFlowAt !== null && got.supplyFlowAt > 0);
+    } finally {
+      await t.cleanup();
+    }
   });
 
   // ---------- summary ----------

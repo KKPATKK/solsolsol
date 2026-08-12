@@ -1,3 +1,22 @@
+export interface SupplyFlowConfig {
+  /** Whether the on-chain supply-flow (rug/distribution) detector is active. */
+  enabled: boolean;
+  /** Distinct top-holder wallets that must feed the same collector to flag. */
+  minFeeders: number;
+  /** % of total supply that must accumulate at the collector in the window. */
+  minFedPct: number;
+  /** Collector outbound transfers in the window to count as "selling". */
+  minSells: number;
+  /** How far back to analyze each coin's transfers. */
+  windowMs: number;
+  /** Re-run the analysis this often per coin (results are cached in Turso). */
+  refreshMs: number;
+  /** How many of the largest holder accounts to inspect. */
+  topAccounts: number;
+  /** Wall-clock budget for one coin's analysis (deferred to next tick when exceeded). */
+  budgetMs: number;
+}
+
 export interface AppConfig {
   /** Telegram bot token from @BotFather. Bot won't start without it. */
   telegramBotToken?: string;
@@ -23,6 +42,8 @@ export interface AppConfig {
   rugcheckRequestIntervalMs: number;
   /** Minimum spacing between Solana RPC requests (rate limiting). */
   heliusRequestIntervalMs: number;
+  /** On-chain supply-flow (rug/distribution) detector tuning. */
+  supplyFlow: SupplyFlowConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -59,5 +80,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     heliusRequestIntervalMs: Number.isFinite(Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 100))
       ? Math.max(0, Number(env.HELIUS_REQUEST_INTERVAL_MS ?? 100))
       : 100,
+    supplyFlow: {
+      enabled: (env.SUPPLY_FLOW_ENABLED ?? "true") !== "false",
+      minFeeders: Number(env.SUPPLY_FLOW_MIN_FEEDERS ?? 3),
+      minFedPct: Number(env.SUPPLY_FLOW_MIN_FED_PCT ?? 1),
+      minSells: Number(env.SUPPLY_FLOW_MIN_SELLS ?? 3),
+      windowMs: Number(env.SUPPLY_FLOW_WINDOW_HOURS ?? 12) * 3600_000,
+      refreshMs: Number(env.SUPPLY_FLOW_REFRESH_MIN ?? 30) * 60_000,
+      topAccounts: Number(env.SUPPLY_FLOW_TOP_ACCOUNTS ?? 8),
+      budgetMs: Number(env.SUPPLY_FLOW_BUDGET_MS ?? 10_000),
+    },
   };
 }

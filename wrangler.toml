@@ -20,3 +20,14 @@ DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
 HELIUS_REQUEST_INTERVAL_MS = "300"
+# On-chain supply-flow (rug/distribution) detector: flags coins whose top
+# holders feed tokens to one collector wallet that keeps selling, then blocks
+# the push. Thresholds are tunable; defaults catch clear-cut distribution
+# (3+ feeders, >=1% of supply consolidated, collector sold 3+ times in 12h).
+SUPPLY_FLOW_ENABLED = "true"
+SUPPLY_FLOW_MIN_FEEDERS = "3"
+SUPPLY_FLOW_MIN_FED_PCT = "1"
+SUPPLY_FLOW_MIN_SELLS = "3"
+SUPPLY_FLOW_WINDOW_HOURS = "12"
+SUPPLY_FLOW_REFRESH_MIN = "30"
+SUPPLY_FLOW_TOP_ACCOUNTS = "8"

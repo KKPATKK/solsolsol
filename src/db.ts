@@ -75,6 +75,10 @@ export interface TokenStats {
   birdeyeSniperPct: number | null;
   /** Lowest market cap since listing (USD), null = unknown. */
   minMcapObserved: number | null;
+  /** Cached supply-flow detector result (JSON of SupplyFlowResult), null = not analyzed. */
+  supplyFlowJson: string | null;
+  /** When the cached supply-flow result was produced (epoch ms). */
+  supplyFlowAt: number | null;
 }
 
 /**
@@ -188,7 +192,9 @@ export class Db {
         rugcheck_top10_pct REAL,
         birdeye_pro_traders INTEGER,
         birdeye_sniper_pct REAL,
-        min_mcap_observed REAL
+        min_mcap_observed REAL,
+        supply_flow TEXT,
+        supply_flow_at INTEGER
       );
     `);
     // Permanent per-tick scan history, so interruptions are visible long
@@ -224,6 +230,8 @@ export class Db {
     await this.addColumnIfMissing("token_stats", "birdeye_pro_traders", "INTEGER");
     await this.addColumnIfMissing("token_stats", "birdeye_sniper_pct", "REAL");
     await this.addColumnIfMissing("token_stats", "min_mcap_observed", "REAL");
+    await this.addColumnIfMissing("token_stats", "supply_flow", "TEXT");
+    await this.addColumnIfMissing("token_stats", "supply_flow_at", "INTEGER");
   }
 
   private async addColumnIfMissing(
@@ -405,6 +413,8 @@ export class Db {
     const proTraders = row.birdeye_pro_traders;
     const sniperPct = row.birdeye_sniper_pct;
     const minMcap = row.min_mcap_observed;
+    const flowJson = row.supply_flow;
+    const flowAt = row.supply_flow_at;
     return {
       token: String(row.token),
       firstSeenAt: Number(row.first_seen_at),
@@ -421,6 +431,10 @@ export class Db {
         sniperPct === null || sniperPct === undefined ? null : Number(sniperPct),
       minMcapObserved:
         minMcap === null || minMcap === undefined ? null : Number(minMcap),
+      supplyFlowJson:
+        flowJson === null || flowJson === undefined ? null : String(flowJson),
+      supplyFlowAt:
+        flowAt === null || flowAt === undefined ? null : Number(flowAt),
     };
   }
 
@@ -501,7 +515,7 @@ export class Db {
 
   async recordTokenStats(stats: TokenStats): Promise<void> {
     await this.get().execute({
-      sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, supply_flow, supply_flow_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
       args: [stats.token, stats.firstSeenAt, stats.firstM5Vol, stats.firstSeenAgeMin, stats.birdeye1mVol, stats.rugcheckBundlerPct, stats.rugcheckTop10Pct, stats.birdeyeProTraders, stats.birdeyeSniperPct, stats.minMcapObserved],
     });
   }
@@ -513,7 +527,9 @@ export class Db {
    */
   async recordTokenStatsMany(statsList: TokenStats[]): Promise<void> {
     if (statsList.length === 0) return;
-    const placeholders = statsList.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",");
+    const placeholders = statsList
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)")
+      .join(",");
     const args: Array<string | number | null> = [];
     for (const s of statsList) {
       args.push(
@@ -530,7 +546,7 @@ export class Db {
       );
     }
     await this.get().execute({
-      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES ${placeholders}`,
+      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, supply_flow, supply_flow_at) VALUES ${placeholders}`,
       args,
     });
   }
@@ -571,6 +587,14 @@ export class Db {
     await this.get().execute({
       sql: "UPDATE token_stats SET min_mcap_observed = ? WHERE token = ?",
       args: [minMcap, token],
+    });
+  }
+
+  /** Cache the supply-flow detector result for a token (reused until refreshMs elapses). */
+  async updateTokenSupplyFlow(token: string, json: string): Promise<void> {
+    await this.get().execute({
+      sql: "UPDATE token_stats SET supply_flow = ?, supply_flow_at = ? WHERE token = ?",
+      args: [json, Date.now(), token],
     });
   }
 }

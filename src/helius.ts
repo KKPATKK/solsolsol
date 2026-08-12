@@ -494,4 +494,305 @@ export class HeliusClient {
       return null;
     }
   }
+
+  /**
+   * Largest token accounts for a mint (getTokenLargestAccounts, 1 credit).
+   * These are the accounts that actually hold the supply; the owner wallet of
+   * each is derivable via getAccountInfo, but for flow analysis the ATA
+   * address itself is the key we watch (every transfer touches it).
+   */
+  async getTokenLargestAccounts(
+    mint: string,
+  ): Promise<Array<{ address: string; uiAmount: number; decimals: number }> | null> {
+    const res = await this.rpc<{
+      value?: Array<{ address?: string; uiAmount?: number; decimals?: number }>;
+    }>("getTokenLargestAccounts", [mint]);
+    if (!res?.value) return null;
+    const out: Array<{ address: string; uiAmount: number; decimals: number }> =
+      [];
+    for (const a of res.value) {
+      if (!a.address) continue;
+      out.push({
+        address: a.address,
+        uiAmount: Number(a.uiAmount ?? 0),
+        decimals: Number(a.decimals ?? 6),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Outbound transfers of `mint` from a token account within a time window,
+   * using Helius' getTransactionsForAddress (gTFA) — one call returns full
+   * parsed transactions (no per-tx getTransaction needed). Filters to only
+   * succeeded, outbound transfers of the target mint; the parsed transfer
+   * instructions give the destination account and amount.
+   */
+  async getOutTransfersForMint(
+    addr: string,
+    mint: string,
+    sinceSec: number,
+    limit = 100,
+  ): Promise<TransferEntry[]> {
+    const res = await this.rpc<{
+      data?: Array<{
+        blockTime?: number | null;
+        transaction?: {
+          message?: {
+            instructions?: Array<{
+              parsed?: { type?: string; info?: Record<string, unknown> };
+            }>;
+          };
+        };
+        meta?: {
+          innerInstructions?: Array<{
+            instructions?: Array<{
+              parsed?: { type?: string; info?: Record<string, unknown> };
+            }>;
+          }>;
+        };
+      }>;
+    }>("getTransactionsForAddress", [
+      addr,
+      {
+        transactionDetails: "full",
+        encoding: "jsonParsed",
+        maxSupportedTransactionVersion: 0,
+        sortOrder: "desc",
+        limit,
+        filters: {
+          blockTime: { gte: sinceSec },
+          status: "succeeded",
+          tokenAccounts: "none",
+          tokenTransfer: { direction: "out", mint },
+        },
+      },
+    ]);
+    const data = res?.data;
+    if (!Array.isArray(data)) return [];
+
+    const out: TransferEntry[] = [];
+    for (const tx of data) {
+      const atMs = typeof tx.blockTime === "number" ? tx.blockTime * 1000 : 0;
+      const ixs = [
+        ...(tx.transaction?.message?.instructions ?? []),
+        ...(tx.meta?.innerInstructions ?? []).flatMap(
+          (ii) => ii.instructions ?? [],
+        ),
+      ];
+      for (const ix of ixs) {
+        const parsed = ix.parsed;
+        if (
+          !parsed ||
+          (parsed.type !== "transfer" && parsed.type !== "transferChecked")
+        ) {
+          continue;
+        }
+        const info = parsed.info ?? {};
+        const from = String(info.source ?? "");
+        const to = String(info.destination ?? "");
+        // Only outbound movements of the queried account; the gTFA filter
+        // already guarantees mint involvement, so plain `transfer` (no mint
+        // field in the ix) is trusted.
+        if (!from || !to || from !== addr) continue;
+        const tokenAmount = info.tokenAmount as
+          | { uiAmount?: number; amount?: string; decimals?: number }
+          | undefined;
+        let uiAmount = Number(tokenAmount?.uiAmount);
+        if (!Number.isFinite(uiAmount) || uiAmount <= 0) {
+          const raw = Number(tokenAmount?.amount ?? info.amount ?? NaN);
+          const dec = Number(tokenAmount?.decimals ?? 6);
+          uiAmount =
+            Number.isFinite(raw) && Number.isFinite(dec) && dec >= 0
+              ? raw / 10 ** dec
+              : 0;
+        }
+        if (!Number.isFinite(uiAmount) || uiAmount <= 0) continue;
+        out.push({ from, to, uiAmount, atMs });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * On-chain supply-flow analysis for one coin (rug/distribution detector).
+   * Returns a result with ok:false when the data cannot be gathered — callers
+   * must decide how to treat unknowns. Requires the Helius key (gTFA is a
+   * Helius-exclusive RPC method; the public RPC does not implement it).
+   */
+  async analyzeSupplyFlow(
+    mint: string,
+    pairAddress: string,
+    totalSupplyUi: number,
+    opts: {
+      windowMs: number;
+      minFeeders: number;
+      minFedPct: number;
+      minSells: number;
+      topAccounts: number;
+      now: number;
+    },
+  ): Promise<SupplyFlowResult> {
+    const now = opts.now;
+    const fail = (): SupplyFlowResult => ({
+      ok: false,
+      flagged: false,
+      feeders: 0,
+      fedPct: 0,
+      sells: 0,
+      collector: null,
+      analyzedAt: now,
+      windowMs: opts.windowMs,
+    });
+    if (
+      !Number.isFinite(totalSupplyUi) ||
+      totalSupplyUi <= 0 ||
+      !this.endpoint.includes("helius")
+    ) {
+      return fail();
+    }
+    const largest = await this.getTokenLargestAccounts(mint);
+    if (!largest || largest.length === 0) return fail();
+    const topAccounts = largest
+      .filter((a) => a.address !== pairAddress)
+      .slice(0, opts.topAccounts)
+      .map((a) => a.address);
+    if (topAccounts.length === 0) return fail();
+    const sinceSec = Math.floor((now - opts.windowMs) / 1000);
+    return detectSupplyFlow({
+      topAccounts,
+      totalSupplyUi,
+      minFeeders: opts.minFeeders,
+      minFedPct: opts.minFedPct,
+      minSells: opts.minSells,
+      windowMs: opts.windowMs,
+      now,
+      fetchOutTransfers: (addr) =>
+        this.getOutTransfersForMint(addr, mint, sinceSec),
+    });
+  }
+}
+
+/** One on-chain token transfer (already reduced to UI units). */
+export interface TransferEntry {
+  from: string;
+  to: string;
+  uiAmount: number;
+  atMs: number;
+}
+
+/** Verdict of the supply-flow (rug/distribution) detector for one coin. */
+export interface SupplyFlowResult {
+  /** True when the analysis completed (ok:false = data unavailable). */
+  ok: boolean;
+  /** True when the feed-the-collector-then-sell pattern was detected. */
+  flagged: boolean;
+  /** Distinct top-holder accounts that fed the collector in the window. */
+  feeders: number;
+  /** % of total supply accumulated at the collector in the window. */
+  fedPct: number;
+  /** Collector outbound transfers (sales) counted in the window. */
+  sells: number;
+  /** The collector token account (null when nothing was flagged). */
+  collector: string | null;
+  /** When this analysis ran (epoch ms). */
+  analyzedAt: number;
+  windowMs: number;
+}
+
+export interface SupplyFlowDeps {
+  /** Token accounts to treat as "top holders" (LP pool already excluded). */
+  topAccounts: string[];
+  /** Total supply in UI units (used to compute fedPct). */
+  totalSupplyUi: number;
+  minFeeders: number;
+  minFedPct: number;
+  minSells: number;
+  windowMs: number;
+  now: number;
+  /** Fetch outbound transfer entries for one token account. */
+  fetchOutTransfers: (addr: string) => Promise<TransferEntry[]>;
+}
+
+/**
+ * Pure supply-flow detector (unit-tested offline): looks for the classic
+ * hidden-distribution pattern — several top-holder wallets sending a
+ * meaningful share of the supply to ONE collector wallet that then sells.
+ *
+ * 1. For each top account, list its outbound transfers of the token.
+ * 2. Group by destination; destinations fed by >= minFeeders distinct top
+ *    accounts are collector candidates.
+ * 3. A candidate must have accumulated >= minFedPct% of supply AND show
+ *    >= minSells outbound transfers of its own in the window to count as
+ *    active distribution ("feeding one wallet that repeatedly sells").
+ */
+export async function detectSupplyFlow(
+  deps: SupplyFlowDeps,
+): Promise<SupplyFlowResult> {
+  const { topAccounts, totalSupplyUi, minFeeders, minFedPct, minSells, windowMs, now } =
+    deps;
+  const since = now - windowMs;
+  const cache = new Map<string, Promise<TransferEntry[]>>();
+  const outTransfers = (addr: string): Promise<TransferEntry[]> => {
+    let p = cache.get(addr);
+    if (!p) {
+      p = deps.fetchOutTransfers(addr).catch(() => []);
+      cache.set(addr, p);
+    }
+    return p;
+  };
+
+  const inflow = new Map<string, { sources: Set<string>; amount: number }>();
+  for (const addr of topAccounts) {
+    const entries = await outTransfers(addr);
+    for (const e of entries) {
+      if (e.atMs < since || e.to === addr || e.to === e.from) continue;
+      if (!Number.isFinite(e.uiAmount) || e.uiAmount <= 0) continue;
+      let agg = inflow.get(e.to);
+      if (!agg) {
+        agg = { sources: new Set(), amount: 0 };
+        inflow.set(e.to, agg);
+      }
+      agg.sources.add(addr);
+      agg.amount += e.uiAmount;
+    }
+  }
+
+  const candidates = [...inflow.entries()]
+    .filter(([, agg]) => agg.sources.size >= minFeeders)
+    .sort((a, b) => b[1].amount - a[1].amount);
+
+  let flagged = false;
+  let feeders = 0;
+  let fedPct = 0;
+  let sells = 0;
+  let collector: string | null = null;
+  for (const [to, agg] of candidates) {
+    const pct = totalSupplyUi > 0 ? (agg.amount / totalSupplyUi) * 100 : 0;
+    if (pct < minFedPct) continue;
+    // Count the collector's own outbound activity ("repeatedly selling").
+    const out = await outTransfers(to);
+    let s = 0;
+    for (const e of out) {
+      if (e.atMs >= since && e.to !== to && e.to !== e.from) s++;
+    }
+    if (s < minSells) continue;
+    flagged = true;
+    feeders = agg.sources.size;
+    fedPct = pct;
+    sells = s;
+    collector = to;
+    break;
+  }
+
+  return {
+    ok: true,
+    flagged,
+    feeders,
+    fedPct,
+    sells,
+    collector,
+    analyzedAt: now,
+    windowMs,
+  };
 }
