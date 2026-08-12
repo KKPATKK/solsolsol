@@ -522,16 +522,17 @@ export class HeliusClient {
   }
 
   /**
-   * Outbound transfers of `mint` from a token account within a time window,
-   * using Helius' getTransactionsForAddress (gTFA) — one call returns full
-   * parsed transactions (no per-tx getTransaction needed). Filters to only
-   * succeeded, outbound transfers of the target mint; the parsed transfer
-   * instructions give the destination account and amount.
+   * Transfers of `mint` to/from a token account within a time window, using
+   * Helius' getTransactionsForAddress (gTFA) — one call returns full parsed
+   * transactions (no per-tx getTransaction needed). Filters to only
+   * succeeded transfers of the target mint in the given direction; the
+   * parsed transfer instructions give the counterparty account and amount.
    */
-  async getOutTransfersForMint(
+  private async getTransfersForMint(
     addr: string,
     mint: string,
     sinceSec: number,
+    direction: "in" | "out",
     limit = 100,
   ): Promise<TransferEntry[]> {
     const res = await this.rpc<{
@@ -564,13 +565,35 @@ export class HeliusClient {
           blockTime: { gte: sinceSec },
           status: "succeeded",
           tokenAccounts: "none",
-          tokenTransfer: { direction: "out", mint },
+          tokenTransfer: { direction, mint },
         },
       },
     ]);
     const data = res?.data;
     if (!Array.isArray(data)) return [];
-    return extractOutboundTransfers(data, addr);
+    return direction === "out"
+      ? extractOutboundTransfers(data, addr)
+      : extractInboundTransfers(data, addr);
+  }
+
+  /** Outbound transfers of `mint` from a token account (who it fed). */
+  async getOutTransfersForMint(
+    addr: string,
+    mint: string,
+    sinceSec: number,
+    limit = 100,
+  ): Promise<TransferEntry[]> {
+    return this.getTransfersForMint(addr, mint, sinceSec, "out", limit);
+  }
+
+  /** Inbound transfers of `mint` into a token account (who fed it). */
+  async getInTransfersForMint(
+    addr: string,
+    mint: string,
+    sinceSec: number,
+    limit = 100,
+  ): Promise<TransferEntry[]> {
+    return this.getTransfersForMint(addr, mint, sinceSec, "in", limit);
   }
 
   /**
@@ -589,6 +612,8 @@ export class HeliusClient {
       minFedPct: number;
       minSells: number;
       topAccounts: number;
+      /** Analyze inbound transfers too (distributed feeders converging on one collector). */
+      checkInflow: boolean;
       now: number;
     },
   ): Promise<SupplyFlowResult> {
@@ -632,6 +657,15 @@ export class HeliusClient {
     );
     if (topAccounts.length === 0) return fail();
     const sinceSec = Math.floor((now - opts.windowMs) / 1000);
+    // LP vaults must never count as a feeder source or a collector
+    // destination: a holder selling back into the pool is a normal trade,
+    // not distribution. The same exclusion set selects the top accounts.
+    const lpAccounts = [
+      pairAddress,
+      ...(ownedRes?.value ?? [])
+        .map((v) => v.pubkey)
+        .filter((p): p is string => Boolean(p)),
+    ];
     return detectSupplyFlow({
       topAccounts,
       totalSupplyUi,
@@ -640,8 +674,15 @@ export class HeliusClient {
       minSells: opts.minSells,
       windowMs: opts.windowMs,
       now,
+      excludeAccounts: lpAccounts,
       fetchOutTransfers: (addr) =>
         this.getOutTransfersForMint(addr, mint, sinceSec),
+      ...(opts.checkInflow
+        ? {
+            fetchInTransfers: (addr) =>
+              this.getInTransfersForMint(addr, mint, sinceSec),
+          }
+        : {}),
     });
   }
 }
@@ -666,16 +707,18 @@ export interface ParsedTxLike {
 }
 
 /**
- * Extract outbound SPL token transfers from parsed transactions. Pure and
- * unit-tested — jsonParsed instruction shape is identical between gTFA full
- * mode and getTransaction, so the same code serves both (and the offline
- * diagnostic). Plain `transfer` (no mint field) is trusted to involve the
- * queried mint when it comes from gTFA's tokenTransfer filter; the
- * diagnostics pass a mint to filter transferChecked.
+ * Extract SPL token transfers touching `addr` from parsed transactions, in
+ * the given direction. Pure and unit-tested — jsonParsed instruction shape
+ * is identical between gTFA full mode and getTransaction, so the same code
+ * serves both (and the offline diagnostic). Plain `transfer` (no mint field)
+ * is trusted to involve the queried mint when it comes from gTFA's
+ * tokenTransfer filter; the diagnostics pass a mint to filter
+ * transferChecked.
  */
-export function extractOutboundTransfers(
+function extractTransfers(
   txs: ParsedTxLike[],
   addr: string,
+  wantOutbound: boolean,
 ): TransferEntry[] {
   const out: TransferEntry[] = [];
   for (const tx of txs) {
@@ -697,7 +740,8 @@ export function extractOutboundTransfers(
       const info = parsed.info ?? {};
       const from = String(info.source ?? "");
       const to = String(info.destination ?? "");
-      if (!from || !to || from !== addr) continue;
+      if (!from || !to) continue;
+      if (wantOutbound ? from !== addr : to !== addr) continue;
       const tokenAmount = info.tokenAmount as
         | { uiAmount?: number; amount?: string; decimals?: number }
         | undefined;
@@ -715,6 +759,22 @@ export function extractOutboundTransfers(
     }
   }
   return out;
+}
+
+/** Transfers FROM `addr` (who it fed). */
+export function extractOutboundTransfers(
+  txs: ParsedTxLike[],
+  addr: string,
+): TransferEntry[] {
+  return extractTransfers(txs, addr, true);
+}
+
+/** Transfers TO `addr` (who fed it). */
+export function extractInboundTransfers(
+  txs: ParsedTxLike[],
+  addr: string,
+): TransferEntry[] {
+  return extractTransfers(txs, addr, false);
 }
 
 /** One on-chain token transfer (already reduced to UI units). */
@@ -777,50 +837,102 @@ export interface SupplyFlowDeps {
   now: number;
   /** Fetch outbound transfer entries for one token account. */
   fetchOutTransfers: (addr: string) => Promise<TransferEntry[]>;
+  /**
+   * Fetch inbound transfer entries for one token account. When provided,
+   * the detector also treats each top account itself as a collector
+   * candidate fed by its inbound sources — catching distributed feeders
+   * that are not themselves top holders but converge on one big wallet.
+   */
+  fetchInTransfers?: (addr: string) => Promise<TransferEntry[]>;
+  /**
+   * Accounts that must never count as a feeder or a collector destination
+   * (LP pair + its vaults): a holder selling back into the pool is a
+   * normal trade, not distribution.
+   */
+  excludeAccounts?: string[];
 }
 
 /**
  * Pure supply-flow detector (unit-tested offline): looks for the classic
- * hidden-distribution pattern — several top-holder wallets sending a
- * meaningful share of the supply to ONE collector wallet that then sells.
+ * hidden-distribution pattern — several wallets sending a meaningful share
+ * of the supply to ONE collector wallet that then sells. Two views feed the
+ * same graph:
  *
- * 1. For each top account, list its outbound transfers of the token.
- * 2. Group by destination; destinations fed by >= minFeeders distinct top
- *    accounts are collector candidates.
- * 3. A candidate must have accumulated >= minFedPct% of supply AND show
- *    >= minSells outbound transfers of its own in the window to count as
- *    active distribution ("feeding one wallet that repeatedly sells").
+ *  1. Outbound view: each top account's transfers out — collector
+ *     candidates are the destinations they feed.
+ *  2. Inbound view (when fetchInTransfers is set): each top account's
+ *     transfers in — collector candidates are the top accounts themselves,
+ *     fed by wallets that need not be top holders (distributed feeders).
+ *
+ * A candidate must be fed by >= minFeeders distinct sources, accumulate
+ * >= minFedPct% of supply, and show >= minSells outbound transfers of its
+ * own in the window to count as active distribution ("feeding one wallet
+ * that repeatedly sells"). LP accounts (excludeAccounts) never count as a
+ * source or a destination.
  */
 export async function detectSupplyFlow(
   deps: SupplyFlowDeps,
 ): Promise<SupplyFlowResult> {
-  const { topAccounts, totalSupplyUi, minFeeders, minFedPct, minSells, windowMs, now } =
-    deps;
+  const {
+    topAccounts,
+    totalSupplyUi,
+    minFeeders,
+    minFedPct,
+    minSells,
+    windowMs,
+    now,
+    excludeAccounts = [],
+  } = deps;
   const since = now - windowMs;
-  const cache = new Map<string, Promise<TransferEntry[]>>();
+  const exclude = new Set(excludeAccounts);
+  const outCache = new Map<string, Promise<TransferEntry[]>>();
   const outTransfers = (addr: string): Promise<TransferEntry[]> => {
-    let p = cache.get(addr);
+    let p = outCache.get(addr);
     if (!p) {
       p = deps.fetchOutTransfers(addr).catch(() => []);
-      cache.set(addr, p);
+      outCache.set(addr, p);
+    }
+    return p;
+  };
+  const inCache = new Map<string, Promise<TransferEntry[]>>();
+  const inTransfers = (addr: string): Promise<TransferEntry[]> => {
+    if (!deps.fetchInTransfers) return Promise.resolve([]);
+    let p = inCache.get(addr);
+    if (!p) {
+      p = deps.fetchInTransfers(addr).catch(() => []);
+      inCache.set(addr, p);
     }
     return p;
   };
 
   const inflow = new Map<string, { sources: Set<string>; amount: number }>();
+  const addEdge = (
+    from: string,
+    to: string,
+    uiAmount: number,
+    atMs: number,
+  ) => {
+    if (atMs < since || !from || !to || from === to) return;
+    if (!Number.isFinite(uiAmount) || uiAmount <= 0) return;
+    if (exclude.has(from) || exclude.has(to)) return;
+    let agg = inflow.get(to);
+    if (!agg) {
+      agg = { sources: new Set(), amount: 0 };
+      inflow.set(to, agg);
+    }
+    agg.sources.add(from);
+    agg.amount += uiAmount;
+  };
+
+  // Outbound view: top accounts feed destinations.
   for (const addr of topAccounts) {
     const entries = await outTransfers(addr);
-    for (const e of entries) {
-      if (e.atMs < since || e.to === addr || e.to === e.from) continue;
-      if (!Number.isFinite(e.uiAmount) || e.uiAmount <= 0) continue;
-      let agg = inflow.get(e.to);
-      if (!agg) {
-        agg = { sources: new Set(), amount: 0 };
-        inflow.set(e.to, agg);
-      }
-      agg.sources.add(addr);
-      agg.amount += e.uiAmount;
-    }
+    for (const e of entries) addEdge(addr, e.to, e.uiAmount, e.atMs);
+  }
+  // Inbound view: sources feed the top accounts (distributed feeders).
+  for (const addr of topAccounts) {
+    const entries = await inTransfers(addr);
+    for (const e of entries) addEdge(e.from, addr, e.uiAmount, e.atMs);
   }
 
   const candidates = [...inflow.entries()]

@@ -421,6 +421,77 @@ async function main() {
     assert.equal(r.flagged, false); // all feeds outside the 12h window
   });
 
+  await test("detectSupplyFlow inbound view flags distributed feeders on one top account", async () => {
+    // Feeders W1/W2/W3 are NOT top holders — invisible to the outbound view.
+    // Inbound view: all three feed the same top account A1, which then sells.
+    const outHistory = {
+      A1: [out("A1", "POOL", 4000), out("A1", "POOL", 3000), out("A1", "POOL", 2000)],
+      A2: [], A3: [], A4: [],
+    };
+    const inHistory = {
+      A1: [out("W1", "A1", 8000), out("W2", "A1", 6000), out("W3", "A1", 9000)],
+      A2: [], A3: [], A4: [],
+    };
+    const r = await detectSupplyFlow(baseDeps({
+      fetchOutTransfers: async (a) => outHistory[a] ?? [],
+      fetchInTransfers: async (a) => inHistory[a] ?? [],
+    }));
+    assert.equal(r.ok, true);
+    assert.equal(r.flagged, true);
+    assert.equal(r.feeders, 3); // W1, W2, W3
+    assert.equal(r.collector, "A1");
+    assert.ok(r.fedPct >= 2.2 && r.fedPct <= 2.4, `fedPct=${r.fedPct}`); // 23000/1e6
+    assert.equal(r.sells, 3);
+  });
+
+  await test("detectSupplyFlow inbound view still respects all thresholds", async () => {
+    // Only 2 distinct inbound feeders → below minFeeders 3.
+    const r1 = await detectSupplyFlow(baseDeps({
+      fetchOutTransfers: async (a) => (a === "A1" ? [out("A1", "POOL", 2000), out("A1", "POOL", 2000), out("A1", "POOL", 2000)] : []),
+      fetchInTransfers: async (a) => (a === "A1" ? [out("W1", "A1", 8000), out("W2", "A1", 6000)] : []),
+    }));
+    assert.equal(r1.flagged, false); // only 2 feeders
+    // 3 feeders but collector never sells → not distribution.
+    const r2 = await detectSupplyFlow(baseDeps({
+      fetchOutTransfers: async () => [],
+      fetchInTransfers: async (a) => (a === "A1" ? [out("W1", "A1", 8000), out("W2", "A1", 6000), out("W3", "A1", 9000)] : []),
+    }));
+    assert.equal(r2.flagged, false); // no sells
+  });
+
+  await test("detectSupplyFlow excludes LP accounts from feeders and collectors", async () => {
+    // Many top holders sell back into the pool — that is normal trading, so
+    // the pool must never be treated as a collector.
+    const history = {
+      A1: [out("A1", "POOL", 8000)],
+      A2: [out("A2", "POOL", 6000)],
+      A3: [out("A3", "POOL", 9000)],
+      A4: [],
+      POOL: [out("POOL", "BUYER1", 5000), out("POOL", "BUYER2", 4000), out("POOL", "BUYER3", 3000)],
+    };
+    const r = await detectSupplyFlow(baseDeps({
+      fetchOutTransfers: async (a) => history[a] ?? [],
+      excludeAccounts: ["POOL"],
+    }));
+    assert.equal(r.flagged, false); // POOL excluded as a collector destination
+    // Similarly, the pool must not count as an inbound feeder (normal buys).
+    const r2 = await detectSupplyFlow(baseDeps({
+      fetchOutTransfers: async (a) => (a === "A1" ? [out("A1", "POOL", 2000), out("A1", "POOL", 2000), out("A1", "POOL", 2000)] : []),
+      fetchInTransfers: async (a) => (a === "A1" ? [out("POOL", "A1", 8000), out("W2", "A1", 6000), out("W3", "A1", 9000)] : []),
+      excludeAccounts: ["POOL"],
+    }));
+    assert.equal(r2.flagged, false); // POOL source excluded → only 2 real feeders
+  });
+
+  await test("detectSupplyFlow without fetchInTransfers keeps outbound-only behavior", async () => {
+    // Existing path: no inbound fetches at all → A1 fed by W1/W2/W3 is not
+    // flagged because the outbound view never sees those wallets.
+    const r = await detectSupplyFlow(baseDeps({
+      fetchOutTransfers: async (a) => (a === "A1" ? [out("A1", "POOL", 2000), out("A1", "POOL", 2000), out("A1", "POOL", 2000)] : []),
+    }));
+    assert.equal(r.flagged, false);
+  });
+
   await test("db updateTokenSupplyFlow round-trips and caches", async () => {
     const t = tmpDb();
     try {

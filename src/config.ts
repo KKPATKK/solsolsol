@@ -13,6 +13,13 @@ export interface SupplyFlowConfig {
   refreshMs: number;
   /** How many of the largest holder accounts to inspect. */
   topAccounts: number;
+  /**
+   * Also analyze each top account's INBOUND transfers (who fed them), so
+   * distributed feeders that are not themselves top holders still surface
+   * when they converge on one collector wallet. Doubles the gTFA calls per
+   * coin; disable when the credit budget is tight.
+   */
+  checkInflow: boolean;
   /** Wall-clock budget for one coin's analysis (deferred to next tick when exceeded). */
   budgetMs: number;
 }
@@ -87,8 +94,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       minSells: Number(env.SUPPLY_FLOW_MIN_SELLS ?? 3),
       windowMs: Number(env.SUPPLY_FLOW_WINDOW_HOURS ?? 12) * 3600_000,
       refreshMs: Number(env.SUPPLY_FLOW_REFRESH_MIN ?? 30) * 60_000,
-      topAccounts: Number(env.SUPPLY_FLOW_TOP_ACCOUNTS ?? 8),
-      budgetMs: Number(env.SUPPLY_FLOW_BUDGET_MS ?? 10_000),
+      topAccounts: Number(env.SUPPLY_FLOW_TOP_ACCOUNTS ?? 10),
+      checkInflow: (env.SUPPLY_FLOW_CHECK_INFLOW ?? "true") !== "false",
+      budgetMs: Number(env.SUPPLY_FLOW_BUDGET_MS ?? 15_000),
     },
   };
 }

@@ -551,6 +551,7 @@ export class Scanner {
           minFedPct: cfg.minFedPct,
           minSells: cfg.minSells,
           topAccounts: cfg.topAccounts,
+          checkInflow: cfg.checkInflow,
           now: Date.now(),
         }),
         // Hard cap: a slow/stuck gTFA must not wedge the tick — treat as

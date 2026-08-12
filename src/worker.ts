@@ -343,6 +343,7 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
         minFedPct: sf.minFedPct,
         minSells: sf.minSells,
         topAccounts: sf.topAccounts,
+        checkInflow: sf.checkInflow,
         now: Date.now(),
       }),
       // Hard cap: a slow/stuck gTFA must not hang the webhook request.
