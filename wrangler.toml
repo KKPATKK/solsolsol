@@ -21,7 +21,7 @@ SCAN_PROFILE_LIMIT = "100"
 # window that the bot keeps tracking until they qualify (code default 40,
 # max 250). Ordered by relevance, so the closest-to-qualifying coins are
 # always checked first; leftovers simply defer to the next tick.
-RE_EVAL_POOL_SIZE = "100"
+RE_EVAL_POOL_SIZE = "250"
 DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
