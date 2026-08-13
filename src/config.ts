@@ -100,6 +100,14 @@ export interface AppConfig {
   port: number;
   /** How many of the newest token profiles to inspect per scan. */
   scanProfileLimit: number;
+  /**
+   * Re-evaluation pool cap: how many never-pushed tokens nearing/inside the
+   * qualifying age window to keep tracking (RE_EVAL_POOL_SIZE). Pool rows
+   * are ordered by distance to the window entry, so the most relevant coins
+   * are always evaluated first; anything not processed within the tick's
+   * deadline stays in the pool and is retried next tick (nothing is lost).
+   */
+  reevalPoolSize: number;
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
@@ -125,6 +133,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   );
   const rawPort = Number(env.PORT ?? 3000);
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
+  const rawReevalPool = Number(env.RE_EVAL_POOL_SIZE ?? 40);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
   const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
   const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
@@ -145,6 +154,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     port: Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 3000,
     scanProfileLimit:
       Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 40,
+    reevalPoolSize:
+      Number.isFinite(rawReevalPool) && rawReevalPool > 0
+        ? Math.min(Math.floor(rawReevalPool), 250)
+        : 40,
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))

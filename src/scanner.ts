@@ -56,12 +56,6 @@ const OPENING_VOLUME_ROOM_MS = 18_000;
  */
 const RE_EVAL_WINDOW_MS = 42 * 60 * 60_000;
 /**
- * Re-evaluation pool cap. Sized so the per-tick pairs re-fetch stays within
- * 2 DexScreener batches (30 addresses each): the pool is ordered by distance
- * to the age-window entry, so the 40 most relevant coins are always covered.
- */
-const RE_EVAL_POOL_SIZE = 40;
-/**
  * Margin (minutes) around the qualifying age window: the pool also holds
  * coins that will enter the window within 3h, so they are pushed the moment
  * they qualify instead of being picked up only after a later scan.
@@ -207,7 +201,7 @@ export class Scanner {
         minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
-        limit: RE_EVAL_POOL_SIZE,
+        limit: this.config.reevalPoolSize,
       });
       if (profiles.length === 0 && recentStats.length === 0) {
         console.log("[scanner] no Solana profiles or re-eval candidates returned");

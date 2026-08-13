@@ -13,9 +13,15 @@ crons = ["* * * * *"]
 # Variables and Secrets) or via `wrangler secret put <NAME>`.
 [vars]
 SCAN_INTERVAL_SECONDS = "60"
-# SCAN_PROFILE_LIMIT intentionally not overridden: the code default (40)
-# keeps more of the profiles feed in view, which matters now that coins
-# age 6–40h before qualifying (the re-eval pool needs the feed's coverage).
+# Max coverage: inspect the newest 100 Solana token profiles per scan
+# (the code caps this at 100). Deferred candidates stay in the re-eval
+# pool, so nothing is lost when a tick runs out of budget.
+SCAN_PROFILE_LIMIT = "100"
+# Re-evaluation pool: never-pushed coins nearing/inside the qualifying age
+# window that the bot keeps tracking until they qualify (code default 40,
+# max 250). Ordered by relevance, so the closest-to-qualifying coins are
+# always checked first; leftovers simply defer to the next tick.
+RE_EVAL_POOL_SIZE = "100"
 DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
