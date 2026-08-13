@@ -41,14 +41,6 @@ const SCAN_TIMEOUT_MS = 25_000;
  */
 const SCAN_TICK_DEADLINE_MS = 20_000;
 /**
- * Room (ms) needed in the tick before attempting the on-chain opening-volume
- * computation: its enumeration budget is 16s, so only start it when it can
- * actually finish within the tick deadline. The computation is display-only
- * (the first-minute-volume filter was removed) — never risk the whole tick
- * for a message-card field; fall back to the cheap proxy/unknown path.
- */
-const OPENING_VOLUME_ROOM_MS = 18_000;
-/**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 40h) plus margin: coins age into the
  * window while sitting in the pool, since the DexScreener profiles feed
@@ -305,7 +297,7 @@ export class Scanner {
         }
         // Opening volume is resolved for the message card but no longer
         // filters — the first-minute-volume filter was removed.
-        const opening = await this.resolveOpeningVolume(coin, tickDeadline);
+        const opening = await this.resolveOpeningVolume(coin);
         // Bundler + top-10 holder share is resolved for the message card but
         // no longer filters — those filters were removed, so coins push even
         // when the RugCheck report is not ready yet (the card shows 未检测).
@@ -436,57 +428,20 @@ export class Scanner {
   }
 
   /**
-   * Resolve the coin's opening volume:
-   *  1. cached exact value (computed on-chain via Helius),
-   *  2. fresh on-chain computation from the pump.fun bonding curve,
-   *  3. DexScreener proxy (m5 at first sight, when seen young),
-   *  4. unknown → the coin is pushed (no way to measure).
-   * Birdeye is deliberately NOT consulted here anymore: its OHLCV endpoint
-   * (35 CU/call) was the main free-tier budget burner, and the on-chain
-   * computation is free (1 credit/call on Helius' plan).
+   * Resolve the coin's opening volume (display-only card field):
+   *  1. cached exact value (computed on-chain before that computation was
+   *     removed to save Helius credits — already-stored values still show),
+   *  2. DexScreener proxy (m5 at first sight, when seen young),
+   *  3. unknown → the card shows —（无法测量）.
+   * The fresh on-chain computation (~150–250 Helius credits per coin) was
+   * removed; Birdeye is also deliberately NOT consulted (its OHLCV endpoint
+   * was the main free-tier budget burner).
    */
-  private async resolveOpeningVolume(
-    coin: QualifyingCoin,
-    tickDeadline: number,
-  ): Promise<OpeningVolume> {
-    const { stats, pair } = coin;
+  private async resolveOpeningVolume(coin: QualifyingCoin): Promise<OpeningVolume> {
+    const { stats } = coin;
 
     if (stats.birdeye1mVol !== null) {
       return { value: stats.birdeye1mVol, source: "helius" };
-    }
-
-    // Budget guard: the on-chain computation is display-only and can cost up
-    // to 16s per coin — only start it when it can finish within the tick
-    // deadline, so a candidate never risks the 30s wall clock for a
-    // message-card field.
-    if (
-      this.helius &&
-      !this.dataNegativeCached(stats.token) &&
-      tickDeadline - Date.now() >= OPENING_VOLUME_ROOM_MS
-    ) {
-      try {
-        const vol = await this.helius.getFirstMinuteVolumeUsd(stats.token, {
-          priceUsd: pair.priceUsd,
-          priceNative: pair.priceNative,
-          pairCreatedAt: pair.pairCreatedAt,
-          pairAddress: pair.pairAddress,
-        });
-        if (vol !== null) {
-          this.dataFailedAt.delete(stats.token);
-          await this.db.updateTokenBirdeyeVol(stats.token, vol);
-          stats.birdeye1mVol = vol;
-          return { value: vol, source: "helius" };
-        }
-        // Empty result (curve not indexed / first minute not complete / not a
-        // pump token): back off instead of re-querying every scan.
-        this.dataFailedAt.set(stats.token, Date.now());
-      } catch (err) {
-        this.dataFailedAt.set(stats.token, Date.now());
-        console.error(
-          `[scanner] on-chain volume lookup failed for ${stats.token}:`,
-          err instanceof Error ? err.message : err,
-        );
-      }
     }
 
     if (stats.firstSeenAgeMin <= MAX_MEASURABLE_AGE_MIN) {
