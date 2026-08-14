@@ -42,6 +42,11 @@ interface ScheduledEventLike {
   cron?: string;
 }
 
+/** Minimal ExecutionContext shape — avoids pulling in workers-types. */
+interface ExecutionContextLike {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
 // --- Module-scoped state (warm-isolate lifetime) ---
 let db: Db | null = null;
 let scanner: Scanner | null = null;
@@ -501,11 +506,19 @@ async function maybeRunScanIfStale(): Promise<void> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContextLike,
+  ): Promise<Response> {
     await ensureInitialized(env);
-    // Keep the scanner alive independently of cron delivery (best-effort
-    // background trigger, guarded by the last-trigger timestamp).
-    void maybeRunScanIfStale();
+    // Keep the scanner alive independently of cron delivery. waitUntil keeps
+    // the isolate alive until the background scan settles — a bare `void`
+    // promise gets frozen with the isolate right after the response returns,
+    // which wedges the scanner's running-lock mid-scan (observed
+    // 2026-08-14: heartbeat frozen for 90+ minutes while the lock read
+    // "previous-scan-still-running"). Guarded by the last-trigger timestamp.
+    ctx.waitUntil(maybeRunScanIfStale());
     const url = new URL(request.url);
 
     // UptimeRobot target: distinguishes "worker up" from "scanner working".

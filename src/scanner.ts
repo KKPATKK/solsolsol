@@ -111,6 +111,8 @@ const REJECT_LOG_MAX = 50;
 
 export class Scanner {
   private running = false;
+  /** When the current scan started — lets a stale lock be broken by age. */
+  private runningSince = 0;
   /** Monotonic scan id: a timed-out scan must not clobber a newer scan's state. */
   private scanSeq = 0;
   /** Summary of the last completed scan, persisted into the heartbeat. */
@@ -160,12 +162,26 @@ export class Scanner {
   /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
   async runOnce(): Promise<void> {
     if (this.running) {
-      console.log("[scanner] previous scan still running, skipping this tick");
-      this.lastSkip = "previous-scan-still-running";
-      return;
+      // A scan held longer than the budget is wedged: on Workers, the
+      // watchdog timer below never fires while the isolate is frozen (it
+      // freezes right after the response, before the timer queue runs), so a
+      // scan that got frozen mid-await would otherwise block every later
+      // tick forever. Break the lock by age so the next wake retries.
+      const heldMs = Date.now() - this.runningSince;
+      if (heldMs > SCAN_TIMEOUT_MS) {
+        console.warn(
+          `[scanner] releasing stale scan lock (held ${heldMs}ms) — retrying this tick`,
+        );
+        this.running = false;
+      } else {
+        console.log("[scanner] previous scan still running, skipping this tick");
+        this.lastSkip = "previous-scan-still-running";
+        return;
+      }
     }
     const seq = ++this.scanSeq;
     this.running = true;
+    this.runningSince = Date.now();
     const startedAt = Date.now();
     const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
     const diag: ScanSummary = {
