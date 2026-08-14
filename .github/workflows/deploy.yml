@@ -36,47 +36,16 @@ jobs:
       # un-deployed draft (e.g. a dashboard edit that was saved but not
       # deployed). Deploying first makes the latest version the deployed one,
       # so the secret write below succeeds instead of blocking the release.
+      # Note: cron delivery to this Worker is currently broken on Cloudflare's
+      # side (2026-08-14 — schedule bound but events never arrive); the
+      # scanner is driven by external /health polling (HetrixTools, 1-min)
+      # instead. wrangler deploy keeps the trigger configured; no extra
+      # re-provisioning step is run anymore.
       - name: Deploy to Cloudflare Workers
         run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      # Cron Trigger repair + diagnostics: `wrangler deploy` prints "Deployed
-      # triggers" even when the schedule silently stops firing (observed
-      # 2026-08-14: the worker's persisted tick counter stayed null for hours
-      # while HTTP-driven scans ran fine — scheduled events never arrived even
-      # after PUT-over-same re-provision). A DELETE + recreate is the API
-      # equivalent of toggling the trigger in the dashboard, which is the
-      # standard remedy for silent cron-delivery failures.
-      - name: Re-provision cron schedule
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -e
-          AUTH="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
-          API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/solana-meme-bot"
-          echo "::group::DELETE schedule"
-          curl -sS -X DELETE -H "$AUTH" "$API/schedules" | tee /tmp/sched_del.json
-          echo
-          echo "::endgroup::"
-          grep -q '"success": true' /tmp/sched_del.json && echo "::notice::Cron schedule deleted" || echo "::error::Cron schedule DELETE failed"
-          echo "::group::PUT schedule (recreate)"
-          curl -sS -X PUT -H "$AUTH" -H "Content-Type: application/json" \
-            -d '[{"cron":"* * * * *"}]' "$API/schedules" | tee /tmp/sched_put.json
-          echo
-          echo "::endgroup::"
-          grep -q '"success": true' /tmp/sched_put.json && echo "::notice::Cron schedule recreated" || echo "::error::Cron schedule PUT failed"
-          echo "::group::Verify schedule"
-          curl -sS -H "$AUTH" "$API/schedules" | tee /tmp/sched.json
-          echo
-          echo "::endgroup::"
-          grep -q '\* \* \* \* \*' /tmp/sched.json && echo "::notice::Cron schedule * * * * * verified bound" || echo "::error::Cron schedule not found after recreate"
-          echo "::group::Deployments"
-          curl -sS -H "$AUTH" "$API/deployments" | head -c 4000
-          echo
-          echo "::endgroup::"
 
       # Write HELIUS_API_KEY as a Worker secret so the on-chain volume
       # resolver runs at full speed. Best-effort by design: if the GitHub
