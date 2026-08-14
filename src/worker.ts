@@ -54,6 +54,7 @@ let bot: Bot | null = null;
 let webhook: ((req: Request) => Promise<Response>) | null = null;
 let dex: DexScreenerClient | null = null;
 let helius: HeliusClient | null = null;
+let birdeye: BirdeyeClient | null = null;
 let trade: TradeService | null = null;
 let cfg: AppConfig | null = null;
 /** Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
@@ -63,6 +64,13 @@ const flowDebugLastRunAt = new Map<string, number>();
 /** Cooldown for the /debug/tick endpoint (manual scan trigger). */
 const TICK_DEBUG_COOLDOWN_MS = 25_000;
 let tickDebugLastRunAt = 0;
+/**
+ * Cooldown for the /debug/backfill endpoint (one-shot Birdeye backfill).
+ * It costs real CU (30–80 per request) and does a full 42h window walk, so
+ * keep it manual and rare.
+ */
+const BACKFILL_DEBUG_COOLDOWN_MS = 5 * 60_000;
+let backfillDebugLastRunAt = 0;
 /** Minimum gap between fallback scans triggered from the fetch path. */
 const SCAN_TRIGGER_INTERVAL_MS = 60_000;
 let lastScanTriggerAt = 0;
@@ -173,7 +181,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     dex = new DexScreenerClient(config);
 
     if (config.telegramBotToken) {
-      let birdeye: BirdeyeClient | null = null;
+      birdeye = null;
       if (config.birdeyeApiKey) {
         try {
           birdeye = new BirdeyeClient(config);
@@ -654,6 +662,116 @@ export default {
       flowDebugLastRunAt.set(mint, Date.now());
       const res = await analyzeMintFlow(mint);
       return Response.json({ mint, ...res });
+    }
+
+    // One-shot backfill: seed token_stats with recently created Solana coins
+    // from Birdeye's fresh-launch feed (new_listing), which includes pump.fun
+    // launches via meme_platform_enabled=true. The pump.fun HTTP API itself
+    // blocks every datacenter egress we have (sandbox/Worker/GitHub Actions
+    // all get 530), so Birdeye — already keyed and reachable from the Worker
+    // — is the backfill's discovery source. Cooldown-bounded (CU cost);
+    // INSERT OR IGNORE makes it idempotent, safe to re-run after tweaks.
+    if (url.pathname === "/debug/backfill") {
+      const sinceLast = Date.now() - backfillDebugLastRunAt;
+      if (sinceLast < BACKFILL_DEBUG_COOLDOWN_MS) {
+        return Response.json(
+          {
+            ok: false,
+            error: "cooldown — backfill is CU-bounded, wait a bit",
+            retryAfterSec: Math.ceil(
+              (BACKFILL_DEBUG_COOLDOWN_MS - sinceLast) / 1000,
+            ),
+          },
+          { status: 429 },
+        );
+      }
+      backfillDebugLastRunAt = Date.now();
+      if (!birdeye || !db) {
+        return Response.json(
+          {
+            ok: false,
+            error: "Birdeye 或資料庫未就緒（key/DB 未配置？）",
+            birdeyeConfigured,
+            dbReady,
+          },
+          { status: 503 },
+        );
+      }
+      const t0 = Date.now();
+      try {
+        // Raw schema probe first — the docs don't publish new_listing's item
+        // fields, so surface the actual response for the first run.
+        let probe: unknown = null;
+        try {
+          probe = await birdeye.probeNewListing();
+        } catch (err) {
+          probe = err instanceof Error ? err.message : String(err);
+        }
+        // Walk the 42h window in 6h chunks (time_to must stay within ~3 days).
+        const windowMs = 42 * 3600_000;
+        const chunkSec = 6 * 3600;
+        const now = Date.now();
+        const toFloor = Math.floor(now / 1000);
+        const fromFloor = Math.floor((now - windowMs) / 1000);
+        const found: Array<{ address: string; createdAtSec: number | null }> =
+          [];
+        const seen = new Set<string>();
+        for (let to = toFloor; to > fromFloor; to -= chunkSec) {
+          let items: Array<{ address: string; createdAtSec: number | null }> =
+            [];
+          try {
+            items = await birdeye.fetchNewListings(to, 20);
+          } catch (err) {
+            console.error(
+              "[worker] backfill new_listing failed:",
+              err instanceof Error ? err.message : err,
+            );
+            break;
+          }
+          let added = 0;
+          for (const it of items) {
+            if (seen.has(it.address)) continue;
+            seen.add(it.address);
+            added++;
+            if (it.createdAtSec !== null) found.push(it);
+          }
+          if (added === 0) break; // window walked — nothing further back
+        }
+        // Seed the re-eval pool (INSERT OR IGNORE — idempotent).
+        const stats = found.map((it) => ({
+          token: it.address,
+          firstSeenAt: it.createdAtSec! * 1000,
+          firstM5Vol: 0,
+          firstSeenAgeMin: (now - it.createdAtSec! * 1000) / 60_000,
+          birdeye1mVol: null,
+          rugcheckBundlerPct: null,
+          rugcheckTop10Pct: null,
+          birdeyeProTraders: null,
+          birdeyeSniperPct: null,
+          minMcapObserved: null,
+          supplyFlowJson: null,
+          supplyFlowAt: null,
+        }));
+        await db.recordTokenStatsMany(stats);
+        return Response.json({
+          ok: true,
+          ms: Date.now() - t0,
+          fetched: found.length,
+          seeded: stats.length,
+          chunkCount: Math.ceil(windowMs / (chunkSec * 1000)),
+          probe,
+          sample: found.slice(0, 3),
+        });
+      } catch (err) {
+        return Response.json(
+          {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+            ms: Date.now() - t0,
+          },
+          { status: 500 },
+        );
+      }
     }
 
     // Read-only Jupiter connection check (no money moves): derives the

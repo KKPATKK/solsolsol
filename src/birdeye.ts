@@ -175,6 +175,60 @@ export class BirdeyeClient {
   }
 
   /**
+   * Newly listed tokens — Birdeye's fresh-launch feed. The pump.fun API is
+   * datacenter-blocked (530 from sandbox / Worker / GitHub Actions), so this
+   * is the discovery source for the one-shot backfill:
+   * meme_platform_enabled=true includes pump.fun launches. 30–80 CU per
+   * request — fine for a bounded backfill, far too expensive for per-minute
+   * live discovery on the free tier (30K CU/month).
+   *
+   * Field names are parsed defensively (the docs don't publish a schema for
+   * the response items): address accepts address/mint/tokenAddress/token;
+   * time accepts createTime/createdAt/creationTime/listedAt/blockTime/unixTime
+   * (ms or s, normalized to s). Returns [] on any shape mismatch.
+   */
+  async fetchNewListings(
+    timeToSec: number,
+    limit = 20,
+  ): Promise<Array<{ address: string; createdAtSec: number | null }>> {
+    const data = (await this.getJson(
+      `/defi/v2/tokens/new_listing?limit=${limit}&meme_platform_enabled=true&time_to=${timeToSec}`,
+    )) as {
+      data?: { tokens?: unknown[]; items?: unknown[]; list?: unknown[] };
+    } | null;
+    const raw = data?.data?.tokens ?? data?.data?.items ?? data?.data?.list;
+    if (!Array.isArray(raw)) return [];
+    const out: Array<{ address: string; createdAtSec: number | null }> = [];
+    for (const t of raw as Record<string, unknown>[]) {
+      const address = String(
+        t?.address ?? t?.mint ?? t?.tokenAddress ?? t?.token ?? "",
+      ).trim();
+      if (!address) continue;
+      const createdRaw =
+        t?.createTime ??
+        t?.createdAt ??
+        t?.creationTime ??
+        t?.listedAt ??
+        t?.blockTime ??
+        t?.unixTime;
+      let createdAtSec: number | null = null;
+      const n = Number(createdRaw);
+      if (Number.isFinite(n) && n > 0) {
+        createdAtSec = n > 1e12 ? Math.floor(n / 1000) : n;
+      }
+      out.push({ address, createdAtSec });
+    }
+    return out;
+  }
+
+  /** One raw new_listing response (schema probe for the backfill route). */
+  async probeNewListing(): Promise<unknown> {
+    return this.getJson(
+      "/defi/v2/tokens/new_listing?limit=1&meme_platform_enabled=true",
+    );
+  }
+
+  /**
    * Lowest market cap since listing, estimated from the candle low × supply.
    * Uses 1-minute candles for coins under 6h old, 15-minute for older ones.
    */
