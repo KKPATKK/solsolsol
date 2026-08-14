@@ -101,57 +101,150 @@ export class Db {
     this.injectedClient = injectedClient;
   }
 
-  async init(): Promise<void> {
+  /** Creates the libsql client once (lazy; no network until first call). */
+  private connect(): Client {
+    if (this.client) return this.client;
     if (this.injectedClient) {
       this.client = this.injectedClient;
-    } else {
-      // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
-      // which works reliably on Workers (fetch) and in Node alike.
-      const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
-      this.client = createClient({
-        url: httpUrl,
-        authToken: this.authToken,
-        // Bound every request (see DB_REQUEST_TIMEOUT_MS): a stalled Turso
-        // call aborts instead of hanging the tick indefinitely.
-        fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
-          fetch(input, {
-            ...init,
-            signal: AbortSignal.timeout(DB_REQUEST_TIMEOUT_MS),
-          }),
-      });
+      return this.client;
     }
-    await this.client.execute(`
-      CREATE TABLE IF NOT EXISTS chat_settings (
-        chat_id TEXT PRIMARY KEY,
-        min_liquidity_usd REAL NOT NULL DEFAULT 0,
-        min_volume_24h_usd REAL NOT NULL DEFAULT 0,
-        min_market_cap_usd REAL NOT NULL DEFAULT 40000,
-        max_market_cap_usd REAL NOT NULL DEFAULT 300000,
-        min_age_minutes REAL NOT NULL DEFAULT 360,
-        max_age_minutes REAL NOT NULL DEFAULT 2400,
-        min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
-        min_5m_chg_pct REAL NOT NULL DEFAULT 30,
-        enabled INTEGER NOT NULL DEFAULT 0
-      );
-    `);
-    // Migrations for databases created before these columns existed.
-    await this.addColumnIfMissing("chat_settings", "min_market_cap_usd", "REAL NOT NULL DEFAULT 40000");
-    await this.addColumnIfMissing("chat_settings", "max_market_cap_usd", "REAL NOT NULL DEFAULT 300000");
-    await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 360");
-    await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 2400");
-    await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
-    await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
-    await this.client.execute(`
-      CREATE TABLE IF NOT EXISTS worker_state (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-    `);
+    // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
+    // which works reliably on Workers (fetch) and in Node alike.
+    const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
+    this.client = createClient({
+      url: httpUrl,
+      authToken: this.authToken,
+      // Bound every request (see DB_REQUEST_TIMEOUT_MS): a stalled Turso
+      // call aborts instead of hanging the tick indefinitely.
+      fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+        fetch(input, {
+          ...init,
+          signal: AbortSignal.timeout(DB_REQUEST_TIMEOUT_MS),
+        }),
+    });
+    return this.client;
+  }
+
+  async init(): Promise<void> {
+    const c = this.connect();
+    // All idempotent DDL in ONE batched round trip. Previously each statement
+    // was its own round trip (~14 of them, each up to DB_REQUEST_TIMEOUT_MS),
+    // so a degraded database could push init past the ~30s scheduled-event
+    // wall clock and kill the tick before the scanner initialized — cron then
+    // LOOKED dead from /health (observed 2026-08-14).
+    await c.batch(
+      [
+        `CREATE TABLE IF NOT EXISTS chat_settings (
+          chat_id TEXT PRIMARY KEY,
+          min_liquidity_usd REAL NOT NULL DEFAULT 0,
+          min_volume_24h_usd REAL NOT NULL DEFAULT 0,
+          min_market_cap_usd REAL NOT NULL DEFAULT 40000,
+          max_market_cap_usd REAL NOT NULL DEFAULT 300000,
+          min_age_minutes REAL NOT NULL DEFAULT 360,
+          max_age_minutes REAL NOT NULL DEFAULT 2400,
+          min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
+          min_5m_chg_pct REAL NOT NULL DEFAULT 30,
+          enabled INTEGER NOT NULL DEFAULT 0
+        );`,
+        `CREATE TABLE IF NOT EXISTS worker_state (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );`,
+        `CREATE TABLE IF NOT EXISTS seen_tokens (
+          chat_id TEXT NOT NULL,
+          token TEXT NOT NULL,
+          first_seen_at INTEGER NOT NULL,
+          PRIMARY KEY (chat_id, token)
+        );`,
+        `CREATE TABLE IF NOT EXISTS token_stats (
+          token TEXT PRIMARY KEY,
+          first_seen_at INTEGER NOT NULL,
+          first_m5_vol REAL NOT NULL,
+          first_seen_age_min REAL NOT NULL,
+          birdeye_1m_vol REAL,
+          rugcheck_bundler_pct REAL,
+          rugcheck_top10_pct REAL,
+          birdeye_pro_traders INTEGER,
+          birdeye_sniper_pct REAL,
+          min_mcap_observed REAL,
+          supply_flow TEXT,
+          supply_flow_at INTEGER
+        );`,
+        // Permanent per-tick scan history, so interruptions are visible long
+        // after the fact (the scan_heartbeat row only keeps the latest value).
+        `CREATE TABLE IF NOT EXISTS scan_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          at INTEGER NOT NULL,
+          ok INTEGER NOT NULL,
+          ms INTEGER NOT NULL,
+          err TEXT,
+          profiles INTEGER,
+          pool INTEGER,
+          candidates INTEGER,
+          pushed INTEGER
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_scan_history_at ON scan_history(at);`,
+        // The re-eval pool query filters token_stats by first_seen_at and
+        // anti-joins seen_tokens every tick; these indexes keep it fast as
+        // both tables grow (token_stats is pruned each tick).
+        `CREATE INDEX IF NOT EXISTS idx_token_stats_first_seen ON token_stats(first_seen_at);`,
+        `CREATE INDEX IF NOT EXISTS idx_seen_tokens_token ON seen_tokens(token);`,
+        // Trade log: one row per bought token (UNIQUE(token) ⇒ a coin is
+        // bought at most once, enforced at the DB layer regardless of mode).
+        `CREATE TABLE IF NOT EXISTS trade_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          token TEXT NOT NULL UNIQUE,
+          chat_id TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          status TEXT NOT NULL,
+          tx_hash TEXT,
+          amount_sol REAL NOT NULL,
+          slippage_pct REAL NOT NULL,
+          error TEXT,
+          created_at INTEGER NOT NULL
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);`,
+        // Sell log: every exit attempt (half/all). NOT unique on token — you
+        // can legitimately sell half now and the rest later. Mirrors trade_log.
+        `CREATE TABLE IF NOT EXISTS sell_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          token TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          status TEXT NOT NULL,
+          tx_hash TEXT,
+          amount_token REAL,
+          error TEXT,
+          created_at INTEGER NOT NULL
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sell_log_created ON sell_log(created_at);`,
+      ],
+      "write",
+    );
+
+    // Flag reads in ONE batched read round trip.
+    const flags = await c.batch(
+      [
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'settings_v2_applied'",
+          args: [],
+        },
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v1_done'",
+          args: [],
+        },
+      ],
+      "read",
+    );
+    const settingsV2 =
+      flags[0].rows.length > 0 ? String(flags[0].rows[0].value) : null;
+    const schemaAlterDone =
+      flags[1].rows.length > 0 ? String(flags[1].rows[0].value) : null;
+
     // One-time migration: existing chats keep their old filter values unless
     // reset. The operator specified a new filter profile, so apply it to all
     // chats once; future /filter customizations are preserved after this.
     const d = DEFAULT_SETTINGS;
-    const settingsV2 = await this.getWorkerState("settings_v2_applied");
     if (!settingsV2) {
       await this.get().execute({
         sql: `UPDATE chat_settings SET
@@ -173,102 +266,53 @@ export class Db {
       await this.setWorkerState("settings_v2_applied", "1");
       console.log("[db] applied new filter defaults to existing chats (settings_v2)");
     }
-    await this.client.execute(`
-      CREATE TABLE IF NOT EXISTS seen_tokens (
-        chat_id TEXT NOT NULL,
-        token TEXT NOT NULL,
-        first_seen_at INTEGER NOT NULL,
-        PRIMARY KEY (chat_id, token)
-      );
-    `);
-    await this.client.execute(`
-      CREATE TABLE IF NOT EXISTS token_stats (
-        token TEXT PRIMARY KEY,
-        first_seen_at INTEGER NOT NULL,
-        first_m5_vol REAL NOT NULL,
-        first_seen_age_min REAL NOT NULL,
-        birdeye_1m_vol REAL,
-        rugcheck_bundler_pct REAL,
-        rugcheck_top10_pct REAL,
-        birdeye_pro_traders INTEGER,
-        birdeye_sniper_pct REAL,
-        min_mcap_observed REAL,
-        supply_flow TEXT,
-        supply_flow_at INTEGER
-      );
-    `);
-    // Permanent per-tick scan history, so interruptions are visible long
-    // after the fact (the scan_heartbeat row only keeps the latest value).
-    await this.client.execute(`
-      CREATE TABLE IF NOT EXISTS scan_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        at INTEGER NOT NULL,
-        ok INTEGER NOT NULL,
-        ms INTEGER NOT NULL,
-        err TEXT,
-        profiles INTEGER,
-        pool INTEGER,
-        candidates INTEGER,
-        pushed INTEGER
-      );
-    `);
-    await this.client.execute(
-      `CREATE INDEX IF NOT EXISTS idx_scan_history_at ON scan_history(at)`,
-    );
-    // The re-eval pool query filters token_stats by first_seen_at and
-    // anti-joins seen_tokens every tick; these indexes keep it fast as both
-    // tables grow (token_stats is pruned to the pool window each tick).
-    await this.client.execute(
-      `CREATE INDEX IF NOT EXISTS idx_token_stats_first_seen ON token_stats(first_seen_at)`,
-    );
-    await this.client.execute(
-      `CREATE INDEX IF NOT EXISTS idx_seen_tokens_token ON seen_tokens(token)`,
-    );
-    // Trade log: one row per bought token (UNIQUE(token) ⇒ a coin is bought
-    // at most once, enforced at the DB layer regardless of mode).
-    await this.client.execute(`
-      CREATE TABLE IF NOT EXISTS trade_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token TEXT NOT NULL UNIQUE,
-        chat_id TEXT NOT NULL,
-        mode TEXT NOT NULL,
-        status TEXT NOT NULL,
-        tx_hash TEXT,
-        amount_sol REAL NOT NULL,
-        slippage_pct REAL NOT NULL,
-        error TEXT,
-        created_at INTEGER NOT NULL
-      );
-    `);
-    await this.client.execute(
-      `CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at)`,
-    );
-    // Sell log: every exit attempt (half/all). NOT unique on token — you can
-    // legitimately sell half now and the rest later. Mirrors trade_log.
-    await this.client.execute(`
-      CREATE TABLE IF NOT EXISTS sell_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token TEXT NOT NULL,
-        chat_id TEXT NOT NULL,
-        mode TEXT NOT NULL,
-        status TEXT NOT NULL,
-        tx_hash TEXT,
-        amount_token REAL,
-        error TEXT,
-        created_at INTEGER NOT NULL
-      );
-    `);
-    await this.client.execute(
-      `CREATE INDEX IF NOT EXISTS idx_sell_log_created ON sell_log(created_at)`,
-    );
-    await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
-    await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
-    await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");
-    await this.addColumnIfMissing("token_stats", "birdeye_pro_traders", "INTEGER");
-    await this.addColumnIfMissing("token_stats", "birdeye_sniper_pct", "REAL");
-    await this.addColumnIfMissing("token_stats", "min_mcap_observed", "REAL");
-    await this.addColumnIfMissing("token_stats", "supply_flow", "TEXT");
-    await this.addColumnIfMissing("token_stats", "supply_flow_at", "INTEGER");
+    // One-time legacy column backfills (databases created before these
+    // columns existed). Fresh databases already carry every column in the
+    // CREATE TABLE, so this runs at most once per database; bump the flag
+    // name (v1→v2…) if new ALTERs are ever added.
+    if (!schemaAlterDone) {
+      await this.addColumnIfMissing("chat_settings", "min_market_cap_usd", "REAL NOT NULL DEFAULT 40000");
+      await this.addColumnIfMissing("chat_settings", "max_market_cap_usd", "REAL NOT NULL DEFAULT 300000");
+      await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 360");
+      await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 2400");
+      await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
+      await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
+      await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
+      await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
+      await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");
+      await this.addColumnIfMissing("token_stats", "birdeye_pro_traders", "INTEGER");
+      await this.addColumnIfMissing("token_stats", "birdeye_sniper_pct", "REAL");
+      await this.addColumnIfMissing("token_stats", "min_mcap_observed", "REAL");
+      await this.addColumnIfMissing("token_stats", "supply_flow", "TEXT");
+      await this.addColumnIfMissing("token_stats", "supply_flow_at", "INTEGER");
+      await this.setWorkerState("schema_alter_v1_done", "1");
+    }
+  }
+
+  /**
+   * Record that a scheduled cron event arrived — raw upserts that work even
+   * BEFORE init() (worker_state exists in every live database; connect() is
+   * lazy and needs no DDL). This is the cross-isolate proof that the Cron
+   * Trigger is delivering: a slow/failed init otherwise kills the scheduled
+   * event inside the ~30s wall clock and cron looks dead from /health even
+   * though the trigger fires (observed 2026-08-14).
+   */
+  async bumpScheduledTick(): Promise<void> {
+    const c = this.connect();
+    const now = String(Date.now());
+    const res = await c.execute({
+      sql: "SELECT value FROM worker_state WHERE key = 'scheduled_tick_total'",
+      args: [],
+    });
+    const prev = res.rows.length > 0 ? parseInt(String(res.rows[0].value), 10) || 0 : 0;
+    await c.execute({
+      sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_total', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      args: [String(prev + 1)],
+    });
+    await c.execute({
+      sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      args: [now],
+    });
   }
 
   private async addColumnIfMissing(

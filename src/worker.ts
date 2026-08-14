@@ -691,20 +691,21 @@ export default {
 
   async scheduled(_event: ScheduledEventLike, env: Env): Promise<void> {
     scheduledTicks++;
-    await ensureInitialized(env);
-    // Persist cron delivery across isolates: scheduled events may land on a
-    // different isolate than the one serving /health, so the module counter
-    // alone cannot prove delivery. These two rows make cron liveness visible
-    // from any isolate (best-effort — a Turso outage loses the counter, which
-    // is itself diagnostic alongside initError).
+    // Record the cron event BEFORE init, with a raw client: a slow/failed
+    // init (Turso degraded) otherwise kills the scheduled event inside the
+    // ~30s wall clock before the counter was written, making cron look dead
+    // from /health even though the trigger fires (observed 2026-08-14:
+    // post-init counter stayed null while HTTP-driven scans ran fine). This
+    // is the cross-isolate proof that scheduled events arrive at all.
     try {
-      const raw = await db?.getWorkerState("scheduled_tick_total");
-      const prev = raw ? (parseInt(raw, 10) || 0) : 0;
-      await db?.setWorkerState("scheduled_tick_total", String(prev + 1));
-      await db?.setWorkerState("scheduled_tick_at", String(Date.now()));
+      if (env.TURSO_DATABASE_URL && env.TURSO_AUTH_TOKEN) {
+        const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
+        await probe.bumpScheduledTick();
+      }
     } catch (err) {
-      console.error("[worker] cron counter persist failed:", err);
+      console.error("[worker] pre-init cron counter failed:", err);
     }
+    await ensureInitialized(env);
     if (!scanner) return;
     // Detect missed ticks (previous scan finished too long ago) and alert.
     try {
