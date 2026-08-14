@@ -205,6 +205,7 @@ export class BirdeyeClient {
       ).trim();
       if (!address) continue;
       const createdRaw =
+        t?.liquidityAddedAt ??
         t?.createTime ??
         t?.createdAt ??
         t?.creationTime ??
@@ -212,9 +213,19 @@ export class BirdeyeClient {
         t?.blockTime ??
         t?.unixTime;
       let createdAtSec: number | null = null;
-      const n = Number(createdRaw);
-      if (Number.isFinite(n) && n > 0) {
-        createdAtSec = n > 1e12 ? Math.floor(n / 1000) : n;
+      if (typeof createdRaw === "string" && createdRaw) {
+        // Observed real shape: "liquidityAddedAt": "2026-08-14T03:38:19"
+        // (ISO string — the liquidity-add / graduation time, which matches
+        // how the scanner ages coins via DexScreener pairCreatedAt).
+        const parsed = Date.parse(createdRaw);
+        if (Number.isFinite(parsed)) {
+          createdAtSec = Math.floor(parsed / 1000);
+        }
+      } else {
+        const n = Number(createdRaw);
+        if (Number.isFinite(n) && n > 0) {
+          createdAtSec = n > 1e12 ? Math.floor(n / 1000) : n;
+        }
       }
       out.push({ address, createdAtSec });
     }
