@@ -58,6 +58,9 @@ const flowDebugLastRunAt = new Map<string, number>();
 /** Cooldown for the /debug/tick endpoint (manual scan trigger). */
 const TICK_DEBUG_COOLDOWN_MS = 25_000;
 let tickDebugLastRunAt = 0;
+/** Minimum gap between fallback scans triggered from the fetch path. */
+const SCAN_TRIGGER_INTERVAL_MS = 60_000;
+let lastScanTriggerAt = 0;
 let lastScanAt: number | null = null;
 let lastScanOk = false;
 let scanCount = 0;
@@ -472,9 +475,36 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
   }
 }
 
+/**
+ * Resilience net for dead cron delivery: every HTTP request (UptimeRobot
+ * polls /health every minute, webhooks arrive as Telegram messages) fires a
+ * scan in the background IF the last scan is stale. Keeps the scanner alive
+ * even when the Cron Trigger stops delivering (observed 2026-08-14: heartbeat
+ * frozen while the scan path itself ran fine via /debug/tick). Fire-and
+ * -forget so request latency is unaffected; runScan's own race keeps the
+ * work inside Cloudflare's wall-clock window, and the next request retries.
+ */
+async function maybeRunScanIfStale(): Promise<void> {
+  if (!scanner) return;
+  const now = Date.now();
+  if (now - lastScanTriggerAt < SCAN_TRIGGER_INTERVAL_MS) return;
+  lastScanTriggerAt = now;
+  try {
+    await runScan();
+  } catch (err) {
+    console.error(
+      "[worker] fallback scan failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     await ensureInitialized(env);
+    // Keep the scanner alive independently of cron delivery (best-effort
+    // background trigger, guarded by the last-trigger timestamp).
+    void maybeRunScanIfStale();
     const url = new URL(request.url);
 
     // UptimeRobot target: distinguishes "worker up" from "scanner working".
@@ -525,21 +555,18 @@ export default {
       });
     }
 
-    // Manual scan trigger — forces one scanner pass immediately. This is
-    // the escape hatch when cron delivery fails AND the diagnostic that
-    // distinguishes "cron not firing" from "scan path broken": if the scan
-    // completes here, the pipeline is healthy and the cron trigger is the
-    // problem. runOnce is re-entrant safe (skips when a scan is already
-    // running) and budget-guarded, so a hung upstream never wedges the
-    // request — the whole call is raced against a 25s cap, matching the
-    // scheduled tick budget.
+    // Manual scan trigger — runs the exact scheduled-path wrapper (runScan:
+    // scan + heartbeat + scan_history), so it is both the diagnostic that
+    // distinguishes "cron not firing" from "scan path broken" and the manual
+    // recovery lever. runOnce is re-entrant safe and budget-guarded; runScan
+    // races the scan against the 26s tick budget and never rejects.
     if (url.pathname === "/debug/tick") {
       const sinceLast = Date.now() - tickDebugLastRunAt;
       if (sinceLast < TICK_DEBUG_COOLDOWN_MS) {
         return Response.json(
           {
             ok: false,
-            error: "cooldown — runOnce is minute-budgeted, wait a bit",
+            error: "cooldown — runScan is minute-budgeted, wait a bit",
             retryAfterSec: Math.ceil(
               (TICK_DEBUG_COOLDOWN_MS - sinceLast) / 1000,
             ),
@@ -560,16 +587,10 @@ export default {
         );
       }
       const t0 = Date.now();
-      const timedOut = await Promise.race([
-        scanner.runOnce().then(() => false),
-        new Promise<boolean>((resolve) =>
-          setTimeout(() => resolve(true), TICK_DEBUG_COOLDOWN_MS),
-        ),
-      ]);
+      await runScan();
       return Response.json({
-        ok: !timedOut,
+        ok: lastScanOk,
         ms: Date.now() - t0,
-        timedOut,
         lastScanError,
         summary: scanner.lastSummary,
       });
