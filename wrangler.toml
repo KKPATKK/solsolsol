@@ -21,7 +21,7 @@ SCAN_PROFILE_LIMIT = "100"
 # window that the bot keeps tracking until they qualify (code default 40,
 # max 250). Ordered by relevance, so the closest-to-qualifying coins are
 # always checked first; leftovers simply defer to the next tick.
-RE_EVAL_POOL_SIZE = "450"
+RE_EVAL_POOL_SIZE = "1000"
 # pump.fun discovery: DexScreener's profiles feed only returns ~24 Solana
 # coins per scan, so also register the newest pump.fun coins (code default
 # 100, max 300) into the re-eval pool every scan. Best-effort — if pump.fun
