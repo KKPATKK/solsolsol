@@ -19,7 +19,7 @@ SCAN_INTERVAL_SECONDS = "60"
 SCAN_PROFILE_LIMIT = "100"
 # Re-evaluation pool: never-pushed coins nearing/inside the qualifying age
 # window that the bot keeps tracking until they qualify (code default 40,
-# max 250). Ordered by relevance, so the closest-to-qualifying coins are
+# max 1000). Ordered by relevance, so the closest-to-qualifying coins are
 # always checked first; leftovers simply defer to the next tick.
 RE_EVAL_POOL_SIZE = "1000"
 # pump.fun discovery: DexScreener's profiles feed only returns ~24 Solana
@@ -31,17 +31,27 @@ PUMPFUN_PROFILE_LIMIT = "100"
 PUMPFUN_REQUEST_INTERVAL_MS = "350"
 # GeckoTerminal new-pools discovery (free, no key): newest Solana pools
 # across every DEX incl. pump.fun graduates. Pages × 20 pools per scan
-# (page size fixed at 20; each page ≈ 1 min of launches). 3 pages covers
-# ~4 min of launches — a safety buffer for scan-gap jitter; 5 is the max
-# (100 pools ≈ 5 min). The zero-CU replacement for Birdeye new_listing
-# (30-80 CU/call is too expensive for per-minute polling on the free
-# 30K CU/month tier). 3 calls/min is well under GeckoTerminal's 30/min limit.
-GECKOTERMINAL_POOL_PAGES = "3"
+# (page size fixed at 20; each page ≈ 1 min of launches). 5 pages covers
+# ~5 min of launches — a safety buffer for scan-gap jitter (max allowed).
+# The zero-CU replacement for Birdeye new_listing (30-80 CU/call is too
+# expensive for per-minute polling on the free 30K CU/month tier). 5 calls/
+# min is well under GeckoTerminal's 30/min limit.
+GECKOTERMINAL_POOL_PAGES = "5"
 GECKOTERMINAL_REQUEST_INTERVAL_MS = "1000"
 DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
 HELIUS_REQUEST_INTERVAL_MS = "300"
+# Periodic Birdeye new_listing backfill (safety net for discovery gaps):
+# every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
+# BIRDEYE_BACKFILL_LOOKBACK_MIN of Birdeye's fresh-launch feed (includes
+# pump.fun launches via meme_platform_enabled=true) and seeds unseen coins
+# into the re-eval pool. Catches coins created while the monitor paused
+# (GeckoTerminal's newest-pools pages roll past them). CU-bounded: 1 request
+# per run ≈ ~80 CU, 4 runs/day ≈ ~320 CU/month against the 30K free tier.
+BIRDEYE_BACKFILL_ENABLED = "true"
+BIRDEYE_BACKFILL_INTERVAL_MIN = "360"
+BIRDEYE_BACKFILL_LOOKBACK_MIN = "360"
 # On-chain supply-flow (rug/distribution) detector: flags coins whose
 # holders feed tokens to one collector wallet that keeps selling, then blocks
 # the push. Two views feed the same graph: each top account's OUT transfers

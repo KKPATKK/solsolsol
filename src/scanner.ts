@@ -93,6 +93,8 @@ export interface ScanSummary {
   pump: number;
   /** GeckoTerminal new-pools feed size this scan (0 when blocked/unconfigured). */
   geo: number;
+  /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
+  backfill: number;
   pool: number;
   candidates: number;
   pushed: number;
@@ -197,6 +199,7 @@ export class Scanner {
       profiles: 0,
       pump: 0,
       geo: 0,
+      backfill: 0,
       pool: 0,
       candidates: 0,
       pushed: 0,
@@ -274,6 +277,22 @@ export class Scanner {
         }
       }
       diag.geo = geckoProfiles.length;
+      // Periodic Birdeye backfill — safety net for discovery gaps. Every
+      // BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back the lookback
+      // window of Birdeye's new_listing feed (which includes pump.fun
+      // launches) and seeds unseen coins into token_stats. This catches
+      // coins created while the monitor paused (GeckoTerminal's newest-pools
+      // pages roll past them and they'd never be seen again). CU-bounded: 1
+      // request per run. Idempotent (INSERT OR IGNORE); last-run persisted
+      // in worker_state so isolates don't re-run it on every recycle.
+      try {
+        diag.backfill = await this.runPeriodicBackfill();
+      } catch (err) {
+        console.error(
+          "[scanner] periodic backfill failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
       // Dedupe the feeds (mints overlap across all three); the DexScreener
       // entry wins — it carries richer profile data.
       const dexMints = new Set(profiles.map((p) => p.tokenAddress));
@@ -512,6 +531,76 @@ export class Scanner {
         this.running = false;
       }
     }
+  }
+
+  /**
+   * Periodic Birdeye new_listing backfill (see runOnce call site). Returns
+   * how many coins were newly seeded, or 0 when the interval hasn't elapsed
+   * / Birdeye isn't configured / nothing new was found. Persists the last
+   * run in worker_state so every isolate shares one cadence instead of each
+   * re-running on recycle (CU protection).
+   */
+  private async runPeriodicBackfill(): Promise<number> {
+    const birdeye = this.birdeye;
+    if (!birdeye || !this.config.birdeyeBackfillEnabled) return 0;
+    const cfg = this.config;
+    const lastRaw = await this.db.getWorkerState("birdeye_backfill_at");
+    const lastRunAt = lastRaw ? Number(lastRaw) : 0;
+    const now = Date.now();
+    if (Number.isFinite(lastRunAt) && now - lastRunAt < cfg.birdeyeBackfillIntervalMs) {
+      return 0; // interval not elapsed
+    }
+    // Walk the lookback window backwards in 6h chunks (time_to must stay
+    // within ~3 days). Each chunk returns the newest ~20 listings.
+    const windowMs = cfg.birdeyeBackfillLookbackMs;
+    const chunkSec = 6 * 3600;
+    const toFloor = Math.floor(now / 1000);
+    const fromFloor = Math.floor((now - windowMs) / 1000);
+    const found: Array<{ address: string; createdAtSec: number | null }> = [];
+    const seen = new Set<string>();
+    for (let to = toFloor; to > fromFloor; to -= chunkSec) {
+      let items: Array<{ address: string; createdAtSec: number | null }> = [];
+      try {
+        items = await birdeye.fetchNewListings(to, 20);
+      } catch (err) {
+        console.error(
+          "[scanner] periodic backfill new_listing failed:",
+          err instanceof Error ? err.message : err,
+        );
+        break;
+      }
+      let added = 0;
+      for (const it of items) {
+        if (seen.has(it.address)) continue;
+        seen.add(it.address);
+        added++;
+        if (it.createdAtSec !== null) found.push(it);
+      }
+      if (added === 0) break; // window walked — nothing further back
+    }
+    if (found.length === 0) {
+      // Still mark the run so a permanently-empty feed doesn't re-trigger
+      // every scan (and burn CU retrying).
+      await this.db.setWorkerState("birdeye_backfill_at", String(now));
+      return 0;
+    }
+    const stats = found.map((it) => ({
+      token: it.address,
+      firstSeenAt: it.createdAtSec! * 1000,
+      firstM5Vol: 0,
+      firstSeenAgeMin: (now - it.createdAtSec! * 1000) / 60_000,
+      birdeye1mVol: null,
+      rugcheckBundlerPct: null,
+      rugcheckTop10Pct: null,
+      birdeyeProTraders: null,
+      birdeyeSniperPct: null,
+      minMcapObserved: null,
+      supplyFlowJson: null,
+      supplyFlowAt: null,
+    }));
+    await this.db.recordTokenStatsMany(stats);
+    await this.db.setWorkerState("birdeye_backfill_at", String(now));
+    return stats.length;
   }
 
   /**

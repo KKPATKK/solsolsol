@@ -133,6 +133,18 @@ export interface AppConfig {
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
   birdeyeRequestIntervalMs: number;
+  /**
+   * Periodic Birdeye new_listing backfill (BIRDEYE_BACKFILL_ENABLED, default
+   * true): every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
+   * BIRDEYE_BACKFILL_LOOKBACK_MIN of Birdeye's fresh-launch feed and seeds
+   * any unseen coins into token_stats (INSERT OR IGNORE). Safety net for
+   * discovery gaps (e.g. the monitor pause that lets GeckoTerminal's
+   * newest-pools pages roll past coins). CU-bounded: 1 request per run ≈
+   * ~80 CU, 4 runs/day ≈ ~320 CU/month against the 30K free tier.
+   */
+  birdeyeBackfillEnabled: boolean;
+  birdeyeBackfillIntervalMs: number;
+  birdeyeBackfillLookbackMs: number;
   /** Minimum spacing between RugCheck HTTP requests (rate limiting). */
   rugcheckRequestIntervalMs: number;
   /** Minimum spacing between Solana RPC requests (rate limiting). */
@@ -204,6 +216,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))
       ? Math.max(0, Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))
       : 1100,
+    birdeyeBackfillEnabled: (env.BIRDEYE_BACKFILL_ENABLED ?? "true") !== "false",
+    birdeyeBackfillIntervalMs:
+      Number.isFinite(Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360)) &&
+      Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360) > 0
+        ? Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360) * 60_000
+        : 360 * 60_000,
+    birdeyeBackfillLookbackMs:
+      Number.isFinite(Number(env.BIRDEYE_BACKFILL_LOOKBACK_MIN ?? 360)) &&
+      Number(env.BIRDEYE_BACKFILL_LOOKBACK_MIN ?? 360) > 0
+        ? Number(env.BIRDEYE_BACKFILL_LOOKBACK_MIN ?? 360) * 60_000
+        : 360 * 60_000,
     rugcheckRequestIntervalMs: Number.isFinite(Number(env.RUGCHECK_REQUEST_INTERVAL_MS ?? 800))
       ? Math.max(0, Number(env.RUGCHECK_REQUEST_INTERVAL_MS ?? 800))
       : 800,
