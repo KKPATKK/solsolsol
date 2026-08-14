@@ -179,7 +179,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 40,
     reevalPoolSize:
       Number.isFinite(rawReevalPool) && rawReevalPool > 0
-        ? Math.min(Math.floor(rawReevalPool), 300)
+        ? Math.min(Math.floor(rawReevalPool), 450)
         : 40,
     pumpfunProfileLimit:
       Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
