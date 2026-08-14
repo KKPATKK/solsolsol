@@ -204,7 +204,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       : 350,
     geckoterminalPoolPages:
       Number.isFinite(rawGeoPages) && rawGeoPages > 0
-        ? Math.min(Math.floor(rawGeoPages), 5)
+        ? Math.min(Math.floor(rawGeoPages), 2)
         : 1,
     geckoterminalRequestIntervalMs: Number.isFinite(
       Number(env.GECKOTERMINAL_REQUEST_INTERVAL_MS ?? 1000),
