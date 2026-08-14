@@ -29,6 +29,12 @@ RE_EVAL_POOL_SIZE = "250"
 # DexScreener alone (see /health summary.pump).
 PUMPFUN_PROFILE_LIMIT = "100"
 PUMPFUN_REQUEST_INTERVAL_MS = "350"
+# GeckoTerminal new-pools discovery (free, no key): newest Solana pools
+# across every DEX incl. pump.fun graduates. Pages × ~20 pools per scan;
+# the zero-CU replacement for Birdeye new_listing (30-80 CU/call is too
+# expensive for per-minute polling on the free 30K CU/month tier).
+GECKOTERMINAL_POOL_PAGES = "1"
+GECKOTERMINAL_REQUEST_INTERVAL_MS = "1000"
 DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"

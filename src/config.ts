@@ -120,6 +120,15 @@ export interface AppConfig {
   pumpfunProfileLimit: number;
   /** Minimum spacing between pump.fun HTTP requests (rate limiting). */
   pumpfunRequestIntervalMs: number;
+  /**
+   * How many newest GeckoTerminal Solana pools to register per scan
+   * (GECKOTERMINAL_POOL_PAGES, default 1, max 5 — each page ~20 pools). Free
+   * discovery feed (no key) covering every Solana DEX incl. pump.fun
+   * graduates, the zero-CU replacement for Birdeye new_listing.
+   */
+  geckoterminalPoolPages: number;
+  /** Minimum spacing between GeckoTerminal HTTP requests (rate limiting). */
+  geckoterminalRequestIntervalMs: number;
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
@@ -147,6 +156,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawReevalPool = Number(env.RE_EVAL_POOL_SIZE ?? 40);
   const rawPumpfunLimit = Number(env.PUMPFUN_PROFILE_LIMIT ?? 100);
+  const rawGeoPages = Number(env.GECKOTERMINAL_POOL_PAGES ?? 1);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
   const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
   const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
@@ -180,6 +190,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     )
       ? Math.max(0, Number(env.PUMPFUN_REQUEST_INTERVAL_MS ?? 350))
       : 350,
+    geckoterminalPoolPages:
+      Number.isFinite(rawGeoPages) && rawGeoPages > 0
+        ? Math.min(Math.floor(rawGeoPages), 5)
+        : 1,
+    geckoterminalRequestIntervalMs: Number.isFinite(
+      Number(env.GECKOTERMINAL_REQUEST_INTERVAL_MS ?? 1000),
+    )
+      ? Math.max(0, Number(env.GECKOTERMINAL_REQUEST_INTERVAL_MS ?? 1000))
+      : 1000,
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))

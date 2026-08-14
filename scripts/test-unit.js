@@ -15,6 +15,7 @@ const { parseAdminIds, isAdmin } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
+const { parseNewPools } = require("../dist/geckoterminal.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -352,6 +353,38 @@ async function main() {
     assert.equal(out[1].openTimestamp, undefined);
     assert.deepEqual(parsePumpCoins({ not: "array" }), []);
     assert.deepEqual(parsePumpCoins(null), []);
+  });
+
+  await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {
+    const out = parseNewPools({
+      data: [
+        {
+          id: "solana_DMSXzfSJErEF1SRfuBedBL8guseidMhG4Dve2fBUxKPC",
+          attributes: {
+            name: "DOGE2 / SOL",
+            pool_created_at: "2026-08-14T03:38:19",
+            reserve_in_usd: "2101.61",
+            fdv_usd: "2696.17",
+          },
+          relationships: {
+            base_token: { data: { id: "solana_EzghaRncwC5Cy6PXzq81U1dej66qaj1CNmdKJBkKpump" } },
+            dex: { data: { id: "pump-fun" } },
+          },
+        },
+        { id: "solana_X", attributes: {}, relationships: {} }, // missing base_token
+        { id: "solana_bad", attributes: { pool_created_at: "garbage" }, relationships: { base_token: { data: { id: "solana_short" } } } }, // invalid mint
+        null,
+        "string",
+      ],
+    });
+    assert.equal(out.length, 1);
+    assert.equal(out[0].tokenAddress, "EzghaRncwC5Cy6PXzq81U1dej66qaj1CNmdKJBkKpump");
+    assert.equal(out[0].createdAtMs, Date.parse("2026-08-14T03:38:19"));
+    assert.equal(out[0].dex, "pump-fun");
+    assert.equal(out[0].fdvUsd, 2696.17);
+    assert.equal(out[0].reserveUsd, 2101.61);
+    assert.deepEqual(parseNewPools({ not: "array" }), []);
+    assert.deepEqual(parseNewPools(null), []);
   });
 
   await test("trade_log record/hasTraded/countTradesSince round-trips with UNIQUE dedupe", async () => {

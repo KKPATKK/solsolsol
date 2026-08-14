@@ -9,6 +9,7 @@ import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
 import type { TradeService } from "./jupiter";
 import type { PumpFunClient } from "./pumpfun";
+import type { GeckoTerminalClient } from "./geckoterminal";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
 /** A token's opening volume (DexScreener proxy) is only meaningful if we saw it young. */
@@ -90,6 +91,8 @@ export interface ScanSummary {
   profiles: number;
   /** pump.fun discovery feed size this scan (0 when blocked/unconfigured). */
   pump: number;
+  /** GeckoTerminal new-pools feed size this scan (0 when blocked/unconfigured). */
+  geo: number;
   pool: number;
   candidates: number;
   pushed: number;
@@ -148,6 +151,12 @@ export class Scanner {
      * Best-effort: failures degrade to the DexScreener-only path.
      */
     private readonly pumpfun: PumpFunClient | null = null,
+    /**
+     * GeckoTerminal new-pools discovery (null = disabled) — free (no key),
+     * datacenter-reachable, covers every Solana DEX incl. pump.fun graduates.
+     * Best-effort: failures degrade to the other feeds.
+     */
+    private readonly gecko: GeckoTerminalClient | null = null,
   ) {}
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -187,6 +196,7 @@ export class Scanner {
     const diag: ScanSummary = {
       profiles: 0,
       pump: 0,
+      geo: 0,
       pool: 0,
       candidates: 0,
       pushed: 0,
@@ -231,12 +241,50 @@ export class Scanner {
         }
       }
       diag.pump = pumpProfiles.length;
-      // Dedupe the two feeds (pump.fun mints overlap the DexScreener feed);
-      // the DexScreener entry wins — it carries richer profile data.
+      // GeckoTerminal new-pools feed — the free (no-key) discovery source
+      // covering every Solana DEX incl. pump.fun graduates, replacing the
+      // CU-expensive Birdeye new_listing for live discovery. Pools are
+      // registered by their pool_created_at (≈ graduation time, matching
+      // how DexScreener pairs age coins), so they enter the re-eval pool
+      // and are evaluated once they reach the qualifying age window.
+      let geckoProfiles: TokenProfile[] = [];
+      if (this.gecko) {
+        try {
+          const pools = [];
+          for (
+            let page = 1;
+            page <= this.config.geckoterminalPoolPages;
+            page++
+          ) {
+            const got = await this.gecko.fetchNewPools(page);
+            pools.push(...got);
+            if (got.length === 0) break;
+          }
+          geckoProfiles = pools
+            .filter((p) => p.createdAtMs !== null)
+            .map((p) => ({
+              tokenAddress: p.tokenAddress,
+              openTimestamp: p.createdAtMs ?? undefined,
+            }));
+        } catch (err) {
+          console.error(
+            "[scanner] geckoterminal discovery failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      diag.geo = geckoProfiles.length;
+      // Dedupe the feeds (mints overlap across all three); the DexScreener
+      // entry wins — it carries richer profile data.
       const dexMints = new Set(profiles.map((p) => p.tokenAddress));
+      const pumpMints = new Set(pumpProfiles.map((p) => p.tokenAddress));
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
+        ...geckoProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) && !pumpMints.has(p.tokenAddress),
+        ),
       ];
       const now = Date.now();
       // Re-evaluation pool: tokens never pushed that are nearing or inside

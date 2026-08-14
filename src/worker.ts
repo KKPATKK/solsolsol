@@ -9,6 +9,7 @@ import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
+import { GeckoTerminalClient } from "./geckoterminal";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -228,6 +229,10 @@ async function ensureInitialized(env: Env): Promise<void> {
           // pump.fun discovery widens coverage beyond the DexScreener
           // profiles feed (best-effort — blocked/degraded feeds return []).
           new PumpFunClient(config),
+          // GeckoTerminal new-pools discovery — free (no key), covers every
+          // Solana DEX incl. pump.fun graduates (best-effort — blocked or
+          // degraded feeds return [] and the scan continues on the others).
+          new GeckoTerminalClient(config),
         );
         scannerReady = true;
       }
