@@ -1,0 +1,58 @@
+name: Backfill pump.fun coins
+
+# Runs the one-time backfill (seed token_stats with pump.fun coins created in
+# the last ~42h) from a GitHub Actions runner. pump.fun blocks datacenter IPs
+# (530 from the sandbox and the Cloudflare Worker), but GitHub-hosted runners
+# egress from different ranges — this job tests reachability first and only
+# runs the backfill when the feed responds.
+#
+# Trigger: manual (Actions tab → Run workflow), or automatically when the
+# backfill script changes. Needs TURSO_DATABASE_URL + TURSO_AUTH_TOKEN as
+# GitHub Actions secrets (same values as the Cloudflare Worker secrets).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/backfill-pumpfun.mjs'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test pump.fun reachability from runner
+        run: |
+          code=$(curl -s -o /tmp/pf.json -w "%{http_code}" --max-time 15 \
+            "https://frontend-api.pump.fun/coins?limit=2&sort=created&order=DESC")
+          echo "HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "::notice::pump.fun reachable from GitHub Actions runner — backfill can run here"
+            echo "REACHABLE=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::pump.fun returns $code from GitHub Actions runner (datacenter block) — backfill cannot run here; see docs for alternatives"
+          fi
+
+      - name: Run backfill
+        if: env.REACHABLE == '1'
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          if [ -z "$TURSO_DATABASE_URL" ] || [ -z "$TURSO_AUTH_TOKEN" ]; then
+            echo "::warning::TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are not set as GitHub Actions secrets — add them (same values as the Worker secrets) and re-run this workflow"
+            exit 0
+          fi
+          node scripts/backfill-pumpfun.mjs --since-hours 42

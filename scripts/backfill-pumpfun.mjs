@@ -46,11 +46,17 @@ async function getJson(path, attempt = 1) {
     if (res.status === 429 || res.status >= 500) {
       throw new Error(`pump.fun HTTP ${res.status}`);
     }
-    if (!res.ok) return null; // 403/404 — blocked or endpoint moved
+    if (!res.ok) {
+      // 403/404/530 — blocked (datacenter IP) or endpoint moved. Log the
+      // status so a reachability check is diagnosable at a glance.
+      console.warn(`  ⚠️ pump.fun HTTP ${res.status} — blocked or endpoint moved`);
+      return null;
+    }
     const text = await res.text();
     try {
       return JSON.parse(text);
     } catch {
+      console.warn(`  ⚠️ pump.fun returned a non-JSON page (challenge/HTML) — blocked`);
       return null; // challenge/HTML page
     }
   } catch (err) {
