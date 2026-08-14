@@ -22,6 +22,13 @@ SCAN_PROFILE_LIMIT = "100"
 # max 250). Ordered by relevance, so the closest-to-qualifying coins are
 # always checked first; leftovers simply defer to the next tick.
 RE_EVAL_POOL_SIZE = "250"
+# pump.fun discovery: DexScreener's profiles feed only returns ~24 Solana
+# coins per scan, so also register the newest pump.fun coins (code default
+# 100, max 300) into the re-eval pool every scan. Best-effort — if pump.fun
+# blocks the caller, discovery returns empty and scanning continues on
+# DexScreener alone (see /health summary.pump).
+PUMPFUN_PROFILE_LIMIT = "100"
+PUMPFUN_REQUEST_INTERVAL_MS = "350"
 DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"

@@ -108,6 +108,18 @@ export interface AppConfig {
    * deadline stays in the pool and is retried next tick (nothing is lost).
    */
   reevalPoolSize: number;
+  /**
+   * How many newest pump.fun coins to register per scan (PUMPFUN_PROFILE_LIMIT).
+   * DexScreener's token-profiles feed only returns ~24 Solana profiles per
+   * scan, so pump.fun discovery is the widest free source of brand-new
+   * coins — coins without a DexScreener pair yet are registered into the
+   * re-eval pool and evaluated the moment their pair appears. Best-effort:
+   * if pump.fun blocks the caller (datacenter IPs), discovery returns empty
+   * and the scanner continues on DexScreener alone.
+   */
+  pumpfunProfileLimit: number;
+  /** Minimum spacing between pump.fun HTTP requests (rate limiting). */
+  pumpfunRequestIntervalMs: number;
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
@@ -134,6 +146,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawPort = Number(env.PORT ?? 3000);
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawReevalPool = Number(env.RE_EVAL_POOL_SIZE ?? 40);
+  const rawPumpfunLimit = Number(env.PUMPFUN_PROFILE_LIMIT ?? 100);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
   const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
   const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
@@ -158,6 +171,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       Number.isFinite(rawReevalPool) && rawReevalPool > 0
         ? Math.min(Math.floor(rawReevalPool), 250)
         : 40,
+    pumpfunProfileLimit:
+      Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
+        ? Math.min(Math.floor(rawPumpfunLimit), 300)
+        : 100,
+    pumpfunRequestIntervalMs: Number.isFinite(
+      Number(env.PUMPFUN_REQUEST_INTERVAL_MS ?? 350),
+    )
+      ? Math.max(0, Number(env.PUMPFUN_REQUEST_INTERVAL_MS ?? 350))
+      : 350,
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))

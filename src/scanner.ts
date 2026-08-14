@@ -8,6 +8,7 @@ import { fmtAge, fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
 import type { TradeService } from "./jupiter";
+import type { PumpFunClient } from "./pumpfun";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
 /** A token's opening volume (DexScreener proxy) is only meaningful if we saw it young. */
@@ -87,6 +88,8 @@ export interface RejectionEntry {
 /** Rejection reasons from the last completed scan (surfaced via /health). */
 export interface ScanSummary {
   profiles: number;
+  /** pump.fun discovery feed size this scan (0 when blocked/unconfigured). */
+  pump: number;
   pool: number;
   candidates: number;
   pushed: number;
@@ -130,6 +133,12 @@ export class Scanner {
     private readonly helius: HeliusClient | null,
     /** Trojan trading (null = trading disabled — no key configured). */
     private readonly trade: TradeService | null = null,
+    /**
+     * pump.fun discovery (null = disabled) — widens coverage beyond the
+     * DexScreener profiles feed, which only lists ~24 Solana coins per scan.
+     * Best-effort: failures degrade to the DexScreener-only path.
+     */
+    private readonly pumpfun: PumpFunClient | null = null,
   ) {}
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -153,6 +162,7 @@ export class Scanner {
     const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
     const diag: ScanSummary = {
       profiles: 0,
+      pump: 0,
       pool: 0,
       candidates: 0,
       pushed: 0,
@@ -178,6 +188,31 @@ export class Scanner {
 
       const profiles = await this.dex.fetchLatestSolanaProfiles();
       diag.profiles = profiles.length;
+      // pump.fun discovery — the widest free source of brand-new coins
+      // (DexScreener's profiles feed only returns ~24 Solana profiles per
+      // scan). Best-effort: any failure returns [] and the scan continues
+      // on DexScreener alone (see /health summary.pump to verify liveness).
+      let pumpProfiles: TokenProfile[] = [];
+      if (this.pumpfun) {
+        try {
+          pumpProfiles = await this.pumpfun.fetchNewestCoins(
+            this.config.pumpfunProfileLimit,
+          );
+        } catch (err) {
+          console.error(
+            "[scanner] pump.fun discovery failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      diag.pump = pumpProfiles.length;
+      // Dedupe the two feeds (pump.fun mints overlap the DexScreener feed);
+      // the DexScreener entry wins — it carries richer profile data.
+      const dexMints = new Set(profiles.map((p) => p.tokenAddress));
+      const feedProfiles: TokenProfile[] = [
+        ...profiles,
+        ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
+      ];
       const now = Date.now();
       // Re-evaluation pool: tokens never pushed that are nearing or inside
       // the qualifying age window. The profiles feed only ever contains young
@@ -195,14 +230,26 @@ export class Scanner {
         windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
         limit: this.config.reevalPoolSize,
       });
-      if (profiles.length === 0 && recentStats.length === 0) {
+      // token_stats grows with pump.fun discovery (100+ new coins per scan):
+      // prune rows older than the re-eval window that were never pushed —
+      // unreachable by the pool query and only wasting storage. Pushed coins
+      // keep their rows so /flow and cached verdicts still work.
+      try {
+        await this.db.pruneOldTokenStats(now - RE_EVAL_WINDOW_MS);
+      } catch (err) {
+        console.error(
+          "[scanner] token_stats prune failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+      if (feedProfiles.length === 0 && recentStats.length === 0) {
         console.log("[scanner] no Solana profiles or re-eval candidates returned");
         return;
       }
       const poolProfiles: TokenProfile[] = [
-        ...profiles,
+        ...feedProfiles,
         ...recentStats
-          .filter((s) => !profiles.some((p) => p.tokenAddress === s.token))
+          .filter((s) => !feedProfiles.some((p) => p.tokenAddress === s.token))
           .map((s) => ({ tokenAddress: s.token })),
       ];
       diag.pool = poolProfiles.length;
@@ -213,25 +260,36 @@ export class Scanner {
       // One batched lookup for the whole feed, then one batched insert for
       // the new tokens — keeps the tick's Turso round trips to 2 instead of
       // ~2×profiles (per-round-trip latency is the tick's biggest cost when
-      // the database is slow, observed ~5s/call).
+      // the database is slow, observed ~5s/call). Registration is
+      // pair-independent for pump.fun coins: a coin with no DexScreener pair
+      // yet (bonding curve not graduated) is still recorded, so it enters
+      // the re-eval pool and is evaluated the moment its pair appears. A
+      // DexScreener profile with missing pair data is still skipped (it
+      // simply re-registers next tick once the pair is fetched).
       const statsByToken = new Map<string, TokenStats>();
       const existingStats = await this.db.getTokenStatsMany(
-        profiles.map((p) => p.tokenAddress),
+        feedProfiles.map((p) => p.tokenAddress),
       );
       const newStats: TokenStats[] = [];
-      for (const profile of profiles) {
-        const pair = pairsByToken.get(profile.tokenAddress);
-        if (!pair) continue;
+      for (const profile of feedProfiles) {
         const existing = existingStats.get(profile.tokenAddress);
         if (existing) {
           statsByToken.set(profile.tokenAddress, existing);
           continue;
         }
+        const pair = pairsByToken.get(profile.tokenAddress);
+        // No pair AND no pump.fun launch time → skip (retry next tick).
+        if (!pair && profile.openTimestamp === undefined) continue;
+        const ageMin = pair
+          ? (now - pair.pairCreatedAt) / 60_000
+          : profile.openTimestamp !== undefined
+            ? (now - profile.openTimestamp) / 60_000
+            : 0;
         const stats: TokenStats = {
           token: profile.tokenAddress,
           firstSeenAt: now,
-          firstM5Vol: pair.volume.m5,
-          firstSeenAgeMin: (now - pair.pairCreatedAt) / 60_000,
+          firstM5Vol: pair?.volume.m5 ?? 0,
+          firstSeenAgeMin: ageMin,
           birdeye1mVol: null,
           rugcheckBundlerPct: null,
           rugcheckTop10Pct: null,

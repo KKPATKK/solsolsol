@@ -8,6 +8,7 @@ import { HeliusClient } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 import { JupiterClient, TradeService } from "./jupiter";
+import { PumpFunClient } from "./pumpfun";
 
 const config = loadConfig();
 
@@ -132,6 +133,7 @@ async function main(): Promise<void> {
         new RugcheckClient(config),
         helius,
         trade ?? undefined,
+        new PumpFunClient(config),
       );
 
       const runScan = async (initial: boolean) => {

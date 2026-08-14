@@ -8,6 +8,7 @@ import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 import { JupiterClient, TradeService } from "./jupiter";
+import { PumpFunClient } from "./pumpfun";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -205,6 +206,9 @@ async function ensureInitialized(env: Env): Promise<void> {
           new RugcheckClient(config),
           helius,
           trade ?? undefined,
+          // pump.fun discovery widens coverage beyond the DexScreener
+          // profiles feed (best-effort — blocked/degraded feeds return []).
+          new PumpFunClient(config),
         );
         scannerReady = true;
       }

@@ -217,7 +217,7 @@ export class Db {
     );
     // The re-eval pool query filters token_stats by first_seen_at and
     // anti-joins seen_tokens every tick; these indexes keep it fast as both
-    // tables grow (token_stats is never pruned).
+    // tables grow (token_stats is pruned to the pool window each tick).
     await this.client.execute(
       `CREATE INDEX IF NOT EXISTS idx_token_stats_first_seen ON token_stats(first_seen_at)`,
     );
@@ -748,6 +748,20 @@ export class Db {
     await this.get().execute({
       sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, supply_flow, supply_flow_at) VALUES ${placeholders}`,
       args,
+    });
+  }
+
+  /**
+   * Drop token_stats rows older than `olderThanMs` that were never pushed
+   * (unreachable by the re-eval pool query, which only reads the last ~42h).
+   * Bounds storage growth from pump.fun discovery, which registers 100+
+   * new coins per scan; pushed coins keep their rows so /flow and cached
+   * verdicts still work. Uses the first_seen_at index — cheap per tick.
+   */
+  async pruneOldTokenStats(olderThanMs: number): Promise<void> {
+    await this.get().execute({
+      sql: "DELETE FROM token_stats WHERE first_seen_at < ? AND token NOT IN (SELECT token FROM seen_tokens)",
+      args: [olderThanMs],
     });
   }
 

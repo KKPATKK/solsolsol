@@ -14,6 +14,7 @@ const { parseFilterArgs } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
+const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -297,6 +298,60 @@ async function main() {
     } finally {
       await t.cleanup();
     }
+  });
+
+  await test("pruneOldTokenStats drops stale unseen rows, keeps pushed", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const old = Date.now() - 60 * 60_000;
+      const mk = (token, firstSeenAt) => ({
+        token,
+        firstSeenAt,
+        firstM5Vol: 0,
+        firstSeenAgeMin: 0,
+        birdeye1mVol: null,
+        rugcheckBundlerPct: null,
+        rugcheckTop10Pct: null,
+        birdeyeProTraders: null,
+        birdeyeSniperPct: null,
+        minMcapObserved: null,
+      });
+      await db.recordTokenStatsMany([
+        mk("OLD-UNSEEN", old), // older than cutoff, never pushed → pruned
+        mk("OLD-PUSHED", old), // older than cutoff but pushed → kept
+        mk("NEW-UNSEEN", Date.now()), // fresh → kept
+      ]);
+      await db.markTokenSeen("chat1", "OLD-PUSHED");
+      await db.pruneOldTokenStats(Date.now() - 42 * 60_000);
+      const map = await db.getTokenStatsMany(["OLD-UNSEEN", "OLD-PUSHED", "NEW-UNSEEN"]);
+      assert.equal(map.has("OLD-UNSEEN"), false);
+      assert.equal(map.has("OLD-PUSHED"), true);
+      assert.equal(map.has("NEW-UNSEEN"), true);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("parsePumpCoins maps mints and timestamps, drops junk", () => {
+    const out = parsePumpCoins([
+      { mint: "MINT1", name: "Alpha", symbol: "ALPHA", created_timestamp: 1710000000000 },
+      { mint: "   ", name: "junk" },
+      { mint: 123 },
+      null,
+      { mint: "MINT2", created_timestamp: 0 },
+      "string",
+    ]);
+    assert.equal(out.length, 2);
+    assert.equal(out[0].tokenAddress, "MINT1");
+    assert.equal(out[0].name, "Alpha");
+    assert.equal(out[0].symbol, "ALPHA");
+    assert.equal(out[0].openTimestamp, 1710000000000);
+    assert.equal(out[1].tokenAddress, "MINT2");
+    assert.equal(out[1].openTimestamp, undefined);
+    assert.deepEqual(parsePumpCoins({ not: "array" }), []);
+    assert.deepEqual(parsePumpCoins(null), []);
   });
 
   await test("trade_log record/hasTraded/countTradesSince round-trips with UNIQUE dedupe", async () => {
