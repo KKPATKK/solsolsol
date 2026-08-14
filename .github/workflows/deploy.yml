@@ -42,6 +42,36 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
+      # Cron Trigger repair: verify the * * * * * schedule is bound to the
+      # script and re-provision it if not. `wrangler deploy` prints "Deployed
+      # triggers" even when the schedule silently stops firing (observed
+      # 2026-08-14: the worker's persisted tick counter stayed null for hours
+      # while HTTP-driven scans ran fine — the scheduled events simply never
+      # arrived). The schedules API is the direct lever: GET to inspect, PUT
+      # to re-provision.
+      - name: Verify cron schedule
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+          API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/solana-meme-bot/schedules"
+          echo "::group::Current schedules"
+          curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$API" | tee /tmp/sched.json
+          echo
+          echo "::endgroup::"
+          if grep -q '"cron":"\* \* \* \* \*"' /tmp/sched.json; then
+            echo "::notice::Cron schedule * * * * * already bound"
+          else
+            echo "::warning::Cron schedule missing — re-provisioning via PUT"
+            curl -sS -X PUT \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"schedules":[{"cron":"* * * * *"}]}' "$API" | tee /tmp/sched_put.json
+            echo
+            grep -q '"success":true' /tmp/sched_put.json && echo "::notice::Cron schedule re-provisioned" || echo "::error::Cron schedule PUT failed"
+          fi
+
       # Write HELIUS_API_KEY as a Worker secret so the on-chain volume
       # resolver runs at full speed. Best-effort by design: if the GitHub
       # Actions secret is unset, or the write hits a transient Cloudflare
