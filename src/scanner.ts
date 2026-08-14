@@ -115,6 +115,13 @@ export class Scanner {
   private scanSeq = 0;
   /** Summary of the last completed scan, persisted into the heartbeat. */
   lastSummary: ScanSummary | null = null;
+  /**
+   * Why the last runOnce returned without a summary (early-return reason),
+   * surfaced via /health so a silently-skipping scanner is diagnosable
+   * without Cloudflare log access: "previous-scan-still-running",
+   * "no-chats-enabled", "empty-feed-and-pool", or null after a real scan.
+   */
+  lastSkip: string | null = null;
   /** When each token's RugCheck report was last fetched (in-memory TTL). */
   private readonly rugcheckFetchedAt = new Map<string, number>();
   /**
@@ -154,6 +161,7 @@ export class Scanner {
   async runOnce(): Promise<void> {
     if (this.running) {
       console.log("[scanner] previous scan still running, skipping this tick");
+      this.lastSkip = "previous-scan-still-running";
       return;
     }
     const seq = ++this.scanSeq;
@@ -183,6 +191,7 @@ export class Scanner {
       const chats = await this.db.listEnabledChats();
       if (chats.length === 0) {
         console.log("[scanner] no chats with push enabled, skipping");
+        this.lastSkip = "no-chats-enabled";
         return;
       }
 
@@ -244,6 +253,7 @@ export class Scanner {
       }
       if (feedProfiles.length === 0 && recentStats.length === 0) {
         console.log("[scanner] no Solana profiles or re-eval candidates returned");
+        this.lastSkip = "empty-feed-and-pool";
         return;
       }
       const poolProfiles: TokenProfile[] = [
@@ -434,6 +444,7 @@ export class Scanner {
       // that eventually settles must not clobber a newer scan's results.
       if (seq === this.scanSeq) {
         this.lastSummary = diag;
+        this.lastSkip = null;
         this.running = false;
       }
     }

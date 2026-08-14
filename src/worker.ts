@@ -276,6 +276,7 @@ async function runScan(): Promise<void> {
           count: scanCount,
           ms: lastScanMs,
           err: lastScanError,
+          skip: scanner?.lastSkip ?? null,
           summary,
         }),
       );
@@ -528,6 +529,21 @@ export default {
       } catch {
         // telemetry only — never fail /health over the mode read
       }
+      // Cross-isolate cron diagnostics: the scheduled handler persists a
+      // running total + last event time to Turso, so any isolate serving
+      // /health can prove whether the Cron Trigger is actually delivering.
+      let scheduledTickTotal: number | null = null;
+      let scheduledTickAt: number | null = null;
+      let enabledChats: number | null = null;
+      try {
+        const rawTotal = await db?.getWorkerState("scheduled_tick_total");
+        const rawAt = await db?.getWorkerState("scheduled_tick_at");
+        scheduledTickTotal = rawTotal ? parseInt(rawTotal, 10) || 0 : null;
+        scheduledTickAt = rawAt ? parseInt(rawAt, 10) || 0 : null;
+        enabledChats = (await db?.listEnabledChats())?.length ?? null;
+      } catch {
+        // telemetry only — never fail /health over the reads
+      }
       return Response.json({
         ok: true,
         scanCount,
@@ -547,6 +563,12 @@ export default {
         lastScanMs,
         lastScanError,
         scheduledTicks,
+        scheduledTickTotal,
+        scheduledTickAt: scheduledTickAt
+          ? new Date(scheduledTickAt).toISOString()
+          : null,
+        enabledChats,
+        lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         heartbeat,
         lastScanGapMs,
@@ -657,6 +679,19 @@ export default {
   async scheduled(_event: ScheduledEventLike, env: Env): Promise<void> {
     scheduledTicks++;
     await ensureInitialized(env);
+    // Persist cron delivery across isolates: scheduled events may land on a
+    // different isolate than the one serving /health, so the module counter
+    // alone cannot prove delivery. These two rows make cron liveness visible
+    // from any isolate (best-effort — a Turso outage loses the counter, which
+    // is itself diagnostic alongside initError).
+    try {
+      const raw = await db?.getWorkerState("scheduled_tick_total");
+      const prev = raw ? (parseInt(raw, 10) || 0) : 0;
+      await db?.setWorkerState("scheduled_tick_total", String(prev + 1));
+      await db?.setWorkerState("scheduled_tick_at", String(Date.now()));
+    } catch (err) {
+      console.error("[worker] cron counter persist failed:", err);
+    }
     if (!scanner) return;
     // Detect missed ticks (previous scan finished too long ago) and alert.
     try {
