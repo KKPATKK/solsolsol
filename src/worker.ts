@@ -55,6 +55,9 @@ let cfg: AppConfig | null = null;
  * expensive (~150–300 Helius credits), so throttle manual triggers. */
 const FLOW_DEBUG_COOLDOWN_MS = 30_000;
 const flowDebugLastRunAt = new Map<string, number>();
+/** Cooldown for the /debug/tick endpoint (manual scan trigger). */
+const TICK_DEBUG_COOLDOWN_MS = 25_000;
+let tickDebugLastRunAt = 0;
 let lastScanAt: number | null = null;
 let lastScanOk = false;
 let scanCount = 0;
@@ -519,6 +522,56 @@ export default {
         lastScanGapMs,
         summary: scanner?.lastSummary ?? null,
         now: new Date().toISOString(),
+      });
+    }
+
+    // Manual scan trigger — forces one scanner pass immediately. This is
+    // the escape hatch when cron delivery fails AND the diagnostic that
+    // distinguishes "cron not firing" from "scan path broken": if the scan
+    // completes here, the pipeline is healthy and the cron trigger is the
+    // problem. runOnce is re-entrant safe (skips when a scan is already
+    // running) and budget-guarded, so a hung upstream never wedges the
+    // request — the whole call is raced against a 25s cap, matching the
+    // scheduled tick budget.
+    if (url.pathname === "/debug/tick") {
+      const sinceLast = Date.now() - tickDebugLastRunAt;
+      if (sinceLast < TICK_DEBUG_COOLDOWN_MS) {
+        return Response.json(
+          {
+            ok: false,
+            error: "cooldown — runOnce is minute-budgeted, wait a bit",
+            retryAfterSec: Math.ceil(
+              (TICK_DEBUG_COOLDOWN_MS - sinceLast) / 1000,
+            ),
+          },
+          { status: 429 },
+        );
+      }
+      tickDebugLastRunAt = Date.now();
+      if (!scanner) {
+        return Response.json(
+          {
+            ok: false,
+            error: "scanner 未就緒（Turso 初始化失敗？）",
+            initError,
+            dbReady,
+          },
+          { status: 503 },
+        );
+      }
+      const t0 = Date.now();
+      const timedOut = await Promise.race([
+        scanner.runOnce().then(() => false),
+        new Promise<boolean>((resolve) =>
+          setTimeout(() => resolve(true), TICK_DEBUG_COOLDOWN_MS),
+        ),
+      ]);
+      return Response.json({
+        ok: !timedOut,
+        ms: Date.now() - t0,
+        timedOut,
+        lastScanError,
+        summary: scanner.lastSummary,
       });
     }
 
