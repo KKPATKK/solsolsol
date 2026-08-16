@@ -155,7 +155,20 @@ export class GmgnClient {
           }),
         );
         if (res.status === 429 || res.status >= 500) {
-          throw new Error(`GMGN HTTP ${res.status}`);
+          // Surface the API's error detail (RATE_LIMIT_EXCEEDED vs
+          // RATE_LIMIT_BANNED + reset_at) for diagnostics via /debug/gmgn.
+          let detail = "";
+          try {
+            const body = (await res.json()) as {
+              msg?: string;
+              data?: { reset_at?: number | string };
+            };
+            const reset = body.data?.reset_at;
+            detail = ` ${body.msg ?? ""}${reset !== undefined ? ` reset=${reset}` : ""}`.trim();
+          } catch {
+            // body not JSON — keep the plain status
+          }
+          throw new Error(`GMGN HTTP ${res.status}${detail}`);
         }
         if (!res.ok) return null; // 4xx — deterministic
         const body = (await res.json()) as { data?: unknown };
