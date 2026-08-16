@@ -13,9 +13,7 @@ import type { GeckoTerminalClient } from "./geckoterminal";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTrendingToken } from "./axiom";
 
-const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
-/** A token's opening volume (DexScreener proxy) is only meaningful if we saw it young. */
-const MAX_MEASURABLE_AGE_MIN = 5;
+
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
 const RUGCHECK_REFRESH_MS = 15 * 60_000;
 /**
@@ -71,13 +69,6 @@ interface QualifyingCoin {
   profile: TokenProfile;
   pair: PairInfo;
   stats: TokenStats;
-}
-
-/** Resolved opening (first-minute) volume for a coin. */
-interface OpeningVolume {
-  /** Exact volume in USD, or null when it could not be determined. */
-  value: number | null;
-  source: "helius" | "proxy" | "unknown";
 }
 
 /**
@@ -602,9 +593,6 @@ export class Scanner {
           );
           continue;
         }
-        // Opening volume is resolved for the message card but no longer
-        // filters — the first-minute-volume filter was removed.
-        const opening = await this.resolveOpeningVolume(coin);
         // Bundler + top-10 holder share is resolved for the message card but
         // no longer filters — those filters were removed, so coins push even
         // when the RugCheck report is not ready yet (the card shows 未检测).
@@ -654,10 +642,8 @@ export class Scanner {
             coin.chatId,
             renderMessage(
               coin,
-              opening,
               rugcheck.bundlerPct,
               rugcheck.top10Pct,
-              trader.proTraders,
               trader.sniperPct,
               flow.status === "clean",
               holders.holderCount,
@@ -840,19 +826,6 @@ export class Scanner {
    * removed; Birdeye is also deliberately NOT consulted (its OHLCV endpoint
    * was the main free-tier budget burner).
    */
-  private async resolveOpeningVolume(coin: QualifyingCoin): Promise<OpeningVolume> {
-    const { stats } = coin;
-
-    if (stats.birdeye1mVol !== null) {
-      return { value: stats.birdeye1mVol, source: "helius" };
-    }
-
-    if (stats.firstSeenAgeMin <= MAX_MEASURABLE_AGE_MIN) {
-      return { value: stats.firstM5Vol, source: "proxy" };
-    }
-    return { value: null, source: "unknown" };
-  }
-
   /** Bundler + top-10 holder share + creator: cached → single RugCheck fetch → unknown. */
   private async resolveRugcheckData(coin: QualifyingCoin): Promise<{
     bundlerPct: number | null;
@@ -1329,10 +1302,8 @@ export class Scanner {
 
 function renderMessage(
   coin: QualifyingCoin,
-  opening: OpeningVolume,
   bundlerPct: number | null,
   top10Pct: number | null,
-  proTraders: number | null,
   sniperPct: number | null,
   supplyFlowClean: boolean,
   holderCount: number | null,
@@ -1347,10 +1318,6 @@ function renderMessage(
   const liquidityUsd = pair.liquidity.usd ?? 0;
   const ageMs = Date.now() - pair.pairCreatedAt;
 
-  const openingLine =
-    opening.value === null
-      ? "🌱 首分钟量: —（无法测量）"
-      : `🌱 首分钟量: ${fmtUsd(opening.value)}${opening.source === "helius" ? " (链上)" : ""}`;
   const bundlerLine =
     bundlerPct === null
       ? "🛡 Bundler: 0.0%（未检测到捆绑网络）"
@@ -1362,10 +1329,6 @@ function renderMessage(
   const flowLine = supplyFlowClean
     ? "🕸 供應流: ✅ 无集中出货（链上检查通过）"
     : "🕸 供應流: —（未分析）";
-  const proTradersLine =
-    proTraders === null
-      ? "🧑‍💻 Pro 交易者: —（未检测）"
-      : `🧑‍💻 Pro 交易者: ${proTraders} (smart)`;
   const sniperLine =
     sniperPct === null
       ? "🎯 Sniper 買入: —（未檢測）"
@@ -1389,11 +1352,9 @@ function renderMessage(
     `💰 市值: ${fmtUsd(pair.marketCap)}`,
     `⚡ 5m 涨幅: ${pair.priceChange.m5 >= 0 ? "+" : ""}${pair.priceChange.m5.toFixed(2)}%`,
     `📊 5m 量: ${fmtUsd(pair.volume.m5)}`,
-    openingLine,
     bundlerLine,
     top10Line,
     flowLine,
-    proTradersLine,
     sniperLine,
     holdersLine,
     creatorLine,
@@ -1402,7 +1363,6 @@ function renderMessage(
     `💧 流动性: ${fmtUsd(liquidityUsd)}`,
     `⏱️ 上线: ${fmtAge(ageMs)}`,
     `🔑 合约: ${tokenAddress}`,
-    `🔗 ${CHAIN_BASE_URL}${tokenAddress}`,
   ];
   return lines.join("\n");
 }
