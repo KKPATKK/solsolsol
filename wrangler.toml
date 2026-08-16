@@ -45,7 +45,10 @@ BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 # smart-money / wash-trading / holder data before pushing
 # (GMGN_BLOCK_WASH_TRADING blocks flagged coins, default true), and (b)
 # adds GMGN Trending as a discovery feed (GMGN_TRENDING_LIMIT, 0 =
-# disabled, default 30).
+# disabled, default 30). KEPT AT 0: GMGN's edge returns a bare 429 to
+# Cloudflare Worker egress (verified 2026-08-16 — same key works from
+# other IPs), so the feed/enrichment stay dormant until access is
+# confirmed (paid tier / IP whitelist / proxy). /debug/gmgn probes it.
 GMGN_TRENDING_LIMIT = "0"
 GMGN_REQUEST_INTERVAL_MS = "600"
 GMGN_BLOCK_WASH_TRADING = "true"
