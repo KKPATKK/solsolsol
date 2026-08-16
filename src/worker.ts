@@ -73,7 +73,12 @@ let tickDebugLastRunAt = 0;
 const BACKFILL_DEBUG_COOLDOWN_MS = 5 * 60_000;
 let backfillDebugLastRunAt = 0;
 /** Minimum gap between fallback scans triggered from the fetch path. */
-const SCAN_TRIGGER_INTERVAL_MS = 60_000;
+// How often the HTTP-triggered fallback scan may fire. Cron (1/min) is the
+// primary driver; 120s keeps the fallback from double-scanning during
+// healthy cron delivery while still self-healing within 2 minutes if cron
+// stops (observed 2026-08-14: cron dead for 24h+, fallback kept the bot
+// alive).
+const SCAN_TRIGGER_INTERVAL_MS = 120_000;
 let lastScanTriggerAt = 0;
 let lastScanAt: number | null = null;
 let lastScanOk = false;
