@@ -17,6 +17,7 @@ const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmoun
 const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools } = require("../dist/geckoterminal.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
+const { parseTokenOverview } = require("../dist/birdeye.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -460,6 +461,27 @@ async function main() {
     assert.equal(info.sellVolume5m, 2000);
     assert.equal(parseTokenInfo(null), null);
     assert.equal(parseTokenInfo("x"), null);
+  });
+
+  await test("parseTokenOverview reads holder + creator from the Birdeye overview shape", () => {
+    const out = parseTokenOverview({
+      address: "abc",
+      holder: 1531,
+      creator: "5x7JhHHQQxxp5yp7xfj1eQvV9Bp7yRRVkP1hMZqNpump",
+      price: "0.0001",
+    });
+    assert.equal(out.holderCount, 1531);
+    assert.equal(out.creator, "5x7JhHHQQxxp5yp7xfj1eQvV9Bp7yRRVkP1hMZqNpump");
+    // Alternative field names + invalid shapes degrade to nulls.
+    assert.deepEqual(parseTokenOverview({ holders: 88, ownerAddress: "5x7JhHHQQxxp5yp7xfj1eQvV9Bp7yRRVkP1hMZqNpump" }), {
+      holderCount: 88,
+      creator: "5x7JhHHQQxxp5yp7xfj1eQvV9Bp7yRRVkP1hMZqNpump",
+    });
+    assert.deepEqual(parseTokenOverview({ holder: 0 }), { holderCount: null, creator: null });
+    assert.deepEqual(parseTokenOverview({ holder: "abc" }), { holderCount: null, creator: null });
+    assert.deepEqual(parseTokenOverview({ holder: 10, creator: "short" }), { holderCount: 10, creator: null });
+    assert.deepEqual(parseTokenOverview(null), { holderCount: null, creator: null });
+    assert.deepEqual(parseTokenOverview("x"), { holderCount: null, creator: null });
   });
 
   await test("trade_log record/hasTraded/countTradesSince round-trips with UNIQUE dedupe", async () => {

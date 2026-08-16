@@ -240,6 +240,25 @@ export class BirdeyeClient {
   }
 
   /**
+   * Holder count + creator wallet from the token overview endpoint — the
+   * card's holders/creator lines (GMGN replacement; Birdeye is already keyed
+   * and reachable from the Worker). Field names are parsed defensively
+   * (the docs don't publish a schema): holder accepts holder/holders/
+   * holderCount/holder_count; creator accepts creator/creatorAddress/
+   * creator_address/ownerAddress. Returns nulls on any shape mismatch so a
+   * schema change degrades to "—" on the card, never a scan failure.
+   */
+  async getTokenOverview(address: string): Promise<{
+    holderCount: number | null;
+    creator: string | null;
+  }> {
+    const data = (await this.getJson(
+      `/defi/v1/token/overview?address=${encodeURIComponent(address)}&ui_amount_mode=raw`,
+    )) as { data?: Record<string, unknown> } | null;
+    return parseTokenOverview(data?.data);
+  }
+
+  /**
    * Lowest market cap since listing, estimated from the candle low × supply.
    * Uses 1-minute candles for coins under 6h old, 15-minute for older ones.
    */
@@ -271,4 +290,30 @@ export class BirdeyeClient {
     const minMc = minLow * supply;
     return Number.isFinite(minMc) && minMc > 0 ? minMc : null;
   }
+}
+
+/**
+ * Pure parser for the token-overview envelope's `data` object (exported for
+ * offline unit tests — see scripts/test-unit.js). Defensive about field
+ * names so a Birdeye schema change degrades to nulls, not a crash.
+ */
+export function parseTokenOverview(d: unknown): {
+  holderCount: number | null;
+  creator: string | null;
+} {
+  if (!d || typeof d !== "object") {
+    return { holderCount: null, creator: null };
+  }
+  const rec = d as Record<string, unknown>;
+  const holderRaw = rec.holder ?? rec.holders ?? rec.holderCount ?? rec.holder_count;
+  const holderNum = Number(holderRaw);
+  const holderCount =
+    Number.isFinite(holderNum) && holderNum > 0 ? Math.floor(holderNum) : null;
+  const creatorRaw =
+    rec.creator ?? rec.creatorAddress ?? rec.creator_address ?? rec.ownerAddress;
+  const creator =
+    typeof creatorRaw === "string" && creatorRaw.trim().length >= 32
+      ? creatorRaw.trim()
+      : null;
+  return { holderCount, creator };
 }

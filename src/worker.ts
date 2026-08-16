@@ -663,6 +663,37 @@ export default {
       }
     }
 
+    // Birdeye token-overview probe — verifies the real holders/creator
+    // response shape from the worker's own egress (the schema isn't
+    // published, so this lets a card-line "—" be diagnosed as missing data
+    // vs a parser mismatch).
+    if (url.pathname === "/debug/birdeye-overview") {
+      const mint = (url.searchParams.get("address") ?? "").trim();
+      if (!mint) {
+        return Response.json({ ok: false, error: "missing ?address=" });
+      }
+      if (!birdeye) {
+        return Response.json({ ok: false, error: "Birdeye not configured" });
+      }
+      try {
+        const t0 = Date.now();
+        const info = await birdeye.getTokenOverview(mint);
+        return Response.json({
+          ok: true,
+          ms: Date.now() - t0,
+          holderCount: info.holderCount,
+          creator: info.creator
+            ? `${info.creator.slice(0, 6)}…${info.creator.slice(-4)}`
+            : null,
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // Push history — read-only distribution of seen_tokens for diagnosing
     // "why is push volume low" (all pushes ever, grouped by day, oldest 20).
     if (url.pathname === "/debug/pushes") {

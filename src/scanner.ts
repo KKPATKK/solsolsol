@@ -556,6 +556,9 @@ export class Scanner {
         // filters — the sniper filter was removed, so coins push even when
         // the data is not ready yet.
         const trader = await this.resolveTraderData(coin);
+        // Holder count + creator (Birdeye token overview) — card-only
+        // enrichment, best-effort like the trader data above.
+        const holderCreator = await this.resolveHolderCreator(coin);
         // GMGN enrichment — smart money count, holders and the wash-trading
         // flag, shown on the card. Best-effort: failures degrade to no
         // enrichment. The wash-trading flag can block the push entirely
@@ -599,6 +602,8 @@ export class Scanner {
               trader.proTraders,
               trader.sniperPct,
               flow.status === "clean",
+              holderCreator.holderCount,
+              holderCreator.creator,
               gmgn,
             ),
             {
@@ -1006,6 +1011,41 @@ export class Scanner {
   }
 
   /**
+   * Holder count + creator wallet (Birdeye token overview) — the card's
+   * holders/creator lines. Best-effort with the same 5-min negative cache:
+   * a failure degrades to "—" on the card, never blocks or slows the push.
+   * Only fetched for qualifying candidates, so the 20 CU/request cost is
+   * negligible at the current push volume.
+   */
+  private async resolveHolderCreator(coin: QualifyingCoin): Promise<{
+    holderCount: number | null;
+    creator: string | null;
+  }> {
+    const mint = coin.pair.baseToken.address;
+    if (!this.birdeye || this.dataNegativeCached(mint)) {
+      return { holderCount: null, creator: null };
+    }
+    try {
+      const info = await this.birdeye.getTokenOverview(mint);
+      if (info.holderCount === null && info.creator === null) {
+        // No holder/creator data back — back off instead of re-querying
+        // the same coin on every scan.
+        this.dataFailedAt.set(mint, Date.now());
+        return info;
+      }
+      this.dataFailedAt.delete(mint);
+      return info;
+    } catch (err) {
+      this.dataFailedAt.set(mint, Date.now());
+      console.error(
+        `[scanner] Birdeye overview lookup failed for ${mint}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return { holderCount: null, creator: null };
+    }
+  }
+
+  /**
    * GMGN enrichment for one candidate: smart money, holders, wash-trading
    * flag. Best-effort — any failure/empty result negative-caches the coin
    * (5 min) and degrades to no enrichment; the push is only blocked when a
@@ -1147,6 +1187,8 @@ function renderMessage(
   proTraders: number | null,
   sniperPct: number | null,
   supplyFlowClean: boolean,
+  holderCount: number | null,
+  creator: string | null,
   gmgn: GmgnTokenInfo | null,
 ): string {
   const { pair, profile } = coin;
@@ -1180,6 +1222,14 @@ function renderMessage(
     sniperPct === null
       ? "🎯 Sniper 買入: —（未檢測）"
       : `🎯 Sniper 買入: ${sniperPct.toFixed(1)}%（佔供應）`;
+  const holdersLine =
+    holderCount === null
+      ? "👥 Holders: —（未检测）"
+      : `👥 Holders: ${holderCount.toLocaleString("en-US")}`;
+  const creatorLine =
+    creator === null
+      ? "✍️ Creator: —（未检测）"
+      : `✍️ Creator: ${creator.slice(0, 6)}…${creator.slice(-4)}`;
   const gmgnLine =
     gmgn === null
       ? "🧠 GMGN: —（未配置）"
@@ -1197,6 +1247,8 @@ function renderMessage(
     flowLine,
     proTradersLine,
     sniperLine,
+    holdersLine,
+    creatorLine,
     gmgnLine,
     `📈 24h 量: ${fmtUsd(pair.volume.h24)}`,
     `💧 流动性: ${fmtUsd(liquidityUsd)}`,
