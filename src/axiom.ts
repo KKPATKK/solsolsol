@@ -344,8 +344,15 @@ export class AxiomClient {
     };
   }
 
-  /** Refresh the access token using a stored refresh token. */
-  async refreshAccessToken(refreshToken: string): Promise<string | null> {
+  /**
+   * Refresh the access token using a stored refresh token. Returns the new
+   * access token plus a rotated refresh token when the API issues one (the
+   * response may set both cookies or return them in the JSON body).
+   */
+  async refreshAccessToken(refreshToken: string): Promise<{
+    accessToken: string | null;
+    refreshToken: string | null;
+  }> {
     const { status, json, setCookie } = await this.postJson(
       REFRESH_HOST,
       "/refresh-access-token",
@@ -355,11 +362,22 @@ export class AxiomClient {
     if (status !== 200) {
       throw new Error(`Axiom refresh HTTP ${status}`);
     }
-    const fromCookie = cookieValue(setCookie, "auth-access-token");
-    if (fromCookie) return fromCookie;
+    const accessFromCookie = cookieValue(setCookie, "auth-access-token");
+    const refreshFromCookie = cookieValue(setCookie, "auth-refresh-token");
     const rec = (json ?? {}) as Record<string, unknown>;
-    const fromBody = rec["auth-access-token"] ?? rec.access_token;
-    return typeof fromBody === "string" && fromBody ? fromBody : null;
+    const accessFromBody = rec["auth-access-token"] ?? rec.access_token;
+    const refreshFromBody = rec["auth-refresh-token"] ?? rec.refresh_token;
+    const accessToken =
+      accessFromCookie ??
+      (typeof accessFromBody === "string" && accessFromBody
+        ? accessFromBody
+        : null);
+    const refreshResult =
+      refreshFromCookie ??
+      (typeof refreshFromBody === "string" && refreshFromBody
+        ? refreshFromBody
+        : null);
+    return { accessToken, refreshToken: refreshResult };
   }
 
   /**

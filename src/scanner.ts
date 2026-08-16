@@ -19,6 +19,13 @@ const MAX_MEASURABLE_AGE_MIN = 5;
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
 const RUGCHECK_REFRESH_MS = 15 * 60_000;
 /**
+ * Min gap between Axiom refresh attempts. Refreshing mints a new access
+ * token server-side; when Axiom's trending shards are genuinely down the
+ * 5xx trigger would otherwise refresh once per scan (60s). A 5-min cooldown
+ * bounds that to a handful of refreshes per outage.
+ */
+const AXIOM_REFRESH_COOLDOWN_MS = 5 * 60_000;
+/**
  * After an on-chain (Helius) or Birdeye lookup comes back empty/failed, do
  * not re-query the same token for this long. Every RPC retry costs credits on
  * the Helius free tier, and empty results (data not indexed yet) are not
@@ -1105,12 +1112,17 @@ export class Scanner {
 
   /**
    * Axiom trending with access-token lifecycle: uses the token persisted by
-   * /debug/axiom-login (worker_state `axiom_access_token`); on an auth
-   * failure it refreshes once via `axiom_refresh_token` and persists the
-   * new token. Returns [] when not logged in or when refresh fails (re-login
-   * via /debug/axiom-login needed). Never throws to the caller — feed
-   * failures degrade to the other discovery sources.
+   * /debug/axiom-tokens (worker_state `axiom_access_token`); on a
+   * refreshable failure (auth rejection OR a 5xx from the sharded trending
+   * hosts, which is what an invalid/expired token actually produces) it
+   * refreshes once via `axiom_refresh_token` and persists whatever comes
+   * back (access + rotated refresh). A cooldown prevents hammering the
+   * refresh endpoint when the API itself is down. Returns [] when not
+   * logged in or when refresh fails (re-login via /debug/axiom-tokens
+   * needed). Never throws to the caller — feed failures degrade to the
+   * other discovery sources.
    */
+  private lastAxiomRefreshAt = 0;
   private async fetchAxiomTrending(): Promise<AxiomTrendingToken[]> {
     const accessToken = await this.db.getWorkerState("axiom_access_token");
     if (!accessToken) return [];
@@ -1121,43 +1133,59 @@ export class Scanner {
         this.config.axiomTrendingLimit,
       );
     } catch (err) {
-      const authFailure =
-        err instanceof Error && /auth/i.test(err.message);
-      if (!authFailure) {
-        // Rate-limited / 5xx: skip this round, keep the token (it's still
-        // valid); the next scan retries the same token.
+      const msg = err instanceof Error ? err.message : String(err);
+      const authFailure = /auth/i.test(msg);
+      // 5xx from every trending host is also refresh-worthy: Axiom's shards
+      // answer 502 to an invalid/expired access token (measured 2026-08-16),
+      // so a plain 5xx can mean the token died, not the API.
+      const refreshable = authFailure || /HTTP 50[0-9]/.test(msg);
+      if (!refreshable) {
+        // 429 / other: skip this round, keep the token (it's still valid);
+        // the next scan retries the same token.
         console.error(
-          "[scanner] axiom trending fetch failed (non-auth):",
-          err instanceof Error ? err.message : err,
+          "[scanner] axiom trending fetch failed (non-refreshable):",
+          msg,
         );
         return [];
       }
-      // Access token expired/rejected — try one refresh with the stored
-      // refresh token, then persist whatever comes back.
+      const now = Date.now();
+      if (now - this.lastAxiomRefreshAt < AXIOM_REFRESH_COOLDOWN_MS) {
+        console.error(
+          "[scanner] axiom refresh cooldown active — skipping refresh this round:",
+          msg,
+        );
+        return [];
+      }
+      this.lastAxiomRefreshAt = now;
       const refreshToken = await this.db.getWorkerState("axiom_refresh_token");
       if (!refreshToken) {
         console.error(
-          "[scanner] axiom access token rejected and no refresh token — re-login via /debug/axiom-login",
+          "[scanner] axiom access token rejected and no refresh token — re-login via /debug/axiom-tokens",
         );
         return [];
       }
       try {
         const fresh = await this.axiom!.refreshAccessToken(refreshToken);
-        if (!fresh) {
+        if (!fresh || !fresh.accessToken) {
           console.error(
-            "[scanner] axiom refresh returned no token — re-login via /debug/axiom-login",
+            "[scanner] axiom refresh returned no token — re-login via /debug/axiom-tokens",
           );
           return [];
         }
-        await this.db.setWorkerState("axiom_access_token", fresh);
+        await this.db.setWorkerState("axiom_access_token", fresh.accessToken);
+        // Persist a rotated refresh token when the API issues one (the SDK
+        // keeps the old one otherwise — both are safe to store).
+        if (fresh.refreshToken) {
+          await this.db.setWorkerState("axiom_refresh_token", fresh.refreshToken);
+        }
         return await this.axiom!.fetchTrending(
-          fresh,
+          fresh.accessToken,
           "1h",
           this.config.axiomTrendingLimit,
         );
       } catch (refreshErr) {
         console.error(
-          "[scanner] axiom token refresh failed — re-login via /debug/axiom-login:",
+          "[scanner] axiom token refresh failed — re-login via /debug/axiom-tokens:",
           refreshErr instanceof Error ? refreshErr.message : refreshErr,
         );
         return [];
