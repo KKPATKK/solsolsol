@@ -986,7 +986,7 @@ export class Scanner {
       const info = await this.gmgn.fetchTokenInfo(mint);
       const empty =
         info === null ||
-        (info.smartDegenCount === null &&
+        (info.smartWallets === null &&
           info.holderCount === null &&
           info.isWashTrading === null);
       if (empty) {
@@ -1148,7 +1148,7 @@ function renderMessage(
   const gmgnLine =
     gmgn === null
       ? "🧠 GMGN: —（未配置）"
-      : `🧠 GMGN: 👤${gmgn.holderCount ?? "—"} 持倉 | 💰${gmgn.smartDegenCount ?? "—"} smart${gmgn.isWashTrading ? " | ⚠️ wash trading" : ""}`;
+      : `🧠 GMGN: 👤${gmgn.holderCount ?? "—"} 持倉 | 💰${gmgn.smartWallets ?? "—"} smart${gmgn.isWashTrading ? " | ⚠️ wash trading" : ""}`;
 
   const lines = [
     `🪙 ${name} (${symbol})`,

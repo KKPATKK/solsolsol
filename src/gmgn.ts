@@ -30,11 +30,12 @@ class Throttle {
 }
 
 export interface GmgnTokenInfo {
-  /** Smart-money (degen) wallets actively involved — GMGN's key signal. */
-  smartDegenCount: number | null;
+  /** Smart-money wallets (wallet_tags_stat.smart_wallets) — GMGN's key signal. */
+  smartWallets: number | null;
   holderCount: number | null;
-  /** Explicit wash-trading flag from GMGN. null when unknown. */
+  /** Explicit wash-trading flag (only from the trending feed; token info has none). */
   isWashTrading: boolean | null;
+  degenCalls: number | null;
   buyVolume5m: number | null;
   sellVolume5m: number | null;
 }
@@ -54,6 +55,13 @@ export interface GmgnTrendingItem {
 
 const num = (v: unknown): number | null =>
   typeof v === "number" && Number.isFinite(v) ? v : null;
+
+/** GMGN timestamps are unix SECONDS; ms timestamps (<1e12) pass through. */
+const toMs = (v: unknown): number | null => {
+  const n = num(v);
+  if (n === null) return null;
+  return n < 1e12 ? n * 1000 : n;
+};
 
 const boolOrNull = (v: unknown): boolean | null =>
   typeof v === "boolean" ? v : null;
@@ -80,7 +88,9 @@ export function parseTrending(data: unknown): GmgnTrendingItem[] {
       holderCount: num(item.holder_count),
       smartDegenCount: num(item.smart_degen_count),
       isWashTrading: item.is_wash_trading === true,
-      createdAtMs: num(item.created_timestamp ?? item.created_at),
+      createdAtMs: toMs(
+        item.creation_timestamp ?? item.created_timestamp ?? item.created_at,
+      ),
     });
   }
   return out;
@@ -94,16 +104,21 @@ export function parseTokenInfo(data: unknown): GmgnTokenInfo | null {
     obj.price && typeof obj.price === "object"
       ? (obj.price as Record<string, unknown>)
       : {};
-  const pick = (key: string): unknown =>
-    obj[key] !== undefined ? obj[key] : price[key];
+  const stat =
+    obj.stat && typeof obj.stat === "object"
+      ? (obj.stat as Record<string, unknown>)
+      : {};
+  const walletTags =
+    obj.wallet_tags_stat && typeof obj.wallet_tags_stat === "object"
+      ? (obj.wallet_tags_stat as Record<string, unknown>)
+      : {};
   return {
-    smartDegenCount: num(pick("smart_degen_count") ?? pick("smartMoney")),
-    holderCount: num(pick("holder_count") ?? pick("holderCount")),
-    isWashTrading:
-      boolOrNull(pick("is_wash_trading")) ??
-      boolOrNull(pick("isWashTrading")),
-    buyVolume5m: num(pick("buy_volume_5m") ?? pick("buyVolume5m")),
-    sellVolume5m: num(pick("sell_volume_5m") ?? pick("sellVolume5m")),
+    smartWallets: num(walletTags.smart_wallets),
+    holderCount: num(obj.holder_count ?? stat.holder_count),
+    isWashTrading: null, // token/info has no wash-trading flag (trending only)
+    degenCalls: num(stat.degen_call_count),
+    buyVolume5m: num(price.buy_volume_5m),
+    sellVolume5m: num(price.sell_volume_5m),
   };
 }
 
@@ -143,15 +158,20 @@ export class GmgnClient {
           throw new Error(`GMGN HTTP ${res.status}`);
         }
         if (!res.ok) return null; // 4xx — deterministic
-        const body = (await res.json()) as {
-          data?: unknown;
-          msg?: string;
-        };
-        // Unwrap the common { code, msg, data } envelope; the CLI prints the
-        // data object, and the underlying API also returns it under `data`.
-        return (body as { data?: unknown }).data !== undefined
-          ? (body as { data?: unknown }).data
-          : body;
+        const body = (await res.json()) as { data?: unknown };
+        // Unwrap the { code, msg, data } envelope, repeatedly — the read
+        // endpoints nest it twice (observed 2026-08-16:
+        // {code,data:{code,data:{rank}}}) while token/info's payload has no
+        // `data` key of its own, so the loop terminates on the real object.
+        let unwrapped: unknown = body;
+        while (
+          unwrapped !== null &&
+          typeof unwrapped === "object" &&
+          (unwrapped as { data?: unknown }).data !== undefined
+        ) {
+          unwrapped = (unwrapped as { data?: unknown }).data;
+        }
+        return unwrapped;
       } catch (err) {
         lastError = err;
         if (attempt < 3) await sleep(attempt * 2000);

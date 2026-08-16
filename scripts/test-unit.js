@@ -419,26 +419,19 @@ async function main() {
     assert.deepEqual(parseTrending(null), []);
   });
 
-  await test("parseTokenInfo reads GMGN smart-money fields (top-level + price subtree)", () => {
+  await test("parseTokenInfo reads the real GMGN token/info shape (stat + wallet_tags_stat + price)", () => {
     const info = parseTokenInfo({
-      price: {
-        buy_volume_5m: 5000,
-        sell_volume_5m: 2000,
-      },
-      smart_degen_count: 7,
       holder_count: 1500,
-      is_wash_trading: true,
+      stat: { degen_call_count: 12 },
+      wallet_tags_stat: { smart_wallets: 7 },
+      price: { buy_volume_5m: 5000, sell_volume_5m: 2000 },
     });
     assert.ok(info);
-    assert.equal(info.smartDegenCount, 7);
+    assert.equal(info.smartWallets, 7);
     assert.equal(info.holderCount, 1500);
-    assert.equal(info.isWashTrading, true);
+    assert.equal(info.degenCalls, 12);
     assert.equal(info.buyVolume5m, 5000);
     assert.equal(info.sellVolume5m, 2000);
-    // Fields nested under price only
-    const nested = parseTokenInfo({ price: { holder_count: 99, smart_degen_count: 2 } });
-    assert.equal(nested.holderCount, 99);
-    assert.equal(nested.smartDegenCount, 2);
     assert.equal(parseTokenInfo(null), null);
     assert.equal(parseTokenInfo("x"), null);
   });
