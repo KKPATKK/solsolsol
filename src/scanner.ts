@@ -139,6 +139,8 @@ export class Scanner {
   lastSkip: string | null = null;
   /** When each token's RugCheck report was last fetched (in-memory TTL). */
   private readonly rugcheckFetchedAt = new Map<string, number>();
+  /** Creator wallet learned from RugCheck reports (static per token). */
+  private readonly rugcheckCreator = new Map<string, string>();
   /**
    * When Helius/Birdeye last returned empty/failed for a token, so we can
    * skip re-querying it for a while (in-memory negative cache).
@@ -556,9 +558,10 @@ export class Scanner {
         // filters — the sniper filter was removed, so coins push even when
         // the data is not ready yet.
         const trader = await this.resolveTraderData(coin);
-        // Holder count + creator (Birdeye token overview) — card-only
-        // enrichment, best-effort like the trader data above.
-        const holderCreator = await this.resolveHolderCreator(coin);
+        // Holder count (Birdeye token overview) — card-only enrichment,
+        // best-effort like the trader data above. Creator comes from the
+        // RugCheck report (this.rugcheck.creator).
+        const holders = await this.resolveHolderCount(coin);
         // GMGN enrichment — smart money count, holders and the wash-trading
         // flag, shown on the card. Best-effort: failures degrade to no
         // enrichment. The wash-trading flag can block the push entirely
@@ -602,8 +605,8 @@ export class Scanner {
               trader.proTraders,
               trader.sniperPct,
               flow.status === "clean",
-              holderCreator.holderCount,
-              holderCreator.creator,
+              holders.holderCount,
+              rugcheck.creator,
               gmgn,
             ),
             {
@@ -795,10 +798,11 @@ export class Scanner {
     return { value: null, source: "unknown" };
   }
 
-  /** Bundler + top-10 holder share: cached → single RugCheck fetch → unknown. */
+  /** Bundler + top-10 holder share + creator: cached → single RugCheck fetch → unknown. */
   private async resolveRugcheckData(coin: QualifyingCoin): Promise<{
     bundlerPct: number | null;
     top10Pct: number | null;
+    creator: string | null;
   }> {
     const { stats } = coin;
     // Use the cache only while it is fresh. RugCheck keeps refining reports
@@ -807,10 +811,14 @@ export class Scanner {
     const fetchedAt = this.rugcheckFetchedAt.get(stats.token);
     const fresh =
       fetchedAt !== undefined && Date.now() - fetchedAt < RUGCHECK_REFRESH_MS;
+    // Creator is a static token property — keep it in-memory across refetches
+    // (the DB stores only the two percentages).
+    const knownCreator = this.rugcheckCreator.get(stats.token) ?? null;
     if (stats.rugcheckTop10Pct !== null && fresh) {
       return {
         bundlerPct: stats.rugcheckBundlerPct,
         top10Pct: stats.rugcheckTop10Pct,
+        creator: knownCreator,
       };
     }
     if (this.rugcheck) {
@@ -820,6 +828,7 @@ export class Scanner {
           coin.pair.pairAddress,
         );
         this.rugcheckFetchedAt.set(stats.token, Date.now());
+        if (report.creator) this.rugcheckCreator.set(stats.token, report.creator);
         await this.db.updateTokenRugcheckData(
           stats.token,
           report.bundlerPct,
@@ -830,6 +839,7 @@ export class Scanner {
         return {
           bundlerPct: report.bundlerPct,
           top10Pct: report.top10HolderPct,
+          creator: report.creator ?? knownCreator,
         };
       } catch (err) {
         console.error(
@@ -844,9 +854,10 @@ export class Scanner {
       return {
         bundlerPct: stats.rugcheckBundlerPct,
         top10Pct: stats.rugcheckTop10Pct,
+        creator: knownCreator,
       };
     }
-    return { bundlerPct: null, top10Pct: null };
+    return { bundlerPct: null, top10Pct: null, creator: knownCreator };
   }
 
   /**
@@ -1011,37 +1022,36 @@ export class Scanner {
   }
 
   /**
-   * Holder count + creator wallet (Birdeye token overview) — the card's
-   * holders/creator lines. Best-effort with the same 5-min negative cache:
-   * a failure degrades to "—" on the card, never blocks or slows the push.
-   * Only fetched for qualifying candidates, so the 20 CU/request cost is
-   * negligible at the current push volume.
+   * Holder count (Birdeye token overview) — the card's holders line.
+   * Best-effort with the same 5-min negative cache: a failure degrades to
+   * "—" on the card, never blocks or slows the push. Only fetched for
+   * qualifying candidates, so the 20 CU/request cost is negligible at the
+   * current push volume.
    */
-  private async resolveHolderCreator(coin: QualifyingCoin): Promise<{
+  private async resolveHolderCount(coin: QualifyingCoin): Promise<{
     holderCount: number | null;
-    creator: string | null;
   }> {
     const mint = coin.pair.baseToken.address;
     if (!this.birdeye || this.dataNegativeCached(mint)) {
-      return { holderCount: null, creator: null };
+      return { holderCount: null };
     }
     try {
       const info = await this.birdeye.getTokenOverview(mint);
-      if (info.holderCount === null && info.creator === null) {
-        // No holder/creator data back — back off instead of re-querying
-        // the same coin on every scan.
+      if (info.holderCount === null) {
+        // No holder data back — back off instead of re-querying the same
+        // coin on every scan.
         this.dataFailedAt.set(mint, Date.now());
-        return info;
+      } else {
+        this.dataFailedAt.delete(mint);
       }
-      this.dataFailedAt.delete(mint);
-      return info;
+      return { holderCount: info.holderCount };
     } catch (err) {
       this.dataFailedAt.set(mint, Date.now());
       console.error(
         `[scanner] Birdeye overview lookup failed for ${mint}:`,
         err instanceof Error ? err.message : err,
       );
-      return { holderCount: null, creator: null };
+      return { holderCount: null };
     }
   }
 

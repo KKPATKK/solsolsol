@@ -25,6 +25,8 @@ export interface RugcheckReport {
    * pool (matched by the pair address) is excluded from the ranking.
    */
   top10HolderPct: number | null;
+  /** Deployer/creator wallet of the token (report root `creator`). */
+  creator: string | null;
 }
 
 interface InsiderNetwork {
@@ -128,6 +130,12 @@ export class RugcheckClient {
       top10HolderPct = Number.isFinite(total) && total > 0 ? total : null;
     }
 
-    return { bundlerPct, top10HolderPct };
+    const creatorRaw = (data as { creator?: unknown } | null)?.creator;
+    const creator =
+      typeof creatorRaw === "string" && creatorRaw.trim().length >= 32
+        ? creatorRaw.trim()
+        : null;
+
+    return { bundlerPct, top10HolderPct, creator };
   }
 }

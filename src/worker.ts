@@ -663,10 +663,11 @@ export default {
       }
     }
 
-    // Birdeye token-overview probe — verifies the real holders/creator
-    // response shape from the worker's own egress (the schema isn't
-    // published, so this lets a card-line "—" be diagnosed as missing data
-    // vs a parser mismatch).
+    // Birdeye token-overview probe — verifies the real holders response
+    // shape from the worker's own egress (the schema isn't published, so
+    // this lets a card-line "—" be diagnosed as missing data vs a parser
+    // mismatch). Creator is verified separately via /debug/flow or a
+    // RugCheck report (creator isn't in the Birdeye free-tier endpoints).
     if (url.pathname === "/debug/birdeye-overview") {
       const mint = (url.searchParams.get("address") ?? "").trim();
       if (!mint) {
@@ -682,9 +683,6 @@ export default {
           ok: true,
           ms: Date.now() - t0,
           holderCount: info.holderCount,
-          creator: info.creator
-            ? `${info.creator.slice(0, 6)}…${info.creator.slice(-4)}`
-            : null,
         });
       } catch (err) {
         return Response.json({
