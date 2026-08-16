@@ -1304,6 +1304,9 @@ export default {
         return Response.json({ ok: false, error: "TURSO not configured" });
       }
       const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
+      // Db.get() requires the client to be connected (init does this; the
+      // lazy connect() used by other probe methods doesn't set it).
+      await probe.init();
       const now = Date.now();
       const hist = await probe.getPoolHistogram(now);
       let poolQueryBuckets: Record<string, number> | null = null;
