@@ -614,6 +614,38 @@ export default {
       });
     }
 
+    // Push history — read-only distribution of seen_tokens for diagnosing
+    // "why is push volume low" (all pushes ever, grouped by day, oldest 20).
+    if (url.pathname === "/debug/pushes") {
+      const rows = (await db?.listSeenTokens()) ?? [];
+      const byDay = new Map<string, number>();
+      for (const r of rows) {
+        const day = new Date(r.firstSeenAt).toISOString().slice(0, 10);
+        byDay.set(day, (byDay.get(day) ?? 0) + 1);
+      }
+      const byChat = new Map<string, number>();
+      for (const r of rows) {
+        byChat.set(r.chatId, (byChat.get(r.chatId) ?? 0) + 1);
+      }
+      return Response.json({
+        ok: true,
+        total: rows.length,
+        byDay: [...byDay.entries()]
+          .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+          .map(([day, n]) => ({ day, n })),
+        byChat: [...byChat.entries()].map(([chatId, n]) => ({ chatId, n })),
+        firstAt: rows.length > 0 ? new Date(rows[0].firstSeenAt).toISOString() : null,
+        lastAt:
+          rows.length > 0
+            ? new Date(rows[rows.length - 1].firstSeenAt).toISOString()
+            : null,
+        recent: rows.slice(-20).reverse().map((r) => ({
+          at: new Date(r.firstSeenAt).toISOString(),
+          token: `${r.token.slice(0, 6)}…${r.token.slice(-4)}`,
+        })),
+      });
+    }
+
     // Manual scan trigger — runs the exact scheduled-path wrapper (runScan:
     // scan + heartbeat + scan_history), so it is both the diagnostic that
     // distinguishes "cron not firing" from "scan path broken" and the manual

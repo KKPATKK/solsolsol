@@ -461,6 +461,26 @@ export class Db {
     return v === null || v === undefined ? null : String(v);
   }
 
+  /** All pushed rows in seen_tokens, oldest first (telemetry for /debug/pushes). */
+  async listSeenTokens(): Promise<{ chatId: string; token: string; firstSeenAt: number }[]> {
+    try {
+      const res = await this.get().execute({
+        sql: "SELECT chat_id, token, first_seen_at FROM seen_tokens ORDER BY first_seen_at ASC",
+        args: [],
+      });
+      return res.rows.map((row) => {
+        const r = row as Record<string, unknown>;
+        return {
+          chatId: String(r.chat_id ?? ""),
+          token: String(r.token ?? ""),
+          firstSeenAt: Number(r.first_seen_at ?? 0),
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+
   /** Total pushed rows in seen_tokens (telemetry for /health). */
   async countSeenTokens(): Promise<number> {
     try {
