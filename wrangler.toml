@@ -37,6 +37,10 @@ PUMPFUN_REQUEST_INTERVAL_MS = "350"
 # min; deeper coverage is provided by the Birdeye periodic backfill below,
 # which is the safety net for any gap the shallow window leaves).
 GECKOTERMINAL_POOL_PAGES = "2"
+# GeckoTerminal trending-pools momentum feed (free, no key) — the
+# replacement for GMGN trending (GMGN's edge blocks Cloudflare Worker
+# egress). 0 = disabled; default 20 (max 20 per call).
+GECKOTERMINAL_TRENDING_LIMIT = "20"
 GECKOTERMINAL_REQUEST_INTERVAL_MS = "1000"
 DEX_REQUEST_INTERVAL_MS = "350"
 BIRDEYE_REQUEST_INTERVAL_MS = "1100"

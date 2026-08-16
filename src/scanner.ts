@@ -94,6 +94,8 @@ export interface ScanSummary {
   pump: number;
   /** GeckoTerminal new-pools feed size this scan (0 when blocked/unconfigured). */
   geo: number;
+  /** GeckoTerminal trending-pools feed size this scan (momentum, 0 when disabled). */
+  geoTrend: number;
   /** GMGN trending feed size this scan (0 when disabled/blocked). */
   gmgn: number;
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
@@ -213,6 +215,7 @@ export class Scanner {
       profiles: 0,
       pump: 0,
       geo: 0,
+      geoTrend: 0,
       gmgn: 0,
       backfill: 0,
       pool: 0,
@@ -307,6 +310,30 @@ export class Scanner {
         }
       }
       diag.geo = geckoProfiles.length;
+      // GeckoTerminal trending-pools — momentum feed (free, no key), the
+      // replacement for GMGN trending (GMGN's edge blocks Cloudflare Worker
+      // egress with 429). Sized by GECKOTERMINAL_TRENDING_LIMIT (0 =
+      // disabled); best-effort — failures return [] and the scan continues.
+      let geoTrendProfiles: TokenProfile[] = [];
+      if (this.gecko && this.config.geckoterminalTrendingLimit > 0) {
+        try {
+          const trending = await this.gecko.fetchTrendingPools(
+            this.config.geckoterminalTrendingLimit,
+          );
+          geoTrendProfiles = trending
+            .filter((p) => p.createdAtMs !== null)
+            .map((p) => ({
+              tokenAddress: p.tokenAddress,
+              openTimestamp: p.createdAtMs ?? undefined,
+            }));
+        } catch (err) {
+          console.error(
+            "[scanner] geckoterminal trending discovery failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      diag.geoTrend = geoTrendProfiles.length;
       // GMGN trending discovery — momentum-ranked candidates with GMGN's
       // smart-money/wash-trading-aware filters already applied server-side
       // (best-effort — failures return [] and the scan continues). Sized by
@@ -352,6 +379,7 @@ export class Scanner {
       const dexMints = new Set(profiles.map((p) => p.tokenAddress));
       const pumpMints = new Set(pumpProfiles.map((p) => p.tokenAddress));
       const geckoMints = new Set(geckoProfiles.map((p) => p.tokenAddress));
+      const geoTrendMints = new Set(geoTrendProfiles.map((p) => p.tokenAddress));
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
@@ -359,11 +387,18 @@ export class Scanner {
           (p) =>
             !dexMints.has(p.tokenAddress) && !pumpMints.has(p.tokenAddress),
         ),
-        ...gmgnProfiles.filter(
+        ...geoTrendProfiles.filter(
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress),
+        ),
+        ...gmgnProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) &&
+            !pumpMints.has(p.tokenAddress) &&
+            !geckoMints.has(p.tokenAddress) &&
+            !geoTrendMints.has(p.tokenAddress),
         ),
       ];
       const now = Date.now();

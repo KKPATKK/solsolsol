@@ -131,6 +131,13 @@ export interface AppConfig {
   geckoterminalPoolPages: number;
   /** Minimum spacing between GeckoTerminal HTTP requests (rate limiting). */
   geckoterminalRequestIntervalMs: number;
+  /**
+   * GeckoTerminal trending-pools feed size per scan (GECKOTERMINAL_TRENDING_LIMIT,
+   * default 20, 0 = disabled). Momentum-ranked pools — the free no-key
+   * replacement for GMGN's trending feed (which GMGN's edge blocks for
+   * Cloudflare Worker egress).
+   */
+  geckoterminalTrendingLimit: number;
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
@@ -227,6 +234,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     )
       ? Math.max(0, Number(env.GECKOTERMINAL_REQUEST_INTERVAL_MS ?? 1000))
       : 1000,
+    geckoterminalTrendingLimit: Number.isFinite(
+      Number(env.GECKOTERMINAL_TRENDING_LIMIT ?? 20),
+    )
+      ? Math.max(0, Math.min(Math.floor(Number(env.GECKOTERMINAL_TRENDING_LIMIT ?? 20)), 20))
+      : 20,
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))

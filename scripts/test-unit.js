@@ -388,6 +388,32 @@ async function main() {
     assert.deepEqual(parseNewPools(null), []);
   });
 
+  await test("parseNewPools handles the real GeckoTerminal trending_pools shape", () => {
+    const out = parseNewPools({
+      data: [
+        {
+          id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump",
+          type: "pool",
+          attributes: {
+            name: "TOADLAYER / SOL",
+            pool_created_at: "2026-08-15T16:21:21Z",
+            volume_usd: { h24: 2340789.63 },
+            reserve_in_usd: "4201.61",
+            fdv_usd: "5432.17",
+          },
+          relationships: {
+            base_token: { data: { id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump" } },
+            dex: { data: { id: "pumpswap" } },
+          },
+        },
+      ],
+    });
+    assert.equal(out.length, 1);
+    assert.equal(out[0].tokenAddress, "5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump");
+    assert.equal(out[0].createdAtMs, Date.parse("2026-08-15T16:21:21Z"));
+    assert.equal(out[0].dex, "pumpswap");
+  });
+
   await test("parseTrending maps the GMGN /v1/market/rank shape", () => {
     const out = parseTrending({
       rank: [

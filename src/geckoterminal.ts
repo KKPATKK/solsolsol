@@ -103,4 +103,32 @@ export class GeckoTerminalClient {
       return [];
     }
   }
+
+  /**
+   * Momentum feed — GeckoTerminal's trending pools (free, no key, verified
+   * reachable 2026-08-16). Same item shape as new_pools (base_token in
+   * relationships, pool_created_at ISO), so parseNewPools is reused. Sized by
+   * GECKOTERMINAL_TRENDING_LIMIT (0 = disabled); the endpoint returns up to
+   * 20 pools per call.
+   */
+  async fetchTrendingPools(limit: number): Promise<NewPool[]> {
+    try {
+      const res = await this.throttle.run(() =>
+        fetch(
+          `${BASE_URL}/networks/solana/trending_pools?include=base_token&limit=${Math.min(
+            Math.max(1, Math.floor(limit)),
+            20,
+          )}`,
+          {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(10_000),
+          },
+        ),
+      );
+      if (!res.ok) return [];
+      return parseNewPools(await res.json());
+    } catch {
+      return [];
+    }
+  }
 }
