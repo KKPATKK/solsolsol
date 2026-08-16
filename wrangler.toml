@@ -39,7 +39,13 @@ PUMPFUN_REQUEST_INTERVAL_MS = "350"
 GECKOTERMINAL_POOL_PAGES = "2"
 # GeckoTerminal trending-pools momentum feed (free, no key) — the
 # replacement for GMGN trending (GMGN's edge blocks Cloudflare Worker
-# egress). 0 = disabled; default 20 (max 20 per call).
+# egress). 0 = disabled; default 20 (max 20 per call). NOTE: measured
+# 2026-08-16 — GeckoTerminal rate-limits Cloudflare Worker egress (shared
+# IP pool) with sustained 429s on trending_pools, which also started
+# starving new_pools. The client now backs off ALL gecko calls for 5 min
+# after one 429 and self-recovers; a round with geo/geoTrend 0 while the
+# feed is in backoff is expected, not an outage (the re-eval pool + Birdeye
+# backfill cover the gap). /debug/gecko-trending probes the raw status.
 GECKOTERMINAL_TRENDING_LIMIT = "20"
 GECKOTERMINAL_REQUEST_INTERVAL_MS = "1000"
 DEX_REQUEST_INTERVAL_MS = "350"

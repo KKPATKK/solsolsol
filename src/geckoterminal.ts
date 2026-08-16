@@ -1,6 +1,15 @@
 import type { AppConfig } from "./config";
 
 const BASE_URL = "https://api.geckoterminal.com/api/v2";
+/**
+ * Back off ALL GeckoTerminal calls for this long after one 429. Measured
+ * 2026-08-16: the API rate-limits Cloudflare Worker egress (shared IP pool)
+ * with a sustained 429 on trending_pools, which also started starving
+ * new_pools. Without backoff the scanner would hit the 429 wall every
+ * round; with it, one 429 pauses the feed for 5 min and it self-recovers.
+ * Matches the discovery gap the re-eval pool + Birdeye backfill cover.
+ */
+const GECKO_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
 
 export interface NewPool {
   tokenAddress: string;
@@ -84,24 +93,44 @@ export function parseNewPools(json: unknown): NewPool[] {
  */
 export class GeckoTerminalClient {
   private readonly throttle: Throttle;
+  /** Timestamp until which all calls are skipped (after a 429). */
+  private rateLimitedUntil = 0;
 
   constructor(config: AppConfig) {
     this.throttle = new Throttle(config.geckoterminalRequestIntervalMs);
   }
 
-  async fetchNewPools(page = 1): Promise<NewPool[]> {
+  private rateLimited(): boolean {
+    return Date.now() < this.rateLimitedUntil;
+  }
+
+  /**
+   * Shared GET: throttle-spaced, 429-aware. Returns the parsed JSON on
+   * success, null on rate-limit (setting the backoff window) or any other
+   * failure — callers degrade to [] without throwing.
+   */
+  private async get(path: string): Promise<unknown> {
+    if (this.rateLimited()) return null;
     try {
       const res = await this.throttle.run(() =>
-        fetch(`${BASE_URL}/networks/solana/new_pools?page=${page}`, {
+        fetch(`${BASE_URL}${path}`, {
           headers: { Accept: "application/json" },
           signal: AbortSignal.timeout(10_000),
         }),
       );
-      if (!res.ok) return [];
-      return parseNewPools(await res.json());
+      if (res.status === 429) {
+        this.rateLimitedUntil = Date.now() + GECKO_RATE_LIMIT_BACKOFF_MS;
+        return null;
+      }
+      if (!res.ok) return null;
+      return res.json();
     } catch {
-      return [];
+      return null;
     }
+  }
+
+  async fetchNewPools(page = 1): Promise<NewPool[]> {
+    return parseNewPools(await this.get(`/networks/solana/new_pools?page=${page}`));
   }
 
   /**
@@ -112,23 +141,13 @@ export class GeckoTerminalClient {
    * 20 pools per call.
    */
   async fetchTrendingPools(limit: number): Promise<NewPool[]> {
-    try {
-      const res = await this.throttle.run(() =>
-        fetch(
-          `${BASE_URL}/networks/solana/trending_pools?include=base_token&limit=${Math.min(
-            Math.max(1, Math.floor(limit)),
-            20,
-          )}`,
-          {
-            headers: { Accept: "application/json" },
-            signal: AbortSignal.timeout(10_000),
-          },
-        ),
-      );
-      if (!res.ok) return [];
-      return parseNewPools(await res.json());
-    } catch {
-      return [];
-    }
+    return parseNewPools(
+      await this.get(
+        `/networks/solana/trending_pools?include=base_token&limit=${Math.min(
+          Math.max(1, Math.floor(limit)),
+          20,
+        )}`,
+      ),
+    );
   }
 }

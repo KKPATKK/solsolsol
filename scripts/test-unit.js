@@ -15,7 +15,7 @@ const { parseAdminIds, isAdmin } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
-const { parseNewPools } = require("../dist/geckoterminal.js");
+const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -414,6 +414,42 @@ async function main() {
     assert.equal(out[0].tokenAddress, "5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump");
     assert.equal(out[0].createdAtMs, Date.parse("2026-08-15T16:21:21Z"));
     assert.equal(out[0].dex, "pumpswap");
+  });
+
+  await test("GeckoTerminalClient backs off all calls for 5 min after a 429", async () => {
+    const calls = [];
+    const origFetch = global.fetch;
+    const okBody = JSON.stringify({ data: [{ id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump", type: "pool", attributes: { pool_created_at: "2026-08-15T16:21:21Z" }, relationships: { base_token: { data: { id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump" } } } }] });
+    global.fetch = async (url) => {
+      calls.push(String(url));
+      return new Response(okBody, { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    try {
+      const client = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+      // First call 200 → parses fine.
+      assert.equal((await client.fetchNewPools(1)).length, 1);
+      // Now the API starts rate-limiting (429) → returns [] and sets backoff.
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return new Response(JSON.stringify({ status: { error_code: 429 } }), { status: 429 });
+      };
+      assert.equal((await client.fetchTrendingPools(20)).length, 0);
+      const callsAfter429 = calls.length;
+      // During backoff: no fetch should happen for either endpoint.
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal((await client.fetchTrendingPools(20)).length, 0);
+      assert.equal(calls.length, callsAfter429, "backoff must not hit the API");
+      // Expire the backoff window → next call fetches again.
+      client.rateLimitedUntil = Date.now() - 1;
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return new Response(okBody, { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      assert.equal((await client.fetchNewPools(1)).length, 1);
+      assert.equal(calls.length, callsAfter429 + 1, "expired backoff must fetch again");
+    } finally {
+      global.fetch = origFetch;
+    }
   });
 
   await test("parseTrending maps the GMGN /v1/market/rank shape", () => {
