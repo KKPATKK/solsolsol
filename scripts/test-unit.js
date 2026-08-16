@@ -288,6 +288,83 @@ async function main() {
     }
   });
 
+  await test("getReevalPool: rotationSlots sweeps the whole window within the configured period", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const H = 3600e3;
+      const M = 60e3;
+      const seed = async (token, firstSeenAt, ageMin) => {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)",
+          args: [token, firstSeenAt, ageMin, firstSeenAt - ageMin * 60e3],
+        });
+      };
+      // Pin `now` so floor(now/300e3) % 6 = 2 — the 6-slot rotation the
+      // scanner derives from REEVAL_ROTATION_MINUTES=30 (6 slots × 5-min
+      // pool cache = 30-min full sweep). Seed one coin per rotation slot
+      // (ages 10/15/21/28/34/40h → slots 0..5), one hot-zone coin (6h) and
+      // one too-young coin (2.5h) that must stay out.
+      const now = 50 * 300e3;
+      const coins = ["R10", "R15", "R21", "R28", "R34", "R40"];
+      const ages = [10, 15, 21, 28, 34, 40];
+      // ageMin = 0 → launch_ms = firstSeenAt, so each coin's age is exactly
+      // its firstSeenAt offset (the seed helper derives launch from
+      // firstSeenAt − ageMin × 60s, same as the production migration).
+      await seed("HOT", now - 6 * H, 0);
+      for (let i = 0; i < coins.length; i++) {
+        await seed(coins[i], now - ages[i] * H, 0);
+      }
+      await seed("YOUNG", now - 150 * M, 0);
+
+      // Six consecutive scans, 5 min apart (one rotation slot each): with 6
+      // slots the whole window is swept in 30 min — the push-latency
+      // property REEVAL_ROTATION_MINUTES=30 is meant to provide.
+      const seenScans = new Map();
+      let hotSeen = 0;
+      for (let s = 0; s < 6; s++) {
+        const pool = await db.getReevalPool({
+          sinceMs: now - 42 * H,
+          minLaunchMs: now - (2400 + 180) * M,
+          maxLaunchMs: now - (360 - 180) * M,
+          windowEntryLaunchMs: now - 360 * M,
+          limit: 1000,
+          rotationSlots: 6,
+          now: now + s * 300e3,
+        });
+        const tokens = pool.map((x) => x.token);
+        if (tokens.includes("HOT")) hotSeen++;
+        assert.ok(!tokens.includes("YOUNG"), "too-young coin must not be evaluated");
+        const rot = tokens.filter((x) => x.startsWith("R"));
+        assert.ok(
+          rot.length <= 1,
+          `one rotation slot per scan, got ${rot.join(",")}`,
+        );
+        for (const c of rot) {
+          seenScans.set(c, [...(seenScans.get(c) ?? []), s]);
+        }
+        // Hot zone is pushed before the rotation slot (band order).
+        if (tokens.length > 0) assert.equal(tokens[0], "HOT");
+      }
+      assert.equal(hotSeen, 6, "hot zone must be evaluated every scan");
+      for (const c of coins) {
+        assert.equal(
+          seenScans.get(c)?.length,
+          1,
+          `${c} reached exactly once in the 30-min sweep`,
+        );
+      }
+      assert.deepEqual(
+        [...seenScans.keys()].sort(),
+        [...coins].sort(),
+        "whole window swept within 30 min (6 slots × 5 min)",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("getTokenStatsMany / recordTokenStatsMany batch and dedupe", async () => {
     const t = tmpDb();
     try {
