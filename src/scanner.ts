@@ -505,16 +505,21 @@ export class Scanner {
       // do.
       const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
       const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
+      const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
       const recentStats = await this.getReevalPoolCached(now, {
         sinceMs: now - RE_EVAL_WINDOW_MS,
         minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
         limit: this.config.reevalPoolSize,
-        // Sweep the whole rotation zone every ~REEVAL_ROTATION_MINUTES
-        // (default 60) instead of the 3h default — the push-latency knob
-        // for coins that qualify after entering the age window.
-        rotationSlots: this.config.reevalRotationSlots,
+        // Graduated rotation (see Db.getReevalPool): near slots swept every
+        // ~REEVAL_NEAR_SWEEP_MIN, far slots every ~REEVAL_FAR_SWEEP_MIN, hot
+        // zone every scan. Bands order by qualification signal and coins
+        // repeatedly seen below half the market-cap gate are dropped, so
+        // the sweep budget concentrates on coins that can actually qualify.
+        nearSlots: this.config.reevalNearSlots,
+        farSlots: this.config.reevalFarSlots,
+        minQualifyMcap: poolMinMcapUsd / 2,
       });
       // token_stats grows with pump.fun discovery (100+ new coins per scan):
       // prune rows older than the re-eval window that were never pushed —
@@ -600,6 +605,43 @@ export class Scanner {
       // Pool-only tokens (not in the current feed) reuse their cached stats.
       for (const stats of recentStats) {
         if (!statsByToken.has(stats.token)) statsByToken.set(stats.token, stats);
+      }
+
+      // ③ Track the highest market cap ever observed for pool candidates.
+      // The re-eval pool query pre-filters on it (coins repeatedly seen far
+      // below the gate stop consuming sweep budget) and orders rotation
+      // bands by it. One batched raise-only UPDATE; the raise list is empty
+      // in steady state (only genuine new highs trigger a write).
+      const raises: Array<{ token: string; mcapUsd: number }> = [];
+      for (const [token, pair] of pairsByToken) {
+        const stats = statsByToken.get(token);
+        if (
+          !stats ||
+          !Number.isFinite(pair.marketCap) ||
+          pair.marketCap <= 0
+        )
+          continue;
+        if (
+          stats.maxMcapObserved === null ||
+          stats.maxMcapObserved === undefined ||
+          pair.marketCap > stats.maxMcapObserved
+        ) {
+          raises.push({ token, mcapUsd: pair.marketCap });
+        }
+      }
+      if (raises.length > 0) {
+        try {
+          await this.db.updateTokenMaxMcaps(raises);
+          for (const r of raises) {
+            const s = statsByToken.get(r.token);
+            if (s) s.maxMcapObserved = r.mcapUsd;
+          }
+        } catch (err) {
+          console.error(
+            "[scanner] max mcap tracking update failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
 
       const agedEval = { count: 0 };
@@ -1166,7 +1208,9 @@ export class Scanner {
       maxLaunchMs: number;
       windowEntryLaunchMs: number;
       limit: number;
-      rotationSlots?: number;
+      nearSlots?: number;
+      farSlots?: number;
+      minQualifyMcap?: number;
     },
   ): Promise<TokenStats[]> {
     if (this.reevalPoolCache && now - this.reevalPoolCache.at < REEVAL_POOL_CACHE_MS) {

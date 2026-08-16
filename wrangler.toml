@@ -35,15 +35,19 @@ SCAN_PROFILE_LIMIT = "100"
 # max 1000). Ordered by relevance, so the closest-to-qualifying coins are
 # always checked first; leftovers simply defer to the next tick.
 RE_EVAL_POOL_SIZE = "1000"
-# How often (minutes) the re-eval pool's ROTATION zone is fully swept.
-# The hot zone around the age-window entry is checked every 5 min, but coins
-# that qualify LATER (cross the mcap/volume gates hours after entering the
-# window) are only re-checked when their rotation slot comes up — 180 (old
-# hardcoded default) meant up to a 3h push delay. 60 = whole window swept
-# every hour (worst-case re-check gap ~1h); lower = more real-time but more
-# Turso rows-read (the hot band was trimmed to keep the total budget roughly
-# flat at 60). 30 = half-hour sweep, ~2x the pool rows-read of 60.
-REEVAL_ROTATION_MINUTES = "30"
+# Graduated re-eval pool rotation (see src/db.ts): everything older than the
+# hot zone (window entry ± margin, evaluated EVERY scan) is swept in two
+# tiers. NEAR tier = the first 6h inside the age window — the coins most
+# likely to cross the gates after entering — swept every REEVAL_NEAR_SWEEP_MIN
+# (default 10). FAR tier = the older tail, swept every REEVAL_FAR_SWEEP_MIN
+# (default 90) — every coin is still re-checked at least once per sweep, but
+# the old tail stops consuming most of the budget. Rotation bands order by
+# the highest mcap ever observed, and coins repeatedly seen below half the
+# market-cap gate are dropped from the pool (pre-qualification filter), so
+# the sweep budget concentrates on realistic candidates. Slots = sweep ÷ the
+# 5-min pool cache (2 near + 18 far at the defaults).
+REEVAL_NEAR_SWEEP_MIN = "10"
+REEVAL_FAR_SWEEP_MIN = "90"
 # pump.fun discovery: DexScreener's profiles feed only returns ~24 Solana
 # coins per scan, so also register the newest pump.fun coins (code default
 # 100, max 300) into the re-eval pool every scan. Best-effort — if pump.fun

@@ -1315,15 +1315,20 @@ export default {
         const chats = await probe.listEnabledChats();
         const minAge = Math.min(...chats.map((c) => c.minAgeMinutes));
         const maxAge = Math.max(...chats.map((c) => c.maxAgeMinutes));
+        const minMcap = Math.min(...chats.map((c) => c.minMarketCapUsd));
         const pool = await probe.getReevalPool({
           sinceMs: now - 42 * 3600_000,
           minLaunchMs: now - (maxAge + 180) * 60_000,
           maxLaunchMs: now - (minAge - 180) * 60_000,
           windowEntryLaunchMs: now - minAge * 60_000,
           limit: 1000,
-          // Mirror the scanner's configured rotation cadence so the probe's
-          // age histogram matches what production actually evaluates.
-          rotationSlots: cfg?.reevalRotationSlots ?? 12,
+          // Mirror the scanner's configured tiered rotation (near slots
+          // swept every ~10 min, far slots every ~90 min, plus the
+          // pre-qualification filter) so the probe's age histogram matches
+          // what production actually evaluates.
+          nearSlots: cfg?.reevalNearSlots ?? 2,
+          farSlots: cfg?.reevalFarSlots ?? 18,
+          minQualifyMcap: minMcap / 2,
         });
         poolQueryCount = pool.length;
         poolQueryBuckets = {

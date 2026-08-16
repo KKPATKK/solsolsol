@@ -77,18 +77,37 @@ const POOL_HOT_ABOVE_MS = 1 * 3600_000;
 /** Max hot-zone coins per scan; the rest of the pool limit goes to rotation. */
 const POOL_HOT_MAX = 300;
 /**
- * The remainder of the re-eval window is split into this many time slots;
- * one slot is evaluated per scan (rotating with the clock), so every coin
- * in the window is re-evaluated at least once per rotation period. This is
- * the DEFAULT when no override is passed (the scanner passes its configured
- * REEVAL_ROTATION_MINUTES-derived slot count, default 12 → 1h sweep); the
- * old hardcoded 36 slots (~3h sweep) was the push-latency bottleneck
- * reported 2026-08-16 — a coin crossing the gates in the rotation zone
- * could wait up to 3h to be re-checked. Without rotation the pool LIMIT
- * fills with coins nearest the entry and older in-window coins are never
- * seen again (zero-push bug, 2026-08-16).
+ * Graduated rotation (2026-08-16 redesign, replaces the uniform-slot sweep):
+ * the rotation zone — everything older than the hot zone — is split into TWO
+ * tiers with different sweep cadences, because qualification probability
+ * decays steeply with age:
+ *
+ *   NEAR zone: [window entry, entry + POOL_NEAR_WINDOW_MS] of age. Coins that
+ *     just entered the window are the most likely to cross the mcap/volume
+ *     gates, so their slots are swept frequently (POOL_NEAR_SLOTS × the 5-min
+ *     pool cache = 10-min full sweep by default).
+ *   FAR zone: the rest of the window (entry+6h → maxAge). Qualification is
+ *     rare this deep in, so it is swept slowly (POOL_FAR_SLOTS × 5 min =
+ *     90-min full sweep by default) — every coin is still re-checked at
+ *     least once per sweep, but the old tail stops consuming most of the
+ *     budget.
+ *
+ * The old uniform rotation (REEVAL_ROTATION_MINUTES → N equal slots over the
+ * whole zone) gave every coin the same 30-min re-check cadence regardless of
+ * how likely it was to qualify, and in dense bands the per-slot LIMIT
+ * (ordered by distance to the slot center) systematically dropped edge coins
+ * — starvation was reduced but not eliminated. The tiered version
+ * concentrates the budget where qualification actually happens, and the
+ * rotation bands order by qualification signal (max_mcap_observed) so the
+ * LIMIT always picks the most promising coins.
  */
-const POOL_ROTATION_SLOTS = 36;
+const POOL_NEAR_WINDOW_MS = 6 * 3600_000;
+/** Near-zone slot count (10-min full sweep at the 5-min pool cache). */
+const POOL_NEAR_SLOTS = 2;
+/** Far-zone slot count (90-min full sweep at the 5-min pool cache). */
+const POOL_FAR_SLOTS = 18;
+/** Share of the rotation budget given to the near zone (rest → far zone). */
+const POOL_NEAR_LIMIT_SHARE = 0.7;
 /**
  * Rotation cadence — must match the scanner's pool cache TTL
  * (REEVAL_POOL_CACHE_MS = 300s) so every cache expiry moves to the next
@@ -126,6 +145,12 @@ export interface TokenStats {
   birdeyeSniperPct: number | null;
   /** Lowest market cap since listing (USD), null = unknown. */
   minMcapObserved: number | null;
+  /**
+   * Highest market cap ever observed by the scanner (pool pre-filter and
+   * rotation-band ordering signal — see Db.getReevalPool). Null for rows
+   * written before the v3 migration or never seen with pair data.
+   */
+  maxMcapObserved?: number | null;
   /** Cached supply-flow detector result (JSON of SupplyFlowResult), null = not analyzed. */
   supplyFlowJson: string | null;
   /** When the cached supply-flow result was produced (epoch ms). */
@@ -219,6 +244,7 @@ export class Db {
           birdeye_pro_traders INTEGER,
           birdeye_sniper_pct REAL,
           min_mcap_observed REAL,
+          max_mcap_observed REAL,
           supply_flow TEXT,
           supply_flow_at INTEGER
         );`,
@@ -384,6 +410,13 @@ export class Db {
         console.log("[db] launch_ms backfill started — resuming on later ticks");
       }
     }
+    // v3: max_mcap_observed — highest market cap the scanner has ever seen
+    // for each coin. The re-eval pool pre-filters on it (coins repeatedly
+    // observed far below the qualifying gate stop consuming sweep budget)
+    // and orders rotation bands by it, so the LIMIT picks the most promising
+    // coins. Unconditional because addColumnIfMissing is idempotent (fresh
+    // databases already carry the column from CREATE TABLE).
+    await this.addColumnIfMissing("token_stats", "max_mcap_observed", "REAL");
     // Telemetry counters: /health used to run COUNT(*) over token_stats
     // (~400K rows) and seen_tokens (~50K rows) on every ping — at the 1-min
     // uptime-monitor cadence that alone is ~600M rows/day (alerted
@@ -959,6 +992,10 @@ export class Db {
         sniperPct === null || sniperPct === undefined ? null : Number(sniperPct),
       minMcapObserved:
         minMcap === null || minMcap === undefined ? null : Number(minMcap),
+      maxMcapObserved:
+        row.max_mcap_observed === null || row.max_mcap_observed === undefined
+          ? null
+          : Number(row.max_mcap_observed),
       supplyFlowJson:
         flowJson === null || flowJson === undefined ? null : String(flowJson),
       supplyFlowAt:
@@ -1029,16 +1066,28 @@ export class Db {
    * already aged past the gate were NEVER re-evaluated (measured: 26.8K
    * eligible never-pushed coins in the window, pool returned 1000 coins ALL
    * aged 3-6h, zero aged 6h+). Older coins only drift farther from the
-   * entry over time, so they never came back. Now the pool splits into a
-   * HOT zone (coins around the entry, evaluated every scan — the
-   * push-latency-critical cohort) plus a ROTATION slot: the rest of the
-   * window is divided into time slots and one slot is evaluated per scan,
-   * so every coin in the window is re-evaluated at least once per rotation
-   * period (slots × the scanner's 5-min pool cache; the scanner passes its
-   * configured REEVAL_ROTATION_MINUTES-derived slot count — 12 slots ≈ 1h
-   * sweep by default, 36 ≈ 3h when unset). Rows-read stays bounded: each
-   * scan reads only the hot band (~1.5h of launches) plus one rotation
-   * slot, not the whole window.
+   * entry over time, so they never came back.
+   *
+   * Structure now (2026-08-16): the pool splits into a HOT zone (coins
+   * around the entry, evaluated every scan, ordered by distance to the
+   * entry — the push-latency-critical cohort) plus a GRADUATED rotation:
+   *
+   *   NEAR zone (entry → entry+6h of age): the coins most likely to cross
+   *     the gates after entering — POOL_NEAR_SLOTS slots swept every ~10 min.
+   *   FAR zone (older tail): POOL_FAR_SLOTS slots swept every ~90 min —
+   *     every coin is still re-checked at least once per far sweep, but the
+   *     old tail stops consuming most of the budget.
+   *
+   * Rotation bands are ordered by qualification signal (max_mcap_observed
+   * DESC, then first_m5_vol DESC), NOT distance to the slot center — the
+   * per-slot LIMIT then always picks the most promising coins instead of
+   * arbitrarily dropping band-edge coins in dense markets (the residual
+   * starvation of the earlier uniform-slot design). When minQualifyMcap is
+   * set, coins whose known max mcap is below it are dropped from every band
+   * (NULL = never seen with pair data → kept): the sweep budget
+   * concentrates on coins that can actually qualify. Rows-read stays
+   * bounded: each scan reads the hot band (~1.5h of launches) plus one near
+   * slot plus one far slot, never the whole window.
    */
   async getReevalPool(opts: {
     /** first_seen_at >= this (drops tokens whose launch is too far in the past). */
@@ -1051,13 +1100,22 @@ export class Db {
     windowEntryLaunchMs: number;
     limit: number;
     /**
-     * How many rotation slots the window is divided into (one per scan;
-     * defaults to POOL_ROTATION_SLOTS). The scanner derives this from
-     * REEVAL_ROTATION_MINUTES so the full window is swept every ~1h instead
-     * of the ~3h default — the push-latency knob for coins that qualify
-     * after entering the age window.
+     * Near-zone slot count (see POOL_NEAR_SLOTS). Default 2 → a full
+     * near-zone sweep every ~10 min at the 5-min pool cache.
      */
-    rotationSlots?: number;
+    nearSlots?: number;
+    /**
+     * Far-zone slot count (see POOL_FAR_SLOTS). Default 18 → a full
+     * far-zone sweep every ~90 min at the 5-min pool cache.
+     */
+    farSlots?: number;
+    /**
+     * Pre-qualification floor: when set, coins whose max_mcap_observed is
+     * known and below this value are dropped from every band (NULL = never
+     * seen with pair data → kept). The scanner passes the widest chat's
+     * minMarketCapUsd / 2.
+     */
+    minQualifyMcap?: number;
     /** Override for deterministic tests; defaults to Date.now(). */
     now?: number;
   }): Promise<TokenStats[]> {
@@ -1070,35 +1128,72 @@ export class Db {
     const hotLimit = Math.min(opts.limit, POOL_HOT_MAX);
     const out: TokenStats[] = [];
     if (hotHi > hotLo) {
+      // Hot zone: every scan, nearest to the entry first (latency-critical).
       out.push(
         ...(await this.queryReevalBand(hotLo, hotHi, center, {
           sinceMs: opts.sinceMs,
           limit: hotLimit,
+          minQualifyMcap: opts.minQualifyMcap,
+          orderBy: "entry",
         })),
       );
     }
     const rotLimit = Math.max(0, opts.limit - hotLimit);
-    if (rotLimit > 0) {
-      const rotSlots = Math.max(1, Math.floor(opts.rotationSlots ?? POOL_ROTATION_SLOTS));
-      const rotHi = hotLo; // everything older than the hot zone
-      const rotLo = spanLo;
-      if (rotHi > rotLo) {
-        const slotW = (rotHi - rotLo) / rotSlots;
-        const slot = Math.floor(now / POOL_ROTATION_PERIOD_MS) % rotSlots;
-        const lo = rotHi - (slot + 1) * slotW;
-        const hi = rotHi - slot * slotW;
-        out.push(
-          ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
-            sinceMs: opts.sinceMs,
-            limit: rotLimit,
-          })),
-        );
-      }
+    if (rotLimit <= 0) return out;
+    const rotLo = spanLo; // oldest launch in the window
+    const rotHi = hotLo; // everything older than the hot zone
+    if (rotHi <= rotLo) return out;
+    const nearLo = Math.max(rotLo, center - POOL_NEAR_WINDOW_MS);
+    const nearSlots = Math.max(1, Math.floor(opts.nearSlots ?? POOL_NEAR_SLOTS));
+    const farSlots = Math.max(1, Math.floor(opts.farSlots ?? POOL_FAR_SLOTS));
+    const nearLimit = Math.max(
+      0,
+      Math.min(rotLimit, Math.round(rotLimit * POOL_NEAR_LIMIT_SHARE)),
+    );
+    const farLimit = Math.max(0, rotLimit - nearLimit);
+    const slot = Math.floor(now / POOL_ROTATION_PERIOD_MS);
+    // Near zone: entry → entry + POOL_NEAR_WINDOW_MS of age — fresh
+    // in-window coins, most likely to cross the gates → frequent sweep.
+    if (rotHi > nearLo && nearLimit > 0) {
+      const slotW = (rotHi - nearLo) / nearSlots;
+      const s = slot % nearSlots;
+      const lo = rotHi - (s + 1) * slotW;
+      const hi = rotHi - s * slotW;
+      out.push(
+        ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
+          sinceMs: opts.sinceMs,
+          limit: nearLimit,
+          minQualifyMcap: opts.minQualifyMcap,
+          orderBy: "signal",
+        })),
+      );
+    }
+    // Far zone: the older tail — qualification is rare this deep, so sweep
+    // it slowly; every coin is still re-checked at least once per sweep.
+    if (nearLo > rotLo && farLimit > 0) {
+      const slotW = (nearLo - rotLo) / farSlots;
+      const s = slot % farSlots;
+      const lo = nearLo - (s + 1) * slotW;
+      const hi = nearLo - s * slotW;
+      out.push(
+        ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
+          sinceMs: opts.sinceMs,
+          limit: farLimit,
+          minQualifyMcap: opts.minQualifyMcap,
+          orderBy: "signal",
+        })),
+      );
     }
     return out;
   }
 
-  /** One banded re-eval pool query (see getReevalPool). */
+  /**
+   * One banded re-eval pool query (see getReevalPool). `orderBy` "entry"
+   * ranks by distance to the band center (hot zone — nearest to the window
+   * entry first); "signal" ranks by qualification signal
+   * (max_mcap_observed, then first_m5_vol) so the per-band LIMIT picks the
+   * most promising coins instead of arbitrary band-edge ones.
+   */
   private async queryReevalBand(
     lo: number,
     hi: number,
@@ -1106,18 +1201,64 @@ export class Db {
     opts: {
       sinceMs: number;
       limit: number;
+      minQualifyMcap?: number;
+      orderBy: "entry" | "signal";
     },
   ): Promise<TokenStats[]> {
+    const qualifyClause =
+      opts.minQualifyMcap !== undefined
+        ? ` AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)`
+        : "";
+    const args: Array<string | number> = [lo, hi, opts.sinceMs];
+    if (opts.minQualifyMcap !== undefined) args.push(opts.minQualifyMcap);
+    const order =
+      opts.orderBy === "signal"
+        ? "ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC"
+        : "ORDER BY ABS(launch_ms - ?)";
+    if (opts.orderBy === "entry") args.push(center);
+    args.push(opts.limit);
     const res = await this.get().execute({
       sql: `SELECT * FROM token_stats
             WHERE launch_ms BETWEEN ? AND ?
               AND first_seen_at > ?
               AND NOT EXISTS (SELECT 1 FROM seen_tokens s WHERE s.token = token_stats.token)
-            ORDER BY ABS(launch_ms - ?)
+              ${qualifyClause}
+            ${order}
             LIMIT ?`,
-      args: [lo, hi, opts.sinceMs, center, opts.limit],
+      args,
     });
     return res.rows.map((row) => this.statsFromRow(row));
+  }
+
+  /**
+   * Raise max_mcap_observed to the given CURRENT market cap for tokens whose
+   * stored value is lower (one batched statement; entries with no raise are
+   * no-ops). The re-eval pool uses this as its qualification pre-signal: a
+   * coin repeatedly observed far below minQualifyMcap stops consuming sweep
+   * budget, and rotation bands order by it so the LIMIT picks the most
+   * promising coins.
+   */
+  async updateTokenMaxMcaps(
+    entries: Array<{ token: string; mcapUsd: number }>,
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    const cases = entries
+      .map(
+        () =>
+          `WHEN token = ? AND (max_mcap_observed IS NULL OR max_mcap_observed < ?) THEN ?`,
+      )
+      .join(" ");
+    const args: Array<string | number> = [];
+    const tokens: string[] = [];
+    for (const e of entries) {
+      args.push(e.token, e.mcapUsd, e.mcapUsd);
+      tokens.push(e.token);
+    }
+    await this.get().execute({
+      sql: `UPDATE token_stats SET max_mcap_observed = CASE ${cases} ELSE max_mcap_observed END
+            WHERE token IN (${tokens.map(() => "?").join(",")})`,
+      args: [...args, ...tokens],
+    });
   }
 
   /**
@@ -1184,7 +1325,7 @@ export class Db {
 
   async recordTokenStats(stats: TokenStats): Promise<void> {
     const res = await this.get().execute({
-      sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, supply_flow, supply_flow_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+      sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
       args: [stats.token, stats.firstSeenAt, stats.firstM5Vol, stats.firstSeenAgeMin, stats.launchMs, stats.birdeye1mVol, stats.rugcheckBundlerPct, stats.rugcheckTop10Pct, stats.birdeyeProTraders, stats.birdeyeSniperPct, stats.minMcapObserved],
     });
     await this.bumpTelemetryCounter(
@@ -1201,7 +1342,7 @@ export class Db {
   async recordTokenStatsMany(statsList: TokenStats[]): Promise<void> {
     if (statsList.length === 0) return;
     const placeholders = statsList
-      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)")
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)")
       .join(",");
     const args: Array<string | number | null> = [];
     for (const s of statsList) {
@@ -1220,7 +1361,7 @@ export class Db {
       );
     }
     const res = await this.get().execute({
-      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, supply_flow, supply_flow_at) VALUES ${placeholders}`,
+      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at) VALUES ${placeholders}`,
       args,
     });
     await this.bumpTelemetryCounter(

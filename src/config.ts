@@ -165,19 +165,20 @@ export interface AppConfig {
    */
   reevalPoolSize: number;
   /**
-   * How often (minutes) the re-eval pool's ROTATION zone is fully swept
-   * (REEVAL_ROTATION_MINUTES, default 60). The hot zone around the age
-   * window entry is evaluated every scan (every 5 min), but coins that
-   * qualify LATER — e.g. a coin that crosses the market-cap/volume gates
-   * hours after entering the window — are only re-checked when their
-   * rotation slot comes up. The rotation period is slots × the 5-min pool
-   * cache, so this is the direct push-latency knob: 180 = one sweep per 3h
-   * (the old hardcoded behavior), 60 = one sweep per hour, 30 = per half
-   * hour. Lower = faster pushes but more Turso rows-read (each sweep
-   * re-reads the window; the hot band was trimmed to keep the total budget
-   * roughly flat at the 60-min default).
+   * Re-evaluation pool rotation tiers (see Db.getReevalPool): everything
+   * older than the hot zone (evaluated every scan) is swept in TWO tiers.
+   * NEAR (first 6h inside the age window — the coins most likely to cross
+   * the gates after entering) every REEVAL_NEAR_SWEEP_MIN (default 10 min);
+   * FAR (the older tail) every REEVAL_FAR_SWEEP_MIN (default 90 min — every
+   * coin is still re-checked at least once per sweep, but the old tail
+   * stops consuming most of the budget). Slots = sweep minutes ÷ the 5-min
+   * pool cache TTL (2 near + 18 far at the defaults). Rotation bands order
+   * by the highest mcap ever observed, and coins repeatedly seen below half
+   * the market-cap gate are dropped from the pool (pre-qualification
+   * filter), so the sweep budget concentrates on realistic candidates.
    */
-  reevalRotationSlots: number;
+  reevalNearSlots: number;
+  reevalFarSlots: number;
   /**
    * How many newest pump.fun coins to register per scan (PUMPFUN_PROFILE_LIMIT).
    * DexScreener's token-profiles feed only returns ~24 Solana profiles per
@@ -265,7 +266,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawPort = Number(env.PORT ?? 3000);
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawReevalPool = Number(env.RE_EVAL_POOL_SIZE ?? 40);
-  const rawRotationMin = Number(env.REEVAL_ROTATION_MINUTES ?? 60);
+  const rawNearSweepMin = Number(env.REEVAL_NEAR_SWEEP_MIN ?? 10);
+  const rawFarSweepMin = Number(env.REEVAL_FAR_SWEEP_MIN ?? 90);
   const rawPumpfunLimit = Number(env.PUMPFUN_PROFILE_LIMIT ?? 100);
   const rawGeoPages = Number(env.GECKOTERMINAL_POOL_PAGES ?? 1);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
@@ -298,13 +300,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       Number.isFinite(rawReevalPool) && rawReevalPool > 0
         ? Math.min(Math.floor(rawReevalPool), 1000)
         : 40,
-    // Slots = rotation period ÷ the 5-min pool cache TTL (they must stay
-    // aligned so every cache expiry advances to the next slot). 60 min → 12
-    // slots (1h sweep); clamped to 3–48 slots (15min–4h sweep).
-    reevalRotationSlots:
-      Number.isFinite(rawRotationMin) && rawRotationMin > 0
-        ? Math.min(48, Math.max(3, Math.round(rawRotationMin / 5)))
-        : 12,
+    // Slots = sweep minutes ÷ the 5-min pool cache TTL (they must stay
+    // aligned so every cache expiry advances to the next slot). Near: 10 min
+    // → 2 slots; far: 90 min → 18 slots.
+    reevalNearSlots:
+      Number.isFinite(rawNearSweepMin) && rawNearSweepMin > 0
+        ? Math.min(12, Math.max(1, Math.round(rawNearSweepMin / 5)))
+        : 2,
+    reevalFarSlots:
+      Number.isFinite(rawFarSweepMin) && rawFarSweepMin > 0
+        ? Math.min(48, Math.max(2, Math.round(rawFarSweepMin / 5)))
+        : 18,
     pumpfunProfileLimit:
       Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
         ? Math.min(Math.floor(rawPumpfunLimit), 300)
