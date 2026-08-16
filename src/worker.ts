@@ -817,6 +817,43 @@ export default {
       return Response.json(res);
     }
 
+    // Axiom refresh probe — exercises refreshAccessToken from the worker's
+    // own egress with the stored refresh token (diagnoses whether the
+    // refresh endpoint is reachable: 200 + new token = healthy; 418 = the
+    // endpoint's bot-protection blocks worker fetch, like GMGN's edge did).
+    if (url.pathname === "/debug/axiom-refresh") {
+      const client = axiom;
+      if (!client) {
+        return Response.json({
+          ok: false,
+          error: "Axiom feed disabled (AXIOM_TRENDING_LIMIT=0)",
+        });
+      }
+      const refreshToken = await db?.getWorkerState("axiom_refresh_token");
+      if (!refreshToken) {
+        return Response.json({ ok: false, error: "no refresh token stored" });
+      }
+      try {
+        const out = await client.refreshAccessToken(refreshToken);
+        if (out.accessToken) {
+          await db?.setWorkerState("axiom_access_token", out.accessToken);
+          if (out.refreshToken) {
+            await db?.setWorkerState("axiom_refresh_token", out.refreshToken);
+          }
+        }
+        return Response.json({
+          ok: Boolean(out.accessToken),
+          accessToken: out.accessToken ? "refreshed-and-stored" : null,
+          refreshRotated: Boolean(out.refreshToken),
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // Axiom trending probe — verifies the feed works end-to-end from the
     // worker's own egress with the stored token (diagnoses auth-expiry vs
     // blocked-egress vs parser mismatch).
