@@ -11,6 +11,7 @@ import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
 import { GmgnClient } from "./gmgn";
+import { AxiomClient } from "./axiom";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -58,6 +59,9 @@ let dex: DexScreenerClient | null = null;
 let helius: HeliusClient | null = null;
 let birdeye: BirdeyeClient | null = null;
 let gmgn: GmgnClient | null = null;
+let axiom: AxiomClient | null = null;
+/** OTP JWT from the pending Axiom login step 1 (module-local, short-lived). */
+let pendingAxiomOtpJwt: string | null = null;
 let trade: TradeService | null = null;
 let cfg: AppConfig | null = null;
 /** Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
@@ -103,6 +107,8 @@ let heliusConfigured = false;
 // Whether the BIRDEYE_API_KEY secret reached the Worker (presence only — never the value).
 let birdeyeConfigured = false;
 let gmgnConfigured = false;
+// Whether AXIOM_EMAIL/PASSWORD reached the Worker (presence only).
+let axiomConfigured = false;
 // Whether the BOT_WALLET_PRIVATE_KEY secret reached the Worker (presence only).
 let tradeConfigured = false;
 // Whether the JUPITER_API_KEY secret reached the Worker (presence only —
@@ -171,6 +177,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
     gmgnConfigured = Boolean(config.gmgnApiKey);
+    axiomConfigured = Boolean(config.axiomEmail && config.axiomPassword);
     tradeConfigured = Boolean(config.trade.walletSecret);
     jupiterKeyed = Boolean(config.trade.jupiterApiKey);
 
@@ -209,6 +216,17 @@ async function ensureInitialized(env: Env): Promise<void> {
         } catch (err) {
           console.warn(
             "[worker] GMGN client not ready:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      axiom = null;
+      if (config.axiomEmail && config.axiomPassword) {
+        try {
+          axiom = new AxiomClient(config);
+        } catch (err) {
+          console.warn(
+            "[worker] Axiom client not ready:",
             err instanceof Error ? err.message : err,
           );
         }
@@ -256,6 +274,9 @@ async function ensureInitialized(env: Env): Promise<void> {
           // GMGN OpenAPI — candidate enrichment (smart money / wash-trading)
           // + trending discovery feed (null when no key configured).
           gmgn,
+          // Axiom Trade trending — login-based momentum feed (null when no
+          // credentials configured).
+          axiom,
         );
         scannerReady = true;
       }
@@ -608,6 +629,7 @@ export default {
         heliusConfigured,
         birdeyeConfigured,
         gmgnConfigured,
+        axiomConfigured,
         tradeConfigured,
         jupiterKeyed,
         tradeMode: effectiveTradeMode,
@@ -653,6 +675,108 @@ export default {
             mcap: i.marketCap,
             smart: i.smartDegenCount,
             wash: i.isWashTrading,
+          })),
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Axiom Trade login + trending probe. Login is interactive: step 1
+    // (no params) submits the stored email/password and emails an OTP code;
+    // step 2 (?otp=XXXXXX) completes login and persists the access/refresh
+    // tokens in worker_state (survives isolate recycling). The trending
+    // probe (?noauth=1 skips token use) exercises the same client the
+    // scanner uses.
+    if (url.pathname === "/debug/axiom-login") {
+      const client = axiom;
+      if (!client) {
+        return Response.json({
+          ok: false,
+          error: "Axiom not configured (need AXIOM_EMAIL + AXIOM_PASSWORD)",
+        });
+      }
+      const otp = (url.searchParams.get("otp") ?? "").trim();
+      try {
+        if (!otp) {
+          const step1 = await client.loginStep1();
+          if (!step1.otpJwtToken) {
+            return Response.json({
+              ok: false,
+              error: "login step1 returned no otpJwtToken",
+              raw: step1.raw,
+            });
+          }
+          // Cache the OTP JWT briefly so step 2 doesn't need it re-sent.
+          pendingAxiomOtpJwt = step1.otpJwtToken;
+          return Response.json({
+            ok: true,
+            step: 1,
+            message: "OTP code emailed — call again with ?otp=<code>",
+          });
+        }
+        const jwt = pendingAxiomOtpJwt;
+        if (!jwt) {
+          return Response.json({
+            ok: false,
+            error: "no pending login — call /debug/axiom-login first (step 1)",
+          });
+        }
+        const step2 = await client.loginStep2(jwt, otp);
+        if (!step2.accessToken || !step2.refreshToken) {
+          return Response.json({
+            ok: false,
+            error: "login step2 returned no tokens",
+            raw: step2.raw,
+          });
+        }
+        await db?.setWorkerState("axiom_access_token", step2.accessToken);
+        await db?.setWorkerState("axiom_refresh_token", step2.refreshToken);
+        pendingAxiomOtpJwt = null;
+        return Response.json({ ok: true, step: 2, loggedIn: true });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Axiom trending probe — verifies the feed works end-to-end from the
+    // worker's own egress with the stored token (diagnoses auth-expiry vs
+    // blocked-egress vs parser mismatch).
+    if (url.pathname === "/debug/axiom-trending") {
+      const client = axiom;
+      if (!client) {
+        return Response.json({
+          ok: false,
+          error: "Axiom not configured (need AXIOM_EMAIL + AXIOM_PASSWORD)",
+        });
+      }
+      const accessToken = await db?.getWorkerState("axiom_access_token");
+      if (!accessToken) {
+        return Response.json({
+          ok: false,
+          error: "not logged in — run /debug/axiom-login first",
+        });
+      }
+      try {
+        const t0 = Date.now();
+        const items = await client.fetchTrending(accessToken, "1h", 10);
+        return Response.json({
+          ok: true,
+          count: items.length,
+          ms: Date.now() - t0,
+          sample: items.slice(0, 3).map((i) => ({
+            symbol: i.symbol,
+            mcap: i.marketCapUsd,
+            sniper: i.sniperCount,
+            insiderPct: i.insiderPct,
+            bundlePct: i.bundlePct,
+            holders: i.holderCount,
           })),
         });
       } catch (err) {

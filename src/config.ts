@@ -94,6 +94,10 @@ export interface AppConfig {
   birdeyeApiKey?: string;
   /** GMGN OpenAPI key for smart-money enrichment + trending feed (optional). */
   gmgnApiKey?: string;
+  /** Axiom Trade account email (login-based trending feed; optional). */
+  axiomEmail?: string;
+  /** Axiom Trade account password (login-based trending feed; optional). */
+  axiomPassword?: string;
   /** Helius RPC API key for on-chain first-minute volume (optional; without it the public Solana RPC is used). */
   heliusApiKey?: string;
   /** How often the scanner runs, in seconds (SCAN_INTERVAL_SECONDS, else SCAN_INTERVAL_MINUTES×60). */
@@ -155,6 +159,14 @@ export interface AppConfig {
    * is configured.
    */
   gmgnBlockWashTrading: boolean;
+  /**
+   * Axiom Trade trending feed size per scan (AXIOM_TRENDING_LIMIT, default
+   * 20, 0 = discovery feed disabled). Axiom's trending rows carry
+   * sniper/insider/bundle/top10-holder signals no other free feed has.
+   * Requires AXIOM_EMAIL + AXIOM_PASSWORD secrets and a one-time OTP login
+   * (see /debug/axiom-login).
+   */
+  axiomTrendingLimit: number;
   /**
    * Periodic Birdeye new_listing backfill (BIRDEYE_BACKFILL_ENABLED, default
    * true): every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
@@ -251,6 +263,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ? Math.max(0, Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
       : 600,
     gmgnBlockWashTrading: (env.GMGN_BLOCK_WASH_TRADING ?? "true") !== "false",
+    axiomEmail: env.AXIOM_EMAIL || undefined,
+    axiomPassword: env.AXIOM_PASSWORD || undefined,
+    axiomTrendingLimit: Number.isFinite(Number(env.AXIOM_TRENDING_LIMIT ?? 20))
+      ? Math.max(0, Math.min(Math.floor(Number(env.AXIOM_TRENDING_LIMIT ?? 20)), 100))
+      : 20,
     birdeyeBackfillEnabled: (env.BIRDEYE_BACKFILL_ENABLED ?? "true") !== "false",
     birdeyeBackfillIntervalMs:
       Number.isFinite(Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360)) &&

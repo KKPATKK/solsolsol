@@ -11,6 +11,7 @@ import type { TradeService } from "./jupiter";
 import type { PumpFunClient } from "./pumpfun";
 import type { GeckoTerminalClient } from "./geckoterminal";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
+import type { AxiomClient, AxiomTrendingToken } from "./axiom";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
 /** A token's opening volume (DexScreener proxy) is only meaningful if we saw it young. */
@@ -98,6 +99,8 @@ export interface ScanSummary {
   geoTrend: number;
   /** GMGN trending feed size this scan (0 when disabled/blocked). */
   gmgn: number;
+  /** Axiom Trade trending feed size this scan (0 when disabled/not logged in). */
+  axiom: number;
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
   backfill: number;
   pool: number;
@@ -177,6 +180,15 @@ export class Scanner {
      * Best-effort: failures degrade to the other feeds.
      */
     private readonly gmgn: GmgnClient | null = null,
+    /**
+     * Axiom Trade trending (null = disabled — no credentials). Momentum
+     * feed with sniper/insider/bundle/top10-holder signals in the row data.
+     * Login is interactive (OTP email) so the access token is persisted in
+     * worker_state by the /debug/axiom-login endpoint; the scanner only
+     * refreshes it when expired. Best-effort: failures degrade to the other
+     * feeds.
+     */
+    private readonly axiom: AxiomClient | null = null,
   ) {}
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -219,6 +231,7 @@ export class Scanner {
       geo: 0,
       geoTrend: 0,
       gmgn: 0,
+      axiom: 0,
       backfill: 0,
       pool: 0,
       agedEval: 0,
@@ -360,6 +373,31 @@ export class Scanner {
         }
       }
       diag.gmgn = gmgnProfiles.length;
+      // Axiom Trade trending — momentum feed with sniper/insider/bundle/
+      // top10-holder signals Axiom computes server-side (no other free feed
+      // has them). Needs a logged-in access token (see /debug/axiom-login);
+      // the scanner refreshes a stale token via the stored refresh token and
+      // silently skips when not logged in. Sized by AXIOM_TRENDING_LIMIT
+      // (0 = disabled); best-effort — failures return [] and the scan
+      // continues.
+      let axiomProfiles: TokenProfile[] = [];
+      if (this.axiom && this.config.axiomTrendingLimit > 0) {
+        try {
+          const trending = await this.fetchAxiomTrending();
+          axiomProfiles = trending
+            .filter((t) => t.createdAtMs !== null)
+            .map((t) => ({
+              tokenAddress: t.address,
+              openTimestamp: t.createdAtMs ?? undefined,
+            }));
+        } catch (err) {
+          console.error(
+            "[scanner] axiom trending discovery failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      diag.axiom = axiomProfiles.length;
       // Periodic Birdeye backfill — safety net for discovery gaps. Every
       // BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back the lookback
       // window of Birdeye's new_listing feed (which includes pump.fun
@@ -382,6 +420,8 @@ export class Scanner {
       const pumpMints = new Set(pumpProfiles.map((p) => p.tokenAddress));
       const geckoMints = new Set(geckoProfiles.map((p) => p.tokenAddress));
       const geoTrendMints = new Set(geoTrendProfiles.map((p) => p.tokenAddress));
+      const gmgnMints = new Set(gmgnProfiles.map((p) => p.tokenAddress));
+      const axiomMints = new Set(axiomProfiles.map((p) => p.tokenAddress));
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
@@ -401,6 +441,14 @@ export class Scanner {
             !pumpMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress),
+        ),
+        ...axiomProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) &&
+            !pumpMints.has(p.tokenAddress) &&
+            !geckoMints.has(p.tokenAddress) &&
+            !geoTrendMints.has(p.tokenAddress) &&
+            !gmgnMints.has(p.tokenAddress),
         ),
       ];
       const now = Date.now();
@@ -1052,6 +1100,68 @@ export class Scanner {
         err instanceof Error ? err.message : err,
       );
       return { holderCount: null };
+    }
+  }
+
+  /**
+   * Axiom trending with access-token lifecycle: uses the token persisted by
+   * /debug/axiom-login (worker_state `axiom_access_token`); on an auth
+   * failure it refreshes once via `axiom_refresh_token` and persists the
+   * new token. Returns [] when not logged in or when refresh fails (re-login
+   * via /debug/axiom-login needed). Never throws to the caller — feed
+   * failures degrade to the other discovery sources.
+   */
+  private async fetchAxiomTrending(): Promise<AxiomTrendingToken[]> {
+    const accessToken = await this.db.getWorkerState("axiom_access_token");
+    if (!accessToken) return [];
+    try {
+      return await this.axiom!.fetchTrending(
+        accessToken,
+        "1h",
+        this.config.axiomTrendingLimit,
+      );
+    } catch (err) {
+      const authFailure =
+        err instanceof Error && /auth/i.test(err.message);
+      if (!authFailure) {
+        // Rate-limited / 5xx: skip this round, keep the token (it's still
+        // valid); the next scan retries the same token.
+        console.error(
+          "[scanner] axiom trending fetch failed (non-auth):",
+          err instanceof Error ? err.message : err,
+        );
+        return [];
+      }
+      // Access token expired/rejected — try one refresh with the stored
+      // refresh token, then persist whatever comes back.
+      const refreshToken = await this.db.getWorkerState("axiom_refresh_token");
+      if (!refreshToken) {
+        console.error(
+          "[scanner] axiom access token rejected and no refresh token — re-login via /debug/axiom-login",
+        );
+        return [];
+      }
+      try {
+        const fresh = await this.axiom!.refreshAccessToken(refreshToken);
+        if (!fresh) {
+          console.error(
+            "[scanner] axiom refresh returned no token — re-login via /debug/axiom-login",
+          );
+          return [];
+        }
+        await this.db.setWorkerState("axiom_access_token", fresh);
+        return await this.axiom!.fetchTrending(
+          fresh,
+          "1h",
+          this.config.axiomTrendingLimit,
+        );
+      } catch (refreshErr) {
+        console.error(
+          "[scanner] axiom token refresh failed — re-login via /debug/axiom-login:",
+          refreshErr instanceof Error ? refreshErr.message : refreshErr,
+        );
+        return [];
+      }
     }
   }
 

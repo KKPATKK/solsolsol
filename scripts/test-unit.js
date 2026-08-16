@@ -18,6 +18,7 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools } = require("../dist/geckoterminal.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
+const { parseAxiomTrending } = require("../dist/axiom.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -482,6 +483,57 @@ async function main() {
     assert.deepEqual(parseTokenOverview({ holder: 10, creator: "short" }), { holderCount: 10, creator: null });
     assert.deepEqual(parseTokenOverview(null), { holderCount: null, creator: null });
     assert.deepEqual(parseTokenOverview("x"), { holderCount: null, creator: null });
+  });
+
+  await test("parseAxiomTrending maps the Axiom new-trending-v2 shape (dict + positional array)", () => {
+    const out = parseAxiomTrending({
+      tokens: [
+        {
+          tokenAddress: "2fEjticD78k5cYfbbBGcBRB2zVZ7eQ5nZgYLm9Wvpump",
+          tokenTicker: "DOGE",
+          tokenName: "Doge",
+          marketCapUsd: 123456,
+          sniperCount: 4,
+          insiderPercentage: 1.2,
+          bundlePercentage: 0,
+          holderCount: 210,
+          createdAt: 1755097200000,
+        },
+        { tokenAddress: "Xyz" }, // missing fields
+        null,
+        "string",
+      ],
+    });
+    assert.equal(out.length, 2);
+    assert.equal(out[0].address, "2fEjticD78k5cYfbbBGcBRB2zVZ7eQ5nZgYLm9Wvpump");
+    assert.equal(out[0].symbol, "DOGE");
+    assert.equal(out[0].marketCapUsd, 123456);
+    assert.equal(out[0].sniperCount, 4);
+    assert.equal(out[0].insiderPct, 1.2);
+    assert.equal(out[0].bundlePct, 0);
+    assert.equal(out[0].holderCount, 210);
+    assert.equal(out[0].createdAtMs, 1755097200000);
+    assert.equal(out[1].marketCapUsd, null);
+    // Bare-array (positional) form maps by TRENDING_V2_FIELDS index:
+    // 0=pairAddress, 1=tokenAddress, 3=tokenTicker, 24=marketCapUsd,
+    // 36=sniperCount, 39=developerHoldingPercent.
+    const positionalRow = new Array(52).fill(null);
+    positionalRow[0] = "pairX";
+    positionalRow[1] = "addrY";
+    positionalRow[2] = "Name";
+    positionalRow[3] = "TICK";
+    positionalRow[24] = 5000;
+    positionalRow[36] = 9;
+    positionalRow[39] = 2.5;
+    const positional = parseAxiomTrending([positionalRow]);
+    assert.equal(positional.length, 1);
+    assert.equal(positional[0].address, "addrY");
+    assert.equal(positional[0].symbol, "TICK");
+    assert.equal(positional[0].marketCapUsd, 5000);
+    assert.equal(positional[0].sniperCount, 9);
+    assert.equal(positional[0].developerHoldingPct, 2.5);
+    assert.deepEqual(parseAxiomTrending({ not: "array" }), []);
+    assert.deepEqual(parseAxiomTrending(null), []);
   });
 
   await test("trade_log record/hasTraded/countTradesSince round-trips with UNIQUE dedupe", async () => {
