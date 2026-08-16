@@ -10,6 +10,7 @@ import type { RugcheckClient } from "./rugcheck";
 import type { TradeService } from "./jupiter";
 import type { PumpFunClient } from "./pumpfun";
 import type { GeckoTerminalClient } from "./geckoterminal";
+import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 
 const CHAIN_BASE_URL = "https://dexscreener.com/solana/";
 /** A token's opening volume (DexScreener proxy) is only meaningful if we saw it young. */
@@ -93,6 +94,8 @@ export interface ScanSummary {
   pump: number;
   /** GeckoTerminal new-pools feed size this scan (0 when blocked/unconfigured). */
   geo: number;
+  /** GMGN trending feed size this scan (0 when disabled/blocked). */
+  gmgn: number;
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
   backfill: number;
   pool: number;
@@ -162,6 +165,14 @@ export class Scanner {
      * Best-effort: failures degrade to the other feeds.
      */
     private readonly gecko: GeckoTerminalClient | null = null,
+    /**
+     * GMGN OpenAPI (null = disabled — no key). Two uses: (a) candidate
+     * enrichment — smart-money count, wash-trading flag and holders fetched
+     * before each push and shown on the card (wash-trading optionally
+     * blocks); (b) trending discovery feed (GMGN_TRENDING_LIMIT > 0).
+     * Best-effort: failures degrade to the other feeds.
+     */
+    private readonly gmgn: GmgnClient | null = null,
   ) {}
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -202,6 +213,7 @@ export class Scanner {
       profiles: 0,
       pump: 0,
       geo: 0,
+      gmgn: 0,
       backfill: 0,
       pool: 0,
       agedEval: 0,
@@ -295,6 +307,30 @@ export class Scanner {
         }
       }
       diag.geo = geckoProfiles.length;
+      // GMGN trending discovery — momentum-ranked candidates with GMGN's
+      // smart-money/wash-trading-aware filters already applied server-side
+      // (best-effort — failures return [] and the scan continues). Sized by
+      // GMGN_TRENDING_LIMIT (0 = disabled).
+      let gmgnProfiles: TokenProfile[] = [];
+      if (this.gmgn && this.config.gmgnTrendingLimit > 0) {
+        try {
+          const trending = await this.gmgn.fetchTrending(
+            this.config.gmgnTrendingLimit,
+          );
+          gmgnProfiles = trending
+            .filter((t) => !t.isWashTrading)
+            .map((t) => ({
+              tokenAddress: t.address,
+              openTimestamp: t.createdAtMs ?? undefined,
+            }));
+        } catch (err) {
+          console.error(
+            "[scanner] gmgn trending discovery failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      diag.gmgn = gmgnProfiles.length;
       // Periodic Birdeye backfill — safety net for discovery gaps. Every
       // BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back the lookback
       // window of Birdeye's new_listing feed (which includes pump.fun
@@ -315,12 +351,19 @@ export class Scanner {
       // entry wins — it carries richer profile data.
       const dexMints = new Set(profiles.map((p) => p.tokenAddress));
       const pumpMints = new Set(pumpProfiles.map((p) => p.tokenAddress));
+      const geckoMints = new Set(geckoProfiles.map((p) => p.tokenAddress));
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
         ...geckoProfiles.filter(
           (p) =>
             !dexMints.has(p.tokenAddress) && !pumpMints.has(p.tokenAddress),
+        ),
+        ...gmgnProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) &&
+            !pumpMints.has(p.tokenAddress) &&
+            !geckoMints.has(p.tokenAddress),
         ),
       ];
       const now = Date.now();
@@ -478,6 +521,24 @@ export class Scanner {
         // filters — the sniper filter was removed, so coins push even when
         // the data is not ready yet.
         const trader = await this.resolveTraderData(coin);
+        // GMGN enrichment — smart money count, holders and the wash-trading
+        // flag, shown on the card. Best-effort: failures degrade to no
+        // enrichment. The wash-trading flag can block the push entirely
+        // (GMGN_BLOCK_WASH_TRADING, default on) — same stance as the
+        // gmgn-vl-radar filters (not_wash_trading).
+        const gmgn = await this.resolveGmgnInfo(coin);
+        if (
+          this.gmgn &&
+          this.config.gmgnBlockWashTrading &&
+          gmgn?.isWashTrading === true
+        ) {
+          diag.fails.other++;
+          this.addReject(diag, coin, "GMGN 標記為 wash trading");
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (GMGN wash-trading flag)`,
+          );
+          continue;
+        }
         // Re-check right before sending: a concurrent scan (rare, only when
         // a scan outlives the 1-min cron) could have pushed it meanwhile.
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
@@ -503,6 +564,7 @@ export class Scanner {
               trader.proTraders,
               trader.sniperPct,
               flow.status === "clean",
+              gmgn,
             ),
             {
               reply_markup: {
@@ -908,6 +970,41 @@ export class Scanner {
     return { proTraders: null, sniperPct: null };
   }
 
+  /**
+   * GMGN enrichment for one candidate: smart money, holders, wash-trading
+   * flag. Best-effort — any failure/empty result negative-caches the coin
+   * (5 min) and degrades to no enrichment; the push is only blocked when a
+   * confirmed wash-trading flag comes back and blocking is enabled.
+   */
+  private async resolveGmgnInfo(
+    coin: QualifyingCoin,
+  ): Promise<GmgnTokenInfo | null> {
+    if (!this.gmgn) return null;
+    const mint = coin.pair.baseToken.address;
+    if (this.dataNegativeCached(mint)) return null;
+    try {
+      const info = await this.gmgn.fetchTokenInfo(mint);
+      const empty =
+        info === null ||
+        (info.smartDegenCount === null &&
+          info.holderCount === null &&
+          info.isWashTrading === null);
+      if (empty) {
+        this.dataFailedAt.set(mint, Date.now());
+        return null;
+      }
+      this.dataFailedAt.delete(mint);
+      return info;
+    } catch (err) {
+      this.dataFailedAt.set(mint, Date.now());
+      console.error(
+        `[scanner] GMGN lookup failed for ${mint}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    }
+  }
+
   private matchCoins(
     profiles: TokenProfile[],
     pairsByToken: Map<string, PairInfo>,
@@ -1015,6 +1112,7 @@ function renderMessage(
   proTraders: number | null,
   sniperPct: number | null,
   supplyFlowClean: boolean,
+  gmgn: GmgnTokenInfo | null,
 ): string {
   const { pair, profile } = coin;
   const name = pair.baseToken.name || profile.name || "Unknown";
@@ -1047,6 +1145,10 @@ function renderMessage(
     sniperPct === null
       ? "🎯 Sniper 買入: —（未檢測）"
       : `🎯 Sniper 買入: ${sniperPct.toFixed(1)}%（佔供應）`;
+  const gmgnLine =
+    gmgn === null
+      ? "🧠 GMGN: —（未配置）"
+      : `🧠 GMGN: 👤${gmgn.holderCount ?? "—"} 持倉 | 💰${gmgn.smartDegenCount ?? "—"} smart${gmgn.isWashTrading ? " | ⚠️ wash trading" : ""}`;
 
   const lines = [
     `🪙 ${name} (${symbol})`,
@@ -1060,6 +1162,7 @@ function renderMessage(
     flowLine,
     proTradersLine,
     sniperLine,
+    gmgnLine,
     `📈 24h 量: ${fmtUsd(pair.volume.h24)}`,
     `💧 流动性: ${fmtUsd(liquidityUsd)}`,
     `⏱️ 上线: ${fmtAge(ageMs)}`,

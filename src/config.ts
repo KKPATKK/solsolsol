@@ -92,6 +92,8 @@ export interface AppConfig {
   tursoAuthToken?: string;
   /** Birdeye API key for trader/sniper insights (optional). */
   birdeyeApiKey?: string;
+  /** GMGN OpenAPI key for smart-money enrichment + trending feed (optional). */
+  gmgnApiKey?: string;
   /** Helius RPC API key for on-chain first-minute volume (optional; without it the public Solana RPC is used). */
   heliusApiKey?: string;
   /** How often the scanner runs, in seconds (SCAN_INTERVAL_SECONDS, else SCAN_INTERVAL_MINUTES×60). */
@@ -133,6 +135,19 @@ export interface AppConfig {
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
   birdeyeRequestIntervalMs: number;
+  /**
+   * GMGN trending feed size per scan (GMGN_TRENDING_LIMIT, default 30,
+   * 0 = discovery feed disabled). Candidates come momentum-ranked.
+   */
+  gmgnTrendingLimit: number;
+  /** Minimum spacing between GMGN HTTP requests (rate limiting). */
+  gmgnRequestIntervalMs: number;
+  /**
+   * Block pushes for coins GMGN explicitly flags as wash trading
+   * (GMGN_BLOCK_WASH_TRADING, default true). Only applies when a GMGN key
+   * is configured.
+   */
+  gmgnBlockWashTrading: boolean;
   /**
    * Periodic Birdeye new_listing backfill (BIRDEYE_BACKFILL_ENABLED, default
    * true): every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
@@ -183,6 +198,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     tursoUrl: env.TURSO_DATABASE_URL || undefined,
     tursoAuthToken: env.TURSO_AUTH_TOKEN || undefined,
     birdeyeApiKey: env.BIRDEYE_API_KEY || undefined,
+    gmgnApiKey: env.GMGN_API_KEY || undefined,
     heliusApiKey: env.HELIUS_API_KEY || undefined,
     scanIntervalSeconds:
       Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 300,
@@ -216,6 +232,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))
       ? Math.max(0, Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))
       : 1100,
+    gmgnTrendingLimit: Number.isFinite(Number(env.GMGN_TRENDING_LIMIT ?? 30))
+      ? Math.max(0, Math.min(Math.floor(Number(env.GMGN_TRENDING_LIMIT ?? 30)), 100))
+      : 30,
+    gmgnRequestIntervalMs: Number.isFinite(Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
+      ? Math.max(0, Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
+      : 600,
+    gmgnBlockWashTrading: (env.GMGN_BLOCK_WASH_TRADING ?? "true") !== "false",
     birdeyeBackfillEnabled: (env.BIRDEYE_BACKFILL_ENABLED ?? "true") !== "false",
     birdeyeBackfillIntervalMs:
       Number.isFinite(Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360)) &&

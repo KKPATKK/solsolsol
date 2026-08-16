@@ -10,6 +10,7 @@ import { Scanner } from "./scanner";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
+import { GmgnClient } from "./gmgn";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -56,6 +57,7 @@ let webhook: ((req: Request) => Promise<Response>) | null = null;
 let dex: DexScreenerClient | null = null;
 let helius: HeliusClient | null = null;
 let birdeye: BirdeyeClient | null = null;
+let gmgn: GmgnClient | null = null;
 let trade: TradeService | null = null;
 let cfg: AppConfig | null = null;
 /** Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
@@ -100,6 +102,7 @@ let scanRunning = false;
 let heliusConfigured = false;
 // Whether the BIRDEYE_API_KEY secret reached the Worker (presence only — never the value).
 let birdeyeConfigured = false;
+let gmgnConfigured = false;
 // Whether the BOT_WALLET_PRIVATE_KEY secret reached the Worker (presence only).
 let tradeConfigured = false;
 // Whether the JUPITER_API_KEY secret reached the Worker (presence only —
@@ -167,6 +170,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     tursoConfigured = Boolean(config.tursoUrl);
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
+    gmgnConfigured = Boolean(config.gmgnApiKey);
     tradeConfigured = Boolean(config.trade.walletSecret);
     jupiterKeyed = Boolean(config.trade.jupiterApiKey);
 
@@ -238,6 +242,9 @@ async function ensureInitialized(env: Env): Promise<void> {
           // Solana DEX incl. pump.fun graduates (best-effort — blocked or
           // degraded feeds return [] and the scan continues on the others).
           new GeckoTerminalClient(config),
+          // GMGN OpenAPI — candidate enrichment (smart money / wash-trading)
+          // + trending discovery feed (null when no key configured).
+          gmgn,
         );
         scannerReady = true;
       }
@@ -589,6 +596,7 @@ export default {
         scannerReady,
         heliusConfigured,
         birdeyeConfigured,
+        gmgnConfigured,
         tradeConfigured,
         jupiterKeyed,
         tradeMode: effectiveTradeMode,

@@ -16,6 +16,7 @@ const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools } = require("../dist/geckoterminal.js");
+const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -385,6 +386,61 @@ async function main() {
     assert.equal(out[0].reserveUsd, 2101.61);
     assert.deepEqual(parseNewPools({ not: "array" }), []);
     assert.deepEqual(parseNewPools(null), []);
+  });
+
+  await test("parseTrending maps the GMGN /v1/market/rank shape", () => {
+    const out = parseTrending({
+      rank: [
+        {
+          address: "2fEjticD78k5cYfbbBGcBRB2zVZ7eQ5nZgYLm9Wvpump",
+          symbol: "DOGE",
+          name: "Doge",
+          usd_market_cap: 123456,
+          liquidity: 50000,
+          volume: 250000,
+          holder_count: 210,
+          smart_degen_count: 4,
+          is_wash_trading: false,
+          created_timestamp: 1755097200000,
+        },
+        { address: "Xyz", is_wash_trading: true }, // wash trading + missing fields
+        null,
+        "string",
+      ],
+    });
+    assert.equal(out.length, 2);
+    assert.equal(out[0].address, "2fEjticD78k5cYfbbBGcBRB2zVZ7eQ5nZgYLm9Wvpump");
+    assert.equal(out[0].marketCap, 123456);
+    assert.equal(out[0].smartDegenCount, 4);
+    assert.equal(out[0].isWashTrading, false);
+    assert.equal(out[0].createdAtMs, 1755097200000);
+    assert.equal(out[1].isWashTrading, true);
+    assert.deepEqual(parseTrending({ not: "array" }), []);
+    assert.deepEqual(parseTrending(null), []);
+  });
+
+  await test("parseTokenInfo reads GMGN smart-money fields (top-level + price subtree)", () => {
+    const info = parseTokenInfo({
+      price: {
+        buy_volume_5m: 5000,
+        sell_volume_5m: 2000,
+      },
+      smart_degen_count: 7,
+      holder_count: 1500,
+      is_wash_trading: true,
+    });
+    assert.ok(info);
+    assert.equal(info.smartDegenCount, 7);
+    assert.equal(info.holderCount, 1500);
+    assert.equal(info.isWashTrading, true);
+    assert.equal(info.buyVolume5m, 5000);
+    assert.equal(info.sellVolume5m, 2000);
+    // Fields nested under price only
+    const nested = parseTokenInfo({ price: { holder_count: 99, smart_degen_count: 2 } });
+    assert.equal(nested.holderCount, 99);
+    assert.equal(nested.smartDegenCount, 2);
+    assert.equal(parseTokenInfo(null), null);
+    assert.equal(parseTokenInfo("x"), null);
   });
 
   await test("trade_log record/hasTraded/countTradesSince round-trips with UNIQUE dedupe", async () => {
