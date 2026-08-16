@@ -461,6 +461,20 @@ export class Db {
     return v === null || v === undefined ? null : String(v);
   }
 
+  /** Total rows in token_stats (telemetry for /health — pool coverage). */
+  async countTokenStats(): Promise<number> {
+    try {
+      const res = await this.get().execute({
+        sql: "SELECT COUNT(*) AS n FROM token_stats",
+        args: [],
+      });
+      const row = res.rows[0] as { n?: number | bigint } | undefined;
+      return Number(row?.n ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
   /**
    * Append one permanent scan-history row per tick (survives isolate
    * evictions, unlike the in-memory counters). History is bounded: rows

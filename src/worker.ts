@@ -566,12 +566,14 @@ export default {
       let scheduledTickTotal: number | null = null;
       let scheduledTickAt: number | null = null;
       let enabledChats: number | null = null;
+      let tokenStatsCount: number | null = null;
       try {
         const rawTotal = await db?.getWorkerState("scheduled_tick_total");
         const rawAt = await db?.getWorkerState("scheduled_tick_at");
         scheduledTickTotal = rawTotal ? parseInt(rawTotal, 10) || 0 : null;
         scheduledTickAt = rawAt ? parseInt(rawAt, 10) || 0 : null;
         enabledChats = (await db?.listEnabledChats())?.length ?? null;
+        tokenStatsCount = (await db?.countTokenStats()) ?? null;
       } catch {
         // telemetry only — never fail /health over the reads
       }
@@ -599,6 +601,7 @@ export default {
           ? new Date(scheduledTickAt).toISOString()
           : null,
         enabledChats,
+        tokenStatsCount,
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         heartbeat,
