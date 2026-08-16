@@ -3,7 +3,11 @@ main = "src/worker.ts"
 compatibility_date = "2026-08-09"
 compatibility_flags = ["nodejs_compat"]
 
-# Scanner runs every minute — the free-tier minimum for cron triggers.
+# Cron fires every minute (the free-tier minimum); the scan itself is
+# gated by SCAN_INTERVAL_SECONDS below (90s → every other tick runs a
+# scan), so upstream API pressure (GeckoTerminal 429s) is roughly halved
+# without losing coverage — the re-eval pool + Birdeye backfill cover the
+# gap between scans.
 [triggers]
 crons = ["* * * * *"]
 
@@ -12,7 +16,16 @@ crons = ["* * * * *"]
 # them in the Cloudflare dashboard (Workers > solana-meme-bot > Settings >
 # Variables and Secrets) or via `wrangler secret put <NAME>`.
 [vars]
-SCAN_INTERVAL_SECONDS = "60"
+# Minimum gap between scans, in seconds. The cron trigger still fires every
+# minute, but the worker skips the scan when the previous one finished less
+# than this long ago (cross-isolate via the DB heartbeat), so the effective
+# cadence is ~2× this value at the 1-min cron granularity. 60 = scan every
+# minute (old default; kept the hot-zone push latency at 1 min but doubled
+# the upstream call rate); 90 = scan every ~2 min, halving GeckoTerminal /
+# DexScreener / Birdeye call volume and Turso rows-read (the 2026-08-16
+# mitigation for the sustained gecko 429s — push latency for coins that
+# qualify inside the age window goes from ~1 min to ~2 min).
+SCAN_INTERVAL_SECONDS = "90"
 # Max coverage: inspect the newest 100 Solana token profiles per scan
 # (the code caps this at 100). Deferred candidates stay in the re-eval
 # pool, so nothing is lost when a tick runs out of budget.

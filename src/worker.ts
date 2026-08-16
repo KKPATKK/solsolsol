@@ -1395,6 +1395,27 @@ export default {
     }
     await ensureInitialized(env);
     if (!scanner) return;
+    // Cadence gate: the cron trigger fires every minute, but SCAN_INTERVAL_SECONDS
+    // may be longer (90s — every other tick, halving upstream API pressure and
+    // Turso rows-read). Skip the scan when one completed recently; the DB
+    // heartbeat is the cross-isolate source of truth (an in-memory timestamp
+    // can't gate another isolate's cron delivery). The HTTP-driven fallback
+    // (maybeRunScanIfStale) still rescues a dead cron within 2 min.
+    const scanGapMs = Math.max(60_000, (cfg?.scanIntervalSeconds ?? 60) * 1000);
+    try {
+      const raw = await db?.getWorkerState("scan_heartbeat");
+      const at = raw
+        ? ((JSON.parse(raw) as { at?: number } | null)?.at ?? 0)
+        : 0;
+      if (typeof at === "number" && at > 0 && Date.now() - at < scanGapMs) {
+        console.log(
+          `[worker] cron tick skipped — last scan ${Math.round((Date.now() - at) / 1000)}s ago (< ${Math.round(scanGapMs / 1000)}s)`,
+        );
+        return;
+      }
+    } catch {
+      // heartbeat unreadable — fail open and run the scan
+    }
     // Detect missed ticks (previous scan finished too long ago) and alert.
     try {
       await checkOutageAndAlert();
