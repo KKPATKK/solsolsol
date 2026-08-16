@@ -561,6 +561,19 @@ async function maybeRunScanIfStale(): Promise<void> {
   const now = Date.now();
   if (now - lastScanTriggerAt < SCAN_TRIGGER_INTERVAL_MS) return;
   lastScanTriggerAt = now;
+  // Dedupe against a healthy cron: skip when a scan already completed
+  // recently (the heartbeat is written at scan completion). The fallback
+  // exists to rescue a DEAD cron, not to double the scan rate — every extra
+  // scan doubles the Turso rows-read and the upstream API pressure (which
+  // is what triggers the gecko 429s). When cron delivers, this makes the
+  // effective cadence exactly the configured 60s instead of ~1.5x it.
+  try {
+    const raw = await db?.getWorkerState("scan_heartbeat");
+    const at = raw ? ((JSON.parse(raw) as { at?: number } | null)?.at ?? 0) : 0;
+    if (typeof at === "number" && now - at < SCAN_TRIGGER_INTERVAL_MS) return;
+  } catch {
+    // heartbeat unreadable — fail open and run the fallback scan
+  }
   try {
     await runScan();
   } catch (err) {
