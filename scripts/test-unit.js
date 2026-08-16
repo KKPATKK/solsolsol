@@ -227,8 +227,10 @@ async function main() {
       const M = 60e3;
       const seed = async (token, firstSeenAt, ageMin, seen = false) => {
         await t.client.execute({
-          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, 0, ?, NULL, NULL, NULL, NULL, NULL, NULL)",
-          args: [token, firstSeenAt, ageMin],
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)",
+          // launch_ms = first_seen_at - age_min * 60s (same estimate the
+          // production migration backfills into legacy rows).
+          args: [token, firstSeenAt, ageMin, firstSeenAt - ageMin * 60e3],
         });
         if (seen) {
           await t.client.execute({
@@ -277,6 +279,7 @@ async function main() {
         firstSeenAt: now,
         firstM5Vol: m5vol,
         firstSeenAgeMin: 2,
+        launchMs: now - 2 * 60e3,
         birdeye1mVol: null,
         rugcheckBundlerPct: null,
         rugcheckTop10Pct: null,
@@ -315,6 +318,7 @@ async function main() {
         firstSeenAt,
         firstM5Vol: 0,
         firstSeenAgeMin: 0,
+        launchMs: firstSeenAt,
         birdeye1mVol: null,
         rugcheckBundlerPct: null,
         rugcheckTop10Pct: null,
@@ -1069,6 +1073,7 @@ async function main() {
         firstSeenAt: Date.now(),
         firstM5Vol: 1,
         firstSeenAgeMin: 2,
+        launchMs: Date.now() - 2 * 60e3,
         birdeye1mVol: null,
         rugcheckBundlerPct: null,
         rugcheckTop10Pct: null,
@@ -1084,6 +1089,40 @@ async function main() {
       assert.equal(parsed.flagged, true);
       assert.equal(parsed.feeders, 4);
       assert.ok(got.supplyFlowAt !== null && got.supplyFlowAt > 0);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("resumeLaunchBackfill backfills NULL launch_ms rows and sets the flag", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init(); // empty DB → the migration completes during init
+      // Simulate a mid-migration database: legacy rows (NULL launch_ms)
+      // present while the migration flag is unset (as on a database that
+      // was seeded before the column existed).
+      await t.client.execute(
+        "DELETE FROM worker_state WHERE key = 'schema_alter_v2_done'",
+      );
+      const now = Date.now();
+      for (let i = 0; i < 3; i++) {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms) VALUES (?, ?, 0, ?, NULL)",
+          args: [`T-LEGACY-${i}`, now - i * 3600e3, 60 + i],
+        });
+      }
+      const done = await db.resumeLaunchBackfill(1000);
+      assert.equal(done, true);
+      assert.equal(await db.getWorkerState("schema_alter_v2_done"), "1");
+      // Every legacy row got launch_ms = first_seen_at - age*60s (the same
+      // estimate the pre-column query computed inline).
+      for (let i = 0; i < 3; i++) {
+        const s = await db.getTokenStats(`T-LEGACY-${i}`);
+        assert.equal(s.launchMs, now - i * 3600e3 - (60 + i) * 60e3);
+      }
+      // Once the flag is set the resume is a no-op (returns true immediately).
+      assert.equal(await db.resumeLaunchBackfill(1), true);
     } finally {
       await t.cleanup();
     }

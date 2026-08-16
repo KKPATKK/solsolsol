@@ -59,14 +59,18 @@ const RE_EVAL_WINDOW_MS = 42 * 60 * 60_000;
 /**
  * In-memory TTL for the re-eval pool query. The pool only changes when new
  * coins are recorded, coins are pushed, or the age window slides — nothing
- * that happens between two 60s scans. Caching it here cuts the scan's most
- * expensive read (SELECT * … ORDER BY ABS(launch-?) over the whole 42h
- * window, ~10–20K rows per scan) from ~1/scan to ~1/120s, which is the
- * dominant Turso rows-read consumer (alerted 2026-08-16). Stale coins are
- * harmless: the push path re-checks isTokenSeen from the DB before sending,
- * and newly discovered feed coins are evaluated via feedProfiles anyway.
+ * that happens between two 60s scans. The query is now index-bounded (see
+ * Db.getReevalPool: a launch_ms band scan over a few thousand rows instead
+ * of the ~400K-row full scan it used to do — the dominant Turso rows-read
+ * consumer, alerted 2026-08-16), so this cache cuts the remaining cost to
+ * 1/5 of a per-scan run. Stale coins are harmless: the push path re-checks
+ * isTokenSeen from the DB before sending, and newly discovered feed coins
+ * are evaluated via feedProfiles anyway. A coin that ages into the window
+ * while the cache is live is pushed at the next cache expiry, at most
+ * REEVAL_POOL_CACHE_MS later (the 3h pre-qualification margin keeps most
+ * coins already pooled by then).
  */
-const REEVAL_POOL_CACHE_MS = 120_000;
+const REEVAL_POOL_CACHE_MS = 300_000;
 /**
  * Margin (minutes) around the qualifying age window: the pool also holds
  * coins that will enter the window within 3h, so they are pushed the moment
@@ -158,6 +162,12 @@ export class Scanner {
    * skip re-querying it for a while (in-memory negative cache).
    */
   private readonly dataFailedAt = new Map<string, number>();
+  /**
+   * Whether the one-time launch_ms backfill migration is complete (see
+   * Db.resumeLaunchBackfill). Cached so the per-tick resume call stops as
+   * soon as the flag is set — no extra DB reads forever after.
+   */
+  private launchBackfillDone = false;
 
   constructor(
     private readonly db: Db,
@@ -461,6 +471,21 @@ export class Scanner {
         ),
       ];
       const now = Date.now();
+      // Resume the one-time launch_ms backfill migration until it finishes
+      // (bounded per tick — see Db.resumeLaunchBackfill). While legacy rows
+      // still have NULL launch_ms they are invisible to the banded pool query
+      // below, so finishing quickly keeps re-eval coverage continuous after a
+      // deploy. Best-effort: a failure just retries next tick.
+      if (!this.launchBackfillDone) {
+        try {
+          this.launchBackfillDone = await this.db.resumeLaunchBackfill(4_000);
+        } catch (err) {
+          console.error(
+            "[scanner] launch_ms backfill resume failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
       // Re-evaluation pool: tokens never pushed that are nearing or inside
       // the qualifying age window. The profiles feed only ever contains young
       // tokens, so without this pool a coin would rotate out of the feed
@@ -538,6 +563,11 @@ export class Scanner {
           firstSeenAt: now,
           firstM5Vol: pair?.volume.m5 ?? 0,
           firstSeenAgeMin: ageMin,
+          launchMs: pair
+            ? pair.pairCreatedAt
+            : profile.openTimestamp !== undefined
+              ? profile.openTimestamp
+              : now,
           birdeye1mVol: null,
           rugcheckBundlerPct: null,
           rugcheckTop10Pct: null,
@@ -767,6 +797,7 @@ export class Scanner {
       firstSeenAt: it.createdAtSec! * 1000,
       firstM5Vol: 0,
       firstSeenAgeMin: (now - it.createdAtSec! * 1000) / 60_000,
+      launchMs: it.createdAtSec! * 1000,
       birdeye1mVol: null,
       rugcheckBundlerPct: null,
       rugcheckTop10Pct: null,
@@ -1095,13 +1126,18 @@ export class Scanner {
   }
 
   /**
-   * Re-eval pool with a short in-memory cache (see REEVAL_POOL_CACHE_MS):
+   * Re-eval pool with an in-memory TTL cache (see REEVAL_POOL_CACHE_MS):
    * the query is the scan's dominant Turso rows-read consumer, and its
-   * result changes only slowly, so cache hits skip the DB entirely.
+   * result changes only slowly, so cache hits skip the DB entirely. The
+   * cache key is the TTL alone — the since/launch bounds slide with `now`
+   * and therefore differ on every call, so comparing them (as the first
+   * version did) made the cache NEVER hit and the pool query ran on every
+   * scan (a 2-min TTL advertised, 0 achieved). A stale pool is harmless:
+   * the push path re-checks isTokenSeen from the DB before sending, and
+   * newly discovered feed coins are evaluated via feedProfiles anyway.
    */
   private reevalPoolCache: {
     at: number;
-    sinceMs: number;
     stats: TokenStats[];
   } | null = null;
   private async getReevalPoolCached(
@@ -1114,15 +1150,11 @@ export class Scanner {
       limit: number;
     },
   ): Promise<TokenStats[]> {
-    if (
-      this.reevalPoolCache &&
-      now - this.reevalPoolCache.at < REEVAL_POOL_CACHE_MS &&
-      this.reevalPoolCache.sinceMs === opts.sinceMs
-    ) {
+    if (this.reevalPoolCache && now - this.reevalPoolCache.at < REEVAL_POOL_CACHE_MS) {
       return this.reevalPoolCache.stats;
     }
     const stats = await this.db.getReevalPool(opts);
-    this.reevalPoolCache = { at: now, sinceMs: opts.sinceMs, stats };
+    this.reevalPoolCache = { at: now, stats };
     return stats;
   }
 
