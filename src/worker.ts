@@ -758,25 +758,48 @@ export default {
     // log in on axiom.trade in your own browser, copy the auth-access-token
     // and auth-refresh-token cookie values, then call
     //   /debug/axiom-tokens?access=<token>&refresh=<token>
-    // The tokens are persisted in worker_state and auto-refreshed by the
-    // scanner, exactly like the OTP-login path.
+    // `access` alone is accepted (verifies worker egress immediately);
+    // `refresh` is optional but strongly recommended — without it the feed
+    // dies when the access token expires (JWT lifetime ≈ 16 min).
     if (url.pathname === "/debug/axiom-tokens") {
       const access = (url.searchParams.get("access") ?? "").trim();
       const refresh = (url.searchParams.get("refresh") ?? "").trim();
-      if (!access || !refresh) {
+      if (!access) {
         return Response.json({
           ok: false,
-          error: "missing ?access=<token>&refresh=<token>",
+          error: "missing ?access=<token> (refresh=<token> optional)",
         });
       }
       await db?.setWorkerState("axiom_access_token", access);
-      await db?.setWorkerState("axiom_refresh_token", refresh);
+      if (refresh) {
+        await db?.setWorkerState("axiom_refresh_token", refresh);
+      }
+      const storedRefresh = Boolean(refresh);
       axiomConfigured = true;
       const res: Record<string, unknown> = {
         ok: true,
         stored: true,
-        hint: "call /debug/axiom-trending to verify the feed",
+        refreshStored: storedRefresh,
+        hint: storedRefresh
+          ? "call /debug/axiom-trending to verify the feed"
+          : "no refresh token stored — the feed will stop when the access token expires",
       };
+      // Report the JWT expiry so the user can see how long the access token
+      // is valid (middle segment is base64url JSON with iat/exp).
+      try {
+        const parts = access.split(".");
+        if (parts.length === 3) {
+          const payload = JSON.parse(
+            Buffer.from(parts[1], "base64url").toString("utf8"),
+          );
+          if (typeof payload.exp === "number") {
+            res.accessExpiresAt = new Date(payload.exp * 1000).toISOString();
+            res.accessLifetimeMin = Math.round((payload.exp - payload.iat) / 60);
+          }
+        }
+      } catch {
+        // non-JWT access token — skip expiry info
+      }
       // Immediately verify with the just-stored token when a client exists.
       if (axiom) {
         try {
