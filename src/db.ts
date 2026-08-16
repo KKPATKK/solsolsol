@@ -461,6 +461,20 @@ export class Db {
     return v === null || v === undefined ? null : String(v);
   }
 
+  /** Total pushed rows in seen_tokens (telemetry for /health). */
+  async countSeenTokens(): Promise<number> {
+    try {
+      const res = await this.get().execute({
+        sql: "SELECT COUNT(*) AS n FROM seen_tokens",
+        args: [],
+      });
+      const row = res.rows[0] as { n?: number | bigint } | undefined;
+      return Number(row?.n ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
   /** Total rows in token_stats (telemetry for /health — pool coverage). */
   async countTokenStats(): Promise<number> {
     try {

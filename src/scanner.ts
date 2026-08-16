@@ -96,6 +96,9 @@ export interface ScanSummary {
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
   backfill: number;
   pool: number;
+  /** Evaluations that passed the age gate (age ≥ min) this scan — proves
+   * in-window coins are actually being evaluated, not silently skipped. */
+  agedEval: number;
   candidates: number;
   pushed: number;
   fails: {
@@ -201,6 +204,7 @@ export class Scanner {
       geo: 0,
       backfill: 0,
       pool: 0,
+      agedEval: 0,
       candidates: 0,
       pushed: 0,
       fails: { mcap: 0, chg: 0, vol5: 0, age: 0, flow: 0, other: 0 },
@@ -417,6 +421,7 @@ export class Scanner {
         if (!statsByToken.has(stats.token)) statsByToken.set(stats.token, stats);
       }
 
+      const agedEval = { count: 0 };
       const candidates = this.matchCoins(
         poolProfiles,
         pairsByToken,
@@ -424,7 +429,9 @@ export class Scanner {
         chats,
         diag.fails,
         diag.rejects,
+        agedEval,
       );
+      diag.agedEval = agedEval.count;
       diag.candidates = candidates.length;
       let pushed = 0;
       for (const [candIdx, coin] of candidates.entries()) {
@@ -918,6 +925,7 @@ export class Scanner {
     }[],
     fails: ScanSummary["fails"],
     rejects: RejectionEntry[],
+    agedEval: { count: number },
   ): QualifyingCoin[] {
     const out: QualifyingCoin[] = [];
     for (const profile of profiles) {
@@ -973,6 +981,10 @@ export class Scanner {
           reject(`上線 ${Math.round(ageMs / 60_000)}m > ${chat.maxAgeMinutes}m`);
           continue; // too old
         }
+        // Reached the age gate in-window (age ≥ min) — count these so /health
+        // can prove in-window coins are evaluated each scan, not silently
+        // skipped (per-chat count, consistent with the fails counters).
+        agedEval.count++;
         if (pair.volume.m5 < chat.min5mVolUsd) {
           fails.vol5++;
           reject(`5m量 ${fmtUsd(pair.volume.m5)} < ${fmtUsd(chat.min5mVolUsd)}`);
