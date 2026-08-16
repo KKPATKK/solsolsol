@@ -5,3 +5,4 @@ dist/
 *.log
 .wrangler/
 .dev.vars
+tsconfig.tsbuildinfo
