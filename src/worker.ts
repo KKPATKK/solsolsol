@@ -202,6 +202,17 @@ async function ensureInitialized(env: Env): Promise<void> {
           );
         }
       }
+      gmgn = null;
+      if (config.gmgnApiKey) {
+        try {
+          gmgn = new GmgnClient(config);
+        } catch (err) {
+          console.warn(
+            "[worker] GMGN client not ready:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
 
       helius = new HeliusClient(config);
 
@@ -626,12 +637,13 @@ export default {
     // egress so a "gmgn feed 0" can be diagnosed as blocked (403/challenge),
     // rate-limited, or a parser mismatch without guessing.
     if (url.pathname === "/debug/gmgn") {
-      if (!gmgn) {
+      const client = gmgn;
+      if (!client) {
         return Response.json({ ok: false, error: "GMGN not configured" });
       }
       try {
         const t0 = Date.now();
-        const items = await gmgn.fetchTrending(5);
+        const items = await client.fetchTrending(5);
         return Response.json({
           ok: true,
           count: items.length,
