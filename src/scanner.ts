@@ -224,7 +224,21 @@ export class Scanner {
         return;
       }
 
-      const profiles = await this.dex.fetchLatestSolanaProfiles();
+      // DexScreener profile feed. Same best-effort guard as pump.fun and
+      // GeckoTerminal below: a rate-limited/5xx feed (shared worker egress
+      // IPs get 429'd regularly) must degrade the scan to the re-eval pool
+      // instead of aborting it — an unguarded throw here produced ~6s
+      // all-zero scans (3 attempts × 2/4s backoff) that skipped the entire
+      // pool evaluation (observed 2026-08-16).
+      let profiles: TokenProfile[] = [];
+      try {
+        profiles = await this.dex.fetchLatestSolanaProfiles();
+      } catch (err) {
+        console.error(
+          "[scanner] dexscreener profile feed failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
       diag.profiles = profiles.length;
       // pump.fun discovery — the widest free source of brand-new coins
       // (DexScreener's profiles feed only returns ~24 Solana profiles per
