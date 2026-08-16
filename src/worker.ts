@@ -1292,6 +1292,78 @@ export default {
       }
     }
 
+    // /debug/pool — diagnostic for zero-push stretches. Age histogram of
+    // never-pushed token_stats rows vs what the scanner's re-eval pool query
+    // actually returns right now (live chat settings, same query shape). If
+    // eligibleInWindow ≫ poolLimit with most coins 12h+ old, the pool's
+    // LIMIT is starving the older half of the window in a dense launch
+    // market; if eligibleInWindow < poolLimit, the pool covers everything
+    // and zero pushes just means nothing qualifies.
+    if (url.pathname === "/debug/pool") {
+      if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
+        return Response.json({ ok: false, error: "TURSO not configured" });
+      }
+      const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
+      const now = Date.now();
+      const hist = await probe.getPoolHistogram(now);
+      let poolQueryBuckets: Record<string, number> | null = null;
+      let poolQueryCount = 0;
+      try {
+        const chats = await probe.listEnabledChats();
+        const minAge = Math.min(...chats.map((c) => c.minAgeMinutes));
+        const maxAge = Math.max(...chats.map((c) => c.maxAgeMinutes));
+        const pool = await probe.getReevalPool({
+          sinceMs: now - 42 * 3600_000,
+          minLaunchMs: now - (maxAge + 180) * 60_000,
+          maxLaunchMs: now - (minAge - 180) * 60_000,
+          windowEntryLaunchMs: now - minAge * 60_000,
+          limit: 1000,
+        });
+        poolQueryCount = pool.length;
+        poolQueryBuckets = {
+          "0-3h": 0,
+          "3-6h": 0,
+          "6-12h": 0,
+          "12-24h": 0,
+          "24-43h": 0,
+          ">43h": 0,
+        };
+        const H = 3600_000;
+        for (const s of pool) {
+          const age = now - s.launchMs;
+          const key =
+            age < 3 * H
+              ? "0-3h"
+              : age < 6 * H
+                ? "3-6h"
+                : age < 12 * H
+                  ? "6-12h"
+                  : age < 24 * H
+                    ? "12-24h"
+                    : age < 43 * H
+                      ? "24-43h"
+                      : ">43h";
+          poolQueryBuckets[key]++;
+        }
+      } catch (err) {
+        console.error(
+          "[worker] /debug/pool pool-query probe failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+      return Response.json({
+        ok: true,
+        now: new Date(now).toISOString(),
+        total: hist.total,
+        neverPushed: hist.neverPushed,
+        buckets: hist.buckets,
+        eligibleInWindow: hist.eligibleInWindow,
+        poolLimit: 1000,
+        poolQueryCount,
+        poolQueryBuckets,
+      });
+    }
+
     // Telegram webhook (grammY registers commands on this bot instance).
     if (webhook) {
       return webhook(request);

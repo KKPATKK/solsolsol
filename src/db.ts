@@ -1042,6 +1042,68 @@ export class Db {
     return res.rows.map((row) => this.statsFromRow(row));
   }
 
+  /**
+   * Diagnostic for /debug/pool: age distribution of token_stats rows
+   * (never-pushed vs total) plus how many never-pushed coins sit inside the
+   * re-eval window (launch 3h–43h ago). Tells whether a zero-push stretch is
+   * a cold market (pool covers the whole window but nothing qualifies) or a
+   * coverage gap (the pool's LIMIT starves 12h+ coins in a dense launch
+   * market — see Scanner.getReevalPoolCached).
+   */
+  async getPoolHistogram(now: number): Promise<{
+    total: number;
+    neverPushed: number;
+    buckets: Record<string, number>;
+    eligibleInWindow: number;
+  }> {
+    const H = 3600_000;
+    const res = await this.get().execute({
+      sql: `SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM seen_tokens s WHERE s.token = token_stats.token) THEN 1 ELSE 0 END) AS never_pushed,
+        SUM(CASE WHEN launch_ms > ? THEN 1 ELSE 0 END) AS b0_3h,
+        SUM(CASE WHEN launch_ms > ? AND launch_ms <= ? THEN 1 ELSE 0 END) AS b3_6h,
+        SUM(CASE WHEN launch_ms > ? AND launch_ms <= ? THEN 1 ELSE 0 END) AS b6_12h,
+        SUM(CASE WHEN launch_ms > ? AND launch_ms <= ? THEN 1 ELSE 0 END) AS b12_24h,
+        SUM(CASE WHEN launch_ms > ? AND launch_ms <= ? THEN 1 ELSE 0 END) AS b24_43h,
+        SUM(CASE WHEN launch_ms <= ? THEN 1 ELSE 0 END) AS b_over43h
+      FROM token_stats`,
+      args: [
+        now - 3 * H,
+        now - 6 * H,
+        now - 3 * H,
+        now - 12 * H,
+        now - 6 * H,
+        now - 24 * H,
+        now - 12 * H,
+        now - 43 * H,
+        now - 24 * H,
+        now - 43 * H,
+      ],
+    });
+    const r = res.rows[0] as Record<string, number | null>;
+    const elig = await this.get().execute({
+      sql: `SELECT COUNT(*) AS n FROM token_stats
+            WHERE launch_ms BETWEEN ? AND ?
+              AND first_seen_at > ?
+              AND NOT EXISTS (SELECT 1 FROM seen_tokens s WHERE s.token = token_stats.token)`,
+      args: [now - 43 * H, now - 3 * H, now - 42 * H],
+    });
+    return {
+      total: Number(r.total ?? 0),
+      neverPushed: Number(r.never_pushed ?? 0),
+      buckets: {
+        "0-3h": Number(r.b0_3h ?? 0),
+        "3-6h": Number(r.b3_6h ?? 0),
+        "6-12h": Number(r.b6_12h ?? 0),
+        "12-24h": Number(r.b12_24h ?? 0),
+        "24-43h": Number(r.b24_43h ?? 0),
+        ">43h": Number(r.b_over43h ?? 0),
+      },
+      eligibleInWindow: Number(elig.rows[0]?.n ?? 0),
+    };
+  }
+
   async recordTokenStats(stats: TokenStats): Promise<void> {
     const res = await this.get().execute({
       sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, supply_flow, supply_flow_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
