@@ -9,6 +9,7 @@ import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
+import { ArkhamClient } from "./arkham";
 
 const config = loadConfig();
 
@@ -134,6 +135,16 @@ async function main(): Promise<void> {
         helius,
         trade ?? undefined,
         new PumpFunClient(config),
+        // gecko / gmgn / axiom are not constructed in the long-running
+        // process (the Worker is the production entry — see worker.ts), so
+        // they stay null here and the Arkham enrichment slots in after them
+        // (positional args — order matters).
+        null, // gecko
+        null, // gmgn
+        null, // axiom
+        // Arkham smart-money attribution (null when no key configured — the
+        // card line shows 未配置).
+        config.arkhamApiKey ? new ArkhamClient(config) : null,
       );
 
       const runScan = async (initial: boolean) => {

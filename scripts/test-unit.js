@@ -11,7 +11,7 @@ const os = require("os");
 const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
-const { parseAdminIds, isAdmin } = require("../dist/config.js");
+const { parseAdminIds, isAdmin, parseSmartMoneyTypes } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
@@ -19,6 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
+const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -574,6 +575,79 @@ async function main() {
     assert.equal(positional[0].developerHoldingPct, 2.5);
     assert.deepEqual(parseAxiomTrending({ not: "array" }), []);
     assert.deepEqual(parseAxiomTrending(null), []);
+  });
+
+  // ---------- arkham.ts ----------
+
+  await test("parseArkhamHolders maps the real /token/holders shape (entity types → smart money)", () => {
+    const out = parseArkhamHolders({
+      token: { identifier: { address: "0x", chain: "solana" }, symbol: "TEST" },
+      totalSupply: { solana: 1e9 },
+      addressTopHolders: {
+        solana: [
+          {
+            address: {
+              address: "walletA",
+              arkhamEntity: { id: "wintermute", name: "Wintermute", type: "marketmaker" },
+              arkhamLabel: { name: "Hot Wallet" },
+            },
+            balance: 50000000,
+            pctOfCap: 0.05, // 5%
+            usd: 12345,
+          },
+          {
+            address: { address: "walletB", arkhamEntity: { id: "binance", name: "Binance", type: "cex" } },
+            balance: 30000000,
+            pctOfCap: 0.03,
+          },
+          {
+            address: { address: "walletC", arkhamEntity: { id: "whale1", name: null, type: "whale" } },
+            balance: 10000000,
+            pctOfCap: 0.01,
+          },
+          {
+            address: { address: "walletD" }, // unlabeled — not smart money
+            balance: 5000000,
+            pctOfCap: 0.005,
+          },
+        ],
+      },
+    });
+    assert.equal(out.holderCount, 4);
+    assert.equal(out.smartMoney.length, 2); // marketmaker + whale (cex excluded)
+    assert.equal(out.smartMoney[0].entityName, "Wintermute");
+    assert.equal(out.smartMoney[0].entityType, "marketmaker");
+    assert.equal(out.smartMoney[0].pctOfCap, 0.05);
+    assert.equal(out.smartMoney[1].entityName, null);
+    assert.equal(out.topHolders[1].entityType, "cex");
+    // Malformed shapes → null; empty holder list → zero-count result (not null).
+    assert.equal(parseArkhamHolders(null), null);
+    assert.equal(parseArkhamHolders("x"), null);
+    assert.equal(parseArkhamHolders({ addressTopHolders: { solana: "nope" } }), null);
+    const empty = parseArkhamHolders({ addressTopHolders: { solana: [] } });
+    assert.equal(empty.holderCount, 0);
+    assert.equal(empty.smartMoney.length, 0);
+  });
+
+  await test("isSmartMoneyType is case-insensitive and excludes neutral types", () => {
+    const types = new Set(["fund", "whale"]);
+    assert.equal(isSmartMoneyType("FUND", types), true);
+    assert.equal(isSmartMoneyType("Whale", types), true);
+    assert.equal(isSmartMoneyType("cex", types), false);
+    assert.equal(isSmartMoneyType(null, types), false);
+    assert.equal(isSmartMoneyType(undefined, types), false);
+  });
+
+  await test("parseSmartMoneyTypes defaults and parses the comma list", () => {
+    assert.equal(parseSmartMoneyTypes(undefined).has("fund"), true);
+    assert.equal(parseSmartMoneyTypes("").has("whale"), true);
+    const custom = parseSmartMoneyTypes(" Whale, market_maker ,,fund ");
+    assert.equal(custom.has("whale"), true);
+    assert.equal(custom.has("market_maker"), true);
+    assert.equal(custom.has("fund"), true);
+    assert.equal(custom.size, 3);
+    // Garbage-only input falls back to the defaults.
+    assert.equal(parseSmartMoneyTypes("  ,, ").has("investor"), true);
   });
 
   await test("AxiomClient token-only mode: no credentials OK, login throws, trending uses injected token", async () => {

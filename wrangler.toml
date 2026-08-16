@@ -62,6 +62,15 @@ BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 GMGN_TRENDING_LIMIT = "0"
 GMGN_REQUEST_INTERVAL_MS = "600"
 GMGN_BLOCK_WASH_TRADING = "true"
+# Arkham Intelligence (requires ARKHAM_API_KEY, a SECRET — set in the
+# Cloudflare dashboard, never here): smart-money attribution on push cards.
+# Each qualifying coin's top-100 holders are checked for entity types in
+# ARKHAM_SMART_MONEY_TYPES (funds/whales/investors/traders/MMs by default);
+# the card shows the smart-money count + top names. Display-only (no
+# blocking). 30 credits/call — the free trial's 1M credits ≈ 33K calls.
+# /debug/arkham?address=<mint> probes it.
+ARKHAM_REQUEST_INTERVAL_MS = "300"
+ARKHAM_SMART_MONEY_TYPES = "fund,hedgefund,hedge_fund,investor,marketmaker,market_maker,trader,vc,venture,whale"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
 HELIUS_REQUEST_INTERVAL_MS = "300"
 # Periodic Birdeye new_listing backfill (safety net for discovery gaps):

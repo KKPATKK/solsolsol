@@ -12,6 +12,7 @@ import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
 import { GmgnClient } from "./gmgn";
 import { AxiomClient } from "./axiom";
+import { ArkhamClient } from "./arkham";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -60,6 +61,7 @@ let helius: HeliusClient | null = null;
 let birdeye: BirdeyeClient | null = null;
 let gmgn: GmgnClient | null = null;
 let axiom: AxiomClient | null = null;
+let arkham: ArkhamClient | null = null;
 /** OTP JWT from the pending Axiom login step 1 (module-local, short-lived). */
 let pendingAxiomOtpJwt: string | null = null;
 let trade: TradeService | null = null;
@@ -107,6 +109,8 @@ let heliusConfigured = false;
 // Whether the BIRDEYE_API_KEY secret reached the Worker (presence only — never the value).
 let birdeyeConfigured = false;
 let gmgnConfigured = false;
+// Whether ARKHAM_API_KEY reached the Worker (presence only — never the value).
+let arkhamConfigured = false;
 // Whether AXIOM_EMAIL/PASSWORD reached the Worker (presence only).
 let axiomConfigured = false;
 // Whether the BOT_WALLET_PRIVATE_KEY secret reached the Worker (presence only).
@@ -177,6 +181,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
     gmgnConfigured = Boolean(config.gmgnApiKey);
+    arkhamConfigured = Boolean(config.arkhamApiKey);
     // Axiom is configured when there are login credentials OR already
     // persisted tokens (Google/SSO accounts have no password — they get
     // tokens via /debug/axiom-tokens, which is re-checked after DB init).
@@ -241,6 +246,18 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
 
+      arkham = null;
+      if (config.arkhamApiKey) {
+        try {
+          arkham = new ArkhamClient(config);
+        } catch (err) {
+          console.warn(
+            "[worker] Arkham client not ready:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
       helius = new HeliusClient(config);
 
       // Jupiter direct trading (off by default; only constructed when the
@@ -286,6 +303,9 @@ async function ensureInitialized(env: Env): Promise<void> {
           // Axiom Trade trending — login-based momentum feed (null when no
           // credentials configured).
           axiom,
+          // Arkham Intelligence — smart-money holder attribution (null when
+          // no ARKHAM_API_KEY configured). Card-only enrichment.
+          arkham,
         );
         scannerReady = true;
       }
@@ -652,6 +672,7 @@ export default {
         heliusConfigured,
         birdeyeConfigured,
         gmgnConfigured,
+        arkhamConfigured,
         axiomConfigured,
         tradeConfigured,
         jupiterKeyed,
@@ -698,6 +719,41 @@ export default {
             mcap: i.marketCap,
             smart: i.smartDegenCount,
             wash: i.isWashTrading,
+          })),
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Arkham smart-money probe — verifies the real holders response shape
+    // from the worker's own egress with the stored key (diagnoses a card
+    // line of 未配置 vs a 4xx auth issue vs a parser mismatch). ?address=
+    // is a Solana token mint; ?raw=1 dumps the parsed holders.
+    if (url.pathname === "/debug/arkham") {
+      const client = arkham;
+      const mint = (url.searchParams.get("address") ?? "").trim();
+      if (!client) {
+        return Response.json({ ok: false, error: "ARKHAM_API_KEY 未配置" });
+      }
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+        return Response.json({ ok: false, error: "missing/invalid ?address=" }, { status: 400 });
+      }
+      try {
+        const t0 = Date.now();
+        const holders = await client.fetchTokenHolders(mint);
+        return Response.json({
+          ok: true,
+          ms: Date.now() - t0,
+          holderCount: holders?.holderCount ?? 0,
+          smartMoneyCount: holders?.smartMoney.length ?? 0,
+          smartMoney: holders?.smartMoney.slice(0, 5).map((h) => ({
+            name: h.entityName,
+            type: h.entityType,
+            pct: h.pctOfCap === null ? null : +(h.pctOfCap * 100).toFixed(2),
           })),
         });
       } catch (err) {

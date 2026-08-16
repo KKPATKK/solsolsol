@@ -25,6 +25,40 @@ export interface SupplyFlowConfig {
 }
 
 /**
+ * Default Arkham entity types counted as "smart money" — funds, whales,
+ * investors, professional traders and market makers. Deliberately excludes
+ * neutral/infrastructure types (cex/dex/bridge/protocol/contract/miner): an
+ * exchange hot wallet holding tokens is not an informed trader.
+ */
+const DEFAULT_SMART_MONEY_TYPES: ReadonlySet<string> = new Set([
+  "fund",
+  "hedgefund",
+  "hedge_fund",
+  "investor",
+  "marketmaker",
+  "market_maker",
+  "trader",
+  "vc",
+  "venture",
+  "whale",
+]);
+
+/**
+ * Parse ARKHAM_SMART_MONEY_TYPES (comma-separated entity-type slugs) into a
+ * lower-cased set (pure — unit-tested). Empty/missing → the default smart
+ * money set; garbage entries are dropped.
+ */
+export function parseSmartMoneyTypes(raw: string | undefined): ReadonlySet<string> {
+  if (!raw || !raw.trim()) return DEFAULT_SMART_MONEY_TYPES;
+  const types = new Set<string>();
+  for (const part of raw.split(",")) {
+    const t = part.trim().toLowerCase();
+    if (t) types.add(t);
+  }
+  return types.size > 0 ? types : DEFAULT_SMART_MONEY_TYPES;
+}
+
+/**
  * Parse BOT_ADMIN_IDS (comma-separated Telegram user IDs) into a number
  * list, dropping empty/garbage entries (pure — unit-tested). Empty string
  * or missing → [] (no admins: /setmode stays locked).
@@ -94,6 +128,22 @@ export interface AppConfig {
   birdeyeApiKey?: string;
   /** GMGN OpenAPI key for smart-money enrichment + trending feed (optional). */
   gmgnApiKey?: string;
+  /**
+   * Arkham Intelligence API key (ARKHAM_API_KEY, a SECRET — set in the
+   * Cloudflare dashboard, never here). Enables smart-money attribution on
+   * push cards: the top-100 holders are checked for entity types in
+   * `arkhamSmartMoneyTypes` (fund/investor/whale/...). Display-only — no
+   * blocking — since "who holds" is context, not a rug signal.
+   */
+  arkhamApiKey?: string;
+  /**
+   * Entity types counted as "smart money" (ARKHAM_SMART_MONEY_TYPES,
+   * comma-separated; defaults to funds/whales/investors/traders/MMs).
+   * Matched lower-case against Arkham's entity `type` slug.
+   */
+  arkhamSmartMoneyTypes: ReadonlySet<string>;
+  /** Minimum spacing between Arkham HTTP requests (rate limiting). */
+  arkhamRequestIntervalMs: number;
   /** Axiom Trade account email (login-based trending feed; optional). */
   axiomEmail?: string;
   /** Axiom Trade account password (login-based trending feed; optional). */
@@ -218,6 +268,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     tursoAuthToken: env.TURSO_AUTH_TOKEN || undefined,
     birdeyeApiKey: env.BIRDEYE_API_KEY || undefined,
     gmgnApiKey: env.GMGN_API_KEY || undefined,
+    arkhamApiKey: env.ARKHAM_API_KEY || undefined,
+    arkhamSmartMoneyTypes: parseSmartMoneyTypes(env.ARKHAM_SMART_MONEY_TYPES),
+    arkhamRequestIntervalMs: Number.isFinite(Number(env.ARKHAM_REQUEST_INTERVAL_MS ?? 300))
+      ? Math.max(0, Number(env.ARKHAM_REQUEST_INTERVAL_MS ?? 300))
+      : 300,
     heliusApiKey: env.HELIUS_API_KEY || undefined,
     scanIntervalSeconds:
       Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 300,

@@ -12,6 +12,7 @@ import type { PumpFunClient } from "./pumpfun";
 import type { GeckoTerminalClient } from "./geckoterminal";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTrendingToken } from "./axiom";
+import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
 
 
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -114,6 +115,8 @@ export interface ScanSummary {
   gmgn: number;
   /** Axiom Trade trending feed size this scan (0 when disabled/not logged in). */
   axiom: number;
+  /** Arkham smart-money enrichments this scan (0 when no key configured). */
+  arkham: number;
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
   backfill: number;
   pool: number;
@@ -208,6 +211,12 @@ export class Scanner {
      * feeds.
      */
     private readonly axiom: AxiomClient | null = null,
+    /**
+     * Arkham Intelligence (null = disabled — no key). Card-only enrichment:
+     * top-100 holder entity attribution → smart-money count + names shown on
+     * the push card. Best-effort: failures degrade to no enrichment.
+     */
+    private readonly arkham: ArkhamClient | null = null,
   ) {}
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -251,6 +260,7 @@ export class Scanner {
       geoTrend: 0,
       gmgn: 0,
       axiom: 0,
+      arkham: 0,
       backfill: 0,
       pool: 0,
       agedEval: 0,
@@ -664,6 +674,9 @@ export class Scanner {
           );
           continue;
         }
+        // Arkham smart-money attribution (card-only enrichment).
+        const arkham = await this.resolveArkhamInfo(coin);
+        if (arkham) diag.arkham++;
         // Re-check right before sending: a concurrent scan (rare, only when
         // a scan outlives the 1-min cron) could have pushed it meanwhile.
         if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
@@ -690,6 +703,7 @@ export class Scanner {
               holders.holderCount,
               rugcheck.creator,
               gmgn,
+              arkham,
             ),
             {
               reply_markup: {
@@ -1276,6 +1290,36 @@ export class Scanner {
     }
   }
 
+  /**
+   * Arkham smart-money attribution for one candidate: entity types of the
+   * top-100 holders, shown on the card. Best-effort — any failure/empty
+   * result negative-caches the coin (5 min) and degrades to no enrichment.
+   */
+  private async resolveArkhamInfo(
+    coin: QualifyingCoin,
+  ): Promise<ArkhamTokenHolders | null> {
+    if (!this.arkham) return null;
+    const mint = coin.pair.baseToken.address;
+    if (this.dataNegativeCached(mint)) return null;
+    try {
+      const holders = await this.arkham.fetchTokenHolders(mint);
+      const empty = holders === null || holders.holderCount === 0;
+      if (empty) {
+        this.dataFailedAt.set(mint, Date.now());
+        return null;
+      }
+      this.dataFailedAt.delete(mint);
+      return holders;
+    } catch (err) {
+      this.dataFailedAt.set(mint, Date.now());
+      console.error(
+        `[scanner] Arkham lookup failed for ${mint}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    }
+  }
+
   private matchCoins(
     profiles: TokenProfile[],
     pairsByToken: Map<string, PairInfo>,
@@ -1384,6 +1428,7 @@ function renderMessage(
   holderCount: number | null,
   creator: string | null,
   gmgn: GmgnTokenInfo | null,
+  arkham: ArkhamTokenHolders | null,
 ): string {
   const { pair, profile } = coin;
   const name = pair.baseToken.name || profile.name || "Unknown";
@@ -1420,6 +1465,18 @@ function renderMessage(
     gmgn === null
       ? "🧠 GMGN: —（未配置）"
       : `🧠 GMGN: 👤${gmgn.holderCount ?? "—"} 持倉 | 💰${gmgn.smartWallets ?? "—"} smart${gmgn.isWashTrading ? " | ⚠️ wash trading" : ""}`;
+  const arkhamLine =
+    arkham === null
+      ? "🕵️ Arkham: —（未配置）"
+      : arkham.smartMoney.length === 0
+        ? "🕵️ Arkham: 0 smart（Top100 无标注机构/鲸鱼）"
+        : (() => {
+            const names = arkham.smartMoney
+              .slice(0, 2)
+              .map((h) => h.entityName ?? h.address.slice(0, 6))
+              .join("、");
+            return `🕵️ Arkham: 💰${arkham.smartMoney.length} smart | ${names}`;
+          })();
 
   const lines = [
     `🪙 ${name} (${symbol})`,
@@ -1434,6 +1491,7 @@ function renderMessage(
     holdersLine,
     creatorLine,
     gmgnLine,
+    arkhamLine,
     `📈 24h 量: ${fmtUsd(pair.volume.h24)}`,
     `💧 流动性: ${fmtUsd(liquidityUsd)}`,
     `⏱️ 上线: ${fmtAge(ageMs)}`,
