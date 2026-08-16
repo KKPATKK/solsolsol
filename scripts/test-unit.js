@@ -18,7 +18,7 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools } = require("../dist/geckoterminal.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
-const { parseAxiomTrending } = require("../dist/axiom.js");
+const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -534,6 +534,47 @@ async function main() {
     assert.equal(positional[0].developerHoldingPct, 2.5);
     assert.deepEqual(parseAxiomTrending({ not: "array" }), []);
     assert.deepEqual(parseAxiomTrending(null), []);
+  });
+
+  await test("AxiomClient token-only mode: no credentials OK, login throws, trending uses injected token", async () => {
+    // Google/SSO accounts have no password — the client must construct fine
+    // without AXIOM_EMAIL/AXIOM_PASSWORD (token-only mode).
+    const client = new AxiomClient({});
+    let threw = null;
+    try {
+      await client.loginStep1();
+    } catch (err) {
+      threw = err instanceof Error ? err.message : String(err);
+    }
+    assert.ok(threw && /AXIOM_EMAIL/.test(threw), "loginStep1 without credentials must throw");
+    // fetchTrending works purely from a stored access token (stub fetch).
+    const origFetch = global.fetch;
+    let calledUrl = null;
+    global.fetch = async (url) => {
+      calledUrl = String(url);
+      return new Response(
+        JSON.stringify({
+          tokens: [
+            {
+              tokenAddress: "2fEjticD78k5cYfbbBGcBRB2zVZ7eQ5nZgYLm9Wvpump",
+              tokenTicker: "DOGE",
+              marketCapUsd: 777,
+              sniperCount: 2,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    try {
+      const items = await client.fetchTrending("fake-access-token", "1h", 5);
+      assert.equal(items.length, 1);
+      assert.equal(items[0].address, "2fEjticD78k5cYfbbBGcBRB2zVZ7eQ5nZgYLm9Wvpump");
+      assert.equal(items[0].marketCapUsd, 777);
+      assert.ok(calledUrl.includes("new-trending-v2"), "hits new-trending-v2");
+    } finally {
+      global.fetch = origFetch;
+    }
   });
 
   await test("trade_log record/hasTraded/countTradesSince round-trips with UNIQUE dedupe", async () => {

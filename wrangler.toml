@@ -117,10 +117,14 @@ TRADE_TIMEOUT_MS = "15000"
 # your ID with @userinfobot. NOTE: /setmode stores a durable override in the
 # DB that wins over TRADE_MODE until it is changed again.
 BOT_ADMIN_IDS = "530602939"
-# Axiom Trade trending feed (login-based; needs AXIOM_EMAIL + AXIOM_PASSWORD
-# as SECRETS — set in the Cloudflare dashboard, never here). The access
-# token is obtained via a one-time OTP login (/debug/axiom-login) and then
-# auto-refreshed. 0 = disabled; default 20 per scan.
+# Axiom Trade trending feed. Two auth paths: (a) email+password — set
+# AXIOM_EMAIL + AXIOM_PASSWORD as SECRETS (Cloudflare dashboard, never
+# here) and do a one-time OTP login via /debug/axiom-login; (b) Google/SSO
+# accounts (no password) — log in on axiom.trade in your browser, copy the
+# auth-access-token + auth-refresh-token cookies, and store them via
+# /debug/axiom-tokens?access=...&refresh=... Either way the tokens live in
+# worker_state and are auto-refreshed by the scanner. 0 = disabled; default
+# 20 per scan.
 AXIOM_TRENDING_LIMIT = "20"
 # Jupiter Swap API v1 (Metis) — the old v6 quote-api.jup.ag endpoints are
 # retired. Keyless works at 0.5 RPS; set JUPITER_API_KEY (a SECRET, via the

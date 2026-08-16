@@ -244,16 +244,19 @@ export function parseAxiomTrending(payload: unknown): AxiomTrendingToken[] {
 }
 
 export class AxiomClient {
-  private readonly email: string;
-  private readonly b64Password: string;
+  private readonly email: string | null;
+  private readonly b64Password: string | null;
 
   constructor(config: AppConfig) {
-    if (!config.axiomEmail || !config.axiomPassword) {
-      throw new Error("AXIOM_EMAIL / AXIOM_PASSWORD are not configured");
-    }
-    this.email = config.axiomEmail;
+    // Credentials are OPTIONAL: accounts that log in via Google/SSO have no
+    // password, so the client can run in token-only mode (tokens persisted
+    // by /debug/axiom-tokens). The password-based login methods below throw
+    // when the credentials are missing.
+    this.email = config.axiomEmail ?? null;
     // The API expects the password base64-encoded in the request body.
-    this.b64Password = b64encode(config.axiomPassword);
+    this.b64Password = config.axiomPassword
+      ? b64encode(config.axiomPassword)
+      : null;
   }
 
   private async postJson(
@@ -293,6 +296,12 @@ export class AxiomClient {
    * OTP code is emailed to the user. Returns the JWT for step 2.
    */
   async loginStep1(): Promise<AxiomLoginStep1> {
+    if (!this.email || !this.b64Password) {
+      throw new Error(
+        "AXIOM_EMAIL / AXIOM_PASSWORD not configured — for Google/SSO accounts " +
+          "extract the tokens from your browser and use /debug/axiom-tokens instead",
+      );
+    }
     const { status, json } = await this.postJson(LOGIN_HOST, "/login-password-v2", {
       email: this.email,
       b64Password: this.b64Password,
@@ -313,6 +322,12 @@ export class AxiomClient {
    * Set-Cookie.
    */
   async loginStep2(otpJwtToken: string, otpCode: string): Promise<AxiomLoginStep2> {
+    if (!this.email || !this.b64Password) {
+      throw new Error(
+        "AXIOM_EMAIL / AXIOM_PASSWORD not configured — for Google/SSO accounts " +
+          "extract the tokens from your browser and use /debug/axiom-tokens instead",
+      );
+    }
     const { status, json, setCookie } = await this.postJson(
       OTP_HOST,
       "/login-otp",

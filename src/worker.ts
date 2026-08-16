@@ -177,21 +177,27 @@ async function ensureInitialized(env: Env): Promise<void> {
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
     gmgnConfigured = Boolean(config.gmgnApiKey);
+    // Axiom is configured when there are login credentials OR already
+    // persisted tokens (Google/SSO accounts have no password — they get
+    // tokens via /debug/axiom-tokens, which is re-checked after DB init).
     axiomConfigured = Boolean(config.axiomEmail && config.axiomPassword);
     tradeConfigured = Boolean(config.trade.walletSecret);
-    jupiterKeyed = Boolean(config.trade.jupiterApiKey);
-
-    if (config.tursoUrl) {
-      try {
-        db = new Db(config.tursoUrl, config.tursoAuthToken);
-        await db.init();
-        dbReady = true;
-        console.log("[worker] Turso ready");
-      } catch (err) {
-        initError = err instanceof Error ? err.message : String(err);
-        console.error("[worker] Turso init failed:", initError);
-      }
-    } else {
+    jupiterKeyed = Boolean(config.trade.jupiterApiKey);      if (config.tursoUrl) {
+        try {
+          db = new Db(config.tursoUrl, config.tursoAuthToken);
+          await db.init();
+          dbReady = true;
+          console.log("[worker] Turso ready");
+          // A Google/SSO Axiom account has no password — its tokens are
+          // persisted by /debug/axiom-tokens, so the feed is "configured"
+          // whenever a stored access token exists too.
+          const storedAxiomToken = await db?.getWorkerState("axiom_access_token");
+          if (storedAxiomToken) axiomConfigured = true;
+        } catch (err) {
+          initError = err instanceof Error ? err.message : String(err);
+          console.error("[worker] Turso init failed:", initError);
+        }
+      } else {
       console.warn("[worker] TURSO_DATABASE_URL missing — persistence disabled");
     }
 
@@ -221,7 +227,10 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
       axiom = null;
-      if (config.axiomEmail && config.axiomPassword) {
+      // The client is created whenever the feed is enabled — credentials are
+      // optional (Google/SSO accounts provide tokens via /debug/axiom-tokens
+      // instead of a password; the client's login methods guard on that).
+      if (config.axiomTrendingLimit > 0) {
         try {
           axiom = new AxiomClient(config);
         } catch (err) {
@@ -696,7 +705,7 @@ export default {
       if (!client) {
         return Response.json({
           ok: false,
-          error: "Axiom not configured (need AXIOM_EMAIL + AXIOM_PASSWORD)",
+          error: "Axiom feed disabled (AXIOM_TRENDING_LIMIT=0) — the OTP login also needs AXIOM_EMAIL + AXIOM_PASSWORD (not available for Google/SSO accounts — use /debug/axiom-tokens)",
         });
       }
       const otp = (url.searchParams.get("otp") ?? "").trim();
@@ -745,6 +754,46 @@ export default {
       }
     }
 
+    // Axiom token injection — for accounts without a password (Google/SSO):
+    // log in on axiom.trade in your own browser, copy the auth-access-token
+    // and auth-refresh-token cookie values, then call
+    //   /debug/axiom-tokens?access=<token>&refresh=<token>
+    // The tokens are persisted in worker_state and auto-refreshed by the
+    // scanner, exactly like the OTP-login path.
+    if (url.pathname === "/debug/axiom-tokens") {
+      const access = (url.searchParams.get("access") ?? "").trim();
+      const refresh = (url.searchParams.get("refresh") ?? "").trim();
+      if (!access || !refresh) {
+        return Response.json({
+          ok: false,
+          error: "missing ?access=<token>&refresh=<token>",
+        });
+      }
+      await db?.setWorkerState("axiom_access_token", access);
+      await db?.setWorkerState("axiom_refresh_token", refresh);
+      axiomConfigured = true;
+      const res: Record<string, unknown> = {
+        ok: true,
+        stored: true,
+        hint: "call /debug/axiom-trending to verify the feed",
+      };
+      // Immediately verify with the just-stored token when a client exists.
+      if (axiom) {
+        try {
+          const items = await axiom.fetchTrending(access, "1h", 5);
+          res.count = items.length;
+          res.sample = items.slice(0, 2).map((i) => ({
+            symbol: i.symbol,
+            mcap: i.marketCapUsd,
+            sniper: i.sniperCount,
+          }));
+        } catch (err) {
+          res.probeError = err instanceof Error ? err.message : String(err);
+        }
+      }
+      return Response.json(res);
+    }
+
     // Axiom trending probe — verifies the feed works end-to-end from the
     // worker's own egress with the stored token (diagnoses auth-expiry vs
     // blocked-egress vs parser mismatch).
@@ -753,7 +802,7 @@ export default {
       if (!client) {
         return Response.json({
           ok: false,
-          error: "Axiom not configured (need AXIOM_EMAIL + AXIOM_PASSWORD)",
+          error: "Axiom feed disabled (AXIOM_TRENDING_LIMIT=0)",
         });
       }
       const accessToken = await db?.getWorkerState("axiom_access_token");
