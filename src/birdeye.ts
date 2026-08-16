@@ -253,7 +253,7 @@ export class BirdeyeClient {
     creator: string | null;
   }> {
     const data = (await this.getJson(
-      `/defi/v1/token/overview?address=${encodeURIComponent(address)}&ui_amount_mode=raw`,
+      `/defi/token_overview?address=${encodeURIComponent(address)}&ui_amount_mode=raw`,
     )) as { data?: Record<string, unknown> } | null;
     return parseTokenOverview(data?.data);
   }
