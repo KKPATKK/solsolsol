@@ -57,6 +57,17 @@ const SCAN_TICK_DEADLINE_MS = 20_000;
  */
 const RE_EVAL_WINDOW_MS = 42 * 60 * 60_000;
 /**
+ * In-memory TTL for the re-eval pool query. The pool only changes when new
+ * coins are recorded, coins are pushed, or the age window slides — nothing
+ * that happens between two 60s scans. Caching it here cuts the scan's most
+ * expensive read (SELECT * … ORDER BY ABS(launch-?) over the whole 42h
+ * window, ~10–20K rows per scan) from ~1/scan to ~1/120s, which is the
+ * dominant Turso rows-read consumer (alerted 2026-08-16). Stale coins are
+ * harmless: the push path re-checks isTokenSeen from the DB before sending,
+ * and newly discovered feed coins are evaluated via feedProfiles anyway.
+ */
+const REEVAL_POOL_CACHE_MS = 120_000;
+/**
  * Margin (minutes) around the qualifying age window: the pool also holds
  * coins that will enter the window within 3h, so they are pushed the moment
  * they qualify instead of being picked up only after a later scan.
@@ -459,7 +470,7 @@ export class Scanner {
       // do.
       const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
       const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
-      const recentStats = await this.db.getReevalPool({
+      const recentStats = await this.getReevalPoolCached(now, {
         sinceMs: now - RE_EVAL_WINDOW_MS,
         minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
@@ -1081,6 +1092,38 @@ export class Scanner {
       );
       return { holderCount: null };
     }
+  }
+
+  /**
+   * Re-eval pool with a short in-memory cache (see REEVAL_POOL_CACHE_MS):
+   * the query is the scan's dominant Turso rows-read consumer, and its
+   * result changes only slowly, so cache hits skip the DB entirely.
+   */
+  private reevalPoolCache: {
+    at: number;
+    sinceMs: number;
+    stats: TokenStats[];
+  } | null = null;
+  private async getReevalPoolCached(
+    now: number,
+    opts: {
+      sinceMs: number;
+      minLaunchMs: number;
+      maxLaunchMs: number;
+      windowEntryLaunchMs: number;
+      limit: number;
+    },
+  ): Promise<TokenStats[]> {
+    if (
+      this.reevalPoolCache &&
+      now - this.reevalPoolCache.at < REEVAL_POOL_CACHE_MS &&
+      this.reevalPoolCache.sinceMs === opts.sinceMs
+    ) {
+      return this.reevalPoolCache.stats;
+    }
+    const stats = await this.db.getReevalPool(opts);
+    this.reevalPoolCache = { at: now, sinceMs: opts.sinceMs, stats };
+    return stats;
   }
 
   /**
