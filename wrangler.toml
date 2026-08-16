@@ -68,7 +68,9 @@ GMGN_BLOCK_WASH_TRADING = "true"
 # ARKHAM_SMART_MONEY_TYPES (funds/whales/investors/traders/MMs by default);
 # the card shows the smart-money count + top names. Display-only (no
 # blocking). 30 credits/call — the free trial's 1M credits ≈ 33K calls.
-# /debug/arkham?address=<mint> probes it.
+# KEPT DORMANT (2026-08-16): opted out — do NOT set ARKHAM_API_KEY until
+# reactivating. The client is key-gated: without the secret no calls are
+# made and the card shows 未配置. /debug/arkham?address=<mint> probes it.
 ARKHAM_REQUEST_INTERVAL_MS = "300"
 ARKHAM_SMART_MONEY_TYPES = "fund,hedgefund,hedge_fund,investor,marketmaker,market_maker,trader,vc,venture,whale"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
