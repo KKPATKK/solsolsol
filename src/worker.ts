@@ -896,6 +896,31 @@ export default {
       }
     }
 
+    // GeckoTerminal trending probe — ground truth for the momentum feed:
+    // reports the raw HTTP status + parse count so a persistent geoTrend: 0
+    // is diagnosable as rate-limited (429), changed shape, or empty feed.
+    if (url.pathname === "/debug/gecko-trending") {
+      const res = await fetch(
+        `https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&limit=20`,
+        { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10_000) },
+      );
+      const text = await res.text();
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        // non-JSON body
+      }
+      const items = (parsed as { data?: unknown[] } | null)?.data ?? [];
+      return Response.json({
+        ok: res.ok,
+        status: res.status,
+        rawBytes: text.length,
+        count: Array.isArray(items) ? items.length : 0,
+        bodyPreview: text.slice(0, 200),
+      });
+    }
+
     // Birdeye token-overview probe — verifies the real holders response
     // shape from the worker's own egress (the schema isn't published, so
     // this lets a card-line "—" be diagnosed as missing data vs a parser
