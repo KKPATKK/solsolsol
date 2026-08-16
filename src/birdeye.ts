@@ -240,22 +240,40 @@ export class BirdeyeClient {
   }
 
   /**
-   * Holder count + creator wallet from the token overview endpoint — the
-   * card's holders/creator lines (GMGN replacement; Birdeye is already keyed
-   * and reachable from the Worker). Field names are parsed defensively
-   * (the docs don't publish a schema): holder accepts holder/holders/
-   * holderCount/holder_count; creator accepts creator/creatorAddress/
-   * creator_address/ownerAddress. Returns nulls on any shape mismatch so a
-   * schema change degrades to "—" on the card, never a scan failure.
+   * Holder count + creator wallet for a token — the card's holders/creator
+   * lines (GMGN replacement; Birdeye is already keyed and reachable from
+   * the Worker). Holders come from the overview endpoint (20 CU), creator
+   * from the security endpoint (50 CU) — creatorAddress is not part of the
+   * overview response. Only called for qualifying candidates, so the ~70 CU
+   * per call is negligible at the current push volume. Field names are
+   * parsed defensively (the docs don't publish a schema) so a schema change
+   * degrades to nulls, never a scan failure.
    */
   async getTokenOverview(address: string): Promise<{
     holderCount: number | null;
     creator: string | null;
   }> {
-    const data = (await this.getJson(
-      `/defi/token_overview?address=${encodeURIComponent(address)}&ui_amount_mode=raw`,
-    )) as { data?: Record<string, unknown> } | null;
-    return parseTokenOverview(data?.data);
+    const [overview, security] = await Promise.all([
+      this.getJson(
+        `/defi/token_overview?address=${encodeURIComponent(address)}&ui_amount_mode=raw`,
+      ),
+      this.getJson(
+        `/defi/token_security?address=${encodeURIComponent(address)}`,
+      ),
+    ]);
+    const holderCount = parseTokenOverview(
+      (overview as { data?: Record<string, unknown> } | null)?.data,
+    ).holderCount;
+    const securityData = (security as { data?: Record<string, unknown> } | null)
+      ?.data;
+    let creator: string | null = null;
+    if (securityData && typeof securityData === "object") {
+      const raw = (securityData as Record<string, unknown>).creatorAddress;
+      if (typeof raw === "string" && raw.trim().length >= 32) {
+        creator = raw.trim();
+      }
+    }
+    return { holderCount, creator };
   }
 
   /**
