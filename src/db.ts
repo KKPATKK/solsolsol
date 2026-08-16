@@ -67,19 +67,26 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
  * qualify or freshly qualified — are evaluated EVERY scan. This is the
  * push-latency-critical cohort: a coin that crosses the gates right after
  * entering the window should be pushed within a minute, not whenever its
- * rotation slot next comes up.
+ * rotation slot next comes up. The above-entry side is 1h (was 2h): a coin
+ * that fails a gate at entry almost never flips within hours, so the extra
+ * hour of band only burned rows-read (the hot band is read+sorted every
+ * scan, and it is the pool query's dominant Turso rows-read consumer).
  */
 const POOL_HOT_BELOW_MS = 0.5 * 3600_000;
-const POOL_HOT_ABOVE_MS = 2 * 3600_000;
+const POOL_HOT_ABOVE_MS = 1 * 3600_000;
 /** Max hot-zone coins per scan; the rest of the pool limit goes to rotation. */
 const POOL_HOT_MAX = 300;
 /**
  * The remainder of the re-eval window is split into this many time slots;
  * one slot is evaluated per scan (rotating with the clock), so every coin
- * in the window is re-evaluated at least once per rotation period (~3h with
- * the scanner's 5-min pool cache). Without rotation the pool LIMIT fills
- * with coins nearest the entry and older in-window coins are never seen
- * again (zero-push bug, 2026-08-16).
+ * in the window is re-evaluated at least once per rotation period. This is
+ * the DEFAULT when no override is passed (the scanner passes its configured
+ * REEVAL_ROTATION_MINUTES-derived slot count, default 12 → 1h sweep); the
+ * old hardcoded 36 slots (~3h sweep) was the push-latency bottleneck
+ * reported 2026-08-16 — a coin crossing the gates in the rotation zone
+ * could wait up to 3h to be re-checked. Without rotation the pool LIMIT
+ * fills with coins nearest the entry and older in-window coins are never
+ * seen again (zero-push bug, 2026-08-16).
  */
 const POOL_ROTATION_SLOTS = 36;
 /**
@@ -1025,11 +1032,13 @@ export class Db {
    * entry over time, so they never came back. Now the pool splits into a
    * HOT zone (coins around the entry, evaluated every scan — the
    * push-latency-critical cohort) plus a ROTATION slot: the rest of the
-   * window is divided into POOL_ROTATION_SLOTS time slots and one slot is
-   * evaluated per scan, so every coin in the window is re-evaluated at
-   * least once per rotation period (~3h with the scanner's 5-min pool
-   * cache). Rows-read stays bounded: each scan reads only the hot band
-   * (~2.5h of launches) plus one rotation slot (~1h), not the whole window.
+   * window is divided into time slots and one slot is evaluated per scan,
+   * so every coin in the window is re-evaluated at least once per rotation
+   * period (slots × the scanner's 5-min pool cache; the scanner passes its
+   * configured REEVAL_ROTATION_MINUTES-derived slot count — 12 slots ≈ 1h
+   * sweep by default, 36 ≈ 3h when unset). Rows-read stays bounded: each
+   * scan reads only the hot band (~1.5h of launches) plus one rotation
+   * slot, not the whole window.
    */
   async getReevalPool(opts: {
     /** first_seen_at >= this (drops tokens whose launch is too far in the past). */
@@ -1041,6 +1050,14 @@ export class Db {
     /** Estimated launch of a token that just entered the window (age == minAgeMinutes). */
     windowEntryLaunchMs: number;
     limit: number;
+    /**
+     * How many rotation slots the window is divided into (one per scan;
+     * defaults to POOL_ROTATION_SLOTS). The scanner derives this from
+     * REEVAL_ROTATION_MINUTES so the full window is swept every ~1h instead
+     * of the ~3h default — the push-latency knob for coins that qualify
+     * after entering the age window.
+     */
+    rotationSlots?: number;
     /** Override for deterministic tests; defaults to Date.now(). */
     now?: number;
   }): Promise<TokenStats[]> {
@@ -1062,12 +1079,12 @@ export class Db {
     }
     const rotLimit = Math.max(0, opts.limit - hotLimit);
     if (rotLimit > 0) {
+      const rotSlots = Math.max(1, Math.floor(opts.rotationSlots ?? POOL_ROTATION_SLOTS));
       const rotHi = hotLo; // everything older than the hot zone
       const rotLo = spanLo;
       if (rotHi > rotLo) {
-        const slotW = (rotHi - rotLo) / POOL_ROTATION_SLOTS;
-        const slot =
-          Math.floor(now / POOL_ROTATION_PERIOD_MS) % POOL_ROTATION_SLOTS;
+        const slotW = (rotHi - rotLo) / rotSlots;
+        const slot = Math.floor(now / POOL_ROTATION_PERIOD_MS) % rotSlots;
         const lo = rotHi - (slot + 1) * slotW;
         const hi = rotHi - slot * slotW;
         out.push(

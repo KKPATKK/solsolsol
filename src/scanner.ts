@@ -511,6 +511,10 @@ export class Scanner {
         maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
         limit: this.config.reevalPoolSize,
+        // Sweep the whole rotation zone every ~REEVAL_ROTATION_MINUTES
+        // (default 60) instead of the 3h default — the push-latency knob
+        // for coins that qualify after entering the age window.
+        rotationSlots: this.config.reevalRotationSlots,
       });
       // token_stats grows with pump.fun discovery (100+ new coins per scan):
       // prune rows older than the re-eval window that were never pushed —
@@ -1162,6 +1166,7 @@ export class Scanner {
       maxLaunchMs: number;
       windowEntryLaunchMs: number;
       limit: number;
+      rotationSlots?: number;
     },
   ): Promise<TokenStats[]> {
     if (this.reevalPoolCache && now - this.reevalPoolCache.at < REEVAL_POOL_CACHE_MS) {

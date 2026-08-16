@@ -1321,6 +1321,9 @@ export default {
           maxLaunchMs: now - (minAge - 180) * 60_000,
           windowEntryLaunchMs: now - minAge * 60_000,
           limit: 1000,
+          // Mirror the scanner's configured rotation cadence so the probe's
+          // age histogram matches what production actually evaluates.
+          rotationSlots: cfg?.reevalRotationSlots ?? 12,
         });
         poolQueryCount = pool.length;
         poolQueryBuckets = {

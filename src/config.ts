@@ -165,6 +165,20 @@ export interface AppConfig {
    */
   reevalPoolSize: number;
   /**
+   * How often (minutes) the re-eval pool's ROTATION zone is fully swept
+   * (REEVAL_ROTATION_MINUTES, default 60). The hot zone around the age
+   * window entry is evaluated every scan (every 5 min), but coins that
+   * qualify LATER — e.g. a coin that crosses the market-cap/volume gates
+   * hours after entering the window — are only re-checked when their
+   * rotation slot comes up. The rotation period is slots × the 5-min pool
+   * cache, so this is the direct push-latency knob: 180 = one sweep per 3h
+   * (the old hardcoded behavior), 60 = one sweep per hour, 30 = per half
+   * hour. Lower = faster pushes but more Turso rows-read (each sweep
+   * re-reads the window; the hot band was trimmed to keep the total budget
+   * roughly flat at the 60-min default).
+   */
+  reevalRotationSlots: number;
+  /**
    * How many newest pump.fun coins to register per scan (PUMPFUN_PROFILE_LIMIT).
    * DexScreener's token-profiles feed only returns ~24 Solana profiles per
    * scan, so pump.fun discovery is the widest free source of brand-new
@@ -251,6 +265,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawPort = Number(env.PORT ?? 3000);
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawReevalPool = Number(env.RE_EVAL_POOL_SIZE ?? 40);
+  const rawRotationMin = Number(env.REEVAL_ROTATION_MINUTES ?? 60);
   const rawPumpfunLimit = Number(env.PUMPFUN_PROFILE_LIMIT ?? 100);
   const rawGeoPages = Number(env.GECKOTERMINAL_POOL_PAGES ?? 1);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
@@ -283,6 +298,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       Number.isFinite(rawReevalPool) && rawReevalPool > 0
         ? Math.min(Math.floor(rawReevalPool), 1000)
         : 40,
+    // Slots = rotation period ÷ the 5-min pool cache TTL (they must stay
+    // aligned so every cache expiry advances to the next slot). 60 min → 12
+    // slots (1h sweep); clamped to 3–48 slots (15min–4h sweep).
+    reevalRotationSlots:
+      Number.isFinite(rawRotationMin) && rawRotationMin > 0
+        ? Math.min(48, Math.max(3, Math.round(rawRotationMin / 5)))
+        : 12,
     pumpfunProfileLimit:
       Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
         ? Math.min(Math.floor(rawPumpfunLimit), 300)
