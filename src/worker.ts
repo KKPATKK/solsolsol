@@ -1184,6 +1184,43 @@ export default {
       });
     }
 
+    // Telegram webhook introspection: reports getWebhookInfo so a dead
+    // /start (messages not delivered) is diagnosable as a missing/moved
+    // webhook registration. ?set=1 re-registers this worker's own URL
+    // (https://<host>/webhook) — safe to call any time.
+    if (url.pathname === "/debug/webhook") {
+      const token = cfg?.telegramBotToken;
+      if (!token) {
+        return Response.json({
+          ok: false,
+          error: "TELEGRAM_BOT_TOKEN not configured",
+        });
+      }
+      try {
+        if (url.searchParams.get("set") === "1") {
+          const whUrl = `https://${url.host}/webhook`;
+          const r = await fetch(
+            `https://api.telegram.org/bot${token}/setWebhook`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url: whUrl }),
+            },
+          );
+          const j: unknown = await r.json();
+          return Response.json({ ok: true, action: "set", url: whUrl, telegram: j });
+        }
+        const r = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`);
+        const j: unknown = await r.json();
+        return Response.json({ ok: true, telegram: j });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // Telegram webhook (grammY registers commands on this bot instance).
     if (webhook) {
       return webhook(request);
