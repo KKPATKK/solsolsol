@@ -61,6 +61,34 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   enabled: false,
 };
 
+/**
+ * Re-eval pool hot zone (see Db.getReevalPool): coins whose launch is within
+ * [window entry − POOL_HOT_BELOW_MS, entry + POOL_HOT_ABOVE_MS] — about to
+ * qualify or freshly qualified — are evaluated EVERY scan. This is the
+ * push-latency-critical cohort: a coin that crosses the gates right after
+ * entering the window should be pushed within a minute, not whenever its
+ * rotation slot next comes up.
+ */
+const POOL_HOT_BELOW_MS = 0.5 * 3600_000;
+const POOL_HOT_ABOVE_MS = 2 * 3600_000;
+/** Max hot-zone coins per scan; the rest of the pool limit goes to rotation. */
+const POOL_HOT_MAX = 300;
+/**
+ * The remainder of the re-eval window is split into this many time slots;
+ * one slot is evaluated per scan (rotating with the clock), so every coin
+ * in the window is re-evaluated at least once per rotation period (~3h with
+ * the scanner's 5-min pool cache). Without rotation the pool LIMIT fills
+ * with coins nearest the entry and older in-window coins are never seen
+ * again (zero-push bug, 2026-08-16).
+ */
+const POOL_ROTATION_SLOTS = 36;
+/**
+ * Rotation cadence — must match the scanner's pool cache TTL
+ * (REEVAL_POOL_CACHE_MS = 300s) so every cache expiry moves to the next
+ * slot instead of re-serving the same slice.
+ */
+const POOL_ROTATION_PERIOD_MS = 300_000;
+
 /** Opening stats captured the first time the scanner ever saw a token. */
 export interface TokenStats {
   token: string;
@@ -983,10 +1011,25 @@ export class Db {
    * the entry point, so only rows near the entry are ever returned: scan the
    * launch_ms index in a narrow band around the entry, widening until the
    * limit is met or the whole window is covered. That turns the ~400K-row
-   * scan into a range scan over a few thousand rows, and the result is
-   * identical to the original query (the widening loop reproduces it
-   * exactly). NOT EXISTS probes the seen_tokens index per candidate instead
-   * of materializing the whole table per query.
+   * scan into a range scan over a few thousand rows. NOT EXISTS probes the
+   * seen_tokens index per candidate instead of materializing the whole table
+   * per query.
+   *
+   * Coverage fix (2026-08-16, zero-push bug): the widening loop stopped as
+   * soon as the band around the entry held `limit` rows, and the pool is
+   * ordered by proximity to the entry — so in a dense launch market the
+   * LIMIT filled up with coins just below the age gate and coins that had
+   * already aged past the gate were NEVER re-evaluated (measured: 26.8K
+   * eligible never-pushed coins in the window, pool returned 1000 coins ALL
+   * aged 3-6h, zero aged 6h+). Older coins only drift farther from the
+   * entry over time, so they never came back. Now the pool splits into a
+   * HOT zone (coins around the entry, evaluated every scan — the
+   * push-latency-critical cohort) plus a ROTATION slot: the rest of the
+   * window is divided into POOL_ROTATION_SLOTS time slots and one slot is
+   * evaluated per scan, so every coin in the window is re-evaluated at
+   * least once per rotation period (~3h with the scanner's 5-min pool
+   * cache). Rows-read stays bounded: each scan reads only the hot band
+   * (~2.5h of launches) plus one rotation slot (~1h), not the whole window.
    */
   async getReevalPool(opts: {
     /** first_seen_at >= this (drops tokens whose launch is too far in the past). */
@@ -998,26 +1041,44 @@ export class Db {
     /** Estimated launch of a token that just entered the window (age == minAgeMinutes). */
     windowEntryLaunchMs: number;
     limit: number;
+    /** Override for deterministic tests; defaults to Date.now(). */
+    now?: number;
   }): Promise<TokenStats[]> {
+    const now = opts.now ?? Date.now();
     const center = opts.windowEntryLaunchMs;
     const spanLo = opts.minLaunchMs;
     const spanHi = opts.maxLaunchMs;
-    // Start at ±1h around the window entry. The launch distribution near
-    // the entry is dense (hundreds of coins launch per hour), so the top
-    // `limit` candidates by distance all live within an hour of the entry;
-    // a narrower band halves the rows read per query. Widen ×4 until the
-    // band covers the full window (max 4 iterations: 1h → 4h → 16h → full)
-    // so sparse markets still return the exact same result the original
-    // whole-window query would.
-    let bandMs = 1 * 60 * 60_000;
-    for (;;) {
-      const lo = Math.max(spanLo, center - bandMs);
-      const hi = Math.min(spanHi, center + bandMs);
-      const rows = await this.queryReevalBand(lo, hi, center, opts);
-      if (rows.length >= opts.limit) return rows;
-      if (lo === spanLo && hi === spanHi) return rows; // full window covered
-      bandMs *= 4;
+    const hotLo = Math.max(spanLo, center - POOL_HOT_BELOW_MS);
+    const hotHi = Math.min(spanHi, center + POOL_HOT_ABOVE_MS);
+    const hotLimit = Math.min(opts.limit, POOL_HOT_MAX);
+    const out: TokenStats[] = [];
+    if (hotHi > hotLo) {
+      out.push(
+        ...(await this.queryReevalBand(hotLo, hotHi, center, {
+          sinceMs: opts.sinceMs,
+          limit: hotLimit,
+        })),
+      );
     }
+    const rotLimit = Math.max(0, opts.limit - hotLimit);
+    if (rotLimit > 0) {
+      const rotHi = hotLo; // everything older than the hot zone
+      const rotLo = spanLo;
+      if (rotHi > rotLo) {
+        const slotW = (rotHi - rotLo) / POOL_ROTATION_SLOTS;
+        const slot =
+          Math.floor(now / POOL_ROTATION_PERIOD_MS) % POOL_ROTATION_SLOTS;
+        const lo = rotHi - (slot + 1) * slotW;
+        const hi = rotHi - slot * slotW;
+        out.push(
+          ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
+            sinceMs: opts.sinceMs,
+            limit: rotLimit,
+          })),
+        );
+      }
+    }
+    return out;
   }
 
   /** One banded re-eval pool query (see getReevalPool). */

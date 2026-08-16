@@ -218,15 +218,14 @@ async function main() {
     }
   });
 
-  await test("getReevalPool respects window, ordering, seen-exclusion and limit", async () => {
+  await test("getReevalPool: hot zone every scan + rotation reaches the old half", async () => {
     const t = tmpDb();
     try {
       const db = new Db(t.p, undefined, t.client);
       await db.init();
-      const now = Date.now();
       const H = 3600e3;
       const M = 60e3;
-      const seed = async (token, firstSeenAt, ageMin, seen = false) => {
+      const seed = async (token, firstSeenAt, ageMin, seen = false, atNow) => {
         await t.client.execute({
           sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)",
           // launch_ms = first_seen_at - age_min * 60s (same estimate the
@@ -236,20 +235,26 @@ async function main() {
         if (seen) {
           await t.client.execute({
             sql: "INSERT INTO seen_tokens (chat_id, token, first_seen_at) VALUES ('chat-x', ?, ?)",
-            args: [token, now],
+            args: [token, atNow],
           });
         }
       };
-      // A: launch 6.5h ago — inside window, closest to entry (0.5h)
+      // Pin `now` to rotation slot 14 (window entry 6h, hot zone 5.5-8h,
+      // rotation band 6.5h-43h split into 36 slots of ~1.014h each → slot 14
+      // covers ages 20.7h-21.7h). All seed times are relative to `now`, so
+      // the synthetic epoch value is fine; floor(50*300e3/300e3)=50, 50%36=14.
+      const now = 50 * 300e3;
+      // A: launch 6.5h ago — in the hot zone, closest to entry
       await seed("A", now - 6 * H, 30);
-      // C: launch 3h20m ago — just before entry, within the 180m margin
+      // C: launch 3h20m ago — young gap below the hot zone (evaluated once
+      // it ages into the hot zone) → not returned this scan
       await seed("C", now - 3 * H - 10 * M, 10);
-      // B: launch 21h ago — inside window, farther (15h)
+      // B: launch 21h ago — in rotation slot 14 (old half of the window)
       await seed("B", now - 20 * H, 60);
-      // F: launch 30h ago — inside window, farthest (24h)
+      // F: launch 30h ago — in a different rotation slot → not this scan
       await seed("F", now - 10 * H, 20 * 60);
       // E: launch 10h ago but already pushed → excluded
-      await seed("E", now - 8 * H, 2 * 60, true);
+      await seed("E", now - 8 * H, 2 * 60, true, now);
       // D: first seen 50h ago → dropped by sinceMs (42h)
       await seed("D", now - 50 * H, 60);
 
@@ -258,12 +263,26 @@ async function main() {
         minLaunchMs: now - (2400 + 180) * M,
         maxLaunchMs: now - (360 - 180) * M,
         windowEntryLaunchMs: now - 360 * M,
-        limit: 3,
+        limit: 1000,
+        now,
       });
-      assert.deepEqual(
-        pool.map((s) => s.token),
-        ["A", "C", "B"], // nearest-to-window-entry first; E and D excluded
-      );
+      // Hot-zone coin (A) first, then the current rotation slot (B). The
+      // young-gap coin C and the other-slot coin F are not returned this
+      // scan; seen (E) and too-old (D) stay excluded.
+      assert.deepEqual(pool.map((s) => s.token), ["A", "B"]);
+
+      // Any other clock position still returns the hot zone (A) — rotation
+      // slots may vary, but the hot cohort must always be evaluated.
+      const pool2 = await db.getReevalPool({
+        sinceMs: now - 42 * H,
+        minLaunchMs: now - (2400 + 180) * M,
+        maxLaunchMs: now - (360 - 180) * M,
+        windowEntryLaunchMs: now - 360 * M,
+        limit: 1000,
+        now: now + 7 * 300e3,
+      });
+      const tokens2 = pool2.map((s) => s.token);
+      assert.ok(tokens2.includes("A"), "hot zone coin must be evaluated every scan");
     } finally {
       await t.cleanup();
     }
