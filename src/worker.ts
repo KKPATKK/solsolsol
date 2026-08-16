@@ -622,6 +622,35 @@ export default {
       });
     }
 
+    // GMGN connectivity probe — calls the real client from the worker's own
+    // egress so a "gmgn feed 0" can be diagnosed as blocked (403/challenge),
+    // rate-limited, or a parser mismatch without guessing.
+    if (url.pathname === "/debug/gmgn") {
+      if (!gmgn) {
+        return Response.json({ ok: false, error: "GMGN not configured" });
+      }
+      try {
+        const t0 = Date.now();
+        const items = await gmgn.fetchTrending(5);
+        return Response.json({
+          ok: true,
+          count: items.length,
+          ms: Date.now() - t0,
+          sample: items.slice(0, 3).map((i) => ({
+            symbol: i.symbol,
+            mcap: i.marketCap,
+            smart: i.smartDegenCount,
+            wash: i.isWashTrading,
+          })),
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // Push history — read-only distribution of seen_tokens for diagnosing
     // "why is push volume low" (all pushes ever, grouped by day, oldest 20).
     if (url.pathname === "/debug/pushes") {
