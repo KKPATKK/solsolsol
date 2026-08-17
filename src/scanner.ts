@@ -499,7 +499,7 @@ export class Scanner {
       // Re-evaluation pool: tokens never pushed that are nearing or inside
       // the qualifying age window. The profiles feed only ever contains young
       // tokens, so without this pool a coin would rotate out of the feed
-      // before reaching the minimum age (6h) and be lost forever. Bounds use
+      // before reaching the minimum age (5h) and be lost forever. Bounds use
       // the widest age window across enabled chats plus a margin, so coins
       // are picked up shortly before they qualify and pushed the moment they
       // do.

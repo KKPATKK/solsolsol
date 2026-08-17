@@ -169,10 +169,10 @@ export interface AppConfig {
    * older than the hot zone (evaluated every scan) is swept in TWO tiers.
    * NEAR (first 6h inside the age window — the coins most likely to cross
    * the gates after entering) every REEVAL_NEAR_SWEEP_MIN (default 10 min);
-   * FAR (the older tail) every REEVAL_FAR_SWEEP_MIN (default 90 min — every
+   * FAR (the older tail) every REEVAL_FAR_SWEEP_MIN (default 45 min — every
    * coin is still re-checked at least once per sweep, but the old tail
    * stops consuming most of the budget). Slots = sweep minutes ÷ the 5-min
-   * pool cache TTL (2 near + 18 far at the defaults). Rotation bands order
+   * pool cache TTL (2 near + 9 far at the defaults). Rotation bands order
    * by the highest mcap ever observed, and coins repeatedly seen below half
    * the market-cap gate are dropped from the pool (pre-qualification
    * filter), so the sweep budget concentrates on realistic candidates.
@@ -267,7 +267,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawReevalPool = Number(env.RE_EVAL_POOL_SIZE ?? 40);
   const rawNearSweepMin = Number(env.REEVAL_NEAR_SWEEP_MIN ?? 10);
-  const rawFarSweepMin = Number(env.REEVAL_FAR_SWEEP_MIN ?? 90);
+  const rawFarSweepMin = Number(env.REEVAL_FAR_SWEEP_MIN ?? 45);
   const rawPumpfunLimit = Number(env.PUMPFUN_PROFILE_LIMIT ?? 100);
   const rawGeoPages = Number(env.GECKOTERMINAL_POOL_PAGES ?? 1);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
@@ -302,7 +302,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         : 40,
     // Slots = sweep minutes ÷ the 5-min pool cache TTL (they must stay
     // aligned so every cache expiry advances to the next slot). Near: 10 min
-    // → 2 slots; far: 90 min → 18 slots.
+    // → 2 slots; far: 45 min → 9 slots.
     reevalNearSlots:
       Number.isFinite(rawNearSweepMin) && rawNearSweepMin > 0
         ? Math.min(12, Math.max(1, Math.round(rawNearSweepMin / 5)))
@@ -310,7 +310,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     reevalFarSlots:
       Number.isFinite(rawFarSweepMin) && rawFarSweepMin > 0
         ? Math.min(48, Math.max(2, Math.round(rawFarSweepMin / 5)))
-        : 18,
+        : 9,
     pumpfunProfileLimit:
       Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
         ? Math.min(Math.floor(rawPumpfunLimit), 300)

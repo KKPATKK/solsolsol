@@ -44,7 +44,7 @@ export interface ChatSettings {
 }
 
 /**
- * Current filter profile: mid-cap coins ($40K–$300K) aged 6–40 hours with a
+ * Current filter profile: mid-cap coins ($40K–$300K) aged 5–40 hours with a
  * hot 5m tape. The first-minute-volume, sniper, bundler and top-10 holder
  * filters were removed (bundler/top-10 data is shown on the card for
  * reference only).
@@ -54,7 +54,7 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minVolume24hUsd: 0,
   minMarketCapUsd: 40000,
   maxMarketCapUsd: 300000,
-  minAgeMinutes: 360, // 6h
+  minAgeMinutes: 300, // 5h
   maxAgeMinutes: 2400, // 40h
   min5mVolUsd: 6000,
   min5mChgPct: 30,
@@ -88,7 +88,7 @@ const POOL_HOT_MAX = 300;
  *     pool cache = 10-min full sweep by default).
  *   FAR zone: the rest of the window (entry+6h → maxAge). Qualification is
  *     rare this deep in, so it is swept slowly (POOL_FAR_SLOTS × 5 min =
- *     90-min full sweep by default) — every coin is still re-checked at
+ *     45-min full sweep by default) — every coin is still re-checked at
  *     least once per sweep, but the old tail stops consuming most of the
  *     budget.
  *
@@ -104,8 +104,8 @@ const POOL_HOT_MAX = 300;
 const POOL_NEAR_WINDOW_MS = 6 * 3600_000;
 /** Near-zone slot count (10-min full sweep at the 5-min pool cache). */
 const POOL_NEAR_SLOTS = 2;
-/** Far-zone slot count (90-min full sweep at the 5-min pool cache). */
-const POOL_FAR_SLOTS = 18;
+/** Far-zone slot count (45-min full sweep at the 5-min pool cache). */
+const POOL_FAR_SLOTS = 9;
 /** Share of the rotation budget given to the near zone (rest → far zone). */
 const POOL_NEAR_LIMIT_SHARE = 0.7;
 /**
@@ -216,7 +216,7 @@ export class Db {
           min_volume_24h_usd REAL NOT NULL DEFAULT 0,
           min_market_cap_usd REAL NOT NULL DEFAULT 40000,
           max_market_cap_usd REAL NOT NULL DEFAULT 300000,
-          min_age_minutes REAL NOT NULL DEFAULT 360,
+          min_age_minutes REAL NOT NULL DEFAULT 300,
           max_age_minutes REAL NOT NULL DEFAULT 2400,
           min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
           min_5m_chg_pct REAL NOT NULL DEFAULT 30,
@@ -357,7 +357,7 @@ export class Db {
     if (!schemaAlterDone) {
       await this.addColumnIfMissing("chat_settings", "min_market_cap_usd", "REAL NOT NULL DEFAULT 40000");
       await this.addColumnIfMissing("chat_settings", "max_market_cap_usd", "REAL NOT NULL DEFAULT 300000");
-      await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 360");
+      await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 300");
       await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 2400");
       await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
       await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
@@ -1074,7 +1074,7 @@ export class Db {
    *
    *   NEAR zone (entry → entry+6h of age): the coins most likely to cross
    *     the gates after entering — POOL_NEAR_SLOTS slots swept every ~10 min.
-   *   FAR zone (older tail): POOL_FAR_SLOTS slots swept every ~90 min —
+   *   FAR zone (older tail): POOL_FAR_SLOTS slots swept every ~45 min —
    *     every coin is still re-checked at least once per far sweep, but the
    *     old tail stops consuming most of the budget.
    *
@@ -1105,8 +1105,8 @@ export class Db {
      */
     nearSlots?: number;
     /**
-     * Far-zone slot count (see POOL_FAR_SLOTS). Default 18 → a full
-     * far-zone sweep every ~90 min at the 5-min pool cache.
+     * Far-zone slot count (see POOL_FAR_SLOTS). Default 9 → a full
+     * far-zone sweep every ~45 min at the 5-min pool cache.
      */
     farSlots?: number;
     /**

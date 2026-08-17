@@ -4,10 +4,10 @@ compatibility_date = "2026-08-09"
 compatibility_flags = ["nodejs_compat"]
 
 # Cron fires every minute (the free-tier minimum); the scan itself is
-# gated by SCAN_INTERVAL_SECONDS below (90s → every other tick runs a
-# scan), so upstream API pressure (GeckoTerminal 429s) is roughly halved
-# without losing coverage — the re-eval pool + Birdeye backfill cover the
-# gap between scans.
+# gated by SCAN_INTERVAL_SECONDS below (60s → every tick runs a scan, the
+# fastest cadence the 1-min cron can drive). If the upstream API pressure
+# (GeckoTerminal 429s) ever returns, raise this back to 90 (every other
+# tick) — the re-eval pool + Birdeye backfill keep coverage during the gap.
 [triggers]
 crons = ["* * * * *"]
 
@@ -18,14 +18,14 @@ crons = ["* * * * *"]
 [vars]
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one finished less
-# than this long ago (cross-isolate via the DB heartbeat), so the effective
-# cadence is ~2× this value at the 1-min cron granularity. 60 = scan every
-# minute (old default; kept the hot-zone push latency at 1 min but doubled
-# the upstream call rate); 90 = scan every ~2 min, halving GeckoTerminal /
-# DexScreener / Birdeye call volume and Turso rows-read (the 2026-08-16
-# mitigation for the sustained gecko 429s — push latency for coins that
-# qualify inside the age window goes from ~1 min to ~2 min).
-SCAN_INTERVAL_SECONDS = "90"
+# than this long ago (cross-isolate via the DB heartbeat). 60 = scan every
+# minute — the fastest cadence the 1-min cron can drive: hot-zone push
+# latency for coins that qualify inside the age window is ~1 min. 90 = scan
+# every ~2 min, halving GeckoTerminal / DexScreener / Birdeye call volume
+# and Turso rows-read (the 2026-08-16 mitigation for the sustained gecko
+# 429s — restore it if those return; the gecko client's 5-min backoff and
+# the Birdeye backfill are the safety nets at the 60s cadence).
+SCAN_INTERVAL_SECONDS = "60"
 # Max coverage: inspect the newest 100 Solana token profiles per scan
 # (the code caps this at 100). Deferred candidates stay in the re-eval
 # pool, so nothing is lost when a tick runs out of budget.
@@ -40,14 +40,14 @@ RE_EVAL_POOL_SIZE = "1000"
 # tiers. NEAR tier = the first 6h inside the age window — the coins most
 # likely to cross the gates after entering — swept every REEVAL_NEAR_SWEEP_MIN
 # (default 10). FAR tier = the older tail, swept every REEVAL_FAR_SWEEP_MIN
-# (default 90) — every coin is still re-checked at least once per sweep, but
+# (default 45) — every coin is still re-checked at least once per sweep, but
 # the old tail stops consuming most of the budget. Rotation bands order by
 # the highest mcap ever observed, and coins repeatedly seen below half the
 # market-cap gate are dropped from the pool (pre-qualification filter), so
 # the sweep budget concentrates on realistic candidates. Slots = sweep ÷ the
-# 5-min pool cache (2 near + 18 far at the defaults).
+# 5-min pool cache (2 near + 9 far at the defaults).
 REEVAL_NEAR_SWEEP_MIN = "10"
-REEVAL_FAR_SWEEP_MIN = "90"
+REEVAL_FAR_SWEEP_MIN = "45"
 # pump.fun discovery: DexScreener's profiles feed only returns ~24 Solana
 # coins per scan, so also register the newest pump.fun coins (code default
 # 100, max 300) into the re-eval pool every scan. Best-effort — if pump.fun

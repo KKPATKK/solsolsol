@@ -44,7 +44,7 @@ async function phase1() {
   const checks = [
     ["DEFAULT_SETTINGS.minMarketCapUsd", DEFAULT_SETTINGS.minMarketCapUsd, 40000],
     ["DEFAULT_SETTINGS.maxMarketCapUsd", DEFAULT_SETTINGS.maxMarketCapUsd, 300000],
-    ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 360],
+    ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 300],
     ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 2400],
     ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 6000],
     ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 30],

@@ -1323,11 +1323,11 @@ export default {
           windowEntryLaunchMs: now - minAge * 60_000,
           limit: 1000,
           // Mirror the scanner's configured tiered rotation (near slots
-          // swept every ~10 min, far slots every ~90 min, plus the
+          // swept every ~10 min, far slots every ~45 min, plus the
           // pre-qualification filter) so the probe's age histogram matches
           // what production actually evaluates.
           nearSlots: cfg?.reevalNearSlots ?? 2,
-          farSlots: cfg?.reevalFarSlots ?? 18,
+          farSlots: cfg?.reevalFarSlots ?? 9,
           minQualifyMcap: minMcap / 2,
         });
         poolQueryCount = pool.length;
@@ -1400,11 +1400,12 @@ export default {
     }
     await ensureInitialized(env);
     if (!scanner) return;
-    // Cadence gate: the cron trigger fires every minute, but SCAN_INTERVAL_SECONDS
-    // may be longer (90s — every other tick, halving upstream API pressure and
-    // Turso rows-read). Skip the scan when one completed recently; the DB
-    // heartbeat is the cross-isolate source of truth (an in-memory timestamp
-    // can't gate another isolate's cron delivery). The HTTP-driven fallback
+    // Cadence gate: the cron trigger fires every minute; SCAN_INTERVAL_SECONDS
+    // (default 60s) lets the operator slow the scan (e.g. 90s — every other
+    // tick, halving upstream API pressure and Turso rows-read). Skip the
+    // scan when one completed recently; the DB heartbeat is the
+    // cross-isolate source of truth (an in-memory timestamp can't gate
+    // another isolate's cron delivery). The HTTP-driven fallback
     // (maybeRunScanIfStale) still rescues a dead cron within 2 min.
     const scanGapMs = Math.max(60_000, (cfg?.scanIntervalSeconds ?? 60) * 1000);
     try {
