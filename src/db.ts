@@ -88,7 +88,7 @@ const POOL_HOT_MAX = 300;
  *     pool cache = 10-min full sweep by default).
  *   FAR zone: the rest of the window (entry+6h → maxAge). Qualification is
  *     rare this deep in, so it is swept slowly (POOL_FAR_SLOTS × 5 min =
- *     45-min full sweep by default) — every coin is still re-checked at
+ *     30-min full sweep by default) — every coin is still re-checked at
  *     least once per sweep, but the old tail stops consuming most of the
  *     budget.
  *
@@ -104,8 +104,8 @@ const POOL_HOT_MAX = 300;
 const POOL_NEAR_WINDOW_MS = 6 * 3600_000;
 /** Near-zone slot count (10-min full sweep at the 5-min pool cache). */
 const POOL_NEAR_SLOTS = 2;
-/** Far-zone slot count (45-min full sweep at the 5-min pool cache). */
-const POOL_FAR_SLOTS = 9;
+/** Far-zone slot count (30-min full sweep at the 5-min pool cache). */
+const POOL_FAR_SLOTS = 6;
 /** Share of the rotation budget given to the near zone (rest → far zone). */
 const POOL_NEAR_LIMIT_SHARE = 0.7;
 /**
@@ -1074,7 +1074,7 @@ export class Db {
    *
    *   NEAR zone (entry → entry+6h of age): the coins most likely to cross
    *     the gates after entering — POOL_NEAR_SLOTS slots swept every ~10 min.
-   *   FAR zone (older tail): POOL_FAR_SLOTS slots swept every ~45 min —
+   *   FAR zone (older tail): POOL_FAR_SLOTS slots swept every ~30 min —
    *     every coin is still re-checked at least once per far sweep, but the
    *     old tail stops consuming most of the budget.
    *
@@ -1105,8 +1105,8 @@ export class Db {
      */
     nearSlots?: number;
     /**
-     * Far-zone slot count (see POOL_FAR_SLOTS). Default 9 → a full
-     * far-zone sweep every ~45 min at the 5-min pool cache.
+     * Far-zone slot count (see POOL_FAR_SLOTS). Default 6 → a full
+     * far-zone sweep every ~30 min at the 5-min pool cache.
      */
     farSlots?: number;
     /**

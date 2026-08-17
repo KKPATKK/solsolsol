@@ -1323,11 +1323,11 @@ export default {
           windowEntryLaunchMs: now - minAge * 60_000,
           limit: 1000,
           // Mirror the scanner's configured tiered rotation (near slots
-          // swept every ~10 min, far slots every ~45 min, plus the
+          // swept every ~10 min, far slots every ~30 min, plus the
           // pre-qualification filter) so the probe's age histogram matches
           // what production actually evaluates.
           nearSlots: cfg?.reevalNearSlots ?? 2,
-          farSlots: cfg?.reevalFarSlots ?? 9,
+          farSlots: cfg?.reevalFarSlots ?? 6,
           minQualifyMcap: minMcap / 2,
         });
         poolQueryCount = pool.length;

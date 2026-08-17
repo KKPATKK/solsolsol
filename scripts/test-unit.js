@@ -242,16 +242,16 @@ async function main() {
       // Pin `now` = 50 × 5 min → slot counter 50. Default tiers: hot zone
       // ages 5h–6.5h (every scan); NEAR zone ages 6.5h–12h in 2 slots (slot
       // 0 = 6.5–9.25h, slot 1 = 9.25–12h, full sweep every 2 scans = 10
-      // min); FAR zone ages 12h–43h in 9 slots (slot 5 = 29.2–32.7h, full
-      // sweep every 9 scans = 45 min).
+      // min); FAR zone ages 12h–43h in 6 slots (slot 2 = 22.3–27.5h, full
+      // sweep every 6 scans = 30 min).
       const now = 50 * 300e3;
       // HOT: age 6h — hot zone, evaluated every scan
       await seed("HOT", now - 6 * H, 0);
       // NEAR0 / NEAR1: ages 8h / 11h — near slots 0 / 1
       await seed("NEAR0", now - 8 * H, 0);
       await seed("NEAR1", now - 11 * H, 0);
-      // FAR: age 30h — far slot 5 (50 % 9 = 5)
-      await seed("FAR", now - 30 * H, 0);
+      // FAR: age 25h — far slot 2 (50 % 6 = 2)
+      await seed("FAR", now - 25 * H, 0);
       // YOUNG: age 2.5h — below the hot zone, not evaluated until it ages in
       await seed("YOUNG", now - 150 * M, 0);
       // SEEN: age 10h but already pushed → excluded
@@ -274,7 +274,7 @@ async function main() {
       assert.ok(t0.includes("HOT"), "hot zone coin present");
       assert.ok(t0.includes("NEAR0"), "near slot 0 active at scan 0");
       assert.ok(!t0.includes("NEAR1"), "near slot 1 not active at scan 0");
-      assert.ok(t0.includes("FAR"), "far slot 5 active at scan 0");
+      assert.ok(t0.includes("FAR"), "far slot 2 active at scan 0");
       assert.ok(!t0.includes("YOUNG"), "too-young coin must not be evaluated");
       assert.ok(!t0.includes("SEEN"), "already-pushed coin excluded");
       assert.ok(!t0.includes("OLD"), "too-old coin dropped by sinceMs");
@@ -284,10 +284,10 @@ async function main() {
       assert.ok(t1.includes("HOT"), "hot zone every scan");
       assert.ok(t1.includes("NEAR1"), "near slot 1 active at scan 1");
       assert.ok(!t1.includes("NEAR0"), "near slot 0 not active at scan 1");
-      assert.ok(!t1.includes("FAR"), "far slot 6 active at scan 1, not slot 5");
+      assert.ok(!t1.includes("FAR"), "far slot 3 active at scan 1, not slot 2");
 
       // Full-sweep properties: NEAR fully covered within 2 scans (10 min),
-      // FAR within 9 scans (45 min), hot every scan.
+      // FAR within 6 scans (30 min), hot every scan.
       let hotSeen = 0;
       let near0 = 0;
       let near1 = 0;
@@ -307,8 +307,8 @@ async function main() {
       );
       assert.deepEqual(
         farScans,
-        [0, 9],
-        "far coin re-checked exactly once per 45-min sweep (slot 5 active at scans 0 and 9)",
+        [0, 6, 12],
+        "far coin re-checked exactly once per 30-min sweep (slot 2 active at scans 0, 6, 12)",
       );
     } finally {
       await t.cleanup();
@@ -334,14 +334,14 @@ async function main() {
           ],
         });
       };
-      // Same far slot (age 30h → slot 5 at now=50×5min), differing mcap
+      // Same far slot (age 25h → slot 2 at now=50×5min), differing mcap
       // history: FAR_HIGH 35K (above half-gate), FAR_LOW 3K (hopeless), and
       // FAR_NULL NULL (never seen with pair data yet). Hot coin with NULL.
       const now = 50 * 300e3;
       await seed("HOT", now - 6 * H, 0, null);
-      await seed("FAR_HIGH", now - 30 * H, 0, 35000);
-      await seed("FAR_LOW", now - 30 * H, 0, 3000);
-      await seed("FAR_NULL", now - 30 * H, 0, null);
+      await seed("FAR_HIGH", now - 25 * H, 0, 35000);
+      await seed("FAR_LOW", now - 25 * H, 0, 3000);
+      await seed("FAR_NULL", now - 25 * H, 0, null);
 
       const pool = await db.getReevalPool({
         sinceMs: now - 42 * H,
