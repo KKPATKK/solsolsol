@@ -102,16 +102,18 @@ const POOL_HOT_MAX = 300;
  * LIMIT always picks the most promising coins.
  */
 const POOL_NEAR_WINDOW_MS = 6 * 3600_000;
-/** Near-zone slot count (10-min full sweep at the 5-min pool cache). */
+/** Near-zone slot count (10-min full sweep at the default pool cache). */
 const POOL_NEAR_SLOTS = 2;
-/** Far-zone slot count (30-min full sweep at the 5-min pool cache). */
+/** Far-zone slot count (30-min full sweep at the default pool cache). */
 const POOL_FAR_SLOTS = 6;
 /** Share of the rotation budget given to the near zone (rest → far zone). */
 const POOL_NEAR_LIMIT_SHARE = 0.7;
 /**
- * Rotation cadence — must match the scanner's pool cache TTL
- * (REEVAL_POOL_CACHE_MS = 300s) so every cache expiry moves to the next
- * slot instead of re-serving the same slice.
+ * Rotation cadence default — must match the caller's pool cache TTL so
+ * every cache expiry moves to the next slot instead of re-serving the same
+ * slice. The scanner passes its configured TTL (REEVAL_POOL_CACHE_SECONDS,
+ * default 180s) as rotationPeriodMs; this constant is the db-side default
+ * (300s) used when no period is given (tests, /debug/pool fallback).
  */
 const POOL_ROTATION_PERIOD_MS = 300_000;
 
@@ -1101,14 +1103,22 @@ export class Db {
     limit: number;
     /**
      * Near-zone slot count (see POOL_NEAR_SLOTS). Default 2 → a full
-     * near-zone sweep every ~10 min at the 5-min pool cache.
+     * near-zone sweep every ~10 min at the default pool cache.
      */
     nearSlots?: number;
     /**
      * Far-zone slot count (see POOL_FAR_SLOTS). Default 6 → a full
-     * far-zone sweep every ~30 min at the 5-min pool cache.
+     * far-zone sweep every ~30 min at the default pool cache.
      */
     farSlots?: number;
+    /**
+     * Rotation period in ms — MUST equal the caller's pool cache TTL so
+     * each cache expiry advances to the next slot. Defaults to
+     * POOL_ROTATION_PERIOD_MS (300s); production passes the configured
+     * REEVAL_POOL_CACHE_SECONDS (default 180s → 6-min near / 18-min far
+     * sweeps at the default slot counts).
+     */
+    rotationPeriodMs?: number;
     /**
      * Pre-qualification floor: when set, coins whose max_mcap_observed is
      * known and below this value are dropped from every band (NULL = never
@@ -1151,7 +1161,7 @@ export class Db {
       Math.min(rotLimit, Math.round(rotLimit * POOL_NEAR_LIMIT_SHARE)),
     );
     const farLimit = Math.max(0, rotLimit - nearLimit);
-    const slot = Math.floor(now / POOL_ROTATION_PERIOD_MS);
+    const slot = Math.floor(now / (opts.rotationPeriodMs ?? POOL_ROTATION_PERIOD_MS));
     // Near zone: entry → entry + POOL_NEAR_WINDOW_MS of age — fresh
     // in-window coins, most likely to cross the gates → frequent sweep.
     if (rotHi > nearLo && nearLimit > 0) {

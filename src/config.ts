@@ -168,17 +168,29 @@ export interface AppConfig {
    * Re-evaluation pool rotation tiers (see Db.getReevalPool): everything
    * older than the hot zone (evaluated every scan) is swept in TWO tiers.
    * NEAR (first 6h inside the age window — the coins most likely to cross
-   * the gates after entering) every REEVAL_NEAR_SWEEP_MIN (default 10 min);
-   * FAR (the older tail) every REEVAL_FAR_SWEEP_MIN (default 30 min — every
+   * the gates after entering) every REEVAL_NEAR_SWEEP_MIN (default 6 min);
+   * FAR (the older tail) every REEVAL_FAR_SWEEP_MIN (default 18 min — every
    * coin is still re-checked at least once per sweep, but the old tail
-   * stops consuming most of the budget). Slots = sweep minutes ÷ the 5-min
-   * pool cache TTL (2 near + 6 far at the defaults). Rotation bands order
-   * by the highest mcap ever observed, and coins repeatedly seen below half
+   * stops consuming most of the budget). Slots = sweep minutes ÷ the pool
+   * cache TTL (2 near + 6 far at the defaults). Rotation bands order by
+   * the highest mcap ever observed, and coins repeatedly seen below half
    * the market-cap gate are dropped from the pool (pre-qualification
    * filter), so the sweep budget concentrates on realistic candidates.
    */
   reevalNearSlots: number;
   reevalFarSlots: number;
+  /**
+   * Re-eval pool query cache TTL in ms (REEVAL_POOL_CACHE_SECONDS, default
+   * 180 = 3 min). The pool query is the scan's dominant Turso rows-read
+   * consumer, so it is cached and re-run once per TTL per isolate; the same
+   * value drives the rotation period (slots advance with each cache
+   * expiry), so it must stay aligned with the sweep vars above. Lower TTL =
+   * faster pickup of newly eligible coins + faster rotation, at
+   * proportionally more pool-query rows-read (180s ≈ ×1.67 the old 300s
+   * cadence — still a small share of the Turso free tier's 500M
+   * rows-read/month).
+   */
+  reevalPoolCacheMs: number;
   /**
    * How many newest pump.fun coins to register per scan (PUMPFUN_PROFILE_LIMIT).
    * DexScreener's token-profiles feed only returns ~24 Solana profiles per
@@ -266,8 +278,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawPort = Number(env.PORT ?? 3000);
   const rawLimit = Number(env.SCAN_PROFILE_LIMIT ?? 40);
   const rawReevalPool = Number(env.RE_EVAL_POOL_SIZE ?? 40);
-  const rawNearSweepMin = Number(env.REEVAL_NEAR_SWEEP_MIN ?? 10);
-  const rawFarSweepMin = Number(env.REEVAL_FAR_SWEEP_MIN ?? 30);
+  const rawPoolCacheSec = Number(env.REEVAL_POOL_CACHE_SECONDS ?? 180);
+  const poolCacheMs =
+    (Number.isFinite(rawPoolCacheSec) && rawPoolCacheSec > 0
+      ? Math.min(600, Math.max(30, rawPoolCacheSec))
+      : 180) * 1000;
+  const rawNearSweepMin = Number(env.REEVAL_NEAR_SWEEP_MIN ?? 6);
+  const rawFarSweepMin = Number(env.REEVAL_FAR_SWEEP_MIN ?? 18);
   const rawPumpfunLimit = Number(env.PUMPFUN_PROFILE_LIMIT ?? 100);
   const rawGeoPages = Number(env.GECKOTERMINAL_POOL_PAGES ?? 1);
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
@@ -300,17 +317,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       Number.isFinite(rawReevalPool) && rawReevalPool > 0
         ? Math.min(Math.floor(rawReevalPool), 1000)
         : 40,
-    // Slots = sweep minutes ÷ the 5-min pool cache TTL (they must stay
-    // aligned so every cache expiry advances to the next slot). Near: 10 min
-    // → 2 slots; far: 30 min → 6 slots.
+    // Slots = sweep minutes ÷ the pool cache TTL (they must stay aligned so
+    // every cache expiry advances to the next slot). Defaults at the 3-min
+    // cache: near 6 min → 2 slots; far 18 min → 6 slots.
     reevalNearSlots:
       Number.isFinite(rawNearSweepMin) && rawNearSweepMin > 0
-        ? Math.min(12, Math.max(1, Math.round(rawNearSweepMin / 5)))
+        ? Math.min(12, Math.max(1, Math.round(rawNearSweepMin / (poolCacheMs / 60_000))))
         : 2,
     reevalFarSlots:
       Number.isFinite(rawFarSweepMin) && rawFarSweepMin > 0
-        ? Math.min(48, Math.max(2, Math.round(rawFarSweepMin / 5)))
+        ? Math.min(48, Math.max(2, Math.round(rawFarSweepMin / (poolCacheMs / 60_000))))
         : 6,
+    reevalPoolCacheMs: poolCacheMs,
     pumpfunProfileLimit:
       Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
         ? Math.min(Math.floor(rawPumpfunLimit), 300)

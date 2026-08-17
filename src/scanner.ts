@@ -58,20 +58,20 @@ const SCAN_TICK_DEADLINE_MS = 20_000;
  */
 const RE_EVAL_WINDOW_MS = 42 * 60 * 60_000;
 /**
- * In-memory TTL for the re-eval pool query. The pool only changes when new
- * coins are recorded, coins are pushed, or the age window slides — nothing
- * that happens between two 60s scans. The query is now index-bounded (see
- * Db.getReevalPool: a launch_ms band scan over a few thousand rows instead
- * of the ~400K-row full scan it used to do — the dominant Turso rows-read
- * consumer, alerted 2026-08-16), so this cache cuts the remaining cost to
- * 1/5 of a per-scan run. Stale coins are harmless: the push path re-checks
- * isTokenSeen from the DB before sending, and newly discovered feed coins
- * are evaluated via feedProfiles anyway. A coin that ages into the window
- * while the cache is live is pushed at the next cache expiry, at most
- * REEVAL_POOL_CACHE_MS later (the 3h pre-qualification margin keeps most
- * coins already pooled by then).
+ * In-memory TTL for the re-eval pool query, from config.reevalPoolCacheMs
+ * (REEVAL_POOL_CACHE_SECONDS, default 180 = 3 min). The pool only changes
+ * when new coins are recorded, coins are pushed, or the age window slides —
+ * nothing that happens between two 60s scans. The query is index-bounded
+ * (see Db.getReevalPool: a launch_ms band scan over a few thousand rows
+ * instead of the ~400K-row full scan it used to do — the dominant Turso
+ * rows-read consumer, alerted 2026-08-16), so this cache cuts the remaining
+ * cost to ~1/3 of a per-scan run at the default 3-min TTL. Stale coins are
+ * harmless: the push path re-checks isTokenSeen from the DB before sending,
+ * and newly discovered feed coins are evaluated via feedProfiles anyway. A
+ * coin that ages into the window while the cache is live is pushed at the
+ * next cache expiry, at most reevalPoolCacheMs later (the 3h
+ * pre-qualification margin keeps most coins already pooled by then).
  */
-const REEVAL_POOL_CACHE_MS = 300_000;
 /**
  * Margin (minutes) around the qualifying age window: the pool also holds
  * coins that will enter the window within 3h, so they are pushed the moment
@@ -519,6 +519,9 @@ export class Scanner {
         // the sweep budget concentrates on coins that can actually qualify.
         nearSlots: this.config.reevalNearSlots,
         farSlots: this.config.reevalFarSlots,
+        // Rotation period must equal the cache TTL so each expiry advances
+        // the slot (see Db.getReevalPool rotationPeriodMs).
+        rotationPeriodMs: this.config.reevalPoolCacheMs,
         minQualifyMcap: poolMinMcapUsd / 2,
       });
       // token_stats grows with pump.fun discovery (100+ new coins per scan):
@@ -1186,7 +1189,7 @@ export class Scanner {
   }
 
   /**
-   * Re-eval pool with an in-memory TTL cache (see REEVAL_POOL_CACHE_MS):
+   * Re-eval pool with an in-memory TTL cache (see config.reevalPoolCacheMs):
    * the query is the scan's dominant Turso rows-read consumer, and its
    * result changes only slowly, so cache hits skip the DB entirely. The
    * cache key is the TTL alone — the since/launch bounds slide with `now`
@@ -1210,10 +1213,11 @@ export class Scanner {
       limit: number;
       nearSlots?: number;
       farSlots?: number;
+      rotationPeriodMs?: number;
       minQualifyMcap?: number;
     },
   ): Promise<TokenStats[]> {
-    if (this.reevalPoolCache && now - this.reevalPoolCache.at < REEVAL_POOL_CACHE_MS) {
+    if (this.reevalPoolCache && now - this.reevalPoolCache.at < this.config.reevalPoolCacheMs) {
       return this.reevalPoolCache.stats;
     }
     const stats = await this.db.getReevalPool(opts);

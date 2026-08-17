@@ -1328,6 +1328,7 @@ export default {
           // what production actually evaluates.
           nearSlots: cfg?.reevalNearSlots ?? 2,
           farSlots: cfg?.reevalFarSlots ?? 6,
+          rotationPeriodMs: cfg?.reevalPoolCacheMs,
           minQualifyMcap: minMcap / 2,
         });
         poolQueryCount = pool.length;
