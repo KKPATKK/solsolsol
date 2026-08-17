@@ -142,6 +142,44 @@ export interface ScanSummary {
 /** Cap on per-coin rejection entries kept in the scan summary/heartbeat. */
 const REJECT_LOG_MAX = 50;
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Normalized description of a Telegram push failure (grammY ApiError or
+ * network error) — code + description for the logs and worker_state, plus
+ * whether a same-tick retry is worth it. Transient = 429 (rate limit),
+ * 5xx, or a non-HTTP network error (no error_code); permanent 4xx (e.g.
+ * 403 bot not a member / 400 bad chat) won't fix themselves within a
+ * second, so those are surfaced but not retried in-tick — the chat-aware
+ * re-eval pool still re-attempts them on later scans.
+ */
+interface PushErrorInfo {
+  code: number | null;
+  description: string;
+  transient: boolean;
+  line: string;
+}
+
+function describePushError(err: unknown): PushErrorInfo {
+  const e = err as {
+    error_code?: number;
+    description?: string;
+    message?: string;
+  } | null;
+  const code = typeof e?.error_code === "number" ? e.error_code : null;
+  const description =
+    e?.description ?? e?.message ?? (typeof err === "string" ? err : String(err));
+  const transient = code === null || code === 429 || code >= 500;
+  return {
+    code,
+    description,
+    transient,
+    line: code !== null ? `Telegram ${code}: ${description}` : description,
+  };
+}
+
 export class Scanner {
   private running = false;
   /** When the current scan started — lets a stale lock be broken by age. */
@@ -227,6 +265,46 @@ export class Scanner {
     if (Date.now() - at < DATA_NEGATIVE_CACHE_MS) return true;
     this.dataFailedAt.delete(token); // prune stale entries
     return false;
+  }
+
+  /**
+   * Persist a per-chat push failure (worker_state `push_fail_<chatId>`,
+   * JSON) so the operator can see exactly why a chat missed pushes without
+   * Cloudflare log access — surfaced by /debug/chats. Keeps only the latest
+   * failure plus a running count.
+   */
+  private async recordPushFailure(
+    chatId: string,
+    token: string,
+    info: PushErrorInfo,
+  ): Promise<void> {
+    try {
+      const key = `push_fail_${chatId}`;
+      const raw = await this.db.getWorkerState(key);
+      let count = 0;
+      if (raw) {
+        try {
+          count = (JSON.parse(raw) as { count?: number }).count ?? 0;
+        } catch {
+          // corrupt state — start fresh
+        }
+      }
+      await this.db.setWorkerState(
+        key,
+        JSON.stringify({
+          at: Date.now(),
+          code: info.code,
+          description: info.description.slice(0, 200),
+          token: token.slice(0, 12),
+          count: count + 1,
+        }),
+      );
+    } catch (err) {
+      console.error(
+        "[scanner] push-failure record failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 
   /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
@@ -524,6 +602,13 @@ export class Scanner {
         // the slot (see Db.getReevalPool rotationPeriodMs).
         rotationPeriodMs: this.config.reevalPoolCacheMs,
         minQualifyMcap: poolMinMcapUsd / 2,
+        // Chat-aware seen exclusion: a token is dropped from the pool only
+        // when EVERY enabled chat has already received it. Without this a
+        // coin pushed to one chat (and marked seen there) vanished from the
+        // pool even when another chat's push had just failed, so the missed
+        // chat NEVER got a retry — the cross-chat push inconsistency
+        // observed between the private chat and the channel.
+        seenChatIds: chats.map((c) => c.chatId),
       });
       // token_stats grows with pump.fun discovery (100+ new coins per scan):
       // prune rows older than the re-eval window that were never pushed —
@@ -661,22 +746,48 @@ export class Scanner {
       diag.agedEval = agedEval.count;
       diag.candidates = candidates.length;
       let pushed = 0;
-      for (const [candIdx, coin] of candidates.entries()) {
-        // Hard tick deadline: each candidate's expensive lookups (Helius up
-        // to 16s + RugCheck + Birdeye) can exceed the remaining budget fast.
+      // Group candidates by token: all the expensive per-coin lookups below
+      // (supply flow, RugCheck, Birdeye, GMGN, Arkham) are token-level, so
+      // they run ONCE per token per tick instead of once per (token, chat)
+      // pair — the previous version re-ran every lookup for each chat
+      // candidate of the same coin, doubling API spend and burning the tick
+      // deadline twice as fast. Pushes still happen per chat, and a push to
+      // one chat failing (Telegram error) never blocks the others: the
+      // chat-aware re-eval pool keeps the coin around so the missed chat
+      // gets a retry on a later scan.
+      const groups = new Map<string, QualifyingCoin[]>();
+      for (const coin of candidates) {
+        const key = coin.profile.tokenAddress;
+        const group = groups.get(key);
+        if (group) group.push(coin);
+        else groups.set(key, [coin]);
+      }
+      let processedCandidates = 0;
+      for (const group of groups.values()) {
+        // Hard tick deadline: each token's expensive lookups (Helius up to
+        // 16s + RugCheck + Birdeye) can exceed the remaining budget fast.
         // Defer the rest to the next tick — they stay in the re-evaluation
         // pool, so this only delays a push by a minute, never loses it.
         if (Date.now() > tickDeadline) {
           console.log(
-            `[scanner] tick deadline reached — deferring ${candidates.length - candIdx} candidate(s) to next tick`,
+            `[scanner] tick deadline reached — deferring ${candidates.length - processedCandidates} candidate(s) to next tick`,
           );
           break;
         }
-        // Fast path: skip coins already pushed to this chat before doing the
-        // (slow) RugCheck/Birdeye lookups for them again.
-        if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
-          continue;
+        processedCandidates += group.length;
+        // Chats in this group that have not yet received this coin (per-chat
+        // dedupe: a coin already pushed to one chat is still pending for the
+        // others, e.g. after a failed delivery — this is the fast path that
+        // skips the slow lookups when every chat already has it).
+        const unseen: QualifyingCoin[] = [];
+        for (const coin of group) {
+          if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
+            continue;
+          }
+          unseen.push(coin);
         }
+        if (unseen.length === 0) continue;
+        const coin = unseen[0];
         // Supply-flow (rug/distribution) check — run before the expensive
         // display lookups so a flagged coin never wastes the tick. Only a
         // confirmed flag blocks the push; a pending/incomplete analysis
@@ -727,46 +838,37 @@ export class Scanner {
         // Arkham smart-money attribution (card-only enrichment).
         const arkham = await this.resolveArkhamInfo(coin);
         if (arkham) diag.arkham++;
-        // Re-check right before sending: a concurrent scan (rare, only when
-        // a scan outlives the 1-min cron) could have pushed it meanwhile.
-        if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
-          continue;
-        }
-        try {
-          const tokenAddress = coin.pair.baseToken.address;
-          // Manual trading mode: add a one-tap buy button to the push card.
-          // Auto mode buys right after the push (below); off mode adds nothing.
-          // Live mode read: /setmode flips apply to the very next card. Buy
-          // button renders in manual mode; sell buttons in any non-off mode
-          // (in auto the coin was already bought — exits are what matter).
-          const tradeMode = this.trade
-            ? await this.trade.effectiveMode()
-            : "off";
-          await this.bot.api.sendMessage(
-            coin.chatId,
-            renderMessage(
-              coin,
-              rugcheck.bundlerPct,
-              rugcheck.top10Pct,
-              trader.sniperPct,
-              flow.status === "clean",
-              holders.holderCount,
-              rugcheck.creator,
-              gmgn,
-              arkham,
-            ),
-            {
-              reply_markup: {
-                inline_keyboard: tradeKeyboard(
-                  tokenAddress,
-                  this.trade ? this.trade.buySizeLabel : "",
-                  tradeMode,
-                  { modeSwitch: Boolean(this.trade) },
-                ),
-              },
+        // Live trade-mode read (once per token): /setmode flips apply to the
+        // very next card. Buy button renders in manual mode; sell buttons in
+        // any non-off mode (in auto the coin was already bought — exits are
+        // what matter).
+        const tradeMode = this.trade
+          ? await this.trade.effectiveMode()
+          : "off";
+        const tokenAddress = coin.pair.baseToken.address;
+        const message = renderMessage(
+          coin,
+          rugcheck.bundlerPct,
+          rugcheck.top10Pct,
+          trader.sniperPct,
+          flow.status === "clean",
+          holders.holderCount,
+          rugcheck.creator,
+          gmgn,
+          arkham,
+        );
+        const sendTo = async (c: QualifyingCoin): Promise<void> => {
+          await this.bot.api.sendMessage(c.chatId, message, {
+            reply_markup: {
+              inline_keyboard: tradeKeyboard(
+                tokenAddress,
+                this.trade ? this.trade.buySizeLabel : "",
+                tradeMode,
+                { modeSwitch: Boolean(this.trade) },
+              ),
             },
-          );
-          await this.db.markTokenSeen(coin.chatId, coin.profile.tokenAddress);
+          });
+          await this.db.markTokenSeen(c.chatId, c.profile.tokenAddress);
           pushed++;
           // Auto trading mode: buy immediately after the push. The mode is
           // read live (a /setmode flip applies right away); executeBuy also
@@ -774,13 +876,46 @@ export class Scanner {
           // over — the coin is already in seen_tokens, and trade_log has
           // UNIQUE(token) — so a slow buy can never double-spend.
           if (this.trade && (await this.trade.effectiveMode()) === "auto") {
-            await this.autoBuy(coin);
+            await this.autoBuy(c);
           }
-        } catch (err) {
-          console.error(
-            `[scanner] failed to push ${coin.profile.symbol ?? coin.profile.tokenAddress} to ${coin.chatId}:`,
-            err instanceof Error ? err.message : err,
-          );
+        };
+        for (const c of unseen) {
+          // Re-check right before sending: a concurrent scan (rare, only
+          // when a scan outlives the 1-min cron) could have pushed it
+          // meanwhile, or a previous tick's retry may have landed.
+          if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
+            continue;
+          }
+          const symbol = c.profile.symbol ?? c.pair.baseToken.symbol ?? c.profile.tokenAddress;
+          try {
+            await sendTo(c);
+          } catch (err) {
+            // A failed delivery is NOT the end: surface the Telegram error
+            // (code + description, recorded per chat for /debug/chats) and
+            // retry once on transient failures (429 / 5xx / network). The
+            // chat-aware re-eval pool re-pushes the coin to this chat on a
+            // later scan either way — never mark it seen on failure.
+            const info = describePushError(err);
+            await this.recordPushFailure(c.chatId, c.profile.tokenAddress, info);
+            console.error(
+              `[scanner] failed to push ${symbol} to ${c.chatId}: ${info.line}`,
+            );
+            if (info.transient) {
+              await sleep(1200);
+              if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
+                continue;
+              }
+              try {
+                await sendTo(c);
+              } catch (retryErr) {
+                const retryInfo = describePushError(retryErr);
+                await this.recordPushFailure(c.chatId, c.profile.tokenAddress, retryInfo);
+                console.error(
+                  `[scanner] retry failed to push ${symbol} to ${c.chatId}: ${retryInfo.line}`,
+                );
+              }
+            }
+          }
         }
       }
       diag.pushed = pushed;
@@ -1216,6 +1351,7 @@ export class Scanner {
       farSlots?: number;
       rotationPeriodMs?: number;
       minQualifyMcap?: number;
+      seenChatIds?: string[];
     },
   ): Promise<TokenStats[]> {
     if (this.reevalPoolCache && now - this.reevalPoolCache.at < this.config.reevalPoolCacheMs) {

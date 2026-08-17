@@ -432,6 +432,72 @@ async function main() {
     }
   });
 
+  await test("getReevalPool: chat-aware seen exclusion keeps coins for chats that missed the push", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const H = 3600e3;
+      const M = 60e3;
+      const now = 50 * 300e3;
+      const seed = async (token, seenChats) => {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)",
+          args: [token, now - 6 * H, 0, now - 6 * H],
+        });
+        for (const chat of seenChats) {
+          await t.client.execute({
+            sql: "INSERT INTO seen_tokens (chat_id, token, first_seen_at) VALUES (?, ?, ?)",
+            args: [chat, token, now],
+          });
+        }
+      };
+      // Same hot zone (age 6h — evaluated every scan): one coin no chat has
+      // seen, one pushed to chat-a only (chat-b's delivery failed — the
+      // cross-chat inconsistency), one seen by every chat.
+      await seed("NONE", []);
+      await seed("PARTIAL", ["chat-a"]);
+      await seed("FULL", ["chat-a", "chat-b"]);
+
+      const opts = {
+        sinceMs: now - 42 * H,
+        minLaunchMs: now - (2400 + 180) * M,
+        maxLaunchMs: now - (360 - 180) * M,
+        windowEntryLaunchMs: now - 360 * M,
+        limit: 1000,
+        now,
+      };
+
+      // Chat-aware (production — the scanner passes the enabled chat ids):
+      // a token is excluded only when EVERY enabled chat has already seen it,
+      // so the chat that missed a failed push gets a retry.
+      const chatAware = (
+        await db.getReevalPool({ ...opts, seenChatIds: ["chat-a", "chat-b"] })
+      ).map((x) => x.token);
+      assert.ok(chatAware.includes("NONE"), "unseen coin stays in the pool");
+      assert.ok(
+        chatAware.includes("PARTIAL"),
+        "coin pushed to one chat but missed by another stays in the pool for a retry",
+      );
+      assert.ok(
+        !chatAware.includes("FULL"),
+        "coin seen by every enabled chat is excluded",
+      );
+
+      // Legacy (no seenChatIds): any seen row removes the coin — the old
+      // token-level behavior that permanently starved the missed chat.
+      const legacy = (await db.getReevalPool(opts)).map((x) => x.token);
+      assert.ok(legacy.includes("NONE"), "legacy: unseen coin stays");
+      assert.ok(
+        !legacy.includes("PARTIAL"),
+        "legacy: partial push excludes the coin everywhere (the old bug)",
+      );
+      assert.ok(!legacy.includes("FULL"), "legacy: fully-seen coin excluded");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("getTokenStatsMany / recordTokenStatsMany batch and dedupe", async () => {
     const t = tmpDb();
     try {

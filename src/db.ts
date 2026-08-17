@@ -1140,6 +1140,15 @@ export class Db {
      * minMarketCapUsd / 2.
      */
     minQualifyMcap?: number;
+    /**
+     * Enabled chat IDs (chat_settings WHERE enabled = 1). When provided, a
+     * token is excluded from the pool only when EVERY one of these chats has
+     * already seen it — a coin pushed to one chat but missed by another
+     * (failed Telegram delivery) stays in the pool so the missed chat gets a
+     * retry on a later scan. When omitted (legacy callers/tests), the old
+     * token-level exclusion applies: any seen row removes the coin.
+     */
+    seenChatIds?: string[];
     /** Override for deterministic tests; defaults to Date.now(). */
     now?: number;
   }): Promise<TokenStats[]> {
@@ -1158,6 +1167,7 @@ export class Db {
           sinceMs: opts.sinceMs,
           limit: hotLimit,
           minQualifyMcap: opts.minQualifyMcap,
+          seenChatIds: opts.seenChatIds,
           orderBy: "entry",
         })),
       );
@@ -1188,6 +1198,7 @@ export class Db {
           sinceMs: opts.sinceMs,
           limit: nearLimit,
           minQualifyMcap: opts.minQualifyMcap,
+          seenChatIds: opts.seenChatIds,
           orderBy: "signal",
         })),
       );
@@ -1204,6 +1215,7 @@ export class Db {
           sinceMs: opts.sinceMs,
           limit: farLimit,
           minQualifyMcap: opts.minQualifyMcap,
+          seenChatIds: opts.seenChatIds,
           orderBy: "signal",
         })),
       );
@@ -1226,6 +1238,7 @@ export class Db {
       sinceMs: number;
       limit: number;
       minQualifyMcap?: number;
+      seenChatIds?: string[];
       orderBy: "entry" | "signal";
     },
   ): Promise<TokenStats[]> {
@@ -1233,8 +1246,10 @@ export class Db {
       opts.minQualifyMcap !== undefined
         ? ` AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)`
         : "";
+    const seen = this.seenExclusion(opts.seenChatIds);
     const args: Array<string | number> = [lo, hi, opts.sinceMs];
     if (opts.minQualifyMcap !== undefined) args.push(opts.minQualifyMcap);
+    args.push(...seen.args);
     const order =
       opts.orderBy === "signal"
         ? "ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC"
@@ -1245,13 +1260,49 @@ export class Db {
       sql: `SELECT * FROM token_stats
             WHERE launch_ms BETWEEN ? AND ?
               AND first_seen_at > ?
-              AND NOT EXISTS (SELECT 1 FROM seen_tokens s WHERE s.token = token_stats.token)
               ${qualifyClause}
+              ${seen.clause}
             ${order}
             LIMIT ?`,
       args,
     });
     return res.rows.map((row) => this.statsFromRow(row));
+  }
+
+  /**
+   * SQL fragment + args that implement the pool's "seen" exclusion.
+   *
+   * Chat-aware (seenChatIds provided): a token is excluded only when EVERY
+   * enabled chat has already seen it — the scanner passes the enabled chat
+   * list so a coin whose push to one chat failed (Telegram error) stays in
+   * the re-eval pool and is retried for the missed chat instead of being
+   * lost forever (the bug behind cross-chat push inconsistency). The
+   * subquery walks the idx_seen_tokens_token index per candidate and the
+   * chat_settings table is tiny (a handful of rows), so rows-read stays
+   * bounded like the legacy NOT EXISTS probe.
+   *
+   * Legacy (seenChatIds omitted): any seen row removes the coin, matching
+   * the pre-2026-08-17 behavior used by tests and one-shot callers.
+   */
+  private seenExclusion(seenChatIds?: string[]): {
+    clause: string;
+    args: Array<string | number>;
+  } {
+    if (seenChatIds && seenChatIds.length > 0) {
+      return {
+        clause: `AND (
+          SELECT COUNT(*) FROM seen_tokens s
+          WHERE s.token = token_stats.token
+            AND s.chat_id IN (${seenChatIds.map(() => "?").join(",")})
+        ) < ?`,
+        args: [...seenChatIds, seenChatIds.length],
+      };
+    }
+    return {
+      clause:
+        "AND NOT EXISTS (SELECT 1 FROM seen_tokens s WHERE s.token = token_stats.token)",
+      args: [],
+    };
   }
 
   /**
@@ -1293,7 +1344,12 @@ export class Db {
    * coverage gap (the pool's LIMIT starves 12h+ coins in a dense launch
    * market — see Scanner.getReevalPoolCached).
    */
-  async getPoolHistogram(now: number): Promise<{
+  async getPoolHistogram(
+    now: number,
+    /** Enabled chat ids — the histogram's eligibleInWindow mirrors the
+     * chat-aware pool exclusion (see seenExclusion) when provided. */
+    seenChatIds?: string[],
+  ): Promise<{
     total: number;
     neverPushed: number;
     buckets: Record<string, number>;
@@ -1325,12 +1381,13 @@ export class Db {
       ],
     });
     const r = res.rows[0] as Record<string, number | null>;
+    const seen = this.seenExclusion(seenChatIds);
     const elig = await this.get().execute({
       sql: `SELECT COUNT(*) AS n FROM token_stats
             WHERE launch_ms BETWEEN ? AND ?
               AND first_seen_at > ?
-              AND NOT EXISTS (SELECT 1 FROM seen_tokens s WHERE s.token = token_stats.token)`,
-      args: [now - 43 * H, now - 3 * H, now - 42 * H],
+              ${seen.clause}`,
+      args: [now - 43 * H, now - 3 * H, now - 42 * H, ...seen.args],
     });
     return {
       total: Number(r.total ?? 0),

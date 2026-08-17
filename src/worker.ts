@@ -1055,9 +1055,40 @@ export default {
     // All chats' filter profiles (incl. disabled) — the pool query bounds
     // use the WIDEST enabled chat, so a stale wide chat silently widens the
     // tracked age window; this surfaces each chat's settings at a glance.
+    // lastPushError shows the most recent failed Telegram delivery to that
+    // chat (worker_state push_fail_<chatId>, written by the scanner) — the
+    // reason a chat can receive fewer coins than another with identical
+    // filters.
     if (url.pathname === "/debug/chats") {
       const chats = (await db?.listAllChats()) ?? [];
       const enabled = chats.filter((c) => c.enabled);
+      const chatsOut = [];
+      for (const c of chats) {
+        let lastPushError: {
+          at?: number;
+          code?: number | null;
+          description?: string;
+          token?: string;
+          count?: number;
+        } | null = null;
+        try {
+          const raw = await db?.getWorkerState(`push_fail_${c.chatId}`);
+          if (raw) lastPushError = JSON.parse(raw);
+        } catch {
+          // corrupt state — omit
+        }
+        chatsOut.push({
+          chatId: c.chatId,
+          enabled: c.enabled,
+          minMarketCapUsd: c.minMarketCapUsd,
+          maxMarketCapUsd: c.maxMarketCapUsd,
+          minAgeMinutes: c.minAgeMinutes,
+          maxAgeMinutes: c.maxAgeMinutes,
+          min5mVolUsd: c.min5mVolUsd,
+          min5mChgPct: c.min5mChgPct,
+          lastPushError,
+        });
+      }
       return Response.json({
         ok: true,
         total: chats.length,
@@ -1071,16 +1102,7 @@ export default {
                 minMcapUsd: Math.min(...enabled.map((c) => c.minMarketCapUsd)),
               }
             : null,
-        chats: chats.map((c) => ({
-          chatId: c.chatId,
-          enabled: c.enabled,
-          minMarketCapUsd: c.minMarketCapUsd,
-          maxMarketCapUsd: c.maxMarketCapUsd,
-          minAgeMinutes: c.minAgeMinutes,
-          maxAgeMinutes: c.maxAgeMinutes,
-          min5mVolUsd: c.min5mVolUsd,
-          min5mChgPct: c.min5mChgPct,
-        })),
+        chats: chatsOut,
       });
     }
 
@@ -1385,11 +1407,14 @@ export default {
       // lazy connect() used by other probe methods doesn't set it).
       await probe.init();
       const now = Date.now();
-      const hist = await probe.getPoolHistogram(now);
+      const chats = await probe.listEnabledChats();
+      // Mirror the scanner's chat-aware seen exclusion so the probe's
+      // eligible/returned counts match what production actually evaluates.
+      const seenChatIds = chats.map((c) => c.chatId);
+      const hist = await probe.getPoolHistogram(now, seenChatIds);
       let poolQueryBuckets: Record<string, number> | null = null;
       let poolQueryCount = 0;
       try {
-        const chats = await probe.listEnabledChats();
         const minAge = Math.min(...chats.map((c) => c.minAgeMinutes));
         const maxAge = Math.max(...chats.map((c) => c.maxAgeMinutes));
         const minMcap = Math.min(...chats.map((c) => c.minMarketCapUsd));
@@ -1407,6 +1432,7 @@ export default {
           farSlots: cfg?.reevalFarSlots ?? 6,
           rotationPeriodMs: cfg?.reevalPoolCacheMs,
           minQualifyMcap: minMcap / 2,
+          seenChatIds,
         });
         poolQueryCount = pool.length;
         poolQueryBuckets = {
