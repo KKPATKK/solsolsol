@@ -181,7 +181,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
     gmgnConfigured = Boolean(config.gmgnApiKey);
-    arkhamConfigured = Boolean(config.arkhamApiKey);
+    arkhamConfigured = Boolean(config.arkhamEnabled && config.arkhamApiKey);
     // Axiom is configured when there are login credentials OR already
     // persisted tokens (Google/SSO accounts have no password — they get
     // tokens via /debug/axiom-tokens, which is re-checked after DB init).
@@ -247,7 +247,7 @@ async function ensureInitialized(env: Env): Promise<void> {
       }
 
       arkham = null;
-      if (config.arkhamApiKey) {
+      if (config.arkhamEnabled && config.arkhamApiKey) {
         try {
           arkham = new ArkhamClient(config);
         } catch (err) {

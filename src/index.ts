@@ -142,9 +142,9 @@ async function main(): Promise<void> {
         null, // gecko
         null, // gmgn
         null, // axiom
-        // Arkham smart-money attribution (null when no key configured — the
-        // card line shows 未配置).
-        config.arkhamApiKey ? new ArkhamClient(config) : null,
+        // Arkham smart-money attribution (null unless ARKHAM_ENABLED AND
+        // ARKHAM_API_KEY are set — the card line shows 未配置 otherwise).
+        config.arkhamEnabled && config.arkhamApiKey ? new ArkhamClient(config) : null,
       );
 
       const runScan = async (initial: boolean) => {

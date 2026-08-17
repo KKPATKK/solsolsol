@@ -137,6 +137,12 @@ export interface AppConfig {
    */
   arkhamApiKey?: string;
   /**
+   * Master switch (ARKHAM_ENABLED, default false). Arkham is DISABLED
+   * unless this is "true"/"1" — even when ARKHAM_API_KEY is set, so a
+   * stray key can never silently re-enable paid credit-burning calls.
+   */
+  arkhamEnabled: boolean;
+  /**
    * Entity types counted as "smart money" (ARKHAM_SMART_MONEY_TYPES,
    * comma-separated; defaults to funds/whales/investors/traders/MMs).
    * Matched lower-case against Arkham's entity `type` slug.
@@ -303,6 +309,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     birdeyeApiKey: env.BIRDEYE_API_KEY || undefined,
     gmgnApiKey: env.GMGN_API_KEY || undefined,
     arkhamApiKey: env.ARKHAM_API_KEY || undefined,
+    arkhamEnabled: env.ARKHAM_ENABLED === "true" || env.ARKHAM_ENABLED === "1",
     arkhamSmartMoneyTypes: parseSmartMoneyTypes(env.ARKHAM_SMART_MONEY_TYPES),
     arkhamRequestIntervalMs: Number.isFinite(Number(env.ARKHAM_REQUEST_INTERVAL_MS ?? 300))
       ? Math.max(0, Number(env.ARKHAM_REQUEST_INTERVAL_MS ?? 300))
