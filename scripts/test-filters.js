@@ -28,7 +28,7 @@ const TOKEN = process.env.TURSO_AUTH_TOKEN;
 const BKEY = process.env.BIRDEYE_API_KEY;
 
 // Mirrors scanner.ts constants so the diagnosis runs the same bounds.
-const RE_EVAL_WINDOW_MS = 42 * 3600e3;
+const RE_EVAL_WINDOW_MS = 30 * 3600e3;
 const RE_EVAL_AGE_MARGIN_MIN = 180;
 const RE_EVAL_POOL_SIZE = 40;
 
@@ -45,7 +45,7 @@ async function phase1() {
     ["DEFAULT_SETTINGS.minMarketCapUsd", DEFAULT_SETTINGS.minMarketCapUsd, 40000],
     ["DEFAULT_SETTINGS.maxMarketCapUsd", DEFAULT_SETTINGS.maxMarketCapUsd, 300000],
     ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 300],
-    ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 2400],
+    ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 1680],
     ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 6000],
     ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 30],
   ];

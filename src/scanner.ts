@@ -52,11 +52,12 @@ const SCAN_TIMEOUT_MS = 25_000;
 const SCAN_TICK_DEADLINE_MS = 20_000;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
- * the qualifying age window (max 40h) plus margin: coins age into the
- * window while sitting in the pool, since the DexScreener profiles feed
- * only ever contains young tokens.
+ * the qualifying age window (max 28h) plus a registration margin — the
+ * operator runs 30h (28h + 2h slack): coins age into the window while
+ * sitting in the pool, since the DexScreener profiles feed only ever
+ * contains young tokens.
  */
-const RE_EVAL_WINDOW_MS = 42 * 60 * 60_000;
+const RE_EVAL_WINDOW_MS = 30 * 60 * 60_000;
 /**
  * In-memory TTL for the re-eval pool query, from config.reevalPoolCacheMs
  * (REEVAL_POOL_CACHE_SECONDS, default 180 = 3 min). The pool only changes

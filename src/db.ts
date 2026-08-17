@@ -16,7 +16,7 @@ import { createClient, type Client } from "@libsql/client/web";
 const DB_REQUEST_TIMEOUT_MS = 15_000;
 /**
  * Min gap between token_stats prunes. Discovery inflow is ~140 coins/min
- * and only rows older than the 42h re-eval window are removed, so a 10-min
+ * and only rows older than the 30h re-eval window are removed, so a 10-min
  * lag has zero functional impact while cutting the prune's rows-read by
  * 10x (it used to run every 60s tick — see pruneOldTokenStats). The
  * timestamp is shared via worker_state so concurrent isolates (cron +
@@ -44,7 +44,7 @@ export interface ChatSettings {
 }
 
 /**
- * Current filter profile: mid-cap coins ($40K–$300K) aged 5–40 hours with a
+ * Current filter profile: mid-cap coins ($40K–$300K) aged 5–28 hours with a
  * hot 5m tape. The first-minute-volume, sniper, bundler and top-10 holder
  * filters were removed (bundler/top-10 data is shown on the card for
  * reference only).
@@ -55,7 +55,7 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minMarketCapUsd: 40000,
   maxMarketCapUsd: 300000,
   minAgeMinutes: 300, // 5h
-  maxAgeMinutes: 2400, // 40h
+  maxAgeMinutes: 1680, // 28h
   min5mVolUsd: 6000,
   min5mChgPct: 30,
   enabled: false,
@@ -219,7 +219,7 @@ export class Db {
           min_market_cap_usd REAL NOT NULL DEFAULT 40000,
           max_market_cap_usd REAL NOT NULL DEFAULT 300000,
           min_age_minutes REAL NOT NULL DEFAULT 300,
-          max_age_minutes REAL NOT NULL DEFAULT 2400,
+          max_age_minutes REAL NOT NULL DEFAULT 1680,
           min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
           min_5m_chg_pct REAL NOT NULL DEFAULT 30,
           enabled INTEGER NOT NULL DEFAULT 0
@@ -360,7 +360,7 @@ export class Db {
       await this.addColumnIfMissing("chat_settings", "min_market_cap_usd", "REAL NOT NULL DEFAULT 40000");
       await this.addColumnIfMissing("chat_settings", "max_market_cap_usd", "REAL NOT NULL DEFAULT 300000");
       await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 300");
-      await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 2400");
+      await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 1680");
       await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
       await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
       await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
@@ -1382,7 +1382,7 @@ export class Db {
 
   /**
    * Drop token_stats rows older than `olderThanMs` that were never pushed
-   * (unreachable by the re-eval pool query, which only reads the last ~42h).
+   * (unreachable by the re-eval pool query, which only reads the last ~30h).
    * Bounds storage growth from pump.fun discovery, which registers 100+
    * new coins per scan; pushed coins keep their rows so /flow and cached
    * verdicts still work.

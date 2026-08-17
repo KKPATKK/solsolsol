@@ -66,7 +66,7 @@ async function main() {
     assert.equal(DEFAULT_SETTINGS.minMarketCapUsd, 40000);
     assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 300000);
     assert.equal(DEFAULT_SETTINGS.minAgeMinutes, 300);
-    assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 2400);
+    assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 1680);
     assert.equal(DEFAULT_SETTINGS.min5mVolUsd, 6000);
     assert.equal(DEFAULT_SETTINGS.min5mChgPct, 30);
     // Bundler/top-10 filters were removed — no thresholds in defaults.
@@ -87,7 +87,7 @@ async function main() {
       assert.equal(d.minMarketCapUsd, 40000);
       assert.equal(d.maxMarketCapUsd, 300000);
       assert.equal(d.minAgeMinutes, 300);
-      assert.equal(d.maxAgeMinutes, 2400);
+      assert.equal(d.maxAgeMinutes, 1680);
       assert.equal(d.min5mVolUsd, 6000);
       assert.equal(d.min5mChgPct, 30);
       assert.equal(d.enabled, true);
@@ -156,7 +156,7 @@ async function main() {
       assert.equal(s.minMarketCapUsd, 40000);
       assert.equal(s.maxMarketCapUsd, 300000);
       assert.equal(s.minAgeMinutes, 300);
-      assert.equal(s.maxAgeMinutes, 2400);
+      assert.equal(s.maxAgeMinutes, 1680);
       assert.equal(s.min5mVolUsd, 6000);
       assert.equal(s.min5mChgPct, 30);
       assert.equal(s.enabled, true); // push state untouched by migration
@@ -256,7 +256,7 @@ async function main() {
       await seed("YOUNG", now - 150 * M, 0);
       // SEEN: age 10h but already pushed → excluded
       await seed("SEEN", now - 10 * H, 0, true, now);
-      // OLD: first seen 50h ago → dropped by sinceMs (42h)
+      // OLD: first seen 50h ago → dropped by sinceMs (30h)
       await seed("OLD", now - 50 * H, 0);
 
       const opts = (nn) => ({

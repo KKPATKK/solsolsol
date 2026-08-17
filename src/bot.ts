@@ -34,8 +34,8 @@ function buildUsage(scanIntervalSeconds: number): string {
     "`/off` — 关闭推送",
     "`/help` — 帮助",
     "",
-    "默认条件: 市值 $40K–$300K，上线 300–2400 分钟，5m 量 ≥ $6,000，5m 涨幅 ≥ 30%",
-    "例子: `/filter 40000 300000 300 2400 6000 30`",
+    "默认条件: 市值 $40K–$300K，上线 300–1680 分钟，5m 量 ≥ $6,000，5m 涨幅 ≥ 30%",
+    "例子: `/filter 40000 300000 300 1680 6000 30`",
   ].join("\n");
 }
 
@@ -60,7 +60,7 @@ export type ParsedFilter =
 
 export function parseFilterArgs(parts: string[]): ParsedFilter {
   const USAGE =
-    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>`\n例如: `/filter 40000 300000 300 2400 6000 30`";
+    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>`\n例如: `/filter 40000 300000 300 1680 6000 30`";
   if (parts.length !== 6) {
     return { ok: false, error: USAGE };
   }
@@ -287,7 +287,7 @@ export function createBot(
     await ctx.reply(
       existing
         ? "✅ 推送已开启，开始监控 Solana 新币。"
-        : `✅ 推送已开启（默认条件: 市值 $40K–$300K，上线 300–2400 分钟，5m 量 ≥ ${fmtUsd(
+        : `✅ 推送已开启（默认条件: 市值 $40K–$300K，上线 300–1680 分钟，5m 量 ≥ ${fmtUsd(
             DEFAULT_SETTINGS.min5mVolUsd,
           )}，5m 涨幅 ≥ ${DEFAULT_SETTINGS.min5mChgPct}%）。用 /filter 自定义条件。`,
     );

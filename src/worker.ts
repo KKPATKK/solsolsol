@@ -1317,7 +1317,7 @@ export default {
         const maxAge = Math.max(...chats.map((c) => c.maxAgeMinutes));
         const minMcap = Math.min(...chats.map((c) => c.minMarketCapUsd));
         const pool = await probe.getReevalPool({
-          sinceMs: now - 42 * 3600_000,
+          sinceMs: now - 30 * 3600_000,
           minLaunchMs: now - (maxAge + 180) * 60_000,
           maxLaunchMs: now - (minAge - 180) * 60_000,
           windowEntryLaunchMs: now - minAge * 60_000,
