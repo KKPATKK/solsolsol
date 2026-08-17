@@ -628,6 +628,20 @@ export class Db {
     return res.rows.map((row) => this.mapRow(row));
   }
 
+  /**
+   * Every chat row regardless of push state (operator diagnostics —
+   * /debug/chats). Lets the operator see each chat's full filter profile,
+   * including disabled ones, since the pool query bounds use the WIDEST
+   * enabled chat and a stale wide chat silently widens the tracked window.
+   */
+  async listAllChats(): Promise<ChatSettings[]> {
+    const res = await this.get().execute({
+      sql: "SELECT * FROM chat_settings ORDER BY chat_id",
+      args: [],
+    });
+    return res.rows.map((row) => this.mapRow(row));
+  }
+
   async isTokenSeen(chatId: string, token: string): Promise<boolean> {
     const res = await this.get().execute({
       sql: "SELECT 1 AS seen FROM seen_tokens WHERE chat_id = ? AND token = ? LIMIT 1",

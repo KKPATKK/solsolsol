@@ -1052,6 +1052,38 @@ export default {
       });
     }
 
+    // All chats' filter profiles (incl. disabled) — the pool query bounds
+    // use the WIDEST enabled chat, so a stale wide chat silently widens the
+    // tracked age window; this surfaces each chat's settings at a glance.
+    if (url.pathname === "/debug/chats") {
+      const chats = (await db?.listAllChats()) ?? [];
+      const enabled = chats.filter((c) => c.enabled);
+      return Response.json({
+        ok: true,
+        total: chats.length,
+        enabled: enabled.length,
+        // The values that actually drive scanning (widest enabled chat).
+        poolWindow:
+          enabled.length > 0
+            ? {
+                minAgeMin: Math.min(...enabled.map((c) => c.minAgeMinutes)),
+                maxAgeMin: Math.max(...enabled.map((c) => c.maxAgeMinutes)),
+                minMcapUsd: Math.min(...enabled.map((c) => c.minMarketCapUsd)),
+              }
+            : null,
+        chats: chats.map((c) => ({
+          chatId: c.chatId,
+          enabled: c.enabled,
+          minMarketCapUsd: c.minMarketCapUsd,
+          maxMarketCapUsd: c.maxMarketCapUsd,
+          minAgeMinutes: c.minAgeMinutes,
+          maxAgeMinutes: c.maxAgeMinutes,
+          min5mVolUsd: c.min5mVolUsd,
+          min5mChgPct: c.min5mChgPct,
+        })),
+      });
+    }
+
     // Manual scan trigger — runs the exact scheduled-path wrapper (runScan:
     // scan + heartbeat + scan_history), so it is both the diagnostic that
     // distinguishes "cron not firing" from "scan path broken" and the manual

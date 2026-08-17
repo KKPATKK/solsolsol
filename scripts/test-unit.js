@@ -123,6 +123,60 @@ async function main() {
     }
   });
 
+  await test("listAllChats returns every chat incl. disabled; listEnabledChats only enabled", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({
+        chatId: "chat-on",
+        minLiquidityUsd: 0,
+        minVolume24hUsd: 0,
+        minMarketCapUsd: 40000,
+        maxMarketCapUsd: 300000,
+        minAgeMinutes: 300,
+        maxAgeMinutes: 1680,
+        min5mVolUsd: 6000,
+        min5mChgPct: 30,
+        enabled: true,
+      });
+      await db.saveChatSettings({
+        chatId: "chat-off",
+        minLiquidityUsd: 0,
+        minVolume24hUsd: 0,
+        minMarketCapUsd: 1000,
+        maxMarketCapUsd: 50000,
+        minAgeMinutes: 60,
+        maxAgeMinutes: 720,
+        min5mVolUsd: 100,
+        min5mChgPct: 5,
+        enabled: false,
+      });
+      const all = await db.listAllChats();
+      assert.deepEqual(
+        all.map((c) => c.chatId),
+        ["chat-off", "chat-on"],
+        "all chats returned regardless of push state, ordered by chat_id",
+      );
+      const on = all.find((c) => c.chatId === "chat-on");
+      assert.ok(on, "chat-on present");
+      assert.equal(on.maxAgeMinutes, 1680);
+      assert.equal(on.enabled, true);
+      const off = all.find((c) => c.chatId === "chat-off");
+      assert.ok(off, "chat-off present");
+      assert.equal(off.maxAgeMinutes, 720);
+      assert.equal(off.enabled, false);
+      const enabledOnly = await db.listEnabledChats();
+      assert.deepEqual(
+        enabledOnly.map((c) => c.chatId),
+        ["chat-on"],
+        "disabled chat excluded from listEnabledChats",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("settings_v2 migration rewrites legacy rows once, never clobbers later changes", async () => {
     const t = tmpDb();
     try {
