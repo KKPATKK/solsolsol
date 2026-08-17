@@ -1324,6 +1324,51 @@ export default {
       }
     }
 
+    // /debug/test-push — sends one real test message to any chat and
+    // surfaces Telegram's RAW response (error_code + description). Gives a
+    // 100% verdict on delivery to a specific chat: e.g. a group the bot was
+    // kicked from returns 403 "bot is not a member of the chat" while the
+    // scanner's sendMessage errors only land in Cloudflare logs. Harmless
+    // (one message, no DB writes) — mirrors /debug/webhook's direct fetch
+    // so the exact Telegram JSON is visible either way.
+    if (url.pathname === "/debug/test-push") {
+      const token = cfg?.telegramBotToken;
+      if (!token) {
+        return Response.json({
+          ok: false,
+          error: "TELEGRAM_BOT_TOKEN not configured",
+        });
+      }
+      const chatId = (url.searchParams.get("chatId") ?? "").trim();
+      if (!chatId) {
+        return Response.json(
+          { ok: false, error: "missing ?chatId=" },
+          { status: 400 },
+        );
+      }
+      const text = `🧪 Test push from solana-meme-bot @ ${new Date().toISOString()}`;
+      try {
+        const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId, text }),
+        });
+        const j = (await r.json()) as { ok?: boolean };
+        return Response.json({
+          ok: j.ok === true,
+          chatId,
+          httpStatus: r.status,
+          telegram: j,
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          chatId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // /debug/pool — diagnostic for zero-push stretches. Age histogram of
     // never-pushed token_stats rows vs what the scanner's re-eval pool query
     // actually returns right now (live chat settings, same query shape). If
