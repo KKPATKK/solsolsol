@@ -1,3 +1,5 @@
+import { DEFAULT_CRIME_WALLETS_URL } from "./crimewallets";
+
 export interface SupplyFlowConfig {
   /** Whether the on-chain supply-flow (rug/distribution) detector is active. */
   enabled: boolean;
@@ -80,6 +82,90 @@ export function parseAdminIds(raw: string | undefined): number[] {
  */
 export function isAdmin(userId: number | undefined, adminIds: number[]): boolean {
   return userId !== undefined && adminIds.includes(userId);
+}
+
+export interface CrimeWalletsConfig {
+  /**
+   * Master switch (CRIME_WALLETS_ENABLED, default true). The client fetches
+   * the community blocklist (one base58 address per line) and the scanner
+   * checks each pushed coin's creator + top holder owners against it.
+   * Free (no key) — unlike Arkham, no credits are burned by enabling it.
+   */
+  enabled: boolean;
+  /**
+   * Blocklist URL (CRIME_WALLETS_URL, default the solguala/crimewallets
+   * `raw format.txt`). Any one-address-per-line file works.
+   */
+  url: string;
+  /** Re-fetch cadence (CRIME_WALLETS_REFRESH_HOURS, default 6h). */
+  refreshMs: number;
+  /**
+   * Block pushes whose creator (or top holder owner) is on the list
+   * (CRIME_WALLETS_BLOCK, default false = display-only flag on the card).
+   * Per the list's own README a match is a warning signal, not proof.
+   */
+  block: boolean;
+  /**
+   * Also check the top holder OWNER wallets (CRIME_WALLETS_CHECK_HOLDERS,
+   * default true). Needs HELIUS_API_KEY (2 RPC calls per pushed coin —
+   * getTokenLargestAccounts + getMultipleAccounts).
+   */
+  checkHolders: boolean;
+  /** How many of the largest holder accounts to resolve owners for. */
+  holderTopN: number;
+  /** Fetch timeout (CRIME_WALLETS_FETCH_TIMEOUT_MS, default 8s). */
+  timeoutMs: number;
+}
+
+export interface WalletAnalysisConfig {
+  /**
+   * Master switch (WALLET_ANALYSIS_ENABLED, default true). On every pushed
+   * coin, analyze the wallets involved: creator profile (age + serial-
+   * launcher create count), top-holder wallet ages, and cross-coin holder
+   * clustering ("same wallets repeatedly appearing across pushed coins").
+   * Reuses the crime check's resolved holders — no extra RPC for the
+   * holder list itself; each unique wallet then costs ONE Helius call
+   * (cached per wallet, so repeat coins/retries are free). All best-effort
+   * with a hard budget — a slow RPC degrades the card, never the push.
+   */
+  enabled: boolean;
+  /**
+   * How many unique wallets to profile per coin (WALLET_ANALYSIS_MAX_WALLETS,
+   * default 9 = creator + 8 top holders). Profiling is serialized through
+   * the Helius throttle, so this bounds the per-coin RPC spend.
+   */
+  maxWallets: number;
+  /** In-memory TTL for a wallet profile (WALLET_ANALYSIS_PROFILE_CACHE_MIN, default 60). */
+  profileCacheMs: number;
+  /**
+   * Wall-clock budget for one coin's wallet profiling (WALLET_ANALYSIS_BUDGET_MS,
+   * default 8s). On expiry the analysis returns partial data (truncated)
+   * instead of blocking the push.
+   */
+  budgetMs: number;
+  /**
+   * Serial-launcher threshold: a creator with >= this many pump.fun
+   * "create" signatures in its sampled window is flagged (WALLET_ANALYSIS_MIN_CREATES,
+   * default 3).
+   */
+  creatorMinCreates: number;
+  /**
+   * A holder wallet whose first signature is younger than this is counted
+   * as a "new wallet" (WALLET_ANALYSIS_NEW_AGE_HOURS, default 24).
+   */
+  newWalletAgeHours: number;
+  /**
+   * A wallet is reported as a cluster hit when it was a top holder of this
+   * many distinct pushed coins (WALLET_ANALYSIS_CLUSTER_MIN_COINS, default
+   * 2 — at the current push volume, one wallet topping 2+ separate coins
+   * that passed every gate is already unusual).
+   */
+  clusterMinCoins: number;
+  /**
+   * How far back the cross-coin clustering window looks (WALLET_ANALYSIS_CLUSTER_WINDOW_DAYS,
+   * default 14). Older pushed_holders rows are pruned.
+   */
+  clusterWindowDays: number;
 }
 
 export interface TradeConfigSettings {
@@ -268,6 +354,10 @@ export interface AppConfig {
   heliusRequestIntervalMs: number;
   /** On-chain supply-flow (rug/distribution) detector tuning. */
   supplyFlow: SupplyFlowConfig;
+  /** Crime-wallet blocklist (community list — see CrimeWalletClient). */
+  crimeWallets: CrimeWalletsConfig;
+  /** Pushed-coin wallet analysis (creator profile + holder ages + clustering). */
+  walletAnalysis: WalletAnalysisConfig;
   /** Jupiter direct trading settings (off by default — see TradeConfigSettings). */
   trade: TradeConfigSettings;
   /**
@@ -301,6 +391,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const tradeFee = Number(env.TRADE_PRIORITY_FEE_SOL ?? 0.001);
   const tradeMaxBuys = Number(env.TRADE_MAX_DAILY_BUYS ?? 5);
   const tradeTimeout = Number(env.TRADE_TIMEOUT_MS ?? 15_000);
+  const crimeRefreshHours = Number(env.CRIME_WALLETS_REFRESH_HOURS ?? 6);
+  const crimeTimeout = Number(env.CRIME_WALLETS_FETCH_TIMEOUT_MS ?? 8000);
+  const crimeHolderTopN = Number(env.CRIME_WALLETS_HOLDER_TOP_N ?? 8);
+  const waMaxWallets = Number(env.WALLET_ANALYSIS_MAX_WALLETS ?? 9);
+  const waProfileCacheMin = Number(env.WALLET_ANALYSIS_PROFILE_CACHE_MIN ?? 60);
+  const waBudgetMs = Number(env.WALLET_ANALYSIS_BUDGET_MS ?? 8000);
+  const waMinCreates = Number(env.WALLET_ANALYSIS_MIN_CREATES ?? 3);
+  const waNewAgeHours = Number(env.WALLET_ANALYSIS_NEW_AGE_HOURS ?? 24);
+  const waClusterMinCoins = Number(env.WALLET_ANALYSIS_CLUSTER_MIN_COINS ?? 2);
+  const waClusterDays = Number(env.WALLET_ANALYSIS_CLUSTER_WINDOW_DAYS ?? 14);
 
   return {
     telegramBotToken: env.TELEGRAM_BOT_TOKEN || undefined,
@@ -407,6 +507,53 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       topAccounts: Number(env.SUPPLY_FLOW_TOP_ACCOUNTS ?? 10),
       checkInflow: (env.SUPPLY_FLOW_CHECK_INFLOW ?? "true") !== "false",
       budgetMs: Number(env.SUPPLY_FLOW_BUDGET_MS ?? 15_000),
+    },
+    crimeWallets: {
+      enabled: (env.CRIME_WALLETS_ENABLED ?? "true") !== "false",
+      url: env.CRIME_WALLETS_URL || DEFAULT_CRIME_WALLETS_URL,
+      refreshMs:
+        Number.isFinite(crimeRefreshHours) && crimeRefreshHours > 0
+          ? crimeRefreshHours * 3600_000
+          : 6 * 3600_000,
+      block: (env.CRIME_WALLETS_BLOCK ?? "false") === "true" || (env.CRIME_WALLETS_BLOCK ?? "false") === "1",
+      checkHolders: (env.CRIME_WALLETS_CHECK_HOLDERS ?? "true") !== "false",
+      holderTopN:
+        Number.isFinite(crimeHolderTopN) && crimeHolderTopN > 0
+          ? Math.min(Math.floor(crimeHolderTopN), 20)
+          : 8,
+      timeoutMs:
+        Number.isFinite(crimeTimeout) && crimeTimeout > 0 ? crimeTimeout : 8000,
+    },
+    walletAnalysis: {
+      enabled: (env.WALLET_ANALYSIS_ENABLED ?? "true") !== "false",
+      maxWallets:
+        Number.isFinite(waMaxWallets) && waMaxWallets > 0
+          ? Math.min(Math.floor(waMaxWallets), 20)
+          : 9,
+      profileCacheMs:
+        Number.isFinite(waProfileCacheMin) && waProfileCacheMin > 0
+          ? Math.min(waProfileCacheMin, 1440) * 60_000
+          : 60 * 60_000,
+      budgetMs:
+        Number.isFinite(waBudgetMs) && waBudgetMs > 0
+          ? Math.min(Math.floor(waBudgetMs), 30_000)
+          : 8000,
+      creatorMinCreates:
+        Number.isFinite(waMinCreates) && waMinCreates > 0
+          ? Math.min(Math.floor(waMinCreates), 100)
+          : 3,
+      newWalletAgeHours:
+        Number.isFinite(waNewAgeHours) && waNewAgeHours > 0
+          ? Math.min(waNewAgeHours, 720)
+          : 24,
+      clusterMinCoins:
+        Number.isFinite(waClusterMinCoins) && waClusterMinCoins > 0
+          ? Math.min(Math.floor(waClusterMinCoins), 100)
+          : 2,
+      clusterWindowDays:
+        Number.isFinite(waClusterDays) && waClusterDays > 0
+          ? Math.min(Math.floor(waClusterDays), 90)
+          : 14,
     },
     trade: {
       walletSecret: env.BOT_WALLET_PRIVATE_KEY || undefined,

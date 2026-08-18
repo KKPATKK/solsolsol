@@ -4,7 +4,7 @@ import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import type { Db, TokenStats } from "./db";
 import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreener";
-import { fmtAge, fmtUsd } from "./format";
+import { fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
 import type { TradeService } from "./jupiter";
@@ -13,6 +13,9 @@ import type { GeckoTerminalClient } from "./geckoterminal";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTrendingToken } from "./axiom";
 import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
+import type { CrimeWalletClient } from "./crimewallets";
+import { renderMessage } from "./render";
+import { WalletAnalyzer } from "./walletanalysis";
 
 
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -81,7 +84,7 @@ const RE_EVAL_WINDOW_MS = 30 * 60 * 60_000;
 const RE_EVAL_AGE_MARGIN_MIN = 180;
 
 /** One qualifying coin, prepared for a specific chat. */
-interface QualifyingCoin {
+export interface QualifyingCoin {
   chatId: string;
   profile: TokenProfile;
   pair: PairInfo;
@@ -118,6 +121,10 @@ export interface ScanSummary {
   axiom: number;
   /** Arkham smart-money enrichments this scan (0 when no key configured). */
   arkham: number;
+  /** Coins whose creator/top-holder wallets matched the crime-wallet list. */
+  crime: number;
+  /** Coins that got a wallet analysis (creator/holder/cluster enrichment). */
+  walletAnalysis: number;
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
   backfill: number;
   pool: number;
@@ -133,6 +140,8 @@ export interface ScanSummary {
     age: number;
     /** Supply-flow (rug/distribution) pattern detected on-chain. */
     flow: number;
+    /** Creator / top-holder wallet matched the crime-wallet blocklist. */
+    crime: number;
     other: number;
   };
   /** Per-coin rejection trace for the last scan (bounded). */
@@ -256,6 +265,23 @@ export class Scanner {
      * the push card. Best-effort: failures degrade to no enrichment.
      */
     private readonly arkham: ArkhamClient | null = null,
+    /**
+     * Crime-wallet blocklist (null = disabled). Each pushed coin's creator
+     * (RugCheck) and top holder owner wallets are checked against the list;
+     * a hit is flagged on the card (and optionally blocks the push — see
+     * CRIME_WALLETS_BLOCK). Best-effort: an unloaded list degrades to no
+     * check, never a blocked scan.
+     */
+    private readonly crimeWallets: CrimeWalletClient | null = null,
+    /**
+     * Wallet analysis (null = disabled): creator profile (age + serial-
+     * launcher create count), top-holder wallet ages, and cross-coin holder
+     * clustering for each pushed coin. Reuses the crime check's resolved
+     * holders (no extra RPC for the holder list); each unique wallet costs
+     * one cached Helius call. Best-effort with a hard budget — a slow RPC
+     * truncates the card enrichment, never the push.
+     */
+    private readonly walletAnalyzer: WalletAnalyzer | null = null,
   ) {}
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -340,12 +366,14 @@ export class Scanner {
       gmgn: 0,
       axiom: 0,
       arkham: 0,
+      crime: 0,
+      walletAnalysis: 0,
       backfill: 0,
       pool: 0,
       agedEval: 0,
       candidates: 0,
       pushed: 0,
-      fails: { mcap: 0, chg: 0, vol5: 0, age: 0, flow: 0, other: 0 },
+      fails: { mcap: 0, chg: 0, vol5: 0, age: 0, flow: 0, crime: 0, other: 0 },
       rejects: [],
     };
     // Watchdog: if the scan outlives its budget, release the lock so the next
@@ -364,6 +392,22 @@ export class Scanner {
         console.log("[scanner] no chats with push enabled, skipping");
         this.lastSkip = "no-chats-enabled";
         return;
+      }
+
+      // Crime-wallet blocklist refresh (bounded by an in-memory TTL — a
+      // no-op on most ticks; the first scan after a deploy fetches the
+      // ~4.8K-address list once). Best-effort: a fetch failure keeps the
+      // previous list and records lastError; the scan never waits more than
+      // the client's fetch timeout on the very first load.
+      if (this.crimeWallets) {
+        try {
+          await this.crimeWallets.refreshIfStale();
+        } catch (err) {
+          console.error(
+            "[scanner] crime-wallet refresh failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
 
       // DexScreener profile feed. Same best-effort guard as pump.fun and
@@ -809,6 +853,43 @@ export class Scanner {
         // no longer filters — those filters were removed, so coins push even
         // when the RugCheck report is not ready yet (the card shows 未检测).
         const rugcheck = await this.resolveRugcheckData(coin);
+        // Crime-wallet check: the coin's creator (RugCheck) and top holder
+        // owner wallets are matched against the community blocklist. A hit
+        // is a warning (flagged on the card) unless CRIME_WALLETS_BLOCK
+        // turns it into a push blocker.
+        const crime = this.crimeWallets
+          ? await this.crimeWallets.checkToken(
+              coin.stats.token,
+              rugcheck.creator,
+              this.helius,
+              {
+                checkHolders: this.config.crimeWallets.checkHolders,
+                holderTopN: this.config.crimeWallets.holderTopN,
+              },
+            )
+          : {
+              hit: false,
+              creatorHit: false,
+              holderHits: [],
+              checkedHolders: 0,
+              loaded: false,
+              holders: [],
+            };
+        if (crime.hit) diag.crime++;
+        if (this.config.crimeWallets.block && crime.hit) {
+          diag.fails.crime++;
+          this.addReject(
+            diag,
+            coin,
+            crime.creatorHit
+              ? "Creator 在犯罪錢包名單（crimewallets）"
+              : `${crime.holderHits.length} 個持有人錢包在犯罪錢包名單`,
+          );
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (crime-wallet match)`,
+          );
+          continue;
+        }
         // Trader data is resolved for the message card but no longer
         // filters — the sniper filter was removed, so coins push even when
         // the data is not ready yet.
@@ -838,6 +919,23 @@ export class Scanner {
         // Arkham smart-money attribution (card-only enrichment).
         const arkham = await this.resolveArkhamInfo(coin);
         if (arkham) diag.arkham++;
+        // Wallet analysis — creator profile (age + serial-launcher create
+        // count), top-holder wallet ages and cross-coin holder clustering.
+        // Runs only for coins that pass every block gate (its pushed_holders
+        // rows feed the clustering, so blocked coins must not pollute it).
+        // Reuses the crime check's resolved holders (no extra RPC for the
+        // holder list itself); each unique wallet costs one cached Helius
+        // call inside a hard budget, so a slow RPC degrades the card, never
+        // the push.
+        const wallet = this.walletAnalyzer
+          ? await this.walletAnalyzer.analyze({
+              token: coin.stats.token,
+              creator: rugcheck.creator,
+              holders: crime.holders,
+              crime,
+            })
+          : null;
+        if (wallet?.ok) diag.walletAnalysis++;
         // Live trade-mode read (once per token): /setmode flips apply to the
         // very next card. Buy button renders in manual mode; sell buttons in
         // any non-off mode (in auto the coin was already bought — exits are
@@ -856,6 +954,8 @@ export class Scanner {
           rugcheck.creator,
           gmgn,
           arkham,
+          crime,
+          wallet,
         );
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
           await this.bot.api.sendMessage(c.chatId, message, {
@@ -1607,85 +1707,4 @@ export class Scanner {
     }
     return out;
   }
-}
-
-function renderMessage(
-  coin: QualifyingCoin,
-  bundlerPct: number | null,
-  top10Pct: number | null,
-  sniperPct: number | null,
-  supplyFlowClean: boolean,
-  holderCount: number | null,
-  creator: string | null,
-  gmgn: GmgnTokenInfo | null,
-  arkham: ArkhamTokenHolders | null,
-): string {
-  const { pair, profile } = coin;
-  const name = pair.baseToken.name || profile.name || "Unknown";
-  const symbol = pair.baseToken.symbol || profile.symbol || "?";
-  const tokenAddress = pair.baseToken.address;
-  const price = Number(pair.priceUsd);
-  const liquidityUsd = pair.liquidity.usd ?? 0;
-  const ageMs = Date.now() - pair.pairCreatedAt;
-
-  const bundlerLine =
-    bundlerPct === null
-      ? "🛡 Bundler: 0.0%（未检测到捆绑网络）"
-      : `🛡 Bundler: ${bundlerPct.toFixed(1)}%`;
-  const top10Line =
-    top10Pct === null
-      ? "👥 Top10 持仓: —（未检测）"
-      : `👥 Top10 持仓: ${top10Pct.toFixed(1)}% (剔除LP)`;
-  const flowLine = supplyFlowClean
-    ? "🕸 供應流: ✅ 无集中出货（链上检查通过）"
-    : "🕸 供應流: —（未分析）";
-  const sniperLine =
-    sniperPct === null
-      ? "🎯 Sniper 買入: —（未檢測）"
-      : `🎯 Sniper 買入: ${sniperPct.toFixed(1)}%（佔供應）`;
-  const holdersLine =
-    holderCount === null
-      ? "👥 Holders: —（未检测）"
-      : `👥 Holders: ${holderCount.toLocaleString("en-US")}`;
-  const creatorLine =
-    creator === null
-      ? "✍️ Creator: —（未检测）"
-      : `✍️ Creator: ${creator.slice(0, 6)}…${creator.slice(-4)}`;
-  const gmgnLine =
-    gmgn === null
-      ? "🧠 GMGN: —（未配置）"
-      : `🧠 GMGN: 👤${gmgn.holderCount ?? "—"} 持倉 | 💰${gmgn.smartWallets ?? "—"} smart${gmgn.isWashTrading ? " | ⚠️ wash trading" : ""}`;
-  const arkhamLine =
-    arkham === null
-      ? "🕵️ Arkham: —（未配置）"
-      : arkham.smartMoney.length === 0
-        ? "🕵️ Arkham: 0 smart（Top100 无标注机构/鲸鱼）"
-        : (() => {
-            const names = arkham.smartMoney
-              .slice(0, 2)
-              .map((h) => h.entityName ?? h.address.slice(0, 6))
-              .join("、");
-            return `🕵️ Arkham: 💰${arkham.smartMoney.length} smart | ${names}`;
-          })();
-
-  const lines = [
-    `🪙 ${name} (${symbol})`,
-    `💵 价格: ${fmtUsd(price)}`,
-    `💰 市值: ${fmtUsd(pair.marketCap)}`,
-    `⚡ 5m 涨幅: ${pair.priceChange.m5 >= 0 ? "+" : ""}${pair.priceChange.m5.toFixed(2)}%`,
-    `📊 5m 量: ${fmtUsd(pair.volume.m5)}`,
-    bundlerLine,
-    top10Line,
-    flowLine,
-    sniperLine,
-    holdersLine,
-    creatorLine,
-    gmgnLine,
-    arkhamLine,
-    `📈 24h 量: ${fmtUsd(pair.volume.h24)}`,
-    `💧 流动性: ${fmtUsd(liquidityUsd)}`,
-    `⏱️ 上线: ${fmtAge(ageMs)}`,
-    `🔑 合约: ${tokenAddress}`,
-  ];
-  return lines.join("\n");
 }

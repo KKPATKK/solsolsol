@@ -298,6 +298,24 @@ export class Db {
           created_at INTEGER NOT NULL
         );`,
         `CREATE INDEX IF NOT EXISTS idx_sell_log_created ON sell_log(created_at);`,
+        // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
+        // row per (pushed token, holder owner) plus the creator row, written
+        // at push time. Cross-coin clustering = "same wallets repeatedly
+        // appearing across pushed coins" (coordinated-activity detection).
+        // Rows are tiny (≤ 9 per push) and pruned after the clustering
+        // window, so growth is bounded.
+        `CREATE TABLE IF NOT EXISTS pushed_holders (
+          token TEXT NOT NULL,
+          owner TEXT NOT NULL,
+          rank INTEGER NOT NULL,
+          ui_amount REAL NOT NULL DEFAULT 0,
+          is_creator INTEGER NOT NULL DEFAULT 0,
+          crime_hit INTEGER NOT NULL DEFAULT 0,
+          pushed_at INTEGER NOT NULL,
+          PRIMARY KEY (token, owner)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_pushed_holders_owner ON pushed_holders(owner, pushed_at);`,
+        `CREATE INDEX IF NOT EXISTS idx_pushed_holders_at ON pushed_holders(pushed_at);`,
       ],
       "write",
     );
@@ -1313,6 +1331,140 @@ export class Db {
    * budget, and rotation bands order by it so the LIMIT picks the most
    * promising coins.
    */
+  /**
+   * Record the top-holder snapshot of one pushed coin (wallet analysis,
+   * feature C): the creator row plus each resolved top holder, tagged with
+   * their rank, whether they are the creator and whether they hit the crime
+   * list. INSERT OR IGNORE so a coin pushed to several chats / retried
+   * across ticks only stores one snapshot. Callers pass `pushedAt` so the
+   * cluster window is anchored to the push time, not the write time.
+   */
+  async recordPushedHolders(
+    rows: Array<{
+      token: string;
+      owner: string;
+      rank: number;
+      uiAmount: number;
+      isCreator: boolean;
+      crimeHit: boolean;
+    }>,
+    pushedAt: number,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const placeholders = rows.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(",");
+    const args: Array<string | number> = [];
+    for (const r of rows) {
+      args.push(
+        r.token,
+        r.owner,
+        r.rank,
+        Number.isFinite(r.uiAmount) ? r.uiAmount : 0,
+        r.isCreator ? 1 : 0,
+        r.crimeHit ? 1 : 0,
+        pushedAt,
+      );
+    }
+    await this.get().execute({
+      sql: `INSERT OR IGNORE INTO pushed_holders (token, owner, rank, ui_amount, is_creator, crime_hit, pushed_at) VALUES ${placeholders}`,
+      args,
+    });
+  }
+
+  /**
+   * Per-owner cluster stats over pushed_holders: how many DISTINCT pushed
+   * coins each owner was a top holder (or creator) of since `sinceMs`, the
+   * most recent push, and whether any of their rows is the creator row.
+   * One query for the whole wallet batch (rows are few — ~9 per push).
+   */
+  async getHolderClusters(
+    owners: string[],
+    sinceMs: number,
+    minCoins: number,
+  ): Promise<
+    Array<{
+      owner: string;
+      coins: number;
+      lastSeenAt: number;
+      isCreator: boolean;
+    }>
+  > {
+    if (owners.length === 0) return [];
+    const res = await this.get().execute({
+      sql: `SELECT owner,
+                   COUNT(DISTINCT token) AS coins,
+                   MAX(pushed_at) AS last_seen,
+                   MAX(is_creator) AS is_creator
+            FROM pushed_holders
+            WHERE owner IN (${owners.map(() => "?").join(",")}) AND pushed_at > ?
+            GROUP BY owner
+            HAVING coins >= ?`,
+      args: [...owners, sinceMs, minCoins],
+    });
+    return res.rows.map((row) => ({
+      owner: String(row.owner),
+      coins: Number(row.coins ?? 0),
+      lastSeenAt: Number(row.last_seen ?? 0),
+      isCreator: Number(row.is_creator ?? 0) === 1,
+    }));
+  }
+
+  /**
+   * Global cluster scan for /debug/holder-clusters: every wallet that was a
+   * top holder (or creator) of >= minCoins distinct pushed coins in the
+   * window, ranked by coin count then most recent activity. Small table, so
+   * a plain GROUP BY scan is cheap (bounded by the window filter + LIMIT).
+   */
+  async getGlobalHolderClusters(
+    sinceMs: number,
+    minCoins: number,
+    limit = 25,
+  ): Promise<
+    Array<{
+      owner: string;
+      coins: number;
+      lastSeenAt: number;
+      isCreator: boolean;
+      crimeHits: number;
+    }>
+  > {
+    const res = await this.get().execute({
+      sql: `SELECT owner,
+                   COUNT(DISTINCT token) AS coins,
+                   MAX(pushed_at) AS last_seen,
+                   MAX(is_creator) AS is_creator,
+                   SUM(crime_hit) AS crime_hits
+            FROM pushed_holders
+            WHERE pushed_at > ?
+            GROUP BY owner
+            HAVING coins >= ?
+            ORDER BY coins DESC, last_seen DESC
+            LIMIT ?`,
+      args: [sinceMs, minCoins, limit],
+    });
+    return res.rows.map((row) => ({
+      owner: String(row.owner),
+      coins: Number(row.coins ?? 0),
+      lastSeenAt: Number(row.last_seen ?? 0),
+      isCreator: Number(row.is_creator ?? 0) === 1,
+      crimeHits: Number(row.crime_hits ?? 0),
+    }));
+  }
+
+  /**
+   * Prune pushed_holders rows older than `olderThanMs` (bounded chunk — the
+   * table is tiny, so one pass suffices; the analyzer rate-limits calls via
+   * worker_state `pushed_holders_last_prune`).
+   */
+  async prunePushedHolders(olderThanMs: number, maxRows = 5000): Promise<number> {
+    const res = await this.get().execute({
+      sql: `DELETE FROM pushed_holders WHERE rowid IN (
+              SELECT rowid FROM pushed_holders WHERE pushed_at < ? LIMIT ?
+            )`,
+      args: [olderThanMs, maxRows],
+    });
+    return Number(res.rowsAffected ?? 0);
+  }
+
   async updateTokenMaxMcaps(
     entries: Array<{ token: string; mcapUsd: number }>,
   ): Promise<void> {

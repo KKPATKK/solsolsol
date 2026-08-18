@@ -10,6 +10,8 @@ import { Scanner } from "./scanner";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { ArkhamClient } from "./arkham";
+import { CrimeWalletClient } from "./crimewallets";
+import { WalletAnalyzer } from "./walletanalysis";
 
 const config = loadConfig();
 
@@ -145,6 +147,14 @@ async function main(): Promise<void> {
         // Arkham smart-money attribution (null unless ARKHAM_ENABLED AND
         // ARKHAM_API_KEY are set — the card line shows 未配置 otherwise).
         config.arkhamEnabled && config.arkhamApiKey ? new ArkhamClient(config) : null,
+        // Crime-wallet blocklist — creator + top-holder owners matched
+        // against the community list (null when disabled). Mirrors the
+        // worker.ts wiring (see there for the full client construction).
+        config.crimeWallets.enabled ? new CrimeWalletClient(config, db) : null,
+        // Wallet analysis — creator profile + holder ages + cross-coin
+        // clustering for pushed coins (null when disabled). Mirrors the
+        // worker.ts wiring (see there).
+        config.walletAnalysis.enabled ? new WalletAnalyzer(config, db, helius) : null,
       );
 
       const runScan = async (initial: boolean) => {

@@ -11,8 +11,8 @@ const os = require("os");
 const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
 const { parseFilterArgs } = require("../dist/bot.js");
-const { parseAdminIds, isAdmin, parseSmartMoneyTypes } = require("../dist/config.js");
-const { detectSupplyFlow, selectTopAccounts } = require("../dist/helius.js");
+const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("../dist/config.js");
+const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
@@ -20,6 +20,8 @@ const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
 const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
+const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
+const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -865,6 +867,313 @@ async function main() {
     assert.equal(isSmartMoneyType("cex", types), false);
     assert.equal(isSmartMoneyType(null, types), false);
     assert.equal(isSmartMoneyType(undefined, types), false);
+  });
+
+  // ---------- crimewallets.ts ----------
+
+  await test("parseCrimeWalletList keeps valid base58, drops comments/CRLF/garbage, dedupes", () => {
+    const good1 = "11111111111111111111111111111111";
+    const good2 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const text = [
+      "# Crime Wallet List",
+      good1,
+      `  ${good2}  `, // surrounding whitespace trimmed
+      "0OIl-not-base58", // invalid chars (0/O/I/l)
+      "",
+      "short",
+      good1, // duplicate
+      `${good1}\r`, // CRLF
+    ].join("\n");
+    const out = parseCrimeWalletList(text);
+    assert.equal(out.length, 2);
+    assert.ok(out.includes(good1));
+    assert.ok(out.includes(good2));
+  });
+
+  await test("CrimeWalletClient.checkToken: unloaded list → skipped, zero Helius calls", async () => {
+    let rpcCalls = 0;
+    const client = new CrimeWalletClient(
+      { crimeWallets: { url: "https://x", refreshMs: 1, timeoutMs: 1000 } },
+      null,
+      async () => {
+        throw new Error("must not fetch");
+      },
+    );
+    const result = await client.checkToken(
+      "TOKEN",
+      "creator-wallet",
+      {
+        getTokenLargestAccounts: async () => {
+          rpcCalls++;
+          return [];
+        },
+        getAccountOwners: async () => new Map(),
+      },
+      { checkHolders: true, holderTopN: 8 },
+    );
+    assert.equal(result.loaded, false);
+    assert.equal(result.hit, false);
+    assert.equal(rpcCalls, 0);
+  });
+
+  await test("CrimeWalletClient.checkToken: creator hit flags without spending holder RPCs", async () => {
+    const bad = "11111111111111111111111111111111";
+    const client = new CrimeWalletClient(
+      { crimeWallets: { url: "https://x", refreshMs: 1, timeoutMs: 1000 } },
+      null,
+      async () => new Response([`${bad}\n`].join(""), { status: 200 }),
+    );
+    await client.refreshIfStale(true);
+    let largestCalls = 0;
+    const fakeHelius = {
+      getTokenLargestAccounts: async () => {
+        largestCalls++;
+        return [];
+      },
+      getAccountOwners: async () => new Map(),
+    };
+    const r = await client.checkToken("T", bad, fakeHelius, {
+      checkHolders: true,
+      holderTopN: 8,
+    });
+    assert.equal(r.loaded, true);
+    assert.equal(r.creatorHit, true);
+    assert.equal(r.hit, true);
+    assert.equal(largestCalls, 0); // creator hit short-circuits the holder RPC spend
+  });
+
+  await test("CrimeWalletClient.checkToken: top-holder owner hit via Helius owner map", async () => {
+    const bad = "11111111111111111111111111111111";
+    const good = "22222222222222222222222222222222";
+    const client = new CrimeWalletClient(
+      { crimeWallets: { url: "https://x", refreshMs: 1, timeoutMs: 1000 } },
+      null,
+      async () => new Response([`${bad}\n`].join(""), { status: 200 }),
+    );
+    await client.refreshIfStale(true);
+    const fakeHelius = {
+      getTokenLargestAccounts: async () => [
+        { address: "acct1", uiAmount: 10, decimals: 6 },
+        { address: "acct2", uiAmount: 5, decimals: 6 },
+      ],
+      getAccountOwners: async (addrs) =>
+        new Map(addrs.map((a, i) => [a, i === 0 ? bad : good])),
+    };
+    const r = await client.checkToken("T", null, fakeHelius, {
+      checkHolders: true,
+      holderTopN: 8,
+    });
+    assert.equal(r.loaded, true);
+    assert.equal(r.creatorHit, false);
+    assert.equal(r.checkedHolders, 2);
+    assert.equal(r.holderHits.length, 1);
+    assert.equal(r.hit, true);
+  });
+
+  await test("CrimeWalletClient.checkToken: holder lookup failure → no hit, no throw", async () => {
+    const client = new CrimeWalletClient(
+      { crimeWallets: { url: "https://x", refreshMs: 1, timeoutMs: 1000 } },
+      null,
+      async () => new Response("11111111111111111111111111111111\n", { status: 200 }),
+    );
+    await client.refreshIfStale(true);
+    const fakeHelius = {
+      getTokenLargestAccounts: async () => {
+        throw new Error("RPC down");
+      },
+      getAccountOwners: async () => new Map(),
+    };
+    const r = await client.checkToken("T", null, fakeHelius, {
+      checkHolders: true,
+      holderTopN: 8,
+    });
+    assert.equal(r.loaded, true);
+    assert.equal(r.hit, false);
+    assert.equal(r.checkedHolders, 0);
+  });
+
+  await test("CrimeWalletClient.checkToken exposes resolved holders for wallet analysis", async () => {
+    const good = "22222222222222222222222222222222";
+    const client = new CrimeWalletClient(
+      { crimeWallets: { url: "https://x", refreshMs: 1, timeoutMs: 1000 } },
+      null,
+      async () => new Response("11111111111111111111111111111111\n", { status: 200 }),
+    );
+    await client.refreshIfStale(true);
+    const fakeHelius = {
+      getTokenLargestAccounts: async () => [
+        { address: "acct1", uiAmount: 10, decimals: 6 },
+        { address: "acct2", uiAmount: 5, decimals: 6 },
+      ],
+      getAccountOwners: async (addrs) => new Map(addrs.map((a) => [a, good])),
+    };
+    const r = await client.checkToken("T", null, fakeHelius, {
+      checkHolders: true,
+      holderTopN: 8,
+    });
+    assert.equal(r.holders.length, 2);
+    assert.equal(r.holders[0].owner, good);
+    assert.equal(r.holders[0].rank, 1);
+    assert.equal(r.holders[1].rank, 2);
+    assert.equal(r.holders[0].uiAmount, 10);
+    // Creator-hit short-circuit leaves holders empty (no holder RPC spend).
+    const r2 = await client.checkToken(
+      "T",
+      "11111111111111111111111111111111",
+      fakeHelius,
+      { checkHolders: true, holderTopN: 8 },
+    );
+    assert.equal(r2.creatorHit, true);
+    assert.equal(r2.holders.length, 0);
+  });
+
+  // ---------- helius.ts wallet profile ----------
+
+  await test("summarizeSignatures computes age, tx count, create count and cap flag", () => {
+    const sigs = [
+      { blockTime: 2000, memo: "create:..." },
+      { blockTime: 1000, memo: "create:..." },
+      { blockTime: 3000, memo: null },
+      { blockTime: null, memo: "create:..." }, // untimed sig still counts as a create
+    ];
+    const r = summarizeSignatures(sigs, true);
+    assert.equal(r.firstTxMs, 1000 * 1000);
+    assert.equal(r.txCount, 4);
+    assert.equal(r.createCount, 3);
+    assert.equal(r.capped, false); // exhausted → exact numbers
+    // Case-insensitive create memo (pump.fun "Create" mixed case).
+    assert.equal(summarizeSignatures([{ blockTime: 1, memo: "Create:xxx" }], true).createCount, 1);
+  });
+
+  await test("summarizeSignatures marks capped when the window is cut off", () => {
+    const sigs = Array.from({ length: 1000 }, (_, i) => ({ blockTime: i, memo: null }));
+    assert.equal(summarizeSignatures(sigs, false).capped, true);
+    assert.equal(summarizeSignatures(sigs, true).capped, false);
+    assert.equal(summarizeSignatures([], true).firstTxMs, null);
+  });
+
+  // ---------- walletanalysis.ts ----------
+
+  await test("db pushed_holders round-trips and cluster queries find repeat wallets", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      const W1 = "11111111111111111111111111111111";
+      const W2 = "22222222222222222222222222222222";
+      await db.recordPushedHolders(
+        [
+          { token: "T1", owner: W1, rank: 1, uiAmount: 100, isCreator: true, crimeHit: false },
+          { token: "T1", owner: W2, rank: 2, uiAmount: 50, isCreator: false, crimeHit: false },
+        ],
+        now - 3 * 3600e3, // 3h ago → older than the 2h prune cutoff below
+      );
+      await db.recordPushedHolders(
+        [
+          { token: "T2", owner: W1, rank: 1, uiAmount: 200, isCreator: false, crimeHit: true },
+          { token: "T2", owner: W2, rank: 2, uiAmount: 60, isCreator: false, crimeHit: false },
+        ],
+        now,
+      );
+      // Per-wallet lookup: W1 connects to 2 distinct coins (as creator + holder).
+      const c = await db.getHolderClusters([W1, W2], now - 30 * 24 * 3600e3, 2);
+      assert.equal(c.length, 2);
+      const w1 = c.find((x) => x.owner === W1);
+      assert.equal(w1.coins, 2);
+      assert.equal(w1.isCreator, true); // MAX(is_creator)
+      // Threshold 3 → nothing.
+      assert.equal((await db.getHolderClusters([W1, W2], now - 30 * 24 * 3600e3, 3)).length, 0);
+      // Global scan (debug endpoint shape).
+      const g = await db.getGlobalHolderClusters(now - 30 * 24 * 3600e3, 2);
+      assert.equal(g.length, 2);
+      assert.equal(g.find((x) => x.owner === W1).crimeHits, 1);
+      // Prune wipes rows older than 2h (the T1 rows).
+      const deleted = await db.prunePushedHolders(now - 2 * 3600e3);
+      assert.ok(deleted >= 2);
+      assert.equal((await db.getHolderClusters([W1, W2], now - 30 * 24 * 3600e3, 2)).length, 0);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("WalletAnalyzer: creator profile + holder ages + clustering end-to-end", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const config = loadConfig({});
+      const now = 1_800_000_000_000;
+      const CREATOR = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+      const DEV2 = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+      const H1 = "11111111111111111111111111111111";
+      const H2 = "22222222222222222222222222222222";
+      const fakeHelius = {
+        getWalletProfile: async (addr) => {
+          if (addr === CREATOR) {
+            return { firstTxMs: now - 30 * 3600e3, txCount: 50, capped: false, createCount: 4 };
+          }
+          if (addr === H1) {
+            return { firstTxMs: now - 2 * 3600e3, txCount: 3, capped: false, createCount: 0 };
+          }
+          return { firstTxMs: now - 100 * 24 * 3600e3, txCount: 200, capped: false, createCount: 0 };
+        },
+      };
+      const analyzer = new WalletAnalyzer(config, db, fakeHelius);
+      const crime = {
+        hit: false,
+        creatorHit: false,
+        holderHits: [],
+        checkedHolders: 2,
+        loaded: true,
+        holders: [
+          { address: "a1", owner: H1, rank: 1, uiAmount: 10 },
+          { address: "a2", owner: H2, rank: 2, uiAmount: 5 },
+        ],
+      };
+      const r = await analyzer.analyze({
+        token: "T1",
+        creator: CREATOR,
+        holders: crime.holders,
+        crime,
+        now,
+      });
+      assert.equal(r.ok, true);
+      assert.equal(r.creator.createCount, 4);
+      assert.equal(r.creator.serialLauncher, true); // 4 >= default 3
+      assert.equal(r.creator.ageHours >= 29 && r.creator.ageHours <= 31, true);
+      assert.equal(r.holders.checked, 2);
+      assert.equal(r.holders.newWallets, 1); // H1 is younger than 24h
+      assert.equal(r.holders.creatorRank, null); // creator not among top holders
+      // Second coin sharing holder H1 → cluster fires for H1.
+      const crime2 = {
+        ...crime,
+        holders: [{ address: "b1", owner: H1, rank: 1, uiAmount: 20 }],
+      };
+      const r2 = await analyzer.analyze({
+        token: "T2",
+        creator: DEV2,
+        holders: crime2.holders,
+        crime: crime2,
+        now: now + 60e3,
+      });
+      assert.equal(r2.holders.cluster.length, 1);
+      assert.equal(r2.holders.cluster[0].owner, H1);
+      assert.equal(r2.holders.cluster[0].coins, 2);
+      assert.equal(r2.creator.clusterCoins, 1); // creator row counts its own coin
+      // Disabled analyzer → skipped, no RPC.
+      let rpcCalls = 0;
+      const off = new WalletAnalyzer(
+        { ...config, walletAnalysis: { ...config.walletAnalysis, enabled: false } },
+        db,
+        { getWalletProfile: async () => { rpcCalls++; return null; } },
+      );
+      const r3 = await off.analyze({ token: "T3", creator: CREATOR, holders: [], crime, now });
+      assert.equal(r3.skippedReason, "disabled");
+      assert.equal(rpcCalls, 0);
+    } finally {
+      await t.cleanup();
+    }
   });
 
   await test("parseSmartMoneyTypes defaults and parses the comma list", () => {

@@ -143,6 +143,51 @@ interface SigInfo {
   memo?: string | null;
 }
 
+/**
+ * One wallet's on-chain profile, sampled from getSignaturesForAddress
+ * (see HeliusClient.getWalletProfile and summarizeSignatures).
+ */
+export interface WalletProfile {
+  /** Oldest signature blockTime observed (epoch ms), null when unknown. */
+  firstTxMs: number | null;
+  /** Signatures observed in the sampled window (≤ maxPages × 1000). */
+  txCount: number;
+  /**
+   * True when the window was cut off before the wallet's first signature:
+   * firstTxMs is an UPPER bound on true age, txCount a LOWER bound on true
+   * activity (the wallet is busier than it looks).
+   */
+  capped: boolean;
+  /** pump.fun "create..." memo count in the sampled window (serial-launcher proxy). */
+  createCount: number;
+}
+
+/**
+ * Pure reducer for getSignaturesForAddress pages (exported for offline
+ * unit tests). `exhausted` = the last page returned fewer than 1000 sigs,
+ * so the wallet's full history is visible and the numbers are exact.
+ */
+export function summarizeSignatures(
+  sigs: Array<{ blockTime?: number | null; memo?: string | null }>,
+  exhausted: boolean,
+): WalletProfile {
+  let firstTxMs: number | null = null;
+  let createCount = 0;
+  for (const s of sigs) {
+    if (typeof s.blockTime === "number") {
+      const ms = s.blockTime * 1000;
+      if (firstTxMs === null || ms < firstTxMs) firstTxMs = ms;
+    }
+    if (s.memo?.toLowerCase().startsWith("create")) createCount++;
+  }
+  return {
+    firstTxMs,
+    txCount: sigs.length,
+    capped: !exhausted && sigs.length >= 1000,
+    createCount,
+  };
+}
+
 export interface OpeningVolumeInput {
   /** USD price of 1 base token (from the DexScreener pair). */
   priceUsd?: number | string;
@@ -519,6 +564,68 @@ export class HeliusClient {
       });
     }
     return out;
+  }
+
+  /**
+   * Owner wallets of the given token ACCOUNTS (getMultipleAccounts with
+   * jsonParsed — ONE RPC call for the whole batch, ~1 credit). Used by the
+   * crime-wallet check: getTokenLargestAccounts returns token-account
+   * addresses, but the blocklist contains owner wallets, so each top
+   * account is mapped back to its owner here. Returns a map of
+   * account → owner for the accounts that resolved; unresolvable (closed/
+   * unparseable) accounts are simply omitted.
+   */
+  async getAccountOwners(addresses: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (addresses.length === 0) return out;
+    const res = await this.rpc<{
+      value?: Array<{
+        data?: { parsed?: { info?: { owner?: string } } } | null;
+      }>;
+    }>("getMultipleAccounts", [addresses, { encoding: "jsonParsed" }]);
+    if (!res?.value) return out;
+    for (let i = 0; i < addresses.length && i < res.value.length; i++) {
+      const owner = res.value[i]?.data?.parsed?.info?.owner;
+      if (typeof owner === "string" && owner) out.set(addresses[i], owner);
+    }
+    return out;
+  }
+
+  /**
+   * Wallet-profile probe (1 RPC call per wallet): the wallet's age (oldest
+   * signature), activity level (signature count) and how many pump.fun
+   * tokens it recently created ("create..." memo count — a serial-launcher
+   * proxy). Used by the wallet analyzer on pushed coins; results are cached
+   * per wallet so repeat coins don't re-spend. maxPages bounds how far back
+   * the sampling walks (default 1 page of 1000 sigs — exhaustive for
+   * memecoin-dev wallets, approximate for very busy ones, see `capped`).
+   */
+  async getWalletProfile(
+    address: string,
+    maxPages = 1,
+  ): Promise<WalletProfile | null> {
+    const sigs: SigInfo[] = [];
+    let before: string | undefined;
+    let exhausted = false;
+    for (let page = 0; page < maxPages; page++) {
+      const batch = await this.rpc<SigInfo[]>("getSignaturesForAddress", [
+        address,
+        { limit: 1000, ...(before ? { before } : {}) },
+      ]);
+      if (!batch || batch.length === 0) {
+        if (page === 0) return null; // no history at all
+        exhausted = true;
+        break;
+      }
+      sigs.push(...batch);
+      if (batch.length < 1000) {
+        exhausted = true;
+        break;
+      }
+      before = batch[batch.length - 1].signature;
+    }
+    if (sigs.length === 0) return null;
+    return summarizeSignatures(sigs, exhausted);
   }
 
   /**

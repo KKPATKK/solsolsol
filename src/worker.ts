@@ -13,6 +13,8 @@ import { GeckoTerminalClient } from "./geckoterminal";
 import { GmgnClient } from "./gmgn";
 import { AxiomClient } from "./axiom";
 import { ArkhamClient } from "./arkham";
+import { CrimeWalletClient } from "./crimewallets";
+import { WalletAnalyzer } from "./walletanalysis";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -62,6 +64,8 @@ let birdeye: BirdeyeClient | null = null;
 let gmgn: GmgnClient | null = null;
 let axiom: AxiomClient | null = null;
 let arkham: ArkhamClient | null = null;
+let crimeWallets: CrimeWalletClient | null = null;
+let walletAnalyzer: WalletAnalyzer | null = null;
 /** OTP JWT from the pending Axiom login step 1 (module-local, short-lived). */
 let pendingAxiomOtpJwt: string | null = null;
 let trade: TradeService | null = null;
@@ -111,6 +115,8 @@ let birdeyeConfigured = false;
 let gmgnConfigured = false;
 // Whether ARKHAM_API_KEY reached the Worker (presence only — never the value).
 let arkhamConfigured = false;
+let crimeWalletsConfigured = false;
+let walletAnalyzerConfigured = false;
 // Whether AXIOM_EMAIL/PASSWORD reached the Worker (presence only).
 let axiomConfigured = false;
 // Whether the BOT_WALLET_PRIVATE_KEY secret reached the Worker (presence only).
@@ -182,6 +188,8 @@ async function ensureInitialized(env: Env): Promise<void> {
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
     gmgnConfigured = Boolean(config.gmgnApiKey);
     arkhamConfigured = Boolean(config.arkhamEnabled && config.arkhamApiKey);
+    crimeWalletsConfigured = Boolean(config.crimeWallets.enabled);
+    walletAnalyzerConfigured = Boolean(config.walletAnalysis.enabled);
     // Axiom is configured when there are login credentials OR already
     // persisted tokens (Google/SSO accounts have no password — they get
     // tokens via /debug/axiom-tokens, which is re-checked after DB init).
@@ -258,6 +266,18 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
 
+      crimeWallets = null;
+      if (config.crimeWallets.enabled) {
+        try {
+          crimeWallets = new CrimeWalletClient(config, db);
+        } catch (err) {
+          console.warn(
+            "[worker] Crime-wallet client not ready:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
       helius = new HeliusClient(config);
 
       // Jupiter direct trading (off by default; only constructed when the
@@ -279,6 +299,18 @@ async function ensureInitialized(env: Env): Promise<void> {
       );
       webhook = webhookCallback(bot, "cloudflare-mod");
       botReady = true;
+
+      walletAnalyzer = null;
+      if (config.walletAnalysis.enabled) {
+        try {
+          walletAnalyzer = new WalletAnalyzer(config, db, helius);
+        } catch (err) {
+          console.warn(
+            "[worker] Wallet-analyzer client not ready:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
 
       if (db) {
         scanner = new Scanner(
@@ -306,6 +338,13 @@ async function ensureInitialized(env: Env): Promise<void> {
           // Arkham Intelligence — smart-money holder attribution (null when
           // no ARKHAM_API_KEY configured). Card-only enrichment.
           arkham,
+          // Crime-wallet blocklist — creator + top-holder owners matched
+          // against the community list (null when disabled). Flags the card;
+          // CRIME_WALLETS_BLOCK=true turns a hit into a push blocker.
+          crimeWallets ?? undefined,
+          // Wallet analysis — creator profile + holder ages + cross-coin
+          // clustering for pushed coins (null when disabled).
+          walletAnalyzer ?? undefined,
         );
         scannerReady = true;
       }
@@ -673,9 +712,12 @@ export default {
         birdeyeConfigured,
         gmgnConfigured,
         arkhamConfigured,
+        crimeWalletsConfigured,
+        walletAnalyzerConfigured,
         axiomConfigured,
         tradeConfigured,
         jupiterKeyed,
+        crimeWallets: crimeWallets?.status ?? null,
         tradeMode: effectiveTradeMode,
         tradeModeOverride,
         adminConfigured: (cfg?.adminIds.length ?? 0) > 0,
@@ -755,6 +797,72 @@ export default {
             type: h.entityType,
             pct: h.pctOfCap === null ? null : +(h.pctOfCap * 100).toFixed(2),
           })),
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Crime-wallet blocklist status — whether the community list is loaded
+    // in this isolate, its size, the last refresh error, and the persisted
+    // refresh time from worker_state. ?refresh=1 forces a re-fetch (the
+    // first load happens automatically on the next scan tick otherwise).
+    if (url.pathname === "/debug/crime-wallets") {
+      const client = crimeWallets;
+      if (!client) {
+        return Response.json({
+          ok: false,
+          error: "crime-wallets disabled (CRIME_WALLETS_ENABLED=false)",
+        });
+      }
+      let refreshed: { ok: boolean; size: number } | null = null;
+      if (url.searchParams.get("refresh") === "1") {
+        refreshed = await client.refreshIfStale(true);
+      }
+      let persistedUpdatedAt: number | null = null;
+      try {
+        const raw = await db?.getWorkerState("crime_wallets_updated_at");
+        persistedUpdatedAt = raw ? Number(raw) : null;
+      } catch {
+        // telemetry only
+      }
+      return Response.json({
+        ok: true,
+        enabled: true,
+        ...client.status,
+        persistedUpdatedAt,
+        refreshed,
+      });
+    }
+
+    // /debug/holder-clusters — cross-coin wallet clustering diagnostics
+    // (wallet analysis feature C): every wallet that appeared as a top
+    // holder (or creator) of >= minCoins distinct pushed coins in the last
+    // `days` days, ranked by coin count then recency. This is the live
+    // global view of the same data the push card's 🔁 關聯錢包 line uses —
+    // the way to spot coordinated wallets that are not (yet) on any list.
+    if (url.pathname === "/debug/holder-clusters") {
+      if (!db) {
+        return Response.json({ ok: false, error: "TURSO not configured" });
+      }
+      const minCoins = Math.max(1, Number(url.searchParams.get("minCoins") ?? 2));
+      const days = Math.max(1, Number(url.searchParams.get("days") ?? 14));
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") ?? 25)));
+      try {
+        const clusters = await db.getGlobalHolderClusters(
+          Date.now() - days * 24 * 3600_000,
+          minCoins,
+          limit,
+        );
+        return Response.json({
+          ok: true,
+          windowDays: days,
+          minCoins,
+          count: clusters.length,
+          clusters,
         });
       } catch (err) {
         return Response.json({

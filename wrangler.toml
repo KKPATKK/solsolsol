@@ -111,6 +111,45 @@ GMGN_BLOCK_WASH_TRADING = "true"
 ARKHAM_ENABLED = "0"
 ARKHAM_REQUEST_INTERVAL_MS = "300"
 ARKHAM_SMART_MONEY_TYPES = "fund,hedgefund,hedge_fund,investor,marketmaker,market_maker,trader,vc,venture,whale"
+# Crime-wallet blocklist (community list, github.com/solguala/crimewallets —
+# no key needed): each pushed coin's creator (RugCheck) and top holder
+# owner wallets (Helius, 2 RPC calls/coin) are matched against ~4.8K wallets
+# flagged from aged-wallet sale listings. A match is a WARNING (the list's
+# own README says so) — default mode flags the card; CRIME_WALLETS_BLOCK
+# turns a hit into a push blocker. The list re-fetches every
+# CRIME_WALLETS_REFRESH_HOURS; /debug/crime-wallets shows status and
+# ?refresh=1 forces a re-fetch.
+CRIME_WALLETS_ENABLED = "true"
+CRIME_WALLETS_BLOCK = "false"
+CRIME_WALLETS_CHECK_HOLDERS = "true"
+CRIME_WALLETS_HOLDER_TOP_N = "8"
+CRIME_WALLETS_REFRESH_HOURS = "6"
+CRIME_WALLETS_FETCH_TIMEOUT_MS = "8000"
+# Wallet analysis on pushed coins (deeper than the blocklist match):
+#   A. creator profile — wallet age (oldest signature) + serial-launcher
+#      create count (pump.fun "create" memos in the sampled window),
+#   B. top-holder depth — how many top-holder owner wallets are brand-new
+#      (< WALLET_ANALYSIS_NEW_AGE_HOURS) and whether the creator is itself
+#      a top holder,
+#   C. cross-coin clustering — every pushed coin's top-holder snapshot is
+#      stored in pushed_holders; wallets appearing as top holders/creators
+#      of >= WALLET_ANALYSIS_CLUSTER_MIN_COINS distinct pushed coins get a
+#      🔁 關聯錢包 warning on the card (coordinated-activity detection —
+#      surfaces wallets that are NOT on any list yet; see
+#      /debug/holder-clusters for the global view).
+# Cost: the holder list reuses the crime check's resolved owners (no extra
+# RPC); each unique wallet then costs ONE cached Helius call
+# (getSignaturesForAddress), capped at WALLET_ANALYSIS_MAX_WALLETS per coin
+# and bounded by WALLET_ANALYSIS_BUDGET_MS — a slow RPC truncates the card
+# enrichment, never the push.
+WALLET_ANALYSIS_ENABLED = "true"
+WALLET_ANALYSIS_MAX_WALLETS = "9"
+WALLET_ANALYSIS_PROFILE_CACHE_MIN = "60"
+WALLET_ANALYSIS_BUDGET_MS = "8000"
+WALLET_ANALYSIS_MIN_CREATES = "3"
+WALLET_ANALYSIS_NEW_AGE_HOURS = "24"
+WALLET_ANALYSIS_CLUSTER_MIN_COINS = "2"
+WALLET_ANALYSIS_CLUSTER_WINDOW_DAYS = "14"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
 HELIUS_REQUEST_INTERVAL_MS = "300"
 # Periodic Birdeye new_listing backfill (safety net for discovery gaps):
