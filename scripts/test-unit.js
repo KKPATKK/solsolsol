@@ -70,7 +70,7 @@ async function main() {
   await test("DEFAULT_SETTINGS match the operator's filter spec", () => {
     assert.equal(DEFAULT_SETTINGS.minMarketCapUsd, 40000);
     assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 300000);
-    assert.equal(DEFAULT_SETTINGS.minAgeMinutes, 300);
+    assert.equal(DEFAULT_SETTINGS.minAgeMinutes, 180);
     assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 1680);
     assert.equal(DEFAULT_SETTINGS.min5mVolUsd, 6000);
     assert.equal(DEFAULT_SETTINGS.min5mChgPct, 30);
@@ -91,7 +91,7 @@ async function main() {
       const d = await db.getChatSettings("chat-defaults");
       assert.equal(d.minMarketCapUsd, 40000);
       assert.equal(d.maxMarketCapUsd, 300000);
-      assert.equal(d.minAgeMinutes, 300);
+      assert.equal(d.minAgeMinutes, 180);
       assert.equal(d.maxAgeMinutes, 1680);
       assert.equal(d.min5mVolUsd, 6000);
       assert.equal(d.min5mChgPct, 30);
@@ -218,7 +218,7 @@ async function main() {
       const s = await db.getChatSettings("legacy-chat");
       assert.equal(s.minMarketCapUsd, 40000);
       assert.equal(s.maxMarketCapUsd, 300000);
-      assert.equal(s.minAgeMinutes, 300);
+      assert.equal(s.minAgeMinutes, 180);
       assert.equal(s.maxAgeMinutes, 1680);
       assert.equal(s.min5mVolUsd, 6000);
       assert.equal(s.min5mChgPct, 30);

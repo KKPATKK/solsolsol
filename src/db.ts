@@ -50,7 +50,7 @@ export interface ChatSettings {
 }
 
 /**
- * Current filter profile: mid-cap coins ($40K–$300K) aged 5–28 hours with a
+ * Current filter profile: mid-cap coins ($40K–$300K) aged 3–28 hours with a
  * hot 5m tape. The first-minute-volume, sniper, bundler and top-10 holder
  * filters were removed (bundler/top-10 data is shown on the card for
  * reference only).
@@ -60,7 +60,7 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minVolume24hUsd: 0,
   minMarketCapUsd: 40000,
   maxMarketCapUsd: 300000,
-  minAgeMinutes: 300, // 5h
+  minAgeMinutes: 180, // 3h
   maxAgeMinutes: 1680, // 28h
   min5mVolUsd: 6000,
   min5mChgPct: 30,
@@ -225,7 +225,7 @@ export class Db {
           min_volume_24h_usd REAL NOT NULL DEFAULT 0,
           min_market_cap_usd REAL NOT NULL DEFAULT 40000,
           max_market_cap_usd REAL NOT NULL DEFAULT 300000,
-          min_age_minutes REAL NOT NULL DEFAULT 300,
+          min_age_minutes REAL NOT NULL DEFAULT 180,
           max_age_minutes REAL NOT NULL DEFAULT 1680,
           min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
           min_5m_chg_pct REAL NOT NULL DEFAULT 30,
@@ -365,6 +365,10 @@ export class Db {
           sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v2_done'",
           args: [],
         },
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'settings_v3_applied'",
+          args: [],
+        },
       ],
       "read",
     );
@@ -374,6 +378,8 @@ export class Db {
       flags[1].rows.length > 0 ? String(flags[1].rows[0].value) : null;
     const schemaAlterV2 =
       flags[2].rows.length > 0 ? String(flags[2].rows[0].value) : null;
+    const settingsV3 =
+      flags[3].rows.length > 0 ? String(flags[3].rows[0].value) : null;
 
     // One-time migration: existing chats keep their old filter values unless
     // reset. The operator specified a new filter profile, so apply it to all
@@ -400,6 +406,16 @@ export class Db {
       await this.setWorkerState("settings_v2_applied", "1");
       console.log("[db] applied new filter defaults to existing chats (settings_v2)");
     }
+    // settings_v3: operator lowered the minimum coin age gate 300m→180m.
+    // Apply once to existing chats; later /filter customizations are kept.
+    if (!settingsV3) {
+      await this.get().execute({
+        sql: "UPDATE chat_settings SET min_age_minutes = ?",
+        args: [d.minAgeMinutes],
+      });
+      await this.setWorkerState("settings_v3_applied", "1");
+      console.log("[db] applied min-age default 180m to existing chats (settings_v3)");
+    }
     // One-time legacy column backfills (databases created before these
     // columns existed). Fresh databases already carry every column in the
     // CREATE TABLE, so this runs at most once per database; bump the flag
@@ -407,7 +423,7 @@ export class Db {
     if (!schemaAlterDone) {
       await this.addColumnIfMissing("chat_settings", "min_market_cap_usd", "REAL NOT NULL DEFAULT 40000");
       await this.addColumnIfMissing("chat_settings", "max_market_cap_usd", "REAL NOT NULL DEFAULT 300000");
-      await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 300");
+      await this.addColumnIfMissing("chat_settings", "min_age_minutes", "REAL NOT NULL DEFAULT 180");
       await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 1680");
       await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
       await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
