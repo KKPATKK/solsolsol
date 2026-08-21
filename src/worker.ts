@@ -1222,6 +1222,7 @@ export default {
           maxAgeMinutes: c.maxAgeMinutes,
           min5mVolUsd: c.min5mVolUsd,
           min5mChgPct: c.min5mChgPct,
+          min1hChgPct: c.min1hChgPct,
           lastPushError,
         });
       }

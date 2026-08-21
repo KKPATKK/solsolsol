@@ -55,13 +55,15 @@ export type ParsedFilter =
       maxAgeMinutes: number;
       min5mVolUsd: number;
       min5mChgPct: number;
+      /** Optional 7th /filter arg — the compound gate's 1h leg (default 40). */
+      min1hChgPct: number;
     }
   | { ok: false; error: string };
 
 export function parseFilterArgs(parts: string[]): ParsedFilter {
   const USAGE =
-    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>`\n例如: `/filter 40000 300000 300 1680 6000 30`";
-  if (parts.length !== 6) {
+    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%]`\n例如: `/filter 40000 300000 300 1680 4000 20 40`\n合格条件 = 5m涨幅 ≥ 第6参数 **或** 1h涨幅 ≥ 第7参数（省略则默认 40）";
+  if (parts.length !== 6 && parts.length !== 7) {
     return { ok: false, error: USAGE };
   }
   const minMarketCapUsd = parseNumber(parts[0]);
@@ -70,6 +72,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
   const maxAgeMinutes = parseNumber(parts[3]);
   const min5mVolUsd = parseNumber(parts[4]);
   const min5mChgPct = parseNumber(parts[5]);
+  const min1hChgPct = parts.length === 7 ? parseNumber(parts[6]) : 40;
   if (
     minMarketCapUsd === null ||
     maxMarketCapUsd === null ||
@@ -77,6 +80,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     maxAgeMinutes === null ||
     min5mVolUsd === null ||
     min5mChgPct === null ||
+    min1hChgPct === null ||
     minMarketCapUsd < 0 ||
     maxMarketCapUsd < 0 ||
     minAgeMinutes <= 0 ||
@@ -88,7 +92,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     return {
       ok: false,
       error:
-        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>`",
+        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%]`",
     };
   }
   return {
@@ -99,6 +103,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     maxAgeMinutes,
     min5mVolUsd,
     min5mChgPct,
+    min1hChgPct,
   };
 }
 
@@ -223,6 +228,7 @@ export function createBot(
       maxAgeMinutes: parsed.maxAgeMinutes,
       min5mVolUsd: parsed.min5mVolUsd,
       min5mChgPct: parsed.min5mChgPct,
+      min1hChgPct: parsed.min1hChgPct,
       enabled: existing?.enabled ?? false,
     });
     await ctx.reply(
@@ -233,7 +239,7 @@ export function createBot(
         `⏱️ 最短上线: ${parsed.minAgeMinutes} 分钟`,
         `⏱️ 最长上线: ${parsed.maxAgeMinutes} 分钟`,
         `📊 最低 5m 量: ${fmtUsd(parsed.min5mVolUsd)}`,
-        `⚡ 最低 5m 涨幅: ${parsed.min5mChgPct}%`,
+        `⚡ 合格涨幅: 5m ≥ ${parsed.min5mChgPct}% 或 1h ≥ ${parsed.min1hChgPct}%`,
         `推送状态: ${existing?.enabled ?? false ? "已开启" : "已关闭（用 /on 开启）"}`,
       ].join("\n"),
     );
@@ -282,6 +288,7 @@ export function createBot(
       maxAgeMinutes: existing?.maxAgeMinutes ?? DEFAULT_SETTINGS.maxAgeMinutes,
       min5mVolUsd: existing?.min5mVolUsd ?? DEFAULT_SETTINGS.min5mVolUsd,
       min5mChgPct: existing?.min5mChgPct ?? DEFAULT_SETTINGS.min5mChgPct,
+      min1hChgPct: existing?.min1hChgPct ?? DEFAULT_SETTINGS.min1hChgPct,
       enabled: true,
     });
     await ctx.reply(
@@ -625,6 +632,7 @@ export function createBot(
       maxAgeMinutes: existing?.maxAgeMinutes ?? DEFAULT_SETTINGS.maxAgeMinutes,
       min5mVolUsd: existing?.min5mVolUsd ?? DEFAULT_SETTINGS.min5mVolUsd,
       min5mChgPct: existing?.min5mChgPct ?? DEFAULT_SETTINGS.min5mChgPct,
+      min1hChgPct: existing?.min1hChgPct ?? DEFAULT_SETTINGS.min1hChgPct,
       enabled: false,
     });
     await ctx.reply("⛔ 推送已关闭。用 /on 重新开启。");

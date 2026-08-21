@@ -40,6 +40,12 @@ export interface ChatSettings {
   min5mVolUsd: number;
   /** Minimum 5-minute price change in percent (e.g. 18 = +18%). */
   min5mChgPct: number;
+  /**
+   * Minimum 1-hour price change in percent for the compound momentum gate
+   * (a coin qualifies on 5m ≥ min5mChgPct OR 1h ≥ this — catches coins
+   * sampled mid-pullback between spikes).
+   */
+  min1hChgPct: number;
   enabled: boolean;
 }
 
@@ -58,6 +64,7 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   maxAgeMinutes: 1680, // 28h
   min5mVolUsd: 6000,
   min5mChgPct: 30,
+  min1hChgPct: 40,
   enabled: false,
 };
 
@@ -222,6 +229,7 @@ export class Db {
           max_age_minutes REAL NOT NULL DEFAULT 1680,
           min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
           min_5m_chg_pct REAL NOT NULL DEFAULT 30,
+          min_1h_chg_pct REAL NOT NULL DEFAULT 40,
           enabled INTEGER NOT NULL DEFAULT 0
         );`,
         `CREATE TABLE IF NOT EXISTS worker_state (
@@ -437,6 +445,13 @@ export class Db {
     // coins. Unconditional because addColumnIfMissing is idempotent (fresh
     // databases already carry the column from CREATE TABLE).
     await this.addColumnIfMissing("token_stats", "max_mcap_observed", "REAL");
+    // v4: min_1h_chg_pct — the compound momentum gate's 1-hour leg (chat
+    // filter). Unconditional because addColumnIfMissing is idempotent.
+    await this.addColumnIfMissing(
+      "chat_settings",
+      "min_1h_chg_pct",
+      "REAL NOT NULL DEFAULT 40",
+    );
     // Telemetry counters: /health used to run COUNT(*) over token_stats
     // (~400K rows) and seen_tokens (~50K rows) on every ping — at the 1-min
     // uptime-monitor cadence that alone is ~600M rows/day (alerted
@@ -590,6 +605,7 @@ export class Db {
       maxAgeMinutes: Number(row.max_age_minutes ?? DEFAULT_SETTINGS.maxAgeMinutes),
       min5mVolUsd: Number(row.min_5m_vol_usd ?? DEFAULT_SETTINGS.min5mVolUsd),
       min5mChgPct: Number(row.min_5m_chg_pct ?? DEFAULT_SETTINGS.min5mChgPct),
+      min1hChgPct: Number(row.min_1h_chg_pct ?? DEFAULT_SETTINGS.min1hChgPct),
       enabled: Number(row.enabled) === 1,
     };
   }
@@ -610,8 +626,8 @@ export class Db {
         INSERT INTO chat_settings
           (chat_id, min_liquidity_usd, min_volume_24h_usd,
            min_market_cap_usd, max_market_cap_usd, min_age_minutes, max_age_minutes,
-           min_5m_vol_usd, min_5m_chg_pct, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           min_5m_vol_usd, min_5m_chg_pct, min_1h_chg_pct, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
           min_liquidity_usd = excluded.min_liquidity_usd,
           min_volume_24h_usd = excluded.min_volume_24h_usd,
@@ -621,6 +637,7 @@ export class Db {
           max_age_minutes = excluded.max_age_minutes,
           min_5m_vol_usd = excluded.min_5m_vol_usd,
           min_5m_chg_pct = excluded.min_5m_chg_pct,
+          min_1h_chg_pct = excluded.min_1h_chg_pct,
           enabled = excluded.enabled
       `,
       args: [
@@ -633,6 +650,7 @@ export class Db {
         settings.maxAgeMinutes,
         settings.min5mVolUsd,
         settings.min5mChgPct,
+        settings.min1hChgPct,
         settings.enabled ? 1 : 0,
       ],
     });

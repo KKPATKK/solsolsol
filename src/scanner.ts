@@ -3,7 +3,7 @@ import { tradeKeyboard } from "./bot";
 import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import type { Db, TokenStats } from "./db";
-import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreener";
+import { DexScreenerClient, passesChgGate, type PairInfo, type TokenProfile } from "./dexscreener";
 import { fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
@@ -1698,6 +1698,7 @@ export class Scanner {
       maxAgeMinutes: number;
       min5mVolUsd: number;
       min5mChgPct: number;
+      min1hChgPct: number;
     }[],
     fails: ScanSummary["fails"],
     rejects: RejectionEntry[],
@@ -1766,9 +1767,11 @@ export class Scanner {
           reject(`5m量 ${fmtUsd(pair.volume.m5)} < ${fmtUsd(chat.min5mVolUsd)}`);
           continue;
         }
-        if (pair.priceChange.m5 < chat.min5mChgPct) {
+        // Compound momentum gate: hot 5m tape OR hot 1h tape (the instant 5m
+        // snapshot alone misses coins sampled mid-pullback between spikes).
+        if (!passesChgGate(pair.priceChange.m5, pair.priceChange.h1, chat.min5mChgPct, chat.min1hChgPct)) {
           fails.chg++;
-          reject(`5m涨幅 ${pair.priceChange.m5.toFixed(1)}% < ${chat.min5mChgPct}%`);
+          reject(`5m涨幅 ${pair.priceChange.m5.toFixed(1)}% 且 1h涨幅 ${pair.priceChange.h1.toFixed(1)}% < ${chat.min1hChgPct}%`);
           continue;
         }
         out.push({

@@ -20,12 +20,28 @@ export interface PairInfo {
   priceNative?: number;
   marketCap: number;
   volume: { h24: number; m5: number };
-  priceChange: { m5: number };
+  priceChange: { m5: number; h1: number };
   liquidity: { usd: number | null };
   pairCreatedAt: number;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Compound momentum gate: a coin qualifies when its 5-minute tape is hot
+ * (fast pump in progress right now) OR its 1-hour tape is hot (pumped
+ * within the last hour and possibly consolidating between spikes — the
+ * single-instant 5m snapshot alone misses coins sampled mid-pullback).
+ * Exported for offline unit tests.
+ */
+export function passesChgGate(
+  chg5m: number,
+  chg1h: number,
+  min5mPct: number,
+  min1hPct: number,
+): boolean {
+  return chg5m >= min5mPct || chg1h >= min1hPct;
+}
 
 /** Spaces out HTTP requests so we stay well under DexScreener's rate limit. */
 class Throttle {
@@ -153,7 +169,7 @@ export class DexScreenerClient {
         if (!baseToken?.address) continue;
         if (result.has(baseToken.address)) continue; // first pair wins
         const volume = raw.volume as { h24?: number; m5?: number } | undefined;
-        const priceChange = raw.priceChange as { m5?: number } | undefined;
+        const priceChange = raw.priceChange as { m5?: number; h1?: number } | undefined;
         result.set(baseToken.address, {
           chainId: "solana",
           url: String(raw.url ?? ""),
@@ -172,6 +188,7 @@ export class DexScreenerClient {
           },
           priceChange: {
             m5: Number(priceChange?.m5 ?? 0),
+            h1: Number(priceChange?.h1 ?? 0),
           },
           liquidity: {
             usd: Number((raw.liquidity as { usd?: number } | undefined)?.usd ?? 0) || null,

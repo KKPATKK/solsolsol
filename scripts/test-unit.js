@@ -17,6 +17,7 @@ const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmoun
 const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
+const { passesChgGate } = require("../dist/dexscreener.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -106,6 +107,7 @@ async function main() {
         maxAgeMinutes: 500,
         min5mVolUsd: 789,
         min5mChgPct: 12,
+        min1hChgPct: 40,
         enabled: true,
       });
       const got = await db.getChatSettings("chat-a");
@@ -119,6 +121,7 @@ async function main() {
         maxAgeMinutes: 500,
         min5mVolUsd: 789,
         min5mChgPct: 12,
+        min1hChgPct: 40,
         enabled: true,
       });
     } finally {
@@ -141,6 +144,7 @@ async function main() {
         maxAgeMinutes: 1680,
         min5mVolUsd: 6000,
         min5mChgPct: 30,
+        min1hChgPct: 40,
         enabled: true,
       });
       await db.saveChatSettings({
@@ -153,6 +157,7 @@ async function main() {
         maxAgeMinutes: 720,
         min5mVolUsd: 100,
         min5mChgPct: 5,
+        min1hChgPct: 40,
         enabled: false,
       });
       const all = await db.listAllChats();
@@ -263,7 +268,7 @@ async function main() {
       const mk = (chatId, enabled) => ({
         chatId, minLiquidityUsd: 0, minVolume24hUsd: 0,
         minMarketCapUsd: 1, maxMarketCapUsd: 2, minAgeMinutes: 3, maxAgeMinutes: 4,
-        min5mVolUsd: 5, min5mChgPct: 6,
+        min5mVolUsd: 5, min5mChgPct: 6, min1hChgPct: 40,
         enabled,
       });
       await db.saveChatSettings(mk("on", true));
@@ -642,6 +647,21 @@ async function main() {
     assert.deepEqual(await client.fetchRecentTokens(5), []);
     assert.deepEqual(await client.fetchTrendingTokens(5), []);
     assert.equal(calls, before); // zero network calls while backed off
+  });
+
+  await test("passesChgGate: compound 5m OR 1h momentum gate", () => {
+    // Hot 5m tape qualifies on its own.
+    assert.equal(passesChgGate(25, 10, 20, 40), true);
+    // Cool 5m but hot 1h — the pullback-between-spikes case this gate adds.
+    assert.equal(passesChgGate(8, 45, 20, 40), true);
+    // Both legs cool → rejected.
+    assert.equal(passesChgGate(9.2, -5, 20, 40), false);
+    // Boundary: >= (not >) on either leg.
+    assert.equal(passesChgGate(20, 0, 20, 40), true);
+    assert.equal(passesChgGate(0, 40, 20, 40), true);
+    assert.equal(passesChgGate(19.9, 39.9, 20, 40), false);
+    // Negative values never qualify.
+    assert.equal(passesChgGate(-41.2, -10, 20, 40), false);
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {
@@ -1600,11 +1620,17 @@ async function main() {
     if (r.ok) assert.equal(r.minMarketCapUsd, 40000);
   });
 
-  await test("parseFilterArgs rejects wrong argument counts (bundler/top10 args removed)", () => {
+  await test("parseFilterArgs rejects wrong argument counts (6 required, optional 1h leg)", () => {
     assert.equal(parseFilterArgs([]).ok, false);
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5"]).ok, false);
-    // 7/8-arg forms (old Bundler/Top10) must now be rejected.
-    assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7"]).ok, false);
+    // 6 args = valid (1h leg defaults to 40); 7 args = explicit 1h leg; 8+ rejected.
+    const six = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20"]);
+    assert.equal(six.ok, true);
+    assert.ok(six.ok && six.min1hChgPct === 40);
+    const seven = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20", "35"]);
+    assert.equal(seven.ok, true);
+    assert.ok(seven.ok && seven.min1hChgPct === 35);
+    assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8"]).ok, false);
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8", "9"]).ok, false);
   });
 
