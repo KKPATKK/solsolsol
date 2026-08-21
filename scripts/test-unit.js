@@ -916,6 +916,56 @@ async function main() {
     assert.equal(rpcCalls, 0);
   });
 
+  await test("CrimeWalletClient: persists parsed list and hydrates from it when upstream dies", async () => {
+    const good = "11111111111111111111111111111111";
+    const good2 = "22222222222222222222222222222222";
+    // Minimal Db stub backed by a map.
+    const state = new Map();
+    const db = {
+      async setWorkerState(k, v) {
+        state.set(k, v);
+      },
+      async getWorkerState(k) {
+        return state.get(k) ?? null;
+      },
+    };
+    const cfg = { crimeWallets: { url: "https://x", refreshMs: 1, timeoutMs: 1000 } };
+
+    // Isolate 1: healthy upstream — list loads AND is persisted to db.
+    const c1 = new CrimeWalletClient(cfg, db, async () => new Response(`${good}\n${good2}\n`, { status: 200 }));
+    const r1 = await c1.refreshIfStale(true);
+    assert.equal(r1.ok, true);
+    assert.equal(r1.size, 2);
+    assert.equal(state.get("crime_wallets_list"), `${good}\n${good2}`);
+
+    // Isolate 2: cold start + upstream gone (404) — hydrates from persisted copy.
+    let fetchTried = false;
+    const c2 = new CrimeWalletClient(cfg, db, async () => {
+      fetchTried = true;
+      return new Response("gone", { status: 404 });
+    });
+    const r2 = await c2.refreshIfStale(true);
+    assert.equal(fetchTried, true); // still tried upstream first
+    assert.equal(r2.ok, true);
+    assert.equal(r2.size, 2);
+    assert.equal(c2.loaded, true);
+    const chk = await c2.checkToken("T", good2, null, { checkHolders: false, holderTopN: 8 });
+    assert.equal(chk.loaded, true);
+    assert.equal(chk.creatorHit, true);
+
+    // No persisted copy + dead upstream → stays unloaded (previous behavior).
+    const emptyDb = {
+      async setWorkerState() {},
+      async getWorkerState() {
+        return null;
+      },
+    };
+    const c3 = new CrimeWalletClient(cfg, emptyDb, async () => new Response("gone", { status: 404 }));
+    const r3 = await c3.refreshIfStale(true);
+    assert.equal(r3.ok, false);
+    assert.equal(c3.loaded, false);
+  });
+
   await test("CrimeWalletClient.checkToken: creator hit flags without spending holder RPCs", async () => {
     const bad = "11111111111111111111111111111111";
     const client = new CrimeWalletClient(

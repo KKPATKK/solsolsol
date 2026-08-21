@@ -15,10 +15,12 @@ import type { HeliusClient } from "./helius";
  * CRIME_WALLETS_BLOCK=true turns a hit into a push blocker.
  *
  * The list is fetched from a one-address-per-line text file (default the
- * repo's `raw format.txt`), re-fetched at most once per refreshMs per
- * isolate (the in-memory gate; the worker also persists the last refresh
- * time in worker_state for /health diagnostics). A failed fetch keeps the
- * previous list and records lastError — the scan path never blocks on this.
+ * mirror's `raw format.txt`), re-fetched at most once per refreshMs per
+ * isolate (the in-memory gate; the worker also persists the refresh time
+ * and the parsed list itself in worker_state — the list is rehydrated from
+ * that copy whenever the upstream fetch fails on a cold isolate). A failed
+ * fetch keeps the previous list and records lastError — the scan path never
+ * blocks on this.
  */
 
 /** Valid base58 Solana address (32–44 chars, no 0/O/I/l). */
@@ -104,9 +106,12 @@ export interface CrimeWalletStatus {
   refreshMs: number;
 }
 
-/** Default raw-list URL (solguala/crimewallets `raw format.txt`). */
+/** Default raw-list URL (crimewallets mirror `raw format.txt`). */
 export const DEFAULT_CRIME_WALLETS_URL =
-  "https://raw.githubusercontent.com/solguala/crimewallets/main/raw%20format.txt";
+  "https://raw.githubusercontent.com/ashantilagos/crimewallets/main/raw%20format.txt";
+
+/** worker_state key holding the last successfully-parsed list (newline-joined). */
+const PERSISTED_LIST_KEY = "crime_wallets_list";
 
 export class CrimeWalletClient {
   private wallets = new Set<string>();
@@ -192,6 +197,10 @@ export class CrimeWalletClient {
       this.lastError = null;
       try {
         await this.db?.setWorkerState("crime_wallets_updated_at", String(this.loadedAt));
+        // Persist the parsed list itself so a future upstream disappearance
+        // (the original solguala repo went 404 on 2026-08-21) degrades to a
+        // stale-but-working blocklist instead of an empty one.
+        await this.db?.setWorkerState(PERSISTED_LIST_KEY, parsed.join("\n"));
       } catch (err) {
         console.error(
           "[crimewallets] refresh-time persist failed:",
@@ -202,6 +211,29 @@ export class CrimeWalletClient {
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
       console.error(`[crimewallets] refresh failed: ${this.lastError}`);
+      // Fallback: hydrate from the last persisted copy so a dead upstream
+      // leaves us with a stale list rather than no list at all.
+      if (!this.loaded && this.db) {
+        try {
+          const saved = await this.db.getWorkerState(PERSISTED_LIST_KEY);
+          if (saved) {
+            const parsed = parseCrimeWalletList(saved);
+            if (parsed.length > 0) {
+              this.wallets = new Set(parsed);
+              this.loadedAt = Date.now();
+              console.error(
+                `[crimewallets] hydrated ${parsed.length} wallets from persisted copy (upstream unavailable)`,
+              );
+              return { ok: true, size: this.wallets.size };
+            }
+          }
+        } catch (dbErr) {
+          console.error(
+            "[crimewallets] persisted-list fallback failed:",
+            dbErr instanceof Error ? dbErr.message : dbErr,
+          );
+        }
+      }
       return { ok: false, size: this.wallets.size };
     }
   }
