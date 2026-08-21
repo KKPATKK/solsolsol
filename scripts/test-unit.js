@@ -16,6 +16,7 @@ const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("..
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
+const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -592,6 +593,55 @@ async function main() {
     assert.equal(out[1].openTimestamp, undefined);
     assert.deepEqual(parsePumpCoins({ not: "array" }), []);
     assert.deepEqual(parsePumpCoins(null), []);
+  });
+
+  await test("parseJupTokens maps mints + ISO createdAt, drops non-base58 and dupes", () => {
+    const good = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const out = parseJupTokens([
+      {
+        id: good,
+        name: "Speed Of Light",
+        symbol: "SOL",
+        createdAt: "2026-08-21T13:43:42Z",
+      },
+      { id: good }, // dupe
+      { id: "short" }, // not base58-length
+      { id: 123 },
+      null,
+      {
+        id: "xyS4ySYhwk8LmUgHzDYKP9y4K7QvST5HoMV4iUepump",
+        createdAt: "not-a-date",
+      },
+    ]);
+    assert.equal(out.length, 2);
+    assert.equal(out[0].tokenAddress, good);
+    assert.equal(out[0].openTimestamp, Date.parse("2026-08-21T13:43:42Z"));
+    assert.equal(out[1].tokenAddress, "xyS4ySYhwk8LmUgHzDYKP9y4K7QvST5HoMV4iUepump");
+    assert.equal(out[1].openTimestamp, undefined); // unparseable date dropped
+    assert.deepEqual(parseJupTokens({ nope: true }), []);
+    assert.deepEqual(parseJupTokens(null), []);
+  });
+
+  await test("JupTokensClient: 429 sets a shared backoff; non-OK degrades to []", async () => {
+    const good = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    let calls = 0;
+    let status = 200;
+    const client = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async () => {
+        calls++;
+        return new Response(JSON.stringify([{ id: good }]), { status });
+      },
+    );
+    const ok = await client.fetchRecentTokens(5);
+    assert.equal(ok.length, 1);
+    // A 429 flips the shared backoff: BOTH feeds return [] without fetching.
+    status = 429;
+    await client.fetchRecentTokens(5); // this one triggers the backoff
+    const before = calls;
+    assert.deepEqual(await client.fetchRecentTokens(5), []);
+    assert.deepEqual(await client.fetchTrendingTokens(5), []);
+    assert.equal(calls, before); // zero network calls while backed off
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {

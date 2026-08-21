@@ -14,6 +14,7 @@ import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTrendingToken } from "./axiom";
 import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
 import type { CrimeWalletClient } from "./crimewallets";
+import type { JupTokensClient } from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
 
@@ -115,6 +116,10 @@ export interface ScanSummary {
   geo: number;
   /** GeckoTerminal trending-pools feed size this scan (momentum, 0 when disabled). */
   geoTrend: number;
+  /** Jupiter recent-launchpad feed size this scan (0 when disabled/blocked). */
+  jup: number;
+  /** Jupiter trending feed size this scan (0 when disabled/blocked). */
+  jupTrend: number;
   /** GMGN trending feed size this scan (0 when disabled/blocked). */
   gmgn: number;
   /** Axiom Trade trending feed size this scan (0 when disabled/not logged in). */
@@ -243,6 +248,12 @@ export class Scanner {
      */
     private readonly gecko: GeckoTerminalClient | null = null,
     /**
+     * Jupiter Token v2 discovery (null = disabled) — free no-key feed pair:
+     * recent launchpad launches (the pump.fun frontend-api replacement) and
+     * 24h trending. Best-effort: failures degrade to the other feeds.
+     */
+    private readonly jupiter: JupTokensClient | null = null,
+    /**
      * GMGN OpenAPI (null = disabled — no key). Two uses: (a) candidate
      * enrichment — smart-money count, wash-trading flag and holders fetched
      * before each push and shown on the card (wash-trading optionally
@@ -363,6 +374,8 @@ export class Scanner {
       pump: 0,
       geo: 0,
       geoTrend: 0,
+      jup: 0,
+      jupTrend: 0,
       gmgn: 0,
       axiom: 0,
       arkham: 0,
@@ -550,6 +563,44 @@ export class Scanner {
         }
       }
       diag.axiom = axiomProfiles.length;
+      // Jupiter Token v2 recent-launches — seconds-old launchpad launches
+      // (pump.fun & co.), the free no-key replacement for the blocked
+      // pump.fun frontend-api feed (HTTP 530 from Worker egress). Carries
+      // createdAt so coins enter the re-eval pool with their true birth
+      // time. Sized by JUPITER_RECENT_LIMIT (0 = disabled); best-effort —
+      // failures return [] and the scan continues.
+      let jupProfiles: TokenProfile[] = [];
+      if (this.jupiter && this.config.jupiterRecentLimit > 0) {
+        try {
+          jupProfiles = await this.jupiter.fetchRecentTokens(
+            this.config.jupiterRecentLimit,
+          );
+        } catch (err) {
+          console.error(
+            "[scanner] jupiter recent discovery failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      diag.jup = jupProfiles.length;
+      // Jupiter Token v2 trending — momentum feed (free, no key). Mostly
+      // older than the qualifying window; kept for early catch of
+      // resurging mints. Sized by JUPITER_TRENDING_LIMIT (0 = disabled);
+      // best-effort — failures return [] and the scan continues.
+      let jupTrendProfiles: TokenProfile[] = [];
+      if (this.jupiter && this.config.jupiterTrendLimit > 0) {
+        try {
+          jupTrendProfiles = await this.jupiter.fetchTrendingTokens(
+            this.config.jupiterTrendLimit,
+          );
+        } catch (err) {
+          console.error(
+            "[scanner] jupiter trending discovery failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      diag.jupTrend = jupTrendProfiles.length;
       // Periodic Birdeye backfill — safety net for discovery gaps. Every
       // BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back the lookback
       // window of Birdeye's new_listing feed (which includes pump.fun
@@ -574,6 +625,10 @@ export class Scanner {
       const geoTrendMints = new Set(geoTrendProfiles.map((p) => p.tokenAddress));
       const gmgnMints = new Set(gmgnProfiles.map((p) => p.tokenAddress));
       const axiomMints = new Set(axiomProfiles.map((p) => p.tokenAddress));
+      const jupMints = new Set(jupProfiles.map((p) => p.tokenAddress));
+      const jupTrendMints = new Set(
+        jupTrendProfiles.map((p) => p.tokenAddress),
+      );
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
@@ -601,6 +656,25 @@ export class Scanner {
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
             !gmgnMints.has(p.tokenAddress),
+        ),
+        ...jupProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) &&
+            !pumpMints.has(p.tokenAddress) &&
+            !geckoMints.has(p.tokenAddress) &&
+            !geoTrendMints.has(p.tokenAddress) &&
+            !gmgnMints.has(p.tokenAddress) &&
+            !axiomMints.has(p.tokenAddress),
+        ),
+        ...jupTrendProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) &&
+            !pumpMints.has(p.tokenAddress) &&
+            !geckoMints.has(p.tokenAddress) &&
+            !geoTrendMints.has(p.tokenAddress) &&
+            !gmgnMints.has(p.tokenAddress) &&
+            !axiomMints.has(p.tokenAddress) &&
+            !jupMints.has(p.tokenAddress),
         ),
       ];
       const now = Date.now();

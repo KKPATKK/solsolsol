@@ -142,6 +142,9 @@ async function main(): Promise<void> {
         // they stay null here and the Arkham enrichment slots in after them
         // (positional args — order matters).
         null, // gecko
+        // Jupiter Token v2 discovery feeds — not constructed in the
+        // long-running process (the Worker is the production entry).
+        null, // jupiter token feeds
         null, // gmgn
         null, // axiom
         // Arkham smart-money attribution (null unless ARKHAM_ENABLED AND

@@ -311,6 +311,23 @@ export interface AppConfig {
    * Cloudflare Worker egress).
    */
   geckoterminalTrendingLimit: number;
+  /**
+   * Jupiter Token v2 recent-launches feed size per scan (JUPITER_RECENT_LIMIT,
+   * default 20, max 100, 0 = disabled). Seconds-old launchpad launches — the
+   * free no-key replacement for the blocked pump.fun frontend-api feed.
+   * Keep modest while Turso's rows-read quota recovers: every net-new coin
+   * grows token_stats and with it the re-eval pool band scans.
+   */
+  jupiterRecentLimit: number;
+  /**
+   * Jupiter Token v2 trending feed size per scan (JUPITER_TRENDING_LIMIT,
+   * default 15, max 100, 0 = disabled). Momentum-ranked coins over 24h —
+   * mostly older than the qualifying window, kept for early catch of
+   * resurging mints.
+   */
+  jupiterTrendLimit: number;
+  /** Minimum spacing between Jupiter HTTP requests (rate limiting). */
+  jupiterRequestIntervalMs: number;
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
@@ -459,6 +476,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     )
       ? Math.max(0, Math.min(Math.floor(Number(env.GECKOTERMINAL_TRENDING_LIMIT ?? 20)), 20))
       : 20,
+    jupiterRecentLimit: Number.isFinite(Number(env.JUPITER_RECENT_LIMIT ?? 20))
+      ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_RECENT_LIMIT ?? 20)), 100))
+      : 20,
+    jupiterTrendLimit: Number.isFinite(Number(env.JUPITER_TRENDING_LIMIT ?? 15))
+      ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_TRENDING_LIMIT ?? 15)), 100))
+      : 15,
+    jupiterRequestIntervalMs: Number.isFinite(
+      Number(env.JUPITER_REQUEST_INTERVAL_MS ?? 1000),
+    )
+      ? Math.max(0, Number(env.JUPITER_REQUEST_INTERVAL_MS ?? 1000))
+      : 1000,
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))

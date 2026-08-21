@@ -65,6 +65,16 @@ REEVAL_POOL_CACHE_SECONDS = "180"
 # DexScreener alone (see /health summary.pump).
 PUMPFUN_PROFILE_LIMIT = "100"
 PUMPFUN_REQUEST_INTERVAL_MS = "350"
+# Jupiter Token v2 discovery (free, no key) — the pump.fun frontend-api
+# replacement (pump.fun 530-blocks Worker egress since ~2026-08-20):
+#   recent   = seconds-old launchpad launches, enters the re-eval pool with
+#              true birth time; trending = 24h momentum (mostly older than
+#              the age window — early catch of resurging mints).
+# Keep the limits modest while Turso's rows-read quota recovers: every
+# net-new coin grows token_stats and with it the pool band scans.
+JUPITER_RECENT_LIMIT = "20"
+JUPITER_TRENDING_LIMIT = "15"
+JUPITER_REQUEST_INTERVAL_MS = "1000"
 # GeckoTerminal new-pools discovery (free, no key): newest Solana pools
 # across every DEX incl. pump.fun graduates. Pages × 20 pools per scan
 # (page size fixed at 20; each page ≈ 1 min of launches). Measured 2026-08-14:

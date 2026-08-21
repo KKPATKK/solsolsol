@@ -10,6 +10,7 @@ import { Scanner } from "./scanner";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
+import { JupTokensClient } from "./jupfeeds";
 import { GmgnClient } from "./gmgn";
 import { AxiomClient } from "./axiom";
 import { ArkhamClient } from "./arkham";
@@ -329,6 +330,12 @@ async function ensureInitialized(env: Env): Promise<void> {
           // Solana DEX incl. pump.fun graduates (best-effort — blocked or
           // degraded feeds return [] and the scan continues on the others).
           new GeckoTerminalClient(config),
+          // Jupiter Token v2 discovery — recent launchpad launches (the
+          // pump.fun frontend-api replacement) + 24h trending (null when
+          // both feed limits are 0).
+          config.jupiterRecentLimit > 0 || config.jupiterTrendLimit > 0
+            ? new JupTokensClient(config)
+            : null,
           // GMGN OpenAPI — candidate enrichment (smart money / wash-trading)
           // + trending discovery feed (null when no key configured).
           gmgn,
@@ -1096,6 +1103,27 @@ export default {
         rawBytes: text.length,
         count: Array.isArray(items) ? items.length : 0,
         bodyPreview: text.slice(0, 200),
+      });
+    }
+
+    // Jupiter Token v2 feed probe — verifies the discovery client's two
+    // endpoints from the worker's own egress (recent launchpad launches +
+    // 24h trending). Pass ?raw=1 to include the first parsed profiles.
+    if (url.pathname === "/debug/jupiter") {
+      if (!cfg) return Response.json({ ok: false, error: "not initialized" });
+      const client = new JupTokensClient(cfg);
+      const [recent, trending] = await Promise.all([
+        client.fetchRecentTokens(5),
+        client.fetchTrendingTokens(5),
+      ]);
+      return Response.json({
+        ok: recent.length > 0 || trending.length > 0,
+        recent: recent.length,
+        trending: trending.length,
+        sample:
+          url.searchParams.get("raw") === "1"
+            ? { recent: recent.slice(0, 3), trending: trending.slice(0, 3) }
+            : undefined,
       });
     }
 
