@@ -1212,6 +1212,16 @@ export default {
     // chat (worker_state push_fail_<chatId>, written by the scanner) — the
     // reason a chat can receive fewer coins than another with identical
     // filters.
+    // DELETE /debug/chats?chatId=... removes a chat entirely (settings +
+    // seen history). Guarded to POST/DELETE so crawlers can't trigger it.
+    if (url.pathname === "/debug/chats" && (request.method === "POST" || request.method === "DELETE")) {
+      const chatId = url.searchParams.get("chatId");
+      if (!chatId) {
+        return Response.json({ ok: false, error: "chatId required" }, { status: 400 });
+      }
+      const removed = (await db?.removeChat(chatId)) ?? false;
+      return Response.json({ ok: true, removed, chatId });
+    }
     if (url.pathname === "/debug/chats") {
       const chats = (await db?.listAllChats()) ?? [];
       const enabled = chats.filter((c) => c.enabled);

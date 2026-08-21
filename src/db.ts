@@ -716,6 +716,19 @@ export class Db {
     return res.rows.map((row) => this.mapRow(row));
   }
 
+  /** Remove a chat entirely (settings + seen history). Returns whether it existed. */
+  async removeChat(chatId: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: "DELETE FROM chat_settings WHERE chat_id = ?",
+      args: [chatId],
+    });
+    await this.get().execute({
+      sql: "DELETE FROM seen_tokens WHERE chat_id = ?",
+      args: [chatId],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
   async isTokenSeen(chatId: string, token: string): Promise<boolean> {
     const res = await this.get().execute({
       sql: "SELECT 1 AS seen FROM seen_tokens WHERE chat_id = ? AND token = ? LIMIT 1",
