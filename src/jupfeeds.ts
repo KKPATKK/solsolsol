@@ -129,12 +129,21 @@ export class JupTokensClient {
   /** Newest launchpad launches (pump.fun & co.), newest first. */
   async fetchRecentTokens(limit: number): Promise<TokenProfile[]> {
     const wanted = Math.max(1, Math.min(Math.floor(limit), 100));
-    return parseJupTokens(await this.get(`/recent?limit=${wanted}`));
+    // Slice client-side: measured 2026-08-21 the lite-api returns ≥30 rows
+    // regardless of the limit param, and the configured cap IS the Turso
+    // rows-read budget guard (every extra row can become a token_stats one).
+    return parseJupTokens(await this.get(`/recent?limit=${wanted}`)).slice(
+      0,
+      wanted,
+    );
   }
 
   /** Momentum-ranked tokens over the trailing 24h window. */
   async fetchTrendingTokens(limit: number): Promise<TokenProfile[]> {
     const wanted = Math.max(1, Math.min(Math.floor(limit), 100));
-    return parseJupTokens(await this.get(`/trending/24h?limit=${wanted}`));
+    return parseJupTokens(await this.get(`/trending/24h?limit=${wanted}`)).slice(
+      0,
+      wanted,
+    );
   }
 }
