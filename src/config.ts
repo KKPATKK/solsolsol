@@ -328,6 +328,21 @@ export interface AppConfig {
   jupiterTrendLimit: number;
   /** Minimum spacing between Jupiter HTTP requests (rate limiting). */
   jupiterRequestIntervalMs: number;
+  /**
+   * Post-push tracker (PUSH_WATCH_ENABLED, default true): every pushed coin
+   * is watched for `windowHours` and refreshed from ONE DexScreener batch
+   * call per tick; follow-up alerts report continuation (🚀 stages) or
+   * breakdown (⚠️ weak / 💀 dead / 💧 liquidity). Birdeye holder growth
+   * probes are CU-bounded by maxHolderChecksPerTick.
+   */
+  pushWatch: {
+    enabled: boolean;
+    maxTracked: number;
+    windowHours: number;
+    cooldownMin: number;
+    holdersRefreshMin: number;
+    maxHolderChecksPerTick: number;
+  };
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
@@ -487,6 +502,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     )
       ? Math.max(0, Number(env.JUPITER_REQUEST_INTERVAL_MS ?? 1000))
       : 1000,
+    pushWatch: {
+      enabled: (env.PUSH_WATCH_ENABLED ?? "true") !== "0" && (env.PUSH_WATCH_ENABLED ?? "true") !== "false",
+      maxTracked: Number.isFinite(Number(env.PUSH_WATCH_MAX_TRACKED ?? 30))
+        ? Math.max(1, Math.min(Math.floor(Number(env.PUSH_WATCH_MAX_TRACKED ?? 30)), 30))
+        : 30,
+      windowHours: Number.isFinite(Number(env.PUSH_WATCH_WINDOW_HOURS ?? 24))
+        ? Math.max(1, Math.min(Math.floor(Number(env.PUSH_WATCH_WINDOW_HOURS ?? 24)), 72))
+        : 24,
+      cooldownMin: Number.isFinite(Number(env.PUSH_WATCH_COOLDOWN_MIN ?? 30))
+        ? Math.max(5, Math.min(Math.floor(Number(env.PUSH_WATCH_COOLDOWN_MIN ?? 30)), 240))
+        : 30,
+      holdersRefreshMin: Number.isFinite(Number(env.PUSH_WATCH_HOLDERS_REFRESH_MIN ?? 30))
+        ? Math.max(10, Math.min(Math.floor(Number(env.PUSH_WATCH_HOLDERS_REFRESH_MIN ?? 30)), 180))
+        : 30,
+      maxHolderChecksPerTick: Number.isFinite(Number(env.PUSH_WATCH_MAX_HOLDER_CHECKS ?? 4))
+        ? Math.max(0, Math.min(Math.floor(Number(env.PUSH_WATCH_MAX_HOLDER_CHECKS ?? 4)), 10))
+        : 4,
+    },
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))

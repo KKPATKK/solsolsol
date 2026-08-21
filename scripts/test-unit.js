@@ -18,6 +18,7 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
+const { evaluateWatch } = require("../dist/pushwatch.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -662,6 +663,80 @@ async function main() {
     assert.equal(passesChgGate(19.9, 39.9, 20, 40), false);
     // Negative values never qualify.
     assert.equal(passesChgGate(-41.2, -10, 20, 40), false);
+  });
+
+  await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "GOAT", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 50_000, lastLiquidity: 30_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const live = (mcap) => ({ mcap, liquidity: 30_000, chg5m: 5, buysH1: 200, sellsH1: 100 });
+    const cfg = { cooldownMs: 30 * 60_000 };
+
+    // +60% → up50 fires once (now is 1h after push, cooldown long past).
+    const r1 = evaluateWatch(row(), 3600_000, live(80_000), cfg);
+    assert.equal(r1.alerts.length, 1);
+    assert.equal(r1.alerts[0].kind, "rising");
+    assert.match(r1.alerts[0].text, /續漲 GOAT/);
+    assert.equal(r1.lastState, "up50");
+
+    // Same stage again within cooldown → no alert, but bookkeeping updates.
+    const r2 = evaluateWatch(row({ lastState: "up50", lastAlertAt: 3600_000 }), 3600_000 + 60_000, live(85_000), cfg);
+    assert.equal(r2.alerts.length, 0);
+    assert.equal(r2.peakMcap, 85_000);
+
+    // Cross +100% after cooldown → up100 fires (not up50 again); the text
+    // shows the actual change (+120%), not the threshold.
+    const r3 = evaluateWatch(row({ lastState: "up50", lastAlertAt: 3600_000 }), 3600_000 + 3600_000, live(110_000), cfg);
+    assert.equal(r3.alerts.length, 1);
+    assert.match(r3.alerts[0].text, /續漲 GOAT/);
+    assert.match(r3.alerts[0].text, /\+120%/);
+    assert.equal(r3.lastState, "up100");
+  });
+
+  await test("evaluateWatch: weak, dead stops tracking, liquidity crash, holder growth", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "X", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 90_000, lastLiquidity: 20_000,
+      holdersAtPush: 1000, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+
+    // -36% off a 1.8x runup → weak fires once.
+    const w = evaluateWatch(row(), 1000, { mcap: 57_500, liquidity: 19_000, chg5m: -8, buysH1: 50, sellsH1: 120 }, cfg);
+    assert.equal(w.alerts.length, 1);
+    assert.equal(w.alerts[0].kind, "weak");
+    assert.equal(w.stopTracking, false);
+
+    // -56% off peak → dead wins and stops tracking.
+    const d = evaluateWatch(row(), 1000, { mcap: 39_000, liquidity: 9_000, chg5m: -12, buysH1: 10, sellsH1: 90 }, cfg);
+    assert.equal(d.alerts[0].kind, "dead");
+    assert.equal(d.stopTracking, true);
+
+    // Never ran up but dumps straight to -55% vs push → dead still fires.
+    const d2 = evaluateWatch(row({ peakMcap: 50_000 }), 1000, { mcap: 22_000, liquidity: 4_000, chg5m: -20, buysH1: 2, sellsH1: 80 }, cfg);
+    assert.equal(d2.alerts[0].kind, "dead");
+    assert.equal(d2.stopTracking, true);
+
+    // Liquidity collapse >55% → liquidity alert.
+    const l = evaluateWatch(row({ lastAlertAt: -3600_000 }), 1000, { mcap: 88_000, liquidity: 8_000, chg5m: 2, buysH1: 90, sellsH1: 80 }, cfg);
+    assert.ok(l.alerts.some((a) => a.kind === "liquidity"));
+
+    // Holders +25% since push → hold25 fires (highest crossed stage).
+    const h = evaluateWatch(
+      row({ holdersLast: 1250, holdersAtPush: 1000, lastAlertAt: -3600_000 }),
+      1000,
+      { mcap: 88_000, liquidity: 19_000, chg5m: 3, buysH1: 90, sellsH1: 80 },
+      cfg,
+    );
+    const holderAlert = h.alerts.find((a) => a.kind === "holders");
+    assert.ok(holderAlert);
+    assert.match(holderAlert.text, /\+25%/);
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {

@@ -306,6 +306,28 @@ export class Db {
           created_at INTEGER NOT NULL
         );`,
         `CREATE INDEX IF NOT EXISTS idx_sell_log_created ON sell_log(created_at);`,
+        // Post-push watch list: every pushed coin is tracked for a bounded
+        // window so the bot can report continuation (🚀 rising stages) or
+        // breakdown (⚠️ weak / 💀 dead) — the "which pushes keep going"
+        // feedback loop. One row per pushed token; refreshed from a single
+        // DexScreener batch call per tick (see PushWatcher).
+        `CREATE TABLE IF NOT EXISTS push_watch (
+          token TEXT PRIMARY KEY,
+          chat_id TEXT NOT NULL,
+          symbol TEXT,
+          pushed_at INTEGER NOT NULL,
+          mcap_at_push REAL NOT NULL,
+          peak_mcap REAL NOT NULL,
+          last_liquidity REAL,
+          holders_at_push INTEGER,
+          holders_last INTEGER,
+          holders_checked_at INTEGER,
+          last_checked INTEGER NOT NULL DEFAULT 0,
+          last_alert_at INTEGER NOT NULL DEFAULT 0,
+          followups_sent INTEGER NOT NULL DEFAULT 0,
+          last_state TEXT
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
         // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
         // row per (pushed token, holder owner) plus the creator row, written
         // at push time. Cross-coin clustering = "same wallets repeatedly
@@ -1386,6 +1408,144 @@ export class Db {
       sql: `INSERT OR IGNORE INTO pushed_holders (token, owner, rank, ui_amount, is_creator, crime_hit, pushed_at) VALUES ${placeholders}`,
       args,
     });
+  }
+
+  /**
+   * Post-push watch rows (see push_watch DDL): written at push time,
+   * refreshed once per tick from a single DexScreener batch call, deleted
+   * when the window ends or the coin dies. Tiny table (≤ maxTracked rows).
+   */
+  async upsertPushWatch(row: {
+    token: string;
+    chatId: string;
+    symbol: string | null;
+    pushedAt: number;
+    mcapAtPush: number;
+    liquidityUsd: number | null;
+  }): Promise<void> {
+    await this.get().execute({
+      sql: `INSERT INTO push_watch
+              (token, chat_id, symbol, pushed_at, mcap_at_push, peak_mcap,
+               last_liquidity, last_checked)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(token) DO NOTHING`,
+      args: [
+        row.token,
+        row.chatId,
+        row.symbol,
+        row.pushedAt,
+        row.mcapAtPush,
+        row.mcapAtPush,
+        row.liquidityUsd,
+        Date.now(),
+      ],
+    });
+  }
+
+  async listPushWatch(limit = 40): Promise<Array<{
+    token: string;
+    chatId: string;
+    symbol: string | null;
+    pushedAt: number;
+    mcapAtPush: number;
+    peakMcap: number;
+    lastLiquidity: number | null;
+    holdersAtPush: number | null;
+    holdersLast: number | null;
+    holdersCheckedAt: number | null;
+    lastChecked: number;
+    lastAlertAt: number;
+    followupsSent: number;
+    lastState: string | null;
+  }>> {
+    const res = await this.get().execute({
+      sql: "SELECT * FROM push_watch ORDER BY pushed_at DESC LIMIT ?",
+      args: [limit],
+    });
+    return res.rows.map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        token: String(r.token),
+        chatId: String(r.chat_id),
+        symbol: r.symbol === null || r.symbol === undefined ? null : String(r.symbol),
+        pushedAt: Number(r.pushed_at ?? 0),
+        mcapAtPush: Number(r.mcap_at_push ?? 0),
+        peakMcap: Number(r.peak_mcap ?? 0),
+        lastLiquidity:
+          r.last_liquidity === null || r.last_liquidity === undefined
+            ? null
+            : Number(r.last_liquidity),
+        holdersAtPush:
+          r.holders_at_push === null || r.holders_at_push === undefined
+            ? null
+            : Number(r.holders_at_push),
+        holdersLast:
+          r.holders_last === null || r.holders_last === undefined
+            ? null
+            : Number(r.holders_last),
+        holdersCheckedAt:
+          r.holders_checked_at === null || r.holders_checked_at === undefined
+            ? null
+            : Number(r.holders_checked_at),
+        lastChecked: Number(r.last_checked ?? 0),
+        lastAlertAt: Number(r.last_alert_at ?? 0),
+        followupsSent: Number(r.followups_sent ?? 0),
+        lastState: r.last_state === null || r.last_state === undefined ? null : String(r.last_state),
+      };
+    });
+  }
+
+  /** Persist one tracker check (mcap/liquidity refresh + alert bookkeeping). */
+  async updatePushWatchCheck(
+    token: string,
+    v: {
+      peakMcap: number;
+      lastLiquidity: number | null;
+      followupsSent?: number;
+      lastState?: string | null;
+      lastAlertAt?: number;
+    },
+  ): Promise<void> {
+    await this.get().execute({
+      sql: `UPDATE push_watch SET
+              peak_mcap = ?, last_liquidity = ?, last_checked = ?,
+              followups_sent = ?, last_state = ?, last_alert_at = ?
+            WHERE token = ?`,
+      args: [
+        v.peakMcap,
+        v.lastLiquidity,
+        Date.now(),
+        v.followupsSent ?? 0,
+        v.lastState ?? null,
+        v.lastAlertAt ?? 0,
+        token,
+      ],
+    });
+  }
+
+  async setPushWatchHolders(token: string, holders: number, at: number): Promise<void> {
+    await this.get().execute({
+      sql: `UPDATE push_watch SET
+              holders_at_push = COALESCE(holders_at_push, ?),
+              holders_last = ?, holders_checked_at = ?
+            WHERE token = ?`,
+      args: [holders, holders, at, token],
+    });
+  }
+
+  async deletePushWatch(token: string): Promise<void> {
+    await this.get().execute({
+      sql: "DELETE FROM push_watch WHERE token = ?",
+      args: [token],
+    });
+  }
+
+  async prunePushWatch(olderThanMs: number): Promise<number> {
+    const res = await this.get().execute({
+      sql: "DELETE FROM push_watch WHERE pushed_at < ?",
+      args: [olderThanMs],
+    });
+    return Number(res.rowsAffected ?? 0);
   }
 
   /**

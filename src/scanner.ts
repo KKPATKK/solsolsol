@@ -17,6 +17,7 @@ import type { CrimeWalletClient } from "./crimewallets";
 import type { JupTokensClient } from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
+import { PushWatcher } from "./pushwatch";
 
 
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -224,6 +225,8 @@ export class Scanner {
    * soon as the flag is set — no extra DB reads forever after.
    */
   private launchBackfillDone = false;
+  /** Post-push tracker (null when disabled or no bot/db — see pushwatch.ts). */
+  private readonly pushWatcher: import("./pushwatch").PushWatcher | null;
 
   constructor(
     private readonly db: Db,
@@ -293,7 +296,17 @@ export class Scanner {
      * truncates the card enrichment, never the push.
      */
     private readonly walletAnalyzer: WalletAnalyzer | null = null,
-  ) {}
+  ) {
+    this.pushWatcher = config.pushWatch.enabled
+      ? new PushWatcher(
+          this.db,
+          this.bot,
+          this.birdeye,
+          config,
+          (addresses: string[]) => this.dex.fetchPairsForTokens(addresses),
+        )
+      : null;
+  }
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
   private dataNegativeCached(token: string): boolean {
@@ -616,6 +629,19 @@ export class Scanner {
           "[scanner] periodic backfill failed:",
           err instanceof Error ? err.message : err,
         );
+      }
+      // Post-push tracker pass: one DexScreener batch + bounded Birdeye
+      // holder probes for the watched coins, then 🚀/⚠️/💀 follow-ups.
+      // Best-effort — a tracker failure never affects the scan.
+      if (this.pushWatcher) {
+        try {
+          await this.pushWatcher.runTick();
+        } catch (err) {
+          console.error(
+            "[scanner] push-watch tick failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
       // Dedupe the feeds (mints overlap across all three); the DexScreener
       // entry wins — it carries richer profile data.
@@ -1044,6 +1070,19 @@ export class Scanner {
           });
           await this.db.markTokenSeen(c.chatId, c.profile.tokenAddress);
           pushed++;
+          // Start post-push tracking (🚀/⚠️/💀 follow-ups). Best-effort and
+          // deduped by the table's PK — never affects the push itself.
+          try {
+            await this.pushWatcher?.onPush(
+              c.chatId,
+              c.profile.tokenAddress,
+              c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
+              c.pair.marketCap,
+              c.pair.liquidity.usd,
+            );
+          } catch {
+            /* tracking is optional */
+          }
           // Auto trading mode: buy immediately after the push. The mode is
           // read live (a /setmode flip applies right away); executeBuy also
           // re-checks the mode gate internally. Dedupe is guaranteed twice

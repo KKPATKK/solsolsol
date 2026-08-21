@@ -75,6 +75,17 @@ PUMPFUN_REQUEST_INTERVAL_MS = "350"
 JUPITER_RECENT_LIMIT = "20"
 JUPITER_TRENDING_LIMIT = "15"
 JUPITER_REQUEST_INTERVAL_MS = "1000"
+# Post-push tracker: every pushed coin is watched for a bounded window and
+# refreshed from ONE DexScreener batch call per tick. Follow-ups report
+# continuation (🚀 +50/100/200/400% stages), breakdown (⚠️ ≥35% off peak,
+# 💀 ≥55% → stop), liquidity collapse (💧 >55% drop) and Birdeye holder
+# growth (📈 +10/25/50% vs push; CU-bounded probes per tick).
+PUSH_WATCH_ENABLED = "true"
+PUSH_WATCH_MAX_TRACKED = "30"
+PUSH_WATCH_WINDOW_HOURS = "24"
+PUSH_WATCH_COOLDOWN_MIN = "30"
+PUSH_WATCH_HOLDERS_REFRESH_MIN = "30"
+PUSH_WATCH_MAX_HOLDER_CHECKS = "4"
 # GeckoTerminal new-pools discovery (free, no key): newest Solana pools
 # across every DEX incl. pump.fun graduates. Pages × 20 pools per scan
 # (page size fixed at 20; each page ≈ 1 min of launches). Measured 2026-08-14:

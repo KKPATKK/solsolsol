@@ -21,6 +21,8 @@ export interface PairInfo {
   marketCap: number;
   volume: { h24: number; m5: number };
   priceChange: { m5: number; h1: number };
+  /** Transaction counts (DexScreener txns) — buy/sell pressure signal. */
+  txns: { m5Buys: number; m5Sells: number; h1Buys: number; h1Sells: number };
   liquidity: { usd: number | null };
   pairCreatedAt: number;
 }
@@ -169,6 +171,12 @@ export class DexScreenerClient {
         if (!baseToken?.address) continue;
         if (result.has(baseToken.address)) continue; // first pair wins
         const volume = raw.volume as { h24?: number; m5?: number } | undefined;
+        const txnsRaw = raw.txns as
+          | {
+              m5?: { buys?: number; sells?: number };
+              h1?: { buys?: number; sells?: number };
+            }
+          | undefined;
         const priceChange = raw.priceChange as { m5?: number; h1?: number } | undefined;
         result.set(baseToken.address, {
           chainId: "solana",
@@ -189,6 +197,12 @@ export class DexScreenerClient {
           priceChange: {
             m5: Number(priceChange?.m5 ?? 0),
             h1: Number(priceChange?.h1 ?? 0),
+          },
+          txns: {
+            m5Buys: Number(txnsRaw?.m5?.buys ?? 0),
+            m5Sells: Number(txnsRaw?.m5?.sells ?? 0),
+            h1Buys: Number(txnsRaw?.h1?.buys ?? 0),
+            h1Sells: Number(txnsRaw?.h1?.sells ?? 0),
           },
           liquidity: {
             usd: Number((raw.liquidity as { usd?: number } | undefined)?.usd ?? 0) || null,

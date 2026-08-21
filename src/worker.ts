@@ -1156,6 +1156,23 @@ export default {
       }
     }
 
+    // Post-push watch list — the tracker's current rows (peak vs push mcap,
+    // holder growth, alert bookkeeping) for verifying follow-ups work.
+    if (url.pathname === "/debug/push-watch") {
+      const rows = db ? await db.listPushWatch(40) : [];
+      return Response.json({
+        ok: true,
+        count: rows.length,
+        rows: rows.map((r) => ({
+          ...r,
+          chgSincePushPct:
+            r.mcapAtPush > 0
+              ? Math.round((r.peakMcap / r.mcapAtPush - 1) * 1000) / 10
+              : null,
+        })),
+      });
+    }
+
     // Push history — read-only distribution of seen_tokens for diagnosing
     // "why is push volume low" (all pushes ever, grouped by day, oldest 20).
     if (url.pathname === "/debug/pushes") {
