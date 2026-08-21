@@ -69,10 +69,11 @@ PUMPFUN_REQUEST_INTERVAL_MS = "350"
 # across every DEX incl. pump.fun graduates. Pages × 20 pools per scan
 # (page size fixed at 20; each page ≈ 1 min of launches). Measured 2026-08-14:
 # 5 pages/scan triggers GeckoTerminal's 429 rate-limit window within one
-# round, so 2 pages is the stable maximum at the 60s scan cadence (~2 req/
-# min; deeper coverage is provided by the Birdeye periodic backfill below,
-# which is the safety net for any gap the shallow window leaves).
-GECKOTERMINAL_POOL_PAGES = "2"
+# round. 2026-08-21: dropped to 1 page — Workers' shared egress IP now gets
+# sustained 429s even at 2 pages (~2 req/min), so halving the request rate
+# improves the odds of catching the upstream quota windows (deeper coverage
+# remains with the Birdeye periodic backfill below).
+GECKOTERMINAL_POOL_PAGES = "1"
 # GeckoTerminal trending-pools momentum feed (free, no key) — the
 # replacement for GMGN trending (GMGN's edge blocks Cloudflare Worker
 # egress). 0 = disabled; default 20 (max 20 per call). NOTE: measured
