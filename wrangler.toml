@@ -58,12 +58,10 @@ REEVAL_FAR_SWEEP_MIN = "18"
 # live signals). Lower it for faster rotation; raise it (e.g. 300) to cut
 # rows-read back.
 REEVAL_POOL_CACHE_SECONDS = "180"
-# pump.fun discovery: DexScreener's profiles feed only returns ~24 Solana
-# coins per scan, so also register the newest pump.fun coins (code default
-# 100, max 300) into the re-eval pool every scan. Best-effort — if pump.fun
-# blocks the caller, discovery returns empty and scanning continues on
-# DexScreener alone (see /health summary.pump).
-PUMPFUN_PROFILE_LIMIT = "100"
+# pump.fun discovery: DISABLED (0) — pump.fun 530-blocks Worker egress since
+# ~2026-08-20, so each tick only burns a doomed request. Jupiter recent covers
+# the brand-new-launchpad gap instead.
+PUMPFUN_PROFILE_LIMIT = "0"
 PUMPFUN_REQUEST_INTERVAL_MS = "350"
 # Jupiter Token v2 discovery (free, no key) — the pump.fun frontend-api
 # replacement (pump.fun 530-blocks Worker egress since ~2026-08-20):

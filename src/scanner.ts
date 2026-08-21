@@ -457,7 +457,7 @@ export class Scanner {
       // scan). Best-effort: any failure returns [] and the scan continues
       // on DexScreener alone (see /health summary.pump to verify liveness).
       let pumpProfiles: TokenProfile[] = [];
-      if (this.pumpfun) {
+      if (this.pumpfun && this.config.pumpfunProfileLimit > 0) {
         try {
           pumpProfiles = await this.pumpfun.fetchNewestCoins(
             this.config.pumpfunProfileLimit,
