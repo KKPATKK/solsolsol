@@ -156,10 +156,20 @@ export class DexScreenerClient {
     for (let i = 0; i < addresses.length; i += 30) {
       if (Date.now() > deadline) break; // keep the tick inside its budget
       const batch = addresses.slice(i, i + 30);
-      const data = (await this.getJson(
-        `/latest/dex/tokens/${batch.join(",")}`,
-        deadline,
-      )) as { pairs?: Array<Record<string, unknown>> } | null;
+      let data: { pairs?: Array<Record<string, unknown>> } | null;
+      try {
+        data = (await this.getJson(
+          `/latest/dex/tokens/${batch.join(",")}`,
+          deadline,
+        )) as { pairs?: Array<Record<string, unknown>> } | null;
+      } catch (err) {
+        // A rate-limited batch means the remaining ones will 429 too — stop
+        // instead of burning the rest of the tick's budget (and Cloudflare's
+        // wall clock) on doomed retries. Partial coverage beats a wedged
+        // scan: covered coins are still evaluated this tick.
+        if (/429/.test(err instanceof Error ? err.message : String(err))) break;
+        continue; // transient/other error — skip this batch, try the next
+      }
       const pairs = data?.pairs;
       if (!Array.isArray(pairs)) continue;
 
