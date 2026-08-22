@@ -715,15 +715,17 @@ async function main() {
     assert.equal(w.alerts[0].kind, "weak");
     assert.equal(w.stopTracking, false);
 
-    // -56% off peak → dead wins and stops tracking.
+    // -56% off peak → dead fires ONCE; row stays tracked (silent watch) so
+    // a V-reversal can still resurrect it.
     const d = evaluateWatch(row(), 1000, { mcap: 39_000, liquidity: 15_000, chg5m: -12, buysH1: 10, sellsH1: 90 }, cfg);
     assert.equal(d.alerts[0].kind, "dead");
-    assert.equal(d.stopTracking, true);
+    assert.match(d.alerts[0].text, /走死/);
+    assert.equal(d.stopTracking, false);
 
     // Never ran up but dumps straight to -55% vs push → dead still fires.
     const d2 = evaluateWatch(row({ peakMcap: 50_000 }), 1000, { mcap: 22_000, liquidity: 14_000, chg5m: -20, buysH1: 2, sellsH1: 80 }, cfg);
     assert.equal(d2.alerts[0].kind, "dead");
-    assert.equal(d2.stopTracking, true);
+    assert.equal(d2.stopTracking, false);
 
     // Liquidity collapse >55% → liquidity alert (still above the absolute
     // floor: 30K → 11K is a 63% drop but ≥ $10K, so the rug rule stays quiet).
@@ -777,6 +779,65 @@ async function main() {
     const custom = evaluateWatch(row({ lastLiquidity: 40_000 }), 1000, { mcap: 90_000, liquidity: 19_000, chg5m: 2, buysH1: 30, sellsH1: 25 }, { cooldownMs: 0, liqFloorUsd: 20_000 });
     assert.equal(custom.alerts[0].kind, "liquidity");
     assert.equal(custom.stopTracking, true);
+  });
+
+  await test("evaluateWatch: volume ignition fires once from a dormant tape, never after rising stages", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "CONK", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 55_000, lastLiquidity: 30_000,
+      lastVol5m: 4_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+
+    // Dormant (4K) → 60K 5m volume with a mild move → ignition.
+    const i1 = evaluateWatch(row(), 1000, { mcap: 55_000, liquidity: 30_000, chg5m: 6, vol5m: 60_000, buysH1: 300, sellsH1: 100 }, cfg);
+    assert.equal(i1.alerts.length, 1);
+    assert.equal(i1.alerts[0].kind, "ignition");
+    assert.match(i1.alerts[0].text, /量能點火 CONK/);
+    assert.equal(i1.lastState, "ignite");
+
+    // Tape still hot but the PREVIOUS check was already hot → no repeat.
+    const i2 = evaluateWatch(row({ lastState: "ignite" }), 1000, { mcap: 56_000, liquidity: 30_000, chg5m: 3, vol5m: 70_000, buysH1: 300, sellsH1: 120 }, cfg);
+    assert.equal(i2.alerts.length, 0);
+
+    // Once +50% is crossed, 🚀 owns the narrative — no ignition noise.
+    const i3 = evaluateWatch(row(), 1000, { mcap: 90_000, liquidity: 30_000, chg5m: 10, vol5m: 80_000, buysH1: 400, sellsH1: 100 }, cfg);
+    assert.ok(i3.alerts.every((a) => a.kind !== "ignition"));
+    assert.ok(i3.alerts.some((a) => a.kind === "rising"));
+  });
+
+  await test("evaluateWatch: dead is silent afterwards, then resurrects on recovery", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "X", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 90_000, lastLiquidity: 20_000,
+      lastVol5m: 3_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 1, lastState: "dead",
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+
+    // Still deep underwater after the 💀 → completely silent.
+    const s = evaluateWatch(row(), 1000, { mcap: 40_000, liquidity: 20_000, chg5m: 2, vol5m: 3_000, buysH1: 5, sellsH1: 9 }, cfg);
+    assert.equal(s.alerts.length, 0);
+    assert.equal(s.lastState, "dead");
+    assert.equal(s.stopTracking, false);
+
+    // Recovers to the push baseline → resurrection, fresh baseline.
+    const r = evaluateWatch(row(), 1000, { mcap: 52_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 }, cfg);
+    assert.equal(r.alerts.length, 1);
+    assert.match(r.alerts[0].text, /死而復生 X/);
+    assert.equal(r.resetBaselineMcap, 52_000);
+    assert.equal(r.peakMcap, 52_000);
+    assert.equal(r.lastState, null);
+
+    // Fresh row that never died still fires 💀 normally (once).
+    const f = evaluateWatch(row({ lastState: null, followupsSent: 0 }), 1000, { mcap: 39_000, liquidity: 20_000, chg5m: -12, vol5m: 2_000, buysH1: 10, sellsH1: 90 }, cfg);
+    assert.equal(f.alerts[0].kind, "dead");
+    assert.equal(f.stopTracking, false);
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {

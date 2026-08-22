@@ -328,7 +328,8 @@ export class Db {
           last_checked INTEGER NOT NULL DEFAULT 0,
           last_alert_at INTEGER NOT NULL DEFAULT 0,
           followups_sent INTEGER NOT NULL DEFAULT 0,
-          last_state TEXT
+          last_state TEXT,
+          last_vol_5m REAL
         );`,
         `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
         // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
@@ -510,6 +511,9 @@ export class Db {
       "min_1h_chg_pct",
       "REAL NOT NULL DEFAULT 40",
     );
+    // push_watch.last_vol_5m — the volume-ignition early-warning signal
+    // compares the fresh 5m volume against the previous check's. Idempotent.
+    await this.addColumnIfMissing("push_watch", "last_vol_5m", "REAL");
     // Telemetry counters: /health used to run COUNT(*) over token_stats
     // (~400K rows) and seen_tokens (~50K rows) on every ping — at the 1-min
     // uptime-monitor cadence that alone is ~600M rows/day (alerted
@@ -1529,6 +1533,7 @@ export class Db {
     mcapAtPush: number;
     peakMcap: number;
     lastLiquidity: number | null;
+    lastVol5m: number | null;
     holdersAtPush: number | null;
     holdersLast: number | null;
     holdersCheckedAt: number | null;
@@ -1554,6 +1559,10 @@ export class Db {
           r.last_liquidity === null || r.last_liquidity === undefined
             ? null
             : Number(r.last_liquidity),
+        lastVol5m:
+          r.last_vol_5m === null || r.last_vol_5m === undefined
+            ? null
+            : Number(r.last_vol_5m),
         holdersAtPush:
           r.holders_at_push === null || r.holders_at_push === undefined
             ? null
@@ -1580,15 +1589,20 @@ export class Db {
     v: {
       peakMcap: number;
       lastLiquidity: number | null;
+      lastVol5m?: number | null;
       followupsSent?: number;
       lastState?: string | null;
       lastAlertAt?: number;
+      /** Resurrection: reset the push-time mcap baseline to this value. */
+      mcapAtPush?: number;
     },
   ): Promise<void> {
     await this.get().execute({
       sql: `UPDATE push_watch SET
               peak_mcap = ?, last_liquidity = ?, last_checked = ?,
-              followups_sent = ?, last_state = ?, last_alert_at = ?
+              followups_sent = ?, last_state = ?, last_alert_at = ?,
+              last_vol_5m = COALESCE(?, last_vol_5m),
+              mcap_at_push = COALESCE(?, mcap_at_push)
             WHERE token = ?`,
       args: [
         v.peakMcap,
@@ -1597,6 +1611,8 @@ export class Db {
         v.followupsSent ?? 0,
         v.lastState ?? null,
         v.lastAlertAt ?? 0,
+        v.lastVol5m ?? null,
+        v.mcapAtPush ?? null,
         token,
       ],
     });

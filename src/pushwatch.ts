@@ -14,8 +14,12 @@ import { fmtUsd } from "./format";
  *
  * Alert kinds (each fires once per stage/state, with a per-coin cooldown):
  *   🚀 rising stages  — mcap crosses +50% / +100% / +200% / +400% vs push
+ *   🔥 ignition       — 5m volume jumps from dormant (< $10K) to ≥ $50K
+ *                       before any rising stage (early new-leg warning)
  *   ⚠️ weak           — ≥35% off the post-push peak (only if it had run up)
- *   💀 dead           — ≥55% off peak → final alert, tracking stops
+ *   💀 dead           — ≥55% off peak → fires once, then SILENT watch; if
+ *                       mcap recovers to the push baseline the row is
+ *                       resurrected with a fresh baseline (V-reversals)
  *   💧 liquidity      — collapsed >55% since the last check, OR absolute
  *                       floor breach (< $10K) → drained LP, mcap unreliable,
  *                       tracking stops
@@ -39,6 +43,15 @@ const LIQ_CRASH_MIN_LAST_USD = 5_000;
  * dead) becomes noise — stop tracking instead of acting on fake numbers.
  */
 export const LIQ_FLOOR_USD = 10_000;
+/**
+ * Volume ignition: a tracked coin whose 5m volume jumps from dormant
+ * (< DORMANT) to >= VOL is often the first breath of a new leg (the CONK
+ * pattern: 75 min of quiet consolidation, then a 13x volume bar minutes
+ * before the god candle). Early-warning only — it never fires once the
+ * +50% rising stage has been crossed, where 🚀 alerts take over.
+ */
+export const IGNITION_VOL_USD = 50_000;
+export const IGNITION_DORMANT_USD = 10_000;
 /** Holder-growth stages (× push-time holders → state suffix). */
 const HOLDER_STAGES = [10, 25, 50] as const;
 
@@ -50,6 +63,7 @@ export interface PushWatchRow {
   mcapAtPush: number;
   peakMcap: number;
   lastLiquidity: number | null;
+  lastVol5m: number | null;
   holdersAtPush: number | null;
   holdersLast: number | null;
   holdersCheckedAt: number | null;
@@ -60,7 +74,7 @@ export interface PushWatchRow {
 }
 
 export interface WatchAlert {
-  kind: "rising" | "weak" | "dead" | "liquidity" | "holders";
+  kind: "rising" | "weak" | "dead" | "liquidity" | "holders" | "ignition";
   text: string;
 }
 
@@ -72,6 +86,11 @@ export interface WatchEval {
   lastState: string | null;
   lastAlertAt: number;
   stopTracking: boolean;
+  /**
+   * Set on resurrection: the row's mcapAtPush (and peak) should be reset
+   * to this value so the next cycle measures from the recovery point.
+   */
+  resetBaselineMcap?: number;
 }
 
 function pct(n: number): string {
@@ -91,6 +110,7 @@ export function evaluateWatch(
     mcap: number;
     liquidity: number | null;
     chg5m: number;
+    vol5m: number;
     buysH1: number;
     sellsH1: number;
   },
@@ -132,24 +152,63 @@ export function evaluateWatch(
     };
   }
 
-  // Dead first — it wins over any other alert and stops tracking. Peak is
-  // always ≥ push mcap, so this also catches never-ran-up straight dumps.
-  if (drawdownFromPeak <= -DEAD_DRAWDOWN_PCT) {
+  // Resurrection first: a 💀-marked coin recovering to its push baseline
+  // restarts with a fresh cycle regardless of the now-stale peak (otherwise
+  // weak/dead math against the old peak would keep suppressing it).
+  if (row.lastState === "dead" && live.mcap >= row.mcapAtPush) {
     fire(
-      "dead",
-      `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，停止追蹤`,
+      "rising",
+      `🟢 死而復生 ${symbol} | 從 💀 收復推送市值 ${fmtUsd(row.mcapAtPush)} → 現 ${fmtUsd(live.mcap)}，重置基準繼續追蹤`,
     );
+    return {
+      alerts,
+      peakMcap: live.mcap,
+      followupsSent,
+      lastState: null,
+      lastAlertAt,
+      stopTracking: false,
+      resetBaselineMcap: live.mcap,
+    };
+  }
+
+  // Dead: ≥55% off the peak. Fires ONCE (the row then stays in silent
+  // watch) — deep-flush V-reversals are common, so if the mcap later
+  // recovers to the push baseline the resurrection above re-arms it.
+  // Peak is always ≥ push mcap, so this also catches never-ran-up dumps.
+  if (drawdownFromPeak <= -DEAD_DRAWDOWN_PCT) {
+    if (row.lastState !== "dead") {
+      fire(
+        "dead",
+        `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(row.mcapAtPush)} 會再通知）`,
+      );
+    }
+    // Already announced: silent monitoring until recovery or window end.
     return {
       alerts,
       peakMcap,
       followupsSent,
       lastState: "dead",
       lastAlertAt,
-      stopTracking: true,
+      stopTracking: false,
     };
   }
 
   if (cooledDown) {
+    // Volume ignition (early-warning, pre-🚀 only): dormant tape suddenly
+    // prints a big 5m volume bar.
+    if (
+      chgSincePush < RISING_STAGES[0] &&
+      live.vol5m >= IGNITION_VOL_USD &&
+      (row.lastVol5m ?? 0) < IGNITION_DORMANT_USD &&
+      lastState !== "ignite"
+    ) {
+      fire(
+        "ignition",
+        `🔥 量能點火 ${symbol} | 5m量 ${fmtUsd(live.vol5m)}（前值 ${fmtUsd(row.lastVol5m ?? 0)}）| 5m ${pct(live.chg5m)} — 疑似新一段行情啟動`,
+      );
+      lastState = "ignite";
+    }
+
     // Rising stages: fire the highest crossed stage not yet announced.
     const firedStages = new Set<string>();
     if (lastState?.startsWith("up")) firedStages.add(lastState);
@@ -302,11 +361,10 @@ export class PushWatcher {
       /* healing is best-effort */
     }
     const rows = await this.db.listPushWatch(cfg.maxTracked);
-    // Terminal rows (rug/dead) are KEPT instead of deleted: their presence in
-    // push_watch is what stops the self-heal from re-enrolling the same push
-    // every tick (which spammed repeated rug/dead alerts). They are skipped
-    // below and pruned once the watch window expires.
-    const activeRows = rows.filter((r) => r.lastState !== "rug" && r.lastState !== "dead");
+    // Only rug (drained LP) rows are terminal: kept so the self-heal does
+    // not re-enroll them, and skipped here. Dead rows stay ACTIVE but the
+    // rules engine keeps them silent until a resurrection.
+    const activeRows = rows.filter((r) => r.lastState !== "rug");
     if (activeRows.length === 0) return { checked: 0, alerted: 0 };
 
     // One DexScreener batch covers the whole watch list (≤30 addresses).
@@ -335,6 +393,7 @@ export class PushWatcher {
           mcap: pair.marketCap,
           liquidity: pair.liquidity.usd,
           chg5m: pair.priceChange.m5,
+          vol5m: pair.volume.m5,
           buysH1: pair.txns.h1Buys,
           sellsH1: pair.txns.h1Sells,
         },
@@ -353,24 +412,14 @@ export class PushWatcher {
         }
       }
 
-      if (evalResult.stopTracking) {
-        // Persist the terminal state instead of deleting the row — see the
-        // note above activeRows.
-        await this.db.updatePushWatchCheck(row.token, {
-          peakMcap: evalResult.peakMcap,
-          lastLiquidity: pair.liquidity.usd,
-          followupsSent: evalResult.followupsSent,
-          lastState: evalResult.lastState,
-          lastAlertAt: evalResult.lastAlertAt,
-        });
-        continue;
-      }
       await this.db.updatePushWatchCheck(row.token, {
         peakMcap: evalResult.peakMcap,
         lastLiquidity: pair.liquidity.usd,
+        lastVol5m: pair.volume.m5,
         followupsSent: evalResult.followupsSent,
         lastState: evalResult.lastState,
         lastAlertAt: evalResult.lastAlertAt,
+        mcapAtPush: evalResult.resetBaselineMcap,
       });
     }
 
