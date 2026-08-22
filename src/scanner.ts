@@ -784,6 +784,22 @@ export class Scanner {
       diag.pool = poolProfiles.length;
       const addresses = [...new Set(poolProfiles.map((p) => p.tokenAddress))];
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
+      // Fallback: when DexScreener's batched endpoint is blocked (shared
+      // egress 429s — observed 2026-08-22, pairs: 0/550), source the gate
+      // data from Jupiter's token API instead. It carries every input the
+      // gates need (mcap, liquidity, 5m/1h volume+change, txns, createdAt).
+      if (pairsByToken.size < addresses.length * 0.5 && this.jupiter) {
+        try {
+          const missing = addresses.filter((a) => !pairsByToken.has(a));
+          for (const [k, v] of await this.jupiter.fetchTokenDataBatch(missing))
+            pairsByToken.set(k, v);
+        } catch (err) {
+          console.error(
+            "[scanner] jupiter pair fallback failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
       diag.pairs = pairsByToken.size;
 
       // Capture each token's opening stats the first time we ever see it.

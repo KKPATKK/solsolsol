@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config";
-import type { TokenProfile } from "./dexscreener";
+import type { PairInfo, TokenProfile } from "./dexscreener";
 
 const BASE_URL = "https://lite-api.jup.ag/tokens/v2";
 /**
@@ -38,6 +38,15 @@ interface JupToken {
   symbol?: unknown;
   /** ISO timestamp of the token's creation (≈ launchpad birth time). */
   createdAt?: unknown;
+}
+
+/** Rolling-window stats block on a token entry (stats5m / stats1h / stats24h). */
+interface JupStats {
+  priceChange?: unknown;
+  numBuys?: unknown;
+  numSells?: unknown;
+  buyVolume?: unknown;
+  sellVolume?: unknown;
 }
 
 /** Valid base58 Solana mint (32–44 chars, no 0/O/I/l). */
@@ -86,6 +95,58 @@ export function parseJupTokens(data: unknown): TokenProfile[] {
  * Both degrade to [] on any failure; a rate limit sets a shared 5-minute
  * backoff so the scan never hammers a throttled upstream.
  */
+/** Number of mints per /search call — the endpoint's documented cap. */
+const JUP_BATCH_SIZE = 100;
+
+function n(v: unknown): number {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : 0;
+}
+
+/**
+ * Pure mapper from Jupiter token entries to the scanner's PairInfo shape
+ * (exported for offline unit tests). Every gate input the scan needs is
+ * available here: mcap, liquidity, 5m volume + price change, buy/sell
+ * counts, 1h change, and the pool creation time for the age gate.
+ */
+export function jupToPairInfos(data: unknown): Map<string, PairInfo> {
+  const out = new Map<string, PairInfo>();
+  if (!Array.isArray(data)) return out;
+  for (const raw of data as Array<Record<string, unknown>>) {
+    const id = typeof raw.id === "string" ? raw.id : undefined;
+    if (!id || !MINT_RE.test(id) || out.has(id)) continue;
+    const s5 = (raw.stats5m ?? {}) as JupStats;
+    const s1 = (raw.stats1h ?? {}) as JupStats;
+    const s24 = (raw.stats24h ?? {}) as JupStats;
+    out.set(id, {
+      chainId: "solana",
+      url: `https://dexscreener.com/solana/${id}`,
+      pairAddress: id,
+      baseToken: {
+        address: id,
+        name: String(raw.name ?? ""),
+        symbol: String(raw.symbol ?? ""),
+      },
+      priceUsd: String(n(raw.usdPrice)),
+      marketCap: n(raw.mcap) || n(raw.fdv),
+      volume: {
+        h24: n(s24.buyVolume) + n(s24.sellVolume),
+        m5: n(s5.buyVolume) + n(s5.sellVolume),
+      },
+      priceChange: { m5: n(s5.priceChange), h1: n(s1.priceChange) },
+      txns: {
+        m5Buys: n(s5.numBuys),
+        m5Sells: n(s5.numSells),
+        h1Buys: n(s1.numBuys),
+        h1Sells: n(s1.numSells),
+      },
+      liquidity: { usd: raw.liquidity === undefined ? null : n(raw.liquidity) },
+      pairCreatedAt: toMs(raw.createdAt) ?? 0,
+    });
+  }
+  return out;
+}
+
 export class JupTokensClient {
   private readonly throttle: Throttle;
   /** Timestamp until which all calls are skipped (after a 429). */
@@ -126,6 +187,7 @@ export class JupTokensClient {
     }
   }
 
+
   /** Newest launchpad launches (pump.fun & co.), newest first. */
   async fetchRecentTokens(limit: number): Promise<TokenProfile[]> {
     const wanted = Math.max(1, Math.min(Math.floor(limit), 100));
@@ -145,5 +207,25 @@ export class JupTokensClient {
       0,
       wanted,
     );
+  }
+
+  /**
+   * Batched gate data for arbitrary mints — the FALLBACK price source when
+   * DexScreener's batched endpoint is 429-blocked. One call per 100 mints
+   * covers every scan gate: mcap, liquidity, 5m/1h volume + change,
+   * buy/sell counts and pool creation time.
+   */
+  async fetchTokenDataBatch(mints: string[], max = 500): Promise<Map<string, PairInfo>> {
+    const out = new Map<string, PairInfo>();
+    const list = mints.filter((m) => MINT_RE.test(m)).slice(0, Math.max(0, max));
+    for (let i = 0; i < list.length; i += JUP_BATCH_SIZE) {
+      if (this.rateLimited()) break;
+      const chunk = list.slice(i, i + JUP_BATCH_SIZE);
+      for (const [k, v] of jupToPairInfos(
+        await this.get(`/search?query=${chunk.join(",")}`),
+      ))
+        out.set(k, v);
+    }
+    return out;
   }
 }
