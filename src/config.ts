@@ -361,6 +361,15 @@ export interface AppConfig {
   gmgnRequestIntervalMs: number;
   /**
    * Block pushes for coins GMGN explicitly flags as wash trading
+   * Reject pushes whose profiled top holders are overwhelmingly brand-new
+   * wallets (insider/syndicate self-pump shape). Gate fires when
+   * newWallets/checked > WALLET_NEW_RATIO_MAX and at least
+   * WALLET_NEW_MIN_CHECKED wallets were profiled; 0 disables.
+   */
+  walletNewRatioMax: number;
+  /** Minimum profiled top-holders before the new-wallet gate judges. */
+  walletNewMinChecked: number;
+  /**
    * (GMGN_BLOCK_WASH_TRADING, default true). Only applies when a GMGN key
    * is configured.
    */
@@ -544,6 +553,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ? Math.max(0, Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
       : 600,
     gmgnBlockWashTrading: (env.GMGN_BLOCK_WASH_TRADING ?? "true") !== "false",
+    walletNewRatioMax: Number.isFinite(Number(env.WALLET_NEW_RATIO_MAX))
+      ? Math.max(0, Math.min(Number(env.WALLET_NEW_RATIO_MAX), 1))
+      : 0.8,
+    walletNewMinChecked: Number.isFinite(Number(env.WALLET_NEW_MIN_CHECKED))
+      ? Math.max(1, Math.floor(Number(env.WALLET_NEW_MIN_CHECKED)))
+      : 5,
     axiomEmail: env.AXIOM_EMAIL || undefined,
     axiomPassword: env.AXIOM_PASSWORD || undefined,
     axiomTrendingLimit: Number.isFinite(Number(env.AXIOM_TRENDING_LIMIT ?? 20))

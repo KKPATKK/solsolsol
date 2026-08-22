@@ -187,6 +187,27 @@ export function mcapRatioBlockReason(
     : null;
 }
 
+/**
+ * Insider self-pump detector: when nearly all profiled top holders are
+ * brand-new wallets (first on-chain activity younger than the analyzer's
+ * new-wallet threshold), the float is concentrated in one syndicate that
+ * will distribute onto followers. Needs enough wallets profiled for a
+ * verdict; ratioMax 0 disables.
+ */
+export function newWalletBlockReason(
+  checked: number,
+  newWallets: number,
+  ratioMax: number,
+  minChecked: number,
+): string | null {
+  if (!(ratioMax > 0)) return null;
+  if (checked < minChecked) return null;
+  const ratio = newWallets / checked;
+  return ratio > ratioMax
+    ? `新錢包集中 ${newWallets}/${checked} > ${Math.round(ratioMax * 100)}%（top holders 幾乎全是新錢包：關聯盤自拉形態）`
+    : null;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1104,6 +1125,23 @@ export class Scanner {
             })
           : null;
         if (wallet?.ok) diag.walletAnalysis++;
+        // Insider self-pump gate: top holders almost all brand-new wallets
+        // (the Cheems shape — 8/8 fresh). Runs after analysis so the data is
+        // already in hand; no extra API cost.
+        const newWalletReason = newWalletBlockReason(
+          wallet?.holders.checked ?? 0,
+          wallet?.holders.newWallets ?? 0,
+          this.config.walletNewRatioMax,
+          this.config.walletNewMinChecked,
+        );
+        if (newWalletReason) {
+          diag.fails.other++;
+          this.addReject(diag, coin, newWalletReason);
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (new-wallet concentration)`,
+          );
+          continue;
+        }
         // Live trade-mode read (once per token): /setmode flips apply to the
         // very next card. Buy button renders in manual mode; sell buttons in
         // any non-off mode (in auto the coin was already bought — exits are

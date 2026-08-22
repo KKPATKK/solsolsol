@@ -19,7 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -2383,6 +2383,23 @@ async function main() {
       const missing = await db.findUntrackedPushes(Date.now() - 3600_000, 10);
       assert.equal(missing.some((m) => m.token === "MINTTOMB"), false);
     } finally { t.cleanup(); }
+  });
+
+  await test("newWalletBlockReason: Cheems shape blocked, healthy mixes pass", () => {
+    // The complaint: 8 profiled top holders, all 8 brand-new → block.
+    assert.match(newWalletBlockReason(8, 8, 0.8, 5), /8\/8/);
+    // 7/8 fresh also clears the 0.8 line.
+    assert.match(newWalletBlockReason(8, 7, 0.8, 5), /7\/8/);
+    // Mixed holder bases pass.
+    assert.equal(newWalletBlockReason(10, 4, 0.8, 5), null);
+    assert.equal(newWalletBlockReason(12, 6, 0.8, 5), null);
+    // Boundary: exactly at ratio passes (strict >).
+    assert.equal(newWalletBlockReason(5, 4, 0.8, 5), null);
+    // Too few wallets profiled — no verdict either way.
+    assert.equal(newWalletBlockReason(4, 4, 0.8, 5), null);
+    assert.equal(newWalletBlockReason(0, 0, 0.8, 5), null);
+    // Disabled.
+    assert.equal(newWalletBlockReason(8, 8, 0, 5), null);
   });
 
   // ---------- summary ----------

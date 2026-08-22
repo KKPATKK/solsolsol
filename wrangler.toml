@@ -84,6 +84,12 @@ PUSH_WATCH_WINDOW_HOURS = "24"
 PUSH_WATCH_COOLDOWN_MIN = "30"
 PUSH_WATCH_HOLDERS_REFRESH_MIN = "30"
 PUSH_WATCH_MAX_HOLDER_CHECKS = "4"
+# Insider self-pump gate: rejects pushes where newWallets/checked top-holder
+# wallets exceeds WALLET_NEW_RATIO_MAX (the Cheems shape — 8/8 profiled
+# holders were brand-new wallets). Only judges once at least
+# WALLET_NEW_MIN_CHECKED wallets were profiled. 0 disables the gate.
+WALLET_NEW_RATIO_MAX = "0.8"
+WALLET_NEW_MIN_CHECKED = "5"
 # Market-cap/liquidity ratio sanity gate: rejects candidates whose market cap
 # exceeds their pooled liquidity by more than MCAP_LIQ_RATIO_MAX times. A
 # price running on a sliver of depth is trivially wickable and nearly
