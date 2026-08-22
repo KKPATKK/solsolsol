@@ -16,7 +16,9 @@ import { fmtUsd } from "./format";
  *   🚀 rising stages  — mcap crosses +50% / +100% / +200% / +400% vs push
  *   ⚠️ weak           — ≥35% off the post-push peak (only if it had run up)
  *   💀 dead           — ≥55% off peak → final alert, tracking stops
- *   💧 liquidity      — liquidity collapsed >55% since the last check
+ *   💧 liquidity      — collapsed >55% since the last check, OR absolute
+ *                       floor breach (< $10K) → drained LP, mcap unreliable,
+ *                       tracking stops
  *   📈 holders        — holder count +10% / +25% / +50% vs push (Birdeye)
  */
 
@@ -30,6 +32,13 @@ const WEAK_MIN_RUNUP_PCT = 15;
 /** Liquidity crash: current < 45% of the last check AND last ≥ $5K. */
 const LIQ_CRASH_RATIO = 0.45;
 const LIQ_CRASH_MIN_LAST_USD = 5_000;
+/**
+ * Absolute liquidity floor: below this the pool is considered drained.
+ * DexScreener keeps reporting "marketCap" from the last traded price even
+ * with zero liquidity, so every mcap-derived signal (rising stages, weak,
+ * dead) becomes noise — stop tracking instead of acting on fake numbers.
+ */
+export const LIQ_FLOOR_USD = 10_000;
 /** Holder-growth stages (× push-time holders → state suffix). */
 const HOLDER_STAGES = [10, 25, 50] as const;
 
@@ -85,7 +94,7 @@ export function evaluateWatch(
     buysH1: number;
     sellsH1: number;
   },
-  cfg: { cooldownMs: number },
+  cfg: { cooldownMs: number; liqFloorUsd?: number },
 ): WatchEval {
   const alerts: WatchAlert[] = [];
   const symbol = row.symbol ?? "?";
@@ -103,6 +112,25 @@ export function evaluateWatch(
     lastAlertAt = now;
     followupsSent += 1;
   };
+
+  // Liquidity drained outright (LP ≈ 0): the reported mcap is just the last
+  // traded price × supply and carries no information. Wins over every other
+  // state so we never send 🚀 off a zombie number.
+  const liqFloor = cfg.liqFloorUsd ?? LIQ_FLOOR_USD;
+  if (live.liquidity !== null && live.liquidity < liqFloor) {
+    fire(
+      "liquidity",
+      `💧 流動性枯竭 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}），市值數據已失真（LP 被抽乾），停止追蹤`,
+    );
+    return {
+      alerts,
+      peakMcap,
+      followupsSent,
+      lastState: "rug",
+      lastAlertAt,
+      stopTracking: true,
+    };
+  }
 
   // Dead first — it wins over any other alert and stops tracking. Peak is
   // always ≥ push mcap, so this also catches never-ran-up straight dumps.

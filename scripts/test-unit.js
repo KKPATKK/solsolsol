@@ -716,17 +716,18 @@ async function main() {
     assert.equal(w.stopTracking, false);
 
     // -56% off peak → dead wins and stops tracking.
-    const d = evaluateWatch(row(), 1000, { mcap: 39_000, liquidity: 9_000, chg5m: -12, buysH1: 10, sellsH1: 90 }, cfg);
+    const d = evaluateWatch(row(), 1000, { mcap: 39_000, liquidity: 15_000, chg5m: -12, buysH1: 10, sellsH1: 90 }, cfg);
     assert.equal(d.alerts[0].kind, "dead");
     assert.equal(d.stopTracking, true);
 
     // Never ran up but dumps straight to -55% vs push → dead still fires.
-    const d2 = evaluateWatch(row({ peakMcap: 50_000 }), 1000, { mcap: 22_000, liquidity: 4_000, chg5m: -20, buysH1: 2, sellsH1: 80 }, cfg);
+    const d2 = evaluateWatch(row({ peakMcap: 50_000 }), 1000, { mcap: 22_000, liquidity: 14_000, chg5m: -20, buysH1: 2, sellsH1: 80 }, cfg);
     assert.equal(d2.alerts[0].kind, "dead");
     assert.equal(d2.stopTracking, true);
 
-    // Liquidity collapse >55% → liquidity alert.
-    const l = evaluateWatch(row({ lastAlertAt: -3600_000 }), 1000, { mcap: 88_000, liquidity: 8_000, chg5m: 2, buysH1: 90, sellsH1: 80 }, cfg);
+    // Liquidity collapse >55% → liquidity alert (still above the absolute
+    // floor: 30K → 11K is a 63% drop but ≥ $10K, so the rug rule stays quiet).
+    const l = evaluateWatch(row({ lastAlertAt: -3600_000, lastLiquidity: 30_000 }), 1000, { mcap: 88_000, liquidity: 11_000, chg5m: 2, buysH1: 90, sellsH1: 80 }, cfg);
     assert.ok(l.alerts.some((a) => a.kind === "liquidity"));
 
     // Holders +25% since push → hold25 fires (highest crossed stage).
@@ -739,6 +740,43 @@ async function main() {
     const holderAlert = h.alerts.find((a) => a.kind === "holders");
     assert.ok(holderAlert);
     assert.match(holderAlert.text, /\+25%/);
+  });
+
+  await test("evaluateWatch: absolute liquidity floor (drained LP) wins and stops tracking", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "CatGPT", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 126_000, lastLiquidity: 12_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0, lastState: "up100",
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+
+    // LP drained to $0 while mcap still shows a fake +152% → rug wins over 🚀.
+    const r = evaluateWatch(row(), 1000, { mcap: 126_000, liquidity: 0, chg5m: 0, buysH1: 0, sellsH1: 0 }, cfg);
+    assert.equal(r.alerts.length, 1);
+    assert.equal(r.alerts[0].kind, "liquidity");
+    assert.match(r.alerts[0].text, /流動性枯竭 CatGPT/);
+    assert.equal(r.lastState, "rug");
+    assert.equal(r.stopTracking, true);
+
+    // Just below the floor with rising mcap — same outcome, no rising alert.
+    const r2 = evaluateWatch(row(), 1000, { mcap: 200_000, liquidity: 9_999, chg5m: 30, buysH1: 500, sellsH1: 10 }, cfg);
+    assert.equal(r2.alerts[0].kind, "liquidity");
+    assert.equal(r2.stopTracking, true);
+
+    // null liquidity (pair without an liq field) must NOT trigger the rule
+    // (within cooldown so no other rule can fire either).
+    const n = evaluateWatch(row({ lastAlertAt: 900 }), 1000, { mcap: 80_000, liquidity: null, chg5m: 4, buysH1: 20, sellsH1: 15 }, { cooldownMs: 3_600_000 });
+    assert.equal(n.alerts.length, 0);
+    assert.equal(n.stopTracking, false);
+
+    // Custom floor override works.
+    const hi = evaluateWatch(row({ lastLiquidity: 40_000, lastAlertAt: 900 }), 1000, { mcap: 90_000, liquidity: 19_000, chg5m: 2, buysH1: 30, sellsH1: 25 }, { cooldownMs: 3_600_000 });
+    assert.equal(hi.alerts.length, 0);
+    const custom = evaluateWatch(row({ lastLiquidity: 40_000 }), 1000, { mcap: 90_000, liquidity: 19_000, chg5m: 2, buysH1: 30, sellsH1: 25 }, { cooldownMs: 0, liqFloorUsd: 20_000 });
+    assert.equal(custom.alerts[0].kind, "liquidity");
+    assert.equal(custom.stopTracking, true);
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {
