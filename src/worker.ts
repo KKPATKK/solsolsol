@@ -1247,6 +1247,7 @@ export default {
           maxMarketCapUsd: c.maxMarketCapUsd,
           minAgeMinutes: c.minAgeMinutes,
           maxAgeMinutes: c.maxAgeMinutes,
+          minLiquidityUsd: c.minLiquidityUsd,
           min5mVolUsd: c.min5mVolUsd,
           min5mChgPct: c.min5mChgPct,
           min1hChgPct: c.min1hChgPct,

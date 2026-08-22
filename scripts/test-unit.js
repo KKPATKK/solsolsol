@@ -74,6 +74,8 @@ async function main() {
     assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 1680);
     assert.equal(DEFAULT_SETTINGS.min5mVolUsd, 6000);
     assert.equal(DEFAULT_SETTINGS.min5mChgPct, 30);
+    // Liquidity floor ships ON ($10K) — zero-liq soft-rugs must never pass.
+    assert.equal(DEFAULT_SETTINGS.minLiquidityUsd, 10000);
     // Bundler/top-10 filters were removed — no thresholds in defaults.
     assert.equal("maxBundlerPct" in DEFAULT_SETTINGS, false);
     assert.equal("maxTop10HolderPct" in DEFAULT_SETTINGS, false);
@@ -1695,18 +1697,61 @@ async function main() {
     if (r.ok) assert.equal(r.minMarketCapUsd, 40000);
   });
 
-  await test("parseFilterArgs rejects wrong argument counts (6 required, optional 1h leg)", () => {
+  await test("parseFilterArgs rejects wrong argument counts (6 required, optional 1h + liq)", () => {
     assert.equal(parseFilterArgs([]).ok, false);
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5"]).ok, false);
-    // 6 args = valid (1h leg defaults to 40); 7 args = explicit 1h leg; 8+ rejected.
+    // 6 args = valid (1h leg 40, liq floor default); 7 = explicit 1h;
+    // 8 = explicit liquidity floor; 9+ rejected.
     const six = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20"]);
     assert.equal(six.ok, true);
     assert.ok(six.ok && six.min1hChgPct === 40);
+    assert.ok(six.ok && six.minLiquidityUsd === 10000);
     const seven = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20", "35"]);
     assert.equal(seven.ok, true);
     assert.ok(seven.ok && seven.min1hChgPct === 35);
-    assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8"]).ok, false);
+    assert.ok(seven.ok && seven.minLiquidityUsd === 10000);
+    const eight = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20", "35", "15000"]);
+    assert.equal(eight.ok, true);
+    assert.ok(eight.ok && eight.minLiquidityUsd === 15000);
+    const zeroLiq = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20", "40", "0"]);
+    assert.equal(zeroLiq.ok, true);
+    assert.ok(zeroLiq.ok && zeroLiq.minLiquidityUsd === 0);
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8", "9"]).ok, false);
+  });
+
+  await test("settings_v4 migration lifts the 0 liquidity floor to the default once", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Simulate a pre-v4 database: chat created while the floor shipped as 0.
+      await t.client.execute("DELETE FROM worker_state WHERE key = 'settings_v4_applied'");
+      await t.client.execute("UPDATE chat_settings SET min_liquidity_usd = 0");
+      await db.saveChatSettings({
+        chatId: "chat-a", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 40000, maxMarketCapUsd: 300000,
+        minAgeMinutes: 180, maxAgeMinutes: 1680, min5mVolUsd: 4000,
+        min5mChgPct: 20, min1hChgPct: 40, enabled: true,
+      });
+      await t.client.execute("DELETE FROM worker_state WHERE key = 'settings_v4_applied'");
+      // Re-open: the migration must run once and only touch 0-valued rows.
+      const db2 = new Db(t.p, undefined, t.client);
+      await db2.init();
+      assert.equal(await db2.getWorkerState("settings_v4_applied"), "1");
+      assert.equal((await db2.getChatSettings("chat-a")).minLiquidityUsd, 10000);
+      // Custom non-zero values survive a later init untouched.
+      await db2.saveChatSettings({
+        chatId: "chat-a", minLiquidityUsd: 25000, minVolume24hUsd: 0,
+        minMarketCapUsd: 40000, maxMarketCapUsd: 300000,
+        minAgeMinutes: 180, maxAgeMinutes: 1680, min5mVolUsd: 4000,
+        min5mChgPct: 20, min1hChgPct: 40, enabled: true,
+      });
+      const db3 = new Db(t.p, undefined, t.client);
+      await db3.init();
+      assert.equal((await db3.getChatSettings("chat-a")).minLiquidityUsd, 25000);
+    } finally {
+      await t.cleanup();
+    }
   });
 
   await test("parseFilterArgs rejects non-numeric, negative and inverted ranges", () => {

@@ -57,13 +57,16 @@ export type ParsedFilter =
       min5mChgPct: number;
       /** Optional 7th /filter arg — the compound gate's 1h leg (default 40). */
       min1hChgPct: number;
+      /** Optional 8th /filter arg — the liquidity floor in USD (default
+       * DEFAULT_SETTINGS.minLiquidityUsd). Blocks LP-pulled soft-rugs. */
+      minLiquidityUsd: number;
     }
   | { ok: false; error: string };
 
 export function parseFilterArgs(parts: string[]): ParsedFilter {
   const USAGE =
-    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%]`\n例如: `/filter 40000 300000 300 1680 4000 20 40`\n合格条件 = 5m涨幅 ≥ 第6参数 **或** 1h涨幅 ≥ 第7参数（省略则默认 40）";
-  if (parts.length !== 6 && parts.length !== 7) {
+    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD]`\n例如: `/filter 40000 300000 300 1680 4000 20 40 10000`\n合格条件 = 5m涨幅 ≥ 第6参数 **或** 1h涨幅 ≥ 第7参数（省略则默认 40）；第8参数 = 流动性门槛（省略则默认 $10K，设 0 停用）";
+  if (parts.length !== 6 && parts.length !== 7 && parts.length !== 8) {
     return { ok: false, error: USAGE };
   }
   const minMarketCapUsd = parseNumber(parts[0]);
@@ -72,7 +75,8 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
   const maxAgeMinutes = parseNumber(parts[3]);
   const min5mVolUsd = parseNumber(parts[4]);
   const min5mChgPct = parseNumber(parts[5]);
-  const min1hChgPct = parts.length === 7 ? parseNumber(parts[6]) : 40;
+  const min1hChgPct = parts.length >= 7 ? parseNumber(parts[6]) : 40;
+  const minLiquidityUsd = parts.length === 8 ? parseNumber(parts[7]) : DEFAULT_SETTINGS.minLiquidityUsd;
   if (
     minMarketCapUsd === null ||
     maxMarketCapUsd === null ||
@@ -81,6 +85,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     min5mVolUsd === null ||
     min5mChgPct === null ||
     min1hChgPct === null ||
+    minLiquidityUsd === null ||
     minMarketCapUsd < 0 ||
     maxMarketCapUsd < 0 ||
     minAgeMinutes <= 0 ||
@@ -92,7 +97,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     return {
       ok: false,
       error:
-        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%]`",
+        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD]`",
     };
   }
   return {
@@ -104,6 +109,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     min5mVolUsd,
     min5mChgPct,
     min1hChgPct,
+    minLiquidityUsd,
   };
 }
 
@@ -220,7 +226,6 @@ export function createBot(
     const existing = await chatDb.getChatSettings(String(chatId));
     await chatDb.saveChatSettings({
       chatId: String(chatId),
-      minLiquidityUsd: existing?.minLiquidityUsd ?? DEFAULT_SETTINGS.minLiquidityUsd,
       minVolume24hUsd: existing?.minVolume24hUsd ?? DEFAULT_SETTINGS.minVolume24hUsd,
       minMarketCapUsd: parsed.minMarketCapUsd,
       maxMarketCapUsd: parsed.maxMarketCapUsd,
@@ -229,6 +234,7 @@ export function createBot(
       min5mVolUsd: parsed.min5mVolUsd,
       min5mChgPct: parsed.min5mChgPct,
       min1hChgPct: parsed.min1hChgPct,
+      minLiquidityUsd: parsed.minLiquidityUsd,
       enabled: existing?.enabled ?? false,
     });
     await ctx.reply(
@@ -240,6 +246,7 @@ export function createBot(
         `⏱️ 最长上线: ${parsed.maxAgeMinutes} 分钟`,
         `📊 最低 5m 量: ${fmtUsd(parsed.min5mVolUsd)}`,
         `⚡ 合格涨幅: 5m ≥ ${parsed.min5mChgPct}% 或 1h ≥ ${parsed.min1hChgPct}%`,
+        `💧 最低流动性: ${fmtUsd(parsed.minLiquidityUsd)}${parsed.minLiquidityUsd === 0 ? "（已停用）" : ""}`,
         `推送状态: ${existing?.enabled ?? false ? "已开启" : "已关闭（用 /on 开启）"}`,
       ].join("\n"),
     );

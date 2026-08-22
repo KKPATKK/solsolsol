@@ -56,7 +56,10 @@ export interface ChatSettings {
  * reference only).
  */
 export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
-  minLiquidityUsd: 0,
+  // $10K floor: DexScreener reporting liquidity ~0 means the LP was pulled or
+  // never seeded (soft-rug signature — e.g. CatGPT 2026-08-21 pushed with
+  // liquidity.usd = 0 while mcap showed $126K). Set 0 to disable the gate.
+  minLiquidityUsd: 10000,
   minVolume24hUsd: 0,
   minMarketCapUsd: 40000,
   maxMarketCapUsd: 300000,
@@ -221,7 +224,7 @@ export class Db {
       [
         `CREATE TABLE IF NOT EXISTS chat_settings (
           chat_id TEXT PRIMARY KEY,
-          min_liquidity_usd REAL NOT NULL DEFAULT 0,
+          min_liquidity_usd REAL NOT NULL DEFAULT 10000,
           min_volume_24h_usd REAL NOT NULL DEFAULT 0,
           min_market_cap_usd REAL NOT NULL DEFAULT 40000,
           max_market_cap_usd REAL NOT NULL DEFAULT 300000,
@@ -369,6 +372,10 @@ export class Db {
           sql: "SELECT value FROM worker_state WHERE key = 'settings_v3_applied'",
           args: [],
         },
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'settings_v4_applied'",
+          args: [],
+        },
       ],
       "read",
     );
@@ -380,6 +387,8 @@ export class Db {
       flags[2].rows.length > 0 ? String(flags[2].rows[0].value) : null;
     const settingsV3 =
       flags[3].rows.length > 0 ? String(flags[3].rows[0].value) : null;
+    const settingsV4 =
+      flags[4].rows.length > 0 ? String(flags[4].rows[0].value) : null;
 
     // One-time migration: existing chats keep their old filter values unless
     // reset. The operator specified a new filter profile, so apply it to all
@@ -415,6 +424,17 @@ export class Db {
       });
       await this.setWorkerState("settings_v3_applied", "1");
       console.log("[db] applied min-age default 180m to existing chats (settings_v3)");
+    }
+    // settings_v4: the liquidity gate shipped defaulted to 0 (= disabled), so
+    // zero-liquidity soft-rugs slipped through. Give every chat that never
+    // opted into a floor the new $10K default; explicit values are kept.
+    if (!settingsV4) {
+      await this.get().execute({
+        sql: "UPDATE chat_settings SET min_liquidity_usd = ? WHERE min_liquidity_usd = 0",
+        args: [d.minLiquidityUsd],
+      });
+      await this.setWorkerState("settings_v4_applied", "1");
+      console.log("[db] applied min-liquidity default to existing chats (settings_v4)");
     }
     // One-time legacy column backfills (databases created before these
     // columns existed). Fresh databases already carry every column in the
