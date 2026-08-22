@@ -302,10 +302,15 @@ export class PushWatcher {
       /* healing is best-effort */
     }
     const rows = await this.db.listPushWatch(cfg.maxTracked);
-    if (rows.length === 0) return { checked: 0, alerted: 0 };
+    // Terminal rows (rug/dead) are KEPT instead of deleted: their presence in
+    // push_watch is what stops the self-heal from re-enrolling the same push
+    // every tick (which spammed repeated rug/dead alerts). They are skipped
+    // below and pruned once the watch window expires.
+    const activeRows = rows.filter((r) => r.lastState !== "rug" && r.lastState !== "dead");
+    if (activeRows.length === 0) return { checked: 0, alerted: 0 };
 
     // One DexScreener batch covers the whole watch list (≤30 addresses).
-    const tokens = rows.map((r) => r.token).slice(0, 30);
+    const tokens = activeRows.map((r) => r.token).slice(0, 30);
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
     try {
       pairs = await this.pairsFor(tokens);
@@ -315,7 +320,7 @@ export class PushWatcher {
 
     let checked = 0;
     let alerted = 0;
-    for (const row of rows) {
+    for (const row of activeRows) {
       const pair = pairs.get(row.token);
       if (!pair) {
         // Delisted/unfindable: drop after a grace period so stale rows don't linger.
@@ -349,7 +354,15 @@ export class PushWatcher {
       }
 
       if (evalResult.stopTracking) {
-        await this.db.deletePushWatch(row.token);
+        // Persist the terminal state instead of deleting the row — see the
+        // note above activeRows.
+        await this.db.updatePushWatchCheck(row.token, {
+          peakMcap: evalResult.peakMcap,
+          lastLiquidity: pair.liquidity.usd,
+          followupsSent: evalResult.followupsSent,
+          lastState: evalResult.lastState,
+          lastAlertAt: evalResult.lastAlertAt,
+        });
         continue;
       }
       await this.db.updatePushWatchCheck(row.token, {
@@ -363,7 +376,7 @@ export class PushWatcher {
 
     // Holder refresh (Birdeye CU-bounded): oldest-checked first, alive coins only.
     if (this.birdeye && cfg.maxHolderChecksPerTick > 0) {
-      const due = rows
+      const due = activeRows
         .filter(
           (r) =>
             pairs.has(r.token) &&
