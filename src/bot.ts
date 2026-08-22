@@ -156,7 +156,7 @@ export function tradeKeyboard(
   token: string,
   buySizeLabel: string,
   mode: TradeMode,
-  opts: { modeSwitch?: boolean } = {},
+  opts: { modeSwitch?: boolean; unwatch?: boolean } = {},
 ): InlineKeyboardButton[][] {
   const rows: InlineKeyboardButton[][] = [
     [{ text: "🔗 打开 Axiom 页面", url: `${AXIOM_BASE_URL}${token}` }],
@@ -178,6 +178,13 @@ export function tradeKeyboard(
   if (opts.modeSwitch) {
     rows.push([
       { text: `⚙️ 模式: ${mode}`, callback_data: `mode:toggle:${token}` },
+    ]);
+  }
+  // Stop-tracking button (push cards): removes the coin from post-push
+  // tracking so 🚀/⚠️/🩸/🏁 follow-ups stop arriving.
+  if (opts.unwatch) {
+    rows.push([
+      { text: "🔕 停止追蹤", callback_data: `unwatch:${token}` },
     ]);
   }
   return rows;
@@ -457,9 +464,29 @@ export function createBot(
       !data ||
       (!data.startsWith("buy:") &&
         !data.startsWith("sell:") &&
-        !data.startsWith("mode:"))
+        !data.startsWith("mode:") &&
+        !data.startsWith("unwatch:"))
     )
       return;
+
+    // 🔔 unwatch: drop the coin from push_watch — no more follow-up alerts
+    // (🚀/⚠️/🩸/🏁) for it. Admin-gated like the trade buttons; the card's
+    // keyboard is cleared so the tap has a visible effect.
+    if (data.startsWith("unwatch:")) {
+      const token = data.slice("unwatch:".length);
+      if (adminIds.length === 0 || !isAdmin(ctx.from?.id, adminIds)) {
+        await ctx.answerCallbackQuery({ text: "你不是本 bot 的管理员，无法操作" });
+        return;
+      }
+      if (!db) {
+        await ctx.answerCallbackQuery({ text: "数据库未配置，无法停止追蹤" });
+        return;
+      }
+      await db.deletePushWatch(token);
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      await ctx.answerCallbackQuery({ text: "🔕 已停止追蹤，不再收到跟進警報" });
+      return;
+    }
 
     // ⚙️ mode switch: toggle (asks for confirmation) / apply / cancel. Global
     // action — the token only exists to re-render the right card.

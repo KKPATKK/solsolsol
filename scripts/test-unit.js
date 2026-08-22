@@ -10,7 +10,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
-const { parseFilterArgs } = require("../dist/bot.js");
+const { parseFilterArgs, tradeKeyboard } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
@@ -2349,6 +2349,18 @@ async function main() {
     // Vault entries without a pubkey are ignored safely.
     const safe = selectTopAccounts(largest, "PAIR", [{ pubkey: undefined }, {}], 4);
     assert.deepEqual(safe, ["VAULT", "HOLDER1", "HOLDER2", "HOLDER3"]);
+  });
+
+
+  // ---------- unwatch button on push cards ----------
+  await test("tradeKeyboard: unwatch opt adds stop-tracking row; absent by default", () => {
+    const base = tradeKeyboard("MINT111", "\$1", "off");
+    assert.equal(base.some((r) => r.some((b) => b.callback_data === "unwatch:MINT111")), false);
+    const withUnwatch = tradeKeyboard("MINT111", "\$1", "manual", { modeSwitch: true, unwatch: true });
+    const flat = withUnwatch.flat();
+    assert.ok(flat.some((b) => b.text === "🔕 停止追蹤" && b.callback_data === "unwatch:MINT111"));
+    assert.ok(flat.some((b) => (b.url || "").includes("MINT111")));
+    assert.ok(flat.some((b) => b.callback_data === "mode:toggle:MINT111"));
   });
 
   // ---------- summary ----------
