@@ -66,9 +66,24 @@ class Throttle {
  * re-evaluation pool and are retried next tick.
  */
 const PAIRS_FETCH_BUDGET_MS = 10_000;
+/**
+ * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
+ * minute after minute), so re-fetching all ~550 addresses every tick burns
+ * ~19 batched requests/min against a shared egress IP that other tenants
+ * also hammer — the observed hard 429 block. A short TTL keeps gate math
+ * fresh enough (cooldowns are ≥30 min) while cutting request volume ~70%.
+ */
+const PAIR_CACHE_TTL_MS = 180_000;
+/** Cache size cap (oldest entries evicted) — bounds isolate memory. */
+const PAIR_CACHE_MAX = 4_000;
 
 export class DexScreenerClient {
   private readonly throttle: Throttle;
+  /** Fresh pair data by token (see PAIR_CACHE_TTL_MS). Insertion-ordered. */
+  private readonly pairCache = new Map<
+    string,
+    { pair: PairInfo; at: number }
+  >();
 
   constructor(private readonly config: AppConfig) {
     this.throttle = new Throttle(config.dexRequestIntervalMs);
@@ -152,10 +167,24 @@ export class DexScreenerClient {
    */
   async fetchPairsForTokens(addresses: string[]): Promise<Map<string, PairInfo>> {
     const result = new Map<string, PairInfo>();
-    const deadline = Date.now() + PAIRS_FETCH_BUDGET_MS;
-    for (let i = 0; i < addresses.length; i += 30) {
+    const now = Date.now();
+    // Serve whatever is still fresh from the cache first; only cache misses
+    // hit the wire.
+    const misses: string[] = [];
+    for (const a of addresses) {
+      const hit = this.pairCache.get(a);
+      if (hit && now - hit.at < PAIR_CACHE_TTL_MS) {
+        result.set(a, hit.pair);
+      } else {
+        misses.push(a);
+      }
+    }
+    if (misses.length === 0) return result;
+
+    const deadline = now + PAIRS_FETCH_BUDGET_MS;
+    for (let i = 0; i < misses.length; i += 30) {
       if (Date.now() > deadline) break; // keep the tick inside its budget
-      const batch = addresses.slice(i, i + 30);
+      const batch = misses.slice(i, i + 30);
       let data: { pairs?: Array<Record<string, unknown>> } | null;
       try {
         data = (await this.getJson(
@@ -225,6 +254,17 @@ export class DexScreenerClient {
           },
           pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
         });
+        this.pairCache.set(baseToken.address, {
+          pair: result.get(baseToken.address)!,
+          at: now,
+        });
+      }
+    }
+    if (this.pairCache.size > PAIR_CACHE_MAX) {
+      // Evolve oldest-first (Map preserves insertion order).
+      for (const k of this.pairCache.keys()) {
+        if (this.pairCache.size <= PAIR_CACHE_MAX) break;
+        this.pairCache.delete(k);
       }
     }
     return result;
