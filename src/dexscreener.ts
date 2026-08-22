@@ -76,6 +76,8 @@ const PAIRS_FETCH_BUDGET_MS = 10_000;
 const PAIR_CACHE_TTL_MS = 180_000;
 /** Cache size cap (oldest entries evicted) — bounds isolate memory. */
 const PAIR_CACHE_MAX = 4_000;
+/** After a batched-endpoint 429, skip all batch calls for this long. */
+const PAIR_BATCH_BACKOFF_MS = 90_000;
 
 export class DexScreenerClient {
   private readonly throttle: Throttle;
@@ -84,6 +86,8 @@ export class DexScreenerClient {
     string,
     { pair: PairInfo; at: number }
   >();
+  /** Until this epoch the batched endpoint 429'd — serve cache only. */
+  private batchBlockedUntil = 0;
 
   constructor(private readonly config: AppConfig) {
     this.throttle = new Throttle(config.dexRequestIntervalMs);
@@ -180,6 +184,9 @@ export class DexScreenerClient {
       }
     }
     if (misses.length === 0) return result;
+    // Blocked by a recent hard 429: don't hammer the endpoint (and don't
+    // burn the tick's budget on doomed retries) — cache-only for now.
+    if (Date.now() < this.batchBlockedUntil) return result;
 
     const deadline = now + PAIRS_FETCH_BUDGET_MS;
     for (let i = 0; i < misses.length; i += 30) {
@@ -194,9 +201,12 @@ export class DexScreenerClient {
       } catch (err) {
         // A rate-limited batch means the remaining ones will 429 too — stop
         // instead of burning the rest of the tick's budget (and Cloudflare's
-        // wall clock) on doomed retries. Partial coverage beats a wedged
-        // scan: covered coins are still evaluated this tick.
-        if (/429/.test(err instanceof Error ? err.message : String(err))) break;
+        // wall clock) on doomed retries, and back off across ticks so the
+        // next scan goes straight to cache-only mode.
+        if (/429/.test(err instanceof Error ? err.message : String(err))) {
+          this.batchBlockedUntil = Date.now() + PAIR_BATCH_BACKOFF_MS;
+          break;
+        }
         continue; // transient/other error — skip this batch, try the next
       }
       const pairs = data?.pairs;
