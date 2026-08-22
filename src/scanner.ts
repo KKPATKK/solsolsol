@@ -659,6 +659,19 @@ export class Scanner {
       const jupTrendMints = new Set(
         jupTrendProfiles.map((p) => p.tokenAddress),
       );
+      // Per-mint discovery attribution (see TokenStats.discoveredVia): the
+      // merge order below is the priority order — the feed that survives a
+      // dedupe filter is the one that found the coin first.
+      const discoveredVia = new Map<string, string>([
+        ...profiles.map((p) => [p.tokenAddress, "dex"] as const),
+        ...pumpProfiles.map((p) => [p.tokenAddress, "pump"] as const),
+        ...geckoProfiles.map((p) => [p.tokenAddress, "gecko"] as const),
+        ...geoTrendProfiles.map((p) => [p.tokenAddress, "geoTrend"] as const),
+        ...gmgnProfiles.map((p) => [p.tokenAddress, "gmgn"] as const),
+        ...axiomProfiles.map((p) => [p.tokenAddress, "axiom"] as const),
+        ...jupProfiles.map((p) => [p.tokenAddress, "jup"] as const),
+        ...jupTrendProfiles.map((p) => [p.tokenAddress, "jupTrend"] as const),
+      ]);
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
@@ -849,6 +862,7 @@ export class Scanner {
           minMcapObserved: null,
           supplyFlowJson: null,
           supplyFlowAt: null,
+          discoveredVia: discoveredVia.get(profile.tokenAddress) ?? null,
         };
         newStats.push(stats);
         statsByToken.set(profile.tokenAddress, stats);

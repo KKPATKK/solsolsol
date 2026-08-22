@@ -167,6 +167,12 @@ export interface TokenStats {
   supplyFlowJson: string | null;
   /** When the cached supply-flow result was produced (epoch ms). */
   supplyFlowAt: number | null;
+  /**
+   * Which discovery feed first registered this coin ("dex" | "pump" |
+   * "gecko" | "geoTrend" | "gmgn" | "axiom" | "jup" | "jupTrend") —
+   * enables per-feed quality attribution. Null for legacy rows.
+   */
+  discoveredVia?: string | null;
 }
 
 /**
@@ -248,6 +254,7 @@ export class Db {
         `CREATE TABLE IF NOT EXISTS token_stats (
           token TEXT PRIMARY KEY,
           first_seen_at INTEGER NOT NULL,
+          discovered_via TEXT,
           first_m5_vol REAL NOT NULL,
           first_seen_age_min REAL NOT NULL,
           launch_ms INTEGER,
@@ -504,6 +511,9 @@ export class Db {
     // coins. Unconditional because addColumnIfMissing is idempotent (fresh
     // databases already carry the column from CREATE TABLE).
     await this.addColumnIfMissing("token_stats", "max_mcap_observed", "REAL");
+    // Feed attribution: which discovery feed first registered each coin
+    // (per-feed quality stats). Unconditional — idempotent.
+    await this.addColumnIfMissing("token_stats", "discovered_via", "TEXT");
     // v4: min_1h_chg_pct — the compound momentum gate's 1-hour leg (chat
     // filter). Unconditional because addColumnIfMissing is idempotent.
     await this.addColumnIfMissing(
@@ -1097,6 +1107,7 @@ export class Db {
     const minMcap = row.min_mcap_observed;
     const flowJson = row.supply_flow;
     const flowAt = row.supply_flow_at;
+    const via = row.discovered_via;
     return {
       token: String(row.token),
       firstSeenAt: Number(row.first_seen_at),
@@ -1127,7 +1138,37 @@ export class Db {
         flowJson === null || flowJson === undefined ? null : String(flowJson),
       supplyFlowAt:
         flowAt === null || flowAt === undefined ? null : Number(flowAt),
+      discoveredVia:
+        via === null || via === undefined ? null : String(via),
     };
+  }
+
+  /**
+   * Per-feed attribution: how many coins each discovery feed registered,
+   * and how many of them were ever pushed (quality signal). One aggregate
+   * query over token_stats LEFT JOIN seen_tokens.
+   */
+  async getFeedAttribution(): Promise<
+    Array<{ feed: string; coins: number; pushed: number }>
+  > {
+    const res = await this.get().execute({
+      sql: `SELECT COALESCE(t.discovered_via, 'legacy') AS feed,
+                   COUNT(*) AS coins,
+                   COUNT(DISTINCT s.token) AS pushed
+              FROM token_stats t
+              LEFT JOIN seen_tokens s ON s.token = t.token
+             GROUP BY feed
+             ORDER BY pushed DESC, coins DESC`,
+      args: [],
+    });
+    return res.rows.map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        feed: String(r.feed),
+        coins: Number(r.coins ?? 0),
+        pushed: Number(r.pushed ?? 0),
+      };
+    });
   }
 
   async getTokenStats(token: string): Promise<TokenStats | null> {
@@ -1831,8 +1872,8 @@ export class Db {
 
   async recordTokenStats(stats: TokenStats): Promise<void> {
     const res = await this.get().execute({
-      sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
-      args: [stats.token, stats.firstSeenAt, stats.firstM5Vol, stats.firstSeenAgeMin, stats.launchMs, stats.birdeye1mVol, stats.rugcheckBundlerPct, stats.rugcheckTop10Pct, stats.birdeyeProTraders, stats.birdeyeSniperPct, stats.minMcapObserved],
+      sql: "INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at, discovered_via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)",
+      args: [stats.token, stats.firstSeenAt, stats.firstM5Vol, stats.firstSeenAgeMin, stats.launchMs, stats.birdeye1mVol, stats.rugcheckBundlerPct, stats.rugcheckTop10Pct, stats.birdeyeProTraders, stats.birdeyeSniperPct, stats.minMcapObserved, stats.discoveredVia ?? null],
     });
     await this.bumpTelemetryCounter(
       "telemetry_token_stats_count",
@@ -1848,7 +1889,7 @@ export class Db {
   async recordTokenStatsMany(statsList: TokenStats[]): Promise<void> {
     if (statsList.length === 0) return;
     const placeholders = statsList
-      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)")
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)")
       .join(",");
     const args: Array<string | number | null> = [];
     for (const s of statsList) {
@@ -1864,10 +1905,11 @@ export class Db {
         s.birdeyeProTraders,
         s.birdeyeSniperPct,
         s.minMcapObserved,
+        s.discoveredVia ?? null,
       );
     }
     const res = await this.get().execute({
-      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at) VALUES ${placeholders}`,
+      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at, discovered_via) VALUES ${placeholders}`,
       args,
     });
     await this.bumpTelemetryCounter(

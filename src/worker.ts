@@ -1190,6 +1190,17 @@ export default {
         );
       }
     }
+    if (url.pathname === "/debug/feed-stats") {
+      try {
+        const rows = await db?.getFeedAttribution();
+        return Response.json({ ok: true, byFeed: rows ?? [] });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        );
+      }
+    }
     if (url.pathname === "/debug/pushes") {
       const rows = (await db?.listSeenTokens()) ?? [];
       const byDay = new Map<string, number>();
