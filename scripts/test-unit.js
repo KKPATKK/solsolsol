@@ -809,35 +809,48 @@ async function main() {
     assert.ok(i3.alerts.some((a) => a.kind === "rising"));
   });
 
-  await test("evaluateWatch: dead is silent afterwards, then resurrects on recovery", () => {
+  await test("evaluateWatch: dead is silent afterwards, then resurrects at trough x1.5", () => {
     const row = (over = {}) => ({
       token: "T", chatId: "c", symbol: "X", pushedAt: 0,
       mcapAtPush: 50_000, peakMcap: 90_000, lastLiquidity: 20_000,
-      lastVol5m: 3_000,
+      lastVol5m: 3_000, deadTroughMcap: 30_000,
       holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
       lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 1, lastState: "dead",
       ...over,
     });
     const cfg = { cooldownMs: 0 };
 
-    // Still deep underwater after the 💀 → completely silent.
-    const s = evaluateWatch(row(), 1000, { mcap: 40_000, liquidity: 20_000, chg5m: 2, vol5m: 3_000, buysH1: 5, sellsH1: 9 }, cfg);
+    // Below trough × 1.5 (45K) after the 💀 → completely silent; a lower
+    // low is tracked for the resurrection anchor.
+    const s = evaluateWatch(row(), 1000, { mcap: 28_000, liquidity: 20_000, chg5m: 2, vol5m: 3_000, buysH1: 5, sellsH1: 9 }, cfg);
     assert.equal(s.alerts.length, 0);
     assert.equal(s.lastState, "dead");
     assert.equal(s.stopTracking, false);
+    assert.equal(s.deadTroughMcap, 28_000);
 
-    // Recovers to the push baseline → resurrection, fresh baseline.
-    const r = evaluateWatch(row(), 1000, { mcap: 52_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 }, cfg);
+    // Recovers above trough × 1.5 (30K × 1.5 = 45K) → resurrection.
+    const r = evaluateWatch(row(), 1000, { mcap: 46_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 }, cfg);
     assert.equal(r.alerts.length, 1);
     assert.match(r.alerts[0].text, /死而復生 X/);
-    assert.equal(r.resetBaselineMcap, 52_000);
-    assert.equal(r.peakMcap, 52_000);
+    assert.match(r.alerts[0].text, /×1\.5/);
+    assert.equal(r.resetBaselineMcap, 46_000);
+    assert.equal(r.peakMcap, 46_000);
     assert.equal(r.lastState, null);
+    assert.equal(r.deadTroughMcap, null);
 
-    // Fresh row that never died still fires 💀 normally (once).
-    const f = evaluateWatch(row({ lastState: null, followupsSent: 0 }), 1000, { mcap: 39_000, liquidity: 20_000, chg5m: -12, vol5m: 2_000, buysH1: 10, sellsH1: 90 }, cfg);
+    // Legacy dead row without a recorded trough falls back to the push
+    // baseline × 1.5 (75K) — 52K does NOT resurrect.
+    const legacy = evaluateWatch(row({ deadTroughMcap: null }), 1000, { mcap: 52_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 }, cfg);
+    assert.equal(legacy.alerts.length, 0);
+    assert.equal(legacy.lastState, "dead");
+
+    // Fresh row that never died still fires 💀 normally (once), and the
+    // alert names the trough × 1.5 recovery target.
+    const f = evaluateWatch(row({ lastState: null, followupsSent: 0, deadTroughMcap: null }), 1000, { mcap: 39_000, liquidity: 20_000, chg5m: -12, vol5m: 2_000, buysH1: 10, sellsH1: 90 }, cfg);
     assert.equal(f.alerts[0].kind, "dead");
+    assert.match(f.alerts[0].text, /39\.00K/);
     assert.equal(f.stopTracking, false);
+    assert.equal(f.deadTroughMcap, 39_000);
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {

@@ -17,9 +17,9 @@ import { fmtUsd } from "./format";
  *   🔥 ignition       — 5m volume jumps from dormant (< $10K) to ≥ $15K
  *                       before any rising stage (early new-leg warning)
  *   ⚠️ weak           — ≥35% off the post-push peak (only if it had run up)
- *   💀 dead           — ≥55% off peak → fires once, then SILENT watch; if
- *                       mcap recovers to the push baseline the row is
- *                       resurrected with a fresh baseline (V-reversals)
+ *   💀 dead           — ≥55% off peak → fires once, then SILENT watch;
+ *                       recovery to trough × 1.5 resurrects the row with
+ *                       a fresh baseline (V-reversals)
  *   💧 liquidity      — collapsed >55% since the last check, OR absolute
  *                       floor breach (< $10K) → drained LP, mcap unreliable,
  *                       tracking stops
@@ -54,6 +54,15 @@ export const IGNITION_VOL_USD = 15_000;
 export const IGNITION_DORMANT_USD = 10_000;
 /** Holder-growth stages (× push-time holders → state suffix). */
 const HOLDER_STAGES = [10, 25, 50] as const;
+/**
+ * Resurrection trigger: a 💀-marked coin re-alerts when it recovers to
+ * this multiple of its DEAD-TIME TROUGH (not the push baseline). Requiring
+ * the full push baseline means a deep flush (-70%) can practically never
+ * resurrect even on a real reversal; trough × 1.5 catches the V while it
+ * is happening. Legacy rows without a recorded trough fall back to the
+ * push baseline × the same multiple.
+ */
+const RESURRECTION_MULT = 1.5;
 
 export interface PushWatchRow {
   token: string;
@@ -64,6 +73,8 @@ export interface PushWatchRow {
   peakMcap: number;
   lastLiquidity: number | null;
   lastVol5m: number | null;
+  /** Lowest mcap observed while in the dead state (resurrection anchor). */
+  deadTroughMcap: number | null;
   holdersAtPush: number | null;
   holdersLast: number | null;
   holdersCheckedAt: number | null;
@@ -91,6 +102,8 @@ export interface WatchEval {
    * to this value so the next cycle measures from the recovery point.
    */
   resetBaselineMcap?: number;
+  /** New dead-state trough to persist (lower low while silent-watching). */
+  deadTroughMcap?: number | null;
 }
 
 function pct(n: number): string {
@@ -152,37 +165,29 @@ export function evaluateWatch(
     };
   }
 
-  // Resurrection first: a 💀-marked coin recovering to its push baseline
-  // restarts with a fresh cycle regardless of the now-stale peak (otherwise
-  // weak/dead math against the old peak would keep suppressing it).
-  if (row.lastState === "dead" && live.mcap >= row.mcapAtPush) {
-    fire(
-      "rising",
-      `🟢 死而復生 ${symbol} | 從 💀 收復推送市值 ${fmtUsd(row.mcapAtPush)} → 現 ${fmtUsd(live.mcap)}，重置基準繼續追蹤`,
-    );
-    return {
-      alerts,
-      peakMcap: live.mcap,
-      followupsSent,
-      lastState: null,
-      lastAlertAt,
-      stopTracking: false,
-      resetBaselineMcap: live.mcap,
-    };
-  }
-
-  // Dead: ≥55% off the peak. Fires ONCE (the row then stays in silent
-  // watch) — deep-flush V-reversals are common, so if the mcap later
-  // recovers to the push baseline the resurrection above re-arms it.
-  // Peak is always ≥ push mcap, so this also catches never-ran-up dumps.
-  if (drawdownFromPeak <= -DEAD_DRAWDOWN_PCT) {
-    if (row.lastState !== "dead") {
+  // Resurrection / silent-watch: once a coin is 💀 it is FULLY silent
+  // until it recovers to trough × 1.5 (then a fresh cycle starts). Without
+  // this absorption the stale-peak math would keep firing weak/ignition on
+  // every bounce below the target.
+  if (row.lastState === "dead") {
+    const target = (row.deadTroughMcap ?? row.mcapAtPush) * RESURRECTION_MULT;
+    if (live.mcap >= target) {
       fire(
-        "dead",
-        `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(row.mcapAtPush)} 會再通知）`,
+        "rising",
+        `🟢 死而復生 ${symbol} | 從低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），重置基準繼續追蹤`,
       );
+      return {
+        alerts,
+        peakMcap: live.mcap,
+        followupsSent,
+        lastState: null,
+        lastAlertAt,
+        stopTracking: false,
+        resetBaselineMcap: live.mcap,
+        deadTroughMcap: null,
+      };
     }
-    // Already announced: silent monitoring until recovery or window end.
+    const trough = Math.min(row.deadTroughMcap ?? live.mcap, live.mcap);
     return {
       alerts,
       peakMcap,
@@ -190,6 +195,27 @@ export function evaluateWatch(
       lastState: "dead",
       lastAlertAt,
       stopTracking: false,
+      deadTroughMcap: trough,
+    };
+  }
+
+  // Dead: ≥55% off the peak. Fires ONCE (the row then enters the silent
+  // watch above) — deep-flush V-reversals are common, so recovery to
+  // trough × 1.5 resurrects it. Peak is always ≥ push mcap, so this also
+  // catches never-ran-up straight dumps.
+  if (drawdownFromPeak <= -DEAD_DRAWDOWN_PCT) {
+    fire(
+      "dead",
+      `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(live.mcap * RESURRECTION_MULT)}＝低點 ×1.5 會再通知）`,
+    );
+    return {
+      alerts,
+      peakMcap,
+      followupsSent,
+      lastState: "dead",
+      lastAlertAt,
+      stopTracking: false,
+      deadTroughMcap: live.mcap,
     };
   }
 
@@ -439,6 +465,7 @@ export class PushWatcher {
         lastState: evalResult.lastState,
         lastAlertAt: evalResult.lastAlertAt,
         mcapAtPush: evalResult.resetBaselineMcap,
+        deadTroughMcap: evalResult.deadTroughMcap ?? null,
       });
     }
 

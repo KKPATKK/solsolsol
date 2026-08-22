@@ -336,7 +336,8 @@ export class Db {
           last_alert_at INTEGER NOT NULL DEFAULT 0,
           followups_sent INTEGER NOT NULL DEFAULT 0,
           last_state TEXT,
-          last_vol_5m REAL
+          last_vol_5m REAL,
+          dead_trough_mcap REAL
         );`,
         `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
         // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
@@ -524,6 +525,9 @@ export class Db {
     // push_watch.last_vol_5m — the volume-ignition early-warning signal
     // compares the fresh 5m volume against the previous check's. Idempotent.
     await this.addColumnIfMissing("push_watch", "last_vol_5m", "REAL");
+    // push_watch.dead_trough_mcap — the dead-state low anchoring the
+    // trough × 1.5 resurrection trigger. Idempotent.
+    await this.addColumnIfMissing("push_watch", "dead_trough_mcap", "REAL");
     // Telemetry counters: /health used to run COUNT(*) over token_stats
     // (~400K rows) and seen_tokens (~50K rows) on every ping — at the 1-min
     // uptime-monitor cadence that alone is ~600M rows/day (alerted
@@ -1575,6 +1579,7 @@ export class Db {
     peakMcap: number;
     lastLiquidity: number | null;
     lastVol5m: number | null;
+    deadTroughMcap: number | null;
     holdersAtPush: number | null;
     holdersLast: number | null;
     holdersCheckedAt: number | null;
@@ -1604,6 +1609,10 @@ export class Db {
           r.last_vol_5m === null || r.last_vol_5m === undefined
             ? null
             : Number(r.last_vol_5m),
+        deadTroughMcap:
+          r.dead_trough_mcap === null || r.dead_trough_mcap === undefined
+            ? null
+            : Number(r.dead_trough_mcap),
         holdersAtPush:
           r.holders_at_push === null || r.holders_at_push === undefined
             ? null
@@ -1631,6 +1640,8 @@ export class Db {
       peakMcap: number;
       lastLiquidity: number | null;
       lastVol5m?: number | null;
+      /** Dead-state low (lower low while silent-watching; null = keep). */
+      deadTroughMcap?: number | null;
       followupsSent?: number;
       lastState?: string | null;
       lastAlertAt?: number;
@@ -1643,6 +1654,7 @@ export class Db {
               peak_mcap = ?, last_liquidity = ?, last_checked = ?,
               followups_sent = ?, last_state = ?, last_alert_at = ?,
               last_vol_5m = COALESCE(?, last_vol_5m),
+              dead_trough_mcap = COALESCE(?, dead_trough_mcap),
               mcap_at_push = COALESCE(?, mcap_at_push)
             WHERE token = ?`,
       args: [
@@ -1653,6 +1665,7 @@ export class Db {
         v.lastState ?? null,
         v.lastAlertAt ?? 0,
         v.lastVol5m ?? null,
+        v.deadTroughMcap ?? null,
         v.mcapAtPush ?? null,
         token,
       ],
