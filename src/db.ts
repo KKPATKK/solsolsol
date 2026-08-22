@@ -346,7 +346,9 @@ export class Db {
           followups_sent INTEGER NOT NULL DEFAULT 0,
           last_state TEXT,
           last_vol_5m REAL,
-          dead_trough_mcap REAL
+          dead_trough_mcap REAL,
+          sell_dom_streak INTEGER NOT NULL DEFAULT 0,
+          last_mcap REAL
         );`,
         `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
         // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
@@ -578,6 +580,14 @@ export class Db {
     // push_watch.dead_trough_mcap — the dead-state low anchoring the
     // trough × 1.5 resurrection trigger. Idempotent.
     await this.addColumnIfMissing("push_watch", "dead_trough_mcap", "REAL");
+    // push_watch.sell_dom_streak / last_mcap — 🩸 distribution streak + the
+    // latest mcap for the 🏁 case-closed recap. Idempotent.
+    await this.addColumnIfMissing(
+      "push_watch",
+      "sell_dom_streak",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+    await this.addColumnIfMissing("push_watch", "last_mcap", "REAL");
     // Telemetry counters: /health used to run COUNT(*) over token_stats
     // (~400K rows) and seen_tokens (~50K rows) on every ping — at the 1-min
     // uptime-monitor cadence that alone is ~600M rows/day (alerted
@@ -1636,6 +1646,10 @@ export class Db {
     holdersAtPush: number | null;
     holdersLast: number | null;
     holdersCheckedAt: number | null;
+    /** Consecutive 🧨 sell-dominant checks (streak; resets on recovery). */
+    sellDomStreak: number;
+    /** Latest tracker-observed mcap (🏁 recap final value). */
+    lastMcap: number | null;
     lastChecked: number;
     lastAlertAt: number;
     followupsSent: number;
@@ -1678,6 +1692,11 @@ export class Db {
           r.holders_checked_at === null || r.holders_checked_at === undefined
             ? null
             : Number(r.holders_checked_at),
+        sellDomStreak: Number(r.sell_dom_streak ?? 0),
+        lastMcap:
+          r.last_mcap === null || r.last_mcap === undefined
+            ? null
+            : Number(r.last_mcap),
         lastChecked: Number(r.last_checked ?? 0),
         lastAlertAt: Number(r.last_alert_at ?? 0),
         followupsSent: Number(r.followups_sent ?? 0),
@@ -1700,6 +1719,10 @@ export class Db {
       lastAlertAt?: number;
       /** Resurrection: reset the push-time mcap baseline to this value. */
       mcapAtPush?: number;
+      /** New 🧨 sell-pressure streak count (persisted as-is). */
+      sellDomStreak?: number;
+      /** Latest observed mcap (🏁 recap final value). */
+      lastMcap?: number;
     },
   ): Promise<void> {
     await this.get().execute({
@@ -1708,7 +1731,9 @@ export class Db {
               followups_sent = ?, last_state = ?, last_alert_at = ?,
               last_vol_5m = COALESCE(?, last_vol_5m),
               dead_trough_mcap = COALESCE(?, dead_trough_mcap),
-              mcap_at_push = COALESCE(?, mcap_at_push)
+              mcap_at_push = COALESCE(?, mcap_at_push),
+              sell_dom_streak = ?,
+              last_mcap = ?
             WHERE token = ?`,
       args: [
         v.peakMcap,
@@ -1720,6 +1745,8 @@ export class Db {
         v.lastVol5m ?? null,
         v.deadTroughMcap ?? null,
         v.mcapAtPush ?? null,
+        v.sellDomStreak ?? 0,
+        v.lastMcap ?? null,
         token,
       ],
     });

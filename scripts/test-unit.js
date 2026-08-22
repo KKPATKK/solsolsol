@@ -18,7 +18,7 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
-const { evaluateWatch } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
 const { mcapRatioBlockReason } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
@@ -1939,6 +1939,90 @@ async function main() {
     assert.equal(parseFilterArgs(["40000", "300000", "180", "1680", "6000", "30", "40", "10000", "-5"]).ok, false);
   });
 
+  // ---------- 🩸 sell-pressure dominance + 🏁 case-closed recap ----------
+
+  await test("evaluateWatch: 🩸 fires on the 3rd consecutive sell-dominant check, once per episode", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "PUMP", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 75_000, lastLiquidity: 30_000, // ran up +50%
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const live = () => ({ mcap: 60_000, liquidity: 30_000, chg5m: -2, vol5m: 500, buysH1: 100, sellsH1: 200 });
+    const cfg = { cooldownMs: 0 };
+
+    const r1 = evaluateWatch(row(), 3600_000, live(), cfg);
+    assert.equal(r1.alerts.length, 0);
+    assert.equal(r1.sellDomStreak, 1);
+
+    const r2 = evaluateWatch(row({ sellDomStreak: 1 }), 3600_000 + 60_000, live(), cfg);
+    assert.equal(r2.alerts.length, 0);
+    assert.equal(r2.sellDomStreak, 2);
+
+    const r3 = evaluateWatch(row({ sellDomStreak: 2 }), 3600_000 + 120_000, live(), cfg);
+    assert.equal(r3.alerts.length, 1);
+    assert.equal(r3.alerts[0].kind, "sell-pressure");
+    assert.match(r3.alerts[0].text, /🩸 賣壓主導 PUMP/);
+    assert.equal(r3.sellDomStreak, 3);
+
+    // Streak 4+ stays silent — one alert per episode.
+    const r4 = evaluateWatch(row({ sellDomStreak: 3 }), 3600_000 + 180_000, live(), cfg);
+    assert.equal(r4.alerts.length, 0);
+    assert.equal(r4.sellDomStreak, 4);
+  });
+
+  await test("evaluateWatch: 🩸 resets on buy recovery and never fires without runup", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: null, pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 50_000, lastLiquidity: 30_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const selling = { mcap: 45_000, liquidity: 30_000, chg5m: -3, vol5m: 300, buysH1: 80, sellsH1: 160 };
+    const recovering = { ...selling, buysH1: 240, sellsH1: 160 };
+    const cfg = { cooldownMs: 0 };
+
+    // Buys recover -> streak resets to 0.
+    const r1 = evaluateWatch(row({ sellDomStreak: 2 }), 3600_000, recovering, cfg);
+    assert.equal(r1.sellDomStreak, 0);
+
+    // Flat loser (no runup): streak still counts past the threshold but
+    // never alerts — its tape is naturally sell-heavy and weak/dead cover it.
+    let streak = 0;
+    for (let i = 0; i < 5; i++) {
+      const r = evaluateWatch(row({ sellDomStreak: streak }), 3600_000 + i * 60_000, selling, cfg);
+      streak = r.sellDomStreak;
+      assert.equal(r.alerts.filter((a) => a.kind === "sell-pressure").length, 0);
+    }
+    assert.equal(streak, 5);
+  });
+
+  await test("recapVerdict: rug wins, then dead floor, then peak grades", () => {
+    assert.match(recapVerdict(50_000, 90_000, 10_000, "rug"), /rug/);
+    assert.match(recapVerdict(50_000, 90_000, 20_000, null), /走死/); // final 40% <= 45%
+    assert.match(recapVerdict(50_000, 250_000, 60_000, null), /金狗/); // peak x5
+    assert.match(recapVerdict(50_000, 120_000, 55_000, "weak"), /強勢/); // peak x2.4
+    assert.match(recapVerdict(50_000, 80_000, 52_000, "weak"), /穩漲/); // peak x1.6
+    assert.match(recapVerdict(50_000, 55_000, 47_000, null), /橫盤/); // final 94%
+    assert.match(recapVerdict(50_000, 55_000, 35_000, "weak"), /回落/); // final 70%
+  });
+
+  await test("recapMessage: one card with push->peak->final arc and verdict", () => {
+    const msg = recapMessage({
+      token: "TOKENXYZ", chatId: "c", symbol: "GOAT", pushedAt: Date.now() - 25 * 3600_000,
+      mcapAtPush: 100_000, peakMcap: 220_000, lastLiquidity: 20_000,
+      lastVol5m: null, deadTroughMcap: null, holdersAtPush: null,
+      holdersLast: null, holdersCheckedAt: null, lastChecked: Date.now(),
+      lastAlertAt: 0, followupsSent: 3, lastState: "weak",
+      sellDomStreak: 0, lastMcap: 130_000,
+    });
+    assert.match(msg, /🏁 結案報告 GOAT/);
+    assert.match(msg, /峰值 \$220\.00K（最高 \+120%）/);
+    assert.match(msg, /終值 \$130\.00K/);
+    assert.match(msg, /跟進警報 3 次/);
+  });
   // ---------- mcap/liquidity ratio gate (Nudaeng lesson) ----------
 
   await test("mcapRatioBlockReason: real push-history calibration", () => {

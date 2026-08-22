@@ -55,6 +55,17 @@ export const IGNITION_DORMANT_USD = 10_000;
 /** Holder-growth stages (× push-time holders → state suffix). */
 const HOLDER_STAGES = [10, 25, 50] as const;
 /**
+ * Sell-pressure dominance (🩸 distribution early-warning): an h1 window
+ * where sells outnumber buys by more than 1/SELL_DOM_RATIO counts as a
+ * sell-dominant check. SELL_DOM_STREAK_NEEDED consecutive checks = a
+ * sustained distribution pattern — fires well before the -35% weak alert.
+ * Only coins that actually ran up qualify: a flat loser's tape is naturally
+ * sell-heavy, and its downside is already covered by weak/dead.
+ */
+const SELL_DOM_RATIO = 0.7;
+const SELL_DOM_STREAK_NEEDED = 3;
+const SELL_DOM_MIN_RUNUP_PCT = 15;
+/**
  * Resurrection trigger: a 💀-marked coin re-alerts when it recovers to
  * this multiple of its DEAD-TIME TROUGH (not the push baseline). Requiring
  * the full push baseline means a deep flush (-70%) can practically never
@@ -82,10 +93,21 @@ export interface PushWatchRow {
   lastAlertAt: number;
   followupsSent: number;
   lastState: string | null;
+  /** Consecutive sell-dominant checks (🩸 streak; resets on recovery). */
+  sellDomStreak: number;
+  /** Most recent mcap seen by the tracker (recap final value). */
+  lastMcap: number | null;
 }
 
 export interface WatchAlert {
-  kind: "rising" | "weak" | "dead" | "liquidity" | "holders" | "ignition";
+  kind:
+    | "rising"
+    | "weak"
+    | "dead"
+    | "liquidity"
+    | "holders"
+    | "ignition"
+    | "sell-pressure";
   text: string;
 }
 
@@ -104,6 +126,8 @@ export interface WatchEval {
   resetBaselineMcap?: number;
   /** New dead-state trough to persist (lower low while silent-watching). */
   deadTroughMcap?: number | null;
+  /** New 🩸 streak count to persist. */
+  sellDomStreak: number;
 }
 
 function pct(n: number): string {
@@ -162,6 +186,7 @@ export function evaluateWatch(
       lastState: "rug",
       lastAlertAt,
       stopTracking: true,
+      sellDomStreak: row.sellDomStreak ?? 0,
     };
   }
 
@@ -185,6 +210,7 @@ export function evaluateWatch(
         stopTracking: false,
         resetBaselineMcap: live.mcap,
         deadTroughMcap: null,
+        sellDomStreak: 0,
       };
     }
     const trough = Math.min(row.deadTroughMcap ?? live.mcap, live.mcap);
@@ -196,6 +222,7 @@ export function evaluateWatch(
       lastAlertAt,
       stopTracking: false,
       deadTroughMcap: trough,
+      sellDomStreak: row.sellDomStreak ?? 0,
     };
   }
 
@@ -216,7 +243,31 @@ export function evaluateWatch(
       lastAlertAt,
       stopTracking: false,
       deadTroughMcap: live.mcap,
+      sellDomStreak: row.sellDomStreak ?? 0,
     };
+  }
+
+  // Sell-pressure dominance (🩸 distribution early-warning): consecutive 1h
+  // windows with sells outnumbering buys. Fires on the exact Nth streak
+  // check — the streak must reset (buys recover) before it can re-arm, so
+  // one episode = one alert. Runs OUTSIDE the cooldown gate: the streak
+  // itself paces the alerting, and distribution is worth seeing promptly.
+  const runupFromPushPct = (peakMcap / Math.max(row.mcapAtPush, 1) - 1) * 100;
+  let sellDomStreak = row.sellDomStreak ?? 0;
+  if (live.sellsH1 > 0 && live.buysH1 / live.sellsH1 < SELL_DOM_RATIO) {
+    sellDomStreak += 1;
+  } else {
+    sellDomStreak = 0;
+  }
+  if (
+    sellDomStreak === SELL_DOM_STREAK_NEEDED &&
+    runupFromPushPct >= SELL_DOM_MIN_RUNUP_PCT
+  ) {
+    fire(
+      "sell-pressure",
+      `🩸 賣壓主導 ${symbol} | 1h 買賣比 ${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1，` +
+        `連續 ${sellDomStreak} 次檢查賣壓佔優（賣 ${live.sellsH1} vs 買 ${live.buysH1}）— 分佈出貨形態`,
+    );
   }
 
   if (cooledDown) {
@@ -310,7 +361,51 @@ export function evaluateWatch(
     lastState,
     lastAlertAt,
     stopTracking: false,
+    sellDomStreak,
   };
+}
+
+/**
+ * Final verdict for a coin leaving the tracking window — one line for the
+ * 🏁 recap card. Aligned with the rule engine's semantics: rug beats
+ * everything (LP data is fake), a -55%+ finish is 走死 regardless of peak,
+ * then the peak multiple grades the ride.
+ */
+export function recapVerdict(
+  mcapAtPush: number,
+  peakMcap: number,
+  finalMcap: number | null,
+  lastState: string | null,
+): string {
+  if (lastState === "rug") return "💧 rug（LP 枯竭，數據已失真）";
+  const finalRatio =
+    mcapAtPush > 0 && finalMcap !== null ? finalMcap / mcapAtPush : 1;
+  if (finalRatio <= 0.45) return "💀 走死收場（較推送 -55%+）";
+  const peakX = mcapAtPush > 0 ? peakMcap / mcapAtPush : 0;
+  if (peakX >= 4) return "🏆 金狗級（峰值 +300%+）";
+  if (peakX >= 2) return "🚀 強勢（峰值 +100%+）";
+  if (peakX >= 1.5) return "📈 穩漲（峰值 +50%+）";
+  if (finalRatio >= 0.9) return "➡️ 橫盤收場（守住推送價）";
+  return "📉 回落收場";
+}
+
+/** The one-per-coin 🏁 card sent when a coin exits the tracking window. */
+export function recapMessage(row: PushWatchRow): string {
+  const symbol = row.symbol ?? row.token.slice(0, 6);
+  const peakPct = row.mcapAtPush > 0 ? (row.peakMcap / row.mcapAtPush - 1) * 100 : 0;
+  const verdict = recapVerdict(
+    row.mcapAtPush,
+    row.peakMcap,
+    row.lastMcap ?? null,
+    row.lastState,
+  );
+  const hours = Math.max(0, Math.round((Date.now() - row.pushedAt) / 3_600_000));
+  return (
+    `🏁 結案報告 ${symbol} | 追蹤 ~${hours}h\n` +
+    `推送 ${fmtUsd(row.mcapAtPush)} → 峰值 ${fmtUsd(row.peakMcap)}（最高 +${peakPct.toFixed(0)}%）` +
+    (row.lastMcap !== null ? ` → 終值 ${fmtUsd(row.lastMcap)}` : "") +
+    `\n判定：${verdict} | 跟進警報 ${row.followupsSent} 次`
+  );
 }
 
 /**
@@ -361,7 +456,23 @@ export class PushWatcher {
   }> {
     const cfg = this.config.pushWatch;
     const now = Date.now();
-    await this.db.prunePushWatch(now - cfg.windowHours * 3_600_000);
+    // Case-closed recaps: every coin leaving the window gets ONE summary
+    // card before the bulk prune deletes it. Best-effort send — a failed
+    // delivery must never keep a dead row alive forever.
+    const windowCutoff = now - cfg.windowHours * 3_600_000;
+    try {
+      const allRows = await this.db.listPushWatch(cfg.maxTracked);
+      for (const r of allRows.filter((x) => x.pushedAt < windowCutoff)) {
+        try {
+          await this.bot.api.sendMessage(r.chatId, recapMessage(r));
+        } catch {
+          /* best-effort */
+        }
+      }
+    } catch {
+      /* listing failed — the prune below still runs */
+    }
+    await this.db.prunePushWatch(windowCutoff);
     // Heal missed enrollments: pushes recorded in seen_tokens but absent
     // from push_watch (an old pre-tracker isolate handled that scan, or the
     // process died between the push and the upsert). Seeded with the CURRENT
@@ -466,6 +577,8 @@ export class PushWatcher {
         lastAlertAt: evalResult.lastAlertAt,
         mcapAtPush: evalResult.resetBaselineMcap,
         deadTroughMcap: evalResult.deadTroughMcap ?? null,
+        sellDomStreak: evalResult.sellDomStreak,
+        lastMcap: pair.marketCap,
       });
     }
 
