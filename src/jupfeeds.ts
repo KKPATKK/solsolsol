@@ -189,6 +189,43 @@ export class JupTokensClient {
   }
 
 
+  /**
+   * Organic-quality snapshot for a single mint (push-card enrichment):
+   * Jupiter's organicScore separates real retail participation from
+   * wash/coordinated volume (calibrated 2026-08-22: CONK 79 / 40M 75 /
+   * BLC 61 vs DOTE 40 / BAOJIN 0 / Nudaeng 0). Display-only today.
+   */
+  async fetchOrganicScore(
+    mint: string,
+  ): Promise<{
+    score: number | null;
+    label: string | null;
+    tradersH1: number | null;
+  } | null> {
+    const data = await this.get(`/search?query=${mint}`);
+    if (!Array.isArray(data)) return null;
+    const entry = data.find(
+      (x) => (x as Record<string, unknown>).id === mint,
+    ) as Record<string, unknown> | undefined;
+    if (!entry) return null;
+    const s1 = (entry.stats1h ?? {}) as Record<string, unknown>;
+    // organicScore of 0 is a REAL value (BAOJIN/Nudaeng) — distinguish
+    // "field absent" (undefined) from a genuine zero via typeof.
+    const score =
+      typeof entry.organicScore === "number" && Number.isFinite(entry.organicScore)
+        ? entry.organicScore
+        : null;
+    const tradersRaw = s1.numTraders;
+    const tradersH1 =
+      typeof tradersRaw === "number" && Number.isFinite(tradersRaw) ? tradersRaw : null;
+    if (score === null && tradersH1 === null) return null;
+    return {
+      score,
+      label: typeof entry.organicScoreLabel === "string" ? entry.organicScoreLabel : null,
+      tradersH1,
+    };
+  }
+
   /** Newest launchpad launches (pump.fun & co.), newest first. */
   async fetchRecentTokens(limit: number): Promise<TokenProfile[]> {
     const wanted = Math.max(1, Math.min(Math.floor(limit), 100));

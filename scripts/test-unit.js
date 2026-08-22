@@ -659,6 +659,55 @@ async function main() {
     assert.equal(calls, before); // zero network calls while backed off
   });
 
+  await test("fetchOrganicScore: parses score/label/traders; genuine 0 ≠ absent", async () => {
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const body = JSON.stringify([
+      {
+        id: mint,
+        organicScore: 0,
+        organicScoreLabel: "low",
+        stats1h: { numTraders: 1 },
+      },
+      { id: "Other11111111111111111111111111111111111111", organicScore: 99 },
+    ]);
+    const client = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async () => new Response(body, { status: 200 }),
+    );
+    // Finds the right entry by id — and a REAL 0 score is reported, not null.
+    assert.deepEqual(await client.fetchOrganicScore(mint), {
+      score: 0,
+      label: "low",
+      tradersH1: 1,
+    });
+
+    // Absent fields (no organicScore / no stats1h) → nulls, and null result
+    // when BOTH are missing (nothing to render).
+    const empty = JSON.stringify([{ id: mint }]);
+    const c2 = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async () => new Response(empty, { status: 200 }),
+    );
+    assert.deepEqual(await c2.fetchOrganicScore(mint), null);
+
+    // Winner-shaped payload (CONK calibration values).
+    const winner = JSON.stringify([
+      {
+        id: mint,
+        organicScore: 79.55925990552242,
+        organicScoreLabel: "medium",
+        stats1h: { numTraders: 224 },
+      },
+    ]);
+    const c3 = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async () => new Response(winner, { status: 200 }),
+    );
+    const r = await c3.fetchOrganicScore(mint);
+    assert.equal(r.score.toFixed(1), "79.6");
+    assert.equal(r.tradersH1, 224);
+  });
+
   await test("passesChgGate: compound 5m OR 1h momentum gate", () => {
     // Hot 5m tape qualifies on its own.
     assert.equal(passesChgGate(25, 10, 20, 40), true);

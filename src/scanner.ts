@@ -1080,6 +1080,13 @@ export class Scanner {
         // Arkham smart-money attribution (card-only enrichment).
         const arkham = await this.resolveArkhamInfo(coin);
         if (arkham) diag.arkham++;
+        // Jupiter organic score — card-only enrichment (display-first; the
+        // calibrated separation on 2026-08-22 winners vs losers was clean,
+        // but n=6 is too small to gate on). Best-effort: failures degrade
+        // to an unrendered line.
+        const organic = this.jupiter
+          ? await this.jupiter.fetchOrganicScore(coin.stats.token)
+          : null;
         // Wallet analysis — creator profile (age + serial-launcher create
         // count), top-holder wallet ages and cross-coin holder clustering.
         // Runs only for coins that pass every block gate (its pushed_holders
@@ -1117,6 +1124,7 @@ export class Scanner {
           arkham,
           crime,
           wallet,
+          organic,
         );
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
           await this.bot.api.sendMessage(c.chatId, message, {

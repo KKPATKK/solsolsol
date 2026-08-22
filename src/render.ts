@@ -24,6 +24,12 @@ export function renderMessage(
   arkham: ArkhamTokenHolders | null,
   crime: CrimeCheckResult,
   wallet: WalletAnalysisResult | null,
+  /** Jupiter organic score snapshot (null = unavailable). */
+  organic: {
+    score: number | null;
+    label: string | null;
+    tradersH1: number | null;
+  } | null,
 ): string {
   const { pair, profile } = coin;
   const name = pair.baseToken.name || profile.name || "Unknown";
@@ -112,6 +118,18 @@ export function renderMessage(
           .join("、")} ⚠️`
       : null;
 
+  const organicLine =
+    organic === null
+      ? null
+      : `🌱 有機度: ${
+          organic.score === null
+            ? "—"
+            : `${organic.score.toFixed(1)}${organic.label ? `（${organic.label}）` : ""}`
+        }${
+          organic.tradersH1 === null
+            ? ""
+            : ` | 1h 交易者 ${organic.tradersH1.toLocaleString("en-US")}`
+        }`;
   const lines = [
     `🪙 ${name} (${symbol})`,
     `💵 价格: ${fmtUsd(price)}`,
@@ -123,6 +141,7 @@ export function renderMessage(
     flowLine,
     sniperLine,
     holdersLine,
+    ...(organicLine ? [organicLine] : []),
     creatorLine,
     gmgnLine,
     arkhamLine,
