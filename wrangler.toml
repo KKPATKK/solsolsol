@@ -84,6 +84,15 @@ PUSH_WATCH_WINDOW_HOURS = "24"
 PUSH_WATCH_COOLDOWN_MIN = "30"
 PUSH_WATCH_HOLDERS_REFRESH_MIN = "30"
 PUSH_WATCH_MAX_HOLDER_CHECKS = "4"
+# Market-cap/liquidity ratio sanity gate: rejects candidates whose market cap
+# exceeds their pooled liquidity by more than MCAP_LIQ_RATIO_MAX times. A
+# price running on a sliver of depth is trivially wickable and nearly
+# un-exitable (Nudaeng, pushed 2026-08-22 at $297K mcap over $16K LP = 18x).
+# Calibrated on push history: healthy pushes measured 2.3-6.4x (BLC/MAPLE/
+# DOTE/CONK); the failures measured 18x (Nudaeng) and 27.9x (BAOJIN, which
+# then rugged to $2K LP). Default 10 splits the clusters with headroom on
+# both sides. 0 = disabled.
+MCAP_LIQ_RATIO_MAX = "10"
 # GeckoTerminal new-pools discovery (free, no key): newest Solana pools
 # across every DEX incl. pump.fun graduates. Pages × 20 pools per scan
 # (page size fixed at 20; each page ≈ 1 min of launches). Measured 2026-08-14:

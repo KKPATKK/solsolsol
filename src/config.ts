@@ -386,6 +386,11 @@ export interface AppConfig {
   heliusRequestIntervalMs: number;
   /** On-chain supply-flow (rug/distribution) detector tuning. */
   supplyFlow: SupplyFlowConfig;
+  /** Max market-cap/liquidity ratio for push candidates. A valuation far
+   * above pool depth (Nudaeng: $297K mcap on $16K LP = 18x) means the price
+   * runs on a sliver of liquidity — trivially wickable, nearly un-exitable.
+   * 0 = disabled. See MCAP_LIQ_RATIO_MAX in wrangler.toml. */
+  mcapLiqRatioMax: number;
   /** Crime-wallet blocklist (community list — see CrimeWalletClient). */
   crimeWallets: CrimeWalletsConfig;
   /** Pushed-coin wallet analysis (creator profile + holder ages + clustering). */
@@ -569,6 +574,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       checkInflow: (env.SUPPLY_FLOW_CHECK_INFLOW ?? "true") !== "false",
       budgetMs: Number(env.SUPPLY_FLOW_BUDGET_MS ?? 15_000),
     },
+    mcapLiqRatioMax: (() => {
+      // 0 disables; garbage/negative falls back to disabled rather than NaN
+      // (NaN would silently pass every comparison).
+      const v = Number(env.MCAP_LIQ_RATIO_MAX ?? 10);
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    })(),
     crimeWallets: {
       enabled: (env.CRIME_WALLETS_ENABLED ?? "true") !== "false",
       url: env.CRIME_WALLETS_URL || DEFAULT_CRIME_WALLETS_URL,

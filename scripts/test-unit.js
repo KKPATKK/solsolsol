@@ -19,6 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
 const { evaluateWatch } = require("../dist/pushwatch.js");
+const { mcapRatioBlockReason } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -1938,6 +1939,40 @@ async function main() {
     assert.equal(parseFilterArgs(["40000", "300000", "180", "1680", "6000", "30", "40", "10000", "-5"]).ok, false);
   });
 
+  // ---------- mcap/liquidity ratio gate (Nudaeng lesson) ----------
+
+  await test("mcapRatioBlockReason: real push-history calibration", () => {
+    // The failures — must be blocked (Nudaeng pushed at 18.0x, BAOJIN 27.9x).
+    assert.match(mcapRatioBlockReason(297569, 16510, 10), /18\.0x/);
+    assert.match(mcapRatioBlockReason(57531, 2059, 10), /27\.9x/);
+    // The healthy pushes — must pass untouched (CONK/DOTE/MAPLE/BLC).
+    assert.equal(mcapRatioBlockReason(646915, 101054, 10), null); // CONK 6.4x
+    assert.equal(mcapRatioBlockReason(151378, 27775, 10), null); // DOTE 5.4x
+    assert.equal(mcapRatioBlockReason(122460, 20696, 10), null); // MAPLE 5.9x
+    assert.equal(mcapRatioBlockReason(115221, 34329, 10), null); // MAPLE 3.4x
+    assert.equal(mcapRatioBlockReason(41288, 17655, 10), null); // BLC 2.3x
+    // Boundary: exactly at the limit passes, just over fails.
+    assert.equal(mcapRatioBlockReason(100000, 10000, 10), null); // 10.0x == max
+    assert.match(mcapRatioBlockReason(100001, 10000, 10), /10\.0x/);
+  });
+
+  await test("mcapRatioBlockReason: disabled and degenerate inputs never block", () => {
+    assert.equal(mcapRatioBlockReason(297569, 16510, 0), null);
+    assert.equal(mcapRatioBlockReason(297569, 16510, -1), null);
+    // Zero/missing mcap or liquidity -> not this gate’s call (the liquidity
+    // floor rejects those earlier); never divide-by-zero.
+    assert.equal(mcapRatioBlockReason(0, 16510, 10), null);
+    assert.equal(mcapRatioBlockReason(297569, 0, 10), null);
+    assert.equal(mcapRatioBlockReason(NaN, 16510, 10), null);
+  });
+
+  await test("loadConfig: MCAP_LIQ_RATIO_MAX default 10, 0 disables, garbage falls back to disabled", () => {
+    assert.equal(loadConfig({}).mcapLiqRatioMax, 10);
+    assert.equal(loadConfig({ MCAP_LIQ_RATIO_MAX: "12" }).mcapLiqRatioMax, 12);
+    assert.equal(loadConfig({ MCAP_LIQ_RATIO_MAX: "0" }).mcapLiqRatioMax, 0);
+    assert.equal(loadConfig({ MCAP_LIQ_RATIO_MAX: "-3" }).mcapLiqRatioMax, 0);
+    assert.equal(loadConfig({ MCAP_LIQ_RATIO_MAX: "abc" }).mcapLiqRatioMax, 0);
+  });
   // ---------- supply-flow detector (pure logic, no network) ----------
 
   const NOW = 1_800_000_000_000;

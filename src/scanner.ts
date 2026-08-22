@@ -160,6 +160,33 @@ export interface ScanSummary {
 /** Cap on per-coin rejection entries kept in the scan summary/heartbeat. */
 const REJECT_LOG_MAX = 50;
 
+/**
+ * Market-cap-to-liquidity sanity gate (Nudaeng lesson, 2026-08-22: pushed at
+ * $297K mcap over just $16K of LP — an 18x valuation/depth ratio; the price
+ * runs on a sliver of liquidity, so it is trivially wickable and positions
+ * are nearly un-exitable). Returns a reject reason when mcap exceeds
+ * liquidity × ratioMax, else null. ratioMax <= 0 disables the gate; zero or
+ * missing liquidity never reaches here (the min-liquidity floor rejects it
+ * first).
+ *
+ * Calibrated on push history (mcap@push ÷ LP): healthy pushes measured
+ * 2.3–6.4x (BLC/MAPLE/DOTE/CONK); the failures measured 18x (Nudaeng) and
+ * 27.9x (BAOJIN — which then rugged to $2K LP). Default 10 splits the
+ * clusters with headroom on both sides.
+ */
+export function mcapRatioBlockReason(
+  marketCap: number,
+  liquidityUsd: number,
+  ratioMax: number,
+): string | null {
+  if (!(ratioMax > 0)) return null;
+  if (!(marketCap > 0) || !(liquidityUsd > 0)) return null;
+  const ratio = marketCap / liquidityUsd;
+  return ratio > ratioMax
+    ? `市值/LP 比率 ${ratio.toFixed(1)}x > ${ratioMax}x（估值遠超池深：價格可操縱、難以出場）`
+    : null;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1821,6 +1848,19 @@ export class Scanner {
           fails.mcap++;
           reject(`市值 ${fmtUsd(pair.marketCap)} > ${fmtUsd(chat.maxMarketCapUsd)}`);
           continue; // too big — mid-cap range only
+        }
+        // Valuation vs pool depth sanity: a price that ran up far beyond its
+        // pooled liquidity is manipulable and nearly un-exitable (see the
+        // helper's calibration notes). Global knob, 0 = off.
+        const ratioReason = mcapRatioBlockReason(
+          pair.marketCap,
+          liquidityUsd,
+          this.config.mcapLiqRatioMax,
+        );
+        if (ratioReason) {
+          fails.other++;
+          reject(ratioReason);
+          continue;
         }
         if (ageMs < chat.minAgeMinutes * 60_000) {
           fails.age++;
