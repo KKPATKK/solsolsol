@@ -638,7 +638,7 @@ export class Scanner {
       if (this.pushWatcher) {
         try {
           const pw = await this.pushWatcher.runTick();
-          diag.pushWatch = `ok:${pw.checked}/${pw.alerted}`;
+          diag.pushWatch = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error("[scanner] push-watch tick failed:", msg);

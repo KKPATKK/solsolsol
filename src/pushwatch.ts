@@ -327,7 +327,12 @@ export class PushWatcher {
    * DexScreener batch, evaluate rules, deliver alerts, and refresh holder
    * counts for at most `maxHolderChecksPerTick` coins (oldest check first).
    */
-  async runTick(): Promise<{ checked: number; alerted: number }> {
+  async runTick(): Promise<{
+    checked: number;
+    alerted: number;
+    /** Why nothing was checked (empty in the heartbeat when work happened). */
+    note?: string;
+  }> {
     const cfg = this.config.pushWatch;
     const now = Date.now();
     await this.db.prunePushWatch(now - cfg.windowHours * 3_600_000);
@@ -365,15 +370,25 @@ export class PushWatcher {
     // not re-enroll them, and skipped here. Dead rows stay ACTIVE but the
     // rules engine keeps them silent until a resurrection.
     const activeRows = rows.filter((r) => r.lastState !== "rug");
-    if (activeRows.length === 0) return { checked: 0, alerted: 0 };
+    if (activeRows.length === 0)
+      return {
+        checked: 0,
+        alerted: 0,
+        note: rows.length === 0 ? "no-rows" : "all-terminal",
+      };
 
     // One DexScreener batch covers the whole watch list (≤30 addresses).
     const tokens = activeRows.map((r) => r.token).slice(0, 30);
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
     try {
       pairs = await this.pairsFor(tokens);
-    } catch {
-      return { checked: 0, alerted: 0 }; // feed down — retry next tick
+    } catch (err) {
+      // feed down — retry next tick; surface the reason via the heartbeat.
+      return {
+        checked: 0,
+        alerted: 0,
+        note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`,
+      };
     }
 
     let checked = 0;
