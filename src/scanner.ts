@@ -141,6 +141,8 @@ export interface ScanSummary {
   pushed: number;
   /** Post-push tracker pass result: "ok:<checked>/<alerted>" or "err:<msg>". */
   pushWatch?: string;
+  /** Pool+feed coins with live DexScreener pair data this scan (vs pool count). */
+  pairs?: number;
   fails: {
     mcap: number;
     chg: number;
@@ -782,6 +784,7 @@ export class Scanner {
       diag.pool = poolProfiles.length;
       const addresses = [...new Set(poolProfiles.map((p) => p.tokenAddress))];
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
+      diag.pairs = pairsByToken.size;
 
       // Capture each token's opening stats the first time we ever see it.
       // One batched lookup for the whole feed, then one batched insert for
