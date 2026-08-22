@@ -1769,6 +1769,19 @@ export class Db {
     });
   }
 
+  /**
+   * Tombstone a row instead of deleting it: findUntrackedPushes’ self-heal
+   * re-enrolls any pushed coin absent from push_watch, so a plain DELETE is
+   * undone on the next tick. A last_state="unwatched" row is skipped by the
+   * rules engine (same as "rug") and ages out via prunePushWatch.
+   */
+  async setPushWatchState(token: string, state: string): Promise<void> {
+    await this.get().execute({
+      sql: "UPDATE push_watch SET last_state = ? WHERE token = ?",
+      args: [state, token],
+    });
+  }
+
   async prunePushWatch(olderThanMs: number): Promise<number> {
     const res = await this.get().execute({
       sql: "DELETE FROM push_watch WHERE pushed_at < ?",

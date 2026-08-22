@@ -469,9 +469,11 @@ export function createBot(
     )
       return;
 
-    // 🔔 unwatch: drop the coin from push_watch — no more follow-up alerts
-    // (🚀/⚠️/🩸/🏁) for it. Admin-gated like the trade buttons; the card's
-    // keyboard is cleared so the tap has a visible effect.
+    // 🔔 unwatch: tombstone the push_watch row — no more follow-up alerts
+    // (🚀/⚠️/🩸/🏁) for it. A tombstone (not DELETE) is required because the
+    // tracker's self-heal re-enrolls pushed coins missing from the table.
+    // Admin-gated like the trade buttons; the card's keyboard is cleared so
+    // the tap has a visible effect.
     if (data.startsWith("unwatch:")) {
       const token = data.slice("unwatch:".length);
       if (adminIds.length === 0 || !isAdmin(ctx.from?.id, adminIds)) {
@@ -482,7 +484,7 @@ export function createBot(
         await ctx.answerCallbackQuery({ text: "数据库未配置，无法停止追蹤" });
         return;
       }
-      await db.deletePushWatch(token);
+      await db.setPushWatchState(token, "unwatched");
       await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
       await ctx.answerCallbackQuery({ text: "🔕 已停止追蹤，不再收到跟進警報" });
       return;

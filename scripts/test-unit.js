@@ -2363,6 +2363,28 @@ async function main() {
     assert.ok(flat.some((b) => b.callback_data === "mode:toggle:MINT111"));
   });
 
+  // ---------- unwatch tombstone vs self-heal ----------
+  await test("setPushWatchState tombstones a row so findUntrackedPushes skips it", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "MINTTOMB", chatId: "c1", symbol: "TOMB",
+        pushedAt: Date.now(), mcapAtPush: 100000, liquidityUsd: 20000,
+      });
+      // Plain DELETE is what the self-heal undoes; the tombstone must keep
+      // the row present so NOT EXISTS in findUntrackedPushes stays false.
+      await db.setPushWatchState("MINTTOMB", "unwatched");
+      const rows = await db.listPushWatch(10);
+      const row = rows.find((r) => r.token === "MINTTOMB");
+      assert.ok(row, "row still present after tombstone");
+      assert.equal(row.lastState, "unwatched");
+      const missing = await db.findUntrackedPushes(Date.now() - 3600_000, 10);
+      assert.equal(missing.some((m) => m.token === "MINTTOMB"), false);
+    } finally { t.cleanup(); }
+  });
+
   // ---------- summary ----------
 
   console.log("\n===== UNIT TESTS =====");

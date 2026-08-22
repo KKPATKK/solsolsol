@@ -1159,6 +1159,14 @@ export default {
     // Post-push watch list — the tracker's current rows (peak vs push mcap,
     // holder growth, alert bookkeeping) for verifying follow-ups work.
     if (url.pathname === "/debug/push-watch") {
+      // ?mint=<address> tombstones that row (same as the 🔕 button) — for
+      // cards whose keyboard was already cleared before a tap could land.
+      const mint = url.searchParams.get("mint");
+      if (mint && request.method === "POST") {
+        if (!db) return Response.json({ ok: false, error: "no db" });
+        await db.setPushWatchState(mint, "unwatched");
+        return Response.json({ ok: true, unwatched: mint });
+      }
       const rows = db ? await db.listPushWatch(40) : [];
       return Response.json({
         ok: true,

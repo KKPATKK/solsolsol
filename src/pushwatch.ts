@@ -506,7 +506,9 @@ export class PushWatcher {
     // Only rug (drained LP) rows are terminal: kept so the self-heal does
     // not re-enroll them, and skipped here. Dead rows stay ACTIVE but the
     // rules engine keeps them silent until a resurrection.
-    const activeRows = rows.filter((r) => r.lastState !== "rug");
+    const activeRows = rows.filter(
+      (r) => r.lastState !== "rug" && r.lastState !== "unwatched",
+    );
     if (activeRows.length === 0)
       return {
         checked: 0,
