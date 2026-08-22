@@ -69,7 +69,7 @@ export type ParsedFilter =
 
 export function parseFilterArgs(parts: string[]): ParsedFilter {
   const USAGE =
-    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD] [最低1h量USD]`\n例如: `/filter 40000 300000 300 1680 4000 20 40 10000 15000`\n合格条件 = 二选一路径：**5m路径**（第5参数量 且 第6参数涨幅）或 **1h路径**（1h涨幅 ≥ 第7参数 且 1h量 ≥ 第9参数）。第7参数省略默认 40；第8参数 = 流动性门槛（默认 $10K，0 停用）；第9参数 = 1h量门槛（默认 $15K，0 停用）";
+    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD] [最低1h量USD]`\n例如（= 当前默认档）: `/filter 40000 380000 80 1260 4500 20 40 10000 15000`\n合格条件 = 二选一路径：**5m路径**（第5参数量 且 第6参数涨幅）或 **1h路径**（1h涨幅 ≥ 第7参数 且 1h量 ≥ 第9参数）。第7参数省略默认 40；第8参数 = 流动性门槛（默认 $10K，0 停用）；第9参数 = 1h量门槛（默认 $15K，0 停用）";
   if (parts.length !== 6 && parts.length !== 7 && parts.length !== 8 && parts.length !== 9) {
     return { ok: false, error: USAGE };
   }

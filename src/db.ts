@@ -56,10 +56,11 @@ export interface ChatSettings {
 }
 
 /**
- * Current filter profile: mid-cap coins ($40K–$300K) aged 3–28 hours with a
- * hot 5m tape. The first-minute-volume, sniper, bundler and top-10 holder
- * filters were removed (bundler/top-10 data is shown on the card for
- * reference only).
+ * Current filter profile: mid-cap coins ($40K–$380K) aged 80m–21h, qualified
+ * through either a hot 5m tape ($4.5K + 20%) or a steady 1h tape ($15K +
+ * 40%). The first-minute-volume, sniper, bundler and top-10 holder filters
+ * were removed (bundler/top-10 data is shown on the card for reference
+ * only).
  */
 export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   // $10K floor: DexScreener reporting liquidity ~0 means the LP was pulled or
@@ -68,12 +69,12 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minLiquidityUsd: 10000,
   minVolume24hUsd: 0,
   minMarketCapUsd: 40000,
-  maxMarketCapUsd: 300000,
-  minAgeMinutes: 180, // 3h
-  maxAgeMinutes: 1680, // 28h
-  min5mVolUsd: 6000,
+  maxMarketCapUsd: 380000,
+  minAgeMinutes: 80,
+  maxAgeMinutes: 1260, // 21h
+  min5mVolUsd: 4500,
   min1hVolUsd: 15000,
-  min5mChgPct: 30,
+  min5mChgPct: 20,
   min1hChgPct: 40,
   enabled: false,
 };
@@ -240,12 +241,12 @@ export class Db {
           min_liquidity_usd REAL NOT NULL DEFAULT 10000,
           min_volume_24h_usd REAL NOT NULL DEFAULT 0,
           min_market_cap_usd REAL NOT NULL DEFAULT 40000,
-          max_market_cap_usd REAL NOT NULL DEFAULT 300000,
-          min_age_minutes REAL NOT NULL DEFAULT 180,
-          max_age_minutes REAL NOT NULL DEFAULT 1680,
-          min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
+          max_market_cap_usd REAL NOT NULL DEFAULT 380000,
+          min_age_minutes REAL NOT NULL DEFAULT 80,
+          max_age_minutes REAL NOT NULL DEFAULT 1260,
+          min_5m_vol_usd REAL NOT NULL DEFAULT 4500,
           min_1h_vol_usd REAL NOT NULL DEFAULT 15000,
-          min_5m_chg_pct REAL NOT NULL DEFAULT 30,
+          min_5m_chg_pct REAL NOT NULL DEFAULT 20,
           min_1h_chg_pct REAL NOT NULL DEFAULT 40,
           enabled INTEGER NOT NULL DEFAULT 0
         );`,
@@ -397,6 +398,10 @@ export class Db {
           sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v3_done'",
           args: [],
         },
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'settings_v5_applied'",
+          args: [],
+        },
       ],
       "read",
     );
@@ -412,6 +417,8 @@ export class Db {
       flags[4].rows.length > 0 ? String(flags[4].rows[0].value) : null;
     const schemaAlterV3 =
       flags[5].rows.length > 0 ? String(flags[5].rows[0].value) : null;
+    const settingsV5 =
+      flags[6].rows.length > 0 ? String(flags[6].rows[0].value) : null;
 
     // One-time migration: existing chats keep their old filter values unless
     // reset. The operator specified a new filter profile, so apply it to all
@@ -447,6 +454,28 @@ export class Db {
       });
       await this.setWorkerState("settings_v3_applied", "1");
       console.log("[db] applied min-age default 180m to existing chats (settings_v3)");
+    }
+    // settings_v5: operator retuned the profile — $40K–$380K, 80–1260m,
+    // $4.5K 5m vol, 20% 5m chg. Apply once to existing chats; later
+    // /filter customizations are kept.
+    if (!settingsV5) {
+      await this.get().execute({
+        sql: `UPDATE chat_settings SET
+          max_market_cap_usd = ?,
+          min_age_minutes = ?,
+          max_age_minutes = ?,
+          min_5m_vol_usd = ?,
+          min_5m_chg_pct = ?`,
+        args: [
+          d.maxMarketCapUsd,
+          d.minAgeMinutes,
+          d.maxAgeMinutes,
+          d.min5mVolUsd,
+          d.min5mChgPct,
+        ],
+      });
+      await this.setWorkerState("settings_v5_applied", "1");
+      console.log("[db] applied retuned filter defaults to existing chats (settings_v5)");
     }
     // settings_v4: the liquidity gate shipped defaulted to 0 (= disabled), so
     // zero-liquidity soft-rugs slipped through. Give every chat that never

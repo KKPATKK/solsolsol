@@ -69,11 +69,11 @@ async function main() {
 
   await test("DEFAULT_SETTINGS match the operator's filter spec", () => {
     assert.equal(DEFAULT_SETTINGS.minMarketCapUsd, 40000);
-    assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 300000);
-    assert.equal(DEFAULT_SETTINGS.minAgeMinutes, 180);
-    assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 1680);
-    assert.equal(DEFAULT_SETTINGS.min5mVolUsd, 6000);
-    assert.equal(DEFAULT_SETTINGS.min5mChgPct, 30);
+    assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 380000);
+    assert.equal(DEFAULT_SETTINGS.minAgeMinutes, 80);
+    assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 1260);
+    assert.equal(DEFAULT_SETTINGS.min5mVolUsd, 4500);
+    assert.equal(DEFAULT_SETTINGS.min5mChgPct, 20);
     // Liquidity floor ships ON ($10K) — zero-liq soft-rugs must never pass.
     assert.equal(DEFAULT_SETTINGS.minLiquidityUsd, 10000);
     // 1h volume floor ships at $15K (path-B leg of the dual-path gate).
@@ -94,11 +94,11 @@ async function main() {
       );
       const d = await db.getChatSettings("chat-defaults");
       assert.equal(d.minMarketCapUsd, 40000);
-      assert.equal(d.maxMarketCapUsd, 300000);
-      assert.equal(d.minAgeMinutes, 180);
-      assert.equal(d.maxAgeMinutes, 1680);
-      assert.equal(d.min5mVolUsd, 6000);
-      assert.equal(d.min5mChgPct, 30);
+      assert.equal(d.maxMarketCapUsd, 380000);
+      assert.equal(d.minAgeMinutes, 80);
+      assert.equal(d.maxAgeMinutes, 1260);
+      assert.equal(d.min5mVolUsd, 4500);
+      assert.equal(d.min5mChgPct, 20);
       assert.equal(d.enabled, true);
 
       // Full customized round-trip.
@@ -225,11 +225,11 @@ async function main() {
       await db.init();
       const s = await db.getChatSettings("legacy-chat");
       assert.equal(s.minMarketCapUsd, 40000);
-      assert.equal(s.maxMarketCapUsd, 300000);
-      assert.equal(s.minAgeMinutes, 180);
-      assert.equal(s.maxAgeMinutes, 1680);
-      assert.equal(s.min5mVolUsd, 6000);
-      assert.equal(s.min5mChgPct, 30);
+      assert.equal(s.maxMarketCapUsd, 380000);
+      assert.equal(s.minAgeMinutes, 80);
+      assert.equal(s.maxAgeMinutes, 1260);
+      assert.equal(s.min5mVolUsd, 4500);
+      assert.equal(s.min5mChgPct, 20);
       assert.equal(s.enabled, true); // push state untouched by migration
       assert.equal(await db.getWorkerState("settings_v2_applied"), "1");
 
