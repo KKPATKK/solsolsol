@@ -205,7 +205,13 @@ export class DexScreenerClient {
             h1Sells: Number(txnsRaw?.h1?.sells ?? 0),
           },
           liquidity: {
-            usd: Number((raw.liquidity as { usd?: number } | undefined)?.usd ?? 0) || null,
+            // Preserve 0 — a drained pool reports usd: 0 and the push-watch
+            // rug rule must see it, not mistake it for "unknown" (null).
+            usd:
+              (raw.liquidity as { usd?: number } | undefined)?.usd ===
+                undefined
+                ? null
+                : Number((raw.liquidity as { usd?: number }).usd),
           },
           pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
         });
