@@ -1973,6 +1973,12 @@ async function main() {
     assert.equal(loadConfig({ MCAP_LIQ_RATIO_MAX: "-3" }).mcapLiqRatioMax, 0);
     assert.equal(loadConfig({ MCAP_LIQ_RATIO_MAX: "abc" }).mcapLiqRatioMax, 0);
   });
+  await test("loadConfig: GMGN_ENABLED master switch defaults on, 0/false disables", () => {
+    assert.equal(loadConfig({}).gmgnEnabled, true);
+    assert.equal(loadConfig({ GMGN_ENABLED: "1" }).gmgnEnabled, true);
+    assert.equal(loadConfig({ GMGN_ENABLED: "0" }).gmgnEnabled, false);
+    assert.equal(loadConfig({ GMGN_ENABLED: "false" }).gmgnEnabled, false);
+  });
   // ---------- supply-flow detector (pure logic, no network) ----------
 
   const NOW = 1_800_000_000_000;

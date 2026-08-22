@@ -125,6 +125,11 @@ BIRDEYE_REQUEST_INTERVAL_MS = "1100"
 # other IPs), so the feed/enrichment stay dormant until access is
 # confirmed (paid tier / IP whitelist / proxy). /debug/gmgn probes it.
 GMGN_TRENDING_LIMIT = "0"
+# Master switch for ALL GMGN usage (feed + candidate enrichment). 0 keeps
+# the client unconstructed even though GMGN_API_KEY remains set — every
+# scan tick was otherwise burning one doomed 429 request per qualifying
+# candidate. Flip to 1 once access is confirmed (proxy/paid tier).
+GMGN_ENABLED = "0"
 GMGN_REQUEST_INTERVAL_MS = "600"
 GMGN_BLOCK_WASH_TRADING = "true"
 # Arkham Intelligence (requires ARKHAM_API_KEY, a SECRET — set in the

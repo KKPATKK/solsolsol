@@ -352,6 +352,11 @@ export interface AppConfig {
    * 0 = discovery feed disabled). Candidates come momentum-ranked.
    */
   gmgnTrendingLimit: number;
+  /** Master switch for ALL GMGN usage (feed + enrichment). When off, the
+   * client is never constructed even if GMGN_API_KEY is set — mirrors
+   * ARKHAM_ENABLED so a stale key can never burn requests against a
+   * 429-blocking edge. */
+  gmgnEnabled: boolean;
   /** Minimum spacing between GMGN HTTP requests (rate limiting). */
   gmgnRequestIntervalMs: number;
   /**
@@ -533,6 +538,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     gmgnTrendingLimit: Number.isFinite(Number(env.GMGN_TRENDING_LIMIT ?? 30))
       ? Math.max(0, Math.min(Math.floor(Number(env.GMGN_TRENDING_LIMIT ?? 30)), 100))
       : 30,
+    gmgnEnabled:
+      (env.GMGN_ENABLED ?? "true") !== "0" && (env.GMGN_ENABLED ?? "true") !== "false",
     gmgnRequestIntervalMs: Number.isFinite(Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
       ? Math.max(0, Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
       : 600,

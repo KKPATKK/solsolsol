@@ -187,7 +187,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     tursoConfigured = Boolean(config.tursoUrl);
     heliusConfigured = Boolean(config.heliusApiKey);
     birdeyeConfigured = Boolean(config.birdeyeApiKey);
-    gmgnConfigured = Boolean(config.gmgnApiKey);
+    gmgnConfigured = Boolean(config.gmgnApiKey) && config.gmgnEnabled;
     arkhamConfigured = Boolean(config.arkhamEnabled && config.arkhamApiKey);
     crimeWalletsConfigured = Boolean(config.crimeWallets.enabled);
     walletAnalyzerConfigured = Boolean(config.walletAnalysis.enabled);
@@ -230,7 +230,7 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
       gmgn = null;
-      if (config.gmgnApiKey) {
+      if (config.gmgnApiKey && config.gmgnEnabled) {
         try {
           gmgn = new GmgnClient(config);
         } catch (err) {
