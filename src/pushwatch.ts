@@ -396,8 +396,12 @@ export class PushWatcher {
     for (const row of activeRows) {
       const pair = pairs.get(row.token);
       if (!pair) {
-        // Delisted/unfindable: drop after a grace period so stale rows don't linger.
-        if (now - row.pushedAt > 2 * 3_600_000) await this.db.deletePushWatch(row.token);
+        // Delisted/unfindable: drop after a grace period so stale rows don't
+        // linger. The clock runs from the LAST SUCCESSFUL CHECK, not the
+        // push time — the batched feed occasionally omits pairs (flaky
+        // shared egress), and a single miss must not delete a live row.
+        const lastSeen = Math.max(row.pushedAt, row.lastChecked);
+        if (now - lastSeen > 2 * 3_600_000) await this.db.deletePushWatch(row.token);
         continue;
       }
       checked += 1;
