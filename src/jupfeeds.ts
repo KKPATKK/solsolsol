@@ -131,6 +131,7 @@ export function jupToPairInfos(data: unknown): Map<string, PairInfo> {
       marketCap: n(raw.mcap) || n(raw.fdv),
       volume: {
         h24: n(s24.buyVolume) + n(s24.sellVolume),
+        h1: n(s1.buyVolume) + n(s1.sellVolume),
         m5: n(s5.buyVolume) + n(s5.sellVolume),
       },
       priceChange: { m5: n(s5.priceChange), h1: n(s1.priceChange) },

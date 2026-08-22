@@ -3,7 +3,7 @@ import { tradeKeyboard } from "./bot";
 import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import type { Db, TokenStats } from "./db";
-import { DexScreenerClient, passesChgGate, type PairInfo, type TokenProfile } from "./dexscreener";
+import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreener";
 import { fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
@@ -146,7 +146,6 @@ export interface ScanSummary {
   fails: {
     mcap: number;
     chg: number;
-    vol5: number;
     age: number;
     /** Supply-flow (rug/distribution) pattern detected on-chain. */
     flow: number;
@@ -403,7 +402,7 @@ export class Scanner {
       agedEval: 0,
       candidates: 0,
       pushed: 0,
-      fails: { mcap: 0, chg: 0, vol5: 0, age: 0, flow: 0, crime: 0, other: 0 },
+      fails: { mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, other: 0 },
       rejects: [],
     };
     // Watchdog: if the scan outlives its budget, release the lock so the next
@@ -1771,6 +1770,7 @@ export class Scanner {
       minAgeMinutes: number;
       maxAgeMinutes: number;
       min5mVolUsd: number;
+      min1hVolUsd: number;
       min5mChgPct: number;
       min1hChgPct: number;
     }[],
@@ -1836,16 +1836,23 @@ export class Scanner {
         // can prove in-window coins are evaluated each scan, not silently
         // skipped (per-chat count, consistent with the fails counters).
         agedEval.count++;
-        if (pair.volume.m5 < chat.min5mVolUsd) {
-          fails.vol5++;
-          reject(`5m量 ${fmtUsd(pair.volume.m5)} < ${fmtUsd(chat.min5mVolUsd)}`);
-          continue;
-        }
-        // Compound momentum gate: hot 5m tape OR hot 1h tape (the instant 5m
-        // snapshot alone misses coins sampled mid-pullback between spikes).
-        if (!passesChgGate(pair.priceChange.m5, pair.priceChange.h1, chat.min5mChgPct, chat.min1hChgPct)) {
+        // Dual-path momentum gate — a coin qualifies through EITHER tape:
+        //   Path A (hot 5m):     5m vol >= floor AND 5m chg >= threshold
+        //   Path B (steady 1h):  1h vol >= floor AND 1h chg >= threshold
+        // Volume and change must co-qualify on the SAME path: a thin-tape
+        // pump (change without volume) and a busy flat tape (volume without
+        // change) are both noise.
+        const vol5Ok = pair.volume.m5 >= chat.min5mVolUsd;
+        const chg5Ok = pair.priceChange.m5 >= chat.min5mChgPct;
+        const vol1hOk = pair.volume.h1 >= chat.min1hVolUsd;
+        const chg1hOk = pair.priceChange.h1 >= chat.min1hChgPct;
+        if (!(vol5Ok && chg5Ok) && !(vol1hOk && chg1hOk)) {
           fails.chg++;
-          reject(`5m涨幅 ${pair.priceChange.m5.toFixed(1)}% 且 1h涨幅 ${pair.priceChange.h1.toFixed(1)}% < ${chat.min1hChgPct}%`);
+          const mark = (ok: boolean) => (ok ? "✓" : "✗");
+          reject(
+            `動能不足：5m路徑[量${mark(vol5Ok)} ${fmtUsd(pair.volume.m5)} 漲${mark(chg5Ok)} ${pair.priceChange.m5.toFixed(0)}%] ` +
+            `1h路徑[量${mark(vol1hOk)} ${fmtUsd(pair.volume.h1)} 漲${mark(chg1hOk)} ${pair.priceChange.h1.toFixed(0)}%]`,
+          );
           continue;
         }
         out.push({

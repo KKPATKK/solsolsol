@@ -47,6 +47,7 @@ async function phase1() {
     ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 300],
     ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 1680],
     ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 6000],
+    ["DEFAULT_SETTINGS.min1hVolUsd", DEFAULT_SETTINGS.min1hVolUsd, 15000],
     ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 30],
   ];
   let allOk = true;
@@ -82,7 +83,7 @@ async function phase1() {
     console.log(`\n  📋 已开启推送的 chat 数量: ${chats.length}`);
     for (const c of chats) {
       console.log(
-        `  chat=${c.chatId} | 市值 ${USD(c.minMarketCapUsd)}–${USD(c.maxMarketCapUsd)} | 上线 ${c.minAgeMinutes}–${c.maxAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 5m涨幅≥${c.min5mChgPct}%`,
+        `  chat=${c.chatId} | 市值 ${USD(c.minMarketCapUsd)}–${USD(c.maxMarketCapUsd)} | 上线 ${c.minAgeMinutes}–${c.maxAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 1h量≥${USD(c.min1hVolUsd)} | 5m涨幅≥${c.min5mChgPct}%`,
       );
     }
     return db;
@@ -150,14 +151,17 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
     // F4 age window
     const f4 = ageMin >= s.minAgeMinutes && ageMin <= s.maxAgeMinutes;
     if (!f4) c.reasons.push(`上线 ${ageMin.toFixed(1)}m（窗口 ${s.minAgeMinutes}–${s.maxAgeMinutes}m）`);
-    // F5 5m volume
-    const f5 = pair.volume.m5 >= s.min5mVolUsd;
-    if (!f5) c.reasons.push(`5m量 ${USD(pair.volume.m5)}`);
-    // F6 5m change
-    const f6 = pair.priceChange.m5 >= s.min5mChgPct;
-    if (!f6) c.reasons.push(`5m涨幅 ${pair.priceChange.m5.toFixed(1)}%`);
+    // F5-F6 dual-path momentum gate (mirror of production): qualifies
+    // through EITHER tape — hot 5m (vol+chg) OR steady 1h (vol+chg).
+    const vol5Ok = pair.volume.m5 >= s.min5mVolUsd;
+    const chg5Ok = pair.priceChange.m5 >= s.min5mChgPct;
+    const vol1Ok = pair.volume.h1 >= s.min1hVolUsd;
+    const chg1Ok = pair.priceChange.h1 >= s.min1hChgPct;
+    const f5 = (vol5Ok && chg5Ok) || (vol1Ok && chg1Ok);
+    if (!f5)
+      c.reasons.push(`動能不足 5m[量${vol5Ok ? "✓" : ""}${USD(pair.volume.m5)} 漲${chg5Ok ? "✓" : ""}${pair.priceChange.m5.toFixed(1)}%] 1h[量${vol1Ok ? "✓" : ""}${USD(pair.volume.h1)} 漲${chg1Ok ? "✓" : ""}${pair.priceChange.h1.toFixed(1)}%]`);
 
-    if (!(f1 && f2 && f3 && f4 && f5 && f6)) {
+    if (!(f1 && f2 && f3 && f4 && f5)) {
       rows.push({ symbol, age: ageMin, mc: pair.marketCap, cheap: false, detail: c.reasons.join(", ") });
       continue;
     }

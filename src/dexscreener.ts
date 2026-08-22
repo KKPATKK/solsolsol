@@ -19,7 +19,7 @@ export interface PairInfo {
   /** Price of 1 base token in native quote (e.g. SOL) — used for SOL/USD. */
   priceNative?: number;
   marketCap: number;
-  volume: { h24: number; m5: number };
+  volume: { h24: number; h1: number; m5: number };
   priceChange: { m5: number; h1: number };
   /** Transaction counts (DexScreener txns) — buy/sell pressure signal. */
   txns: { m5Buys: number; m5Sells: number; h1Buys: number; h1Sells: number };
@@ -219,7 +219,7 @@ export class DexScreenerClient {
           | undefined;
         if (!baseToken?.address) continue;
         if (result.has(baseToken.address)) continue; // first pair wins
-        const volume = raw.volume as { h24?: number; m5?: number } | undefined;
+        const volume = raw.volume as { h24?: number; h1?: number; m5?: number } | undefined;
         const txnsRaw = raw.txns as
           | {
               m5?: { buys?: number; sells?: number };
@@ -241,6 +241,7 @@ export class DexScreenerClient {
           marketCap: Number(raw.marketCap ?? 0),
           volume: {
             h24: Number(volume?.h24 ?? 0),
+            h1: Number(volume?.h1 ?? 0),
             m5: Number(volume?.m5 ?? 0),
           },
           priceChange: {

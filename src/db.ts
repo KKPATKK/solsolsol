@@ -38,6 +38,12 @@ export interface ChatSettings {
   maxAgeMinutes: number;
   /** Minimum 5-minute volume in USD. */
   min5mVolUsd: number;
+  /**
+   * Minimum 1-hour volume in USD (0 disables). Filters out coins whose
+   * whole tape is thin — a $6K 5m spike on a $15K/day coin is noise, not
+   * momentum.
+   */
+  min1hVolUsd: number;
   /** Minimum 5-minute price change in percent (e.g. 18 = +18%). */
   min5mChgPct: number;
   /**
@@ -66,6 +72,7 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minAgeMinutes: 180, // 3h
   maxAgeMinutes: 1680, // 28h
   min5mVolUsd: 6000,
+  min1hVolUsd: 15000,
   min5mChgPct: 30,
   min1hChgPct: 40,
   enabled: false,
@@ -237,6 +244,7 @@ export class Db {
           min_age_minutes REAL NOT NULL DEFAULT 180,
           max_age_minutes REAL NOT NULL DEFAULT 1680,
           min_5m_vol_usd REAL NOT NULL DEFAULT 6000,
+          min_1h_vol_usd REAL NOT NULL DEFAULT 15000,
           min_5m_chg_pct REAL NOT NULL DEFAULT 30,
           min_1h_chg_pct REAL NOT NULL DEFAULT 40,
           enabled INTEGER NOT NULL DEFAULT 0
@@ -385,6 +393,10 @@ export class Db {
           sql: "SELECT value FROM worker_state WHERE key = 'settings_v4_applied'",
           args: [],
         },
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v3_done'",
+          args: [],
+        },
       ],
       "read",
     );
@@ -398,6 +410,8 @@ export class Db {
       flags[3].rows.length > 0 ? String(flags[3].rows[0].value) : null;
     const settingsV4 =
       flags[4].rows.length > 0 ? String(flags[4].rows[0].value) : null;
+    const schemaAlterV3 =
+      flags[5].rows.length > 0 ? String(flags[5].rows[0].value) : null;
 
     // One-time migration: existing chats keep their old filter values unless
     // reset. The operator specified a new filter profile, so apply it to all
@@ -465,6 +479,13 @@ export class Db {
       await this.addColumnIfMissing("token_stats", "supply_flow", "TEXT");
       await this.addColumnIfMissing("token_stats", "supply_flow_at", "INTEGER");
       await this.setWorkerState("schema_alter_v1_done", "1");
+    }
+    // schema_alter_v3: 1h-volume push gate column (default $20K, existing
+    // chats inherit the default via the column DEFAULT).
+    if (!schemaAlterV3) {
+      await this.addColumnIfMissing("chat_settings", "min_1h_vol_usd", "REAL NOT NULL DEFAULT 15000");
+      await this.setWorkerState("schema_alter_v3_done", "1");
+      console.log("[db] added chat_settings.min_1h_vol_usd (schema_alter_v3)");
     }
     // v2: store launch_ms (estimated launch time) so the re-eval pool query
     // can use the idx_token_stats_launch index instead of computing
@@ -680,6 +701,7 @@ export class Db {
       minAgeMinutes: Number(row.min_age_minutes ?? DEFAULT_SETTINGS.minAgeMinutes),
       maxAgeMinutes: Number(row.max_age_minutes ?? DEFAULT_SETTINGS.maxAgeMinutes),
       min5mVolUsd: Number(row.min_5m_vol_usd ?? DEFAULT_SETTINGS.min5mVolUsd),
+      min1hVolUsd: Number(row.min_1h_vol_usd ?? DEFAULT_SETTINGS.min1hVolUsd),
       min5mChgPct: Number(row.min_5m_chg_pct ?? DEFAULT_SETTINGS.min5mChgPct),
       min1hChgPct: Number(row.min_1h_chg_pct ?? DEFAULT_SETTINGS.min1hChgPct),
       enabled: Number(row.enabled) === 1,
@@ -702,8 +724,8 @@ export class Db {
         INSERT INTO chat_settings
           (chat_id, min_liquidity_usd, min_volume_24h_usd,
            min_market_cap_usd, max_market_cap_usd, min_age_minutes, max_age_minutes,
-           min_5m_vol_usd, min_5m_chg_pct, min_1h_chg_pct, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           min_5m_vol_usd, min_1h_vol_usd, min_5m_chg_pct, min_1h_chg_pct, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
           min_liquidity_usd = excluded.min_liquidity_usd,
           min_volume_24h_usd = excluded.min_volume_24h_usd,
@@ -712,6 +734,7 @@ export class Db {
           min_age_minutes = excluded.min_age_minutes,
           max_age_minutes = excluded.max_age_minutes,
           min_5m_vol_usd = excluded.min_5m_vol_usd,
+          min_1h_vol_usd = excluded.min_1h_vol_usd,
           min_5m_chg_pct = excluded.min_5m_chg_pct,
           min_1h_chg_pct = excluded.min_1h_chg_pct,
           enabled = excluded.enabled
@@ -725,6 +748,7 @@ export class Db {
         settings.minAgeMinutes,
         settings.maxAgeMinutes,
         settings.min5mVolUsd,
+        settings.min1hVolUsd,
         settings.min5mChgPct,
         settings.min1hChgPct,
         settings.enabled ? 1 : 0,

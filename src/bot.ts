@@ -24,7 +24,7 @@ function buildUsage(scanIntervalSeconds: number): string {
     `${formatInterval(scanIntervalSeconds)}扫描一次 Solana 新上线的 meme coin，符合条件的自动推送到这里。`,
     "",
     "*命令*",
-    "`/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>` — 设置筛选条件",
+    "`/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%>` — 设置筛选条件（另有可选 1h涨幅/流动性/1h量 参数）",
     "`/flow <合约地址>` — 手动检查某币的链上供应流（多钱包喂给同一接收者再卖出）",
     "`/trade` — 查看 Jupiter 自动买入设置",
     "`/setmode <manual|auto|off>` — 切换交易模式（仅管理员）",
@@ -60,13 +60,17 @@ export type ParsedFilter =
       /** Optional 8th /filter arg — the liquidity floor in USD (default
        * DEFAULT_SETTINGS.minLiquidityUsd). Blocks LP-pulled soft-rugs. */
       minLiquidityUsd: number;
+      /** Optional 9th /filter arg — the 1h volume floor in USD (default
+       * DEFAULT_SETTINGS.min1hVolUsd). Requires sustained interest, not a
+       * single 5m print. 0 disables. */
+      min1hVolUsd: number;
     }
   | { ok: false; error: string };
 
 export function parseFilterArgs(parts: string[]): ParsedFilter {
   const USAGE =
-    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD]`\n例如: `/filter 40000 300000 300 1680 4000 20 40 10000`\n合格条件 = 5m涨幅 ≥ 第6参数 **或** 1h涨幅 ≥ 第7参数（省略则默认 40）；第8参数 = 流动性门槛（省略则默认 $10K，设 0 停用）";
-  if (parts.length !== 6 && parts.length !== 7 && parts.length !== 8) {
+    "用法: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD] [最低1h量USD]`\n例如: `/filter 40000 300000 300 1680 4000 20 40 10000 15000`\n合格条件 = 二选一路径：**5m路径**（第5参数量 且 第6参数涨幅）或 **1h路径**（1h涨幅 ≥ 第7参数 且 1h量 ≥ 第9参数）。第7参数省略默认 40；第8参数 = 流动性门槛（默认 $10K，0 停用）；第9参数 = 1h量门槛（默认 $15K，0 停用）";
+  if (parts.length !== 6 && parts.length !== 7 && parts.length !== 8 && parts.length !== 9) {
     return { ok: false, error: USAGE };
   }
   const minMarketCapUsd = parseNumber(parts[0]);
@@ -76,7 +80,8 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
   const min5mVolUsd = parseNumber(parts[4]);
   const min5mChgPct = parseNumber(parts[5]);
   const min1hChgPct = parts.length >= 7 ? parseNumber(parts[6]) : 40;
-  const minLiquidityUsd = parts.length === 8 ? parseNumber(parts[7]) : DEFAULT_SETTINGS.minLiquidityUsd;
+  const minLiquidityUsd = parts.length >= 8 ? parseNumber(parts[7]) : DEFAULT_SETTINGS.minLiquidityUsd;
+  const min1hVolUsd = parts.length === 9 ? parseNumber(parts[8]) : DEFAULT_SETTINGS.min1hVolUsd;
   if (
     minMarketCapUsd === null ||
     maxMarketCapUsd === null ||
@@ -86,18 +91,20 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     min5mChgPct === null ||
     min1hChgPct === null ||
     minLiquidityUsd === null ||
+    min1hVolUsd === null ||
     minMarketCapUsd < 0 ||
     maxMarketCapUsd < 0 ||
     minAgeMinutes <= 0 ||
     maxAgeMinutes <= 0 ||
     min5mVolUsd < 0 ||
+    min1hVolUsd < 0 ||
     maxMarketCapUsd < minMarketCapUsd ||
     maxAgeMinutes < minAgeMinutes
   ) {
     return {
       ok: false,
       error:
-        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD]`",
+        "参数无效。请用数字且保证 最高市值 ≥ 最低市值、最长上线 ≥ 最短上线: `/filter <最低市值USD> <最高市值USD> <最短上线分钟> <最长上线分钟> <最低5m量USD> <最低5m涨幅%> [最低1h涨幅%] [最低流动性USD] [最低1h量USD]`\n合格 = 5m路径（量+涨幅同达标）或 1h路径（涨幅+量同达标）",
     };
   }
   return {
@@ -110,6 +117,7 @@ export function parseFilterArgs(parts: string[]): ParsedFilter {
     min5mChgPct,
     min1hChgPct,
     minLiquidityUsd,
+    min1hVolUsd,
   };
 }
 
@@ -232,6 +240,7 @@ export function createBot(
       minAgeMinutes: parsed.minAgeMinutes,
       maxAgeMinutes: parsed.maxAgeMinutes,
       min5mVolUsd: parsed.min5mVolUsd,
+      min1hVolUsd: parsed.min1hVolUsd,
       min5mChgPct: parsed.min5mChgPct,
       min1hChgPct: parsed.min1hChgPct,
       minLiquidityUsd: parsed.minLiquidityUsd,
@@ -245,6 +254,7 @@ export function createBot(
         `⏱️ 最短上线: ${parsed.minAgeMinutes} 分钟`,
         `⏱️ 最长上线: ${parsed.maxAgeMinutes} 分钟`,
         `📊 最低 5m 量: ${fmtUsd(parsed.min5mVolUsd)}`,
+        `📊 最低 1h 量: ${fmtUsd(parsed.min1hVolUsd)}${parsed.min1hVolUsd === 0 ? "（已停用）" : ""}`,
         `⚡ 合格涨幅: 5m ≥ ${parsed.min5mChgPct}% 或 1h ≥ ${parsed.min1hChgPct}%`,
         `💧 最低流动性: ${fmtUsd(parsed.minLiquidityUsd)}${parsed.minLiquidityUsd === 0 ? "（已停用）" : ""}`,
         `推送状态: ${existing?.enabled ?? false ? "已开启" : "已关闭（用 /on 开启）"}`,
@@ -294,6 +304,7 @@ export function createBot(
       minAgeMinutes: existing?.minAgeMinutes ?? DEFAULT_SETTINGS.minAgeMinutes,
       maxAgeMinutes: existing?.maxAgeMinutes ?? DEFAULT_SETTINGS.maxAgeMinutes,
       min5mVolUsd: existing?.min5mVolUsd ?? DEFAULT_SETTINGS.min5mVolUsd,
+      min1hVolUsd: existing?.min1hVolUsd ?? DEFAULT_SETTINGS.min1hVolUsd,
       min5mChgPct: existing?.min5mChgPct ?? DEFAULT_SETTINGS.min5mChgPct,
       min1hChgPct: existing?.min1hChgPct ?? DEFAULT_SETTINGS.min1hChgPct,
       enabled: true,
@@ -638,6 +649,7 @@ export function createBot(
       minAgeMinutes: existing?.minAgeMinutes ?? DEFAULT_SETTINGS.minAgeMinutes,
       maxAgeMinutes: existing?.maxAgeMinutes ?? DEFAULT_SETTINGS.maxAgeMinutes,
       min5mVolUsd: existing?.min5mVolUsd ?? DEFAULT_SETTINGS.min5mVolUsd,
+      min1hVolUsd: existing?.min1hVolUsd ?? DEFAULT_SETTINGS.min1hVolUsd,
       min5mChgPct: existing?.min5mChgPct ?? DEFAULT_SETTINGS.min5mChgPct,
       min1hChgPct: existing?.min1hChgPct ?? DEFAULT_SETTINGS.min1hChgPct,
       enabled: false,

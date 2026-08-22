@@ -76,6 +76,8 @@ async function main() {
     assert.equal(DEFAULT_SETTINGS.min5mChgPct, 30);
     // Liquidity floor ships ON ($10K) — zero-liq soft-rugs must never pass.
     assert.equal(DEFAULT_SETTINGS.minLiquidityUsd, 10000);
+    // 1h volume floor ships at $15K (path-B leg of the dual-path gate).
+    assert.equal(DEFAULT_SETTINGS.min1hVolUsd, 15000);
     // Bundler/top-10 filters were removed — no thresholds in defaults.
     assert.equal("maxBundlerPct" in DEFAULT_SETTINGS, false);
     assert.equal("maxTop10HolderPct" in DEFAULT_SETTINGS, false);
@@ -109,6 +111,7 @@ async function main() {
         minAgeMinutes: 60,
         maxAgeMinutes: 500,
         min5mVolUsd: 789,
+        min1hVolUsd: 999,
         min5mChgPct: 12,
         min1hChgPct: 40,
         enabled: true,
@@ -123,6 +126,7 @@ async function main() {
         minAgeMinutes: 60,
         maxAgeMinutes: 500,
         min5mVolUsd: 789,
+        min1hVolUsd: 999,
         min5mChgPct: 12,
         min1hChgPct: 40,
         enabled: true,
@@ -146,6 +150,7 @@ async function main() {
         minAgeMinutes: 300,
         maxAgeMinutes: 1680,
         min5mVolUsd: 6000,
+        min1hVolUsd: 20000,
         min5mChgPct: 30,
         min1hChgPct: 40,
         enabled: true,
@@ -159,6 +164,7 @@ async function main() {
         minAgeMinutes: 60,
         maxAgeMinutes: 720,
         min5mVolUsd: 100,
+        min1hVolUsd: 3000,
         min5mChgPct: 5,
         min1hChgPct: 40,
         enabled: false,
@@ -271,7 +277,7 @@ async function main() {
       const mk = (chatId, enabled) => ({
         chatId, minLiquidityUsd: 0, minVolume24hUsd: 0,
         minMarketCapUsd: 1, maxMarketCapUsd: 2, minAgeMinutes: 3, maxAgeMinutes: 4,
-        min5mVolUsd: 5, min5mChgPct: 6, min1hChgPct: 40,
+        min5mVolUsd: 5, min1hVolUsd: 55, min5mChgPct: 6, min1hChgPct: 40,
         enabled,
       });
       await db.saveChatSettings(mk("on", true));
@@ -1813,7 +1819,7 @@ async function main() {
     assert.equal(parseFilterArgs([]).ok, false);
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5"]).ok, false);
     // 6 args = valid (1h leg 40, liq floor default); 7 = explicit 1h;
-    // 8 = explicit liquidity floor; 9+ rejected.
+    // 8 = explicit liquidity floor; 9 = explicit 1h volume floor; 10 rejected.
     const six = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20"]);
     assert.equal(six.ok, true);
     assert.ok(six.ok && six.min1hChgPct === 40);
@@ -1828,7 +1834,12 @@ async function main() {
     const zeroLiq = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20", "40", "0"]);
     assert.equal(zeroLiq.ok, true);
     assert.ok(zeroLiq.ok && zeroLiq.minLiquidityUsd === 0);
-    assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8", "9"]).ok, false);
+    const nine = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20", "35", "15000", "25000"]);
+    assert.equal(nine.ok, true);
+    assert.ok(nine.ok && nine.min1hVolUsd === 25000);
+    const ten = parseFilterArgs(["40000", "300000", "300", "1680", "4000", "20", "35", "15000", "25000", "9"]);
+    assert.equal(ten.ok, false);
+    assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]).ok, false);
   });
 
   await test("db findUntrackedPushes returns seen-but-untracked pushes only", async () => {
@@ -1874,7 +1885,7 @@ async function main() {
         chatId: "chat-a", minLiquidityUsd: 0, minVolume24hUsd: 0,
         minMarketCapUsd: 40000, maxMarketCapUsd: 300000,
         minAgeMinutes: 180, maxAgeMinutes: 1680, min5mVolUsd: 4000,
-        min5mChgPct: 20, min1hChgPct: 40, enabled: true,
+        min1hVolUsd: 20000, min5mChgPct: 20, min1hChgPct: 40, enabled: true,
       });
       await t.client.execute("DELETE FROM worker_state WHERE key = 'settings_v4_applied'");
       // Re-open: the migration must run once and only touch 0-valued rows.
@@ -1887,7 +1898,7 @@ async function main() {
         chatId: "chat-a", minLiquidityUsd: 25000, minVolume24hUsd: 0,
         minMarketCapUsd: 40000, maxMarketCapUsd: 300000,
         minAgeMinutes: 180, maxAgeMinutes: 1680, min5mVolUsd: 4000,
-        min5mChgPct: 20, min1hChgPct: 40, enabled: true,
+        min1hVolUsd: 20000, min5mChgPct: 20, min1hChgPct: 40, enabled: true,
       });
       const db3 = new Db(t.p, undefined, t.client);
       await db3.init();
@@ -1908,6 +1919,23 @@ async function main() {
   await test("parseFilterArgs allows min mcap 0 and 5m volume 0 (no minimum)", () => {
     const r = parseFilterArgs(["0", "300000", "360", "2400", "0", "30"]);
     assert.equal(r.ok, true);
+  });
+
+  await test("parseFilterArgs: 9th arg is the 1h volume floor (default $15K)", () => {
+    // Omitted -> default $15K.
+    const dflt = parseFilterArgs(["40000", "300000", "180", "1680", "6000", "30"]);
+    assert.equal(dflt.ok, true);
+    assert.equal(dflt.min1hVolUsd, 15000);
+    // Explicit value passes through.
+    const explicit = parseFilterArgs(["40000", "300000", "180", "1680", "6000", "30", "40", "10000", "12000"]);
+    assert.equal(explicit.ok, true);
+    assert.equal(explicit.min1hVolUsd, 12000);
+    // 0 disables the gate.
+    const off = parseFilterArgs(["40000", "300000", "180", "1680", "6000", "30", "40", "10000", "0"]);
+    assert.equal(off.ok, true);
+    assert.equal(off.min1hVolUsd, 0);
+    // Negative -> rejected.
+    assert.equal(parseFilterArgs(["40000", "300000", "180", "1680", "6000", "30", "40", "10000", "-5"]).ok, false);
   });
 
   // ---------- supply-flow detector (pure logic, no network) ----------
