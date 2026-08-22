@@ -14,7 +14,7 @@ import { fmtUsd } from "./format";
  *
  * Alert kinds (each fires once per stage/state, with a per-coin cooldown):
  *   🚀 rising stages  — mcap crosses +50% / +100% / +200% / +400% vs push
- *   🔥 ignition       — 5m volume jumps from dormant (< $10K) to ≥ $50K
+ *   🔥 ignition       — 5m volume jumps from dormant (< $10K) to ≥ $15K
  *                       before any rising stage (early new-leg warning)
  *   ⚠️ weak           — ≥35% off the post-push peak (only if it had run up)
  *   💀 dead           — ≥55% off peak → fires once, then SILENT watch; if
@@ -46,11 +46,11 @@ export const LIQ_FLOOR_USD = 10_000;
 /**
  * Volume ignition: a tracked coin whose 5m volume jumps from dormant
  * (< DORMANT) to >= VOL is often the first breath of a new leg (the CONK
- * pattern: 75 min of quiet consolidation, then a 13x volume bar minutes
+ * pattern: 75 min of quiet consolidation, then a volume spike minutes
  * before the god candle). Early-warning only — it never fires once the
  * +50% rising stage has been crossed, where 🚀 alerts take over.
  */
-export const IGNITION_VOL_USD = 50_000;
+export const IGNITION_VOL_USD = 15_000;
 export const IGNITION_DORMANT_USD = 10_000;
 /** Holder-growth stages (× push-time holders → state suffix). */
 const HOLDER_STAGES = [10, 25, 50] as const;
