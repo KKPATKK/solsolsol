@@ -70,13 +70,16 @@ export function renderMessage(
     const serial = cw.serialLauncher ? ` ⚠️ 連發${cw.createCount}` : "";
     creatorLine += ` | 🕐 ${ageLabel}${fmtAge(now - cw.profile.firstTxMs)}${serial}`;
   }
+  // GMGN/Arkham lines are omitted entirely when the source is not
+  // configured (or failed) — a "—（未配置）" placeholder is just noise on
+  // every card. Same stance as the crime line below.
   const gmgnLine =
     gmgn === null
-      ? "🧠 GMGN: —（未配置）"
+      ? null
       : `🧠 GMGN: 👤${gmgn.holderCount ?? "—"} 持倉 | 💰${gmgn.smartWallets ?? "—"} smart${gmgn.isWashTrading ? " | ⚠️ wash trading" : ""}`;
   const arkhamLine =
     arkham === null
-      ? "🕵️ Arkham: —（未配置）"
+      ? null
       : arkham.smartMoney.length === 0
         ? "🕵️ Arkham: 0 smart（Top100 无标注机构/鲸鱼）"
         : (() => {
@@ -143,8 +146,8 @@ export function renderMessage(
     holdersLine,
     ...(organicLine ? [organicLine] : []),
     creatorLine,
-    gmgnLine,
-    arkhamLine,
+    ...(gmgnLine ? [gmgnLine] : []),
+    ...(arkhamLine ? [arkhamLine] : []),
     ...(crimeLine ? [crimeLine] : []),
     ...(holderAnalysisLine ? [holderAnalysisLine] : []),
     ...(clusterLine ? [clusterLine] : []),
