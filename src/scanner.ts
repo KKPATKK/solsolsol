@@ -139,6 +139,8 @@ export interface ScanSummary {
   agedEval: number;
   candidates: number;
   pushed: number;
+  /** Post-push tracker pass result: "ok:<checked>/<alerted>" or "err:<msg>". */
+  pushWatch?: string;
   fails: {
     mcap: number;
     chg: number;
@@ -635,12 +637,12 @@ export class Scanner {
       // Best-effort — a tracker failure never affects the scan.
       if (this.pushWatcher) {
         try {
-          await this.pushWatcher.runTick();
+          const pw = await this.pushWatcher.runTick();
+          diag.pushWatch = `ok:${pw.checked}/${pw.alerted}`;
         } catch (err) {
-          console.error(
-            "[scanner] push-watch tick failed:",
-            err instanceof Error ? err.message : err,
-          );
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("[scanner] push-watch tick failed:", msg);
+          diag.pushWatch = `err:${msg.slice(0, 140)}`;
         }
       }
       // Dedupe the feeds (mints overlap across all three); the DexScreener
