@@ -1491,6 +1491,36 @@ export class Db {
     });
   }
 
+  /**
+   * Recent pushes (seen_tokens) that have no push_watch row — i.e. pushes
+   * whose enrollment hook never ran (an old pre-tracker isolate handled the
+   * scan, or the process died between push and upsert). The tracker seeds
+   * these so a missed hook can never permanently drop a coin from follow-up.
+   */
+  async findUntrackedPushes(
+    sinceMs: number,
+    limit = 10,
+  ): Promise<Array<{ token: string; chatId: string; pushedAt: number }>> {
+    const res = await this.get().execute({
+      sql: `SELECT s.token, s.chat_id, MIN(s.first_seen_at) AS pushed_at
+              FROM seen_tokens s
+             WHERE s.first_seen_at > ?
+               AND NOT EXISTS (SELECT 1 FROM push_watch pw WHERE pw.token = s.token)
+             GROUP BY s.token, s.chat_id
+             ORDER BY pushed_at DESC
+             LIMIT ?`,
+      args: [sinceMs, limit],
+    });
+    return res.rows.map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        token: String(r.token),
+        chatId: String(r.chat_id),
+        pushedAt: Number(r.pushed_at ?? 0),
+      };
+    });
+  }
+
   async listPushWatch(limit = 40): Promise<Array<{
     token: string;
     chatId: string;

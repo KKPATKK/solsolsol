@@ -1719,6 +1719,37 @@ async function main() {
     assert.equal(parseFilterArgs(["1", "2", "3", "4", "5", "6", "7", "8", "9"]).ok, false);
   });
 
+  await test("db findUntrackedPushes returns seen-but-untracked pushes only", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      // Two pushed tokens; one already tracked, one outside the window.
+      await db.markTokenSeen("chat-a", "T-TRACKED");
+      await db.markTokenSeen("chat-a", "T-MISSING");
+      await db.markTokenSeen("chat-a", "T-OLD");
+      await db.upsertPushWatch({
+        token: "T-TRACKED", chatId: "chat-a", symbol: "A",
+        pushedAt: now - 60e3, mcapAtPush: 1, liquidityUsd: null,
+      });
+      await t.client.execute({
+        sql: "UPDATE seen_tokens SET first_seen_at = ? WHERE token = 'T-OLD'",
+        args: [now - 48 * 3600e3],
+      });
+      const missing = await db.findUntrackedPushes(now - 24 * 3600e3, 10);
+      assert.deepEqual(missing.map((m) => m.token), ["T-MISSING"]);
+      // Seeding it makes the query empty (NOT EXISTS).
+      await db.upsertPushWatch({
+        token: "T-MISSING", chatId: "chat-a", symbol: null,
+        pushedAt: now, mcapAtPush: 5, liquidityUsd: null,
+      });
+      assert.deepEqual(await db.findUntrackedPushes(now - 24 * 3600e3, 10), []);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("settings_v4 migration lifts the 0 liquidity floor to the default once", async () => {
     const t = tmpDb();
     try {

@@ -244,6 +244,35 @@ export class PushWatcher {
     const cfg = this.config.pushWatch;
     const now = Date.now();
     await this.db.prunePushWatch(now - cfg.windowHours * 3_600_000);
+    // Heal missed enrollments: pushes recorded in seen_tokens but absent
+    // from push_watch (an old pre-tracker isolate handled that scan, or the
+    // process died between the push and the upsert). Seeded with the CURRENT
+    // mcap as baseline — follow-ups measure from tracking start, not from
+    // the original push moment. Extra DexScreener call only when something
+    // is actually missing; a no-pair coin retries on the next tick.
+    try {
+      const missing = await this.db.findUntrackedPushes(
+        now - cfg.windowHours * 3_600_000,
+        10,
+      );
+      if (missing.length > 0) {
+        const missPairs = await this.pairsFor(missing.map((m) => m.token));
+        for (const m of missing) {
+          const pair = missPairs.get(m.token);
+          if (!pair) continue;
+          await this.db.upsertPushWatch({
+            token: m.token,
+            chatId: m.chatId,
+            symbol: pair.baseToken.symbol ?? null,
+            pushedAt: m.pushedAt,
+            mcapAtPush: pair.marketCap,
+            liquidityUsd: pair.liquidity.usd ?? null,
+          });
+        }
+      }
+    } catch {
+      /* healing is best-effort */
+    }
     const rows = await this.db.listPushWatch(cfg.maxTracked);
     if (rows.length === 0) return { checked: 0, alerted: 0 };
 
