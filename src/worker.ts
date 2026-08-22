@@ -1175,6 +1175,21 @@ export default {
 
     // Push history — read-only distribution of seen_tokens for diagnosing
     // "why is push volume low" (all pushes ever, grouped by day, oldest 20).
+    if (url.pathname === "/debug/token") {
+      const mint = url.searchParams.get("mint") ?? "";
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+        return Response.json({ ok: false, error: "invalid mint" }, { status: 400 });
+      }
+      try {
+        const stats = await db?.getTokenStatsMany([mint]).then((m) => m.get(mint) ?? null);
+        return Response.json({ ok: true, stats });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        );
+      }
+    }
     if (url.pathname === "/debug/pushes") {
       const rows = (await db?.listSeenTokens()) ?? [];
       const byDay = new Map<string, number>();
