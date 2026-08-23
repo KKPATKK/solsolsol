@@ -370,6 +370,12 @@ export interface AppConfig {
   /** Minimum profiled top-holders before the new-wallet gate judges. */
   walletNewMinChecked: number;
   /**
+   * Reject pushes whose top-10 holder concentration (LP-excluded, RugCheck)
+   * is below TOP10_PCT_MIN — e.g. the MCGA shape (2.2%): float so dispersed
+   * there is no committed holder base. 0 disables.
+   */
+  top10PctMin: number;
+  /**
    * (GMGN_BLOCK_WASH_TRADING, default true). Only applies when a GMGN key
    * is configured.
    */
@@ -559,6 +565,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     walletNewMinChecked: Number.isFinite(Number(env.WALLET_NEW_MIN_CHECKED))
       ? Math.max(1, Math.floor(Number(env.WALLET_NEW_MIN_CHECKED)))
       : 5,
+    top10PctMin: Number.isFinite(Number(env.TOP10_PCT_MIN))
+      ? Math.max(0, Math.min(Number(env.TOP10_PCT_MIN), 100))
+      : 10,
     axiomEmail: env.AXIOM_EMAIL || undefined,
     axiomPassword: env.AXIOM_PASSWORD || undefined,
     axiomTrendingLimit: Number.isFinite(Number(env.AXIOM_TRENDING_LIMIT ?? 20))

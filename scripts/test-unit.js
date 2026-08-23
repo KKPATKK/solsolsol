@@ -19,7 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -2400,6 +2400,21 @@ async function main() {
     assert.equal(newWalletBlockReason(0, 0, 0.8, 5), null);
     // Disabled.
     assert.equal(newWalletBlockReason(8, 8, 0, 5), null);
+  });
+
+  await test("top10MinBlockReason: MCGA shape blocked, healthy concentration passes", () => {
+    // The complaint: MCGA pushed with 2.2% top-10 -> block.
+    assert.match(top10MinBlockReason(2.2, 10), /2\.2% < 10%/);
+    // Below the line blocks; exactly at the line passes (strict <).
+    assert.match(top10MinBlockReason(9.9, 10), /9\.9%/);
+    assert.equal(top10MinBlockReason(10.0, 10), null);
+    // Healthy concentrations pass.
+    assert.equal(top10MinBlockReason(18.8, 10), null);
+    assert.equal(top10MinBlockReason(32.3, 10), null);
+    // Missing data never judges (card shows untested).
+    assert.equal(top10MinBlockReason(null, 10), null);
+    // Disabled.
+    assert.equal(top10MinBlockReason(2.2, 0), null);
   });
 
   // ---------- summary ----------

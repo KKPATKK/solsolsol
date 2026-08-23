@@ -90,6 +90,11 @@ PUSH_WATCH_MAX_HOLDER_CHECKS = "4"
 # WALLET_NEW_MIN_CHECKED wallets were profiled. 0 disables the gate.
 WALLET_NEW_RATIO_MAX = "0.8"
 WALLET_NEW_MIN_CHECKED = "5"
+# Dispersed-float gate: rejects pushes whose LP-excluded top-10 holder
+# concentration (RugCheck) is below TOP10_PCT_MIN — the MCGA shape (2.2%):
+# float so dispersed there is no committed holder base. Missing data never
+# judges. 0 disables the gate.
+TOP10_PCT_MIN = "10"
 # Market-cap/liquidity ratio sanity gate: rejects candidates whose market cap
 # exceeds their pooled liquidity by more than MCAP_LIQ_RATIO_MAX times. A
 # price running on a sliver of depth is trivially wickable and nearly

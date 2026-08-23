@@ -208,6 +208,23 @@ export function newWalletBlockReason(
     : null;
 }
 
+/**
+ * Dispersed-float detector: when the LP-excluded top-10 holder concentration
+ * is below pctMin (the MCGA shape — 2.2%), there is no committed holder base
+ * and price is pure churn. null top10 (data missing) never judges;
+ * pctMin 0 disables.
+ */
+export function top10MinBlockReason(
+  top10Pct: number | null,
+  pctMin: number,
+): string | null {
+  if (!(pctMin > 0)) return null;
+  if (top10Pct === null || !Number.isFinite(top10Pct)) return null;
+  return top10Pct < pctMin
+    ? `Top10 持倉僅 ${top10Pct.toFixed(1)}% < ${pctMin}%（籌碼過度分散：無堅定持倉基礎，純粹擊鼓傳花）`
+    : null;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1139,6 +1156,21 @@ export class Scanner {
           this.addReject(diag, coin, newWalletReason);
           console.log(
             `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (new-wallet concentration)`,
+          );
+          continue;
+        }
+        // Dispersed-float gate: LP-excluded top-10 concentration below the
+        // configured floor (the MCGA shape — 2.2%). RugCheck data already in
+        // hand; no extra API cost.
+        const top10Reason = top10MinBlockReason(
+          rugcheck.top10Pct,
+          this.config.top10PctMin,
+        );
+        if (top10Reason) {
+          diag.fails.other++;
+          this.addReject(diag, coin, top10Reason);
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (top10 below floor)`,
           );
           continue;
         }
