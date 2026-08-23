@@ -2409,6 +2409,47 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  // ---------- alert reservation closes the mid-write race ----------
+  await test("reservePushWatchAlert: loser reading between claim and write is blocked", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "MINTRES", chatId: "c1", symbol: "RES",
+        pushedAt: Date.now(), mcapAtPush: 100000, liquidityUsd: 20000,
+      });
+      const [snap] = await db.listPushWatch(10);
+      // Isolate A: claim wins, then reserves the transition BEFORE sending.
+      await db.claimPushWatch("MINTRES", snap.lastChecked, 5000);
+      const aWon = await db.reservePushWatchAlert(
+        "MINTRES", snap.lastState ?? null, snap.lastAlertAt ?? 0, "holder50", 5000,
+      );
+      assert.equal(aWon, true);
+      // Isolate B reads BETWEEN A's claim and A's final write: it sees the
+      // claimed last_checked=5000 (its own claim would succeed) but still
+      // the pre-alert (state, alertAt). Its reservation must LOSE.
+      const bClaimOk = await db.claimPushWatch("MINTRES", 5000, 6000);
+      assert.equal(bClaimOk, true, "B inherits A's claimed stamp");
+      const bLost = await db.reservePushWatchAlert(
+        "MINTRES", snap.lastState ?? null, snap.lastAlertAt ?? 0, "holder50", 5000,
+      );
+      assert.equal(bLost, false);
+      // Same-state alerts (🩸 streak): to == from, but the bumped
+      // last_alert_at still latches — second fire from the same snapshot loses.
+      const [mid] = await db.listPushWatch(10);
+      const s1 = await db.reservePushWatchAlert(
+        "MINTRES", "holder50", 5000, "holder50", 7000,
+      );
+      const s2 = await db.reservePushWatchAlert(
+        "MINTRES", "holder50", 5000, "holder50", 8000,
+      );
+      assert.equal(s1, true);
+      assert.equal(s2, false);
+      assert.notEqual(mid, undefined);
+    } finally { t.cleanup(); }
+  });
+
   // ---------- unwatch tombstone vs self-heal ----------
   await test("setPushWatchState tombstones a row so findUntrackedPushes skips it", async () => {
     const t = tmpDb();

@@ -568,6 +568,36 @@ export class PushWatcher {
         { cooldownMs: cfg.cooldownMin * 60_000 },
       );
 
+      // Authoritative duplicate guard: reserve the state transition
+      // BEFORE delivering. The last_checked claim alone cannot stop an
+      // isolate that reads between this isolate's claim and its final
+      // write — it inherits the claimed stamp but the pre-alert state.
+      // Matching on (last_state, last_alert_at) makes exactly one
+      // contender's UPDATE win; the loser skips delivery.
+      if (
+        evalResult.alerts.length > 0 &&
+        !(await this.db.reservePushWatchAlert(
+          row.token,
+          row.lastState ?? null,
+          row.lastAlertAt ?? 0,
+          evalResult.lastState ?? null,
+          evalResult.lastAlertAt,
+        ))
+      ) {
+        await this.db.updatePushWatchCheck(row.token, {
+          peakMcap: evalResult.peakMcap,
+          lastLiquidity: pair.liquidity.usd,
+          lastVol5m: pair.volume.m5,
+          followupsSent: evalResult.followupsSent - evalResult.alerts.length,
+          lastState: row.lastState ?? null,
+          lastAlertAt: row.lastAlertAt ?? 0,
+          mcapAtPush: evalResult.resetBaselineMcap,
+          deadTroughMcap: evalResult.deadTroughMcap ?? null,
+          sellDomStreak: evalResult.sellDomStreak,
+          lastMcap: pair.marketCap,
+        });
+        continue;
+      }
       for (const a of evalResult.alerts) {
         try {
           await this.bot.api.sendMessage(row.chatId, a.text);

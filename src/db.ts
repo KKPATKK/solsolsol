@@ -1809,6 +1809,32 @@ export class Db {
    * tombstoned the coin (🔕 unwatched rows stay silent — they were opted out
    * of all follow-ups). Prune removes the row regardless of delivery.
    */
+  /**
+   * Atomic alert reservation (the authoritative duplicate-alert guard).
+   * The caller read (last_state, last_alert_at) from a snapshot and the
+   * rules engine decided to fire; this flips BOTH to their post-alert
+   * values only if they still match the snapshot. Two isolates evaluating
+   * the same row can otherwise both pass a last_checked-only claim:
+   * isolate B reading between A's claim and A's final write inherits A's
+   * claimed stamp but sees the pre-alert state, and re-fires. Reserving
+   * the transition BEFORE sending closes that window — exactly one
+   * isolate's WHERE matches, the loser skips delivery.
+   */
+  async reservePushWatchAlert(
+    token: string,
+    fromState: string | null,
+    fromAlertAt: number,
+    toState: string | null,
+    alertAt: number,
+  ): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: `UPDATE push_watch SET last_state = ?, last_alert_at = ?
+            WHERE token = ? AND last_state IS ? AND last_alert_at = ?`,
+      args: [toState, alertAt, token, fromState, fromAlertAt],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
   async markRecapClaimed(token: string): Promise<boolean> {
     const res = await this.get().execute({
       sql: "UPDATE push_watch SET last_state = 'expired'\n            WHERE token = ?\n              AND (last_state IS NULL OR last_state NOT IN ('expired', 'unwatched'))",
