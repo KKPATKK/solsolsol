@@ -2363,6 +2363,52 @@ async function main() {
     assert.ok(flat.some((b) => b.callback_data === "mode:toggle:MINT111"));
   });
 
+  // ---------- cross-isolate duplicate-alert guard ----------
+  await test("claimPushWatch CAS: exactly one overlapping tick wins", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "MINTCLAIM", chatId: "c1", symbol: "CLAIM",
+        pushedAt: Date.now(), mcapAtPush: 100000, liquidityUsd: 20000,
+      });
+      const [row] = await db.listPushWatch(10);
+      // Isolate A reads lastChecked=0; isolate B reads the same snapshot.
+      // A claims with the expected stamp -> true; B's identical claim loses
+      // (last_checked moved) -> false. No double alert.
+      const aWon = await db.claimPushWatch("MINTCLAIM", row.lastChecked, 111);
+      const bLost = await db.claimPushWatch("MINTCLAIM", row.lastChecked, 222);
+      assert.equal(aWon, true);
+      assert.equal(bLost, false);
+      // Next tick: B re-reads the fresh stamp and wins.
+      const [row2] = await db.listPushWatch(10);
+      assert.equal(await db.claimPushWatch("MINTCLAIM", row2.lastChecked, 333), true);
+      // Wrong expected stamp never claims.
+      assert.equal(await db.claimPushWatch("MINTCLAIM", 999, 444), false);
+    } finally { t.cleanup(); }
+  });
+
+  await test("markRecapClaimed: recap sent once; unwatched rows stay silent", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      for (const [tok, sym] of [["MINTR1","R1"],["MINTR2","R2"]]) {
+        await db.upsertPushWatch({
+          token: tok, chatId: "c1", symbol: sym,
+          pushedAt: Date.now(), mcapAtPush: 100000, liquidityUsd: 20000,
+        });
+      }
+      await db.setPushWatchState("MINTR2", "unwatched");
+      // First claim delivers; second claim (overlapping tick) is refused.
+      assert.equal(await db.markRecapClaimed("MINTR1"), true);
+      assert.equal(await db.markRecapClaimed("MINTR1"), false);
+      // Tombstoned coin opted out of follow-ups — no recap either.
+      assert.equal(await db.markRecapClaimed("MINTR2"), false);
+    } finally { t.cleanup(); }
+  });
+
   // ---------- unwatch tombstone vs self-heal ----------
   await test("setPushWatchState tombstones a row so findUntrackedPushes skips it", async () => {
     const t = tmpDb();

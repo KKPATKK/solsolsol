@@ -462,8 +462,13 @@ export class PushWatcher {
     const windowCutoff = now - cfg.windowHours * 3_600_000;
     try {
       const allRows = await this.db.listPushWatch(cfg.maxTracked);
-      for (const r of allRows.filter((x) => x.pushedAt < windowCutoff)) {
+      for (const r of allRows.filter(
+        (x) => x.pushedAt < windowCutoff && x.lastState !== "unwatched",
+      )) {
         try {
+          // Claim first: overlapping ticks (deploy soft-switch) must not
+          // deliver the same 🏁 card twice. Unwatched rows never claim.
+          if (!(await this.db.markRecapClaimed(r.token))) continue;
           await this.bot.api.sendMessage(r.chatId, recapMessage(r));
         } catch {
           /* best-effort */
@@ -543,6 +548,11 @@ export class PushWatcher {
         if (now - lastSeen > 2 * 3_600_000) await this.db.deletePushWatch(row.token);
         continue;
       }
+      // Cross-isolate claim: only one concurrent tick may alert this row.
+      // The loser's snapshot is stale — it would re-fire state-machine
+      // transitions (duplicate ⚠️/🚀 cards). Skip silently on lost race.
+      if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now)))
+        continue;
       checked += 1;
       const evalResult = evaluateWatch(
         row,

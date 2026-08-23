@@ -1782,6 +1782,41 @@ export class Db {
     });
   }
 
+  /**
+   * Atomic per-tick claim (compare-and-swap on last_checked): bump the
+   * stamp only if it still holds the value the caller read. Two isolates
+   * can run overlapping tracker ticks (deploy soft-switch, cron overlap)
+   * and would otherwise evaluate the same row from the same snapshot and
+   * send duplicate alerts — the double ⚠️ JEFFERY incident. The winner
+   * claims the row; the loser skips it for this tick.
+   */
+  async claimPushWatch(
+    token: string,
+    expectedLastChecked: number,
+    now: number,
+  ): Promise<boolean> {
+    const res = await this.get().execute({
+      sql:
+        "UPDATE push_watch SET last_checked = ? WHERE token = ? AND last_checked = ?",
+      args: [now, token, expectedLastChecked],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
+  /**
+   * Recap dedupe: mark an expiring row recap-sent BEFORE delivering the 🏁
+   * card. Returns false when another isolate already claimed it or the user
+   * tombstoned the coin (🔕 unwatched rows stay silent — they were opted out
+   * of all follow-ups). Prune removes the row regardless of delivery.
+   */
+  async markRecapClaimed(token: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: "UPDATE push_watch SET last_state = 'expired'\n            WHERE token = ?\n              AND (last_state IS NULL OR last_state NOT IN ('expired', 'unwatched'))",
+      args: [token],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
   async prunePushWatch(olderThanMs: number): Promise<number> {
     const res = await this.get().execute({
       sql: "DELETE FROM push_watch WHERE pushed_at < ?",

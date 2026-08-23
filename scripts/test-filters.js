@@ -43,12 +43,12 @@ async function phase1() {
   console.log("\n===== PHASE 1: 配置完整性 =====\n");
   const checks = [
     ["DEFAULT_SETTINGS.minMarketCapUsd", DEFAULT_SETTINGS.minMarketCapUsd, 40000],
-    ["DEFAULT_SETTINGS.maxMarketCapUsd", DEFAULT_SETTINGS.maxMarketCapUsd, 300000],
-    ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 300],
-    ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 1680],
-    ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 6000],
+    ["DEFAULT_SETTINGS.maxMarketCapUsd", DEFAULT_SETTINGS.maxMarketCapUsd, 380000],
+    ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 80],
+    ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 1260],
+    ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 4500],
     ["DEFAULT_SETTINGS.min1hVolUsd", DEFAULT_SETTINGS.min1hVolUsd, 15000],
-    ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 30],
+    ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 20],
   ];
   let allOk = true;
   for (const [name, actual, expected] of checks) {
