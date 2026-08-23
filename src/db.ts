@@ -348,7 +348,8 @@ export class Db {
           last_vol_5m REAL,
           dead_trough_mcap REAL,
           sell_dom_streak INTEGER NOT NULL DEFAULT 0,
-          last_mcap REAL
+          last_mcap REAL,
+          up_stages TEXT
         );`,
         `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
         // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
@@ -404,6 +405,10 @@ export class Db {
           sql: "SELECT value FROM worker_state WHERE key = 'settings_v5_applied'",
           args: [],
         },
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v4_done'",
+          args: [],
+        },
       ],
       "read",
     );
@@ -419,6 +424,8 @@ export class Db {
       flags[4].rows.length > 0 ? String(flags[4].rows[0].value) : null;
     const schemaAlterV3 =
       flags[5].rows.length > 0 ? String(flags[5].rows[0].value) : null;
+    const schemaAlterV4 =
+      flags[7].rows.length > 0 ? String(flags[7].rows[0].value) : null;
     const settingsV5 =
       flags[6].rows.length > 0 ? String(flags[6].rows[0].value) : null;
 
@@ -501,7 +508,6 @@ export class Db {
       await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 1680");
       await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
       await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
-      await this.addColumnIfMissing("push_watch", "up_stages", "TEXT");
       await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
       await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
       await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");
@@ -518,6 +524,13 @@ export class Db {
       await this.addColumnIfMissing("chat_settings", "min_1h_vol_usd", "REAL NOT NULL DEFAULT 15000");
       await this.setWorkerState("schema_alter_v3_done", "1");
       console.log("[db] added chat_settings.min_1h_vol_usd (schema_alter_v3)");
+    }
+    // schema_alter_v4: persistent 🚀 stage memory (announced milestones must
+    // survive ⚠️/🔥 overwriting lastState).
+    if (!schemaAlterV4) {
+      await this.addColumnIfMissing("push_watch", "up_stages", "TEXT");
+      await this.setWorkerState("schema_alter_v4_done", "1");
+      console.log("[db] added push_watch.up_stages (schema_alter_v4)");
     }
     // v2: store launch_ms (estimated launch time) so the re-eval pool query
     // can use the idx_token_stats_launch index instead of computing
