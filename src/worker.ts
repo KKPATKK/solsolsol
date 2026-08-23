@@ -1,6 +1,6 @@
 import { webhookCallback, type Bot } from "grammy";
 import { BirdeyeClient } from "./birdeye";
-import { createBot, type FlowCheckResult } from "./bot";
+import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
 import { Db } from "./db";
 import { DexScreenerClient } from "./dexscreener";
@@ -1179,6 +1179,71 @@ export default {
               : null,
         })),
       });
+    }
+
+    // POST /debug/resend?mint=<address> — re-deliver a compact card with
+    // live data for pushes whose first card never arrived client-side
+    // (XST / GLITCH / Félicette / RING). Keyboard included so tracking can
+    // still be stopped from the re-sent card; audited as kind:"resend".
+    if (url.pathname === "/debug/resend") {
+      const mint = url.searchParams.get("mint") ?? "";
+      if (request.method !== "POST") {
+        return Response.json({ ok: false, error: "POST only" }, { status: 405 });
+      }
+      if (!bot || !dex || !db) {
+        return Response.json({ ok: false, error: "not ready" }, { status: 503 });
+      }
+      const row = (await db.listPushWatch(40)).find((r) => r.token === mint);
+      if (!row) {
+        return Response.json({ ok: false, error: "not tracked" }, { status: 404 });
+      }
+      const pair = (await dex.fetchPairsForTokens([mint])).get(mint);
+      if (!pair) {
+        return Response.json({ ok: false, error: "no pair data" }, { status: 404 });
+      }
+      const usd = (n: number | null | undefined) =>
+        n == null || !Number.isFinite(n)
+          ? "—"
+          : "$" + Math.round(n).toLocaleString("en-US");
+      const pctStr = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
+      const chg =
+        row.mcapAtPush > 0 ? (pair.marketCap / row.mcapAtPush - 1) * 100 : null;
+      const peakPct =
+        row.mcapAtPush > 0 ? (row.peakMcap / row.mcapAtPush - 1) * 100 : null;
+      const ageMin = Math.max(
+        0,
+        Math.round((Date.now() - pair.pairCreatedAt) / 60_000),
+      );
+      const text =
+        `📤 補發推送 ${pair.baseToken.symbol}（${row.symbol ?? pair.baseToken.symbol}）\n` +
+        `💰 市值 ${usd(pair.marketCap)}（推送時 ${usd(row.mcapAtPush)}${chg === null ? "" : "，" + pctStr(chg)}）\n` +
+        `📈 推送後峰值 ${pctStr(peakPct ?? 0)}\n` +
+        `💧 流動性 ${usd(pair.liquidity.usd)} | ⏱ 年齡 ${ageMin} 分鐘\n` +
+        `📊 5m量 ${usd(pair.volume.m5)} | 5m ${pctStr(pair.priceChange.m5)}\n` +
+        `🔗 ${pair.url}`;
+      const mode = (await trade?.effectiveMode()) ?? "off";
+      const sent = await bot.api.sendMessage(row.chatId, text, {
+        reply_markup: {
+          inline_keyboard: tradeKeyboard(
+            mint,
+            trade?.buySizeLabel ?? "",
+            mode,
+            { modeSwitch: Boolean(trade), unwatch: true },
+          ),
+        },
+      });
+      try {
+        await db.recordPushDelivery({
+          chatId: row.chatId,
+          token: mint,
+          symbol: row.symbol,
+          messageId: Number((sent as { message_id?: unknown }).message_id ?? 0),
+          kind: "resend",
+        });
+      } catch {
+        /* audit is best-effort */
+      }
+      return Response.json({ ok: true, resent: mint });
     }
 
     // Delivery audit ring: the last 30 successful initial push sends with
