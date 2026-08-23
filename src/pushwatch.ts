@@ -344,7 +344,9 @@ export function evaluateWatch(
     }
     {
       const csv = [...firedStages].sort().join(",");
-      if (csv !== preFireStages) announcedUpStages = csv;
+      if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
+        announcedUpStages = csv;
+      }
     }
 
     // Weak: meaningful runup then ≥35% off the peak.
