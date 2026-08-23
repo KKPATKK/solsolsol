@@ -209,20 +209,25 @@ export function newWalletBlockReason(
 }
 
 /**
- * Dispersed-float detector: when the LP-excluded top-10 holder concentration
- * is below pctMin (the MCGA shape — 2.2%), there is no committed holder base
- * and price is pure churn. null top10 (data missing) never judges;
- * pctMin 0 disables.
+ * Top-10 holder concentration gate (LP-excluded, RugCheck). Two-sided:
+ * below pctMin (the MCGA shape — 2.2%) there is no committed holder base
+ * and price is pure churn; above pctMax the supply is cartel-locked and
+ * retail only provides exit liquidity. null top10 (data missing) never
+ * judges; pctMin/pctMax 0 disables that side.
  */
 export function top10MinBlockReason(
   top10Pct: number | null,
   pctMin: number,
+  pctMax = 0,
 ): string | null {
-  if (!(pctMin > 0)) return null;
   if (top10Pct === null || !Number.isFinite(top10Pct)) return null;
-  return top10Pct < pctMin
-    ? `Top10 持倉僅 ${top10Pct.toFixed(1)}% < ${pctMin}%（籌碼過度分散：無堅定持倉基礎，純粹擊鼓傳花）`
-    : null;
+  if (pctMin > 0 && top10Pct < pctMin) {
+    return `Top10 持倉僅 ${top10Pct.toFixed(1)}% < ${pctMin}%（籌碼過度分散：無堅定持倉基礎，純粹擊鼓傳花）`;
+  }
+  if (pctMax > 0 && top10Pct > pctMax) {
+    return `Top10 持倉高達 ${top10Pct.toFixed(1)}% > ${pctMax}%（籌碼過度集中：供應鎖死在少數錢包，散戶只當出貨對象）`;
+  }
+  return null;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1162,15 +1167,19 @@ export class Scanner {
         // Dispersed-float gate: LP-excluded top-10 concentration below the
         // configured floor (the MCGA shape — 2.2%). RugCheck data already in
         // hand; no extra API cost.
+        // Concentration gate: LP-excluded top-10 must sit in a healthy band —
+        // not dispersed (MCGA shape) nor cartel-locked (>90%). RugCheck data
+        // already in hand; no extra API cost.
         const top10Reason = top10MinBlockReason(
           rugcheck.top10Pct,
           this.config.top10PctMin,
+          this.config.top10PctMax,
         );
         if (top10Reason) {
           diag.fails.other++;
           this.addReject(diag, coin, top10Reason);
           console.log(
-            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (top10 below floor)`,
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (top10 out of band)`,
           );
           continue;
         }

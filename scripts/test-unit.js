@@ -2603,6 +2603,23 @@ async function main() {
     assert.equal(top10MinBlockReason(2.2, 0), null);
   });
 
+  await test("top10MinBlockReason: cartel-locked shape blocked above pctMax", () => {
+    // Cartel holding >90% of supply -> retail only provides exit liquidity.
+    assert.match(
+      top10MinBlockReason(95.5, 10, 90),
+      /95\.5% > 90%/,
+    );
+    assert.match(top10MinBlockReason(90.1, 10, 90), /90\.1%/);
+    // Exactly at the line passes (strict >).
+    assert.equal(top10MinBlockReason(90.0, 10, 90), null);
+    // Healthy band between the two lines passes.
+    assert.equal(top10MinBlockReason(50, 10, 90), null);
+    // pctMax 0 disables only the ceiling side; floor still active.
+    assert.equal(top10MinBlockReason(95.5, 10, 0), null);
+    // Missing data never judges even with both bounds set.
+    assert.equal(top10MinBlockReason(null, 10, 90), null);
+  });
+
   // ---------- summary ----------
 
   console.log("\n===== UNIT TESTS =====");

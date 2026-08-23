@@ -376,6 +376,12 @@ export interface AppConfig {
    */
   top10PctMin: number;
   /**
+   * Reject pushes whose top-10 holder concentration (LP-excluded, RugCheck)
+   * is above TOP10_PCT_MAX — e.g. a cartel holding >90% of supply: retail
+   * only exists to provide exit liquidity. 0 disables.
+   */
+  top10PctMax: number;
+  /**
    * (GMGN_BLOCK_WASH_TRADING, default true). Only applies when a GMGN key
    * is configured.
    */
@@ -568,6 +574,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     top10PctMin: Number.isFinite(Number(env.TOP10_PCT_MIN))
       ? Math.max(0, Math.min(Number(env.TOP10_PCT_MIN), 100))
       : 10,
+    top10PctMax: Number.isFinite(Number(env.TOP10_PCT_MAX))
+      ? Math.max(0, Math.min(Number(env.TOP10_PCT_MAX), 100))
+      : 90,
     axiomEmail: env.AXIOM_EMAIL || undefined,
     axiomPassword: env.AXIOM_PASSWORD || undefined,
     axiomTrendingLimit: Number.isFinite(Number(env.AXIOM_TRENDING_LIMIT ?? 20))
