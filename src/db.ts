@@ -1209,6 +1209,8 @@ export class Db {
     symbol: string | null;
     messageId: number;
     mcapAtPush?: number;
+    /** "initial" = first push card (scanner); "followup" = tracker alert. */
+    kind?: string;
   }): Promise<void> {
     const raw = await this.getWorkerState("push_audit");
     let list: unknown[] = [];

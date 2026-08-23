@@ -1236,6 +1236,7 @@ export class Scanner {
                   (sent as { message_id?: unknown }).message_id ?? 0,
                 ),
                 mcapAtPush: c.pair.marketCap,
+                kind: "initial",
               });
             } catch {
               /* audit is best-effort */

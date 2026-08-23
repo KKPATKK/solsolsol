@@ -629,8 +629,24 @@ export class PushWatcher {
       }
       for (const a of evalResult.alerts) {
         try {
-          await this.bot.api.sendMessage(row.chatId, a.text);
+          const sent = await this.bot.api.sendMessage(row.chatId, a.text);
           alerted += 1;
+          // Audit follow-ups as well: comparing this ring against the
+          // initial-card ring distinguishes "the client drops everything"
+          // from "only first cards go missing".
+          try {
+            await this.db.recordPushDelivery({
+              chatId: row.chatId,
+              token: row.token,
+              symbol: row.symbol,
+              messageId: Number(
+                (sent as { message_id?: unknown }).message_id ?? 0,
+              ),
+              kind: "followup",
+            });
+          } catch {
+            /* audit is best-effort */
+          }
         } catch (err) {
           console.error(
             `[push-watch] alert send failed for ${row.symbol ?? row.token}:`,
