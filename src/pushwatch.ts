@@ -107,6 +107,9 @@ export interface PushWatchRow {
   sellDomStreak: number;
   /** Most recent mcap seen by the tracker (recap final value). */
   lastMcap: number | null;
+  /** CSV of 🚀 stages already announced (up50,up100,…). Persistent so a
+   * ⚠️/🔥 overwrite of lastState cannot re-announce the same milestone. */
+  upStages: string | null;
 }
 
 export interface WatchAlert {
@@ -145,6 +148,8 @@ export interface WatchEval {
   deadTroughMcap?: number | null;
   /** New 🩸 streak count to persist. */
   sellDomStreak: number;
+  /** CSV to persist into up_stages (undefined = keep; '' = clear, resurrection). */
+  announcedUpStages?: string;
 }
 
 function pct(n: number): string {
@@ -181,6 +186,7 @@ export function evaluateWatch(
   let lastAlertAt = row.lastAlertAt;
   let followupsSent = row.followupsSent;
   let resetBaselineHolders: number | undefined;
+  let announcedUpStages: string | undefined;
 
   const fire = (kind: WatchAlert["kind"], text: string) => {
     alerts.push({ kind, text });
@@ -229,6 +235,7 @@ export function evaluateWatch(
         resetBaselineMcap: live.mcap,
         deadTroughMcap: null,
         sellDomStreak: 0,
+        announcedUpStages: "",
       };
     }
     const trough = Math.min(row.deadTroughMcap ?? live.mcap, live.mcap);
@@ -308,8 +315,14 @@ export function evaluateWatch(
     }
 
     // Rising stages: fire the highest crossed stage not yet announced.
+    // Memory lives in the PERSISTENT up_stages column — lastState is shared
+    // with ⚠️/🔥 and gets wiped by them, which re-announced the same
+    // milestone (three 🚀 JEFFERY cards in one hour). The card also names
+    // the NEXT milestone so every card carries forward-looking info.
     const firedStages = new Set<string>();
+    for (const s of (row.upStages ?? "").split(",")) if (s) firedStages.add(s);
     if (lastState?.startsWith("up")) firedStages.add(lastState);
+    const preFireStages = [...firedStages].sort().join(",");
     for (let i = RISING_STAGES.length - 1; i >= 0; i--) {
       const stage = RISING_STAGES[i];
       const state = `up${stage}`;
@@ -318,13 +331,20 @@ export function evaluateWatch(
           live.buysH1 + live.sellsH1 > 0
             ? `${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1`
             : "—";
+        const nextStage = i + 1 < RISING_STAGES.length ? RISING_STAGES[i + 1] : null;
         fire(
           "rising",
-          `🚀 續漲 ${symbol} | 推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)`,
+          `🚀 續漲 ${symbol} | 推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
+            (nextStage ? ` | 下一關 +${nextStage}%` : " | 已達最高里程碑"),
         );
+        firedStages.add(state);
         lastState = state;
         break; // one stage per cooldown window
       }
+    }
+    {
+      const csv = [...firedStages].sort().join(",");
+      if (csv !== preFireStages) announcedUpStages = csv;
     }
 
     // Weak: meaningful runup then ≥35% off the peak.
@@ -390,6 +410,7 @@ export function evaluateWatch(
     stopTracking: false,
     resetBaselineHolders,
     sellDomStreak,
+    announcedUpStages,
   };
 }
 
@@ -621,6 +642,7 @@ export class PushWatcher {
           lastAlertAt: row.lastAlertAt ?? 0,
           mcapAtPush: evalResult.resetBaselineMcap,
         holdersAtPush: evalResult.resetBaselineHolders,
+          upStages: evalResult.announcedUpStages,
           deadTroughMcap: evalResult.deadTroughMcap ?? null,
           sellDomStreak: evalResult.sellDomStreak,
           lastMcap: pair.marketCap,
@@ -667,6 +689,7 @@ export class PushWatcher {
         // holder check re-fire against the stale push-time baseline
         // (BABYCATE 1,000 → 2,441 then 1,000 → 2,458).
         holdersAtPush: evalResult.resetBaselineHolders,
+        upStages: evalResult.announcedUpStages,
         deadTroughMcap: evalResult.deadTroughMcap ?? null,
         sellDomStreak: evalResult.sellDomStreak,
         lastMcap: pair.marketCap,

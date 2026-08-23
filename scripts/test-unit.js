@@ -2573,6 +2573,60 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  await test("evaluateWatch: up-stage memory survives weak wipes; card names next milestone", async () => {
+    // Helpers mirror the holder-baseline test above.
+    const mkRow = (over) => ({
+      token: "T", chatId: "c", symbol: "JEFFERY", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 60_000, lastLiquidity: 12_000,
+      deadTroughMcap: null, holdersCheckedAt: null,
+      holdersAtPush: null, holdersLast: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0,
+      lastState: null, sellDomStreak: 0, lastMcap: null,
+      lastVol5m: null, upStages: null,
+      ...over,
+    });
+    const cfg = { cooldownMs: 1800_000 };
+    const live = () => ({ mcap: 105_000, liquidity: 19_000, chg5m: 2, vol5m: 5_000, buysH1: 90, sellsH1: 80 });
+
+    // The reported bug: ⚠️ wiped lastState ("weak") while up100 had already
+    // been announced — the old code re-fired 🚀 up100 (third card in 1h).
+    const e1 = evaluateWatch(mkRow({ upStages: "up100,up50", lastState: "weak" }), 1000, live(), cfg);
+    assert.ok(!e1.alerts.some((a) => a.kind === "rising"), "same stage must not re-fire");
+
+    // A genuinely new milestone fires ONCE and carries forward-looking info.
+    const e2 = evaluateWatch(
+      mkRow({ mcapAtPush: 50_000, upStages: "up100,up50", lastState: "up100" }),
+      1000, { ...live(), mcap: 155_000 }, cfg, // +210% crosses the 200 stage
+    );
+    const rising = e2.alerts.find((a) => a.kind === "rising");
+    assert.ok(rising, "new stage up200 fires");
+    assert.match(rising.text, /下一關 \+400%/);
+    assert.equal(e2.announcedUpStages, "up100,up200,up50");
+
+    // Legacy rows recover their memory from lastState. A lower un-announced
+    // stage may fire ONCE during migration (up50 never announced), then the
+    // full set persists so it can never repeat.
+    const e3 = evaluateWatch(mkRow({ lastState: "up100", upStages: null }), 1000, live(), cfg);
+    const mig = e3.alerts.find((a) => a.kind === "rising");
+    assert.ok(mig, "one-time backfill of the unannounced up50 stage");
+    assert.match(mig.text, /下一關 \+100%/);
+    assert.equal(e3.announcedUpStages, "up100,up50");
+    const e3b = evaluateWatch(
+      mkRow({ lastState: "up100", upStages: e3.announcedUpStages }),
+      1000 + 1900_000, live(), cfg,
+    );
+    assert.ok(!e3b.alerts.some((a) => a.kind === "rising"), "memory now complete — silent");
+
+    // Top stage reached: card says so, nothing left to announce.
+    const e4 = evaluateWatch(
+      mkRow({ upStages: "up200,up50,up100", lastState: "up200" }),
+      1000, { ...live(), mcap: 260_000 }, cfg,
+    );
+    const top = e4.alerts.find((a) => a.kind === "rising");
+    assert.ok(top && /已達最高里程碑/.test(top.text));
+    assert.equal(e4.announcedUpStages, "up100,up200,up400,up50");
+  });
+
   await test("updatePushWatchCheck: rolling holder baseline overwrites and preserves", async () => {
     const t = tmpDb();
     try {

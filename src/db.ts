@@ -501,6 +501,7 @@ export class Db {
       await this.addColumnIfMissing("chat_settings", "max_age_minutes", "REAL NOT NULL DEFAULT 1680");
       await this.addColumnIfMissing("chat_settings", "min_5m_vol_usd", "REAL NOT NULL DEFAULT 6000");
       await this.addColumnIfMissing("chat_settings", "min_5m_chg_pct", "REAL NOT NULL DEFAULT 30");
+      await this.addColumnIfMissing("push_watch", "up_stages", "TEXT");
       await this.addColumnIfMissing("token_stats", "birdeye_1m_vol", "REAL");
       await this.addColumnIfMissing("token_stats", "rugcheck_bundler_pct", "REAL");
       await this.addColumnIfMissing("token_stats", "rugcheck_top10_pct", "REAL");
@@ -1732,6 +1733,7 @@ export class Db {
     lastAlertAt: number;
     followupsSent: number;
     lastState: string | null;
+    upStages: string | null;
   }>> {
     const res = await this.get().execute({
       // Active rows claim their slots FIRST; terminal rows (rug / unwatched /
@@ -1787,6 +1789,7 @@ export class Db {
         lastAlertAt: Number(r.last_alert_at ?? 0),
         followupsSent: Number(r.followups_sent ?? 0),
         lastState: r.last_state === null || r.last_state === undefined ? null : String(r.last_state),
+        upStages: r.up_stages === null || r.up_stages === undefined ? null : String(r.up_stages),
       };
     });
   }
@@ -1807,6 +1810,8 @@ export class Db {
       mcapAtPush?: number;
       /** 📈 alert fired: roll the holders baseline forward to this value. */
       holdersAtPush?: number;
+      /** CSV of 🚀 stages already announced (undefined = keep; '' = clear). */
+      upStages?: string | null;
       /** New 🧨 sell-pressure streak count (persisted as-is). */
       sellDomStreak?: number;
       /** Latest observed mcap (🏁 recap final value). */
@@ -1822,6 +1827,7 @@ export class Db {
               mcap_at_push = COALESCE(?, mcap_at_push),
               holders_at_push = COALESCE(?, holders_at_push),
               sell_dom_streak = ?,
+              up_stages = COALESCE(?, up_stages),
               last_mcap = ?
             WHERE token = ?`,
       args: [
@@ -1836,6 +1842,7 @@ export class Db {
         v.mcapAtPush ?? null,
         v.holdersAtPush ?? null,
         v.sellDomStreak ?? 0,
+        v.upStages ?? null,
         v.lastMcap ?? null,
         token,
       ],
