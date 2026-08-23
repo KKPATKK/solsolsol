@@ -2573,6 +2573,23 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  await test("hasInitialPushAudit: only initial-kind entries qualify for the token", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Followups and resends do NOT prove the first card was delivered.
+      await db.recordPushDelivery({ chatId: "c1", token: "HM1", symbol: "H", messageId: 1, kind: "followup" });
+      assert.equal(await db.hasInitialPushAudit("HM1"), false);
+      // An initial entry does — even with other tokens interleaved.
+      await db.recordPushDelivery({ chatId: "c1", token: "HM2", symbol: "G", messageId: 2, kind: "initial" });
+      await db.recordPushDelivery({ chatId: "c1", token: "HM1", symbol: "H", messageId: 3, kind: "resend" });
+      assert.equal(await db.hasInitialPushAudit("HM2"), true);
+      assert.equal(await db.hasInitialPushAudit("HM1"), false);
+      assert.equal(await db.hasInitialPushAudit("UNKNOWN"), false);
+    } finally { t.cleanup(); }
+  });
+
   await test("evaluateWatch: up-stage memory survives weak wipes; card names next milestone", async () => {
     // Helpers mirror the holder-baseline test above.
     const mkRow = (over) => ({

@@ -1238,6 +1238,24 @@ export class Db {
     await this.setWorkerState("push_audit", JSON.stringify(list));
   }
 
+  /**
+   * Whether a token has an "initial" delivery-audit entry — i.e. Telegram
+   * verifiably accepted its first card. A claimed-but-unaudited recent
+   * push means the sending isolate died mid-request (deploy eviction) and
+   * the card never went out; the self-heal uses this to re-send instead
+   * of silently enrolling tracking for a card nobody ever received.
+   */
+  async hasInitialPushAudit(token: string): Promise<boolean> {
+    const raw = await this.getWorkerState("push_audit");
+    if (!raw) return false;
+    try {
+      const list = JSON.parse(raw) as Array<{ kind?: string; token?: string }>;
+      return list.some((e) => e.kind === "initial" && e.token === token);
+    } catch {
+      return false;
+    }
+  }
+
   /** Newest-last view of the delivery audit ring for /debug/push-audit. */
   async getPushAudit(): Promise<
     Array<{

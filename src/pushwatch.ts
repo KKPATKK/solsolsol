@@ -28,6 +28,13 @@ import { fmtUsd } from "./format";
 
 /** Rising-stage thresholds (%) above the push-time mcap → state suffix. */
 const RISING_STAGES = [50, 100, 200, 400] as const;
+/**
+ * Grace window for the self-heal's first-card resend: a claim newer than
+ * this without an initial-audit entry is treated as "isolate died before
+ * the card went out" and gets a re-sent card. Older claims predate the
+ * audit ring (delivered long ago) or are far past any recovery point.
+ */
+const FIRST_CARD_RESEND_GRACE_MS = 15 * 60_000;
 /** Drawdown-from-peak thresholds for the weak / dead states (%). */
 const WEAK_DRAWDOWN_PCT = 35;
 const DEAD_DRAWDOWN_PCT = 55;
@@ -467,7 +474,15 @@ export function recapMessage(row: PushWatchRow): string {
 export class PushWatcher {
   constructor(
     private readonly db: Db,
-    private readonly bot: { api: { sendMessage(chatId: string, text: string): Promise<unknown> } },
+    private readonly bot: {
+    api: {
+      sendMessage(
+        chatId: string,
+        text: string,
+        opts?: { reply_markup?: unknown },
+      ): Promise<unknown>;
+    };
+  },
     private readonly birdeye: BirdeyeClient | null,
     private readonly config: AppConfig,
     /** Live pair data for ≤30 addresses (the DexScreener client method). */
@@ -545,6 +560,71 @@ export class PushWatcher {
         for (const m of missing) {
           const pair = missPairs.get(m.token);
           if (!pair) continue;
+          // A RECENTLY-claimed coin with no initial-card audit entry means
+          // the sending isolate died between claim and send (deploy
+          // eviction — XST/GLITCH/Félicette/RING): the card never reached
+          // Telegram, so re-send it instead of silently enrolling tracking
+          // for a push nobody saw. Older unaudited pushes predate the audit
+          // ring and were delivered normally — keep silent enrollment.
+          const recentClaim = now - m.pushedAt <= FIRST_CARD_RESEND_GRACE_MS;
+          let resent = false;
+          if (recentClaim && !(await this.db.hasInitialPushAudit(m.token))) {
+            try {
+              const usd = (n: number | null | undefined) =>
+                n == null || !Number.isFinite(n)
+                  ? "—"
+                  : "$" + Math.round(n).toLocaleString("en-US");
+              const pctStr = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
+              const ageMin = Math.max(
+                0,
+                Math.round((Date.now() - pair.pairCreatedAt) / 60_000),
+              );
+              const sent = await this.bot.api.sendMessage(m.chatId,
+                `📤 補發推送 ${pair.baseToken.symbol}（首次卡片未送達）\n` +
+                  `💰 市值 ${usd(pair.marketCap)}\n` +
+                  `💧 流動性 ${usd(pair.liquidity.usd)} | ⏱ 年齡 ${ageMin} 分鐘\n` +
+                  `📊 5m量 ${usd(pair.volume.m5)} | 5m ${pctStr(pair.priceChange.m5)}`,
+                {
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        {
+                          text: "🔗 打开 Axiom 页面",
+                          url: `https://axiom.trade/t/${m.token}`,
+                        },
+                      ],
+                      [
+                        {
+                          text: "🔕 停止追蹤",
+                          callback_data: `unwatch:${m.token}`,
+                        },
+                      ],
+                    ],
+                  },
+                },
+              );
+              resent = true;
+              try {
+                await this.db.recordPushDelivery({
+                  chatId: m.chatId,
+                  token: m.token,
+                  symbol: pair.baseToken.symbol ?? null,
+                  messageId: Number(
+                    (sent as { message_id?: unknown }).message_id ?? 0,
+                  ),
+                  mcapAtPush: pair.marketCap,
+                  kind: "resend",
+                });
+              } catch {
+                /* audit is best-effort */
+              }
+            } catch (err) {
+              console.error(
+                `[push-watch] heal resend failed for ${pair.baseToken.symbol ?? m.token}:`,
+                err instanceof Error ? err.message : err,
+              );
+            }
+          }
           await this.db.upsertPushWatch({
             token: m.token,
             chatId: m.chatId,
@@ -553,6 +633,7 @@ export class PushWatcher {
             mcapAtPush: pair.marketCap,
             liquidityUsd: pair.liquidity.usd ?? null,
           });
+          if (resent) continue; // fresh card just went out — skip holder seed noise
         }
       }
     } catch {
