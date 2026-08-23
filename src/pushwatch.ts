@@ -663,6 +663,10 @@ export class PushWatcher {
         lastState: evalResult.lastState,
         lastAlertAt: evalResult.lastAlertAt,
         mcapAtPush: evalResult.resetBaselineMcap,
+        // Roll the 📈 baseline forward — omitting this made every later
+        // holder check re-fire against the stale push-time baseline
+        // (BABYCATE 1,000 → 2,441 then 1,000 → 2,458).
+        holdersAtPush: evalResult.resetBaselineHolders,
         deadTroughMcap: evalResult.deadTroughMcap ?? null,
         sellDomStreak: evalResult.sellDomStreak,
         lastMcap: pair.marketCap,

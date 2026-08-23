@@ -2573,6 +2573,32 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  await test("updatePushWatchCheck: rolling holder baseline overwrites and preserves", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({ token: "ROLLMINT", chatId: "c1", symbol: "ROLL", pushedAt: Date.now(), mcapAtPush: 100000, liquidityUsd: 20000 });
+      // 📈 fired: baseline rolls forward to holdersLast (the BABYCATE fix —
+      // this write was previously missing from the delivered-alert branch).
+      await db.updatePushWatchCheck("ROLLMINT", {
+        peakMcap: 100000, lastLiquidity: 20000, followupsSent: 1,
+        lastState: "hold", lastAlertAt: Date.now(), mcapAtPush: null,
+        holdersAtPush: 2441, sellDomStreak: 0, lastMcap: 99000,
+      });
+      let row = (await db.listPushWatch(5)).find((r) => r.token === "ROLLMINT");
+      assert.equal(row.holdersAtPush, 2441, "baseline must roll forward");
+      // No 📈 this tick: undefined → COALESCE keeps the rolled baseline.
+      await db.updatePushWatchCheck("ROLLMINT", {
+        peakMcap: 101000, lastLiquidity: 20000, followupsSent: 1,
+        lastState: "up50", lastAlertAt: Date.now(), mcapAtPush: null,
+        holdersAtPush: null, sellDomStreak: 0, lastMcap: 99500, // no 📈 this tick
+      });
+      row = (await db.listPushWatch(5)).find((r) => r.token === "ROLLMINT");
+      assert.equal(row.holdersAtPush, 2441, "baseline must survive non-holder ticks");
+    } finally { t.cleanup(); }
+  });
+
   await test("listPushWatch: active rows claim slots before terminal tombstones", async () => {
     const t = tmpDb();
     try {
