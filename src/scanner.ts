@@ -1197,17 +1197,34 @@ export class Scanner {
           organic,
         );
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
-          await this.bot.api.sendMessage(c.chatId, message, {
-            reply_markup: {
-              inline_keyboard: tradeKeyboard(
-                tokenAddress,
-                this.trade ? this.trade.buySizeLabel : "",
-                tradeMode,
-                { modeSwitch: Boolean(this.trade), unwatch: true },
-              ),
-            },
-          });
-          await this.db.markTokenSeen(c.chatId, c.profile.tokenAddress);
+          // Atomic claim BEFORE sending: overlapping isolates can both pass
+          // the isTokenSeen check-then-act window above, but only one wins
+          // this INSERT OR IGNORE — duplicate cards (e.g. double TRILLY)
+          // are impossible at the storage layer.
+          if (!(await this.db.claimTokenPush(c.chatId, c.profile.tokenAddress))) {
+            return;
+          }
+          try {
+            await this.bot.api.sendMessage(c.chatId, message, {
+              reply_markup: {
+                inline_keyboard: tradeKeyboard(
+                  tokenAddress,
+                  this.trade ? this.trade.buySizeLabel : "",
+                  tradeMode,
+                  { modeSwitch: Boolean(this.trade), unwatch: true },
+                ),
+              },
+            });
+          } catch (err) {
+            // Release the claim: the caller's failure handling + the
+            // chat-aware re-eval pool will retry on a later scan.
+            try {
+              await this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress);
+            } catch {
+              /* best-effort */
+            }
+            throw err;
+          }
           pushed++;
           // Start post-push tracking (🚀/⚠️/💀 follow-ups). Best-effort and
           // deduped by the table's PK — never affects the push itself.

@@ -1165,6 +1165,35 @@ export class Db {
     );
   }
 
+  /**
+   * Atomic push claim: INSERT OR IGNORE into seen_tokens BEFORE sending the
+   * card. Overlapping scans (deploy soft-switch isolates, cron + /health
+   * both driving a tick) can all pass the isTokenSeen check-then-act window,
+   * but only one caller wins this insert — duplicate push cards become
+   * impossible at the storage layer. On failed delivery call
+   * unclaimTokenPush so the chat-aware re-eval pool can retry later.
+   */
+  async claimTokenPush(chatId: string, token: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: "INSERT OR IGNORE INTO seen_tokens (chat_id, token, first_seen_at) VALUES (?, ?, ?)",
+      args: [chatId, token, Date.now()],
+    });
+    const won = Number(res.rowsAffected ?? 0) > 0;
+    if (won) {
+      await this.bumpTelemetryCounter("telemetry_seen_tokens_count", 1);
+    }
+    return won;
+  }
+
+  /** Release a push claim after a failed delivery (retry stays possible). */
+  async unclaimTokenPush(chatId: string, token: string): Promise<void> {
+    await this.get().execute({
+      sql: "DELETE FROM seen_tokens WHERE chat_id = ? AND token = ?",
+      args: [chatId, token],
+    });
+    await this.bumpTelemetryCounter("telemetry_seen_tokens_count", -1);
+  }
+
   private statsFromRow(row: Record<string, unknown>): TokenStats {
     const birdeye = row.birdeye_1m_vol;
     const rugcheck = row.rugcheck_bundler_pct;

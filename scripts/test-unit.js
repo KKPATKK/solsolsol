@@ -2450,6 +2450,27 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  // ---------- duplicate push-card guard ----------
+  await test("claimTokenPush: overlapping scans deliver the card exactly once", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Both isolates pass the isTokenSeen check (nothing marked yet), then
+      // race to claim. INSERT OR IGNORE lets exactly one win.
+      const aWon = await db.claimTokenPush("c1", "TRILLYMINT");
+      const bLost = await db.claimTokenPush("c1", "TRILLYMINT");
+      assert.equal(aWon, true);
+      assert.equal(bLost, false);
+      // Different chat is an independent slot (per-chat dedupe preserved).
+      assert.equal(await db.claimTokenPush("c2", "TRILLYMINT"), true);
+      // Failed delivery releases the claim so a later scan can retry.
+      await db.unclaimTokenPush("c1", "TRILLYMINT");
+      assert.equal(await db.isTokenSeen("c1", "TRILLYMINT"), false);
+      assert.equal(await db.claimTokenPush("c1", "TRILLYMINT"), true);
+    } finally { t.cleanup(); }
+  });
+
   // ---------- unwatch tombstone vs self-heal ----------
   await test("setPushWatchState tombstones a row so findUntrackedPushes skips it", async () => {
     const t = tmpDb();
