@@ -2573,6 +2573,30 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  await test("listPushWatch: active rows claim slots before terminal tombstones", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      // 25 NEWER rug tombstones + 10 OLDER active rows: the old LIMIT by
+      // pushed_at alone would evict the actives; ordering must protect them.
+      for (let i = 0; i < 25; i++) {
+        await db.upsertPushWatch({ token: `RUG${i}`, chatId: "c1", symbol: `R${i}`, pushedAt: now - i * 1000, mcapAtPush: 100000, liquidityUsd: 20000 });
+        await db.setPushWatchState(`RUG${i}`, "rug");
+      }
+      for (let i = 0; i < 10; i++) {
+        await db.upsertPushWatch({ token: `ACT${i}`, chatId: "c1", symbol: `A${i}`, pushedAt: now - 60_000 - i * 1000, mcapAtPush: 100000, liquidityUsd: 20000 });
+      }
+      const rows = await db.listPushWatch(30);
+      const missingActive = [];
+      for (let i = 0; i < 10; i++) if (!rows.some((r) => r.token === `ACT${i}`)) missingActive.push(`ACT${i}`);
+      assert.equal(missingActive.length, 0, `active rows evicted: ${missingActive.join(",")}`);
+      // Tombstones fill only the leftover slots (20 of the 25 newest).
+      assert.equal(rows.filter((r) => r.lastState === "rug").length, 20);
+    } finally { t.cleanup(); }
+  });
+
   // ---------- unwatch tombstone vs self-heal ----------
   await test("setPushWatchState tombstones a row so findUntrackedPushes skips it", async () => {
     const t = tmpDb();

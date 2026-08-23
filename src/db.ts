@@ -1732,7 +1732,15 @@ export class Db {
     lastState: string | null;
   }>> {
     const res = await this.get().execute({
-      sql: "SELECT * FROM push_watch ORDER BY pushed_at DESC LIMIT ?",
+      // Active rows claim their slots FIRST; terminal rows (rug / unwatched /
+      // expired tombstones kept only so the self-heal skips them) fill any
+      // leftovers. Without this, a burst of pushes inside the 24h window
+      // could evict older ACTIVE coins from the listing — they would
+      // silently stop being refreshed.
+      sql: `SELECT * FROM push_watch
+            ORDER BY CASE WHEN COALESCE(last_state, '') IN ('rug', 'unwatched', 'expired') THEN 1 ELSE 0 END,
+                     pushed_at DESC
+            LIMIT ?`,
       args: [limit],
     });
     return res.rows.map((row) => {
