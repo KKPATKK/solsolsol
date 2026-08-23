@@ -72,7 +72,7 @@ async function main() {
     assert.equal(DEFAULT_SETTINGS.minMarketCapUsd, 40000);
     assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 380000);
     assert.equal(DEFAULT_SETTINGS.minAgeMinutes, 80);
-    assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 1260);
+    assert.equal(DEFAULT_SETTINGS.maxAgeMinutes, 1560); // settings_v6 widened 21h -> 26h
     assert.equal(DEFAULT_SETTINGS.min5mVolUsd, 4500);
     assert.equal(DEFAULT_SETTINGS.min5mChgPct, 20);
     // Liquidity floor ships ON ($10K) — zero-liq soft-rugs must never pass.
@@ -97,7 +97,7 @@ async function main() {
       assert.equal(d.minMarketCapUsd, 40000);
       assert.equal(d.maxMarketCapUsd, 380000);
       assert.equal(d.minAgeMinutes, 80);
-      assert.equal(d.maxAgeMinutes, 1260);
+      assert.equal(d.maxAgeMinutes, 1560);
       assert.equal(d.min5mVolUsd, 4500);
       assert.equal(d.min5mChgPct, 20);
       assert.equal(d.enabled, true);
@@ -228,7 +228,8 @@ async function main() {
       assert.equal(s.minMarketCapUsd, 40000);
       assert.equal(s.maxMarketCapUsd, 380000);
       assert.equal(s.minAgeMinutes, 80);
-      assert.equal(s.maxAgeMinutes, 1260);
+      // settings_v6 (runs right after v2 in the same init) widens 1260 -> 1560.
+      assert.equal(s.maxAgeMinutes, 1560);
       assert.equal(s.min5mVolUsd, 4500);
       assert.equal(s.min5mChgPct, 20);
       assert.equal(s.enabled, true); // push state untouched by migration

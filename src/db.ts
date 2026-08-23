@@ -56,7 +56,7 @@ export interface ChatSettings {
 }
 
 /**
- * Current filter profile: mid-cap coins ($40K–$380K) aged 80m–21h, qualified
+ * Current filter profile: mid-cap coins ($40K–$380K) aged 80m–26h, qualified
  * through either a hot 5m tape ($4.5K + 20%) or a steady 1h tape ($15K +
  * 40%). The first-minute-volume, sniper, bundler and top-10 holder filters
  * were removed (bundler/top-10 data is shown on the card for reference
@@ -71,7 +71,7 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
   minMarketCapUsd: 40000,
   maxMarketCapUsd: 380000,
   minAgeMinutes: 80,
-  maxAgeMinutes: 1260, // 21h
+  maxAgeMinutes: 1560, // 26h
   min5mVolUsd: 4500,
   min1hVolUsd: 15000,
   min5mChgPct: 20,
@@ -243,7 +243,7 @@ export class Db {
           min_market_cap_usd REAL NOT NULL DEFAULT 40000,
           max_market_cap_usd REAL NOT NULL DEFAULT 380000,
           min_age_minutes REAL NOT NULL DEFAULT 80,
-          max_age_minutes REAL NOT NULL DEFAULT 1260,
+          max_age_minutes REAL NOT NULL DEFAULT 1560,
           min_5m_vol_usd REAL NOT NULL DEFAULT 4500,
           min_1h_vol_usd REAL NOT NULL DEFAULT 15000,
           min_5m_chg_pct REAL NOT NULL DEFAULT 20,
@@ -409,6 +409,10 @@ export class Db {
           sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v4_done'",
           args: [],
         },
+        {
+          sql: "SELECT value FROM worker_state WHERE key = 'settings_v6_applied'",
+          args: [],
+        },
       ],
       "read",
     );
@@ -428,6 +432,8 @@ export class Db {
       flags[7].rows.length > 0 ? String(flags[7].rows[0].value) : null;
     const settingsV5 =
       flags[6].rows.length > 0 ? String(flags[6].rows[0].value) : null;
+    const settingsV6 =
+      flags[8].rows.length > 0 ? String(flags[8].rows[0].value) : null;
 
     // One-time migration: existing chats keep their old filter values unless
     // reset. The operator specified a new filter profile, so apply it to all
@@ -496,6 +502,17 @@ export class Db {
       });
       await this.setWorkerState("settings_v4_applied", "1");
       console.log("[db] applied min-liquidity default to existing chats (settings_v4)");
+    }
+    // settings_v6: operator widened the age window ceiling 1260m→1560m
+    // (21h→26h) — late-blooming runners like GLITCH re-ignited past 21h.
+    // Apply once to existing chats; later /filter customizations are kept.
+    if (!settingsV6) {
+      await this.get().execute({
+        sql: "UPDATE chat_settings SET max_age_minutes = ?",
+        args: [d.maxAgeMinutes],
+      });
+      await this.setWorkerState("settings_v6_applied", "1");
+      console.log("[db] applied max-age default 1560m to existing chats (settings_v6)");
     }
     // One-time legacy column backfills (databases created before these
     // columns existed). Fresh databases already carry every column in the

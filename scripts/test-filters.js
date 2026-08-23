@@ -45,7 +45,7 @@ async function phase1() {
     ["DEFAULT_SETTINGS.minMarketCapUsd", DEFAULT_SETTINGS.minMarketCapUsd, 40000],
     ["DEFAULT_SETTINGS.maxMarketCapUsd", DEFAULT_SETTINGS.maxMarketCapUsd, 380000],
     ["DEFAULT_SETTINGS.minAgeMinutes", DEFAULT_SETTINGS.minAgeMinutes, 80],
-    ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 1260],
+    ["DEFAULT_SETTINGS.maxAgeMinutes", DEFAULT_SETTINGS.maxAgeMinutes, 1560],
     ["DEFAULT_SETTINGS.min5mVolUsd", DEFAULT_SETTINGS.min5mVolUsd, 4500],
     ["DEFAULT_SETTINGS.min1hVolUsd", DEFAULT_SETTINGS.min1hVolUsd, 15000],
     ["DEFAULT_SETTINGS.min5mChgPct", DEFAULT_SETTINGS.min5mChgPct, 20],
