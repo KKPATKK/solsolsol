@@ -70,6 +70,11 @@ const MIN_HOLDER_GROWTH_PCT = 10;
 const SELL_DOM_RATIO = 0.7;
 const SELL_DOM_STREAK_NEEDED = 3;
 const SELL_DOM_MIN_RUNUP_PCT = 15;
+/** Minimum gap between 🩸 cards for the same coin. Thin-tape losers flip the
+ * buy/sell ratio across the dominance line every few checks; without pacing,
+ * each re-armed episode re-fires a near-identical card (same rolling 1h
+ * counts). Paced episodes are deferred, not dropped — see the >= below. */
+const SELL_DOM_PACE_MS = 60 * 60_000;
 /**
  * Resurrection trigger: a 💀-marked coin re-alerts when it recovers to
  * this multiple of its DEAD-TIME TROUGH (not the push baseline). Requiring
@@ -261,10 +266,12 @@ export function evaluateWatch(
   }
 
   // Sell-pressure dominance (🩸 distribution early-warning): consecutive 1h
-  // windows with sells outnumbering buys. Fires on the exact Nth streak
-  // check — the streak must reset (buys recover) before it can re-arm, so
-  // one episode = one alert. Runs OUTSIDE the cooldown gate: the streak
-  // itself paces the alerting, and distribution is worth seeing promptly.
+  // windows with sells outnumbering buys. Fires from the Nth streak check
+  // onward, paced at most one card per SELL_DOM_PACE_MS — thin tapes flip
+  // the ratio back and forth, resetting the streak and re-arming rapidly;
+  // the pace gate turns that into at most one card per hour per coin.
+  // Runs OUTSIDE the cooldown gate: distribution is worth seeing promptly,
+  // and the streak plus pace together keep it from becoming noise.
   const runupFromPushPct = (peakMcap / Math.max(row.mcapAtPush, 1) - 1) * 100;
   let sellDomStreak = row.sellDomStreak ?? 0;
   if (live.sellsH1 > 0 && live.buysH1 / live.sellsH1 < SELL_DOM_RATIO) {
@@ -273,8 +280,9 @@ export function evaluateWatch(
     sellDomStreak = 0;
   }
   if (
-    sellDomStreak === SELL_DOM_STREAK_NEEDED &&
-    runupFromPushPct >= SELL_DOM_MIN_RUNUP_PCT
+    sellDomStreak >= SELL_DOM_STREAK_NEEDED &&
+    runupFromPushPct >= SELL_DOM_MIN_RUNUP_PCT &&
+    now - (row.lastAlertAt ?? 0) >= SELL_DOM_PACE_MS
   ) {
     fire(
       "sell-pressure",

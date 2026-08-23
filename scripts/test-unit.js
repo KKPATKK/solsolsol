@@ -2065,10 +2065,38 @@ async function main() {
     assert.match(r3.alerts[0].text, /🩸 賣壓主導 PUMP/);
     assert.equal(r3.sellDomStreak, 3);
 
-    // Streak 4+ stays silent — one alert per episode.
-    const r4 = evaluateWatch(row({ sellDomStreak: 3 }), 3600_000 + 180_000, live(), cfg);
+    // Streak 4+ stays silent while inside the pace window — one card per hour.
+    const firedAt = 3600_000 + 120_000;
+    const r4 = evaluateWatch(
+      row({ sellDomStreak: 3, lastAlertAt: firedAt }),
+      firedAt + 60_000,
+      live(),
+      cfg,
+    );
     assert.equal(r4.alerts.length, 0);
     assert.equal(r4.sellDomStreak, 4);
+
+    // Paced episodes are deferred, not dropped: streak keeps counting, and
+    // once the pace window opens the next sell-dominant check delivers.
+    const r5 = evaluateWatch(
+      row({ sellDomStreak: 4, lastAlertAt: firedAt }),
+      firedAt + 3_600_000,
+      live(),
+      cfg,
+    );
+    assert.equal(r5.alerts.length, 1);
+    assert.equal(r5.alerts[0].kind, "sell-pressure");
+
+    // Rapid re-arm (streak reset by a single buy tick, then back to 3) is
+    // still paced: no second near-identical card within the window.
+    const r6 = evaluateWatch(
+      row({ sellDomStreak: 2, lastAlertAt: firedAt }),
+      firedAt + 10 * 60_000,
+      live(),
+      cfg,
+    );
+    assert.equal(r6.alerts.length, 0);
+    assert.equal(r6.sellDomStreak, 3);
   });
 
   await test("evaluateWatch: 🩸 resets on buy recovery and never fires without runup", () => {
