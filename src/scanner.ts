@@ -1214,7 +1214,7 @@ export class Scanner {
             return;
           }
           try {
-            await this.bot.api.sendMessage(c.chatId, message, {
+            const sent = await this.bot.api.sendMessage(c.chatId, message, {
               reply_markup: {
                 inline_keyboard: tradeKeyboard(
                   tokenAddress,
@@ -1224,6 +1224,22 @@ export class Scanner {
                 ),
               },
             });
+            // Delivery audit: Telegram returned a message_id, so the card
+            // left us and was accepted. Recording it lets a later "never
+            // got the first card" report be answered with hard evidence.
+            try {
+              await this.db.recordPushDelivery({
+                chatId: c.chatId,
+                token: c.profile.tokenAddress,
+                symbol: c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
+                messageId: Number(
+                  (sent as { message_id?: unknown }).message_id ?? 0,
+                ),
+                mcapAtPush: c.pair.marketCap,
+              });
+            } catch {
+              /* audit is best-effort */
+            }
           } catch (err) {
             // Release the claim: the caller's failure handling + the
             // chat-aware re-eval pool will retry on a later scan.

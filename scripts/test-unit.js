@@ -2549,6 +2549,30 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  await test("push delivery audit ring records message_id and caps at 30", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Two deliveries recorded like sendTo does after sendMessage succeeds.
+      await db.recordPushDelivery({ chatId: "c1", token: "XSTMINT", symbol: "XST", messageId: 111, mcapAtPush: 153000 });
+      await db.recordPushDelivery({ chatId: "c1", token: "GLITCHMINT", symbol: "GLITCH", messageId: 222, mcapAtPush: 194242 });
+      let audit = await db.getPushAudit();
+      assert.equal(audit.length, 2);
+      assert.equal(audit[0].messageId, 111);
+      assert.equal(audit[1].messageId, 222);
+      assert.equal(audit[1].symbol, "GLITCH");
+      // Ring cap: oldest entries fall off, newest survive.
+      for (let i = 0; i < 35; i++) {
+        await db.recordPushDelivery({ chatId: "c1", token: `M${i}`, symbol: null, messageId: i });
+      }
+      audit = await db.getPushAudit();
+      assert.equal(audit.length, 30);
+      assert.equal(audit[audit.length - 1].token, "M34");
+      assert.ok(!audit.some((r) => r.token === "XSTMINT"), "oldest entry evicted");
+    } finally { t.cleanup(); }
+  });
+
   // ---------- unwatch tombstone vs self-heal ----------
   await test("setPushWatchState tombstones a row so findUntrackedPushes skips it", async () => {
     const t = tmpDb();

@@ -1181,6 +1181,14 @@ export default {
       });
     }
 
+    // Delivery audit ring: the last 30 successful initial push sends with
+    // Telegram's message_id — answers "was the card actually sent?" with
+    // hard evidence instead of inference (XST / GLITCH reports).
+    if (url.pathname === "/debug/push-audit") {
+      const rows = (await db?.getPushAudit()) ?? [];
+      return Response.json({ ok: true, count: rows.length, rows });
+    }
+
     // Push history — read-only distribution of seen_tokens for diagnosing
     // "why is push volume low" (all pushes ever, grouped by day, oldest 20).
     if (url.pathname === "/debug/token") {

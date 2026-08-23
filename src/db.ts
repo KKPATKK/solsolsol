@@ -1194,6 +1194,53 @@ export class Db {
     await this.bumpTelemetryCounter("telemetry_seen_tokens_count", -1);
   }
 
+  /**
+   * Delivery audit ring (worker_state JSON, last N entries): records the
+   * Telegram message_id returned by each successful initial push card send,
+   * so a "never received the first card" report (XST, GLITCH) can be
+   * answered definitively — "sent at T, Telegram accepted it as message M"
+   * — instead of inferred from indirect evidence. Read-modify-write is
+   * acceptable here: the audit is best-effort diagnostics and losing an
+   * entry to a cross-isolate race is fine.
+   */
+  async recordPushDelivery(entry: {
+    chatId: string;
+    token: string;
+    symbol: string | null;
+    messageId: number;
+    mcapAtPush?: number;
+  }): Promise<void> {
+    const raw = await this.getWorkerState("push_audit");
+    let list: unknown[] = [];
+    try {
+      list = raw ? (JSON.parse(raw) as unknown[]) : [];
+    } catch {
+      list = [];
+    }
+    list.push({ ...entry, at: Date.now() });
+    if (list.length > 30) list = list.slice(-30);
+    await this.setWorkerState("push_audit", JSON.stringify(list));
+  }
+
+  /** Newest-last view of the delivery audit ring for /debug/push-audit. */
+  async getPushAudit(): Promise<
+    Array<{
+      chatId: string;
+      token: string;
+      symbol: string | null;
+      messageId: number;
+      mcapAtPush?: number;
+      at: number;
+    }>
+  > {
+    const raw = await this.getWorkerState("push_audit");
+    try {
+      return raw ? (JSON.parse(raw) as never) : [];
+    } catch {
+      return [];
+    }
+  }
+
   private statsFromRow(row: Record<string, unknown>): TokenStats {
     const birdeye = row.birdeye_1m_vol;
     const rugcheck = row.rugcheck_bundler_pct;
