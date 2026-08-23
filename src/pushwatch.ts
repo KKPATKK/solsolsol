@@ -35,6 +35,15 @@ const RISING_STAGES = [50, 100, 200, 400] as const;
  * audit ring (delivered long ago) or are far past any recovery point.
  */
 const FIRST_CARD_RESEND_GRACE_MS = 15 * 60_000;
+/**
+ * ⚡ Price/holder divergence (the JEFFERY shape): price ≥ +25% vs push while
+ * the holder base shrank ≥10% vs its rolling baseline — the run is being
+ * carried by fewer and fewer wallets, so pullbacks tend to be fast and
+ * deep. One card per activation; the "div" mark (persistent in up_stages)
+ * re-arms as soon as either side of the condition recovers.
+ */
+const DIVERGENCE_MIN_GAIN_PCT = 25;
+const DIVERGENCE_MIN_DROP_PCT = 0.10;
 /** Drawdown-from-peak thresholds for the weak / dead states (%). */
 const WEAK_DRAWDOWN_PCT = 35;
 const DEAD_DRAWDOWN_PCT = 55;
@@ -124,6 +133,7 @@ export interface WatchAlert {
     | "rising"
     | "weak"
     | "dead"
+    | "divergence"
     | "liquidity"
     | "holders"
     | "ignition"
@@ -420,6 +430,39 @@ export function evaluateWatch(
         );
         lastState = "hold";
         resetBaselineHolders = row.holdersLast;
+      }
+    }
+
+    // ⚡ Divergence detector: strong price gain on a SHRINKING holder base.
+    // Persistent "div" mark (up_stages): fires once per activation and
+    // re-arms as soon as holders stop shrinking or the gain cools off.
+    if (row.holdersAtPush !== null && row.holdersLast !== null && row.holdersAtPush > 0) {
+      const holderRatio = row.holdersLast / row.holdersAtPush;
+      const divActive =
+        chgSincePush >= DIVERGENCE_MIN_GAIN_PCT &&
+        holderRatio <= 1 - DIVERGENCE_MIN_DROP_PCT;
+      if (!divActive && firedStages.has("div")) {
+        firedStages.delete("div");
+        const csv = [...firedStages].sort().join(",");
+        if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
+          announcedUpStages = csv;
+        }
+      }
+      if (
+        cooledDown &&
+        divActive &&
+        !firedStages.has("div")
+      ) {
+        fire(
+          "divergence",
+          `⚡ 籌碼集中 ${symbol} | 價 ${pct(chgSincePush)}（推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)}）| 持倉 ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (${pct((holderRatio - 1) * 100)})— 價漲人跌：漲幅由越來越少的錢包推動，回撤會又快又深`,
+        );
+        firedStages.add("div");
+        lastState = "divergence";
+        const csv = [...firedStages].sort().join(",");
+        if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
+          announcedUpStages = csv;
+        }
       }
     }
   }

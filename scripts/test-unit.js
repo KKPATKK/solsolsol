@@ -2573,6 +2573,55 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  await test("evaluateWatch: divergence fires once per activation, re-arms on recovery", async () => {
+    const mkRow = (over) => ({
+      token: "T", chatId: "c", symbol: "JEFFERY", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 70_000, lastLiquidity: 20_000,
+      deadTroughMcap: null, holdersCheckedAt: null,
+      holdersAtPush: 1000, holdersLast: 850,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0,
+      lastState: null, sellDomStreak: 0, lastMcap: null,
+      lastVol5m: null, upStages: null,
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+    // +30% price on a -15% holder base (the JEFFERY shape).
+    const live = () => ({ mcap: 65_000, liquidity: 19_000, chg5m: 3, vol5m: 5_000, buysH1: 90, sellsH1: 80 });
+
+    // Fires once and persists the div mark.
+    const d1 = evaluateWatch(mkRow(), 1000, live(), cfg);
+    const div1 = d1.alerts.find((a) => a.kind === "divergence");
+    assert.ok(div1 && /⚡ 籌碼集中/.test(div1.text));
+    assert.ok(d1.announcedUpStages?.includes("div"));
+
+    // A 📈/🚀 wiping lastState must NOT re-fire it.
+    const d2 = evaluateWatch(
+      mkRow({ upStages: d1.announcedUpStages, lastState: "hold" }),
+      2000, live(), cfg,
+    );
+    assert.ok(!d2.alerts.some((a) => a.kind === "divergence"), "same activation must not re-fire");
+
+    // Holders stop shrinking → mark clears…
+    const rec = evaluateWatch(
+      mkRow({ upStages: d1.announcedUpStages, lastState: null }),
+      3000, { ...live(), mcap: 65_000 }, cfg,
+    );
+    assert.ok(!rec.announcedUpStages?.includes("div"));
+
+    // …and a fresh shrinkage re-arms the signal.
+    const d3 = evaluateWatch(
+      mkRow({ upStages: rec.announcedUpStages ?? undefined, lastState: null }),
+      4000, live(), cfg,
+    );
+    assert.equal(d3.alerts.filter((a) => a.kind === "divergence").length, 1);
+
+    // Below thresholds: +20% gain → silent even with shrinking holders.
+    const quiet = evaluateWatch(
+      mkRow(), 5000, { ...live(), mcap: 60_000 }, cfg,
+    );
+    assert.ok(!quiet.alerts.some((a) => a.kind === "divergence"));
+  });
+
   await test("evaluateWatch: weak depth memory survives state wipes; escalates once; re-arms on recovery", async () => {
     const mkRow = (over) => ({
       token: "T", chatId: "c", symbol: "BABYCATE", pushedAt: 0,
