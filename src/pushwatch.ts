@@ -356,18 +356,32 @@ export function evaluateWatch(
       }
     }
 
-    // Weak: meaningful runup then ≥35% off the peak.
+    // Weak: meaningful runup then ≥35% off the peak. Depth-staged with
+    // PERSISTENT memory (w35/w45 marks in up_stages next to the 🚀 stages):
+    // a 📈/🚀 overwriting lastState used to re-fire the same ⚠️ one cooldown
+    // later (BABYCATE -37% then -39%). Escalates once more at -45%; re-arms
+    // only on real recovery above -25%; dead takes over at -55%.
     const runupPct = (row.peakMcap / Math.max(row.mcapAtPush, 1) - 1) * 100;
+    if (drawdownFromPeak > -25) {
+      firedStages.delete("w35");
+      firedStages.delete("w45");
+    }
+    const weakMark = drawdownFromPeak <= -45 ? "w45" : "w35";
     if (
       drawdownFromPeak <= -WEAK_DRAWDOWN_PCT &&
       runupPct >= WEAK_MIN_RUNUP_PCT &&
-      lastState !== "weak"
+      !firedStages.has(weakMark)
     ) {
       fire(
         "weak",
         `⚠️ 動能轉弱 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})`,
       );
+      firedStages.add(weakMark);
       lastState = "weak";
+      const csv = [...firedStages].sort().join(",");
+      if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
+        announcedUpStages = csv;
+      }
     }
 
     // Liquidity crash.

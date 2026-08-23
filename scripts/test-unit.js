@@ -2573,6 +2573,55 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
+  await test("evaluateWatch: weak depth memory survives state wipes; escalates once; re-arms on recovery", async () => {
+    const mkRow = (over) => ({
+      token: "T", chatId: "c", symbol: "BABYCATE", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 90_000, lastLiquidity: 20_000,
+      deadTroughMcap: null, holdersCheckedAt: null,
+      holdersAtPush: null, holdersLast: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0,
+      lastState: null, sellDomStreak: 0, lastMcap: null,
+      lastVol5m: null, upStages: "up100,up50",
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+    const live = (mcap) => ({ mcap, liquidity: 19_000, chg5m: -5, vol5m: 5_000, buysH1: 40, sellsH1: 90 });
+
+    // First weak at -37% fires and persists the w35 mark.
+    const w1 = evaluateWatch(mkRow(), 1000, live(56_700), cfg);
+    assert.equal(w1.alerts.filter((a) => a.kind === "weak").length, 1);
+    assert.ok(w1.announcedUpStages?.includes("w35"));
+
+    // The BABYCATE bug: a 📈 wiped lastState ("hold") one cooldown later,
+    // drawdown barely deeper (-39%) — must stay SILENT now.
+    const w2 = evaluateWatch(
+      mkRow({ upStages: w1.announcedUpStages, lastState: "hold" }),
+      2000, live(54_900), cfg,
+    );
+    assert.ok(!w2.alerts.some((a) => a.kind === "weak"), "same depth must not re-fire");
+
+    // Escalation past -45% fires exactly once more (w45).
+    const w3 = evaluateWatch(
+      mkRow({ upStages: w1.announcedUpStages, lastState: "weak" }),
+      3000, live(48_600), cfg,
+    );
+    assert.equal(w3.alerts.filter((a) => a.kind === "weak").length, 1);
+    assert.ok(w3.announcedUpStages?.includes("w45"));
+
+    // Real recovery above -25% clears the marks…
+    const rec = evaluateWatch(
+      mkRow({ upStages: w3.announcedUpStages, lastState: "hold" }),
+      4000, live(80_000), cfg,
+    );
+    assert.ok(!rec.announcedUpStages?.includes("w35"));
+    // …so a re-deepening leg warns again.
+    const w4 = evaluateWatch(
+      mkRow({ upStages: rec.announcedUpStages, lastState: "hold" }),
+      5000, live(56_700), cfg,
+    );
+    assert.equal(w4.alerts.filter((a) => a.kind === "weak").length, 1);
+  });
+
   await test("hasInitialPushAudit: only initial-kind entries qualify for the token", async () => {
     const t = tmpDb();
     try {
