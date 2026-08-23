@@ -1748,6 +1748,8 @@ export class Db {
       lastAlertAt?: number;
       /** Resurrection: reset the push-time mcap baseline to this value. */
       mcapAtPush?: number;
+      /** 📈 alert fired: roll the holders baseline forward to this value. */
+      holdersAtPush?: number;
       /** New 🧨 sell-pressure streak count (persisted as-is). */
       sellDomStreak?: number;
       /** Latest observed mcap (🏁 recap final value). */
@@ -1761,6 +1763,7 @@ export class Db {
               last_vol_5m = COALESCE(?, last_vol_5m),
               dead_trough_mcap = COALESCE(?, dead_trough_mcap),
               mcap_at_push = COALESCE(?, mcap_at_push),
+              holders_at_push = COALESCE(?, holders_at_push),
               sell_dom_streak = ?,
               last_mcap = ?
             WHERE token = ?`,
@@ -1774,6 +1777,7 @@ export class Db {
         v.lastVol5m ?? null,
         v.deadTroughMcap ?? null,
         v.mcapAtPush ?? null,
+        v.holdersAtPush ?? null,
         v.sellDomStreak ?? 0,
         v.lastMcap ?? null,
         token,

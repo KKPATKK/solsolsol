@@ -77,7 +77,9 @@ JUPITER_REQUEST_INTERVAL_MS = "1000"
 # refreshed from ONE DexScreener batch call per tick. Follow-ups report
 # continuation (🚀 +50/100/200/400% stages), breakdown (⚠️ ≥35% off peak,
 # 💀 ≥55% → stop), liquidity collapse (💧 >55% drop) and Birdeye holder
-# growth (📈 +10/25/50% vs push; CU-bounded probes per tick).
+# growth (📈 ≥+10% vs the ROLLING baseline — each 📈 alert rolls the
+# baseline forward, so every card reports fresh incremental growth and a
+# +1 drift never re-fires; CU-bounded probes per tick).
 PUSH_WATCH_ENABLED = "true"
 PUSH_WATCH_MAX_TRACKED = "30"
 PUSH_WATCH_WINDOW_HOURS = "24"

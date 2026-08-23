@@ -798,6 +798,56 @@ async function main() {
     const holderAlert = h.alerts.find((a) => a.kind === "holders");
     assert.ok(holderAlert);
     assert.match(holderAlert.text, /\+25%/);
+    // Baseline rolls forward so the next card reports incremental growth.
+    assert.equal(h.resetBaselineHolders, 1250);
+    assert.equal(h.lastState, "hold");
+  });
+
+  await test("evaluateWatch: rolling holder baseline kills the 216→340 then 216→341 repeat", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "ZEC", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 60_000, lastLiquidity: 12_000,
+      deadTroughMcap: null,
+      holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0,
+      lastState: null, sellDomStreak: 0, lastMcap: null,
+      lastVol5m: null,
+      ...over,
+    });
+    const cfg = { cooldownMs: 1800_000 };
+    const live = (h) => ({ mcap: 55_000, liquidity: 19_000, chg5m: 3, vol5m: 5_000, buysH1: 90, sellsH1: 80 });
+
+    // Step 1: +57% vs push baseline 216 → fires, resets baseline to 340.
+    const e1 = evaluateWatch(row({ holdersAtPush: 216, holdersLast: 340 }), 1000, live(), cfg);
+    const a1 = e1.alerts.find((a) => a.kind === "holders");
+    assert.ok(a1);
+    assert.match(a1.text, /216 → 340/);
+
+    // Step 2 (the reported bug): +1 drift vs the NEW baseline, and even with
+    // another alert type having wiped lastState — must stay silent.
+    const e2 = evaluateWatch(
+      row({ holdersAtPush: 340, holdersLast: 341, lastState: "up50" }),
+      1000 + 1900_000, live(), cfg,
+    );
+    assert.ok(!e2.alerts.some((a) => a.kind === "holders"));
+
+    // Step 3: another real leg (+13% vs rolled baseline 340) → fires again
+    // with the fresh incremental numbers, not the push-time 216.
+    const e3 = evaluateWatch(
+      row({ holdersAtPush: 340, holdersLast: 385, lastState: null }),
+      1000 + 3800_000, live(), cfg,
+    );
+    const a3 = e3.alerts.find((a) => a.kind === "holders");
+    assert.ok(a3);
+    assert.match(a3.text, /340 → 385/);
+    assert.equal(e3.resetBaselineHolders, 385);
+
+    // Cooldown still gates: same growth but alert just fired elsewhere.
+    const e4 = evaluateWatch(
+      row({ holdersAtPush: 340, holdersLast: 385, lastAlertAt: 1000 + 3700_000 }),
+      1000 + 3800_000, live(), cfg,
+    );
+    assert.ok(!e4.alerts.some((a) => a.kind === "holders"));
   });
 
   await test("evaluateWatch: absolute liquidity floor (drained LP) wins and stops tracking", () => {

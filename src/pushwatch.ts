@@ -52,8 +52,13 @@ export const LIQ_FLOOR_USD = 10_000;
  */
 export const IGNITION_VOL_USD = 15_000;
 export const IGNITION_DORMANT_USD = 10_000;
-/** Holder-growth stages (× push-time holders → state suffix). */
-const HOLDER_STAGES = [10, 25, 50] as const;
+/**
+ * Holder-growth threshold vs the ROLLING baseline (holders_at_push). Each
+ * 📈 alert rolls the baseline forward to the current count, so every card
+ * reports fresh incremental growth (+10% over the last REPORTED step)
+ * instead of re-measuring the same push-time delta.
+ */
+const MIN_HOLDER_GROWTH_PCT = 10;
 /**
  * Sell-pressure dominance (🩸 distribution early-warning): an h1 window
  * where sells outnumber buys by more than 1/SELL_DOM_RATIO counts as a
@@ -124,6 +129,13 @@ export interface WatchEval {
    * to this value so the next cycle measures from the recovery point.
    */
   resetBaselineMcap?: number;
+  /**
+   * Set when a 📈 holder alert fires: roll holders_at_push forward to this
+   * value so the NEXT card measures incremental growth from the last
+   * reported count, not the push-time number (kills the "216 → 340" /
+   * "216 → 341" repeat shape).
+   */
+  resetBaselineHolders?: number;
   /** New dead-state trough to persist (lower low while silent-watching). */
   deadTroughMcap?: number | null;
   /** New 🩸 streak count to persist. */
@@ -163,6 +175,7 @@ export function evaluateWatch(
   let lastState = row.lastState;
   let lastAlertAt = row.lastAlertAt;
   let followupsSent = row.followupsSent;
+  let resetBaselineHolders: number | undefined;
 
   const fire = (kind: WatchAlert["kind"], text: string) => {
     alerts.push({ kind, text });
@@ -336,20 +349,26 @@ export function evaluateWatch(
       lastState = "liq";
     }
 
-    // Holder growth stages (Birdeye).
-    if (row.holdersAtPush !== null && row.holdersLast !== null) {
-      const growth = (row.holdersLast / Math.max(row.holdersAtPush, 1) - 1) * 100;
-      for (let i = HOLDER_STAGES.length - 1; i >= 0; i--) {
-        const stage = HOLDER_STAGES[i];
-        const state = `hold${stage}`;
-        if (growth >= stage && lastState !== state) {
-          fire(
-            "holders",
-            `📈 持倉增長 ${symbol} | ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (+${growth.toFixed(0)}%)`,
-          );
-          lastState = state;
-          break;
-        }
+    // Holder growth (Birdeye), measured against a ROLLING baseline: each
+    // 📈 alert rolls holders_at_push forward, so a repeat requires ANOTHER
+    // +10% of NEW holders — a +1 drift like 340 → 341 never re-fires. The
+    // old stage machine keyed off the shared lastState, so any 🚀/⚠️ alert
+    // wiping it let the same-stage 📈 re-send with near-identical content.
+    if (
+      cooledDown &&
+      row.holdersAtPush !== null &&
+      row.holdersLast !== null &&
+      lastState !== "hold"
+    ) {
+      const growth =
+        (row.holdersLast / Math.max(row.holdersAtPush, 1) - 1) * 100;
+      if (growth >= MIN_HOLDER_GROWTH_PCT) {
+        fire(
+          "holders",
+          `📈 持倉增長 ${symbol} | ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (+${growth.toFixed(0)}%)`,
+        );
+        lastState = "hold";
+        resetBaselineHolders = row.holdersLast;
       }
     }
   }
@@ -361,6 +380,7 @@ export function evaluateWatch(
     lastState,
     lastAlertAt,
     stopTracking: false,
+    resetBaselineHolders,
     sellDomStreak,
   };
 }
@@ -592,6 +612,7 @@ export class PushWatcher {
           lastState: row.lastState ?? null,
           lastAlertAt: row.lastAlertAt ?? 0,
           mcapAtPush: evalResult.resetBaselineMcap,
+        holdersAtPush: evalResult.resetBaselineHolders,
           deadTroughMcap: evalResult.deadTroughMcap ?? null,
           sellDomStreak: evalResult.sellDomStreak,
           lastMcap: pair.marketCap,
