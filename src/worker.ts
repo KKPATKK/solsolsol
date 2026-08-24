@@ -1119,23 +1119,34 @@ export default {
           error: "not logged in — run /debug/axiom-login first",
         });
       }
-      // The access JWT lives ~16 minutes — assume it may be stale and
-      // refresh FIRST (Axiom's edge answers expired/absent cookies with a
-      // bare 502 rather than 401, so waiting for a "real" auth error never
-      // triggers). Falls back to the stored token if the refresh fails.
-      const refreshToken0 = await db?.getWorkerState("axiom_refresh_token");
-      if (refreshToken0) {
+      // Refresh ONLY when the stored JWT is actually expired (or nearly):
+      // every refresh rotates the refresh token, so unconditional refreshes
+      // burn the session (the failure mode that killed it once already).
+      const jwtExpired = (tok: string): boolean => {
         try {
-          const fresh = await client.refreshAccessToken(refreshToken0);
-          if (fresh.accessToken) {
-            accessToken = fresh.accessToken;
-            await db?.setWorkerState("axiom_access_token", fresh.accessToken);
-            if (fresh.refreshToken) {
-              await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
-            }
-          }
+          const payload = JSON.parse(
+            Buffer.from(tok.split(".")[1] ?? "", "base64url").toString("utf8"),
+          ) as { exp?: number };
+          return !payload.exp || payload.exp * 1000 < Date.now() + 60_000;
         } catch {
-          // keep the stored token — maybe still valid
+          return true;
+        }
+      };
+      const refreshToken0 = await db?.getWorkerState("axiom_refresh_token");
+      if (!accessToken || jwtExpired(accessToken)) {
+        if (refreshToken0) {
+          try {
+            const fresh = await client.refreshAccessToken(refreshToken0);
+            if (fresh.accessToken) {
+              accessToken = fresh.accessToken;
+              await db?.setWorkerState("axiom_access_token", fresh.accessToken);
+              if (fresh.refreshToken) {
+                await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
+              }
+            }
+          } catch {
+            // keep the stored token — maybe still valid
+          }
         }
       }
       try {
