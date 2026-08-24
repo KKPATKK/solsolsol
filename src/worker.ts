@@ -241,10 +241,16 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
       axiom = null;
-      // The client is created whenever the feed is enabled — credentials are
-      // optional (Google/SSO accounts provide tokens via /debug/axiom-tokens
-      // instead of a password; the client's login methods guard on that).
-      if (config.axiomTrendingLimit > 0) {
+      // The client is created whenever the feed is enabled OR a stored
+      // session exists — credentials are optional (Google/SSO accounts
+      // provide tokens via /debug/axiom-tokens instead of a password; the
+      // client's login methods guard on that). Decoupling from the trending
+      // switch keeps /debug/axiom-token-info usable while the feed is off.
+      if (
+        config.axiomTrendingLimit > 0 ||
+        axiomConfigured ||
+        Boolean(config.axiomEmail && config.axiomPassword)
+      ) {
         try {
           axiom = new AxiomClient(config);
         } catch (err) {
