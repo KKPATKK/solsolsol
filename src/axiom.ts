@@ -443,9 +443,11 @@ export class AxiomClient {
     param = "address",
     /** Extra raw query string appended verbatim (e.g. "onlyTrackedWallets=false&v=123"). */
     extraQuery = "",
+    /** Optional host list override for endpoint discovery (e.g. ["axiom.trade"]). */
+    hostsOverride?: string[],
   ): Promise<{ status: number; data: Record<string, unknown> | null }> {
     let lastError: unknown;
-    for (const host of TRENDING_HOSTS) {
+    for (const host of hostsOverride?.length ? hostsOverride : TRENDING_HOSTS) {
       try {
         const url = `https://${host}${path}?${param}=${encodeURIComponent(mint)}${
           extraQuery ? `&${extraQuery}` : ""

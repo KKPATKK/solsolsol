@@ -1102,6 +1102,12 @@ export default {
       // Raw passthrough for endpoints that require additional params
       // (e.g. top-traders-v4 needs onlyTrackedWallets + a v= timestamp).
       const extraQuery = (url.searchParams.get("extra") ?? "").replace(/[^a-zA-Z0-9_=&.]/g, "");
+      // Optional host override for endpoint discovery — some routes only
+      // exist on specific gateways (e.g. axiom.trade/api, api.axiomtrade.com).
+      const hostsParam = (url.searchParams.get("host") ?? "")
+        .split(",")
+        .map((h) => h.trim().replace(/[^a-z0-9.\-]/g, ""))
+        .filter(Boolean);
       if (!mint) {
         return Response.json({ ok: false, error: "missing ?mint=<address>" });
       }
@@ -1150,7 +1156,7 @@ export default {
         }
       }
       try {
-        const out = await client.fetchTokenInfo(accessToken, mint, path, param, extraQuery);
+        const out = await client.fetchTokenInfo(accessToken, mint, path, param, extraQuery, hostsParam);
         return Response.json({ ok: out.status === 200, status: out.status, data: out.data });
       } catch (err) {
         return Response.json({
