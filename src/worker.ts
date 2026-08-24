@@ -1099,6 +1099,9 @@ export default {
         ? url.searchParams.get("path")!
         : "/read-token-info";
       const param = (url.searchParams.get("param") ?? "address").replace(/[^a-zA-Z0-9_]/g, "");
+      // Raw passthrough for endpoints that require additional params
+      // (e.g. top-traders-v4 needs onlyTrackedWallets + a v= timestamp).
+      const extraQuery = (url.searchParams.get("extra") ?? "").replace(/[^a-zA-Z0-9_=&.]/g, "");
       if (!mint) {
         return Response.json({ ok: false, error: "missing ?mint=<address>" });
       }
@@ -1136,7 +1139,7 @@ export default {
         }
       }
       try {
-        const out = await client.fetchTokenInfo(accessToken, mint, path, param);
+        const out = await client.fetchTokenInfo(accessToken, mint, path, param, extraQuery);
         return Response.json({ ok: out.status === 200, status: out.status, data: out.data });
       } catch (err) {
         return Response.json({

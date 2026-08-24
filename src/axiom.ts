@@ -441,11 +441,15 @@ export class AxiomClient {
     path = "/read-token-info",
     /** Query parameter name for the mint on the target endpoint. */
     param = "address",
+    /** Extra raw query string appended verbatim (e.g. "onlyTrackedWallets=false&v=123"). */
+    extraQuery = "",
   ): Promise<{ status: number; data: Record<string, unknown> | null }> {
     let lastError: unknown;
     for (const host of TRENDING_HOSTS) {
       try {
-        const url = `https://${host}${path}?${param}=${encodeURIComponent(mint)}`;
+        const url = `https://${host}${path}?${param}=${encodeURIComponent(mint)}${
+          extraQuery ? `&${extraQuery}` : ""
+        }`;
         const res = await fetch(url, {
           headers: {
             ...BASE_HEADERS,
