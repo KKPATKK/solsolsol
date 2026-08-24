@@ -1110,26 +1110,27 @@ export default {
           error: "not logged in — run /debug/axiom-login first",
         });
       }
-      try {
-        let out = await client.fetchTokenInfo(accessToken, mint);
-        if (out.status !== 200) {
-          const refreshToken = await db?.getWorkerState("axiom_refresh_token");
-          if (refreshToken) {
-            try {
-              const fresh = await client.refreshAccessToken(refreshToken);
-              if (fresh.accessToken) {
-                accessToken = fresh.accessToken;
-                await db?.setWorkerState("axiom_access_token", fresh.accessToken);
-                if (fresh.refreshToken) {
-                  await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
-                }
-                out = await client.fetchTokenInfo(fresh.accessToken, mint);
-              }
-            } catch {
-              // fall through with the original response
+      // The access JWT lives ~16 minutes — assume it may be stale and
+      // refresh FIRST (Axiom's edge answers expired/absent cookies with a
+      // bare 502 rather than 401, so waiting for a "real" auth error never
+      // triggers). Falls back to the stored token if the refresh fails.
+      const refreshToken0 = await db?.getWorkerState("axiom_refresh_token");
+      if (refreshToken0) {
+        try {
+          const fresh = await client.refreshAccessToken(refreshToken0);
+          if (fresh.accessToken) {
+            accessToken = fresh.accessToken;
+            await db?.setWorkerState("axiom_access_token", fresh.accessToken);
+            if (fresh.refreshToken) {
+              await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
             }
           }
+        } catch {
+          // keep the stored token — maybe still valid
         }
+      }
+      try {
+        const out = await client.fetchTokenInfo(accessToken, mint);
         return Response.json({ ok: out.status === 200, status: out.status, data: out.data });
       } catch (err) {
         return Response.json({
