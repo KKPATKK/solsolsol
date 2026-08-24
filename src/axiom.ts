@@ -436,11 +436,16 @@ export class AxiomClient {
   async fetchTokenInfo(
     accessToken: string,
     mint: string,
+    /** API path — defaults to read-token-info; overridable while the
+     * real per-token endpoint name is being discovered. */
+    path = "/read-token-info",
+    /** Query parameter name for the mint on the target endpoint. */
+    param = "address",
   ): Promise<{ status: number; data: Record<string, unknown> | null }> {
     let lastError: unknown;
     for (const host of TRENDING_HOSTS) {
       try {
-        const url = `https://${host}/read-token-info?address=${encodeURIComponent(mint)}`;
+        const url = `https://${host}${path}?${param}=${encodeURIComponent(mint)}`;
         const res = await fetch(url, {
           headers: {
             ...BASE_HEADERS,

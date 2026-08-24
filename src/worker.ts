@@ -1093,6 +1093,12 @@ export default {
     // so card enrichment can be designed against real field names.
     if (url.pathname === "/debug/axiom-token-info") {
       const mint = (url.searchParams.get("mint") ?? "").trim();
+      // Endpoint discovery: ?path=/xxx&param=yyy probes candidate API
+      // surfaces with the live session (defaults reproduce read-token-info).
+      const path = (url.searchParams.get("path") ?? "/read-token-info").startsWith("/")
+        ? url.searchParams.get("path")!
+        : "/read-token-info";
+      const param = (url.searchParams.get("param") ?? "address").replace(/[^a-zA-Z0-9_]/g, "");
       if (!mint) {
         return Response.json({ ok: false, error: "missing ?mint=<address>" });
       }
@@ -1130,7 +1136,7 @@ export default {
         }
       }
       try {
-        const out = await client.fetchTokenInfo(accessToken, mint);
+        const out = await client.fetchTokenInfo(accessToken, mint, path, param);
         return Response.json({ ok: out.status === 200, status: out.status, data: out.data });
       } catch (err) {
         return Response.json({
