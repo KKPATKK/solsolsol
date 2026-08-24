@@ -1081,6 +1081,58 @@ export default {
       }
     }
 
+    // Axiom token-info probe — per-token detail metrics (creator fee,
+    // volumes, holders) from read-token-info using the stored session.
+    // Refreshes once and retries on auth failure. Reveals the live schema
+    // so card enrichment can be designed against real field names.
+    if (url.pathname === "/debug/axiom-token-info") {
+      const mint = (url.searchParams.get("mint") ?? "").trim();
+      if (!mint) {
+        return Response.json({ ok: false, error: "missing ?mint=<address>" });
+      }
+      const client = axiom;
+      if (!client) {
+        return Response.json({
+          ok: false,
+          error: "Axiom client disabled",
+        });
+      }
+      let accessToken = await db?.getWorkerState("axiom_access_token");
+      if (!accessToken) {
+        return Response.json({
+          ok: false,
+          error: "not logged in — run /debug/axiom-login first",
+        });
+      }
+      try {
+        let out = await client.fetchTokenInfo(accessToken, mint);
+        if (out.status !== 200) {
+          const refreshToken = await db?.getWorkerState("axiom_refresh_token");
+          if (refreshToken) {
+            try {
+              const fresh = await client.refreshAccessToken(refreshToken);
+              if (fresh.accessToken) {
+                accessToken = fresh.accessToken;
+                await db?.setWorkerState("axiom_access_token", fresh.accessToken);
+                if (fresh.refreshToken) {
+                  await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
+                }
+                out = await client.fetchTokenInfo(fresh.accessToken, mint);
+              }
+            } catch {
+              // fall through with the original response
+            }
+          }
+        }
+        return Response.json({ ok: out.status === 200, status: out.status, data: out.data });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // GeckoTerminal trending probe — ground truth for the momentum feed:
     // reports the raw HTTP status + parse count so a persistent geoTrend: 0
     // is diagnosable as rate-limited (429), changed shape, or empty feed.

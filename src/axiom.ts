@@ -425,6 +425,54 @@ export class AxiomClient {
       ? lastError
       : new Error("Axiom trending request failed");
   }
+
+  /**
+   * Per-token detail metrics (read-token-info) — the surface behind the
+   * web app's token page: creator fee, volumes, holder data. The exact
+   * field names are not publicly documented; the raw JSON is returned so
+   * callers can inspect the live schema. Host-fallback mirrors
+   * fetchTrending (auth errors are terminal).
+   */
+  async fetchTokenInfo(
+    accessToken: string,
+    mint: string,
+  ): Promise<{ status: number; data: Record<string, unknown> | null }> {
+    let lastError: unknown;
+    for (const host of TRENDING_HOSTS) {
+      try {
+        const url = `https://${host}/read-token-info?address=${encodeURIComponent(mint)}`;
+        const res = await fetch(url, {
+          headers: {
+            ...BASE_HEADERS,
+            Cookie: `auth-access-token=${accessToken}`,
+          },
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (res.status === 401 || res.status === 403) {
+          throw new Error(`Axiom token-info auth HTTP ${res.status}`);
+        }
+        if (!res.ok) {
+          throw new Error(`Axiom token-info HTTP ${res.status}`);
+        }
+        const payload: unknown = await res.json();
+        return {
+          status: res.status,
+          data:
+            payload && typeof payload === "object"
+              ? (payload as Record<string, unknown>)
+              : null,
+        };
+      } catch (err) {
+        lastError = err;
+        // auth errors are terminal — don't waste the other hosts
+        if (err instanceof Error && /auth/.test(err.message)) throw err;
+        await sleep(300);
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Axiom token-info request failed");
+  }
 }
 
 /**
