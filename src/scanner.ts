@@ -30,6 +30,8 @@ const RUGCHECK_REFRESH_MS = 15 * 60_000;
  * bounds that to a handful of refreshes per outage.
  */
 const AXIOM_REFRESH_COOLDOWN_MS = 5 * 60_000;
+/** Min gap between "Axiom session dead" admin alerts (6h — one nudge per half-day, not per scan). */
+const AXIOM_SESSION_ALERT_GAP_MS = 6 * 3600_000;
 /**
  * After an on-chain (Helius) or Birdeye lookup comes back empty/failed, do
  * not re-query the same token for this long. Every RPC retry costs credits on
@@ -426,6 +428,7 @@ export class Scanner {
     if (!storedToken) return null;
     try {
       const out = await call(storedToken);
+      this.axiomSessionFailStreak = 0; // session alive — reset the alert latch
       return parseAxiomTokenInfo(out.data);
     } catch (err) {
       // Only a rejected session is worth a refresh; everything else
@@ -441,16 +444,49 @@ export class Scanner {
       if (!refreshToken) return null;
       try {
         const fresh = await this.axiom!.refreshAccessToken(refreshToken);
-        if (!fresh || !fresh.accessToken) return null;
+        if (!fresh || !fresh.accessToken) {
+          void this.alertAxiomSessionDead();
+          return null;
+        }
         await this.db.setWorkerState("axiom_access_token", fresh.accessToken);
         if (fresh.refreshToken) {
           await this.db.setWorkerState("axiom_refresh_token", fresh.refreshToken);
         }
         const out = await call(fresh.accessToken);
+        this.axiomSessionFailStreak = 0;
         return parseAxiomTokenInfo(out.data);
       } catch {
+        void this.alertAxiomSessionDead();
         return null;
       }
+    }
+  }
+
+  /** Consecutive auth+refresh failures — drives the one-shot admin alert. */
+  private axiomSessionFailStreak = 0;
+  private axiomSessionAlertAt = 0;
+
+  /**
+   * When the refresh host-cycling still can't renew the session, the bot
+   * degrades to legacy cards silently — the operator would only notice
+   * days later. Ping the first admin once per AXIOM_SESSION_ALERT_GAP
+   * instead so re-pasting tokens via /debug/axiom-tokens happens same-day.
+   */
+  private async alertAxiomSessionDead(): Promise<void> {
+    this.axiomSessionFailStreak++;
+    if (this.axiomSessionFailStreak < 3) return;
+    const now = Date.now();
+    if (now - this.axiomSessionAlertAt < AXIOM_SESSION_ALERT_GAP_MS) return;
+    this.axiomSessionAlertAt = now;
+    const admin = this.config.adminIds[0];
+    if (!admin || !this.bot) return;
+    try {
+      await this.bot.api.sendMessage(
+        String(admin),
+        `⚠️ Axiom session 已死（refresh 被擋）— 推送照常但卡片用緊舊格式、bot-users 閘門暫停。\n修復：瀏覽器登入 axiom.trade → 複製 auth-access-token + auth-refresh-token cookies → 開 /debug/axiom-tokens?access=...&refresh=...`,
+      );
+    } catch {
+      /* best-effort */
     }
   }
 

@@ -396,12 +396,32 @@ export class AxiomClient {
     accessToken: string | null;
     refreshToken: string | null;
   }> {
-    const { status, json, setCookie } = await this.postJson(
-      REFRESH_HOST,
-      "/refresh-access-token",
-      undefined,
-      { Cookie: `auth-refresh-token=${refreshToken}` },
-    );
+    // The refresh endpoint sits behind Cloudflare Bot Management on some
+    // hosts (418 to non-browser TLS fingerprints) — but the block is
+    // PER-HOST and probabilistic. Cycling all shards like the data calls
+    // do turns "one blocked request kills the session" into "the session
+    // survives unless every shard blocks us".
+    const hosts = [REFRESH_HOST, ...TRENDING_HOSTS.filter((h) => h !== REFRESH_HOST)];
+    let status = 0;
+    let json: unknown = null;
+    let setCookie: string | null = null;
+    for (const host of hosts) {
+      try {
+        const out = await this.postJson(
+          host,
+          "/refresh-access-token",
+          undefined,
+          { Cookie: `auth-refresh-token=${refreshToken}` },
+        );
+        status = out.status;
+        json = out.json;
+        setCookie = out.setCookie;
+        if (status === 200) break;
+      } catch {
+        // network error → next host
+      }
+      await sleep(250);
+    }
     if (status !== 200) {
       throw new Error(`Axiom refresh HTTP ${status}`);
     }
