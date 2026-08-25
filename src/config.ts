@@ -404,6 +404,14 @@ export interface AppConfig {
    */
   axiomMinBotUsers: number;
   /**
+   * External refresher mode (AXIOM_EXTERNAL_REFRESH, default off): when on,
+   * the Worker stops refreshing the Axiom session itself — a scheduled
+   * GitHub Action (scripts/axiom-refresh-action.py, curl_cffi Chrome TLS)
+   * is the sole writer. Axiom rotates the refresh token on every call, so
+   * two writers would invalidate each other's sessions.
+   */
+  axiomExternalRefresh: boolean;
+  /**
    * Periodic Birdeye new_listing backfill (BIRDEYE_BACKFILL_ENABLED, default
    * true): every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
    * BIRDEYE_BACKFILL_LOOKBACK_MIN of Birdeye's fresh-launch feed and seeds
@@ -594,6 +602,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     axiomMinBotUsers: Number.isFinite(Number(env.AXIOM_MIN_BOT_USERS ?? 90))
       ? Math.max(0, Math.floor(Number(env.AXIOM_MIN_BOT_USERS ?? 90)))
       : 90,
+    axiomExternalRefresh: (env.AXIOM_EXTERNAL_REFRESH ?? "0") === "1",
     birdeyeBackfillEnabled: (env.BIRDEYE_BACKFILL_ENABLED ?? "true") !== "false",
     birdeyeBackfillIntervalMs:
       Number.isFinite(Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360)) &&

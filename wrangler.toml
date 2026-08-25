@@ -278,6 +278,13 @@ BOT_ADMIN_IDS = "530602939"
 # each token. /debug/axiom-tokens stores tokens, /debug/axiom-refresh
 # probes the blocked endpoint, /debug/axiom-trending probes the feed.
 AXIOM_TRENDING_LIMIT = "0"
+# External Axiom session refresher (single-writer rule). "1" = the Worker
+# NEVER refreshes the session itself; a scheduled GitHub Action
+# (.github/workflows/axiom-refresh.yml, curl_cffi Chrome-TLS) is the sole
+# writer of axiom_access_token/axiom_refresh_token in worker_state. Axiom
+# rotates the refresh token on every call, so flipping this on before the
+# Action is verified green will strand the session. Default "0".
+AXIOM_EXTERNAL_REFRESH = "0"
 # Axiom bot-users push gate: a final candidate whose pair reports fewer
 # distinct Axiom bot users than this floor is rejected as a dead/shill pool.
 # 0 disables. Missing data (session down, no pair address) never judges —

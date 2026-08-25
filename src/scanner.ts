@@ -435,6 +435,14 @@ export class Scanner {
       // (network blip, 404, parse) just degrades to "no data".
       const msg = err instanceof Error ? err.message : String(err);
       if (!/auth/.test(msg)) return null;
+      // Single-writer rule: Axiom rotates the refresh token on every call.
+      // In external-refresher mode the GitHub Action is the ONLY writer —
+      // a Worker-side refresh here would rotate underneath it and kill
+      // both sessions. Just report and wait for the next Action run.
+      if (this.config.axiomExternalRefresh) {
+        void this.alertAxiomSessionDead();
+        return null;
+      }
       const now = Date.now();
       if (now - this.lastAxiomRefreshAt < AXIOM_REFRESH_COOLDOWN_MS) {
         return null;

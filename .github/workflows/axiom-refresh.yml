@@ -1,0 +1,49 @@
+# Axiom session refresher — the Layer-2 sidecar (no hardware needed).
+#
+# Why: axiom.trade's /refresh-access-token intermittently 418s the Cloudflare
+# Worker's TLS fingerprint. This workflow runs curl_cffi (impersonating a real
+# Chrome build) on a GitHub runner, refreshes the pair, and writes it back to
+# Turso worker_state — the exact keys the Worker reads. The Worker must be
+# flipped to AXIOM_EXTERNAL_REFRESH="1" (wrangler.toml) so IT stops refreshing:
+# Axiom rotates the refresh token on every call, so exactly ONE writer may
+# refresh or the two will invalidate each other's sessions.
+#
+# Secrets required (repo → Settings → Secrets and variables → Actions):
+#   TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io
+#   TURSO_AUTH_TOKEN     Turso auth token
+
+name: Axiom session refresher
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: axiom-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install curl_cffi
+        run: pip install --quiet "curl_cffi>=0.7"
+
+      - name: Refresh Axiom tokens
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python scripts/axiom-refresh-action.py
