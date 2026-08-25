@@ -277,7 +277,11 @@ BOT_ADMIN_IDS = "530602939"
 # (JWT exp). So the feed cannot self-renew from the worker and dies with
 # each token. /debug/axiom-tokens stores tokens, /debug/axiom-refresh
 # probes the blocked endpoint, /debug/axiom-trending probes the feed.
-AXIOM_TRENDING_LIMIT = "0"
+# ENABLED 2026-08-25: session is auto-refreshed by the GitHub Action
+# (AXIOM_EXTERNAL_REFRESH=1), so the feed survives token expiry. Scanner
+# caches the feed for 3 min (AXIOM_TREND_CACHE_TTL_MS) — upstream sees at
+# most one call per 3 min, not one per 60s tick.
+AXIOM_TRENDING_LIMIT = "20"
 # External Axiom session refresher (single-writer rule). "1" = the Worker
 # NEVER refreshes the session itself; a scheduled GitHub Action
 # (.github/workflows/axiom-refresh.yml, curl_cffi Chrome-TLS) is the sole

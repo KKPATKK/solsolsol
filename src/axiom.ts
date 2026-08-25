@@ -289,6 +289,13 @@ export function parseAxiomTrending(payload: unknown): AxiomTrendingToken[] {
 export class AxiomClient {
   private readonly email: string | null;
   private readonly b64Password: string | null;
+  /**
+   * Single-writer rule: when the external refresher (GitHub Action,
+   * AXIOM_EXTERNAL_REFRESH=1) owns the session, refreshAccessToken refuses
+   * to run — Axiom rotates the refresh token per call and a rogue Worker
+   * side refresh would invalidate the pair the Action just stored.
+   */
+  private readonly externalRefresh: boolean;
 
   constructor(config: AppConfig) {
     // Credentials are OPTIONAL: accounts that log in via Google/SSO have no
@@ -300,6 +307,7 @@ export class AxiomClient {
     this.b64Password = config.axiomPassword
       ? b64encode(config.axiomPassword)
       : null;
+    this.externalRefresh = config.axiomExternalRefresh;
   }
 
   private async postJson(
@@ -396,6 +404,11 @@ export class AxiomClient {
     accessToken: string | null;
     refreshToken: string | null;
   }> {
+    if (this.externalRefresh) {
+      throw new Error(
+        "Axiom refresh disabled: external refresher owns the session (AXIOM_EXTERNAL_REFRESH=1)",
+      );
+    }
     // The refresh endpoint sits behind Cloudflare Bot Management on some
     // hosts (418 to non-browser TLS fingerprints) — but the block is
     // PER-HOST and probabilistic. Cycling all shards like the data calls

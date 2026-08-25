@@ -30,6 +30,10 @@ const RUGCHECK_REFRESH_MS = 15 * 60_000;
  * bounds that to a handful of refreshes per outage.
  */
 const AXIOM_REFRESH_COOLDOWN_MS = 5 * 60_000;
+/** Trending feed TTL cache — caps upstream Axiom calls at one per 3 min
+ * across scan ticks (was once per 60s tick; rate-limit insurance). */
+const AXIOM_TREND_CACHE_TTL_MS = 3 * 60_000;
+let axiomTrendCache: { at: number; items: AxiomTrendingToken[] } | null = null;
 /** Min gap between "Axiom session dead" admin alerts (6h — one nudge per half-day, not per scan). */
 const AXIOM_SESSION_ALERT_GAP_MS = 6 * 3600_000;
 /**
@@ -498,6 +502,21 @@ export class Scanner {
     }
   }
 
+  /**
+   * TTL-cached trending fetch — the discovery loop calls this every scan
+   * tick, but upstream only sees a request at most once per 3 minutes.
+   */
+  private async fetchTrendingCached(): Promise<AxiomTrendingToken[]> {
+    if (axiomTrendCache && Date.now() - axiomTrendCache.at < AXIOM_TREND_CACHE_TTL_MS) {
+      return axiomTrendCache.items;
+    }
+    const items = await this.fetchAxiomTrending();
+    if (items.length > 0) {
+      axiomTrendCache = { at: Date.now(), items };
+    }
+    return items;
+  }
+
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
   private dataNegativeCached(token: string): boolean {
     const at = this.dataFailedAt.get(token);
@@ -751,7 +770,7 @@ export class Scanner {
       let axiomProfiles: TokenProfile[] = [];
       if (this.axiom && this.config.axiomTrendingLimit > 0) {
         try {
-          const trending = await this.fetchAxiomTrending();
+          const trending = await this.fetchTrendingCached();
           axiomProfiles = trending
             .filter((t) => t.createdAtMs !== null)
             .map((t) => ({
