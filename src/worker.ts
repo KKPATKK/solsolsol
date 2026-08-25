@@ -1205,11 +1205,14 @@ export default {
     if (url.pathname === "/debug/axiom-token-info") {
       const mint = (url.searchParams.get("mint") ?? "").trim();
       // Endpoint discovery: ?path=/xxx&param=yyy probes candidate API
-      // surfaces with the live session (defaults reproduce read-token-info).
-      const path = (url.searchParams.get("path") ?? "/read-token-info").startsWith("/")
+      // surfaces with the live session. Defaults mirror the PRODUCTION
+      // combo (/token-info + pairAddress) so a bare ?mint=<pair> probe
+      // exercises the same route the scanner uses — NOT the dead legacy
+      // /read-token-info path (404/530) that once caused false alarms.
+      const path = (url.searchParams.get("path") ?? "/token-info").startsWith("/")
         ? url.searchParams.get("path")!
-        : "/read-token-info";
-      const param = (url.searchParams.get("param") ?? "address").replace(/[^a-zA-Z0-9_]/g, "");
+        : "/token-info";
+      const param = (url.searchParams.get("param") ?? "pairAddress").replace(/[^a-zA-Z0-9_]/g, "");
       // Raw passthrough for endpoints that require additional params
       // (e.g. top-traders-v4 needs onlyTrackedWallets + a v= timestamp).
       const extraQuery = (url.searchParams.get("extra") ?? "").replace(/[^a-zA-Z0-9_=&.]/g, "");
