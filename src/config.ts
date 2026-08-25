@@ -395,6 +395,15 @@ export interface AppConfig {
    */
   axiomTrendingLimit: number;
   /**
+   * Axiom bot-users push gate (AXIOM_MIN_BOT_USERS, default 90, 0 = off).
+   * A candidate whose pair reports fewer distinct Axiom bot users than this
+   * floor is rejected as a dead/shill pool — calibrated on live samples:
+   * every coin the operator liked had 140+, junk sat below 90. One API call
+   * per final candidate; missing data (session down, no pair address) never
+   * judges so a dead session can't silence pushes.
+   */
+  axiomMinBotUsers: number;
+  /**
    * Periodic Birdeye new_listing backfill (BIRDEYE_BACKFILL_ENABLED, default
    * true): every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
    * BIRDEYE_BACKFILL_LOOKBACK_MIN of Birdeye's fresh-launch feed and seeds
@@ -582,6 +591,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     axiomTrendingLimit: Number.isFinite(Number(env.AXIOM_TRENDING_LIMIT ?? 20))
       ? Math.max(0, Math.min(Math.floor(Number(env.AXIOM_TRENDING_LIMIT ?? 20)), 100))
       : 20,
+    axiomMinBotUsers: Number.isFinite(Number(env.AXIOM_MIN_BOT_USERS ?? 90))
+      ? Math.max(0, Math.floor(Number(env.AXIOM_MIN_BOT_USERS ?? 90)))
+      : 90,
     birdeyeBackfillEnabled: (env.BIRDEYE_BACKFILL_ENABLED ?? "true") !== "false",
     birdeyeBackfillIntervalMs:
       Number.isFinite(Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360)) &&

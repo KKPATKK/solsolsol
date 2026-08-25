@@ -19,7 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
@@ -50,6 +50,24 @@ function tmpDb() {
 }
 
 async function main() {
+  // ---------- scanner.ts push gates ----------
+
+  await test("botUsersBlockReason: dead pools blocked below the floor, healthy pass", () => {
+    // Junk pool shape (calibration: liked coins had 140+, junk sat < 90).
+    assert.match(botUsersBlockReason(37, 90), /37 < 90/);
+    // Just under the line blocks; exactly at the line passes (strict <).
+    assert.match(botUsersBlockReason(89, 90), /89/);
+    assert.equal(botUsersBlockReason(90, 90), null);
+    // Healthy pools pass.
+    assert.equal(botUsersBlockReason(140, 90), null);
+    assert.equal(botUsersBlockReason(1200, 90), null);
+    // Missing data never judges (session down / no pair address).
+    assert.equal(botUsersBlockReason(null, 90), null);
+    assert.equal(botUsersBlockReason(NaN, 90), null);
+    // Disabled.
+    assert.equal(botUsersBlockReason(5, 0), null);
+  });
+
   // ---------- db.ts ----------
 
   await test("db.init creates all tables and is idempotent", async () => {

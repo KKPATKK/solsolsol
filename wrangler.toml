@@ -278,6 +278,11 @@ BOT_ADMIN_IDS = "530602939"
 # each token. /debug/axiom-tokens stores tokens, /debug/axiom-refresh
 # probes the blocked endpoint, /debug/axiom-trending probes the feed.
 AXIOM_TRENDING_LIMIT = "0"
+# Axiom bot-users push gate: a final candidate whose pair reports fewer
+# distinct Axiom bot users than this floor is rejected as a dead/shill pool.
+# 0 disables. Missing data (session down, no pair address) never judges —
+# the push goes out rather than being silently dropped.
+AXIOM_MIN_BOT_USERS = "90"
 # Jupiter Swap API v1 (Metis) — the old v6 quote-api.jup.ag endpoints are
 # retired. Keyless works at 0.5 RPS; set JUPITER_API_KEY (a SECRET, via the
 # dashboard or `wrangler secret put`) as the x-api-key header to unlock

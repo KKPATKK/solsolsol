@@ -235,6 +235,24 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Axiom bot-users gate: coins traded by fewer than `min` distinct Axiom bot
+ * users are dead/shill pools with no real trader interest (calibrated on
+ * live samples — every coin the operator liked had 140+; junk sat below 90).
+ * null (endpoint failure, session down, or no pair address) never judges;
+ * min 0 disables. One API call per final candidate only.
+ */
+export function botUsersBlockReason(
+  numBotUsers: number | null,
+  min: number,
+): string | null {
+  if (!(min > 0)) return null;
+  if (numBotUsers === null || !Number.isFinite(numBotUsers)) return null;
+  return numBotUsers < min
+    ? `Axiom bot用戶僅 ${Math.round(numBotUsers)} < ${Math.round(min)}（真實交易者太少：殭屍盤/自拉盤）`
+    : null;
+}
+
+/**
  * Normalized description of a Telegram push failure (grammY ApiError or
  * network error) — code + description for the logs and worker_state, plus
  * whether a same-tick retry is worth it. Transient = 429 (rate limit),
@@ -1094,6 +1112,25 @@ export class Scanner {
           );
           continue;
         }
+        // Axiom bot-users gate — one API call per final candidate; runs
+        // FIRST among the enrichments so a reject saves the Birdeye/GMGN/
+        // Arkham/Jupiter/wallet budget entirely. Missing data (session
+        // down, no pair address) never judges — a dead session must not
+        // silence the bot.
+        if (this.axiom && this.config.axiomMinBotUsers > 0) {
+          const botUsers = coin.pair.pairAddress
+            ? await this.resolveAxiomBotUsers(coin.pair.pairAddress)
+            : null;
+          const botReason = botUsersBlockReason(botUsers, this.config.axiomMinBotUsers);
+          if (botReason) {
+            diag.fails.other++;
+            this.addReject(diag, coin, botReason);
+            console.log(
+              `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (axiom bot-users below floor)`,
+            );
+            continue;
+          }
+        }
         // Trader data is resolved for the message card but no longer
         // filters — the sniper filter was removed, so coins push even when
         // the data is not ready yet.
@@ -1846,6 +1883,59 @@ export class Scanner {
    * (5 min) and degrades to no enrichment; the push is only blocked when a
    * confirmed wash-trading flag comes back and blocking is enabled.
    */
+  /**
+   * Axiom bot-users count for one candidate pair (/token-info?pairAddress).
+   * Best-effort: null on any failure or missing data so the gate never
+   * judges. On an auth error, does ONE cooldown-guarded refresh then
+   * retries once — same discipline as the trending feed (unconditional
+   * refreshes rotate and burn the session).
+   */
+  private async resolveAxiomBotUsers(
+    pairAddress: string,
+  ): Promise<number | null> {
+    if (!this.axiom) return null;
+    const call = (accessToken: string) =>
+      this.axiom!.fetchTokenInfo(
+        accessToken,
+        pairAddress,
+        "/token-info",
+        "pairAddress",
+      );
+    const extract = (data: Record<string, unknown> | null): number | null => {
+      const n = Number(data?.numBotUsers);
+      return Number.isFinite(n) ? n : null;
+    };
+    const storedToken = await this.db.getWorkerState("axiom_access_token");
+    if (!storedToken) return null;
+    try {
+      const out = await call(storedToken);
+      return extract(out.data);
+    } catch (err) {
+      // Only a rejected session is worth a refresh; everything else
+      // (network blip, 404, parse) just degrades to "no data".
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/auth/.test(msg)) return null;
+      const now = Date.now();
+      if (now - this.lastAxiomRefreshAt < AXIOM_REFRESH_COOLDOWN_MS) {
+        return null;
+      }
+      this.lastAxiomRefreshAt = now;
+      const refreshToken = await this.db.getWorkerState("axiom_refresh_token");
+      if (!refreshToken) return null;
+      try {
+        const fresh = await this.axiom!.refreshAccessToken(refreshToken);
+        if (!fresh || !fresh.accessToken) return null;
+        await this.db.setWorkerState("axiom_access_token", fresh.accessToken);
+        if (fresh.refreshToken) {
+          await this.db.setWorkerState("axiom_refresh_token", fresh.refreshToken);
+        }
+        const out = await call(fresh.accessToken);
+        return extract(out.data);
+      } catch {
+        return null;
+      }
+    }
+  }
   private async resolveGmgnInfo(
     coin: QualifyingCoin,
   ): Promise<GmgnTokenInfo | null> {
