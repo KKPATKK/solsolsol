@@ -12,7 +12,9 @@ import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
 import { JupTokensClient } from "./jupfeeds";
 import { GmgnClient } from "./gmgn";
-import { AxiomClient } from "./axiom";
+import { AxiomClient, parseAxiomTokenInfo, type AxiomTokenInfo } from "./axiom";
+import { renderMessage } from "./render";
+import type { QualifyingCoin } from "./scanner";
 import { ArkhamClient } from "./arkham";
 import { CrimeWalletClient } from "./crimewallets";
 import { WalletAnalyzer } from "./walletanalysis";
@@ -676,6 +678,113 @@ export default {
     const url = new URL(request.url);
 
     // UptimeRobot target: distinguishes "worker up" from "scanner working".
+    // /debug/card-preview — renders ONE push card with LIVE Axiom
+    // token-info data for ?pair=<pairAddress> and sends it to ?chatId=
+    // (defaults to the first admin). Pure preview: no DB writes, no seen
+    // claims; market rows are clearly-marked placeholders so only the new
+    // Axiom summary line is under test. If the payload can't resolve, the
+    // card intentionally shows the legacy lines — that fallback IS part of
+    // what's being previewed.
+    if (url.pathname === "/debug/card-preview") {
+      const client = axiom;
+      if (!client) {
+        return Response.json({ ok: false, error: "Axiom client unavailable" });
+      }
+      const pairAddr = (url.searchParams.get("pair") ?? "").trim();
+      if (!pairAddr) {
+        return Response.json(
+          { ok: false, error: "missing ?pair=<pairAddress>" },
+          { status: 400 },
+        );
+      }
+      let chatId = (url.searchParams.get("chatId") ?? "").trim();
+      if (!chatId && cfg?.adminIds.length) chatId = String(cfg.adminIds[0]);
+      if (!chatId) {
+        return Response.json(
+          { ok: false, error: "missing ?chatId= and no admins configured" },
+          { status: 400 },
+        );
+      }
+      let axiomPayload: AxiomTokenInfo | null = null;
+      try {
+        const accessToken = await db?.getWorkerState("axiom_access_token");
+        if (accessToken) {
+          try {
+            const out = await client.fetchTokenInfo(
+              accessToken,
+              pairAddr,
+              "/token-info",
+              "pairAddress",
+            );
+            axiomPayload = parseAxiomTokenInfo(out.data);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (/auth/.test(msg)) {
+              const refreshToken = await db?.getWorkerState("axiom_refresh_token");
+              if (refreshToken) {
+                const fresh = await client.refreshAccessToken(refreshToken);
+                if (fresh?.accessToken) {
+                  await db?.setWorkerState("axiom_access_token", fresh.accessToken);
+                  if (fresh.refreshToken) {
+                    await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
+                  }
+                  const out2 = await client.fetchTokenInfo(
+                    fresh.accessToken,
+                    pairAddr,
+                    "/token-info",
+                    "pairAddress",
+                  );
+                  axiomPayload = parseAxiomTokenInfo(out2.data);
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        axiomPayload = null; // fallback branch — legacy lines stay visible
+      }
+      const now = Date.now();
+      const mockCoin = {
+        chatId,
+        profile: { tokenAddress: pairAddr, name: "Card Preview", symbol: "PREVIEW" },
+        pair: {
+          baseToken: { address: pairAddr, name: "Card Preview", symbol: "PREVIEW" },
+          pairAddress: pairAddr,
+          priceUsd: 0.0001329,
+          marketCap: 132900,
+          liquidity: { usd: 21000 },
+          pairCreatedAt: now - 5 * 3600_000,
+          priceChange: { m5: 3.2 },
+          volume: { m5: 23400, h24: 183000 },
+        },
+        stats: { token: pairAddr },
+      } as unknown as QualifyingCoin;
+      const message = renderMessage(
+        mockCoin,
+        null,
+        null,
+        null,
+        true,
+        null,
+        null,
+        null,
+        null,
+        { hit: false, creatorHit: false, holderHits: [], checkedHolders: 0, loaded: false, holders: [] },
+        null,
+        null,
+        axiomPayload,
+      );
+      let sent = false;
+      let sendError: string | null = null;
+      try {
+        await bot!.api.sendMessage(chatId, message);
+        sent = true;
+      } catch (err) {
+        sendError = err instanceof Error ? err.message : String(err);
+      }
+      return Response.json({ ok: sent, chatId, sent, sendError, message });
+    }
+
     if (url.pathname === "/health") {
       let heartbeat: unknown = null;
       let lastScanGapMs: number | null = null;
