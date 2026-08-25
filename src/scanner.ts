@@ -11,7 +11,8 @@ import type { TradeService } from "./jupiter";
 import type { PumpFunClient } from "./pumpfun";
 import type { GeckoTerminalClient } from "./geckoterminal";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
-import type { AxiomClient, AxiomTrendingToken } from "./axiom";
+import type { AxiomClient, AxiomTokenInfo, AxiomTrendingToken } from "./axiom";
+import { parseAxiomTokenInfo } from "./axiom";
 import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
 import type { CrimeWalletClient } from "./crimewallets";
 import type { JupTokensClient } from "./jupfeeds";
@@ -397,6 +398,60 @@ export class Scanner {
           (addresses: string[]) => this.dex.fetchPairsForTokens(addresses),
         )
       : null;
+  }
+
+  /**
+   * Full /token-info payload for one candidate pair (?pairAddress=) — the
+   * bot-users count AND the nine other fields shown on the push card
+   * summary line. Best-effort: null on any failure so the gate never
+   * judges and the card falls back to the legacy lines. On an auth error,
+   * does ONE cooldown-guarded refresh then retries once — same discipline
+   * as the trending feed (unconditional refreshes rotate and burn the
+   * session). NOTE: supersedes resolveAxiomBotUsers further below, which
+   * is now dead code kept only because the file-sync layer cannot edit
+   * that region of this file.
+   */
+  private async resolveAxiomTokenInfo(
+    pairAddress: string,
+  ): Promise<AxiomTokenInfo | null> {
+    if (!this.axiom) return null;
+    const call = (accessToken: string) =>
+      this.axiom!.fetchTokenInfo(
+        accessToken,
+        pairAddress,
+        "/token-info",
+        "pairAddress",
+      );
+    const storedToken = await this.db.getWorkerState("axiom_access_token");
+    if (!storedToken) return null;
+    try {
+      const out = await call(storedToken);
+      return parseAxiomTokenInfo(out.data);
+    } catch (err) {
+      // Only a rejected session is worth a refresh; everything else
+      // (network blip, 404, parse) just degrades to "no data".
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/auth/.test(msg)) return null;
+      const now = Date.now();
+      if (now - this.lastAxiomRefreshAt < AXIOM_REFRESH_COOLDOWN_MS) {
+        return null;
+      }
+      this.lastAxiomRefreshAt = now;
+      const refreshToken = await this.db.getWorkerState("axiom_refresh_token");
+      if (!refreshToken) return null;
+      try {
+        const fresh = await this.axiom!.refreshAccessToken(refreshToken);
+        if (!fresh || !fresh.accessToken) return null;
+        await this.db.setWorkerState("axiom_access_token", fresh.accessToken);
+        if (fresh.refreshToken) {
+          await this.db.setWorkerState("axiom_refresh_token", fresh.refreshToken);
+        }
+        const out = await call(fresh.accessToken);
+        return parseAxiomTokenInfo(out.data);
+      } catch {
+        return null;
+      }
+    }
   }
 
   /** True while an on-chain/Birdeye retry for this token should be skipped. */
@@ -1112,16 +1167,21 @@ export class Scanner {
           );
           continue;
         }
-        // Axiom bot-users gate — one API call per final candidate; runs
-        // FIRST among the enrichments so a reject saves the Birdeye/GMGN/
-        // Arkham/Jupiter/wallet budget entirely. Missing data (session
-        // down, no pair address) never judges — a dead session must not
-        // silence the bot.
-        if (this.axiom && this.config.axiomMinBotUsers > 0) {
-          const botUsers = coin.pair.pairAddress
-            ? await this.resolveAxiomBotUsers(coin.pair.pairAddress)
+        // Axiom token-info — one API call feeds BOTH the bot-users push
+        // gate and the card summary line (Top 10 | 持有人 | Pro | Dev | …).
+        // Runs FIRST among the enrichments so a gate reject saves the
+        // Birdeye/GMGN/Arkham/Jupiter/wallet budget entirely. Missing data
+        // (session down, no pair address) never judges and hides the card
+        // line instead — a dead session must not silence the bot.
+        const axiomInfo =
+          this.axiom && coin.pair.pairAddress
+            ? await this.resolveAxiomTokenInfo(coin.pair.pairAddress)
             : null;
-          const botReason = botUsersBlockReason(botUsers, this.config.axiomMinBotUsers);
+        if (this.config.axiomMinBotUsers > 0) {
+          const botReason = botUsersBlockReason(
+            axiomInfo?.numBotUsers ?? null,
+            this.config.axiomMinBotUsers,
+          );
           if (botReason) {
             diag.fails.other++;
             this.addReject(diag, coin, botReason);
@@ -1241,6 +1301,7 @@ export class Scanner {
           crime,
           wallet,
           organic,
+          axiomInfo,
         );
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
           // Atomic claim BEFORE sending: overlapping isolates can both pass

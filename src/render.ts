@@ -1,9 +1,57 @@
 import { fmtAge, fmtUsd } from "./format";
 import type { ArkhamTokenHolders } from "./arkham";
+import type { AxiomTokenInfo } from "./axiom";
 import type { CrimeCheckResult } from "./crimewallets";
 import type { GmgnTokenInfo } from "./gmgn";
 import type { QualifyingCoin } from "./scanner";
 import type { WalletAnalysisResult } from "./walletanalysis";
+
+/**
+ * Axiom /token-info summary line — one compact pipe-separated strip that
+ * replaces the five legacy enrichment lines (Bundler/Top10/供應流/Sniper/
+ * Holders) when the payload resolves. Format (operator spec):
+ *   Top 10 22% | 持有人 356 | Pro 238 | Dev 0% | 內部 22.1% | 捆綁 0.1% |
+ *   狙擊 0% | 已付Dex | Creator 已收 184 SOL
+ * 內部 ≥15% / 捆綁 ≥13% / 狙擊 ≥5% get a 🔴 flag; missing identity fields
+ * hide the whole line (null) and the caller falls back to legacy lines.
+ */
+export function renderAxiomSummaryLine(
+  axiom: AxiomTokenInfo | null,
+): string | null {
+  if (!axiom) return null;
+  if (
+    axiom.numBotUsers === null ||
+    axiom.numHolders === null ||
+    axiom.top10HoldersPercent === null
+  ) {
+    return null; // 缺數據整行隱藏 — partial payloads mean schema drift
+  }
+  // One decimal, trailing .0 trimmed: 22 → "22%", 22.1 → "22.1%", 0 → "0%".
+  const pct = (v: number): string => `${Math.round(v * 10) / 10}%`;
+  const flag = (v: number, min: number): string => (v >= min ? "🔴" : "");
+  const segs = [
+    `Top 10 ${pct(axiom.top10HoldersPercent)}`,
+    `持有人 ${Math.round(axiom.numHolders).toLocaleString("en-US")}`,
+    `Pro ${Math.round(axiom.numBotUsers)}`,
+    ...(axiom.devHoldsPercent !== null
+      ? [`Dev ${pct(axiom.devHoldsPercent)}`]
+      : []),
+    ...(axiom.insidersHoldPercent !== null
+      ? [`${flag(axiom.insidersHoldPercent, 15)}內部 ${pct(axiom.insidersHoldPercent)}`]
+      : []),
+    ...(axiom.bundlersHoldPercent !== null
+      ? [`${flag(axiom.bundlersHoldPercent, 13)}捆綁 ${pct(axiom.bundlersHoldPercent)}`]
+      : []),
+    ...(axiom.snipersHoldPercent !== null
+      ? [`${flag(axiom.snipersHoldPercent, 5)}狙擊 ${pct(axiom.snipersHoldPercent)}`]
+      : []),
+    ...(axiom.dexPaid !== null ? [axiom.dexPaid ? "已付Dex" : "未付Dex"] : []),
+    ...(axiom.creatorFeesSol !== null
+      ? [`Creator 已收 ${Math.round(axiom.creatorFeesSol * 10) / 10} SOL`]
+      : []),
+  ];
+  return segs.join(" | ");
+}
 
 /**
  * Renders the Telegram push card for a qualifying coin. Pure (no I/O), so
@@ -30,6 +78,8 @@ export function renderMessage(
     label: string | null;
     tradersH1: number | null;
   } | null,
+  /** Axiom /token-info payload (null = fetch failed → legacy lines). */
+  axiom: AxiomTokenInfo | null,
 ): string {
   const { pair, profile } = coin;
   const name = pair.baseToken.name || profile.name || "Unknown";
@@ -133,17 +183,18 @@ export function renderMessage(
             ? ""
             : ` | 1h 交易者 ${organic.tradersH1.toLocaleString("en-US")}`
         }`;
+  // Axiom summary replaces the five legacy enrichment lines when the
+  // payload resolved; otherwise the card keeps today's exact shape.
+  const axiomSummary = renderAxiomSummaryLine(axiom);
   const lines = [
     `🪙 ${name} (${symbol})`,
     `💵 价格: ${fmtUsd(price)}`,
     `💰 市值: ${fmtUsd(pair.marketCap)}`,
     `⚡ 5m 涨幅: ${pair.priceChange.m5 >= 0 ? "+" : ""}${pair.priceChange.m5.toFixed(2)}%`,
     `📊 5m 量: ${fmtUsd(pair.volume.m5)}`,
-    bundlerLine,
-    top10Line,
-    flowLine,
-    sniperLine,
-    holdersLine,
+    ...(axiomSummary
+      ? [axiomSummary]
+      : [bundlerLine, top10Line, flowLine, sniperLine, holdersLine]),
     ...(organicLine ? [organicLine] : []),
     creatorLine,
     ...(gmgnLine ? [gmgnLine] : []),

@@ -21,6 +21,8 @@ const { passesChgGate } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
+const { renderAxiomSummaryLine } = require("../dist/render.js");
+const { parseAxiomTokenInfo } = require("../dist/axiom.js");
 const { parseTokenOverview } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
 const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
@@ -66,6 +68,64 @@ async function main() {
     assert.equal(botUsersBlockReason(NaN, 90), null);
     // Disabled.
     assert.equal(botUsersBlockReason(5, 0), null);
+  });
+
+  await test("renderAxiomSummaryLine: operator format, red flags, fallbacks", () => {
+    // Live Burpcoin sample — exact operator-specified layout.
+    const burp = renderAxiomSummaryLine(
+      parseAxiomTokenInfo({
+        numHolders: 836,
+        numBotUsers: 237,
+        top10HoldersPercent: 26.346290048605002,
+        devHoldsPercent: 0,
+        insidersHoldPercent: 22.10801488094056,
+        bundlersHoldPercent: 0.06457287556194331,
+        snipersHoldPercent: 0,
+        dexPaid: true,
+        totalPairFeesPaid: 184.28299824532502,
+      }),
+    );
+    assert.equal(
+      burp,
+      "Top 10 26.3% | 持有人 836 | Pro 237 | Dev 0% | 🔴內部 22.1% | 捆綁 0.1% | 狙擊 0% | 已付Dex | Creator 已收 184.3 SOL",
+    );
+    // Red-flag thresholds: 內部 ≥15 / 捆綁 ≥13 / 狙擊 ≥5.
+    const flagged = renderAxiomSummaryLine(
+      parseAxiomTokenInfo({
+        numHolders: 100,
+        numBotUsers: 50,
+        top10HoldersPercent: 30,
+        devHoldsPercent: 1.2,
+        insidersHoldPercent: 15,
+        bundlersHoldPercent: 13,
+        snipersHoldPercent: 5.2,
+        dexPaid: false,
+      }),
+    );
+    assert.ok(flagged.includes("🔴內部 15%"));
+    assert.ok(flagged.includes("🔴捆綁 13%"));
+    assert.ok(flagged.includes("🔴狙擊 5.2%"));
+    assert.ok(flagged.includes("未付Dex"));
+    assert.ok(!flagged.includes("Creator"), "absent fees field renders no segment");
+    // Just below the lines stays unflagged (strict >=).
+    const clean = renderAxiomSummaryLine(
+      parseAxiomTokenInfo({
+        numHolders: 100,
+        numBotUsers: 90,
+        top10HoldersPercent: 10,
+        insidersHoldPercent: 14.9,
+        bundlersHoldPercent: 12.9,
+        snipersHoldPercent: 4.9,
+      }),
+    );
+    assert.ok(!clean.includes("🔴"));
+    // Missing data hides the whole line → card falls back to legacy lines.
+    assert.equal(renderAxiomSummaryLine(null), null);
+    assert.equal(
+      renderAxiomSummaryLine(parseAxiomTokenInfo({ dexPaid: true })),
+      null,
+      "identity fields absent → null",
+    );
   });
 
   // ---------- db.ts ----------

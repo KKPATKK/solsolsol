@@ -65,6 +65,49 @@ export interface AxiomTrendingToken {
   raw: unknown;
 }
 
+/**
+ * Parsed /token-info payload (the per-token surface behind the web app's
+ * token page). Every field nullable — the push-card summary line hides
+ * itself when the identity fields did not resolve.
+ */
+export interface AxiomTokenInfo {
+  numHolders: number | null;
+  numBotUsers: number | null;
+  top10HoldersPercent: number | null;
+  devHoldsPercent: number | null;
+  insidersHoldPercent: number | null;
+  bundlersHoldPercent: number | null;
+  snipersHoldPercent: number | null;
+  dexPaid: boolean | null;
+  /** totalPairFeesPaid — SOL units per live samples (184.28 ≈ 184 SOL). */
+  creatorFeesSol: number | null;
+}
+
+/**
+ * Pure parser for the /token-info JSON (exported for offline unit tests).
+ * Defensive: absent/mistyped fields degrade to null instead of throwing.
+ */
+export function parseAxiomTokenInfo(
+  data: Record<string, unknown> | null,
+): AxiomTokenInfo {
+  const num = (key: string): number | null => {
+    const v = Number(data?.[key]);
+    return Number.isFinite(v) ? v : null;
+  };
+  const paid = data?.dexPaid;
+  return {
+    numHolders: num("numHolders"),
+    numBotUsers: num("numBotUsers"),
+    top10HoldersPercent: num("top10HoldersPercent"),
+    devHoldsPercent: num("devHoldsPercent"),
+    insidersHoldPercent: num("insidersHoldPercent"),
+    bundlersHoldPercent: num("bundlersHoldPercent"),
+    snipersHoldPercent: num("snipersHoldPercent"),
+    dexPaid: typeof paid === "boolean" ? paid : null,
+    creatorFeesSol: num("totalPairFeesPaid"),
+  };
+}
+
 /** Response shape of POST /login-password-v2. */
 export interface AxiomLoginStep1 {
   otpJwtToken: string | null;
