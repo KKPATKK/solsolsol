@@ -36,7 +36,11 @@ import time
 
 from curl_cffi import requests as creq
 
-TURSO_URL = (os.environ.get("TURSO_DATABASE_URL") or "").strip()
+# libsql:// secrets are normalised to https:// — Turso's REST pipeline API
+# lives on the same host over HTTPS.
+TURSO_URL = (os.environ.get("TURSO_DATABASE_URL") or "").strip().replace(
+    "libsql://", "https://", 1
+)
 TURSO_TOKEN = (os.environ.get("TURSO_AUTH_TOKEN") or "").strip()
 
 HOSTS = ["api9.axiom.trade", "api3.axiom.trade", "api6.axiom.trade", "api10.axiom.trade"]
