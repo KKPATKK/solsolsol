@@ -284,7 +284,9 @@ AXIOM_TRENDING_LIMIT = "0"
 # writer of axiom_access_token/axiom_refresh_token in worker_state. Axiom
 # rotates the refresh token on every call, so flipping this on before the
 # Action is verified green will strand the session. Default "0".
-AXIOM_EXTERNAL_REFRESH = "0"
+# ENABLED 2026-08-25: axiom-refresh.yml verified green (curl_cffi refresh
+# via GitHub runner) — the Action owns the session now.
+AXIOM_EXTERNAL_REFRESH = "1"
 # Axiom bot-users push gate: a final candidate whose pair reports fewer
 # distinct Axiom bot users than this floor is rejected as a dead/shill pool.
 # 0 disables. Missing data (session down, no pair address) never judges —
