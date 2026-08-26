@@ -129,11 +129,19 @@ def turso_query(sql: str, args: list | None = None):
 
 
 def turso_execute(sql: str, args: list | None = None) -> int:
-    """One mutating statement; returns rowsAffected for CAS checks."""
+    """One mutating statement; returns affected-row count for CAS checks."""
     inner = turso_pipeline(sql, args)
-    # Raw Hrana spells it rows_affected; some proxies/versions return
-    # camelCase — accept both.
-    return int(inner.get("rowsAffected") or inner.get("rows_affected") or 0)
+    # Turso's v2/pipeline result spells it affected_row_count (docs-verified
+    # 2026-08-26). The old rowsAffected/rows_affected guesses match NOTHING,
+    # so every claim read as "0 rows" and skipped itself while having just
+    # re-stamped the lock — the deadlock behind every run logging
+    # "stale/expired → another refresher holds the lock" since a06056e.
+    return int(
+        inner.get("affected_row_count")
+        or inner.get("rowsAffected")
+        or inner.get("rows_affected")
+        or 0
+    )
 
 
 def try_claim_lock(now_s: int) -> bool:

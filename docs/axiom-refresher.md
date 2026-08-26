@@ -30,13 +30,15 @@
 
 github.com → Settings → Developer settings，二選一：
 
-**Fine-grained token（推薦）：**
+**Classic token（✅ 已採用，無到期日）：**
+- 只需要勾 ☑ **`workflow`** 一個 scope（public repo 讀取唔使 `repo`）
+- 實測 2026-08-26：dispatch 每 10 分鐘 204，Actions 全綠
+
+**Fine-grained token（後備選項）：**
 - Repository access → Only select repositories → 揀 `KKPATKK/solsolsol`
 - Permissions → Repository permissions → **Workflows → Read and write**
-- （改權限後要 Regenerate，新字串即刻抄低）
-
-**Classic token（更簡單）：**
-- 只需要勾 ☑ **`workflow`** 一個 scope（public repo 讀取唔使 `repo`）
+- ⚠️ 冇開 Workflows: RW 的話 dispatch API 回 403 "Resource not accessible
+  by personal access token"（當日實錄）；而且有到期日，到期全線 401
 
 ### ② cron-job.org 開 job
 
@@ -77,6 +79,10 @@ cron-job.org 註冊/登入 → **Create cronjob**：
 
 - Axiom 自身後端故障（例如 2026-08-26 全分片 HTTP 500）兩條通道都冇符，
   只能等復原；復原後下一個 slot 自動接返。
-- fine-grained PAT 有到期日，到期前記得續（cron-job.org History 會突然
-  全部 401 就係呢個症狀）。
+- 轉用 classic PAT 後無到期日問題；假如第日換返 fine-grained，留意佢有
+  到期日（cron-job.org History 突然全部 401 就係呢個症狀）。
 - GitHub 免費額度：public repo 嘅 Actions 無限分鐘，呢個用量完全免費。
+- 鎖修復備忘（2026-08-26）：Turso pipeline 嘅受影響行數欄位係
+  `affected_row_count`，舊碼讀 `rowsAffected` 永遠攞到 0，搞到每次都
+  「自稱搶鎖成功→又當自己搶唔到」跳過刷新。已修正；症狀係每個 run 都
+  打「stale/expired → another refresher holds the lock」。
