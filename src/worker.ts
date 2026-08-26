@@ -709,12 +709,16 @@ export default {
       try {
         const accessToken = await db?.getWorkerState("axiom_access_token");
         if (accessToken) {
+          const sessionRefresh = await db?.getWorkerState("axiom_refresh_token");
           try {
             const out = await client.fetchTokenInfo(
               accessToken,
               pairAddr,
               "/token-info",
               "pairAddress",
+              "",
+              undefined,
+              sessionRefresh ?? undefined,
             );
             axiomPayload = parseAxiomTokenInfo(out.data);
           } catch (err) {
@@ -733,6 +737,9 @@ export default {
                     pairAddr,
                     "/token-info",
                     "pairAddress",
+                    "",
+                    undefined,
+                    fresh.refreshToken ?? sessionRefresh ?? undefined,
                   );
                   axiomPayload = parseAxiomTokenInfo(out2.data);
                 }
@@ -1270,7 +1277,15 @@ export default {
         }
       }
       try {
-        const out = await client.fetchTokenInfo(accessToken, mint, path, param, extraQuery, hostsParam);
+        const out = await client.fetchTokenInfo(
+          accessToken,
+          mint,
+          path,
+          param,
+          extraQuery,
+          hostsParam.length ? hostsParam : undefined,
+          refreshToken0 ?? undefined,
+        );
         return Response.json({ ok: out.status === 200, status: out.status, data: out.data });
       } catch (err) {
         return Response.json({

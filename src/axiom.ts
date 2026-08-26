@@ -26,12 +26,18 @@ const TRENDING_HOSTS = ["api3.axiom.trade", "api6.axiom.trade", "api9.axiom.trad
 
 const BASE_HEADERS: Record<string, string> = {
   "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
   Accept: "application/json, text/plain, */*",
   "Accept-Language": "en-US,en;q=0.9",
   Origin: "https://axiom.trade",
   Referer: "https://axiom.trade/",
   Connection: "keep-alive",
+  // Mirror the browser's sec-fetch trio — the community SDK sends these and
+  // some endpoints (token-info started returning bare 404s on 2026-08-26)
+  // appear to gate on them.
+  "sec-fetch-dest": "empty",
+  "sec-fetch-mode": "cors",
+  "sec-fetch-site": "same-site",
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -503,11 +509,17 @@ export class AxiomClient {
   }
 
   /**
-   * Per-token detail metrics (read-token-info) — the surface behind the
-   * web app's token page: creator fee, volumes, holder data. The exact
-   * field names are not publicly documented; the raw JSON is returned so
-   * callers can inspect the live schema. Host-fallback mirrors
-   * fetchTrending (auth errors are terminal).
+   * Per-token detail metrics (/token-info?pairAddress=) — the surface
+   * behind the web app's token page. The exact field names are not publicly
+   * documented; the raw JSON is returned so callers can inspect the live
+   * schema. Host-fallback mirrors fetchTrending (auth errors are terminal).
+   *
+   * 2026-08-26: the production combo started answering a bare 404 on every
+   * host while trending kept working with the same session cookie, so this
+   * now (a) sends BOTH session cookies + the browser's sec-fetch headers,
+   * matching the community Python SDK byte-for-byte where it still works,
+   * and (b) falls back to the sibling endpoints /pair-info and /pair-stats
+   * (same pairAddress param, per the SDK) when the primary path 404s.
    */
   async fetchTokenInfo(
     accessToken: string,
@@ -521,43 +533,77 @@ export class AxiomClient {
     extraQuery = "",
     /** Optional host list override for endpoint discovery (e.g. ["axiom.trade"]). */
     hostsOverride?: string[],
+    /** Optional refresh token — sent as the second session cookie exactly
+     * like the browser/SDK session does. Some endpoints validate the full
+     * session, not just the access token. */
+    refreshToken?: string,
   ): Promise<{ status: number; data: Record<string, unknown> | null }> {
-    let lastError: unknown;
-    for (const host of hostsOverride?.length ? hostsOverride : TRENDING_HOSTS) {
+    const hosts = hostsOverride?.length ? hostsOverride : TRENDING_HOSTS;
+    const cookie = `auth-access-token=${accessToken}${
+      refreshToken ? `; auth-refresh-token=${refreshToken}` : ""
+    }`;
+    const attempt = async (
+      p: string,
+      pm: string,
+    ): Promise<{ status: number; data: Record<string, unknown> | null }> => {
+      let lastError: unknown;
+      for (const host of hosts) {
+        try {
+          const url = `https://${host}${p}?${pm}=${encodeURIComponent(mint)}${
+            extraQuery ? `&${extraQuery}` : ""
+          }`;
+          const res = await fetch(url, {
+            headers: { ...BASE_HEADERS, Cookie: cookie },
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (res.status === 401 || res.status === 403) {
+            throw new Error(`Axiom token-info auth HTTP ${res.status}`);
+          }
+          if (!res.ok) {
+            throw new Error(`Axiom token-info HTTP ${res.status}`);
+          }
+          const payload: unknown = await res.json();
+          return {
+            status: res.status,
+            data:
+              payload && typeof payload === "object"
+                ? (payload as Record<string, unknown>)
+                : null,
+          };
+        } catch (err) {
+          lastError = err;
+          // auth errors are terminal — don't waste the other hosts
+          if (err instanceof Error && /auth/.test(err.message)) throw err;
+          await sleep(300);
+        }
+      }
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("Axiom token-info request failed");
+    };
+    // Fallback ladder only for the production combo: the sibling pair
+    // endpoints take the same pairAddress param (per the community SDK), so
+    // a dead /token-info degrades to partial data instead of nothing.
+    const isProductionCombo = path === "/token-info" && param === "pairAddress";
+    const ladders: Array<[string, string]> = isProductionCombo
+      ? [
+          [path, param],
+          ["/pair-info", "pairAddress"],
+          ["/pair-stats", "pairAddress"],
+        ]
+      : [[path, param]];
+    let primaryError: unknown;
+    for (const [p, pm] of ladders) {
       try {
-        const url = `https://${host}${path}?${param}=${encodeURIComponent(mint)}${
-          extraQuery ? `&${extraQuery}` : ""
-        }`;
-        const res = await fetch(url, {
-          headers: {
-            ...BASE_HEADERS,
-            Cookie: `auth-access-token=${accessToken}`,
-          },
-          signal: AbortSignal.timeout(15_000),
-        });
-        if (res.status === 401 || res.status === 403) {
-          throw new Error(`Axiom token-info auth HTTP ${res.status}`);
-        }
-        if (!res.ok) {
-          throw new Error(`Axiom token-info HTTP ${res.status}`);
-        }
-        const payload: unknown = await res.json();
-        return {
-          status: res.status,
-          data:
-            payload && typeof payload === "object"
-              ? (payload as Record<string, unknown>)
-              : null,
-        };
+        return await attempt(p, pm);
       } catch (err) {
-        lastError = err;
-        // auth errors are terminal — don't waste the other hosts
-        if (err instanceof Error && /auth/.test(err.message)) throw err;
-        await sleep(300);
+        if (!primaryError) primaryError = err;
+        // auth errors already threw inside attempt; anything else tries the
+        // next rung of the ladder.
       }
     }
-    throw lastError instanceof Error
-      ? lastError
+    throw primaryError instanceof Error
+      ? primaryError
       : new Error("Axiom token-info request failed");
   }
 }

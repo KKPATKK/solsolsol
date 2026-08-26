@@ -421,17 +421,23 @@ export class Scanner {
     pairAddress: string,
   ): Promise<AxiomTokenInfo | null> {
     if (!this.axiom) return null;
-    const call = (accessToken: string) =>
+    const call = (accessToken: string, refreshToken?: string) =>
       this.axiom!.fetchTokenInfo(
         accessToken,
         pairAddress,
         "/token-info",
         "pairAddress",
+        "",
+        undefined,
+        refreshToken,
       );
     const storedToken = await this.db.getWorkerState("axiom_access_token");
     if (!storedToken) return null;
+    // Send both session cookies like the browser does — some Axiom endpoints
+    // validate the full session, not just the access token.
+    const sessionRefresh = await this.db.getWorkerState("axiom_refresh_token");
     try {
-      const out = await call(storedToken);
+      const out = await call(storedToken, sessionRefresh ?? undefined);
       this.axiomSessionFailStreak = 0; // session alive — reset the alert latch
       return parseAxiomTokenInfo(out.data);
     } catch (err) {
