@@ -8,12 +8,14 @@
 # Axiom rotates the refresh token on every call, so exactly ONE writer may
 # refresh or the two will invalidate each other's sessions.
 #
-# DUAL-PLATFORM NOTE (2026-08-26): GitHub's schedule delivery stalls during
+# DUAL-CHANNEL NOTE (2026-08-26): GitHub's schedule delivery stalls during
 # incidents (00:02–01:52Z that day: zero deliveries for ~110 min → dead
-# session). A GitLab CI schedule (.gitlab-ci.yml) now runs the same script as
-# an independent second channel. Cross-platform safety comes from the Turso
-# CAS lock inside scripts/axiom-refresh-action.py — only one platform can
-# rotate at a time; the other skips harmlessly.
+# session). A cron-job.org free job now calls this workflow's dispatch API
+# every 10 minutes as an independent second trigger — dispatches don't go
+# through the (flaky) scheduler queue at all. Setup guide:
+# docs/axiom-refresher.md. Cross-channel safety comes from the Turso CAS
+# lock inside scripts/axiom-refresh-action.py — concurrent triggers can
+# never double-rotate the session.
 #
 # Secrets required (repo → Settings → Secrets and variables → Actions):
 #   TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io

@@ -60,8 +60,9 @@ REFRESH_MARGIN_SECONDS = 660
 # ---------------------------------------------------------------------------
 # Cross-platform refresh lock (Turso compare-and-swap).
 #
-# The session is refreshed by MULTIPLE independent schedulers now (GitHub
-# Actions cron + a GitLab CI schedule mirror) because GitHub's schedule
+# The session is refreshed by MULTIPLE independent triggers now (a GitHub
+# Actions cron + a cron-job.org job calling this workflow's dispatch API)
+# because GitHub's schedule
 # delivery stalls during incidents (2026-08-26 00:02–01:52Z: zero runs for
 # ~110 min). Axiom rotates the refresh token on EVERY successful call, so
 # two platforms refreshing simultaneously would invalidate each other and
@@ -109,7 +110,12 @@ def turso_pipeline(sql: str, args: list | None = None):
         json=body,
         timeout=20,
     )
-    res.raise_for_status()
+    # Surface the response BODY on non-2xx — a bare status hides whether the
+    # request shape (arg types!) or the SQL was rejected.
+    if res.status_code >= 300:
+        raise RuntimeError(
+            f"Turso HTTP {res.status_code}: {res.text[:300]!r} for sql={sql[:80]!r}"
+        )
     result = res.json()["results"][0]
     if result.get("type") != "ok":
         raise RuntimeError(f"Turso error: {json.dumps(result)[:300]}")
@@ -137,14 +143,20 @@ def try_claim_lock(now_s: int) -> bool:
     either a fresh lock is held elsewhere (SELECT confirms → lose) or the
     row was never inserted (INSERT wins; losing a UNIQUE-constraint race to
     a concurrent claimer on another platform also means lose).
+
+    NOTE: all bind args go through as TEXT with CASTs on both sides of the
+    comparison — Turso's v2/pipeline rejects the Hrana "integer" value type
+    on this endpoint (live-verified 2026-08-26: HTTP 400), while plain text
+    args are exactly what the rest of this script has always used.
     """
-    cutoff = now_s - LOCK_TTL_SECONDS
+    cutoff = str(now_s - LOCK_TTL_SECONDS)
     n = turso_execute(
-        "UPDATE worker_state SET value = ? WHERE key = ? AND CAST(value AS INTEGER) <= ?",
+        "UPDATE worker_state SET value = ? WHERE key = ? "
+        "AND CAST(value AS INTEGER) <= CAST(? AS INTEGER)",
         [
             {"type": "text", "value": str(now_s)},
             {"type": "text", "value": LOCK_KEY},
-            {"type": "integer", "value": cutoff},
+            {"type": "text", "value": cutoff},
         ],
     )
     if n > 0:
