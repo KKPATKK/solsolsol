@@ -4,9 +4,16 @@
 # Worker's TLS fingerprint. This workflow runs curl_cffi (impersonating a real
 # Chrome build) on a GitHub runner, refreshes the pair, and writes it back to
 # Turso worker_state — the exact keys the Worker reads. The Worker must be
-# flipped to AXIOM_EXTERNAL_REFRESH="1" (wrangler.toml) so IT stops refreshing:
+# flipped to AXIOM_EXTERNAL_REFRESH="1" (wrangler.toml) so it stops refreshing:
 # Axiom rotates the refresh token on every call, so exactly ONE writer may
 # refresh or the two will invalidate each other's sessions.
+#
+# DUAL-PLATFORM NOTE (2026-08-26): GitHub's schedule delivery stalls during
+# incidents (00:02–01:52Z that day: zero deliveries for ~110 min → dead
+# session). A GitLab CI schedule (.gitlab-ci.yml) now runs the same script as
+# an independent second channel. Cross-platform safety comes from the Turso
+# CAS lock inside scripts/axiom-refresh-action.py — only one platform can
+# rotate at a time; the other skips harmlessly.
 #
 # Secrets required (repo → Settings → Secrets and variables → Actions):
 #   TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io

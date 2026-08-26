@@ -84,9 +84,34 @@ jobs:
             if echo "$JUPITER_API_KEY" | npx wrangler secret put JUPITER_API_KEY; then
               echo "::notice::JUPITER_API_KEY written to Worker secret"
             else
-              echo "::warning::JUPITER_API_KEY secret update failed (see above) — continuing keyless (0.5 RPS)"
+              echo "::warning::JUPITER_API_KEY secret update failed — continuing keyless (0.5 RPS is fine)"
             fi
           else
             echo "::warning::JUPITER_API_KEY not set as a GitHub Actions secret — skipping (keyless 0.5 RPS is fine)"
+          fi
+
+      # Mirror main to GitLab so its independent CI schedule always runs the
+      # CURRENT script (dual-platform redundancy against GitHub Actions'
+      # schedule-delivery stalls — see .gitlab-ci.yml). Inert until two repo
+      # secrets exist:
+      #   GITLAB_MIRROR_URL    e.g. https://gitlab.com/<user>/<repo>.git
+      #   GITLAB_MIRROR_TOKEN  GitLab project token with write_repository scope
+      # Best-effort by design: never blocks a Cloudflare release.
+      - name: Mirror main to GitLab
+        env:
+          GITLAB_MIRROR_URL: ${{ secrets.GITLAB_MIRROR_URL }}
+          GITLAB_MIRROR_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+        run: |
+          if [ -z "$GITLAB_MIRROR_URL" ] || [ -z "$GITLAB_MIRROR_TOKEN" ]; then
+            echo "::notice::GITLAB_MIRROR_URL/TOKEN not set — skipping GitLab mirror"
+            exit 0
+          fi
+          # checkout@v4 default is shallow; GitLab rejects pushes from shallow clones.
+          git fetch --unshallow origin >/dev/null 2>&1 || true
+          authed="${GITLAB_MIRROR_URL/https:\/\//https:\/\/oauth2:${GITLAB_MIRROR_TOKEN}@}"
+          if git push --force "$authed" HEAD:refs/heads/main; then
+            echo "::notice::main mirrored to GitLab"
+          else
+            echo "::warning::GitLab mirror push failed — GitLab CI may run a stale refresher script"
           fi
 

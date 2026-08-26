@@ -15,15 +15,16 @@ Flow:
   1. Read auth-access-token / auth-refresh-token from Turso worker_state.
   2. Decode the access JWT's exp claim. If >REFRESH_MARGIN seconds remain,
      exit 0 without refreshing (fewer rotations = fewer failure windows).
-  3. Otherwise POST /refresh-access-token through every shard until one
-     answers 200 (curl_cffi, impersonate="chrome").
-  4. Write the rotated pair back to worker_state.
+  3. Claim the cross-platform refresh lock (CAS on worker_state).
+  4. POST /refresh-access-token through every shard until one answers 200
+     (curl_cffi, impersonate="chrome").
+  5. Write the rotated pair back to worker_state and release the lock.
 
 Secrets expected (GitHub repo → Settings → Secrets → Actions):
   TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io
   TURSO_AUTH_TOKEN     Turso auth token
 
-Tokens themselves are NEVER stored in GitHub Secrets — Turso worker_state is
+Tokens themselves are NEVER stored in CI Secrets — Turso worker_state is
 the single source of truth, same keys the Worker reads.
 """
 
@@ -56,6 +57,24 @@ REFRESH_PATH = "/refresh-access-token"
 # them, so each reads the latest rotated refresh-token from Turso.
 REFRESH_MARGIN_SECONDS = 660
 
+# ---------------------------------------------------------------------------
+# Cross-platform refresh lock (Turso compare-and-swap).
+#
+# The session is refreshed by MULTIPLE independent schedulers now (GitHub
+# Actions cron + a GitLab CI schedule mirror) because GitHub's schedule
+# delivery stalls during incidents (2026-08-26 00:02–01:52Z: zero runs for
+# ~110 min). Axiom rotates the refresh token on EVERY successful call, so
+# two platforms refreshing simultaneously would invalidate each other and
+# kill the session outright. This lock — same CAS pattern as db.claimPushWatch
+# in src/db.ts — lets exactly ONE runner past the rotation step at a time:
+# the winner claims the key with a conditional UPDATE, losers exit 0. The
+# lock is released when a run finishes (success OR failure); if a runner
+# dies mid-flight, LOCK_TTL_SECONDS auto-expires it so the next slot can
+# retry. Pacing is NOT the lock's job — REFRESH_MARGIN handles that; the
+# lock only closes the simultaneous-double-refresh window across platforms.
+LOCK_KEY = "axiom_refresh_lock"
+LOCK_TTL_SECONDS = 300
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -74,8 +93,8 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-def turso_query(sql: str, args: list | None = None):
-    """One statement via Turso's v2/pipeline HTTP API."""
+def turso_pipeline(sql: str, args: list | None = None):
+    """One statement via Turso's v2/pipeline HTTP API; returns the result."""
     body = {
         "requests": [
             {"type": "execute", "stmt": {"sql": sql, "args": args or []}}
@@ -91,16 +110,73 @@ def turso_query(sql: str, args: list | None = None):
         timeout=20,
     )
     res.raise_for_status()
-    payload = res.json()
-    result = payload["results"][0]
+    result = res.json()["results"][0]
     if result.get("type") != "ok":
         raise RuntimeError(f"Turso error: {json.dumps(result)[:300]}")
-    rows = result["response"]["result"]["rows"]
-    # Rows come back as [[{"type":"text","value":"..."}, ...], ...]
-    out = []
-    for row in rows:
-        out.append([cell.get("value") for cell in row])
-    return out
+    return result["response"]["result"]
+
+
+def turso_query(sql: str, args: list | None = None):
+    """One SELECT; rows come back as [[cell_value, ...], ...]."""
+    rows = turso_pipeline(sql, args)["rows"]
+    return [[cell.get("value") for cell in row] for row in rows]
+
+
+def turso_execute(sql: str, args: list | None = None) -> int:
+    """One mutating statement; returns rowsAffected for CAS checks."""
+    inner = turso_pipeline(sql, args)
+    # Raw Hrana spells it rows_affected; some proxies/versions return
+    # camelCase — accept both.
+    return int(inner.get("rowsAffected") or inner.get("rows_affected") or 0)
+
+
+def try_claim_lock(now_s: int) -> bool:
+    """Atomically claim the refresh lock. True = we may refresh.
+
+    One CAS UPDATE covers the common case (row exists). Zero rows means
+    either a fresh lock is held elsewhere (SELECT confirms → lose) or the
+    row was never inserted (INSERT wins; losing a UNIQUE-constraint race to
+    a concurrent claimer on another platform also means lose).
+    """
+    cutoff = now_s - LOCK_TTL_SECONDS
+    n = turso_execute(
+        "UPDATE worker_state SET value = ? WHERE key = ? AND CAST(value AS INTEGER) <= ?",
+        [
+            {"type": "text", "value": str(now_s)},
+            {"type": "text", "value": LOCK_KEY},
+            {"type": "integer", "value": cutoff},
+        ],
+    )
+    if n > 0:
+        return True
+    rows = turso_query(
+        "SELECT value FROM worker_state WHERE key = ?",
+        [{"type": "text", "value": LOCK_KEY}],
+    )
+    if rows:
+        return False  # row exists with a fresh timestamp — someone else owns it
+    try:
+        turso_execute(
+            "INSERT INTO worker_state (key, value) VALUES (?, ?)",
+            [
+                {"type": "text", "value": LOCK_KEY},
+                {"type": "text", "value": str(now_s)},
+            ],
+        )
+        return True
+    except RuntimeError:
+        return False  # concurrent INSERT won the race
+
+
+def release_lock() -> None:
+    """Free the lock immediately so the next slot isn't blocked by the TTL."""
+    try:
+        turso_execute(
+            "UPDATE worker_state SET value = '0' WHERE key = ?",
+            [{"type": "text", "value": LOCK_KEY}],
+        )
+    except Exception as exc:
+        print(f"⚠️ lock release failed ({str(exc)[:120]}) — TTL will clear it")
 
 
 def get_worker_state(key: str) -> str | None:
@@ -184,15 +260,34 @@ def main() -> None:
         return
 
     print(f"🔁 access token stale/expired ({MASK(access)}) — refreshing…")
-    new_access, new_refresh, host = refresh(refresh_token)
-    new_exp = jwt_exp(new_access)
 
-    set_worker_state("axiom_access_token", new_access)
-    if new_refresh != refresh_token:
-        set_worker_state("axiom_refresh_token", new_refresh)
-        print("♻️ refresh token rotated — updated worker_state")
-    mins = f"{(new_exp - now) // 60} min" if new_exp else "?"
-    print(f"✅ refreshed via {host} — new access {MASK(new_access)} expires in {mins}")
+    # Only ONE platform may rotate the pair — claim the cross-platform lock.
+    if not try_claim_lock(now):
+        print("🔒 another refresher holds the lock — skipping (it owns this rotation)")
+        return
+    try:
+        # Another scheduler may have refreshed between our first read and the
+        # claim — re-read both tokens and re-check before spending a rotation.
+        access = get_worker_state("axiom_access_token") or access
+        refresh_token = get_worker_state("axiom_refresh_token") or refresh_token
+        re_exp = jwt_exp(access)
+        if re_exp is not None and re_exp - int(time.time()) > REFRESH_MARGIN_SECONDS:
+            print(
+                f"✅ re-checked after lock: already fresh ({(re_exp - int(time.time())) // 60} min left) — no rotation needed"
+            )
+            return
+
+        new_access, new_refresh, host = refresh(refresh_token)
+        new_exp = jwt_exp(new_access)
+
+        set_worker_state("axiom_access_token", new_access)
+        if new_refresh != refresh_token:
+            set_worker_state("axiom_refresh_token", new_refresh)
+            print("♻️ refresh token rotated — updated worker_state")
+        mins = f"{(new_exp - now) // 60} min" if new_exp else "?"
+        print(f"✅ refreshed via {host} — new access {MASK(new_access)} expires in {mins}")
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":

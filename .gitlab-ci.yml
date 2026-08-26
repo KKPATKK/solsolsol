@@ -1,0 +1,32 @@
+# Axiom session refresher — GitLab CI channel (dual-platform redundancy).
+#
+# Why: GitHub Actions' schedule delivery is best-effort and stalls during
+# incidents (2026-08-26 00:02–01:52Z: zero runs for ~110 min → dead Axiom
+# session the whole time). This pipeline is an INDEPENDENT scheduler running
+# the exact same script from the mirrored repo. Safety across platforms
+# comes from the Turso CAS lock inside scripts/axiom-refresh-action.py —
+# two sources can never double-refresh and invalidate each other.
+#
+# One-time setup (gitlab.com project):
+#   1. Create/mirror the repo so this file exists on the GitLab side
+#      (deploy.yml's "Mirror-push to GitLab" step keeps main in sync once
+#      GITLAB_MIRROR_URL / GITLAB_MIRROR_TOKEN secrets exist on GitHub).
+#   2. Settings → CI/CD → Variables (both flagged Masked):
+#        TURSO_DATABASE_URL   libsql://…        (same values as GitHub)
+#        TURSO_AUTH_TOKEN     eyJ…
+#   3. Build → Pipeline schedules → New schedule:
+#        Interval: every 10 minutes, Target branch: main.
+#
+# The job intentionally does NOT run on pushes — only schedules and manual
+# web runs, mirroring the GitHub workflow's triggers.
+
+axiom-refresh:
+  image: python:3.12-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+  timeout: 5 minutes
+  script:
+    - pip install --quiet "curl_cffi>=0.7"
+    - python scripts/axiom-refresh-action.py
