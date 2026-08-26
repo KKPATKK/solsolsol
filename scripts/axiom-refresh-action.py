@@ -45,10 +45,16 @@ TURSO_TOKEN = (os.environ.get("TURSO_AUTH_TOKEN") or "").strip()
 
 HOSTS = ["api9.axiom.trade", "api3.axiom.trade", "api6.axiom.trade", "api10.axiom.trade"]
 REFRESH_PATH = "/refresh-access-token"
-# Refresh only when the access token has less than this much life left (the
-# JWT lives ~16 min; refreshing at <3 min wastes few rotations but keeps a
-# comfortable buffer over cron jitter).
-REFRESH_MARGIN_SECONDS = 180
+# Refresh only when the access token has less than this much life left.
+# The JWT lives ~16 min and cron delivers every ~10 (GitHub delays slots
+# by minutes at times). The margin MUST exceed the cadence or every cycle
+# ends with an expired-token window — observed live 2026-08-26 00:17-00:35
+# UTC: two skipped slots left all Axiom endpoints returning disguised-502
+# for ~15 min. 11 min > the 10-min cadence means every delivered run
+# refreshes, keeping >=5 min of buffer against delivery jitter. Bursts of
+# catch-up runs stay safe: the workflow's concurrency group serializes
+# them, so each reads the latest rotated refresh-token from Turso.
+REFRESH_MARGIN_SECONDS = 660
 
 HEADERS = {
     "User-Agent": (
