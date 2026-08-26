@@ -470,7 +470,7 @@ export class Scanner {
         if (fresh.refreshToken) {
           await this.db.setWorkerState("axiom_refresh_token", fresh.refreshToken);
         }
-        const out = await call(fresh.accessToken);
+        const out = await call(fresh.accessToken, fresh.refreshToken ?? refreshToken);
         this.axiomSessionFailStreak = 0;
         return parseAxiomTokenInfo(out.data);
       } catch {
