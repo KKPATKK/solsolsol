@@ -1198,8 +1198,8 @@ export default {
       }
     }
 
-    // Axiom token-info probe — per-token detail metrics (creator fee,
-    // volumes, holders) from read-token-info using the stored session.
+    // Axiom token-info probe — per-token detail metrics (holders,
+    // numBotUsers, concentration) from /token-info using the stored session.
     // Refreshes once and retries on auth failure. Reveals the live schema
     // so card enrichment can be designed against real field names.
     if (url.pathname === "/debug/axiom-token-info") {
