@@ -509,24 +509,21 @@ export class AxiomClient {
   }
 
   /**
-   * Per-token detail metrics (/token-info?pairAddress=) — the surface
+   * Per-token detail metrics (/token-info-v2?pairAddress=) — the surface
    * behind the web app's token page. The exact field names are not publicly
    * documented; the raw JSON is returned so callers can inspect the live
    * schema. Host-fallback mirrors fetchTrending (auth errors are terminal).
    *
-   * 2026-08-26: the production combo started answering a bare 404 on every
-   * host while trending kept working with the same session cookie, so this
-   * now (a) sends BOTH session cookies + the browser's sec-fetch headers,
-   * matching the community Python SDK byte-for-byte where it still works,
-   * and (b) falls back to the sibling endpoints /pair-info and /pair-stats
-   * (same pairAddress param, per the SDK) when the primary path 404s.
+   * 2026-08-27: Axiom renamed /token-info to /token-info-v2. The v1 endpoint
+   * returns bare 404/530 on every host while v2 returns full data including
+   * numBotUsers, numHolders, concentration metrics, etc.
    */
   async fetchTokenInfo(
     accessToken: string,
     mint: string,
-    /** API path — defaults to read-token-info; overridable while the
-     * real per-token endpoint name is being discovered. */
-    path = "/read-token-info",
+    /** API path — /token-info-v2 is the current Axiom endpoint for
+     * per-token detail metrics (numBotUsers, concentration, etc.). */
+    path = "/token-info-v2",
     /** Query parameter name for the mint on the target endpoint. */
     param = "address",
     /** Extra raw query string appended verbatim (e.g. "onlyTrackedWallets=false&v=123"). */
@@ -584,12 +581,12 @@ export class AxiomClient {
     // Fallback ladder only for the production combo: the sibling pair
     // endpoints take the same pairAddress param (per the community SDK), so
     // a dead /token-info degrades to partial data instead of nothing.
-    const isProductionCombo = path === "/token-info" && param === "pairAddress";
+    const isProductionCombo = path === "/token-info-v2" && param === "pairAddress";
     const ladders: Array<[string, string]> = isProductionCombo
       ? [
           [path, param],
           ["/pair-info", "pairAddress"],
-          ["/pair-stats", "pairAddress"],
+          ["/token-info", "pairAddress"],
         ]
       : [[path, param]];
     let primaryError: unknown;

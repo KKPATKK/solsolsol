@@ -714,7 +714,7 @@ export default {
             const out = await client.fetchTokenInfo(
               accessToken,
               pairAddr,
-              "/token-info",
+              "/token-info-v2",
               "pairAddress",
               "",
               undefined,
@@ -735,7 +735,7 @@ export default {
                   const out2 = await client.fetchTokenInfo(
                     fresh.accessToken,
                     pairAddr,
-                    "/token-info",
+                    "/token-info-v2",
                     "pairAddress",
                     "",
                     undefined,
@@ -1206,19 +1206,18 @@ export default {
     }
 
     // Axiom token-info probe — per-token detail metrics (holders,
-    // numBotUsers, concentration) from /token-info using the stored session.
+    // numBotUsers, concentration) from /token-info-v2 using the stored session.
     // Refreshes once and retries on auth failure. Reveals the live schema
     // so card enrichment can be designed against real field names.
     if (url.pathname === "/debug/axiom-token-info") {
       const mint = (url.searchParams.get("mint") ?? "").trim();
       // Endpoint discovery: ?path=/xxx&param=yyy probes candidate API
       // surfaces with the live session. Defaults mirror the PRODUCTION
-      // combo (/token-info + pairAddress) so a bare ?mint=<pair> probe
-      // exercises the same route the scanner uses — NOT the dead legacy
-      // /read-token-info path (404/530) that once caused false alarms.
-      const path = (url.searchParams.get("path") ?? "/token-info").startsWith("/")
+      // combo (/token-info-v2 + pairAddress) — the v2 endpoint returns full
+      // data including numBotUsers, concentration, etc.
+      const path = (url.searchParams.get("path") ?? "/token-info-v2").startsWith("/")
         ? url.searchParams.get("path")!
-        : "/token-info";
+        : "/token-info-v2";
       const param = (url.searchParams.get("param") ?? "pairAddress").replace(/[^a-zA-Z0-9_]/g, "");
       // Raw passthrough for endpoints that require additional params
       // (e.g. top-traders-v4 needs onlyTrackedWallets + a v= timestamp).

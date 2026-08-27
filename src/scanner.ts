@@ -425,7 +425,7 @@ export class Scanner {
       this.axiom!.fetchTokenInfo(
         accessToken,
         pairAddress,
-        "/token-info",
+        "/token-info-v2",
         "pairAddress",
         "",
         undefined,
@@ -2028,7 +2028,7 @@ export class Scanner {
       this.axiom!.fetchTokenInfo(
         accessToken,
         pairAddress,
-        "/token-info",
+        "/token-info-v2",
         "pairAddress",
       );
     const extract = (data: Record<string, unknown> | null): number | null => {
