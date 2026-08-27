@@ -1215,9 +1215,8 @@ export default {
       // surfaces with the live session. Defaults mirror the PRODUCTION
       // combo (/token-info-v2 + pairAddress) — the v2 endpoint returns full
       // data including numBotUsers, concentration, etc.
-      const path = (url.searchParams.get("path") ?? "/token-info-v2").startsWith("/")
-        ? url.searchParams.get("path")!
-        : "/token-info-v2";
+      const rawPath = url.searchParams.get("path") ?? "/token-info-v2";
+      const path = rawPath.startsWith("/") ? rawPath : "/token-info-v2";
       const param = (url.searchParams.get("param") ?? "pairAddress").replace(/[^a-zA-Z0-9_]/g, "");
       // Raw passthrough for endpoints that require additional params
       // (e.g. top-traders-v4 needs onlyTrackedWallets + a v= timestamp).
