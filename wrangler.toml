@@ -281,7 +281,7 @@ BOT_ADMIN_IDS = "530602939"
 # (AXIOM_EXTERNAL_REFRESH=1), so the feed survives token expiry. Scanner
 # caches the feed for 3 min (AXIOM_TREND_CACHE_TTL_MS) — upstream sees at
 # most one call per 3 min, not one per 60s tick.
-AXIOM_TRENDING_LIMIT = "20"
+AXIOM_TRENDING_LIMIT = "0"
 # External Axiom session refresher (single-writer rule). "1" = the Worker
 # NEVER refreshes the session itself; a scheduled GitHub Action
 # (.github/workflows/axiom-refresh.yml, curl_cffi Chrome-TLS) is the sole
@@ -290,7 +290,7 @@ AXIOM_TRENDING_LIMIT = "20"
 # Action is verified green will strand the session. Default "0".
 # ENABLED 2026-08-25: axiom-refresh.yml verified green (curl_cffi refresh
 # via GitHub runner) — the Action owns the session now.
-AXIOM_EXTERNAL_REFRESH = "1"
+AXIOM_EXTERNAL_REFRESH = "0"
 # Axiom bot-users push gate: a final candidate whose pair reports fewer
 # distinct Axiom bot users than this floor is rejected as a dead/shill pool.
 # 0 disables. Missing data (session down, no pair address) never judges —
