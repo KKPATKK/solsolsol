@@ -340,6 +340,40 @@ async function main() {
     }
   });
 
+  await test("claimScanLock: batched heartbeat goes out with the winning claim only; completion batch releases", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = 2_000_000;
+      const hb = JSON.stringify({ at: now, ok: true, phase: "scanning", ms: null, err: null, skip: null });
+      const a = await db.claimScanLock("ownerA", now, 55_000, hb);
+      assert.ok(a !== null, "first claim wins");
+      assert.equal(await db.getWorkerState("scan_heartbeat"), hb, "winner heartbeat written in the same batch");
+      // A losing claimant is denied the lock, but its batched heartbeat
+      // stamp is equivalent (a scan is running that second — the winner's),
+      // so liveness stays fresh either way.
+      const hbLose = JSON.stringify({ at: now + 1, ok: true, phase: "scanning", ms: null, err: null, skip: null });
+      assert.equal(await db.claimScanLock("ownerB", now + 1, 55_000, hbLose), null);
+      const hbAfter = await db.getWorkerState("scan_heartbeat");
+      assert.ok(hbAfter !== null && JSON.parse(hbAfter).phase === "scanning", "liveness heartbeat stays fresh");
+      // The completion-flush batch (heartbeat done + history + lock delete)
+      // releases the lock in the same round trip.
+      await db.persistScanCompletion(
+        JSON.stringify({ at: now + 10, ok: true, phase: "done", ms: 10, err: null, skip: null }),
+        { at: now + 10, ok: true, ms: 10, err: null, profiles: 1, pool: 1, candidates: 0, pushed: 0 },
+        a,
+      );
+      assert.equal(await db.getWorkerState("scan_lock"), null, "completion batch released the lock");
+      assert.ok(
+        (await db.claimScanLock("ownerB", now + 20, 55_000)) !== null,
+        "lock free after batch release",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("DEFAULT_SETTINGS match the operator's filter spec", () => {
     assert.equal(DEFAULT_SETTINGS.minMarketCapUsd, 40000);
     assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 380000);

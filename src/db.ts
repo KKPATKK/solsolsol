@@ -964,24 +964,48 @@ export class Db {
    * Value format is "<untilMs>|<owner>" — deliberately not JSON, so release
    * can be an exact-value DELETE and a holder can never clear someone
    * else's lock. Claim is insert-or-ignore, then a CAS takeover when the
-   * existing row is stale (the holder isolate died inside its ~25s scan; the
-   * TTL far exceeds the scan envelope). Returns the exact value to pass to
+   * existing row is stale (the holder isolate died inside its scan; the TTL
+   * far exceeds the scan envelope). Returns the exact value to pass to
    * releaseScanLock, or null when another isolate holds a live lock. Throws
    * on DB errors — the caller logs and scans anyway (fail-open).
+   *
+   * WALL-CLOCK DISCIPLINE (2026-09-03 lesson): the scan tick's completion
+   * flush lives on a ~1s margin against Cloudflare's invocation kill (~24s
+   * effective), so this claim must NOT add round trips to the critical
+   * path. When `heartbeatJson` is passed, the claim insert and the
+   * start-heartbeat upsert run in ONE batched round trip — the same as the
+   * pre-lock single heartbeat write the worker used to make. Note that a
+   * racing LOSER's batch also stamps the heartbeat: that is fine and
+   * accurate — a scan IS running that second (the winner's), the stamp
+   * differs only by milliseconds, and the lock still lets exactly one
+   * isolate run it. The stale-takeover path costs extra reads, but only
+   * when a holder isolate died, which is rare.
    */
   async claimScanLock(
     owner: string,
     now: number,
     ttlMs: number,
+    heartbeatJson?: string | null,
   ): Promise<string | null> {
     const value = `${now + ttlMs}|${owner}`;
-    const tryInsert = () =>
-      this.get().execute({
-        sql: "INSERT INTO worker_state (key, value) VALUES ('scan_lock', ?) ON CONFLICT(key) DO NOTHING",
-        args: [value],
-      });
-    const ins = await tryInsert();
-    if (Number(ins.rowsAffected ?? 0) > 0) return value;
+    const claimStmt = {
+      sql: "INSERT INTO worker_state (key, value) VALUES ('scan_lock', ?) ON CONFLICT(key) DO NOTHING",
+      args: [value],
+    };
+    const heartbeatStmt = heartbeatJson
+      ? {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('scan_heartbeat', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [heartbeatJson],
+        }
+      : null;
+    // Winner path: one batched round trip carrying the claim + heartbeat.
+    if (heartbeatStmt) {
+      const batch = await this.get().batch([claimStmt, heartbeatStmt], "write");
+      if (Number(batch[0]?.rowsAffected ?? 0) > 0) return value;
+    } else {
+      const ins = await this.get().execute(claimStmt);
+      if (Number(ins.rowsAffected ?? 0) > 0) return value;
+    }
     const cur = await this.get().execute({
       sql: "SELECT value FROM worker_state WHERE key = 'scan_lock'",
       args: [],
@@ -992,7 +1016,11 @@ export class Db {
     if (!raw) {
       // Row vanished between insert and read (owner released mid-claim) —
       // retry once instead of losing this claim to a race.
-      const ins2 = await tryInsert();
+      if (heartbeatStmt) {
+        const batch = await this.get().batch([claimStmt, heartbeatStmt], "write");
+        return Number(batch[0]?.rowsAffected ?? 0) > 0 ? value : null;
+      }
+      const ins2 = await this.get().execute(claimStmt);
       return Number(ins2.rowsAffected ?? 0) > 0 ? value : null;
     }
     const until = Number(raw.split("|")[0]) || 0;
@@ -1002,7 +1030,17 @@ export class Db {
       sql: "UPDATE worker_state SET value = ? WHERE key = 'scan_lock' AND value = ?",
       args: [value, raw],
     });
-    return Number(upd.rowsAffected ?? 0) > 0 ? value : null;
+    const won = Number(upd.rowsAffected ?? 0) > 0;
+    if (won && heartbeatStmt) {
+      // Rare path (dead holder): restore liveness with a separate heartbeat
+      // write — one extra round trip only when a takeover actually happens.
+      try {
+        await this.get().execute(heartbeatStmt);
+      } catch {
+        /* heartbeat is best-effort — the scan still proceeds */
+      }
+    }
+    return won ? value : null;
   }
 
   /**
@@ -1169,6 +1207,14 @@ export class Db {
       candidates: number | null;
       pushed: number | null;
     } | null,
+    /**
+     * Exact value of the scan lock this isolate holds (see
+     * claimScanLock). When provided, its release DELETE rides in the same
+     * completion batch — the tick's end-of-scan cost stays ONE round trip
+     * (no extra write on the wall-clock-critical path). Null when the scan
+     * ran without a lock (fail-open claim error).
+     */
+    scanLockValue: string | null = null,
   ): Promise<void> {
     const c = this.get();
     const ops: Array<{
@@ -1180,6 +1226,12 @@ export class Db {
         args: [heartbeatJson],
       },
     ];
+    if (scanLockValue) {
+      ops.push({
+        sql: "DELETE FROM worker_state WHERE key = 'scan_lock' AND value = ?",
+        args: [scanLockValue],
+      });
+    }
     if (history) {
       ops.push({
         sql: `INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed)

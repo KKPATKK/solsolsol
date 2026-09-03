@@ -440,49 +440,67 @@ async function runScan(): Promise<void> {
   // DIFFERENT isolates that each read the same stale heartbeat and both
   // start a scan in the same second (observed 2026-09-03 — duplicate
   // scan_history rows at the same timestamp). Only one isolate scans per
-  // lease; the loser skips this tick and the next trigger retries. Fail-
-  // open: a DB error logs and scans anyway rather than risk a silent
-  // outage; a missing DB implies no scanner (early return above).
+  // lease; the loser skips this tick and the next trigger retries.
+  // WALL-CLOCK DISCIPLINE: the claim is batched with the start-heartbeat
+  // write (ONE round trip — the same as the pre-lock heartbeat write) and
+  // the release rides in the completion-flush batch, so this guard adds no
+  // round trips to a tick whose completion flush lives on a ~1s margin
+  // against Cloudflare's invocation kill. Fail-open: a DB error logs and
+  // scans anyway (with a standalone heartbeat write for liveness) rather
+  // than risk a silent outage; a missing DB implies no scanner (early
+  // return above).
+  const startedAt = Date.now();
   let scanLock: string | null = null;
+  let claimErrored = false;
+  const heartbeatJson = JSON.stringify({
+    at: startedAt,
+    ok: true,
+    phase: "scanning",
+    ms: null,
+    err: null,
+    skip: scanner?.lastSkip ?? null,
+  });
   if (db) {
     try {
-      scanLock = await db.claimScanLock(SCAN_LOCK_OWNER, Date.now(), SCAN_LOCK_TTL_MS);
+      scanLock = await db.claimScanLock(
+        SCAN_LOCK_OWNER,
+        startedAt,
+        SCAN_LOCK_TTL_MS,
+        heartbeatJson,
+      );
     } catch (err) {
+      claimErrored = true;
       console.error(
         "[worker] scan-lock claim failed — scanning anyway:",
         err instanceof Error ? err.message : err,
       );
     }
   }
-  if (scanLock === null) {
+  if (scanLock === null && !claimErrored) {
+    // Another isolate won the lease (its heartbeat write went out with the
+    // claim, so liveness is covered) — skip this tick.
     crossIsolateScanSkips++;
     console.log("[worker] scan skipped — another isolate holds the scan lock");
     return;
   }
-  try {
-    const startedAt = Date.now();
-    let timedOut = false;
-    // Liveness-first heartbeat, BEFORE the race: a tick killed by the ~30s
-    // wall clock mid-scan can no longer freeze the heartbeat (the
-    // 2026-09-03 outage alerts — cron delivered every minute but the
-    // completion write in the tail kept losing the race). The cadence gate
-    // sees a fresh `at`, so the effective scan rate returns to the
-    // configured 60s and the alert only fires when ticks genuinely stop.
+  if (claimErrored) {
+    // Fail-open path: the batched claim+heartbeat never ran, so restore
+    // the pre-lock standalone liveness write before scanning unlocked.
     try {
-      await db?.setWorkerState(
-        "scan_heartbeat",
-        JSON.stringify({
-          at: startedAt,
-          ok: true,
-          phase: "scanning",
-          ms: null,
-          err: null,
-          skip: scanner?.lastSkip ?? null,
-        }),
-      );
+      await db?.setWorkerState("scan_heartbeat", heartbeatJson);
     } catch (err) {
       console.error("[worker] start heartbeat write failed:", err);
     }
+  }
+  let timedOut = false;
+  try {
+    // Liveness-first heartbeat (phase=scanning) already went out with the
+    // claim batch: a tick killed by the ~30s wall clock mid-scan can no
+    // longer freeze the heartbeat (the 2026-09-03 outage alerts — cron
+    // delivered every minute but the completion write in the tail kept
+    // losing the race). The cadence gate sees a fresh `at`, so the
+    // effective scan rate returns to the configured 60s and the alert only
+    // fires when ticks genuinely stop.
     try {
       // Race the scan against the tick budget. runOnce never rejects (it
       // catches its own errors), so the first to settle wins; on timeout
@@ -515,11 +533,13 @@ async function runScan(): Promise<void> {
       scanCount++;
       const summary = scanner?.lastSummary ?? null;
       // Completion flush, ONE batched round trip (heartbeat phase=done +
-      // history row) in the same tick. Pre-race work is lean — batched
-      // scheduled counter, no redundant reads — so the 22s race + this
-      // write fits inside the effective wall envelope. If a rare Turso
-      // spike still kills it, the start heartbeat already proved liveness
-      // and only this row is lost.
+      // history row + scan-lock release) in the same tick — the lock is
+      // freed here so the guard adds NO extra end-of-tick write. Pre-race
+      // work is lean — batched scheduled counter, no redundant reads — so
+      // the 22s race + this write fits inside the effective wall envelope.
+      // If a rare Turso spike still kills it, the start heartbeat already
+      // proved liveness, only this row is lost, and the lock self-heals
+      // via its TTL + stale takeover on the next tick.
       try {
         await db?.persistScanCompletion(
           JSON.stringify({
@@ -542,19 +562,27 @@ async function runScan(): Promise<void> {
             candidates: summary?.candidates ?? null,
             pushed: summary?.pushed ?? null,
           },
+          scanLock,
         );
       } catch (err) {
         console.error("[worker] completion write failed:", err);
       }
     }
   } finally {
-    try {
-      await db?.releaseScanLock(scanLock);
-    } catch (err) {
-      console.error(
-        "[worker] scan-lock release failed:",
-        err instanceof Error ? err.message : err,
-      );
+    // Safety net only: normally the completion batch already released the
+    // lock (exact-value DELETE). This runs when the flush itself threw
+    // (DB down) — the DELETE is then a no-op if the batch still went out,
+    // and a best-effort release otherwise; a surviving lock expires via
+    // its TTL and is CAS-taken over by the next tick.
+    if (scanLock !== null) {
+      try {
+        await db?.releaseScanLock(scanLock);
+      } catch (err) {
+        console.error(
+          "[worker] scan-lock release failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
     }
   }
 }
