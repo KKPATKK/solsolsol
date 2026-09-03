@@ -674,35 +674,29 @@ export class Db {
     const c = this.connect();
     const now = Date.now();
     const nowStr = String(now);
+    // ONE read for all three keys + ONE batched write: this runs before
+    // every scheduled scan, so its round trips count against the ~30s wall
+    // clock (observed 2026-09-03: a 5-round-trip counter pushed the tick's
+    // completion write over the edge and dropped history rows).
     const res = await c.execute({
-      sql: "SELECT value FROM worker_state WHERE key = 'scheduled_tick_total'",
+      sql: `SELECT key, value FROM worker_state
+            WHERE key IN ('scheduled_tick_total', 'scheduled_tick_at', 'scheduled_tick_ring')`,
       args: [],
     });
-    const prev = res.rows.length > 0 ? parseInt(String(res.rows[0].value), 10) || 0 : 0;
-    await c.execute({
-      sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_total', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      args: [String(prev + 1)],
-    });
-    await c.execute({
-      sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      args: [nowStr],
-    });
+    const vals = new Map<string, string>();
+    for (const r of res.rows) {
+      vals.set(String(r.key), String(r.value));
+    }
+    const prev = parseInt(vals.get("scheduled_tick_total") ?? "0", 10) || 0;
     // Rolling ring of recent cron delivery times (last 90), so a heartbeat
     // gap is diagnosable afterwards: a gap in the RING = cron didn't
     // deliver; ticks present in the ring but missing from scan_history =
-    // ticks arrived and died before writing the heartbeat (init stall /
-    // wall-clock kill / DB write failure). One tiny row per minute —
-    // negligible vs the scan's rows-read.
-    const RING_KEY = "scheduled_tick_ring";
-    const RING_LEN = 90;
-    const ringRes = await c.execute({
-      sql: "SELECT value FROM worker_state WHERE key = ?",
-      args: [RING_KEY],
-    });
+    // ticks arrived but died before the scan completed.
     let ring: number[] = [];
-    if (ringRes.rows.length > 0) {
+    const rawRing = vals.get("scheduled_tick_ring");
+    if (rawRing) {
       try {
-        const parsed = JSON.parse(String(ringRes.rows[0].value));
+        const parsed = JSON.parse(rawRing);
         if (Array.isArray(parsed)) {
           ring = parsed.filter((v): v is number => typeof v === "number");
         }
@@ -711,10 +705,23 @@ export class Db {
       }
     }
     ring.push(now);
-    await c.execute({
-      sql: "INSERT INTO worker_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      args: [RING_KEY, JSON.stringify(ring.slice(-RING_LEN))],
-    });
+    await c.batch(
+      [
+        {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_total', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [String(prev + 1)],
+        },
+        {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [nowStr],
+        },
+        {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_ring', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [JSON.stringify(ring.slice(-90))],
+        },
+      ],
+      "write",
+    );
   }
 
   private async addColumnIfMissing(
@@ -1075,13 +1082,12 @@ export class Db {
 
   /**
    * Persist one tick's completion in a SINGLE batched round trip — the
-   * scan_heartbeat upsert plus the scan_history insert. The worker calls
-   * this at the START of the next tick (before the scan race), never in the
-   * tick's tail: tail DB writes kept losing Cloudflare's ~30s wall-clock
-   * race (observed 2026-09-03 — completion rows stopped landing while the
-   * start heartbeat advanced), so completion data is computed in-memory by
-   * the previous tick's finally and flushed here where it always lands.
-   * `history` is null on the first tick (heartbeat-only write). The prune
+   * scan_heartbeat upsert plus the scan_history insert. Called from the
+   * tick's finally: pre-race work is kept lean (batched scheduled counter,
+   * no redundant reads) so the race budget + this one write fits inside
+   * Cloudflare's ~30s wall clock, and the completion always lands on the
+   * isolate that ran the scan (a deferred cross-isolate flush strands rows
+   * when ticks land on different isolates — observed 2026-09-03). The prune
    * gate is re-checked at most once per hour per isolate.
    */
   async persistScanCompletion(

@@ -405,41 +405,19 @@ async function ensureInitialized(env: Env): Promise<void> {
   }
 }
 
-/**
- * Completion data of the previous runScan, flushed to Turso at the START of
- * the next tick (pre-race, where it always lands inside the wall clock). Set
- * in the finally below; written by the next runScan. Observed 2026-09-03:
- * completion DB writes in the tick's tail kept losing Cloudflare's ~30s
- * wall-clock race (scan ~21-26s + writes) — heartbeat stayed phase=scanning
- * and history rows stopped landing even though the start heartbeat advanced
- * every tick. Moving ALL writes before the race makes the completion write
- * unkillable; history rows arrive one tick late with accurate timestamps.
- */
-let pendingCompletion: {
-  at: number;
-  ok: boolean;
-  ms: number;
-  err: string | null;
-  profiles: number | null;
-  pool: number | null;
-  candidates: number | null;
-  pushed: number | null;
-} | null = null;
-
 async function runScan(): Promise<void> {
   if (!scanner) return;
   const startedAt = Date.now();
   let timedOut = false;
-  // Liveness-first heartbeat + deferred completion flush, BOTH BEFORE the
-  // race: the start stamp proves the scanner is alive on every delivered
-  // tick (a tick killed by the wall clock mid-scan can no longer freeze the
-  // heartbeat — the 2026-09-03 outage alerts), and the previous tick's
-  // completion row lands in the same single batched round trip. The cadence
-  // gate sees a fresh `at`, so the effective scan rate returns to the
-  // configured 60s and the alert only fires when ticks genuinely stop.
-  const completion = pendingCompletion;
+  // Liveness-first heartbeat, BEFORE the race: a tick killed by the ~30s
+  // wall clock mid-scan can no longer freeze the heartbeat (the 2026-09-03
+  // outage alerts — cron delivered every minute but the completion write in
+  // the tail kept losing the race). The cadence gate sees a fresh `at`, so
+  // the effective scan rate returns to the configured 60s and the alert
+  // only fires when ticks genuinely stop.
   try {
-    await db?.persistScanCompletion(
+    await db?.setWorkerState(
+      "scan_heartbeat",
       JSON.stringify({
         at: startedAt,
         ok: true,
@@ -447,18 +425,8 @@ async function runScan(): Promise<void> {
         ms: null,
         err: null,
         skip: scanner?.lastSkip ?? null,
-        lastDone: completion
-          ? {
-              at: completion.at,
-              ok: completion.ok,
-              ms: completion.ms,
-              err: completion.err,
-            }
-          : null,
       }),
-      completion,
     );
-    pendingCompletion = null; // only cleared once the flush landed
   } catch (err) {
     console.error("[worker] start heartbeat write failed:", err);
   }
@@ -481,7 +449,7 @@ async function runScan(): Promise<void> {
       ? `tick exceeded ${SCAN_TICK_BUDGET_MS}ms budget`
       : null;
     if (timedOut) {
-      console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — timeout recorded for the next tick's flush`);
+      console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — completion written with timeout flag`);
     }
   } catch (err) {
     lastScanOk = false;
@@ -492,18 +460,37 @@ async function runScan(): Promise<void> {
     lastScanAt = Date.now();
     scanCount++;
     const summary = scanner?.lastSummary ?? null;
-    // In-memory only — the DB flush happens at the next tick's start so it
-    // can never be lost to the wall-clock kill.
-    pendingCompletion = {
-      at: lastScanAt,
-      ok: lastScanOk,
-      ms: lastScanMs,
-      err: lastScanError,
-      profiles: summary?.profiles ?? null,
-      pool: summary?.pool ?? null,
-      candidates: summary?.candidates ?? null,
-      pushed: summary?.pushed ?? null,
-    };
+    // Completion flush, ONE batched round trip (heartbeat phase=done +
+    // history row) in the same tick. Pre-race work is lean — batched
+    // scheduled counter, no redundant reads — so the 22s race + this write
+    // fits inside the wall clock. If a rare Turso spike still kills it, the
+    // start heartbeat already proved liveness and only this row is lost.
+    try {
+      await db?.persistScanCompletion(
+        JSON.stringify({
+          at: lastScanAt,
+          ok: lastScanOk,
+          phase: "done",
+          count: scanCount,
+          ms: lastScanMs,
+          err: lastScanError,
+          skip: scanner?.lastSkip ?? null,
+          summary,
+        }),
+        {
+          at: lastScanAt,
+          ok: lastScanOk,
+          ms: lastScanMs,
+          err: lastScanError,
+          profiles: summary?.profiles ?? null,
+          pool: summary?.pool ?? null,
+          candidates: summary?.candidates ?? null,
+          pushed: summary?.pushed ?? null,
+        },
+      );
+    } catch (err) {
+      console.error("[worker] completion write failed:", err);
+    }
   }
 }
 
@@ -512,17 +499,21 @@ async function runScan(): Promise<void> {
  * finished more than OUTAGE_ALERT_GAP_MS ago, the scanner was down or
  * stuck. Alert each enabled chat once per episode (cooldown-bounded).
  */
-async function checkOutageAndAlert(): Promise<void> {
+async function checkOutageAndAlert(heartbeatAt?: number | null): Promise<void> {
   if (!db || !bot) return;
-  const raw = await db.getWorkerState("scan_heartbeat");
-  if (!raw) return; // first ever run — no history yet
-  let hb: { at?: number };
-  try {
-    hb = JSON.parse(raw);
-  } catch {
-    return;
+  // Reuse the cadence gate's heartbeat read (passed in by the scheduled
+  // handler) — every extra Turso round trip counts against the ~30s wall
+  // clock. Falls back to reading it itself when called without one.
+  let lastScanAt = typeof heartbeatAt === "number" && heartbeatAt > 0 ? heartbeatAt : 0;
+  if (!lastScanAt) {
+    const raw = await db.getWorkerState("scan_heartbeat");
+    if (!raw) return; // first ever run — no history yet
+    try {
+      lastScanAt = ((JSON.parse(raw) as { at?: number } | null)?.at ?? 0) || 0;
+    } catch {
+      return;
+    }
   }
-  const lastScanAt = typeof hb.at === "number" ? hb.at : 0;
   const gapMs = Date.now() - lastScanAt;
   if (gapMs < OUTAGE_ALERT_GAP_MS) return;
   const lastAlertRaw = await db.getWorkerState("outage_alert_at");
