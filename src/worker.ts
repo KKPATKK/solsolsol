@@ -169,16 +169,25 @@ const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
 const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
 /**
  * Hard budget for the whole scheduled tick. Cloudflare kills the invocation
- * at the ~30s wall-clock limit, so the tick must fit: pre-race flush (~1s,
- * see persistScanCompletion) + scan (this budget) + an in-memory-only
- * finally ≈ 23-24s — there are NO DB writes after the race anymore, so
- * nothing can be lost to the wall-clock kill (observed 2026-09-03: tail
- * writes kept losing that race and froze the heartbeat / dropped history
- * rows). The scanner's own internal candidate deadline is
- * SCAN_TICK_DEADLINE_MS=20s, so 22s costs almost nothing — deferred
- * candidates stay in the re-eval pool and are picked up by the next tick.
+ * at the ~30s wall-clock limit, so the tick must fit: lean pre-race (~1s:
+ * batched tick counter + start heartbeat, see persistScanCompletion) +
+ * scan (this budget) + the completion flush (ONE batched round trip) ≈
+ * 27-28s. There are NO DB writes after the race anymore, so nothing can be
+ * lost to the wall-clock kill (observed 2026-09-03: tail writes kept losing
+ * that race and froze the heartbeat / dropped history rows).
+ *
+ * 25s, not 22s: the 22s cap was set while pre-race work still cost ~4-5s;
+ * commit c868df2 slimmed pre-race to ~1s, making 22s overly conservative —
+ * scans that genuinely finish (measured 20.7-22.0s, occasionally slower on
+ * a hot pool) kept losing the race by a hair, so every completion row was
+ * written as ok=false with a null summary and the per-scan feed counters
+ * (pool/candidates/pushed) went missing from /health and /debug/scan-history
+ * (observed 2026-09-03 ~13:44Z+). The scanner's own internal candidate
+ * deadline is SCAN_TICK_DEADLINE_MS=20s; the ~3-5s of tail beyond it is
+ * push fan-out + result flush, and deferred candidates stay in the re-eval
+ * pool for the next tick.
  */
-const SCAN_TICK_BUDGET_MS = 22_000;
+const SCAN_TICK_BUDGET_MS = 25_000;
 
 async function ensureInitialized(env: Env): Promise<void> {
   const fp = tradeFingerprint(env);
@@ -462,7 +471,7 @@ async function runScan(): Promise<void> {
     const summary = scanner?.lastSummary ?? null;
     // Completion flush, ONE batched round trip (heartbeat phase=done +
     // history row) in the same tick. Pre-race work is lean — batched
-    // scheduled counter, no redundant reads — so the 22s race + this write
+    // scheduled counter, no redundant reads — so the 25s race + this write
     // fits inside the wall clock. If a rare Turso spike still kills it, the
     // start heartbeat already proved liveness and only this row is lost.
     try {
