@@ -169,11 +169,13 @@ const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
 const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
 /**
  * Hard budget for the whole scheduled tick. Cloudflare kills the invocation
- * at the ~30s wall-clock limit; if a slow scan crosses that, runScan's
- * finally (which writes the heartbeat) never runs and the scan looks dead
- * from the outside. Racing the scan against this budget — well under the
- * wall clock — guarantees the heartbeat is written every tick, with a
- * timeout flag, so a slow scan is visible instead of silent.
+ * at the ~30s wall-clock limit; if a slow scan crosses that, the completion
+ * write in runScan's finally may never run. Liveness is guaranteed by the
+ * START heartbeat written before the race (see runScan), so every delivered
+ * tick advances the heartbeat even if the completion write loses the wall-
+ * clock race; this budget just decides how much time the scan itself gets
+ * before the timeout flag is recorded in the completion heartbeat, making a
+ * slow scan visible instead of silent.
  */
 const SCAN_TICK_BUDGET_MS = 26_000;
 
@@ -406,6 +408,31 @@ async function runScan(): Promise<void> {
   if (!scanner) return;
   const startedAt = Date.now();
   let timedOut = false;
+  // Liveness-first heartbeat: written BEFORE the scan so a tick that is
+  // killed by Cloudflare's ~30s wall clock (scan ~21-26s + the completion
+  // DB writes left only ~4s) still advances the heartbeat. Observed
+  // 2026-09-03: cron delivered every minute, but scans only completed every
+  // 2-6 min because the completion write in `finally` kept losing the
+  // wall-clock race — the frozen heartbeat then tripped the 3-min outage
+  // alert repeatedly. With this start stamp the heartbeat advances on every
+  // delivered tick, the cadence gate sees a fresh `at`, and the alert only
+  // fires when ticks genuinely stop. The completion write below overwrites
+  // this with the real ok/ms/summary (phase "done").
+  try {
+    await db?.setWorkerState(
+      "scan_heartbeat",
+      JSON.stringify({
+        at: startedAt,
+        ok: true,
+        phase: "scanning",
+        ms: null,
+        err: null,
+        skip: scanner?.lastSkip ?? null,
+      }),
+    );
+  } catch (err) {
+    console.error("[worker] start heartbeat write failed:", err);
+  }
   try {
     // Race the scan against the tick budget. runOnce never rejects (it
     // catches its own errors), so the first to settle wins; on timeout the
@@ -444,6 +471,7 @@ async function runScan(): Promise<void> {
         JSON.stringify({
           at: lastScanAt,
           ok: lastScanOk,
+          phase: "done",
           count: scanCount,
           ms: lastScanMs,
           err: lastScanError,
