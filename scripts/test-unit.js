@@ -147,6 +147,159 @@ async function main() {
     }
   });
 
+  // ---------- worker liveness/heartbeat DB helpers (2026-09-03 changes) ----------
+
+  await test("bumpScheduledTick: batched counter + tick ring (cap 90, corruption-safe)", async () => {
+    const t = tmpDb();
+    try {
+      // The worker constructs a fresh Db and calls bumpScheduledTick BEFORE
+      // init on a schema that already exists (created by an earlier init on
+      // a previous deploy). Mirror that: init once, then bump via a second
+      // Db instance on the same file.
+      const boot = new Db(t.p, undefined, t.client);
+      await boot.init();
+      const db = new Db(t.p, undefined, t.client);
+      await db.bumpScheduledTick();
+      let row = (
+        await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_total'")
+      ).rows[0];
+      assert.equal(String(row.value), "1");
+      row = (await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_at'")).rows[0];
+      const at = Number(row.value);
+      assert.ok(Math.abs(Date.now() - at) < 30_000, "scheduled_tick_at is recent");
+      let ring = JSON.parse(
+        String((await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_ring'")).rows[0].value),
+      );
+      assert.equal(ring.length, 1);
+      assert.equal(ring[0], at);
+
+      // Accumulates across calls.
+      await db.bumpScheduledTick();
+      row = (await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_total'")).rows[0];
+      assert.equal(String(row.value), "2");
+      ring = JSON.parse(
+        String((await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_ring'")).rows[0].value),
+      );
+      assert.equal(ring.length, 2);
+      assert.equal(ring[1] > ring[0], true, "ring is ordered oldest -> newest");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("bumpScheduledTick: ring caps at 90 and survives a corrupted ring", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Corrupted ring value must reset, not crash.
+      await t.client.execute(
+        "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_ring', 'not-json') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      );
+      await db.bumpScheduledTick();
+      let ring = JSON.parse(
+        String((await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_ring'")).rows[0].value),
+      );
+      assert.equal(ring.length, 1);
+      // 95 pre-seeded entries + 1 bump -> capped at the newest 90.
+      const old = Array.from({ length: 95 }, (_, i) => 1_000_000 + i);
+      await t.client.execute(
+        "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_ring', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [JSON.stringify(old)],
+      );
+      await db.bumpScheduledTick();
+      ring = JSON.parse(
+        String((await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_ring'")).rows[0].value),
+      );
+      assert.equal(ring.length, 90, "ring capped at 90");
+      assert.equal(ring[89] > 1_000_094, true, "newest entry appended, oldest dropped");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("persistScanCompletion: heartbeat + history in one call; null history = heartbeat only", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const at = Date.now();
+      const hb = JSON.stringify({ at, ok: false, phase: "done", ms: 22139 });
+      await db.persistScanCompletion(hb, {
+        at,
+        ok: false,
+        ms: 22139,
+        err: "tick exceeded 22000ms budget",
+        profiles: 12,
+        pool: 447,
+        candidates: 0,
+        pushed: 0,
+      });
+      const hbRow = (await t.client.execute("SELECT value FROM worker_state WHERE key = 'scan_heartbeat'")).rows[0];
+      assert.equal(String(hbRow.value), hb, "heartbeat persisted verbatim");
+      let hist = (await t.client.execute("SELECT * FROM scan_history")).rows;
+      assert.equal(hist.length, 1);
+      assert.equal(Number(hist[0].at), at);
+      assert.equal(hist[0].ok, 0, "ok mapped to 0 for false");
+      assert.equal(Number(hist[0].pool), 447);
+      assert.equal(String(hist[0].err), "tick exceeded 22000ms budget");
+      // null history -> heartbeat-only write, no extra row.
+      await db.persistScanCompletion(JSON.stringify({ at: at + 1, ok: true, phase: "scanning" }), null);
+      hist = (await t.client.execute("SELECT * FROM scan_history")).rows;
+      assert.equal(hist.length, 1, "no history row for null history");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("getScanHistory: newest-first with mapped fields and limit", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Realistic timestamps: persistScanCompletion's first-call prune check
+      // deletes rows older than 30 days, so synthetic epoch-1000 rows would
+      // be pruned before the assertions run.
+      const now = Date.now();
+      await db.persistScanCompletion("x", { at: now, ok: true, ms: 10, err: null, profiles: 1, pool: 2, candidates: 3, pushed: 4 });
+      await db.persistScanCompletion("x", { at: now + 1, ok: false, ms: 20, err: "boom", profiles: 5, pool: 6, candidates: 7, pushed: 8 });
+      const rows = await db.getScanHistory(10);
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].at, now + 1, "newest first");
+      assert.equal(rows[0].ok, false);
+      assert.equal(rows[0].err, "boom");
+      assert.equal(rows[1].at, now);
+      assert.equal(rows[1].ok, true);
+      assert.equal(rows[1].profiles, 1);
+      // Respects the limit.
+      const limited = await db.getScanHistory(1);
+      assert.equal(limited.length, 1);
+      assert.equal(limited[0].at, now + 1);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("recordScanHistory still inserts with the in-memory prune gate", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.recordScanHistory({ at: Date.now(), ok: true, ms: 100, err: null, profiles: 1, pool: 1, candidates: 0, pushed: 0 });
+      await db.recordScanHistory({ at: Date.now() + 1, ok: false, ms: 200, err: "e", profiles: null, pool: null, candidates: null, pushed: null });
+      const rows = await db.getScanHistory(10);
+      assert.equal(rows.length, 2, "both rows present");
+      assert.equal(rows[0].ok, false);
+      assert.equal(rows[0].err, "e");
+      assert.equal(rows[0].profiles, null);
+      // Prune gate must never delete fresh rows even when due for a check.
+      const n = Number((await t.client.execute("SELECT COUNT(*) AS n FROM scan_history")).rows[0].n);
+      assert.equal(n, 2);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("DEFAULT_SETTINGS match the operator's filter spec", () => {
     assert.equal(DEFAULT_SETTINGS.minMarketCapUsd, 40000);
     assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 380000);
