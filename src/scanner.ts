@@ -19,6 +19,7 @@ import type { JupTokensClient } from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
 import { PushWatcher } from "./pushwatch";
+import { FlurryAnalyzer, type FlurryReport } from "./flurry";
 
 
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -158,8 +159,16 @@ export interface ScanSummary {
     flow: number;
     /** Creator / top-holder wallet matched the crime-wallet blocklist. */
     crime: number;
+    /** Deploy-slot bundle detected (Flurry forensics, last gate). */
+    flurry: number;
     other: number;
   };
+  /** Flurry forensics verdicts produced this scan (0 when disabled). */
+  flurryAnalyzed: number;
+  /** Flurry Helius RPC calls made (cumulative across scans — spend watch). */
+  flurryRpcCalls: number;
+  /** Flurry cache hits (verdicts reused without RPC). */
+  flurryCacheHits: number;
   /** Per-coin rejection trace for the last scan (bounded). */
   rejects: RejectionEntry[];
 }
@@ -181,6 +190,23 @@ const REJECT_LOG_MAX = 50;
  * 27.9x (BAOJIN — which then rugged to $2K LP). Default 10 splits the
  * clusters with headroom on both sides.
  */
+/**
+ * Deploy-slot bundle gate (Flurry forensics, ported from
+ * github.com/NerdHerderDani/flurry): a coin is rejected when N distinct
+ * wallets acquired >= minSupplyPct of the supply in the exact slot the
+ * token was created — the classic Jito-bundle / same-block-spam shape.
+ * Fail-open: a null report (non-pump mint, RPC error, budget exceeded)
+ * never judges.
+ */
+export function flurryBlockReason(report: FlurryReport | null): string | null {
+  if (!report?.bundled) return null;
+  const lineage =
+    report.linkedWallets > 0
+      ? `, ${report.linkedWallets}個錢包同資金來源`
+      : "";
+  return `Launch 捆綁: ${report.deploySlotWallets}個錢包在創建同一slot買入 ${report.deploySlotSupplyPct}%供應${lineage}（Jito bundle 特徵）`;
+}
+
 export function mcapRatioBlockReason(
   marketCap: number,
   liquidityUsd: number,
@@ -394,6 +420,15 @@ export class Scanner {
      * truncates the card enrichment, never the push.
      */
     private readonly walletAnalyzer: WalletAnalyzer | null = null,
+    /**
+     * Flurry launch forensics (null = disabled): deploy-slot bundle
+     * detection + one-hop funding lineage, ported from the Flurry terminal
+     * (Apache-2.0). The LAST gate before a push — only coins that passed
+     * every other gate are checked, so its Helius spend tracks coins about
+     * to be pushed. Fail-open: non-pump mints, RPC errors and budget
+     * exhaustion pass without blocking; verdicts cached per mint.
+     */
+    private readonly flurry: FlurryAnalyzer | null = null,
   ) {
     this.pushWatcher = config.pushWatch.enabled
       ? new PushWatcher(
@@ -614,7 +649,18 @@ export class Scanner {
       agedEval: 0,
       candidates: 0,
       pushed: 0,
-      fails: { mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, other: 0 },
+      fails: {
+        mcap: 0,
+        chg: 0,
+        age: 0,
+        flow: 0,
+        crime: 0,
+        flurry: 0,
+        other: 0,
+      },
+      flurryAnalyzed: 0,
+      flurryRpcCalls: 0,
+      flurryCacheHits: 0,
       rejects: [],
     };
     // Watchdog: if the scan outlives its budget, release the lock so the next
@@ -1349,6 +1395,27 @@ export class Scanner {
           );
           continue;
         }
+        // Flurry launch forensics — deploy-slot bundle + funding-lineage
+        // check. Deliberately the LAST gate: it only runs on coins that
+        // passed every other gate (so its Helius spend tracks coins about
+        // to be pushed, not all candidates), and a bundled coin blocked
+        // here costs one extra envelope before the verdict is cached per
+        // mint (0 RPC on re-sweeps). Fail-open: non-pump mints, RPC errors
+        // and budget exhaustion all pass without blocking.
+        const flurryOut = this.flurry
+          ? await this.flurry.analyze(coin.stats.token, tickDeadline)
+          : { status: "skip" as const };
+        const flurryReport =
+          flurryOut.status === "report" ? flurryOut.report : null;
+        if (flurryReport) diag.flurryAnalyzed++;
+        if (flurryReport?.bundled && this.config.flurry.blockBundles) {
+          diag.fails.flurry++;
+          this.addReject(diag, coin, flurryBlockReason(flurryReport)!);
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (deploy-slot bundle)`,
+          );
+          continue;
+        }
         // Live trade-mode read (once per token): /setmode flips apply to the
         // very next card. Buy button renders in manual mode; sell buttons in
         // any non-off mode (in auto the coin was already bought — exits are
@@ -1371,6 +1438,9 @@ export class Scanner {
           wallet,
           organic,
           axiomInfo,
+          // null = forensics disabled → line hidden; { report: null } =
+          // configured but nothing to report (non-pump mint / skip).
+          this.flurry ? { report: flurryReport } : null,
         );
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
           // Atomic claim BEFORE sending: overlapping isolates can both pass
@@ -1495,6 +1565,11 @@ export class Scanner {
       // Only a still-current scan may publish summary/state; a timed-out scan
       // that eventually settles must not clobber a newer scan's results.
       if (seq === this.scanSeq) {
+        // Flurry RPC spend is cumulative across ticks (isolate lifetime) —
+        // surface it on every heartbeat so actual cost stays observable.
+        const fs = this.flurry?.stats();
+        diag.flurryRpcCalls = fs?.rpcCalls ?? 0;
+        diag.flurryCacheHits = fs?.cacheHits ?? 0;
         this.lastSummary = diag;
         this.lastSkip = null;
         this.running = false;

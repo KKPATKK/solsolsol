@@ -143,6 +143,42 @@ interface SigInfo {
   memo?: string | null;
 }
 
+/** One entry from getSignaturesForAddress (used by the Flurry forensics). */
+export interface RpcSignatureInfo {
+  signature: string;
+  /** Solana slot of the transaction (absent on some RPC responses). */
+  slot?: number;
+  blockTime?: number | null;
+  err?: unknown;
+  memo?: string | null;
+}
+
+/** jsonParsed token-balance entry (meta.preTokenBalances/postTokenBalances). */
+export interface ParsedTokenBalance {
+  accountIndex: number;
+  mint: string;
+  owner?: string;
+  uiTokenAmount: { amount: string };
+}
+
+/**
+ * jsonParsed transaction shape consumed by the Flurry deploy-slot decoder
+ * (slot + token-balance deltas + SOL balance deltas + account keys).
+ */
+export interface ParsedTx {
+  slot?: number;
+  meta?: {
+    err?: unknown;
+    preBalances?: number[] | null;
+    postBalances?: number[] | null;
+    preTokenBalances?: ParsedTokenBalance[] | null;
+    postTokenBalances?: ParsedTokenBalance[] | null;
+  } | null;
+  transaction?: {
+    message?: { accountKeys?: Array<string | { pubkey: string }> };
+  };
+}
+
 /**
  * One wallet's on-chain profile, sampled from getSignaturesForAddress
  * (see HeliusClient.getWalletProfile and summarizeSignatures).
@@ -309,6 +345,32 @@ export class HeliusClient {
       }
     }
     return null;
+  }
+
+  /** getSignaturesForAddress — newest-first signature page (Flurry forensics). */
+  async getSignatures(
+    address: string,
+    limit: number,
+  ): Promise<RpcSignatureInfo[] | null> {
+    return this.rpc<RpcSignatureInfo[]>("getSignaturesForAddress", [
+      address,
+      { limit },
+    ]);
+  }
+
+  /** getTransaction with jsonParsed — balance deltas for slot-activity decode. */
+  async getParsedTransaction(sig: string): Promise<ParsedTx | null> {
+    return this.rpc<ParsedTx>("getTransaction", [
+      sig,
+      { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+    ]);
+  }
+
+  /** getTokenSupply — raw base-unit supply (the % denominator for forensics). */
+  async getTokenSupply(
+    mint: string,
+  ): Promise<{ value: { amount: string } } | null> {
+    return this.rpc<{ value: { amount: string } }>("getTokenSupply", [mint]);
   }
 
   /**

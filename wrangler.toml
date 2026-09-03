@@ -206,6 +206,28 @@ WALLET_ANALYSIS_MIN_CREATES = "3"
 WALLET_ANALYSIS_NEW_AGE_HOURS = "24"
 WALLET_ANALYSIS_CLUSTER_MIN_COINS = "2"
 WALLET_ANALYSIS_CLUSTER_WINDOW_DAYS = "14"
+# Flurry launch forensics (ported from github.com/NerdHerderDani/flurry,
+# Apache-2.0): deploy-slot bundle detection + one-hop funding lineage — the
+# classic Jito-bundle shape (N distinct wallets buying supply in the exact
+# slot the token was created). Runs as the LAST gate before each push, only
+# on coins that passed every other gate, via Helius RPC only (~5-12
+# calls/coin typical — negligible against the 1M-credit free tier; zero
+# Birdeye/GeckoTerminal/DexScreener calls). Fail-open: non-pump mints (no
+# bonding curve), RPC errors and budget exhaustion all pass without
+# blocking. Verdicts are cached per mint (FLURRY_CACHE_MS) so re-sweeps of
+# a blocked coin cost 0 RPC; /health exposes analyzed/rpcCalls/cacheHits
+# counters to watch actual spend.
+FLURRY_ENABLED = "true"
+# true = bundled launches are blocked before the push; false = observe-only
+# (the bundle flag is shown on the card but never blocks).
+FLURRY_BLOCK_BUNDLES = "true"
+FLURRY_MIN_WALLETS = "4"
+FLURRY_MIN_SUPPLY_PCT = "15"
+# Funding-lineage wallet cap (1 sig call + up to 10 txs per wallet,
+# early-exit on the first inbound SOL transfer).
+FLURRY_MAX_WALLETS = "12"
+FLURRY_CACHE_MS = "1800000"
+FLURRY_BUDGET_MS = "15000"
 RUGCHECK_REQUEST_INTERVAL_MS = "800"
 HELIUS_REQUEST_INTERVAL_MS = "300"
 # Periodic Birdeye new_listing backfill (safety net for discovery gaps):

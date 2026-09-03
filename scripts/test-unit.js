@@ -19,7 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -28,6 +28,7 @@ const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
 const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
+const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint } = require("../dist/worker.js");
 
 let passed = 0;
@@ -2940,6 +2941,303 @@ async function main() {
     assert.equal(top10MinBlockReason(95.5, 10, 0), null);
     // Missing data never judges even with both bounds set.
     assert.equal(top10MinBlockReason(null, 10, 90), null);
+  });
+
+  // ---------- Flurry launch forensics (deploy-slot bundle + lineage) ----------
+
+  await test("deriveBondingCurvePda: matches the live create_v2 vector", () => {
+    assert.equal(
+      deriveBondingCurvePda("9dtmpyqK6gokJLVWrqPnhw6bq1kXGDJsuCoMtWQUpump"),
+      "Dan7TVQLS8qS2BBt5z5bm7r9FKf149Xs33XACfUP6UPX",
+    );
+  });
+
+  await test("detectBundle: 4+ wallets with 15%+ supply in the deploy slot is a bundle", () => {
+    const slot = 300_000_000;
+    const activity = [1, 2, 3, 4].map((i) => ({
+      wallet: `Buyer${i}`,
+      slot,
+      supplyPct: 5,
+    }));
+    const report = detectBundle(slot, activity);
+    assert.equal(report.bundled, true);
+    assert.equal(report.deploySlotWallets, 4);
+    assert.equal(report.deploySlotSupplyPct, 20);
+  });
+
+  await test("detectBundle: 3 wallets or <15% supply passes; thresholds tunable", () => {
+    const slot = 300_000_000;
+    // 3 wallets even at high supply → not a bundle (default floor is 4).
+    assert.equal(
+      detectBundle(slot, [1, 2, 3].map((i) => ({ wallet: `B${i}`, slot, supplyPct: 10 }))).bundled,
+      false,
+    );
+    // 4 wallets but only 10% supply → not a bundle.
+    assert.equal(
+      detectBundle(slot, [1, 2, 3, 4].map((i) => ({ wallet: `B${i}`, slot, supplyPct: 2.5 }))).bundled,
+      false,
+    );
+    // Outside-slot buys never count toward the bundle.
+    const outside = [1, 2, 3, 4].map((i) => ({ wallet: `B${i}`, slot: slot + 1, supplyPct: 6 }));
+    assert.equal(detectBundle(slot, outside).bundled, false);
+    // Stricter operator thresholds apply.
+    assert.equal(
+      detectBundle(slot, [1, 2, 3, 4].map((i) => ({ wallet: `B${i}`, slot, supplyPct: 5 })), {
+        minWallets: 6,
+        minSupplyPct: 30,
+      }).bundled,
+      false,
+    );
+  });
+
+  await test("slotActivityFromTransaction: balance deltas → supply pct, sellers/errors excluded", () => {
+    const total = 1_000_000_000n; // 1e9 raw base units (6 decimals, display 1000)
+    const mint = "MINT";
+    const tx = {
+      slot: 42,
+      meta: {
+        err: null,
+        preTokenBalances: [
+          { accountIndex: 0, mint, uiTokenAmount: { amount: "0" } },
+          { accountIndex: 1, mint, uiTokenAmount: { amount: "100000000" } },
+        ],
+        postTokenBalances: [
+          { accountIndex: 0, mint, owner: "BuyerA", uiTokenAmount: { amount: "50000000" } },
+          { accountIndex: 1, mint, owner: "SellerB", uiTokenAmount: { amount: "20000000" } },
+        ],
+      },
+    };
+    const activity = slotActivityFromTransaction(tx, mint, total);
+    // BuyerA acquired 5% of supply; SellerB's delta is negative → excluded.
+    assert.equal(activity.length, 1);
+    assert.equal(activity[0].wallet, "BuyerA");
+    assert.equal(activity[0].supplyPct, 5);
+    // Errored transactions yield nothing.
+    assert.deepEqual(
+      slotActivityFromTransaction({ ...tx, meta: { ...tx.meta, err: "InstructionError" } }, mint, total),
+      [],
+    );
+  });
+
+  await test("clusterByFunding / linkedWalletCount: shared funder detected, none = clean", () => {
+    const activity = [
+      { wallet: "W1", slot: 1, supplyPct: 5, fundedBy: "FunderA" },
+      { wallet: "W2", slot: 1, supplyPct: 5, fundedBy: "FunderA" },
+      { wallet: "W3", slot: 1, supplyPct: 5, fundedBy: "FunderA" },
+      { wallet: "W4", slot: 1, supplyPct: 5, fundedBy: "FunderB" },
+      { wallet: "W5", slot: 1, supplyPct: 5 },
+    ];
+    const clusters = clusterByFunding(activity);
+    assert.equal(clusters.length, 1);
+    assert.equal(clusters[0].funder, "FunderA");
+    assert.deepEqual(clusters[0].wallets, ["W1", "W2", "W3"]);
+    assert.equal(linkedWalletCount(clusters), 3);
+    // No shared funding → no clusters.
+    assert.deepEqual(clusterByFunding([{ wallet: "X", slot: 1, supplyPct: 5 }]), []);
+    assert.equal(linkedWalletCount([]), 0);
+  });
+
+  await test("scoreRisk: bundling dominates the tier; clean deploys stay low", () => {
+    assert.equal(scoreRisk({ bundled: true, firstBlockSupplyPct: 40, linkedWallets: 8, deployerPriorRugs: 0, devHoldsPct: 0 }).tier, "CRITICAL");
+    assert.equal(scoreRisk({ bundled: true, firstBlockSupplyPct: 20, linkedWallets: 3, deployerPriorRugs: 0, devHoldsPct: 0 }).tier, "HIGH");
+    assert.equal(scoreRisk({ bundled: false, firstBlockSupplyPct: 25, linkedWallets: 6, deployerPriorRugs: 0, devHoldsPct: 0 }).tier, "MODERATE");
+    assert.equal(scoreRisk({ bundled: false, firstBlockSupplyPct: 5, linkedWallets: 0, deployerPriorRugs: 0, devHoldsPct: 0 }).tier, "LOW");
+  });
+
+  await test("flurryBlockReason: bundled report blocks, clean/null pass (fail-open)", () => {
+    assert.match(
+      flurryBlockReason({ bundled: true, deploySlotWallets: 6, deploySlotSupplyPct: 31.5, linkedWallets: 4, clusterSize: 4, score: 7, tier: "CRITICAL" }),
+      /6個錢包在創建同一slot買入 31\.5%供應/,
+    );
+    assert.match(
+      flurryBlockReason({ bundled: true, deploySlotWallets: 6, deploySlotSupplyPct: 31.5, linkedWallets: 4, clusterSize: 4, score: 7, tier: "CRITICAL" }),
+      /同資金來源/,
+    );
+    assert.equal(
+      flurryBlockReason({ bundled: false, deploySlotWallets: 2, deploySlotSupplyPct: 8, linkedWallets: 0, clusterSize: 0, score: 0, tier: "LOW" }),
+      null,
+    );
+    // Fail-open: no report (non-pump mint / RPC error / budget) never judges.
+    assert.equal(flurryBlockReason(null), null);
+  });
+
+  await test("findFundedBy: inbound SOL matched to a funder; no funding → null", async () => {
+    const transport = {
+      async getSignatures(address) {
+        if (address === "Buyer") {
+          return [
+            { signature: "sig-buy", err: null },
+            { signature: "sig-fund", err: null },
+          ];
+        }
+        return [];
+      },
+      async getParsedTransaction(sig) {
+        if (sig === "sig-buy") {
+          return {
+            slot: 10,
+            meta: {
+              err: null,
+              preBalances: [1000000, 50000000, 0],
+              postBalances: [900000, 49999000, 1000000],
+            },
+            transaction: { message: { accountKeys: ["Buyer", "Other", "Funder"] } },
+          };
+        }
+        if (sig === "sig-fund") {
+          return {
+            slot: 5,
+            meta: {
+              err: null,
+              preBalances: [0, 1000000, 50000000],
+              postBalances: [1000000, 999900, 49000000],
+            },
+            transaction: { message: { accountKeys: ["Buyer", "Mint", "Funder"] } },
+          };
+        }
+        return null;
+      },
+    };
+    // sig-fund: Buyer received 1 SOL from Funder (their balance dropped by the
+    // same amount) — newest-first scan finds it on the first tx it checks.
+    assert.equal(await findFundedBy(transport, "Buyer"), "Funder");
+    // A wallet with no inbound transfers resolves to null.
+    assert.equal(await findFundedBy(transport, "NoHistory"), null);
+  });
+
+  await test("FlurryAnalyzer: bundled launch detected end-to-end, verdict cached (0 repeat RPC)", async () => {
+    const mint = "9dtmpyqK6gokJLVWrqPnhw6bq1kXGDJsuCoMtWQUpump";
+    const deploySlot = 500;
+    const fakeHelius = {
+      rpcCount: 0,
+      async getSignatures(address, limit) {
+        this.rpcCount++;
+        return [1, 2, 3, 4].map((i) => ({
+          signature: `sig-${i}`,
+          slot: deploySlot,
+          err: null,
+        }));
+      },
+      async getParsedTransaction(sig) {
+        this.rpcCount++;
+        return {
+          slot: deploySlot,
+          meta: {
+            err: null,
+            preBalances: [0, 1000000],
+            postBalances: [1000000, 0],
+            preTokenBalances: [
+              { accountIndex: 0, mint, uiTokenAmount: { amount: "0" } },
+            ],
+            postTokenBalances: [
+              {
+                accountIndex: 0,
+                mint,
+                owner: `Wallet${sig}`,
+                uiTokenAmount: { amount: "50000000" },
+              },
+            ],
+          },
+          transaction: { message: { accountKeys: [`Wallet${sig}`, "FunderX"] } },
+        };
+      },
+      async getTokenSupply() {
+        this.rpcCount++;
+        return { value: { amount: "1000000000" } }; // 1e9 raw
+      },
+    };
+    const analyzer = new FlurryAnalyzer(loadConfig({}), fakeHelius);
+    const first = await analyzer.analyze(mint, Date.now() + 60_000);
+    assert.equal(first.status, "report");
+    if (first.status === "report") {
+      assert.equal(first.report.bundled, true);
+      assert.equal(first.report.deploySlotWallets, 4);
+      assert.equal(first.report.deploySlotSupplyPct, 20);
+      // 4 distinct wallets, each funded from the same tx pattern → one cluster
+      // of 4, all sharing the fake "Funder" from the parsed tx.
+      assert.equal(first.report.linkedWallets, 4);
+      assert.equal(first.report.clusterSize, 4);
+    }
+    const callsAfterFirst = fakeHelius.rpcCount;
+    // Second call within the TTL is served from cache — zero new RPC.
+    const second = await analyzer.analyze(mint, Date.now() + 60_000);
+    assert.equal(second.status, "report");
+    assert.equal(fakeHelius.rpcCount, callsAfterFirst);
+    const stats = analyzer.stats();
+    assert.equal(stats.cacheHits, 1);
+    assert.ok(stats.rpcCalls >= 1);
+  });
+
+  await test("FlurryAnalyzer: non-pump mint fail-opens and negative-caches", async () => {
+    const mint = "9dtmpyqK6gokJLVWrqPnhw6bq1kXGDJsuCoMtWQUpump";
+    const fakeHelius = {
+      rpcCount: 0,
+      async getSignatures() {
+        this.rpcCount++;
+        return []; // no curve history → not a pump.fun launch
+      },
+      async getParsedTransaction() {
+        return null;
+      },
+      async getTokenSupply() {
+        return null;
+      },
+    };
+    const analyzer = new FlurryAnalyzer(loadConfig({}), fakeHelius);
+    assert.equal((await analyzer.analyze(mint, Date.now() + 60_000)).status, "skip");
+    const calls = fakeHelius.rpcCount;
+    // Negative cache: the second sweep costs 0 RPC too.
+    assert.equal((await analyzer.analyze(mint, Date.now() + 60_000)).status, "skip");
+    assert.equal(fakeHelius.rpcCount, calls);
+  });
+
+  await test("FlurryAnalyzer: disabled config skips without touching the RPC", async () => {
+    const fakeHelius = {
+      rpcCount: 0,
+      async getSignatures() {
+        this.rpcCount++;
+        return [{ signature: "s", slot: 1, err: null }];
+      },
+      async getParsedTransaction() {
+        return null;
+      },
+      async getTokenSupply() {
+        return null;
+      },
+    };
+    const analyzer = new FlurryAnalyzer(
+      loadConfig({ FLURRY_ENABLED: "0" }),
+      fakeHelius,
+    );
+    assert.equal((await analyzer.analyze("9dtmpyqK6gokJLVWrqPnhw6bq1kXGDJsuCoMtWQUpump", Date.now() + 60_000)).status, "skip");
+    assert.equal(fakeHelius.rpcCount, 0);
+  });
+
+  await test("loadConfig: flurry defaults and env overrides", () => {
+    const def = loadConfig({}).flurry;
+    assert.equal(def.enabled, true);
+    assert.equal(def.blockBundles, true);
+    assert.equal(def.minWallets, 4);
+    assert.equal(def.minSupplyPct, 15);
+    assert.equal(def.maxWallets, 12);
+    assert.equal(def.cacheMs, 30 * 60_000);
+    assert.equal(def.budgetMs, 15_000);
+    const over = loadConfig({
+      FLURRY_ENABLED: "false",
+      FLURRY_BLOCK_BUNDLES: "false",
+      FLURRY_MIN_WALLETS: "6",
+      FLURRY_MIN_SUPPLY_PCT: "30",
+      FLURRY_MAX_WALLETS: "20",
+      FLURRY_CACHE_MS: "120000",
+      FLURRY_BUDGET_MS: "8000",
+    }).flurry;
+    assert.equal(over.enabled, false);
+    assert.equal(over.blockBundles, false);
+    assert.equal(over.minWallets, 6);
+    assert.equal(over.minSupplyPct, 30);
+    assert.equal(over.maxWallets, 20);
+    assert.equal(over.cacheMs, 120_000);
+    assert.equal(over.budgetMs, 8_000);
   });
 
   // ---------- summary ----------

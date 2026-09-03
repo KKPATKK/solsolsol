@@ -18,6 +18,7 @@ import type { QualifyingCoin } from "./scanner";
 import { ArkhamClient } from "./arkham";
 import { CrimeWalletClient } from "./crimewallets";
 import { WalletAnalyzer } from "./walletanalysis";
+import { FlurryAnalyzer } from "./flurry";
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -69,6 +70,7 @@ let axiom: AxiomClient | null = null;
 let arkham: ArkhamClient | null = null;
 let crimeWallets: CrimeWalletClient | null = null;
 let walletAnalyzer: WalletAnalyzer | null = null;
+let flurryAnalyzer: FlurryAnalyzer | null = null;
 /** OTP JWT from the pending Axiom login step 1 (module-local, short-lived). */
 let pendingAxiomOtpJwt: string | null = null;
 let trade: TradeService | null = null;
@@ -323,6 +325,21 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
       }
 
+      // Flurry launch forensics — deploy-slot bundle gate + funding lineage
+      // (ported from github.com/NerdHerderDani/flurry, Apache-2.0). Last gate
+      // before each push; fail-open; verdicts cached per mint.
+      flurryAnalyzer = null;
+      if (config.flurry.enabled && helius) {
+        try {
+          flurryAnalyzer = new FlurryAnalyzer(config, helius);
+        } catch (err) {
+          console.warn(
+            "[worker] Flurry forensics client not ready:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
       if (db) {
         scanner = new Scanner(
           db,
@@ -362,6 +379,9 @@ async function ensureInitialized(env: Env): Promise<void> {
           // Wallet analysis — creator profile + holder ages + cross-coin
           // clustering for pushed coins (null when disabled).
           walletAnalyzer ?? undefined,
+          // Flurry launch forensics — deploy-slot bundle gate + funding
+          // lineage (null when disabled). Last gate before each push.
+          flurryAnalyzer ?? undefined,
         );
         scannerReady = true;
       }
@@ -780,6 +800,7 @@ export default {
         null,
         null,
         axiomPayload,
+        null, // flurry forensics — hidden when disabled
       );
       let sent = false;
       let sendError: string | null = null;

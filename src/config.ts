@@ -438,6 +438,39 @@ export interface AppConfig {
   crimeWallets: CrimeWalletsConfig;
   /** Pushed-coin wallet analysis (creator profile + holder ages + clustering). */
   walletAnalysis: WalletAnalysisConfig;
+  /**
+   * Flurry launch forensics (ported from github.com/NerdHerderDani/flurry,
+   * Apache-2.0): deploy-slot bundle detection + one-hop funding lineage. Runs
+   * as the LAST gate before each push — only coins that passed every other
+   * gate — via Helius RPC (~5-12 calls/coin typical). Fail-open: non-pump
+   * mints, RPC errors and budget exhaustion pass without blocking; verdicts
+   * are cached per mint so re-sweeps cost 0 RPC. All Helius RPC, zero calls
+   * to Birdeye/GeckoTerminal/DexScreener.
+   */
+  flurry: {
+    /** Master switch (FLURRY_ENABLED, default true). */
+    enabled: boolean;
+    /**
+     * Block pushes for bundled launches (FLURRY_BLOCK_BUNDLES, default
+     * true); false = observe-only — the bundle flag is shown on the card
+     * but never blocks.
+     */
+    blockBundles: boolean;
+    /** Distinct wallets in the deploy slot required (FLURRY_MIN_WALLETS,
+     * default 4 — the classic Jito-bundle shape). */
+    minWallets: number;
+    /** Supply % acquired in the deploy slot required (FLURRY_MIN_SUPPLY_PCT,
+     * default 15). */
+    minSupplyPct: number;
+    /** Funding-lineage wallet cap (FLURRY_MAX_WALLETS, default 12 — 1 sig
+     * call + up to 10 txs each, early-exit on the first inbound SOL). */
+    maxWallets: number;
+    /** Verdict cache TTL (FLURRY_CACHE_MS, default 30 min). */
+    cacheMs: number;
+    /** Hard per-coin budget (FLURRY_BUDGET_MS, default 15 s); exceeded →
+     * fail-open. */
+    budgetMs: number;
+  };
   /** Jupiter direct trading settings (off by default — see TradeConfigSettings). */
   trade: TradeConfigSettings;
   /**
@@ -481,6 +514,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const waNewAgeHours = Number(env.WALLET_ANALYSIS_NEW_AGE_HOURS ?? 24);
   const waClusterMinCoins = Number(env.WALLET_ANALYSIS_CLUSTER_MIN_COINS ?? 2);
   const waClusterDays = Number(env.WALLET_ANALYSIS_CLUSTER_WINDOW_DAYS ?? 14);
+  const rawFlurryCacheMs = Number(env.FLURRY_CACHE_MS ?? 30 * 60_000);
+  const rawFlurryBudgetMs = Number(env.FLURRY_BUDGET_MS ?? 15_000);
 
   return {
     telegramBotToken: env.TELEGRAM_BOT_TOKEN || undefined,
@@ -582,6 +617,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ? Math.max(0, Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
       : 600,
     gmgnBlockWashTrading: (env.GMGN_BLOCK_WASH_TRADING ?? "true") !== "false",
+    flurry: {
+      enabled:
+        (env.FLURRY_ENABLED ?? "true") !== "0" &&
+        (env.FLURRY_ENABLED ?? "true") !== "false",
+      blockBundles: (env.FLURRY_BLOCK_BUNDLES ?? "true") !== "false",
+      minWallets: Number.isFinite(Number(env.FLURRY_MIN_WALLETS ?? 4))
+        ? Math.max(2, Math.floor(Number(env.FLURRY_MIN_WALLETS ?? 4)))
+        : 4,
+      minSupplyPct: Number.isFinite(Number(env.FLURRY_MIN_SUPPLY_PCT ?? 15))
+        ? Math.max(1, Math.min(Number(env.FLURRY_MIN_SUPPLY_PCT ?? 15), 100))
+        : 15,
+      maxWallets: Number.isFinite(Number(env.FLURRY_MAX_WALLETS ?? 12))
+        ? Math.max(1, Math.min(Math.floor(Number(env.FLURRY_MAX_WALLETS ?? 12)), 50))
+        : 12,
+      cacheMs:
+        Number.isFinite(rawFlurryCacheMs) && rawFlurryCacheMs > 0
+          ? Math.min(3600_000, Math.max(60_000, rawFlurryCacheMs))
+          : 30 * 60_000,
+      budgetMs:
+        Number.isFinite(rawFlurryBudgetMs) && rawFlurryBudgetMs > 0
+          ? Math.min(26_000, Math.max(2_000, rawFlurryBudgetMs))
+          : 15_000,
+    },
     walletNewRatioMax: Number.isFinite(Number(env.WALLET_NEW_RATIO_MAX))
       ? Math.max(0, Math.min(Number(env.WALLET_NEW_RATIO_MAX), 1))
       : 0.8,

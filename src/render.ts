@@ -5,6 +5,21 @@ import type { CrimeCheckResult } from "./crimewallets";
 import type { GmgnTokenInfo } from "./gmgn";
 import type { QualifyingCoin } from "./scanner";
 import type { WalletAnalysisResult } from "./walletanalysis";
+import type { FlurryReport } from "./flurry";
+
+/** Chinese label for the Flurry risk tier (card line). */
+function flurryTierLabel(tier: FlurryReport["tier"]): string {
+  switch (tier) {
+    case "CRITICAL":
+      return "極高風險";
+    case "HIGH":
+      return "高風險";
+    case "MODERATE":
+      return "中風險";
+    default:
+      return "低風險";
+  }
+}
 
 /**
  * Axiom /token-info summary line — one compact pipe-separated strip that
@@ -80,6 +95,12 @@ export function renderMessage(
   } | null,
   /** Axiom /token-info payload (null = fetch failed → legacy lines). */
   axiom: AxiomTokenInfo | null,
+  /**
+   * Flurry launch forensics: null = feature disabled → line hidden;
+   * { report: null } = configured but nothing to report (non-pump mint /
+   * fail-open skip) → “未分析”; report = the deploy-slot verdict.
+   */
+  flurry: { report: FlurryReport | null } | null,
 ): string {
   const { pair, profile } = coin;
   const name = pair.baseToken.name || profile.name || "Unknown";
@@ -171,6 +192,19 @@ export function renderMessage(
           .join("、")} ⚠️`
       : null;
 
+  // Flurry launch forensics — deploy-slot bundle + funding lineage. Hidden
+  // entirely when the feature is disabled (same stance as GMGN/Arkham); a
+  // configured-but-unverified coin shows 未分析 honestly (fail-open, never
+  // misleading).
+  const flurryLine =
+    flurry === null
+      ? null
+      : flurry.report === null
+        ? "🎭 Launch: —（未分析）"
+        : flurry.report.bundled
+          ? `🎭 Launch: 🔴 ${flurry.report.deploySlotWallets}錢包同slot買入 ${flurry.report.deploySlotSupplyPct}%供應${flurry.report.linkedWallets > 0 ? ` | ${flurry.report.linkedWallets}錢包同資金來源` : ""}（${flurryTierLabel(flurry.report.tier)}）`
+          : `🎭 Launch: ✅ 乾淨（${flurry.report.deploySlotWallets}錢包 / ${flurry.report.deploySlotSupplyPct}%同slot）`;
+
   const organicLine =
     organic === null
       ? null
@@ -202,6 +236,7 @@ export function renderMessage(
     ...(crimeLine ? [crimeLine] : []),
     ...(holderAnalysisLine ? [holderAnalysisLine] : []),
     ...(clusterLine ? [clusterLine] : []),
+    ...(flurryLine ? [flurryLine] : []),
     `📈 24h 量: ${fmtUsd(pair.volume.h24)}`,
     `💧 流动性: ${fmtUsd(liquidityUsd)}`,
     `⏱️ 上线: ${fmtAge(ageMs)}`,
