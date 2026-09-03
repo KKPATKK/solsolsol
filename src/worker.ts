@@ -191,6 +191,23 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool.
  */
 const SCAN_TICK_BUDGET_MS = 22_000;
+/**
+ * Cross-isolate single-flight lease for one scan pass (see
+ * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
+ * two isolates can both see the same stale heartbeat and start a full scan
+ * in the same second (cron + the HTTP fallback, or parallel uptime-monitor
+ * requests) — observed 2026-09-03 as duplicate scan_history completion rows
+ * at the same timestamp, each burning a full second round of upstream calls
+ * + Turso rows-read. The lock makes the loser skip. 55s covers the whole
+ * scan envelope (22s budget + ~1s flush) with margin and still expires fast
+ * if the holder isolate dies mid-scan (Cloudflare kills invocations around
+ * ~30s).
+ */
+const SCAN_LOCK_TTL_MS = 55_000;
+/** Opaque per-isolate owner tag for scan-lock claims. */
+const SCAN_LOCK_OWNER = `iso-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+/** How often a scan was skipped because another isolate held the scan lock. */
+let crossIsolateScanSkips = 0;
 
 async function ensureInitialized(env: Env): Promise<void> {
   const fp = tradeFingerprint(env);
@@ -419,90 +436,125 @@ async function ensureInitialized(env: Env): Promise<void> {
 
 async function runScan(): Promise<void> {
   if (!scanner) return;
-  const startedAt = Date.now();
-  let timedOut = false;
-  // Liveness-first heartbeat, BEFORE the race: a tick killed by the ~30s
-  // wall clock mid-scan can no longer freeze the heartbeat (the 2026-09-03
-  // outage alerts — cron delivered every minute but the completion write in
-  // the tail kept losing the race). The cadence gate sees a fresh `at`, so
-  // the effective scan rate returns to the configured 60s and the alert
-  // only fires when ticks genuinely stop.
-  try {
-    await db?.setWorkerState(
-      "scan_heartbeat",
-      JSON.stringify({
-        at: startedAt,
-        ok: true,
-        phase: "scanning",
-        ms: null,
-        err: null,
-        skip: scanner?.lastSkip ?? null,
-      }),
-    );
-  } catch (err) {
-    console.error("[worker] start heartbeat write failed:", err);
+  // Cross-isolate single-flight: cron and the HTTP fallback may run on
+  // DIFFERENT isolates that each read the same stale heartbeat and both
+  // start a scan in the same second (observed 2026-09-03 — duplicate
+  // scan_history rows at the same timestamp). Only one isolate scans per
+  // lease; the loser skips this tick and the next trigger retries. Fail-
+  // open: a DB error logs and scans anyway rather than risk a silent
+  // outage; a missing DB implies no scanner (early return above).
+  let scanLock: string | null = null;
+  if (db) {
+    try {
+      scanLock = await db.claimScanLock(SCAN_LOCK_OWNER, Date.now(), SCAN_LOCK_TTL_MS);
+    } catch (err) {
+      console.error(
+        "[worker] scan-lock claim failed — scanning anyway:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  if (scanLock === null) {
+    crossIsolateScanSkips++;
+    console.log("[worker] scan skipped — another isolate holds the scan lock");
+    return;
   }
   try {
-    // Race the scan against the tick budget. runOnce never rejects (it
-    // catches its own errors), so the first to settle wins; on timeout the
-    // background scan keeps going until Cloudflare kills it, and the seq
-    // guard in Scanner prevents it from clobbering the next tick's state.
-    await Promise.race([
-      scanner.runOnce(),
-      new Promise<void>((resolve) => {
-        setTimeout(() => {
-          timedOut = true;
-          resolve();
-        }, SCAN_TICK_BUDGET_MS);
-      }),
-    ]);
-    lastScanOk = !timedOut;
-    lastScanError = timedOut
-      ? `tick exceeded ${SCAN_TICK_BUDGET_MS}ms budget`
-      : null;
-    if (timedOut) {
-      console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — completion written with timeout flag`);
-    }
-  } catch (err) {
-    lastScanOk = false;
-    lastScanError = err instanceof Error ? err.message : String(err);
-    console.error("[worker] scheduled scan failed:", lastScanError);
-  } finally {
-    lastScanMs = Date.now() - startedAt;
-    lastScanAt = Date.now();
-    scanCount++;
-    const summary = scanner?.lastSummary ?? null;
-    // Completion flush, ONE batched round trip (heartbeat phase=done +
-    // history row) in the same tick. Pre-race work is lean — batched
-    // scheduled counter, no redundant reads — so the 22s race + this write
-    // fits inside the effective wall envelope. If a rare Turso spike still
-    // kills it, the start heartbeat already proved liveness and only this
-    // row is lost.
+    const startedAt = Date.now();
+    let timedOut = false;
+    // Liveness-first heartbeat, BEFORE the race: a tick killed by the ~30s
+    // wall clock mid-scan can no longer freeze the heartbeat (the
+    // 2026-09-03 outage alerts — cron delivered every minute but the
+    // completion write in the tail kept losing the race). The cadence gate
+    // sees a fresh `at`, so the effective scan rate returns to the
+    // configured 60s and the alert only fires when ticks genuinely stop.
     try {
-      await db?.persistScanCompletion(
+      await db?.setWorkerState(
+        "scan_heartbeat",
         JSON.stringify({
-          at: lastScanAt,
-          ok: lastScanOk,
-          phase: "done",
-          count: scanCount,
-          ms: lastScanMs,
-          err: lastScanError,
+          at: startedAt,
+          ok: true,
+          phase: "scanning",
+          ms: null,
+          err: null,
           skip: scanner?.lastSkip ?? null,
-          summary,
         }),
-        {
-          at: lastScanAt,
-          ok: lastScanOk,
-          ms: lastScanMs,
-          err: lastScanError,
-          profiles: summary?.profiles ?? null,
-          pool: summary?.pool ?? null,
-          candidates: summary?.candidates ?? null,
-          pushed: summary?.pushed ?? null,
-        },
       );
     } catch (err) {
-      console.error("[worker] completion write failed:", err);
+      console.error("[worker] start heartbeat write failed:", err);
+    }
+    try {
+      // Race the scan against the tick budget. runOnce never rejects (it
+      // catches its own errors), so the first to settle wins; on timeout
+      // the background scan keeps going until Cloudflare kills it, and the
+      // seq guard in Scanner prevents it from clobbering the next tick's
+      // state.
+      await Promise.race([
+        scanner.runOnce(),
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, SCAN_TICK_BUDGET_MS);
+        }),
+      ]);
+      lastScanOk = !timedOut;
+      lastScanError = timedOut
+        ? `tick exceeded ${SCAN_TICK_BUDGET_MS}ms budget`
+        : null;
+      if (timedOut) {
+        console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — completion written with timeout flag`);
+      }
+    } catch (err) {
+      lastScanOk = false;
+      lastScanError = err instanceof Error ? err.message : String(err);
+      console.error("[worker] scheduled scan failed:", lastScanError);
+    } finally {
+      lastScanMs = Date.now() - startedAt;
+      lastScanAt = Date.now();
+      scanCount++;
+      const summary = scanner?.lastSummary ?? null;
+      // Completion flush, ONE batched round trip (heartbeat phase=done +
+      // history row) in the same tick. Pre-race work is lean — batched
+      // scheduled counter, no redundant reads — so the 22s race + this
+      // write fits inside the effective wall envelope. If a rare Turso
+      // spike still kills it, the start heartbeat already proved liveness
+      // and only this row is lost.
+      try {
+        await db?.persistScanCompletion(
+          JSON.stringify({
+            at: lastScanAt,
+            ok: lastScanOk,
+            phase: "done",
+            count: scanCount,
+            ms: lastScanMs,
+            err: lastScanError,
+            skip: scanner?.lastSkip ?? null,
+            summary,
+          }),
+          {
+            at: lastScanAt,
+            ok: lastScanOk,
+            ms: lastScanMs,
+            err: lastScanError,
+            profiles: summary?.profiles ?? null,
+            pool: summary?.pool ?? null,
+            candidates: summary?.candidates ?? null,
+            pushed: summary?.pushed ?? null,
+          },
+        );
+      } catch (err) {
+        console.error("[worker] completion write failed:", err);
+      }
+    }
+  } finally {
+    try {
+      await db?.releaseScanLock(scanLock);
+    } catch (err) {
+      console.error(
+        "[worker] scan-lock release failed:",
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 }
@@ -929,6 +981,10 @@ export default {
         pushedTotal,
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
+        // Cross-isolate single-flight: how often this isolate skipped a
+        // scan because another isolate held the lock (expected to rise when
+        // cron + the HTTP fallback would previously have double-scanned).
+        scanLockSkips: crossIsolateScanSkips,
         heartbeat,
         lastScanGapMs,
         summary: scanner?.lastSummary ?? null,

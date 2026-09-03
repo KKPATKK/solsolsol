@@ -949,6 +949,73 @@ export class Db {
     return v === null || v === undefined ? null : String(v);
   }
 
+  /**
+   * Cross-isolate single-flight claim for one full scan pass. The cadence
+   * gate (worker_state scan_heartbeat) is a read-then-act check: two
+   * isolates can both see the same stale heartbeat and start a full scan
+   * within the same second (cron delivery + the HTTP-triggered fallback on
+   * different isolates, or parallel uptime-monitor requests) — observed as
+   * duplicate scan_history completion rows at the same timestamp
+   * (2026-09-03: ~10 double scans in the last 90 rows). Every duplicate
+   * burns a second full round of feed calls and Turso rows-read, and its
+   * per-candidate Helius/Birdeye work is NOT shielded by the other
+   * isolate's in-memory caches.
+   *
+   * Value format is "<untilMs>|<owner>" — deliberately not JSON, so release
+   * can be an exact-value DELETE and a holder can never clear someone
+   * else's lock. Claim is insert-or-ignore, then a CAS takeover when the
+   * existing row is stale (the holder isolate died inside its ~25s scan; the
+   * TTL far exceeds the scan envelope). Returns the exact value to pass to
+   * releaseScanLock, or null when another isolate holds a live lock. Throws
+   * on DB errors — the caller logs and scans anyway (fail-open).
+   */
+  async claimScanLock(
+    owner: string,
+    now: number,
+    ttlMs: number,
+  ): Promise<string | null> {
+    const value = `${now + ttlMs}|${owner}`;
+    const tryInsert = () =>
+      this.get().execute({
+        sql: "INSERT INTO worker_state (key, value) VALUES ('scan_lock', ?) ON CONFLICT(key) DO NOTHING",
+        args: [value],
+      });
+    const ins = await tryInsert();
+    if (Number(ins.rowsAffected ?? 0) > 0) return value;
+    const cur = await this.get().execute({
+      sql: "SELECT value FROM worker_state WHERE key = 'scan_lock'",
+      args: [],
+    });
+    const raw = cur.rows[0]
+      ? String((cur.rows[0] as Record<string, unknown>).value ?? "")
+      : "";
+    if (!raw) {
+      // Row vanished between insert and read (owner released mid-claim) —
+      // retry once instead of losing this claim to a race.
+      const ins2 = await tryInsert();
+      return Number(ins2.rowsAffected ?? 0) > 0 ? value : null;
+    }
+    const until = Number(raw.split("|")[0]) || 0;
+    if (until > now) return null; // live lock held by another isolate
+    // Stale row → CAS takeover (only if nobody else claimed it in between).
+    const upd = await this.get().execute({
+      sql: "UPDATE worker_state SET value = ? WHERE key = 'scan_lock' AND value = ?",
+      args: [value, raw],
+    });
+    return Number(upd.rowsAffected ?? 0) > 0 ? value : null;
+  }
+
+  /**
+   * Release a scan lock this isolate acquired (exact-value delete — a stale
+   * value is a no-op, so a slow old holder can never clear a new owner).
+   */
+  async releaseScanLock(value: string): Promise<void> {
+    await this.get().execute({
+      sql: "DELETE FROM worker_state WHERE key = 'scan_lock' AND value = ?",
+      args: [value],
+    });
+  }
+
   /** All pushed rows in seen_tokens, oldest first (telemetry for /debug/pushes). */
   async listSeenTokens(): Promise<{ chatId: string; token: string; firstSeenAt: number }[]> {
     try {

@@ -300,6 +300,46 @@ async function main() {
     }
   });
 
+  await test("claimScanLock: exclusive claim, stale takeover, exact-value release", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = 1_000_000;
+      // First claim wins and hands back the exact release value.
+      const a = await db.claimScanLock("ownerA", now, 55_000);
+      assert.ok(a !== null, "first claim wins");
+      // Second isolate while the first is live → denied (even with a longer TTL).
+      assert.equal(await db.claimScanLock("ownerB", now + 1_000, 55_000), null);
+      assert.equal(await db.claimScanLock("ownerB", now + 2_000, 120_000), null);
+      // Owner release (exact value) frees the lock for the next claim.
+      await db.releaseScanLock(a);
+      const b = await db.claimScanLock("ownerB", now + 3_000, 55_000);
+      assert.ok(b !== null, "claim after release wins");
+      // A dead holder (TTL elapsed) is CAS-taken over.
+      await db.releaseScanLock(b);
+      const c = await db.claimScanLock("ownerC", now, 1_000);
+      assert.ok(c !== null, "short-TTL claim wins");
+      const d = await db.claimScanLock("ownerD", now + 2_000, 55_000);
+      assert.ok(d !== null, "stale claim taken over after TTL");
+      // Releasing with the OLD value must not clear the new owner's lock.
+      await db.releaseScanLock(c);
+      assert.equal(
+        await db.claimScanLock("ownerE", now + 3_000, 55_000),
+        null,
+        "old-value release is a no-op",
+      );
+      // The real owner's release clears it.
+      await db.releaseScanLock(d);
+      assert.ok(
+        (await db.claimScanLock("ownerE", now + 4_000, 55_000)) !== null,
+        "real owner release frees the lock",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("DEFAULT_SETTINGS match the operator's filter spec", () => {
     assert.equal(DEFAULT_SETTINGS.minMarketCapUsd, 40000);
     assert.equal(DEFAULT_SETTINGS.maxMarketCapUsd, 380000);
