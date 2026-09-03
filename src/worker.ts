@@ -169,15 +169,18 @@ const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
 const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
 /**
  * Hard budget for the whole scheduled tick. Cloudflare kills the invocation
- * at the ~30s wall-clock limit; if a slow scan crosses that, the completion
- * write in runScan's finally may never run. Liveness is guaranteed by the
- * START heartbeat written before the race (see runScan), so every delivered
- * tick advances the heartbeat even if the completion write loses the wall-
- * clock race; this budget just decides how much time the scan itself gets
- * before the timeout flag is recorded in the completion heartbeat, making a
- * slow scan visible instead of silent.
+ * at the ~30s wall-clock limit; if the scan plus the tail DB writes cross
+ * that, the completion write in runScan's finally never lands (observed
+ * 2026-09-03: at 26s the completion write systematically lost the race once
+ * the start-heartbeat write was added — heartbeat stayed phase=scanning,
+ * no history rows). 22s keeps the tick inside the wall clock: start write
+ * (~1-2s) + scan (22s) + heartbeat/history writes (~3-4s) ≈ 27-28s. The
+ * scanner's own internal deadline is SCAN_TICK_DEADLINE_MS=20s, so a 22s
+ * budget costs almost nothing — deferred candidates stay in the re-eval
+ * pool and are picked up by the next tick. Liveness itself is guaranteed
+ * by the START heartbeat written before the race (see runScan).
  */
-const SCAN_TICK_BUDGET_MS = 26_000;
+const SCAN_TICK_BUDGET_MS = 22_000;
 
 async function ensureInitialized(env: Env): Promise<void> {
   const fp = tradeFingerprint(env);

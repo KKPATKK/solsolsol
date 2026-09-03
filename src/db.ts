@@ -1064,6 +1064,16 @@ export class Db {
   }
 
   /**
+   * In-memory mirror of history_last_prune: the prune check used to read
+   * worker_state on EVERY insert, adding a Turso round-trip to the tick's
+   * completion path (which must fit in the ~30s wall clock — observed
+   * 2026-09-03: tail DB writes losing that race dropped completion rows).
+   * Re-check the worker_state gate at most once per hour per isolate; the
+   * DELETE itself stays gated by the DB-side timestamp, once per day.
+   */
+  private lastHistoryPruneCheckAt = 0;
+
+  /**
    * Append one permanent scan-history row per tick (survives isolate
    * evictions, unlike the in-memory counters). History is bounded: rows
    * older than 30 days are pruned, at most once per day.
@@ -1092,10 +1102,15 @@ export class Db {
         entry.pushed,
       ],
     });
+    // Cheap on the hot path: the worker_state read is skipped except once
+    // per hour per isolate (see lastHistoryPruneCheckAt). Once per day is
+    // enough for the DELETE itself: the table is ~43K rows (30 days × 1
+    // row/tick), and the hourly cadence read the whole index ~24×/day
+    // (~1M rows/day — a non-trivial rows-read consumer at the 500M/month
+    // free tier).
+    if (Date.now() - this.lastHistoryPruneCheckAt < 3600_000) return;
+    this.lastHistoryPruneCheckAt = Date.now();
     const lastPrune = await this.getWorkerState("history_last_prune");
-    // Once per day is enough: the table is ~43K rows (30 days × 1 row/tick),
-    // and the hourly cadence read the whole index ~24×/day (~1M rows/day —
-    // a non-trivial rows-read consumer at the 500M/month free tier).
     if (!lastPrune || Date.now() - Number(lastPrune) > 24 * 3600_000) {
       await this.get().execute({
         sql: "DELETE FROM scan_history WHERE at < ?",
