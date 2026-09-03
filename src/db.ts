@@ -1074,6 +1074,71 @@ export class Db {
   private lastHistoryPruneCheckAt = 0;
 
   /**
+   * Persist one tick's completion in a SINGLE batched round trip — the
+   * scan_heartbeat upsert plus the scan_history insert. The worker calls
+   * this at the START of the next tick (before the scan race), never in the
+   * tick's tail: tail DB writes kept losing Cloudflare's ~30s wall-clock
+   * race (observed 2026-09-03 — completion rows stopped landing while the
+   * start heartbeat advanced), so completion data is computed in-memory by
+   * the previous tick's finally and flushed here where it always lands.
+   * `history` is null on the first tick (heartbeat-only write). The prune
+   * gate is re-checked at most once per hour per isolate.
+   */
+  async persistScanCompletion(
+    heartbeatJson: string,
+    history: {
+      at: number;
+      ok: boolean;
+      ms: number;
+      err: string | null;
+      profiles: number | null;
+      pool: number | null;
+      candidates: number | null;
+      pushed: number | null;
+    } | null,
+  ): Promise<void> {
+    const c = this.get();
+    const ops: Array<{
+      sql: string;
+      args: Array<string | number | null>;
+    }> = [
+      {
+        sql: "INSERT INTO worker_state (key, value) VALUES ('scan_heartbeat', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        args: [heartbeatJson],
+      },
+    ];
+    if (history) {
+      ops.push({
+        sql: `INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          history.at,
+          history.ok ? 1 : 0,
+          history.ms,
+          history.err,
+          history.profiles,
+          history.pool,
+          history.candidates,
+          history.pushed,
+        ],
+      });
+    }
+    await c.batch(ops, "write");
+    // Prune gate — cheap on the hot path: one read per hour per isolate at
+    // most; the DELETE itself stays gated by the DB timestamp (once/day).
+    if (Date.now() - this.lastHistoryPruneCheckAt < 3600_000) return;
+    this.lastHistoryPruneCheckAt = Date.now();
+    const lastPrune = await this.getWorkerState("history_last_prune");
+    if (!lastPrune || Date.now() - Number(lastPrune) > 24 * 3600_000) {
+      await c.execute({
+        sql: "DELETE FROM scan_history WHERE at < ?",
+        args: [Date.now() - 30 * 24 * 3600_000],
+      });
+      await this.setWorkerState("history_last_prune", String(Date.now()));
+    }
+  }
+
+  /**
    * Append one permanent scan-history row per tick (survives isolate
    * evictions, unlike the in-memory counters). History is bounded: rows
    * older than 30 days are pruned, at most once per day.

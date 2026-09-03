@@ -169,16 +169,14 @@ const OUTAGE_ALERT_GAP_MS = 3 * 60_000;
 const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
 /**
  * Hard budget for the whole scheduled tick. Cloudflare kills the invocation
- * at the ~30s wall-clock limit; if the scan plus the tail DB writes cross
- * that, the completion write in runScan's finally never lands (observed
- * 2026-09-03: at 26s the completion write systematically lost the race once
- * the start-heartbeat write was added — heartbeat stayed phase=scanning,
- * no history rows). 22s keeps the tick inside the wall clock: start write
- * (~1-2s) + scan (22s) + heartbeat/history writes (~3-4s) ≈ 27-28s. The
- * scanner's own internal deadline is SCAN_TICK_DEADLINE_MS=20s, so a 22s
- * budget costs almost nothing — deferred candidates stay in the re-eval
- * pool and are picked up by the next tick. Liveness itself is guaranteed
- * by the START heartbeat written before the race (see runScan).
+ * at the ~30s wall-clock limit, so the tick must fit: pre-race flush (~1s,
+ * see persistScanCompletion) + scan (this budget) + an in-memory-only
+ * finally ≈ 23-24s — there are NO DB writes after the race anymore, so
+ * nothing can be lost to the wall-clock kill (observed 2026-09-03: tail
+ * writes kept losing that race and froze the heartbeat / dropped history
+ * rows). The scanner's own internal candidate deadline is
+ * SCAN_TICK_DEADLINE_MS=20s, so 22s costs almost nothing — deferred
+ * candidates stay in the re-eval pool and are picked up by the next tick.
  */
 const SCAN_TICK_BUDGET_MS = 22_000;
 
@@ -407,23 +405,41 @@ async function ensureInitialized(env: Env): Promise<void> {
   }
 }
 
+/**
+ * Completion data of the previous runScan, flushed to Turso at the START of
+ * the next tick (pre-race, where it always lands inside the wall clock). Set
+ * in the finally below; written by the next runScan. Observed 2026-09-03:
+ * completion DB writes in the tick's tail kept losing Cloudflare's ~30s
+ * wall-clock race (scan ~21-26s + writes) — heartbeat stayed phase=scanning
+ * and history rows stopped landing even though the start heartbeat advanced
+ * every tick. Moving ALL writes before the race makes the completion write
+ * unkillable; history rows arrive one tick late with accurate timestamps.
+ */
+let pendingCompletion: {
+  at: number;
+  ok: boolean;
+  ms: number;
+  err: string | null;
+  profiles: number | null;
+  pool: number | null;
+  candidates: number | null;
+  pushed: number | null;
+} | null = null;
+
 async function runScan(): Promise<void> {
   if (!scanner) return;
   const startedAt = Date.now();
   let timedOut = false;
-  // Liveness-first heartbeat: written BEFORE the scan so a tick that is
-  // killed by Cloudflare's ~30s wall clock (scan ~21-26s + the completion
-  // DB writes left only ~4s) still advances the heartbeat. Observed
-  // 2026-09-03: cron delivered every minute, but scans only completed every
-  // 2-6 min because the completion write in `finally` kept losing the
-  // wall-clock race — the frozen heartbeat then tripped the 3-min outage
-  // alert repeatedly. With this start stamp the heartbeat advances on every
-  // delivered tick, the cadence gate sees a fresh `at`, and the alert only
-  // fires when ticks genuinely stop. The completion write below overwrites
-  // this with the real ok/ms/summary (phase "done").
+  // Liveness-first heartbeat + deferred completion flush, BOTH BEFORE the
+  // race: the start stamp proves the scanner is alive on every delivered
+  // tick (a tick killed by the wall clock mid-scan can no longer freeze the
+  // heartbeat — the 2026-09-03 outage alerts), and the previous tick's
+  // completion row lands in the same single batched round trip. The cadence
+  // gate sees a fresh `at`, so the effective scan rate returns to the
+  // configured 60s and the alert only fires when ticks genuinely stop.
+  const completion = pendingCompletion;
   try {
-    await db?.setWorkerState(
-      "scan_heartbeat",
+    await db?.persistScanCompletion(
       JSON.stringify({
         at: startedAt,
         ok: true,
@@ -431,8 +447,18 @@ async function runScan(): Promise<void> {
         ms: null,
         err: null,
         skip: scanner?.lastSkip ?? null,
+        lastDone: completion
+          ? {
+              at: completion.at,
+              ok: completion.ok,
+              ms: completion.ms,
+              err: completion.err,
+            }
+          : null,
       }),
+      completion,
     );
+    pendingCompletion = null; // only cleared once the flush landed
   } catch (err) {
     console.error("[worker] start heartbeat write failed:", err);
   }
@@ -455,7 +481,7 @@ async function runScan(): Promise<void> {
       ? `tick exceeded ${SCAN_TICK_BUDGET_MS}ms budget`
       : null;
     if (timedOut) {
-      console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — heartbeat written with timeout flag`);
+      console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — timeout recorded for the next tick's flush`);
     }
   } catch (err) {
     lastScanOk = false;
@@ -466,40 +492,18 @@ async function runScan(): Promise<void> {
     lastScanAt = Date.now();
     scanCount++;
     const summary = scanner?.lastSummary ?? null;
-    // Persist the heartbeat so any isolate (e.g. the one serving /health)
-    // can observe scanner liveness via the shared database.
-    try {
-      await db?.setWorkerState(
-        "scan_heartbeat",
-        JSON.stringify({
-          at: lastScanAt,
-          ok: lastScanOk,
-          phase: "done",
-          count: scanCount,
-          ms: lastScanMs,
-          err: lastScanError,
-          skip: scanner?.lastSkip ?? null,
-          summary,
-        }),
-      );
-    } catch (err) {
-      console.error("[worker] heartbeat write failed:", err);
-    }
-    // Permanent per-tick history row (queryable for gap analysis later).
-    try {
-      await db?.recordScanHistory({
-        at: lastScanAt,
-        ok: lastScanOk,
-        ms: lastScanMs,
-        err: lastScanError,
-        profiles: summary?.profiles ?? null,
-        pool: summary?.pool ?? null,
-        candidates: summary?.candidates ?? null,
-        pushed: summary?.pushed ?? null,
-      });
-    } catch (err) {
-      console.error("[worker] history write failed:", err);
-    }
+    // In-memory only — the DB flush happens at the next tick's start so it
+    // can never be lost to the wall-clock kill.
+    pendingCompletion = {
+      at: lastScanAt,
+      ok: lastScanOk,
+      ms: lastScanMs,
+      err: lastScanError,
+      profiles: summary?.profiles ?? null,
+      pool: summary?.pool ?? null,
+      candidates: summary?.candidates ?? null,
+      pushed: summary?.pushed ?? null,
+    };
   }
 }
 
