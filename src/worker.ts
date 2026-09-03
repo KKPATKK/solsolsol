@@ -91,11 +91,15 @@ const BACKFILL_DEBUG_COOLDOWN_MS = 5 * 60_000;
 let backfillDebugLastRunAt = 0;
 /** Minimum gap between fallback scans triggered from the fetch path. */
 // How often the HTTP-triggered fallback scan may fire. Cron (1/min) is the
-// primary driver; 120s keeps the fallback from double-scanning during
-// healthy cron delivery while still self-healing within 2 minutes if cron
+// primary driver; 60s keeps the fallback from double-scanning during
+// healthy cron delivery while still self-healing within ~1 minute if cron
 // stops (observed 2026-08-14: cron dead for 24h+, fallback kept the bot
-// alive).
-const SCAN_TRIGGER_INTERVAL_MS = 120_000;
+// alive; observed 2026-09-03: a ~4-min cron delivery pause produced a
+// heartbeat freeze + outage alert because no request arrived in the
+// window — tightened from 120s so any webhook/monitor request rescues
+// sooner. The heartbeat-freshness check below still dedupes against
+// healthy cron, so the effective cadence stays 1/min when cron works).
+const SCAN_TRIGGER_INTERVAL_MS = 60_000;
 let lastScanTriggerAt = 0;
 let lastScanAt: number | null = null;
 let lastScanOk = false;
@@ -891,6 +895,90 @@ export default {
         summary: scanner?.lastSummary ?? null,
         now: new Date().toISOString(),
       });
+    }
+
+    // Scan-history + cron-delivery forensics — the page the outage alert
+    // links to. Dumps the last N scan_history rows with gaps > 2 min
+    // flagged, plus the scheduled-tick ring: if the ring kept ticking
+    // during a heartbeat gap, cron delivered and the ticks died before
+    // writing the heartbeat (init stall / wall-clock kill / DB write
+    // failure); if the ring itself has the gap, the Cron Trigger paused
+    // (best-effort delivery — the documented 2026-08-14 / 2026-09-03
+    // behavior). ?rows=N overrides the default 120.
+    if (url.pathname === "/debug/scan-history") {
+      try {
+        const limit = Math.min(
+          500,
+          Math.max(10, Number(url.searchParams.get("rows") ?? 120) || 120),
+        );
+        const rows = (await db?.getScanHistory(limit)) ?? [];
+        const gaps: Array<{ from: string; to: string; gapSec: number }> = [];
+        for (let i = 1; i < rows.length; i++) {
+          const gapSec = (rows[i - 1].at - rows[i].at) / 1000;
+          if (gapSec > 120) {
+            gaps.push({
+              from: new Date(rows[i - 1].at).toISOString(),
+              to: new Date(rows[i].at).toISOString(),
+              gapSec: Math.round(gapSec),
+            });
+          }
+        }
+        let ring: number[] = [];
+        let scheduledTickTotal: number | null = null;
+        let scheduledTickAt: number | null = null;
+        let outageAlertAt: number | null = null;
+        try {
+          const rawRing = await db?.getWorkerState("scheduled_tick_ring");
+          if (rawRing) {
+            const parsed = JSON.parse(rawRing) as unknown;
+            if (Array.isArray(parsed)) {
+              ring = parsed.filter((v): v is number => typeof v === "number");
+            }
+          }
+          const rawTotal = await db?.getWorkerState("scheduled_tick_total");
+          const rawAt = await db?.getWorkerState("scheduled_tick_at");
+          const rawAlert = await db?.getWorkerState("outage_alert_at");
+          scheduledTickTotal = rawTotal ? parseInt(rawTotal, 10) || 0 : null;
+          scheduledTickAt = rawAt ? parseInt(rawAt, 10) || 0 : null;
+          outageAlertAt = rawAlert ? Number(rawAlert) : null;
+        } catch {
+          // telemetry only — never fail the endpoint over these reads
+        }
+        return Response.json({
+          ok: true,
+          now: new Date().toISOString(),
+          count: rows.length,
+          rows: rows.map((r) => ({
+            at: new Date(r.at).toISOString(),
+            ok: r.ok,
+            ms: r.ms,
+            err: r.err,
+            profiles: r.profiles,
+            pool: r.pool,
+            candidates: r.candidates,
+            pushed: r.pushed,
+          })),
+          gaps: gaps.slice(0, 20),
+          scheduledTickTotal,
+          scheduledTickAt: scheduledTickAt
+            ? new Date(scheduledTickAt).toISOString()
+            : null,
+          // Newest first; a missing minute here while scan rows exist is
+          // the cross-check for "cron delivered but ticks died".
+          tickRing: ring
+            .slice(-90)
+            .reverse()
+            .map((t) => new Date(t).toISOString()),
+          outageAlertAt: outageAlertAt
+            ? new Date(outageAlertAt).toISOString()
+            : null,
+        });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     // GMGN connectivity probe — calls the real client from the worker's own

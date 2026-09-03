@@ -672,7 +672,8 @@ export class Db {
    */
   async bumpScheduledTick(): Promise<void> {
     const c = this.connect();
-    const now = String(Date.now());
+    const now = Date.now();
+    const nowStr = String(now);
     const res = await c.execute({
       sql: "SELECT value FROM worker_state WHERE key = 'scheduled_tick_total'",
       args: [],
@@ -684,7 +685,35 @@ export class Db {
     });
     await c.execute({
       sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      args: [now],
+      args: [nowStr],
+    });
+    // Rolling ring of recent cron delivery times (last 90), so a heartbeat
+    // gap is diagnosable afterwards: a gap in the RING = cron didn't
+    // deliver; ticks present in the ring but missing from scan_history =
+    // ticks arrived and died before writing the heartbeat (init stall /
+    // wall-clock kill / DB write failure). One tiny row per minute —
+    // negligible vs the scan's rows-read.
+    const RING_KEY = "scheduled_tick_ring";
+    const RING_LEN = 90;
+    const ringRes = await c.execute({
+      sql: "SELECT value FROM worker_state WHERE key = ?",
+      args: [RING_KEY],
+    });
+    let ring: number[] = [];
+    if (ringRes.rows.length > 0) {
+      try {
+        const parsed = JSON.parse(String(ringRes.rows[0].value));
+        if (Array.isArray(parsed)) {
+          ring = parsed.filter((v): v is number => typeof v === "number");
+        }
+      } catch {
+        // corrupted ring — start fresh
+      }
+    }
+    ring.push(now);
+    await c.execute({
+      sql: "INSERT INTO worker_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      args: [RING_KEY, JSON.stringify(ring.slice(-RING_LEN))],
     });
   }
 
@@ -996,6 +1025,42 @@ export class Db {
       "telemetry_token_stats_count",
       "SELECT COUNT(*) AS n FROM token_stats",
     );
+  }
+
+  /**
+   * Last N scan-history rows (newest first) for gap forensics — the data
+   * behind /debug/scan-history. A gap in these rows while the tick ring
+   * (scheduled_tick_ring) shows deliveries means ticks died before the
+   * heartbeat/history write (init stall or wall-clock kill), not that cron
+   * stopped.
+   */
+  async getScanHistory(limit = 120): Promise<
+    Array<{
+      at: number;
+      ok: boolean;
+      ms: number;
+      err: string | null;
+      profiles: number | null;
+      pool: number | null;
+      candidates: number | null;
+      pushed: number | null;
+    }>
+  > {
+    const res = await this.get().execute({
+      sql: `SELECT at, ok, ms, err, profiles, pool, candidates, pushed
+            FROM scan_history ORDER BY at DESC LIMIT ?`,
+      args: [limit],
+    });
+    return res.rows.map((r) => ({
+      at: Number(r.at),
+      ok: Number(r.ok) === 1,
+      ms: Number(r.ms),
+      err: r.err === null ? null : String(r.err),
+      profiles: r.profiles === null ? null : Number(r.profiles),
+      pool: r.pool === null ? null : Number(r.pool),
+      candidates: r.candidates === null ? null : Number(r.candidates),
+      pushed: r.pushed === null ? null : Number(r.pushed),
+    }));
   }
 
   /**
