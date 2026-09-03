@@ -176,18 +176,21 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * lost to the wall-clock kill (observed 2026-09-03: tail writes kept losing
  * that race and froze the heartbeat / dropped history rows).
  *
- * 25s, not 22s: the 22s cap was set while pre-race work still cost ~4-5s;
- * commit c868df2 slimmed pre-race to ~1s, making 22s overly conservative —
- * scans that genuinely finish (measured 20.7-22.0s, occasionally slower on
- * a hot pool) kept losing the race by a hair, so every completion row was
- * written as ok=false with a null summary and the per-scan feed counters
- * (pool/candidates/pushed) went missing from /health and /debug/scan-history
- * (observed 2026-09-03 ~13:44Z+). The scanner's own internal candidate
- * deadline is SCAN_TICK_DEADLINE_MS=20s; the ~3-5s of tail beyond it is
- * push fan-out + result flush, and deferred candidates stay in the re-eval
- * pool for the next tick.
+ * 22s is empirically the maximum that lands: completion rows written at
+ * ~22.3-22.8s into the invocation persisted reliably for hours (c868df2,
+ * 2026-09-03 12:55-14:02Z), while the SAME code path with a 25s race
+ * (c60e2e4) wrote completions at ~25s and landed ZERO rows for 15+ minutes
+ * despite in-memory ok=true completions — so the effective wall-clock
+ * envelope of a cron invocation here is ~24s, not the ~30s the platform
+ * advertises. Do NOT raise this constant without first verifying live that
+ * completions still land.
+ *
+ * Consequence: scans that finish inside 22s persist a full summary; slower
+ * scans (hot pool) write an ok=false timeout row and their feed counters
+ * (pool/candidates/pushed) are carried by the NEXT tick's row via
+ * scanner.lastSummary. Deferred candidates stay in the re-eval pool.
  */
-const SCAN_TICK_BUDGET_MS = 25_000;
+const SCAN_TICK_BUDGET_MS = 22_000;
 
 async function ensureInitialized(env: Env): Promise<void> {
   const fp = tradeFingerprint(env);
@@ -471,9 +474,10 @@ async function runScan(): Promise<void> {
     const summary = scanner?.lastSummary ?? null;
     // Completion flush, ONE batched round trip (heartbeat phase=done +
     // history row) in the same tick. Pre-race work is lean — batched
-    // scheduled counter, no redundant reads — so the 25s race + this write
-    // fits inside the wall clock. If a rare Turso spike still kills it, the
-    // start heartbeat already proved liveness and only this row is lost.
+    // scheduled counter, no redundant reads — so the 22s race + this write
+    // fits inside the effective wall envelope. If a rare Turso spike still
+    // kills it, the start heartbeat already proved liveness and only this
+    // row is lost.
     try {
       await db?.persistScanCompletion(
         JSON.stringify({
