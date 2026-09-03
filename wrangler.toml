@@ -39,25 +39,31 @@ RE_EVAL_POOL_SIZE = "1000"
 # hot zone (window entry ± margin, evaluated EVERY scan) is swept in two
 # tiers. NEAR tier = the first 6h inside the age window — the coins most
 # likely to cross the gates after entering — swept every REEVAL_NEAR_SWEEP_MIN
-# (default 6). FAR tier = the older tail, swept every REEVAL_FAR_SWEEP_MIN
-# (default 18) — every coin is still re-checked at least once per sweep, but
-# the old tail stops consuming most of the budget. Rotation bands order by
-# the highest mcap ever observed, and coins repeatedly seen below half the
-# market-cap gate are dropped from the pool (pre-qualification filter), so
-# the sweep budget concentrates on realistic candidates. Slots = sweep ÷ the
-# pool cache TTL below (2 near + 6 far at the defaults).
-REEVAL_NEAR_SWEEP_MIN = "6"
-REEVAL_FAR_SWEEP_MIN = "18"
+# (code default 6; halved to 3 on 2026-09-03 so pool coins are re-checked
+# 2× as often and a coin that crosses a gate is caught ~2× sooner — the
+# biggest lever for finding qualifying coins, since the pool is the largest
+# source by far). FAR tier = the older tail, swept every REEVAL_FAR_SWEEP_MIN
+# (code default 18; halved to 9 to match) — every coin is still re-checked at
+# least once per sweep, but the old tail stops consuming most of the budget.
+# Rotation bands order by the highest mcap ever observed, and coins
+# repeatedly seen below half the market-cap gate are dropped from the pool
+# (pre-qualification filter), so the sweep budget concentrates on realistic
+# candidates. Slots = sweep ÷ the pool cache TTL below (2 near + 6 far at
+# these values).
+REEVAL_NEAR_SWEEP_MIN = "3"
+REEVAL_FAR_SWEEP_MIN = "9"
 # Re-eval pool query cache TTL + rotation period, in seconds. The pool query
 # is the scan's dominant Turso rows-read consumer; it re-runs once per TTL
 # per isolate, and each expiry advances the rotation slot (slots = sweep ÷
-# TTL, so this value MUST stay aligned with the sweep vars above). 180s =
-# 3-min cache: sweeps at 6/18 min, hot-zone membership refreshed every
-# 3 min, pool-query rows-read ≈ ×1.67 the old 300s cadence — still a small
+# TTL, so this value MUST stay aligned with the sweep vars above). 90s =
+# 1.5-min cache: sweeps at 3/9 min, hot-zone membership refreshed every
+# 1.5 min, pool-query rows-read ≈ ×2 the 180s cadence — still a small
 # share of the Turso free tier's 500M rows-read/month (see /debug/pool for
-# live signals). Lower it for faster rotation; raise it (e.g. 300) to cut
-# rows-read back.
-REEVAL_POOL_CACHE_SECONDS = "180"
+# live signals). NOTE: cron frequency is hard-capped at 1 scan/min (Cloudflare
+# cron triggers are 5-field only, no seconds), so re-check rate is raised via
+# sweep/TTL alignment, not more ticks. Raise TTL (e.g. 300) to cut rows-read
+# back.
+REEVAL_POOL_CACHE_SECONDS = "90"
 # pump.fun discovery: DISABLED (0) — pump.fun 530-blocks Worker egress since
 # ~2026-08-20, so each tick only burns a doomed request. Jupiter recent covers
 # the brand-new-launchpad gap instead.
