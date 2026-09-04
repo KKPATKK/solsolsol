@@ -187,9 +187,19 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * trip) stopped landing ENTIRELY — zero scan_history rows for 30+ minutes
  * while the start heartbeat kept getting written every tick — freezing the
  * heartbeat in phase=scanning and re-triggering the outage-alert pattern.
- * The budget is therefore set to 19s so the flush starts ~19.5s in and
- * lands (~20-21s) with real margin. Do NOT raise this constant without
- * first verifying live that completions still land.
+ * Re-measured live 2026-09-04 04:00-07:00Z: with the 19s race the flush
+ * (attempted ~19.5s in) STILL stops landing for stretches of 5-20 minutes —
+ * zero scan_history rows while the start heartbeat keeps getting written
+ * every tick (heartbeat frozen in phase=scanning, the outage-alert
+ * pattern). The effective kill therefore fluctuates just past ~20s, not a
+ * clean ~24s, so the budget is cut to 16s: the flush starts ~16.3-16.5s in
+ * and lands with ~3-4s of margin against the earliest observed kill. This
+ * pairs with the cooperative scan abort (Scanner.abort — runScan calls it
+ * the moment the race trips, so the background scan stops issuing new
+ * work at its next phase boundary instead of grinding on as a zombie
+ * alongside the flush). Do NOT raise this constant without first
+ * verifying live that completions still land (22s+ landed zero rows; 19s
+ * produced recurring 5-20 min holes).
  *
  * Consequence: scans that finish inside the budget persist a full summary;
  * slower scans (hot pool) write an ok=false timeout row and their feed
@@ -197,7 +207,7 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
  */
-const SCAN_TICK_BUDGET_MS = 19_000;
+const SCAN_TICK_BUDGET_MS = 16_000;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -206,9 +216,9 @@ const SCAN_TICK_BUDGET_MS = 19_000;
  * requests) — observed 2026-09-03 as duplicate scan_history completion rows
  * at the same timestamp, each burning a full second round of upstream calls
  * + Turso rows-read. The lock makes the loser skip. 55s covers the whole
- * scan envelope (19s budget + ~1s flush + pre-race round trip) with margin
+ * scan envelope (16s budget + ~1s flush + pre-race round trip) with margin
  * and still expires fast if the holder isolate dies mid-scan (Cloudflare
- * kills invocations around ~24-30s).
+ * kills invocations around ~20-30s).
  */
 const SCAN_LOCK_TTL_MS = 55_000;
 /** Opaque per-isolate owner tag for scan-lock claims. */
@@ -511,14 +521,22 @@ async function runScan(): Promise<void> {
     try {
       // Race the scan against the tick budget. runOnce never rejects (it
       // catches its own errors), so the first to settle wins; on timeout
-      // the background scan keeps going until Cloudflare kills it, and the
-      // seq guard in Scanner prevents it from clobbering the next tick's
-      // state.
+      // the abort above stops the scan at its next phase boundary and the
+      // seq guard in Scanner keeps a straggler from clobbering a newer
+      // tick's state.
       await Promise.race([
         scanner.runOnce(),
         new Promise<void>((resolve) => {
           setTimeout(() => {
             timedOut = true;
+            // Cooperative stop: tell runOnce its budget is up so the
+            // background scan returns at its next phase boundary instead of
+            // grinding on until Cloudflare kills the isolate — the zombie
+            // tail kept issuing upstream requests alongside the completion
+            // flush below (burning quota) and lengthened the window in
+            // which a slow flush round trip could lose to the wall-clock
+            // kill (the recurring 5-20 min zero-row holes).
+            scanner?.abort();
             resolve();
           }, SCAN_TICK_BUDGET_MS);
         }),
@@ -543,7 +561,7 @@ async function runScan(): Promise<void> {
       // history row + scan-lock release) in the same tick — the lock is
       // freed here so the guard adds NO extra end-of-tick write. Pre-race
       // work is lean — batched scheduled counter, no redundant reads — so
-      // the 19s race + this write fits inside the effective wall envelope.
+      // the 16s race + this write fits inside the effective wall envelope.
       // If a rare Turso spike still kills it, the start heartbeat already
       // proved liveness, only this row is lost, and the lock self-heals
       // via its TTL + stale takeover on the next tick.

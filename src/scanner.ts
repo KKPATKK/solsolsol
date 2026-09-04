@@ -323,6 +323,15 @@ export class Scanner {
   private running = false;
   /** When the current scan started — lets a stale lock be broken by age. */
   private runningSince = 0;
+  /**
+   * Set by the worker (Scanner.abort) when the tick's race budget trips in
+   * runScan. runOnce checks it at every phase boundary and returns early, so
+   * a timed-out scan stops issuing new upstream/DB work the moment the
+   * completion flush is about to run instead of grinding on as a zombie
+   * until Cloudflare kills the isolate (burning quota and competing with
+   * the flush). Reset at the start of every runOnce.
+   */
+  private abortRequested = false;
   /** Monotonic scan id: a timed-out scan must not clobber a newer scan's state. */
   private scanSeq = 0;
   /** Summary of the last completed scan, persisted into the heartbeat. */
@@ -607,6 +616,18 @@ export class Scanner {
     }
   }
 
+  /** Worker hook: flag the running scan to stop at its next phase boundary. */
+  abort(): void {
+    this.abortRequested = true;
+  }
+
+  /** True when the worker's race budget tripped; logs once and returns. */
+  private shouldStopEarly(): boolean {
+    if (!this.abortRequested) return false;
+    console.log("[scanner] tick budget tripped — ending scan early");
+    return true;
+  }
+
   /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
   async runOnce(): Promise<void> {
     if (this.running) {
@@ -630,6 +651,7 @@ export class Scanner {
     const seq = ++this.scanSeq;
     this.running = true;
     this.runningSince = Date.now();
+    this.abortRequested = false;
     const startedAt = Date.now();
     const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
     const diag: ScanSummary = {
@@ -686,6 +708,7 @@ export class Scanner {
       // ~4.8K-address list once). Best-effort: a fetch failure keeps the
       // previous list and records lastError; the scan never waits more than
       // the client's fetch timeout on the very first load.
+      if (this.shouldStopEarly()) return;
       if (this.crimeWallets) {
         try {
           await this.crimeWallets.refreshIfStale();
@@ -703,6 +726,7 @@ export class Scanner {
       // instead of aborting it — an unguarded throw here produced ~6s
       // all-zero scans (3 attempts × 2/4s backoff) that skipped the entire
       // pool evaluation (observed 2026-08-16).
+      if (this.shouldStopEarly()) return;
       let profiles: TokenProfile[] = [];
       try {
         profiles = await this.dex.fetchLatestSolanaProfiles();
@@ -738,6 +762,7 @@ export class Scanner {
       // how DexScreener pairs age coins), so they enter the re-eval pool
       // and are evaluated once they reach the qualifying age window.
       let geckoProfiles: TokenProfile[] = [];
+      if (this.shouldStopEarly()) return;
       if (this.gecko) {
         try {
           const pools = [];
@@ -769,6 +794,7 @@ export class Scanner {
       // egress with 429). Sized by GECKOTERMINAL_TRENDING_LIMIT (0 =
       // disabled); best-effort — failures return [] and the scan continues.
       let geoTrendProfiles: TokenProfile[] = [];
+      if (this.shouldStopEarly()) return;
       if (this.gecko && this.config.geckoterminalTrendingLimit > 0) {
         try {
           const trending = await this.gecko.fetchTrendingPools(
@@ -793,6 +819,7 @@ export class Scanner {
       // (best-effort — failures return [] and the scan continues). Sized by
       // GMGN_TRENDING_LIMIT (0 = disabled).
       let gmgnProfiles: TokenProfile[] = [];
+      if (this.shouldStopEarly()) return;
       if (this.gmgn && this.config.gmgnTrendingLimit > 0) {
         try {
           const trending = await this.gmgn.fetchTrending(
@@ -820,6 +847,7 @@ export class Scanner {
       // (0 = disabled); best-effort — failures return [] and the scan
       // continues.
       let axiomProfiles: TokenProfile[] = [];
+      if (this.shouldStopEarly()) return;
       if (this.axiom && this.config.axiomTrendingLimit > 0) {
         try {
           const trending = await this.fetchTrendingCached();
@@ -844,6 +872,7 @@ export class Scanner {
       // time. Sized by JUPITER_RECENT_LIMIT (0 = disabled); best-effort —
       // failures return [] and the scan continues.
       let jupProfiles: TokenProfile[] = [];
+      if (this.shouldStopEarly()) return;
       if (this.jupiter && this.config.jupiterRecentLimit > 0) {
         try {
           jupProfiles = await this.jupiter.fetchRecentTokens(
@@ -862,6 +891,7 @@ export class Scanner {
       // resurging mints. Sized by JUPITER_TRENDING_LIMIT (0 = disabled);
       // best-effort — failures return [] and the scan continues.
       let jupTrendProfiles: TokenProfile[] = [];
+      if (this.shouldStopEarly()) return;
       if (this.jupiter && this.config.jupiterTrendLimit > 0) {
         try {
           jupTrendProfiles = await this.jupiter.fetchTrendingTokens(
@@ -883,6 +913,7 @@ export class Scanner {
       // pages roll past them and they'd never be seen again). CU-bounded: 1
       // request per run. Idempotent (INSERT OR IGNORE); last-run persisted
       // in worker_state so isolates don't re-run it on every recycle.
+      if (this.shouldStopEarly()) return;
       try {
         diag.backfill = await this.runPeriodicBackfill();
       } catch (err) {
@@ -895,6 +926,7 @@ export class Scanner {
       // holder probes for the watched coins, then 🚀/⚠️/💀 follow-ups.
       // Best-effort — a tracker failure never affects the scan.
       if (this.pushWatcher) {
+        if (this.shouldStopEarly()) return;
         try {
           const pw = await this.pushWatcher.runTick();
           diag.pushWatch = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
@@ -984,6 +1016,7 @@ export class Scanner {
       // below, so finishing quickly keeps re-eval coverage continuous after a
       // deploy. Best-effort: a failure just retries next tick.
       if (!this.launchBackfillDone) {
+        if (this.shouldStopEarly()) return;
         try {
           this.launchBackfillDone = await this.db.resumeLaunchBackfill(4_000);
         } catch (err) {
@@ -1003,6 +1036,7 @@ export class Scanner {
       const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
       const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
       const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
+      if (this.shouldStopEarly()) return;
       const recentStats = await this.getReevalPoolCached(now, {
         sinceMs: now - RE_EVAL_WINDOW_MS,
         minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
@@ -1053,6 +1087,7 @@ export class Scanner {
       ];
       diag.pool = poolProfiles.length;
       const addresses = [...new Set(poolProfiles.map((p) => p.tokenAddress))];
+      if (this.shouldStopEarly()) return;
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
       // Fallback: when DexScreener's batched endpoint is blocked (shared
       // egress 429s — observed 2026-08-22, pairs: 0/550), source the gate
@@ -1083,6 +1118,7 @@ export class Scanner {
       // DexScreener profile with missing pair data is still skipped (it
       // simply re-registers next tick once the pair is fetched).
       const statsByToken = new Map<string, TokenStats>();
+      if (this.shouldStopEarly()) return;
       const existingStats = await this.db.getTokenStatsMany(
         feedProfiles.map((p) => p.tokenAddress),
       );
@@ -1204,7 +1240,7 @@ export class Scanner {
         // 16s + RugCheck + Birdeye) can exceed the remaining budget fast.
         // Defer the rest to the next tick — they stay in the re-evaluation
         // pool, so this only delays a push by a minute, never loses it.
-        if (Date.now() > tickDeadline) {
+        if (this.abortRequested || Date.now() > tickDeadline) {
           console.log(
             `[scanner] tick deadline reached — deferring ${candidates.length - processedCandidates} candidate(s) to next tick`,
           );
