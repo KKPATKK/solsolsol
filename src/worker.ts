@@ -197,9 +197,15 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * pairs with the cooperative scan abort (Scanner.abort — runScan calls it
  * the moment the race trips, so the background scan stops issuing new
  * work at its next phase boundary instead of grinding on as a zombie
- * alongside the flush). Do NOT raise this constant without first
- * verifying live that completions still land (22s+ landed zero rows; 19s
- * produced recurring 5-20 min holes).
+ * alongside the flush). Cut again 16s → 15s on 2026-09-05: the 16s-era
+ * flush stopped landing ENTIRELY right after the backfill deploy
+ * (observed live 09:00-09:15Z — every tick died before its flush, zero
+ * completions, each tick only visible via the next-tick backfill row), so
+ * the kill point had drifted into the 16s flush window. 15s starts the
+ * flush ~1.5s earlier; the re-eval pool absorbs the lost scan work (a
+ * shorter budget costs tick latency, never coin coverage). Do NOT raise
+ * this constant without first verifying live that completions still land
+ * (22s+ landed zero rows; 19s produced recurring 5-20 min holes).
  *
  * Consequence: scans that finish inside the budget persist a full summary;
  * slower scans (hot pool) write an ok=false timeout row and their feed
@@ -207,7 +213,7 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
  */
-const SCAN_TICK_BUDGET_MS = 16_000;
+const SCAN_TICK_BUDGET_MS = 15_000;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -216,7 +222,7 @@ const SCAN_TICK_BUDGET_MS = 16_000;
  * requests) — observed 2026-09-03 as duplicate scan_history completion rows
  * at the same timestamp, each burning a full second round of upstream calls
  * + Turso rows-read. The lock makes the loser skip. 55s covers the whole
- * scan envelope (16s budget + ~1s flush + pre-race round trip) with margin
+ * scan envelope (15s budget + ~1s flush + pre-race round trip) with margin
  * and still expires fast if the holder isolate dies mid-scan (Cloudflare
  * kills invocations around ~20-30s).
  */
@@ -496,7 +502,7 @@ async function ensureInitialized(env: Env): Promise<void> {
   }
 }
 
-async function runScan(): Promise<void> {
+async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
   if (!scanner) return;
   // Cross-isolate single-flight: cron and the HTTP fallback may run on
   // DIFFERENT isolates that each read the same stale heartbeat and both
@@ -504,30 +510,54 @@ async function runScan(): Promise<void> {
   // scan_history rows at the same timestamp). Only one isolate scans per
   // lease; the loser skips this tick and the next trigger retries.
   // WALL-CLOCK DISCIPLINE: the claim is batched with the start-heartbeat
-  // write (ONE round trip — the same as the pre-lock heartbeat write) and
-  // the release rides in the completion-flush batch, so this guard adds no
-  // round trips to a tick whose completion flush lives on a ~1s margin
-  // against Cloudflare's invocation kill. Fail-open: a DB error logs and
-  // scans anyway (with a standalone heartbeat write for liveness) rather
-  // than risk a silent outage; a missing DB implies no scanner (early
-  // return above).
+  // write (ONE round trip — the same as the pre-lock heartbeat write), the
+  // dead-tick backfill row RIDES that same claim batch (conditional on our
+  // lock value, so a racing loser can't duplicate it), and the release
+  // rides in the completion-flush batch. This guard adds ZERO round trips
+  // to a tick whose completion flush lives on a ~1s margin against
+  // Cloudflare's invocation kill (2026-09-05: the separate backfill write
+  // was pushing the flush past the kill point — zero completions for 15+
+  // min). Fail-open: a DB error logs and scans anyway (with a standalone
+  // heartbeat write for liveness) rather than risk a silent outage; a
+  // missing DB implies no scanner (early return above).
   const startedAt = Date.now();
   let scanLock: string | null = null;
   let claimErrored = false;
-  // Capture the PRE-CLAIM heartbeat before the claim batch overwrites it
-  // with ours: if the previous tick is still phase=scanning and long past
-  // its budget, it died before its completion flush (the flush batch sets
-  // phase=done atomically with the history row). We backfill that tick's
-  // row after winning the lease so scan_history never grows >4-min holes
-  // just because an isolate was killed between scan end and flush.
-  let prevHeartbeatRaw: string | null = null;
-  if (db) {
+  // The PRE-CLAIM heartbeat tells us whether the previous tick died before
+  // its completion flush (the flush batch sets phase=done atomically with
+  // the history row, so a scanning heartbeat long past its budget means its
+  // row never landed). The scheduled handler and the HTTP fallback already
+  // read this heartbeat for their cadence gates — they pass it in so the
+  // tick adds NO extra round trip; /debug/tick (diagnostic only) reads it
+  // here.
+  let prevHeartbeatRaw = prevHeartbeatRawArg ?? null;
+  if (prevHeartbeatRaw === null && db) {
     try {
       prevHeartbeatRaw = await db.getWorkerState("scan_heartbeat");
     } catch {
       // best-effort — a failed read just skips the backfill this tick
     }
   }
+  // Backfill entry for a dead predecessor: written by the next tick that
+  // wins the lease, riding the claim batch (zero extra round trips). The
+  // row records that the tick started but never flushed, so scan_history
+  // never grows >4-min holes just because an isolate was killed between
+  // scan end and flush.
+  const dead = prevHeartbeatRaw
+    ? deadTickBackfillInfo(prevHeartbeatRaw, Date.now(), BACKFILL_STALE_MS)
+    : null;
+  const backfillEntry = dead
+    ? {
+        at: dead.at,
+        ok: false,
+        ms: dead.ms,
+        err: "previous tick died before its completion flush (backfilled by next tick)",
+        profiles: null,
+        pool: null,
+        candidates: null,
+        pushed: null,
+      }
+    : null;
   const heartbeatJson = JSON.stringify({
     at: startedAt,
     ok: true,
@@ -543,6 +573,7 @@ async function runScan(): Promise<void> {
         startedAt,
         SCAN_LOCK_TTL_MS,
         heartbeatJson,
+        backfillEntry,
       );
     } catch (err) {
       claimErrored = true;
@@ -568,32 +599,13 @@ async function runScan(): Promise<void> {
       console.error("[worker] start heartbeat write failed:", err);
     }
   }
-  // Backfill the dead predecessor (rare path — only fires when we hold the
-  // lease AND the previous tick's heartbeat shows it died mid-scan). One
-  // extra write at tick start, never on the wall-clock-critical flush path;
-  // the next tick after any recovery covers the dead tick's missing row.
-  if (scanLock !== null && prevHeartbeatRaw) {
-    const dead = deadTickBackfillInfo(prevHeartbeatRaw, Date.now(), BACKFILL_STALE_MS);
-    if (dead) {
-      try {
-        await db?.recordScanHistory({
-          at: dead.at,
-          ok: false,
-          ms: dead.ms,
-          err: "previous tick died before its completion flush (backfilled by next tick)",
-          profiles: null,
-          pool: null,
-          candidates: null,
-          pushed: null,
-        });
-        backfilledTicks++;
-        console.log(
-          `[worker] backfilled dead tick at ${new Date(dead.at).toISOString()} (lived ${dead.ms}ms, flush lost)`,
-        );
-      } catch (err) {
-        console.error("[worker] dead-tick backfill write failed:", err);
-      }
-    }
+  if (scanLock !== null && backfillEntry) {
+    // The backfill row rode the winning claim batch — already in
+    // scan_history. Telemetry + log only, never on the flush path.
+    backfilledTicks++;
+    console.log(
+      `[worker] backfilled dead tick at ${new Date(backfillEntry.at).toISOString()} (lived ${backfillEntry.ms}ms, flush lost)`,
+    );
   }
   let timedOut = false;
   try {
@@ -647,7 +659,7 @@ async function runScan(): Promise<void> {
       // history row + scan-lock release) in the same tick — the lock is
       // freed here so the guard adds NO extra end-of-tick write. Pre-race
       // work is lean — batched scheduled counter, no redundant reads — so
-      // the 16s race + this write fits inside the effective wall envelope.
+      // the 15s race + this write fits inside the effective wall envelope.
       // If a rare Turso spike still kills it, the start heartbeat already
       // proved liveness, only this row is lost, and the lock self-heals
       // via its TTL + stale takeover on the next tick.
@@ -898,15 +910,19 @@ async function maybeRunScanIfStale(): Promise<void> {
   // scan doubles the Turso rows-read and the upstream API pressure (which
   // is what triggers the gecko 429s). When cron delivers, this makes the
   // effective cadence exactly the configured 60s instead of ~1.5x it.
+  // The heartbeat read doubles as the backfill input for runScan (a dead
+  // predecessor's stale scanning heartbeat) — pass it down so the tick
+  // adds no extra round trip on the wall-clock-critical path.
+  let hbRaw: string | null = null;
   try {
-    const raw = await db?.getWorkerState("scan_heartbeat");
-    const at = raw ? ((JSON.parse(raw) as { at?: number } | null)?.at ?? 0) : 0;
+    hbRaw = (await db?.getWorkerState("scan_heartbeat")) ?? null;
+    const at = hbRaw ? ((JSON.parse(hbRaw) as { at?: number } | null)?.at ?? 0) : 0;
     if (typeof at === "number" && now - at < SCAN_TRIGGER_INTERVAL_MS) return;
   } catch {
     // heartbeat unreadable — fail open and run the fallback scan
   }
   try {
-    await runScan();
+    await runScan(hbRaw);
   } catch (err) {
     console.error(
       "[worker] fallback scan failed:",
@@ -1942,7 +1958,7 @@ export default {
     // scan + heartbeat + scan_history), so it is both the diagnostic that
     // distinguishes "cron not firing" from "scan path broken" and the manual
     // recovery lever. runOnce is re-entrant safe and budget-guarded; runScan
-    // races the scan against the 26s tick budget and never rejects.
+    // races the scan against the 15s tick budget and never rejects.
     if (url.pathname === "/debug/tick") {
       const sinceLast = Date.now() - tickDebugLastRunAt;
       if (sinceLast < TICK_DEBUG_COOLDOWN_MS) {
@@ -2344,14 +2360,20 @@ export default {
     // another isolate's cron delivery). The HTTP-driven fallback
     // (maybeRunScanIfStale) still rescues a dead cron within 2 min.
     const scanGapMs = Math.max(60_000, (cfg?.scanIntervalSeconds ?? 60) * 1000);
+    // The heartbeat read doubles as the backfill input for runScan (a dead
+    // predecessor's stale scanning heartbeat) and the outage check — pass
+    // both down so the tick adds no extra round trips.
+    let hbRaw: string | null = null;
+    let hbAt: number | null = null;
     try {
-      const raw = await db?.getWorkerState("scan_heartbeat");
-      const at = raw
-        ? ((JSON.parse(raw) as { at?: number } | null)?.at ?? 0)
+      hbRaw = (await db?.getWorkerState("scan_heartbeat")) ?? null;
+      const at = hbRaw
+        ? ((JSON.parse(hbRaw) as { at?: number } | null)?.at ?? 0)
         : 0;
-      if (typeof at === "number" && at > 0 && Date.now() - at < scanGapMs) {
+      hbAt = typeof at === "number" && at > 0 ? at : null;
+      if (hbAt !== null && Date.now() - hbAt < scanGapMs) {
         console.log(
-          `[worker] cron tick skipped — last scan ${Math.round((Date.now() - at) / 1000)}s ago (< ${Math.round(scanGapMs / 1000)}s)`,
+          `[worker] cron tick skipped — last scan ${Math.round((Date.now() - hbAt) / 1000)}s ago (< ${Math.round(scanGapMs / 1000)}s)`,
         );
         return;
       }
@@ -2360,13 +2382,13 @@ export default {
     }
     // Detect missed ticks (previous scan finished too long ago) and alert.
     try {
-      await checkOutageAndAlert();
+      await checkOutageAndAlert(hbAt);
     } catch (err) {
       console.error("[worker] outage check failed:", err);
     }
     scanRunning = true;
     try {
-      await runScan();
+      await runScan(hbRaw);
     } finally {
       scanRunning = false;
     }

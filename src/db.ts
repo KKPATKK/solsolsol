@@ -974,33 +974,62 @@ export class Db {
    * effective), so this claim must NOT add round trips to the critical
    * path. When `heartbeatJson` is passed, the claim insert and the
    * start-heartbeat upsert run in ONE batched round trip — the same as the
-   * pre-lock single heartbeat write the worker used to make. Note that a
-   * racing LOSER's batch also stamps the heartbeat: that is fine and
-   * accurate — a scan IS running that second (the winner's), the stamp
-   * differs only by milliseconds, and the lock still lets exactly one
-   * isolate run it. The stale-takeover path costs extra reads, but only
-   * when a holder isolate died, which is rare.
+   * pre-lock single heartbeat write the worker used to make. A dead-tick
+   * backfill row (`historyEntry`) rides that SAME batch (2026-09-05: the
+   * separate backfill write was pushing the flush past the kill point —
+   * zero completions landed for 15+ min). Note that a racing LOSER's batch
+   * also stamps the heartbeat: that is fine and accurate — a scan IS
+   * running that second (the winner's), the stamp differs only by
+   * milliseconds, and the lock still lets exactly one isolate run it. The
+   * backfill INSERT is guarded by an EXISTS on OUR lock value so a loser's
+   * batch can never duplicate the row (the duplicate-completion-rows
+   * problem the lock was built to prevent). The stale-takeover path costs
+   * extra reads, but only when a holder isolate died, which is rare.
    */
   async claimScanLock(
     owner: string,
     now: number,
     ttlMs: number,
     heartbeatJson?: string | null,
+    historyEntry?: {
+      at: number;
+      ok: boolean;
+      ms: number;
+      err: string | null;
+      profiles: number | null;
+      pool: number | null;
+      candidates: number | null;
+      pushed: number | null;
+    } | null,
   ): Promise<string | null> {
     const value = `${now + ttlMs}|${owner}`;
-    const claimStmt = {
+    const claimStmt: { sql: string; args: Array<string | number | null> } = {
       sql: "INSERT INTO worker_state (key, value) VALUES ('scan_lock', ?) ON CONFLICT(key) DO NOTHING",
       args: [value],
     };
-    const heartbeatStmt = heartbeatJson
-      ? {
-          sql: "INSERT INTO worker_state (key, value) VALUES ('scan_heartbeat', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-          args: [heartbeatJson],
-        }
-      : null;
-    // Winner path: one batched round trip carrying the claim + heartbeat.
-    if (heartbeatStmt) {
-      const batch = await this.get().batch([claimStmt, heartbeatStmt], "write");
+    const heartbeatStmt: { sql: string; args: Array<string | number | null> } | null =
+      heartbeatJson
+        ? {
+            sql: "INSERT INTO worker_state (key, value) VALUES ('scan_heartbeat', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            args: [heartbeatJson],
+          }
+        : null;
+    const historyStmt: { sql: string; args: Array<string | number | null> } | null =
+      historyEntry
+        ? {
+            sql: `INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed)
+                  SELECT ?, 0, ?, ?, NULL, NULL, NULL, NULL
+                  WHERE EXISTS (SELECT 1 FROM worker_state WHERE key = 'scan_lock' AND value = ?)`,
+            args: [historyEntry.at, historyEntry.ms, historyEntry.err, value],
+          }
+        : null;
+    const winBatch = [claimStmt, heartbeatStmt, historyStmt].filter(
+      (s): s is { sql: string; args: Array<string | number | null> } => s !== null,
+    );
+    // Winner path: one batched round trip carrying the claim + heartbeat
+    // (+ the dead-tick backfill row when a predecessor died mid-scan).
+    if (heartbeatStmt || historyStmt) {
+      const batch = await this.get().batch(winBatch, "write");
       if (Number(batch[0]?.rowsAffected ?? 0) > 0) return value;
     } else {
       const ins = await this.get().execute(claimStmt);
@@ -1016,8 +1045,8 @@ export class Db {
     if (!raw) {
       // Row vanished between insert and read (owner released mid-claim) —
       // retry once instead of losing this claim to a race.
-      if (heartbeatStmt) {
-        const batch = await this.get().batch([claimStmt, heartbeatStmt], "write");
+      if (heartbeatStmt || historyStmt) {
+        const batch = await this.get().batch(winBatch, "write");
         return Number(batch[0]?.rowsAffected ?? 0) > 0 ? value : null;
       }
       const ins2 = await this.get().execute(claimStmt);
@@ -1031,11 +1060,16 @@ export class Db {
       args: [value, raw],
     });
     const won = Number(upd.rowsAffected ?? 0) > 0;
-    if (won && heartbeatStmt) {
-      // Rare path (dead holder): restore liveness with a separate heartbeat
-      // write — one extra round trip only when a takeover actually happens.
+    if (won && (heartbeatStmt || historyStmt)) {
+      // Rare path (dead holder): restore liveness with a separate write —
+      // one extra round trip only when a takeover actually happens.
       try {
-        await this.get().execute(heartbeatStmt);
+        await this.get().batch(
+          [heartbeatStmt, historyStmt].filter(
+            (s): s is { sql: string; args: Array<string | number | null> } => s !== null,
+          ),
+          "write",
+        );
       } catch {
         /* heartbeat is best-effort — the scan still proceeds */
       }
@@ -1256,53 +1290,6 @@ export class Db {
     const lastPrune = await this.getWorkerState("history_last_prune");
     if (!lastPrune || Date.now() - Number(lastPrune) > 24 * 3600_000) {
       await c.execute({
-        sql: "DELETE FROM scan_history WHERE at < ?",
-        args: [Date.now() - 30 * 24 * 3600_000],
-      });
-      await this.setWorkerState("history_last_prune", String(Date.now()));
-    }
-  }
-
-  /**
-   * Append one permanent scan-history row per tick (survives isolate
-   * evictions, unlike the in-memory counters). History is bounded: rows
-   * older than 30 days are pruned, at most once per day.
-   */
-  async recordScanHistory(entry: {
-    at: number;
-    ok: boolean;
-    ms: number;
-    err: string | null;
-    profiles: number | null;
-    pool: number | null;
-    candidates: number | null;
-    pushed: number | null;
-  }): Promise<void> {
-    await this.get().execute({
-      sql: `INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [
-        entry.at,
-        entry.ok ? 1 : 0,
-        entry.ms,
-        entry.err,
-        entry.profiles,
-        entry.pool,
-        entry.candidates,
-        entry.pushed,
-      ],
-    });
-    // Cheap on the hot path: the worker_state read is skipped except once
-    // per hour per isolate (see lastHistoryPruneCheckAt). Once per day is
-    // enough for the DELETE itself: the table is ~43K rows (30 days × 1
-    // row/tick), and the hourly cadence read the whole index ~24×/day
-    // (~1M rows/day — a non-trivial rows-read consumer at the 500M/month
-    // free tier).
-    if (Date.now() - this.lastHistoryPruneCheckAt < 3600_000) return;
-    this.lastHistoryPruneCheckAt = Date.now();
-    const lastPrune = await this.getWorkerState("history_last_prune");
-    if (!lastPrune || Date.now() - Number(lastPrune) > 24 * 3600_000) {
-      await this.get().execute({
         sql: "DELETE FROM scan_history WHERE at < ?",
         args: [Date.now() - 30 * 24 * 3600_000],
       });

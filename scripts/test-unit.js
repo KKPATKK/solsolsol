@@ -280,26 +280,6 @@ async function main() {
     }
   });
 
-  await test("recordScanHistory still inserts with the in-memory prune gate", async () => {
-    const t = tmpDb();
-    try {
-      const db = new Db(t.p, undefined, t.client);
-      await db.init();
-      await db.recordScanHistory({ at: Date.now(), ok: true, ms: 100, err: null, profiles: 1, pool: 1, candidates: 0, pushed: 0 });
-      await db.recordScanHistory({ at: Date.now() + 1, ok: false, ms: 200, err: "e", profiles: null, pool: null, candidates: null, pushed: null });
-      const rows = await db.getScanHistory(10);
-      assert.equal(rows.length, 2, "both rows present");
-      assert.equal(rows[0].ok, false);
-      assert.equal(rows[0].err, "e");
-      assert.equal(rows[0].profiles, null);
-      // Prune gate must never delete fresh rows even when due for a check.
-      const n = Number((await t.client.execute("SELECT COUNT(*) AS n FROM scan_history")).rows[0].n);
-      assert.equal(n, 2);
-    } finally {
-      await t.cleanup();
-    }
-  });
-
   // ---------- dead-tick backfill (worker.ts deadTickBackfillInfo) ----------
 
   await test("deadTickBackfillInfo: stale phase=scanning heartbeat → backfill row, done/fresh/null → none", () => {
@@ -334,21 +314,19 @@ async function main() {
     assert.equal(deadTickBackfillInfo(JSON.stringify({ phase: "scanning" }), now, stale), null);
   });
 
-  await test("dead-tick backfill row lands in scan_history via recordScanHistory", async () => {
+  await test("claimScanLock: dead-tick backfill row rides the winning claim batch; losers never duplicate", async () => {
     const t = tmpDb();
     try {
       const db = new Db(t.p, undefined, t.client);
       await db.init();
-      // Simulate runScan's flow: a dead predecessor left a stale scanning
-      // heartbeat; the next tick wins the lease and writes the backfill row
-      // (recordScanHistory — the exact call runScan makes), then finishes
-      // its own scan with a normal persistScanCompletion.
+      // A dead predecessor left a stale scanning heartbeat; the next tick
+      // builds the backfill entry from it and passes it into the claim.
       const deadAt = Date.now() - 120_000;
       await db.setWorkerState(
         "scan_heartbeat",
         JSON.stringify({ at: deadAt, ok: true, phase: "scanning" }),
       );
-      await db.recordScanHistory({
+      const entry = {
         at: deadAt,
         ok: false,
         ms: 120_000,
@@ -357,21 +335,28 @@ async function main() {
         pool: null,
         candidates: null,
         pushed: null,
-      });
-      const liveAt = Date.now();
-      await db.persistScanCompletion(
-        JSON.stringify({ at: liveAt, ok: true, phase: "done" }),
-        { at: liveAt, ok: true, ms: 13_000, err: null, profiles: 5, pool: 477, candidates: 0, pushed: 0 },
-      );
-      const rows = await db.getScanHistory(10);
-      assert.equal(rows.length, 2);
-      assert.equal(rows[1].at, deadAt, "backfilled row present with the dead tick's start time");
-      assert.equal(rows[1].ok, false);
-      assert.match(rows[1].err ?? "", /backfilled/);
-      assert.equal(rows[1].profiles, null, "dead tick's feed counters are unknown");
-      assert.equal(rows[1].pool, null);
-      assert.equal(rows[0].at, liveAt, "the live tick's own completion row still lands");
-      assert.equal(rows[0].ok, true);
+      };
+      const winner = await db.claimScanLock("ownerA", Date.now(), 55_000, "{}", entry);
+      assert.ok(winner, "first claim wins");
+      let rows = await db.getScanHistory(10);
+      assert.equal(rows.length, 1, "backfill row landed inside the claim batch");
+      assert.equal(rows[0].at, deadAt, "row carries the dead tick's start time");
+      assert.equal(rows[0].ok, false);
+      assert.match(rows[0].err ?? "", /backfilled/);
+      assert.equal(rows[0].profiles, null, "dead tick's feed counters are unknown");
+      // A racing loser computed the SAME entry from the same stale heartbeat
+      // (read before the winner's claim overwrote it). Its claim batch also
+      // executes — the lock-value EXISTS guard must stop its INSERT.
+      const loser = await db.claimScanLock("ownerB", Date.now() + 1_000, 55_000, "{}", entry);
+      assert.equal(loser, null, "live lock blocks the loser");
+      rows = await db.getScanHistory(10);
+      assert.equal(rows.length, 1, "loser's claim batch inserted no duplicate");
+      // Without an entry, the claim batch inserts no history row at all.
+      await db.releaseScanLock(winner);
+      const plain = await db.claimScanLock("ownerC", Date.now() + 2_000, 55_000, "{}");
+      assert.ok(plain, "claim without entry still wins");
+      rows = await db.getScanHistory(10);
+      assert.equal(rows.length, 1, "no entry → no extra row");
     } finally {
       await t.cleanup();
     }
