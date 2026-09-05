@@ -29,7 +29,7 @@ const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
-const { tradeFingerprint } = require("../dist/worker.js");
+const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
 
 let passed = 0;
 let failed = 0;
@@ -295,6 +295,83 @@ async function main() {
       // Prune gate must never delete fresh rows even when due for a check.
       const n = Number((await t.client.execute("SELECT COUNT(*) AS n FROM scan_history")).rows[0].n);
       assert.equal(n, 2);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  // ---------- dead-tick backfill (worker.ts deadTickBackfillInfo) ----------
+
+  await test("deadTickBackfillInfo: stale phase=scanning heartbeat → backfill row, done/fresh/null → none", () => {
+    const now = 1_000_000;
+    const stale = 45_000;
+    // Stale scanning heartbeat (a tick died before its completion flush).
+    assert.deepEqual(
+      deadTickBackfillInfo(JSON.stringify({ at: now - 120_000, ok: true, phase: "scanning" }), now, stale),
+      { at: now - 120_000, ms: 120_000 },
+    );
+    // Fresh scanning heartbeat — a scan is still legitimately running.
+    assert.equal(
+      deadTickBackfillInfo(JSON.stringify({ at: now - 10_000, ok: true, phase: "scanning" }), now, stale),
+      null,
+    );
+    // Exactly at the boundary IS stale (only younger-than-stale is excluded
+    // — a 45s-old scan cannot be legitimately running under a 16s budget).
+    assert.deepEqual(
+      deadTickBackfillInfo(JSON.stringify({ at: now - stale, ok: true, phase: "scanning" }), now, stale),
+      { at: now - stale, ms: stale },
+    );
+    // Done heartbeat — the completion flush landed, its row already exists.
+    assert.equal(
+      deadTickBackfillInfo(JSON.stringify({ at: now - 300_000, ok: true, phase: "done" }), now, stale),
+      null,
+    );
+    // No heartbeat / missing phase / missing at / garbage JSON → never backfill.
+    assert.equal(deadTickBackfillInfo(null, now, stale), null);
+    assert.equal(deadTickBackfillInfo("", now, stale), null);
+    assert.equal(deadTickBackfillInfo("not json", now, stale), null);
+    assert.equal(deadTickBackfillInfo(JSON.stringify({ at: now - 120_000 }), now, stale), null);
+    assert.equal(deadTickBackfillInfo(JSON.stringify({ phase: "scanning" }), now, stale), null);
+  });
+
+  await test("dead-tick backfill row lands in scan_history via recordScanHistory", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Simulate runScan's flow: a dead predecessor left a stale scanning
+      // heartbeat; the next tick wins the lease and writes the backfill row
+      // (recordScanHistory — the exact call runScan makes), then finishes
+      // its own scan with a normal persistScanCompletion.
+      const deadAt = Date.now() - 120_000;
+      await db.setWorkerState(
+        "scan_heartbeat",
+        JSON.stringify({ at: deadAt, ok: true, phase: "scanning" }),
+      );
+      await db.recordScanHistory({
+        at: deadAt,
+        ok: false,
+        ms: 120_000,
+        err: "previous tick died before its completion flush (backfilled by next tick)",
+        profiles: null,
+        pool: null,
+        candidates: null,
+        pushed: null,
+      });
+      const liveAt = Date.now();
+      await db.persistScanCompletion(
+        JSON.stringify({ at: liveAt, ok: true, phase: "done" }),
+        { at: liveAt, ok: true, ms: 13_000, err: null, profiles: 5, pool: 477, candidates: 0, pushed: 0 },
+      );
+      const rows = await db.getScanHistory(10);
+      assert.equal(rows.length, 2);
+      assert.equal(rows[1].at, deadAt, "backfilled row present with the dead tick's start time");
+      assert.equal(rows[1].ok, false);
+      assert.match(rows[1].err ?? "", /backfilled/);
+      assert.equal(rows[1].profiles, null, "dead tick's feed counters are unknown");
+      assert.equal(rows[1].pool, null);
+      assert.equal(rows[0].at, liveAt, "the live tick's own completion row still lands");
+      assert.equal(rows[0].ok, true);
     } finally {
       await t.cleanup();
     }

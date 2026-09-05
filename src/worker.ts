@@ -223,8 +223,53 @@ const SCAN_TICK_BUDGET_MS = 16_000;
 const SCAN_LOCK_TTL_MS = 55_000;
 /** Opaque per-isolate owner tag for scan-lock claims. */
 const SCAN_LOCK_OWNER = `iso-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+/**
+ * How old a phase=scanning heartbeat must be before the next tick treats
+ * its tick as dead and backfills the missing scan_history row. A live scan
+ * flushes phase=done within ~17-18s of its start (16s budget + flush), so
+ * anything still scanning at 45s died before the flush. The cadence gates
+ * (scheduled + HTTP fallback) only start a new scan when the heartbeat is
+ * >= 60s old anyway, so this never fires on a still-running tick, and 45s
+ * stays below every supported SCAN_INTERVAL_SECONDS (60/90/120). The
+ * backfilled row is written by the next tick that wins the scan lease, so
+ * scan_history no longer depends on the scan isolate surviving long enough
+ * to flush (the recurring 5-20 min zero-row holes — observed 2026-09-05:
+ * a 416s hole 08:28:40 -> 08:35:36 even under the 16s budget).
+ */
+const BACKFILL_STALE_MS = 45_000;
+
+/**
+ * Decide whether the previous tick died before its completion flush. The
+ * scan_heartbeat is overwritten by every claim, so runScan captures it
+ * BEFORE claiming; after winning the lease, a phase=scanning heartbeat
+ * older than staleMs means that tick started a scan but never flushed (the
+ * completion batch sets phase=done atomically with the history row, so a
+ * done heartbeat implies its row already landed). Returns the dead tick's
+ * start time + liveness span for the backfill row, or null when there is
+ * nothing to backfill.
+ */
+export function deadTickBackfillInfo(
+  heartbeatRaw: string | null,
+  now: number,
+  staleMs: number,
+): { at: number; ms: number } | null {
+  if (!heartbeatRaw) return null;
+  let hb: { at?: unknown; phase?: unknown } | null = null;
+  try {
+    hb = JSON.parse(heartbeatRaw) as { at?: unknown; phase?: unknown } | null;
+  } catch {
+    return null;
+  }
+  if (!hb || hb.phase !== "scanning") return null;
+  const at = typeof hb.at === "number" ? hb.at : 0;
+  if (!(at > 0) || now - at < staleMs) return null;
+  return { at, ms: now - at };
+}
+
 /** How often a scan was skipped because another isolate held the scan lock. */
 let crossIsolateScanSkips = 0;
+/** How many times a dead predecessor tick's history row was backfilled. */
+let backfilledTicks = 0;
 
 async function ensureInitialized(env: Env): Promise<void> {
   const fp = tradeFingerprint(env);
@@ -469,6 +514,20 @@ async function runScan(): Promise<void> {
   const startedAt = Date.now();
   let scanLock: string | null = null;
   let claimErrored = false;
+  // Capture the PRE-CLAIM heartbeat before the claim batch overwrites it
+  // with ours: if the previous tick is still phase=scanning and long past
+  // its budget, it died before its completion flush (the flush batch sets
+  // phase=done atomically with the history row). We backfill that tick's
+  // row after winning the lease so scan_history never grows >4-min holes
+  // just because an isolate was killed between scan end and flush.
+  let prevHeartbeatRaw: string | null = null;
+  if (db) {
+    try {
+      prevHeartbeatRaw = await db.getWorkerState("scan_heartbeat");
+    } catch {
+      // best-effort — a failed read just skips the backfill this tick
+    }
+  }
   const heartbeatJson = JSON.stringify({
     at: startedAt,
     ok: true,
@@ -507,6 +566,33 @@ async function runScan(): Promise<void> {
       await db?.setWorkerState("scan_heartbeat", heartbeatJson);
     } catch (err) {
       console.error("[worker] start heartbeat write failed:", err);
+    }
+  }
+  // Backfill the dead predecessor (rare path — only fires when we hold the
+  // lease AND the previous tick's heartbeat shows it died mid-scan). One
+  // extra write at tick start, never on the wall-clock-critical flush path;
+  // the next tick after any recovery covers the dead tick's missing row.
+  if (scanLock !== null && prevHeartbeatRaw) {
+    const dead = deadTickBackfillInfo(prevHeartbeatRaw, Date.now(), BACKFILL_STALE_MS);
+    if (dead) {
+      try {
+        await db?.recordScanHistory({
+          at: dead.at,
+          ok: false,
+          ms: dead.ms,
+          err: "previous tick died before its completion flush (backfilled by next tick)",
+          profiles: null,
+          pool: null,
+          candidates: null,
+          pushed: null,
+        });
+        backfilledTicks++;
+        console.log(
+          `[worker] backfilled dead tick at ${new Date(dead.at).toISOString()} (lived ${dead.ms}ms, flush lost)`,
+        );
+      } catch (err) {
+        console.error("[worker] dead-tick backfill write failed:", err);
+      }
     }
   }
   let timedOut = false;
@@ -1038,6 +1124,11 @@ export default {
         // scan because another isolate held the lock (expected to rise when
         // cron + the HTTP fallback would previously have double-scanned).
         scanLockSkips: crossIsolateScanSkips,
+        // Dead-tick backfills: how many predecessor ticks died before their
+        // completion flush and had their scan_history row written by the
+        // next tick (see BACKFILL_STALE_MS). Rising while lastScanGapMs
+        // stays low = history self-healing instead of holes.
+        backfilledTicks,
         heartbeat,
         lastScanGapMs,
         summary: scanner?.lastSummary ?? null,
