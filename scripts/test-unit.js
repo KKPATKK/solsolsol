@@ -19,7 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -53,6 +53,53 @@ function tmpDb() {
 }
 
 async function main() {
+  // ---------- scanner.ts re-eval pool rotation slice ----------
+
+  await test("slicePoolRotation: small pool taken whole, cursor resets", () => {
+    const items = ["a", "b", "c"];
+    const r1 = slicePoolRotation(items, 2, 120);
+    assert.deepEqual(r1.slice, ["a", "b", "c"]);
+    assert.equal(r1.nextCursor, 0);
+  });
+
+  await test("slicePoolRotation: successive windows cover every item exactly once per sweep", () => {
+    // 409 pool coins, 120/tick → 4 ticks (120+120+120+49). This is the
+    // zero-push fix: every coin must be re-checked at least once per sweep.
+    const items = Array.from({ length: 409 }, (_, i) => i);
+    const seen = new Map();
+    let cursor = 0;
+    for (let tick = 0; tick < 4; tick++) {
+      const { slice, nextCursor } = slicePoolRotation(items, cursor, 120);
+      for (const item of slice) seen.set(item, (seen.get(item) ?? 0) + 1);
+      cursor = nextCursor;
+    }
+    assert.equal(seen.size, 409, "every pool coin evaluated within one sweep");
+    assert.ok([...seen.values()].every((n) => n === 1), "no duplicates within a sweep");
+    // The tail window (49 < 120) resets the cursor: tick 5 starts a fresh
+    // sweep from the top instead of wrapping over just-covered items.
+    assert.equal(cursor, 0);
+    const { slice } = slicePoolRotation(items, cursor, 120);
+    assert.deepEqual(slice, items.slice(0, 120));
+  });
+
+  await test("slicePoolRotation: full window at the end takes only the tail, no wrap-back", () => {
+    const items = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    // 10 items, max 5: cursor 5 → [5..9] tail, cursor resets to 0 (the old
+    // wrap-back version returned [5..9, 0..4] — a whole duplicate sweep).
+    const r = slicePoolRotation(items, 5, 5);
+    assert.deepEqual(r.slice, [5, 6, 7, 8, 9]);
+    assert.equal(r.nextCursor, 0);
+    // Mid-window keeps order: cursor 8, max 5 → tail [8, 9] only.
+    const r2 = slicePoolRotation(items, 8, 5);
+    assert.deepEqual(r2.slice, [8, 9]);
+    assert.equal(r2.nextCursor, 0);
+    // A wildly out-of-range cursor is normalized by the modulo, not a crash
+    // (7 of 10 with max 5 → tail [7..9]; 3 items < max is valid tail behavior).
+    const r3 = slicePoolRotation(items, 10_007, 5);
+    assert.deepEqual(r3.slice, [7, 8, 9]);
+    assert.equal(r3.nextCursor, 0);
+  });
+
   // ---------- scanner.ts push gates ----------
 
   await test("botUsersBlockReason: dead pools blocked below the floor, healthy pass", () => {

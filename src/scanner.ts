@@ -92,6 +92,47 @@ const RE_EVAL_WINDOW_MS = 30 * 60 * 60_000;
  * they qualify instead of being picked up only after a later scan.
  */
 const RE_EVAL_AGE_MARGIN_MIN = 180;
+/**
+ * Max re-eval-pool coins whose pair data is fetched per tick (the live feed
+ * is always included on top). The pair fetch is the scan's dominant cost —
+ * ~30 addresses per DexScreener batch inside a 10s internal budget — and
+ * once the pool passed ~300 coins (10K+ eligible in the age window,
+ * observed 2026-09-05) the fetch consumed the whole 15s tick budget: the
+ * worker's abort then fired at the next phase boundary and NO coin was ever
+ * evaluated (agedEval 0, empty rejects, zero pushes since 2026-09-03).
+ * Slicing the pool into a rotating per-tick window bounds the fetch to ~4
+ * batches and hands the budget back to the gates. The slice advances by its
+ * own length every tick and wraps, so every pool coin is still re-checked
+ * once per full sweep (≈ pool/120 ticks ≈ 4 min at 409 coins); the SQL
+ * rotation bands underneath are untouched. A coin crossing a momentum gate
+ * is caught within one sweep instead of same-tick — the price of finishing
+ * scans at all.
+ */
+const RE_EVAL_PER_TICK_MAX = 120;
+
+/**
+ * Pure rotation-slice over the pool-only token list (exported for offline
+ * unit tests). Returns the ≤ maxPerTick window starting at `cursor` plus the
+ * next cursor; pools at or below maxPerTick are taken whole with the cursor
+ * reset. A full window that would run past the end takes only the remaining
+ * tail and resets the cursor — the next tick starts a fresh sweep from the
+ * top instead of wrapping back over items it just covered. Successive calls
+ * with the returned cursor cover every item exactly once per sweep — no
+ * gaps, no duplicates.
+ */
+export function slicePoolRotation<T>(
+  items: T[],
+  cursor: number,
+  maxPerTick: number,
+): { slice: T[]; nextCursor: number } {
+  if (items.length <= maxPerTick) return { slice: items, nextCursor: 0 };
+  const start = cursor % items.length;
+  const end = start + maxPerTick;
+  if (end <= items.length) {
+    return { slice: items.slice(start, end), nextCursor: end % items.length };
+  }
+  return { slice: items.slice(start), nextCursor: 0 };
+}
 
 /** One qualifying coin, prepared for a specific chat. */
 export interface QualifyingCoin {
@@ -142,6 +183,9 @@ export interface ScanSummary {
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
   backfill: number;
   pool: number;
+  /** Pool coins actually evaluated this tick (rotation slice of `pool`,
+   * see RE_EVAL_PER_TICK_MAX). Undefined on pre-fix summaries. */
+  poolSliced?: number;
   /** Evaluations that passed the age gate (age ≥ min) this scan — proves
    * in-window coins are actually being evaluated, not silently skipped. */
   agedEval: number;
@@ -358,6 +402,13 @@ export class Scanner {
    * soon as the flag is set — no extra DB reads forever after.
    */
   private launchBackfillDone = false;
+  /**
+   * Start offset of the current tick's pool rotation slice (see
+   * RE_EVAL_PER_TICK_MAX). Advances by the slice length each tick and wraps,
+   * so the whole pool is covered in ⌈pool / slice⌉ ticks. Cursor > pool
+   * length self-normalizes via the modulo at use.
+   */
+  private poolSliceCursor = 0;
   /** Post-push tracker (null when disabled or no bot/db — see pushwatch.ts). */
   private readonly pushWatcher: import("./pushwatch").PushWatcher | null;
 
@@ -1086,7 +1137,23 @@ export class Scanner {
           .map((s) => ({ tokenAddress: s.token })),
       ];
       diag.pool = poolProfiles.length;
-      const addresses = [...new Set(poolProfiles.map((p) => p.tokenAddress))];
+      // Rotation slice: evaluate at most RE_EVAL_PER_TICK_MAX pool coins per
+      // tick (the feed itself is always included). A pool larger than the
+      // slice cycles through per-tick windows so every coin is still swept;
+      // a smaller pool is taken whole (cursor clamps). Stable order across
+      // ticks (the pool query sorts by band then mcap) keeps the window
+      // sweep deterministic.
+      const feedOnly = poolProfiles.slice(0, feedProfiles.length);
+      const poolOnly = poolProfiles.slice(feedProfiles.length);
+      const { slice: poolSlice, nextCursor } = slicePoolRotation(
+        poolOnly,
+        this.poolSliceCursor,
+        RE_EVAL_PER_TICK_MAX,
+      );
+      this.poolSliceCursor = nextCursor;
+      diag.poolSliced = poolSlice.length;
+      const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
+      const addresses = [...new Set(scannedProfiles.map((p) => p.tokenAddress))];
       if (this.shouldStopEarly()) return;
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
       // Fallback: when DexScreener's batched endpoint is blocked (shared
@@ -1207,7 +1274,7 @@ export class Scanner {
 
       const agedEval = { count: 0 };
       const candidates = this.matchCoins(
-        poolProfiles,
+        scannedProfiles,
         pairsByToken,
         statsByToken,
         chats,
@@ -1588,7 +1655,7 @@ export class Scanner {
       }
       diag.pushed = pushed;
       console.log(
-        `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${poolProfiles.length} pooled, ${candidates.length} candidates, ${pushed} pushed` +
+        `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${scannedProfiles.length}/${poolProfiles.length} pooled, ${candidates.length} candidates, ${pushed} pushed` +
           (this.birdeye ? "" : " (Birdeye not configured)"),
       );
     } catch (err) {
