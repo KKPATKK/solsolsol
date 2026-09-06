@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test-filters.js",
     "test:unit": "npm run build && node scripts/test-unit.js",
-    "deploy:worker": "wrangler deploy"
+    "deploy:worker": "wrangler deploy",
+    "deploy:env": "node --env-file-if-exists=.env.local node_modules/wrangler/bin/wrangler.js deploy"
   },
   "engines": {
     "node": ">=20"
