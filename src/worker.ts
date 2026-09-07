@@ -216,13 +216,20 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * spikes; the flush also retries once after a settled failure (see below).
  * The rotation slice + re-eval pool absorb the 2s of lost scan work.
  *
+ * Cut again 13s → 11s the same day, after the 13s build went live: of its
+ * first 6 ticks, ZERO scanned cleanly (2 timeout rows landed at 13.3-13.5s,
+ * 4 flushes hung and died) while claims kept landing every minute — reads
+ * and claim-writes healthy, only the mid-teens flush window is lethal on
+ * heavy ticks. 11.2s buys another 2s of headroom; the pool absorbs the
+ * scan work.
+ *
  * Consequence: scans that finish inside the budget persist a full summary;
  * slower scans (hot pool) write an ok=false timeout row and their feed
  * counters (pool/candidates/pushed) are carried by the NEXT tick's row via
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
  */
-const SCAN_TICK_BUDGET_MS = 13_000;
+const SCAN_TICK_BUDGET_MS = 11_000;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -689,14 +696,17 @@ async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
       // proved liveness, only this row is lost, and the lock self-heals
       // via its TTL + stale takeover on the next tick.
       // Flush = ONE batched round trip (heartbeat phase=done + history row +
-      // lock release). A settled failure (fast Turso 4xx/5xx) gets ONE
-      // immediate retry: the 2026-09-07 live history showed dead-tick
-      // clusters where every flush was lost to transient Turso errors, and
-      // a 300ms-backoff retry still lands ~6s before the invocation kill.
-      // Safe to repeat: persistScanCompletion deletes its own `at` row
-      // before inserting, so a committed-but-response-lost first attempt
-      // can never produce a duplicate history row. (A slow/hanging write
-      // that never settles just dies with the isolate — nothing to retry.)
+      // lock release). Two failure shapes, two remedies:
+      //   - settled failure (fast Turso 4xx/5xx): ONE sequential retry after
+      //     a 300ms backoff.
+      //   - HANGING write (observed live post-13s-deploy 2026-09-07: 4 dead
+      //     ticks in 6 while claims landed every minute — the libsql client
+      //     internally retries quota/5xx errors, so the flush promise never
+      //     settles and a sequential retry never fires before the kill):
+      //     if the first attempt hasn't settled within 2.5s, fire a
+      //     CONCURRENT retry and await it. Safe: the batch is idempotent
+      //     (it deletes its own `at` history row before inserting), so a
+      //     first attempt that commits late can never produce a duplicate.
       // Narrowed snapshots: the module-level lets are `number | null`, and
       // TS does not carry the assignment narrowing from the enclosing block
       // into the closure below — copy them into consts first.
@@ -725,9 +735,32 @@ async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
             pushed: summary?.pushed ?? null,
           },
           scanLock,
-        );
+        ) ?? Promise.resolve();
+      let settled = false;
+      const attempt1 = flushCompletion();
+      const mark = attempt1.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
       try {
-        await flushCompletion();
+        await Promise.race([
+          mark,
+          new Promise((resolve) => setTimeout(resolve, 2500)),
+        ]);
+        if (!settled) {
+          console.error(
+            "[worker] completion write hung — firing racing retry",
+          );
+          await flushCompletion();
+        } else {
+          // Success resolves here; a settled rejection throws into the
+          // catch below for the backoff retry.
+          await attempt1;
+        }
       } catch (err) {
         console.error("[worker] completion write failed — retrying once:", err);
         await new Promise((resolve) => setTimeout(resolve, 300));
