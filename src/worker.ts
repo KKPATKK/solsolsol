@@ -207,13 +207,22 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * this constant without first verifying live that completions still land
  * (22s+ landed zero rows; 19s produced recurring 5-20 min holes).
  *
+ * Cut again 15s → 13s on 2026-09-07 (directive: the budget number does not
+ * matter — EVERY tick must complete): the live history showed dead ticks
+ * still clustering (16:29-16:33Z, 15:55-15:57Z, 15:44-15:47Z — four-plus
+ * consecutive ticks whose ~16.5s flush never landed, each backfilled by
+ * the next tick). The flush now starts ~13.2-13.5s in, buying ~2s more
+ * margin against both the fluctuating kill point and Turso write-latency
+ * spikes; the flush also retries once after a settled failure (see below).
+ * The rotation slice + re-eval pool absorb the 2s of lost scan work.
+ *
  * Consequence: scans that finish inside the budget persist a full summary;
  * slower scans (hot pool) write an ok=false timeout row and their feed
  * counters (pool/candidates/pushed) are carried by the NEXT tick's row via
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
  */
-const SCAN_TICK_BUDGET_MS = 15_000;
+const SCAN_TICK_BUDGET_MS = 13_000;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -227,6 +236,22 @@ const SCAN_TICK_BUDGET_MS = 15_000;
  * kills invocations around ~20-30s).
  */
 const SCAN_LOCK_TTL_MS = 55_000;
+/**
+ * Slack allowed between two scans beyond SCAN_INTERVAL_SECONDS when the
+ * cadence gate compares against the previous tick's CLAIM time. The gate is
+ * `now - heartbeat.at >= scanGapMs`, and `at` is written by the claim batch
+ * ~1-4s AFTER cron fires — so a strict 60s gate measures ~56-58s on the
+ * next tick and systematically skips it (live evidence 2026-09-07:
+ * scan_history gaps of 121-122s, heartbeat 86s stale while a tick had
+ * fired 28s earlier — every other tick silently did nothing). The margin
+ * covers the claim offset + cron delivery jitter; overlap safety is the
+ * scan lock's job (CAS claim, 55s TTL), not the gate's. With the margin,
+ * SCAN_INTERVAL_SECONDS=60 scans on EVERY tick; 90/120 still gate to
+ * every-other / every-third tick (gaps 60 < 80 < 120). Set generously:
+ * a margin up to ~20s cannot double-scan (the previous scan releases the
+ * lock at claim+~15s and a second trigger loses the CAS claim).
+ */
+const SCAN_GATE_MARGIN_MS = 10_000;
 /** Opaque per-isolate owner tag for scan-lock claims. */
 const SCAN_LOCK_OWNER = `iso-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 /**
@@ -663,22 +688,36 @@ async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
       // If a rare Turso spike still kills it, the start heartbeat already
       // proved liveness, only this row is lost, and the lock self-heals
       // via its TTL + stale takeover on the next tick.
-      try {
-        await db?.persistScanCompletion(
+      // Flush = ONE batched round trip (heartbeat phase=done + history row +
+      // lock release). A settled failure (fast Turso 4xx/5xx) gets ONE
+      // immediate retry: the 2026-09-07 live history showed dead-tick
+      // clusters where every flush was lost to transient Turso errors, and
+      // a 300ms-backoff retry still lands ~6s before the invocation kill.
+      // Safe to repeat: persistScanCompletion deletes its own `at` row
+      // before inserting, so a committed-but-response-lost first attempt
+      // can never produce a duplicate history row. (A slow/hanging write
+      // that never settles just dies with the isolate — nothing to retry.)
+      // Narrowed snapshots: the module-level lets are `number | null`, and
+      // TS does not carry the assignment narrowing from the enclosing block
+      // into the closure below — copy them into consts first.
+      const flushedAt: number = lastScanAt;
+      const flushedMs: number = lastScanMs;
+      const flushCompletion = () =>
+        db?.persistScanCompletion(
           JSON.stringify({
-            at: lastScanAt,
+            at: flushedAt,
             ok: lastScanOk,
             phase: "done",
             count: scanCount,
-            ms: lastScanMs,
+            ms: flushedMs,
             err: lastScanError,
             skip: scanner?.lastSkip ?? null,
             summary,
           }),
           {
-            at: lastScanAt,
+            at: flushedAt,
             ok: lastScanOk,
-            ms: lastScanMs,
+            ms: flushedMs,
             err: lastScanError,
             profiles: summary?.profiles ?? null,
             pool: summary?.pool ?? null,
@@ -687,8 +726,16 @@ async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
           },
           scanLock,
         );
+      try {
+        await flushCompletion();
       } catch (err) {
-        console.error("[worker] completion write failed:", err);
+        console.error("[worker] completion write failed — retrying once:", err);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        try {
+          await flushCompletion();
+        } catch (err2) {
+          console.error("[worker] completion retry failed:", err2);
+        }
       }
     }
   } finally {
@@ -2360,6 +2407,12 @@ export default {
     // another isolate's cron delivery). The HTTP-driven fallback
     // (maybeRunScanIfStale) still rescues a dead cron within 2 min.
     const scanGapMs = Math.max(60_000, (cfg?.scanIntervalSeconds ?? 60) * 1000);
+    // Gate against the CLAIM time minus the jitter margin (see
+    // SCAN_GATE_MARGIN_MS): the heartbeat's `at` lands 1-4s after cron
+    // fires, so a strict `scanGapMs` comparison skips every other tick at
+    // the 60s cadence (2026-09-07 live: 121s history gaps). The scan lock,
+    // not this gate, prevents overlapping scans.
+    const gateMs = scanGapMs - SCAN_GATE_MARGIN_MS;
     // The heartbeat read doubles as the backfill input for runScan (a dead
     // predecessor's stale scanning heartbeat) and the outage check — pass
     // both down so the tick adds no extra round trips.
@@ -2371,9 +2424,9 @@ export default {
         ? ((JSON.parse(hbRaw) as { at?: number } | null)?.at ?? 0)
         : 0;
       hbAt = typeof at === "number" && at > 0 ? at : null;
-      if (hbAt !== null && Date.now() - hbAt < scanGapMs) {
+      if (hbAt !== null && Date.now() - hbAt < gateMs) {
         console.log(
-          `[worker] cron tick skipped — last scan ${Math.round((Date.now() - hbAt) / 1000)}s ago (< ${Math.round(scanGapMs / 1000)}s)`,
+          `[worker] cron tick skipped — last scan claimed ${Math.round((Date.now() - hbAt) / 1000)}s ago (< ${Math.round(gateMs / 1000)}s)`,
         );
         return;
       }

@@ -1267,6 +1267,14 @@ export class Db {
       });
     }
     if (history) {
+      // Idempotent insert: clear any row with the same timestamp first (the
+      // batch runs as one transaction), so the worker's flush retry after a
+      // committed-but-response-lost first attempt can never duplicate a
+      // scan_history row.
+      ops.push({
+        sql: "DELETE FROM scan_history WHERE at = ?",
+        args: [history.at],
+      });
       ops.push({
         sql: `INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
