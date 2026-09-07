@@ -64,6 +64,19 @@ const SCAN_TIMEOUT_MS = 25_000;
  */
 const SCAN_TICK_DEADLINE_MS = 20_000;
 /**
+ * Wall-clock cap for the discovery-feed phase (feeds run sequentially, each
+ * best-effort). Evidence 2026-09-07 ~18:30Z: timeout rows pinned at ms≈11.1s
+ * carried profiles=0 pool=0 cand=0 — the feed phase alone consumed the whole
+ * tick (slow/empty DexScreener profiles + gecko 429 backoff) and pool
+ * evaluation plus candidates never ran, so ZERO ticks completed. The cap is
+ * enforced two ways: each feed is skipped outright once the deadline has
+ * passed, and each in-flight fetch is raced against the remaining feed
+ * budget (a hanging upstream call resolves empty at the deadline instead of
+ * starving the core scan). The core phases — pool eval, candidates, pushes —
+ * always get the remainder of the tick.
+ */
+const FEED_DEADLINE_MS = 5_500;
+/**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the
  * operator runs 30h (28h + 2h slack): coins age into the window while
@@ -183,6 +196,14 @@ export interface ScanSummary {
   /** Birdeye periodic backfill: coins seeded into the re-eval pool this run. */
   backfill: number;
   pool: number;
+  /** Wall-clock ms spent in the discovery-feed phase (profiles → backfill). */
+  feedsMs?: number;
+  /** Wall-clock ms spent on the post-push tracker pass. */
+  trackerMs?: number;
+  /** Wall-clock ms for the re-eval pool query + rotation slice. */
+  poolMs?: number;
+  /** Wall-clock ms for matching + candidate gate evaluation. */
+  evalMs?: number;
   /** Pool coins actually evaluated this tick (rotation slice of `pool`,
    * see RE_EVAL_PER_TICK_MAX). Undefined on pre-fix summaries. */
   poolSliced?: number;
@@ -679,6 +700,27 @@ export class Scanner {
     return true;
   }
 
+  /**
+   * Run one feed fetch capped by the feed deadline (see FEED_DEADLINE_MS).
+   * Skips outright when the deadline has passed; otherwise races the fetch
+   * against the remaining feed budget so a hanging upstream call resolves
+   * empty at the deadline instead of starving the core scan. The abandoned
+   * promise keeps its race handlers attached, so a late settlement (or
+   * rejection) is swallowed — no unhandled-rejection crash.
+   */
+  private async fetchFeedCapped<T>(
+    feed: () => Promise<T>,
+    empty: T,
+    feedDeadline: number,
+  ): Promise<T> {
+    const remaining = feedDeadline - Date.now();
+    if (remaining <= 250) return empty;
+    return Promise.race([
+      feed(),
+      new Promise<T>((resolve) => setTimeout(() => resolve(empty), remaining)),
+    ]);
+  }
+
   /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
   async runOnce(): Promise<void> {
     if (this.running) {
@@ -705,6 +747,7 @@ export class Scanner {
     this.abortRequested = false;
     const startedAt = Date.now();
     const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
+    const feedDeadline = startedAt + FEED_DEADLINE_MS;
     const diag: ScanSummary = {
       profiles: 0,
       pump: 0,
@@ -778,9 +821,14 @@ export class Scanner {
       // all-zero scans (3 attempts × 2/4s backoff) that skipped the entire
       // pool evaluation (observed 2026-08-16).
       if (this.shouldStopEarly()) return;
+      const feedsStart = Date.now();
       let profiles: TokenProfile[] = [];
       try {
-        profiles = await this.dex.fetchLatestSolanaProfiles();
+        profiles = await this.fetchFeedCapped(
+          () => this.dex.fetchLatestSolanaProfiles(),
+          [],
+          feedDeadline,
+        );
       } catch (err) {
         console.error(
           "[scanner] dexscreener profile feed failed:",
@@ -795,8 +843,11 @@ export class Scanner {
       let pumpProfiles: TokenProfile[] = [];
       if (this.pumpfun && this.config.pumpfunProfileLimit > 0) {
         try {
-          pumpProfiles = await this.pumpfun.fetchNewestCoins(
-            this.config.pumpfunProfileLimit,
+          pumpProfiles = await this.fetchFeedCapped(
+            () =>
+              this.pumpfun!.fetchNewestCoins(this.config.pumpfunProfileLimit),
+            [],
+            feedDeadline,
           );
         } catch (err) {
           console.error(
@@ -816,22 +867,28 @@ export class Scanner {
       if (this.shouldStopEarly()) return;
       if (this.gecko) {
         try {
-          const pools = [];
-          for (
-            let page = 1;
-            page <= this.config.geckoterminalPoolPages;
-            page++
-          ) {
-            const got = await this.gecko.fetchNewPools(page);
-            pools.push(...got);
-            if (got.length === 0) break;
-          }
-          geckoProfiles = pools
-            .filter((p) => p.createdAtMs !== null)
-            .map((p) => ({
-              tokenAddress: p.tokenAddress,
-              openTimestamp: p.createdAtMs ?? undefined,
-            }));
+          geckoProfiles = await this.fetchFeedCapped(
+            async () => {
+              const pools = [];
+              for (
+                let page = 1;
+                page <= this.config.geckoterminalPoolPages;
+                page++
+              ) {
+                const got = await this.gecko!.fetchNewPools(page);
+                pools.push(...got);
+                if (got.length === 0) break;
+              }
+              return pools
+                .filter((p) => p.createdAtMs !== null)
+                .map((p) => ({
+                  tokenAddress: p.tokenAddress,
+                  openTimestamp: p.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
+          );
         } catch (err) {
           console.error(
             "[scanner] geckoterminal discovery failed:",
@@ -848,15 +905,21 @@ export class Scanner {
       if (this.shouldStopEarly()) return;
       if (this.gecko && this.config.geckoterminalTrendingLimit > 0) {
         try {
-          const trending = await this.gecko.fetchTrendingPools(
-            this.config.geckoterminalTrendingLimit,
+          geoTrendProfiles = await this.fetchFeedCapped(
+            async () => {
+              const trending = await this.gecko!.fetchTrendingPools(
+                this.config.geckoterminalTrendingLimit,
+              );
+              return trending
+                .filter((p) => p.createdAtMs !== null)
+                .map((p) => ({
+                  tokenAddress: p.tokenAddress,
+                  openTimestamp: p.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
           );
-          geoTrendProfiles = trending
-            .filter((p) => p.createdAtMs !== null)
-            .map((p) => ({
-              tokenAddress: p.tokenAddress,
-              openTimestamp: p.createdAtMs ?? undefined,
-            }));
         } catch (err) {
           console.error(
             "[scanner] geckoterminal trending discovery failed:",
@@ -873,15 +936,21 @@ export class Scanner {
       if (this.shouldStopEarly()) return;
       if (this.gmgn && this.config.gmgnTrendingLimit > 0) {
         try {
-          const trending = await this.gmgn.fetchTrending(
-            this.config.gmgnTrendingLimit,
+          gmgnProfiles = await this.fetchFeedCapped(
+            async () => {
+              const trending = await this.gmgn!.fetchTrending(
+                this.config.gmgnTrendingLimit,
+              );
+              return trending
+                .filter((t) => !t.isWashTrading)
+                .map((t) => ({
+                  tokenAddress: t.address,
+                  openTimestamp: t.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
           );
-          gmgnProfiles = trending
-            .filter((t) => !t.isWashTrading)
-            .map((t) => ({
-              tokenAddress: t.address,
-              openTimestamp: t.createdAtMs ?? undefined,
-            }));
         } catch (err) {
           console.error(
             "[scanner] gmgn trending discovery failed:",
@@ -901,13 +970,19 @@ export class Scanner {
       if (this.shouldStopEarly()) return;
       if (this.axiom && this.config.axiomTrendingLimit > 0) {
         try {
-          const trending = await this.fetchTrendingCached();
-          axiomProfiles = trending
-            .filter((t) => t.createdAtMs !== null)
-            .map((t) => ({
-              tokenAddress: t.address,
-              openTimestamp: t.createdAtMs ?? undefined,
-            }));
+          axiomProfiles = await this.fetchFeedCapped(
+            async () => {
+              const trending = await this.fetchTrendingCached();
+              return trending
+                .filter((t) => t.createdAtMs !== null)
+                .map((t) => ({
+                  tokenAddress: t.address,
+                  openTimestamp: t.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
+          );
         } catch (err) {
           console.error(
             "[scanner] axiom trending discovery failed:",
@@ -926,8 +1001,11 @@ export class Scanner {
       if (this.shouldStopEarly()) return;
       if (this.jupiter && this.config.jupiterRecentLimit > 0) {
         try {
-          jupProfiles = await this.jupiter.fetchRecentTokens(
-            this.config.jupiterRecentLimit,
+          jupProfiles = await this.fetchFeedCapped(
+            () =>
+              this.jupiter!.fetchRecentTokens(this.config.jupiterRecentLimit),
+            [],
+            feedDeadline,
           );
         } catch (err) {
           console.error(
@@ -945,8 +1023,11 @@ export class Scanner {
       if (this.shouldStopEarly()) return;
       if (this.jupiter && this.config.jupiterTrendLimit > 0) {
         try {
-          jupTrendProfiles = await this.jupiter.fetchTrendingTokens(
-            this.config.jupiterTrendLimit,
+          jupTrendProfiles = await this.fetchFeedCapped(
+            () =>
+              this.jupiter!.fetchTrendingTokens(this.config.jupiterTrendLimit),
+            [],
+            feedDeadline,
           );
         } catch (err) {
           console.error(
@@ -966,16 +1047,22 @@ export class Scanner {
       // in worker_state so isolates don't re-run it on every recycle.
       if (this.shouldStopEarly()) return;
       try {
-        diag.backfill = await this.runPeriodicBackfill();
+        diag.backfill = await this.fetchFeedCapped(
+          () => this.runPeriodicBackfill(),
+          0,
+          feedDeadline,
+        );
       } catch (err) {
         console.error(
           "[scanner] periodic backfill failed:",
           err instanceof Error ? err.message : err,
         );
       }
+      diag.feedsMs = Date.now() - feedsStart;
       // Post-push tracker pass: one DexScreener batch + bounded Birdeye
       // holder probes for the watched coins, then 🚀/⚠️/💀 follow-ups.
       // Best-effort — a tracker failure never affects the scan.
+      const trackerStart = Date.now();
       if (this.pushWatcher) {
         if (this.shouldStopEarly()) return;
         try {
@@ -987,6 +1074,7 @@ export class Scanner {
           diag.pushWatch = `err:${msg.slice(0, 140)}`;
         }
       }
+      diag.trackerMs = Date.now() - trackerStart;
       // Dedupe the feeds (mints overlap across all three); the DexScreener
       // entry wins — it carries richer profile data.
       const dexMints = new Set(profiles.map((p) => p.tokenAddress));
@@ -1088,6 +1176,7 @@ export class Scanner {
       const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
       const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
       if (this.shouldStopEarly()) return;
+      const poolStart = Date.now();
       const recentStats = await this.getReevalPoolCached(now, {
         sinceMs: now - RE_EVAL_WINDOW_MS,
         minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
@@ -1152,6 +1241,8 @@ export class Scanner {
       );
       this.poolSliceCursor = nextCursor;
       diag.poolSliced = poolSlice.length;
+      diag.poolMs = Date.now() - poolStart;
+      const evalStart = Date.now();
       const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
       const addresses = [...new Set(scannedProfiles.map((p) => p.tokenAddress))];
       if (this.shouldStopEarly()) return;
@@ -1654,6 +1745,7 @@ export class Scanner {
         }
       }
       diag.pushed = pushed;
+      diag.evalMs = Date.now() - evalStart;
       console.log(
         `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${scannedProfiles.length}/${poolProfiles.length} pooled, ${candidates.length} candidates, ${pushed} pushed` +
           (this.birdeye ? "" : " (Birdeye not configured)"),
