@@ -308,6 +308,28 @@ export function deadTickBackfillInfo(
 let crossIsolateScanSkips = 0;
 /** How many times a dead predecessor tick's history row was backfilled. */
 let backfilledTicks = 0;
+/**
+ * Consecutive dead ticks observed BY THIS ISOLATE (its own tick dying
+ * without a flush, or backfilling a predecessor that died). One dead tick
+ * is noise (a Turso spike, a wall-clock kill); a STREAK means this
+ * isolate's module-scoped state is wedged — a hung upstream fetch or a
+ * libsql connection stuck in an internal retry loop that never settles
+ * (observed live 2026-09-08 12:26-12:59Z: 29 consecutive dead ticks while
+ * healthy isolates kept landing OK rows — every tick routed to the
+ * poisoned isolate died, recovery only came when Cloudflare recycled it).
+ * When the streak reaches DEAD_TICK_STREAK_RESET, runScan drops the
+ * module-scoped client instances (dex/helius/birdeye/…) and the scanner,
+ * so the next tick's ensureInitialized rebuilds everything from scratch —
+ * fresh fetch connections, fresh libsql client — instead of waiting for
+ * an eviction that may not come for half an hour. The streak resets on
+ * any flush that lands (the next tick's runScan sees its own completion
+ * succeed and clears the counter).
+ */
+let deadTickStreak = 0;
+/** Streak length that triggers the module-state rebuild (2 dead ticks). */
+const DEAD_TICK_STREAK_RESET = 2;
+/** Set by runScan when it rebuilt the module state; surfaced via /health. */
+let wedgedStateResets = 0;
 
 async function ensureInitialized(env: Env): Promise<void> {
   const fp = tradeFingerprint(env);
@@ -534,7 +556,10 @@ async function ensureInitialized(env: Env): Promise<void> {
   }
 }
 
-async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
+async function runScan(
+  prevHeartbeatRawArg?: string | null,
+  envRef?: Env,
+): Promise<void> {
   if (!scanner) return;
   // Cross-isolate single-flight: cron and the HTTP fallback may run on
   // DIFFERENT isolates that each read the same stale heartbeat and both
@@ -639,6 +664,13 @@ async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
       `[worker] backfilled dead tick at ${new Date(backfillEntry.at).toISOString()} (lived ${backfillEntry.ms}ms, flush lost)`,
     );
   }
+  // Wedged-isolate circuit breaker: track consecutive dead ticks. The
+  // predecessor's death counts toward the streak (this isolate is the one
+  // that keeps seeing deaths — if the deaths are its own doing, the streak
+  // climbs), and our own flush landing resets it below. See
+  // DEAD_TICK_STREAK_RESET for the rationale.
+  if (backfillEntry) deadTickStreak++;
+  let rebuilt = false;
   let timedOut = false;
   try {
     // Liveness-first heartbeat (phase=scanning) already went out with the
@@ -772,6 +804,68 @@ async function runScan(prevHeartbeatRawArg?: string | null): Promise<void> {
       }
     }
   } finally {
+    // Streak bookkeeping AFTER the flush attempt: a landed completion
+    // (heartbeat reached phase=done) proves this isolate's state works —
+    // reset the streak. A tick that died before the flush (the isolate was
+    // killed mid-run, so this finally never ran) leaves the streak intact;
+    // the NEXT tick's backfill of this dead tick increments it.
+    if (db) {
+      try {
+        const hbRaw = await db.getWorkerState("scan_heartbeat");
+        const phase = hbRaw
+          ? ((JSON.parse(hbRaw) as { phase?: string } | null)?.phase ?? null)
+          : null;
+        if (phase === "done") {
+          deadTickStreak = 0;
+        }
+      } catch {
+        // best-effort — a failed read just skips the reset this tick
+      }
+    }
+    if (deadTickStreak >= DEAD_TICK_STREAK_RESET && scanner) {
+      // This isolate has now seen DEAD_TICK_STREAK_RESET consecutive dead
+      // ticks (its own deaths or its backfills of the same wedged
+      // predecessor). Its module-scoped clients are the prime suspect: a
+      // hung upstream fetch promise or a libsql client stuck in an internal
+      // retry loop never settles, so the 11s race resolves but the scan
+      // promise (and any write sharing the connection) never does. Drop the
+      // clients + scanner + webhook so ensureInitialized rebuilds them from
+      // scratch on the next tick — fresh fetch connections and a fresh
+      // libsql client. initPromise=null makes the rebuild happen even on a
+      // warm isolate (it normally early-returns). bot survives: the webhook
+      // is re-created alongside it.
+      console.error(
+        `[worker] ${deadTickStreak} consecutive dead ticks — rebuilding module state (fresh clients + connections)`,
+      );
+      dex = null;
+      helius = null;
+      birdeye = null;
+      gmgn = null;
+      axiom = null;
+      arkham = null;
+      crimeWallets = null;
+      walletAnalyzer = null;
+      flurryAnalyzer = null;
+      scanner = null;
+      scannerReady = false;
+      initPromise = null;
+      deadTickStreak = 0;
+      wedgedStateResets++;
+      rebuilt = true;
+    }
+    if (rebuilt) {
+      // Rebuild synchronously so the NEXT request (likely the UptimeRobot
+      // /health poll seconds later) finds a ready scanner instead of paying
+      // the init cost inside its own wall-clock window.
+      try {
+        await ensureInitialized(envRef!);
+      } catch (err) {
+        console.error(
+          "[worker] post-reset re-init failed (next tick retries):",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
     // Safety net only: normally the completion batch already released the
     // lock (exact-value DELETE). This runs when the flush itself threw
     // (DB down) — the DELETE is then a no-op if the batch still went out,
@@ -979,7 +1073,7 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
  * -forget so request latency is unaffected; runScan's own race keeps the
  * work inside Cloudflare's wall-clock window, and the next request retries.
  */
-async function maybeRunScanIfStale(): Promise<void> {
+async function maybeRunScanIfStale(env?: Env): Promise<void> {
   if (!scanner) return;
   const now = Date.now();
   if (now - lastScanTriggerAt < SCAN_TRIGGER_INTERVAL_MS) return;
@@ -1002,7 +1096,7 @@ async function maybeRunScanIfStale(): Promise<void> {
     // heartbeat unreadable — fail open and run the fallback scan
   }
   try {
-    await runScan(hbRaw);
+    await runScan(hbRaw, env);
   } catch (err) {
     console.error(
       "[worker] fallback scan failed:",
@@ -1024,7 +1118,7 @@ export default {
     // which wedges the scanner's running-lock mid-scan (observed
     // 2026-08-14: heartbeat frozen for 90+ minutes while the lock read
     // "previous-scan-still-running"). Guarded by the last-trigger timestamp.
-    ctx.waitUntil(maybeRunScanIfStale());
+    ctx.waitUntil(maybeRunScanIfStale(env));
     const url = new URL(request.url);
 
     // UptimeRobot target: distinguishes "worker up" from "scanner working".
@@ -1225,6 +1319,14 @@ export default {
         // next tick (see BACKFILL_STALE_MS). Rising while lastScanGapMs
         // stays low = history self-healing instead of holes.
         backfilledTicks,
+        // Wedged-isolate circuit breaker: current consecutive-dead-tick
+        // streak (0 = healthy) and how many times this isolate rebuilt its
+        // module-scoped clients after a streak tripped (see
+        // DEAD_TICK_STREAK_RESET). A rising reset count with a low streak
+        // means the breaker is doing its job; a streak pinned at the
+        // threshold means the rebuild itself is not fixing the wedge.
+        deadTickStreak,
+        wedgedStateResets,
         heartbeat,
         lastScanGapMs,
         summary: scanner?.lastSummary ?? null,
@@ -2066,7 +2168,7 @@ export default {
         );
       }
       const t0 = Date.now();
-      await runScan();
+      await runScan(undefined, env);
       return Response.json({
         ok: lastScanOk,
         ms: Date.now() - t0,
@@ -2474,7 +2576,7 @@ export default {
     }
     scanRunning = true;
     try {
-      await runScan(hbRaw);
+      await runScan(hbRaw, env);
     } finally {
       scanRunning = false;
     }
