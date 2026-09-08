@@ -116,12 +116,19 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * Slicing the pool into a rotating per-tick window bounds the fetch to ~4
  * batches and hands the budget back to the gates. The slice advances by its
  * own length every tick and wraps, so every pool coin is still re-checked
- * once per full sweep (≈ pool/120 ticks ≈ 4 min at 409 coins); the SQL
- * rotation bands underneath are untouched. A coin crossing a momentum gate
- * is caught within one sweep instead of same-tick — the price of finishing
- * scans at all.
+ * once per full sweep (≈ pool/80 ticks ≈ 6 min at 480 coins — still inside
+ * the 3/9-min rotation bands); the SQL rotation bands underneath are
+ * untouched. A coin crossing a momentum gate is caught within one sweep
+ * instead of same-tick — the price of finishing scans at all.
+ *
+ * 2026-09-08: 120 → 80. Live phase timings post-Jupiter-pacing-fix showed
+ * feedsMs 3.8s (was 5.4s) but evalMs GREW to ~2.9s — the freed feed budget
+ * went into evaluating the full 120-coin slice, so ticks still landed at
+ * ~11.2s and ~2/3 still tripped the 11s budget (13 ok / 25 T/O per 40).
+ * 80/tick cuts evalMs ~1s (each slice coin costs one DexScreener batch
+ * slot) while the sweep still covers every coin within the rotation bands.
  */
-const RE_EVAL_PER_TICK_MAX = 120;
+const RE_EVAL_PER_TICK_MAX = 80;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
