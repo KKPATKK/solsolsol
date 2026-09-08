@@ -78,7 +78,12 @@ PUMPFUN_REQUEST_INTERVAL_MS = "350"
 # net-new coin grows token_stats and with it the pool band scans.
 JUPITER_RECENT_LIMIT = "20"
 JUPITER_TRENDING_LIMIT = "15"
-JUPITER_REQUEST_INTERVAL_MS = "1000"
+# 2026-09-08: halved from 1000 — Jupiter-recent pacing (20 coins × interval)
+# was consuming ~5s of the 5.5s feed cap every tick, so feedsMs+evalMs+overhead
+# blew the 11s tick budget on ~2/3 of ticks (timeout rows in scan-history).
+# Coverage unchanged: the feed cap still bounds the phase, it just fits more
+# coins inside it before the cap trips.
+JUPITER_REQUEST_INTERVAL_MS = "500"
 # Post-push tracker: every pushed coin is watched for a bounded window and
 # refreshed from ONE DexScreener batch call per tick. Follow-ups report
 # continuation (🚀 +50/100/200/400% stages), breakdown (⚠️ ≥35% off peak,
