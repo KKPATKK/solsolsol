@@ -644,6 +644,20 @@ async function runScan(
     // Another isolate won the lease (its heartbeat write went out with the
     // claim, so liveness is covered) — skip this tick.
     crossIsolateScanSkips++;
+    // The lease loss itself is neutral, but a dead predecessor seen on the
+    // losing path still counts toward the streak: the current live pattern
+    // (2026-09-08 18:28Z+) is a poisoned isolate that wins the claim INSERT
+    // in its own isolate but whose flush never lands — every OTHER isolate
+    // then sees a dead heartbeat every tick. If only the backfill path
+    // counted, the winner's streak would climb while the losers stay at 0
+    // and the breaker never fires on the isolate that needs rebuilding.
+    // Losing isolates that see NO dead predecessor remain fully neutral.
+    if (dead) {
+      deadTickStreak++;
+      console.warn(
+        `[worker] lease lost AND predecessor tick died — dead-tick streak ${deadTickStreak}`,
+      );
+    }
     console.log("[worker] scan skipped — another isolate holds the scan lock");
     return;
   }
@@ -1327,6 +1341,7 @@ export default {
         // threshold means the rebuild itself is not fixing the wedge.
         deadTickStreak,
         wedgedStateResets,
+        crossIsolateScanSkips,
         heartbeat,
         lastScanGapMs,
         summary: scanner?.lastSummary ?? null,
