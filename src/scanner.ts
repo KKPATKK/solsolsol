@@ -137,8 +137,15 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * ~7 to ~8 minutes, well inside the 6/18-min rotation bands, and the hot
  * zone (latency-critical near-entry coins) is re-evaluated EVERY scan
  * regardless of the slice size.
+ *
+ * 2026-09-09 (later): 70 → 60. The geo feeds stayed healthy and the pool
+ * grew to ~710–875 rows: 6 of 12 ticks tripped the 12s budget (12.1–12.3s),
+ * 4 in a row. The 0.6× pre-filter prunes the bottom of the pool but not
+ * enough at this size. 60/tick shaves another ~0.5–1s off evalMs; the sweep
+ * stretches to ~12 min (still inside the 6/18-min rotation bands, and the
+ * hot zone is evaluated every scan regardless).
  */
-const RE_EVAL_PER_TICK_MAX = 70;
+const RE_EVAL_PER_TICK_MAX = 60;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
