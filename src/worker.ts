@@ -223,13 +223,21 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * heavy ticks. 11.2s buys another 2s of headroom; the pool absorbs the
  * scan work.
  *
+ * Raised 11s → 12s on 2026-09-09 (directive: ~90% of ticks were tripping
+ * the budget by only 100-300ms at 11.1-11.3s once GeckoTerminal recovered
+ * and the pool grew to ~650 rows — the pool-eval phase was being aborted
+ * ~0.1s before it would have finished). 12s starts the flush ~12.3s in,
+ * still ~8s clear of the ~20s kill window, and OK ticks measured 8.8-10.1s
+ * all morning, so the 1s raise converts those marginal ticks to completions
+ * without approaching the lethal mid-teens flush window.
+ *
  * Consequence: scans that finish inside the budget persist a full summary;
  * slower scans (hot pool) write an ok=false timeout row and their feed
  * counters (pool/candidates/pushed) are carried by the NEXT tick's row via
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
  */
-const SCAN_TICK_BUDGET_MS = 11_000;
+const SCAN_TICK_BUDGET_MS = 12_000;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -841,7 +849,7 @@ async function runScan(
       // ticks (its own deaths or its backfills of the same wedged
       // predecessor). Its module-scoped clients are the prime suspect: a
       // hung upstream fetch promise or a libsql client stuck in an internal
-      // retry loop never settles, so the 11s race resolves but the scan
+      // retry loop never settles, so the 12s race resolves but the scan
       // promise (and any write sharing the connection) never does. Drop the
       // clients + scanner + webhook so ensureInitialized rebuilds them from
       // scratch on the next tick — fresh fetch connections and a fresh
