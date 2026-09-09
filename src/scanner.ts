@@ -1251,6 +1251,17 @@ export class Scanner {
       diag.poolMs = Date.now() - poolStart;
       const evalStart = Date.now();
       const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
+      // REJECT_LOG_MAX (50) is smaller than feed+slice (~90+ coins/tick), so
+      // the bounded reject list filled first-come-first-served: the feed's
+      // dozens of fresh bonding-curve coins (all "流动性 ~$0") flooded it and
+      // the pool coins' rejections never surfaced, making zero-push stretches
+      // look unexplained on /health. Reserve the pool slice a guaranteed
+      // share: feed coins may log only into the first `feedBudgetStart`
+      // slots (the leftover), pool coins log up to the cap.
+      const rejectBudgetBeforeEval = REJECT_LOG_MAX - Math.min(
+        poolSlice.length,
+        REJECT_LOG_MAX,
+      );
       const addresses = [...new Set(scannedProfiles.map((p) => p.tokenAddress))];
       if (this.shouldStopEarly()) return;
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
@@ -1379,6 +1390,10 @@ export class Scanner {
         diag.fails,
         diag.rejects,
         agedEval,
+        // Feed coins log into the leftover slots only — the pool slice has a
+        // guaranteed share of the reject list (see rejectBudgetBeforeEval).
+        // scannedProfiles = [...feedOnly, ...poolSlice]: the tail is the pool.
+        { feedBudgetStart: rejectBudgetBeforeEval, poolStartIdx: feedOnly.length },
       );
       diag.agedEval = agedEval.count;
       diag.candidates = candidates.length;
@@ -2422,9 +2437,20 @@ export class Scanner {
     fails: ScanSummary["fails"],
     rejects: RejectionEntry[],
     agedEval: { count: number },
+    /**
+     * Reject-log budget split (see rejectBudgetBeforeEval at the call site):
+     * `poolStartIdx` marks where the pool slice begins inside `profiles`, and
+     * feed coins may log only into the first `feedBudgetStart` slots (the
+     * leftover after the pool's guaranteed share) — otherwise the feed's
+     * fresh bonding-curve coins (all "流动性 ~$0") flood the bounded list
+     * before any pool coin is logged and zero-push stretches look
+     * unexplained on /health.
+     */
+    logBudget?: { feedBudgetStart: number; poolStartIdx: number },
   ): QualifyingCoin[] {
     const out: QualifyingCoin[] = [];
-    for (const profile of profiles) {
+    for (let pi = 0; pi < profiles.length; pi++) {
+      const profile = profiles[pi]!;
       const pair = pairsByToken.get(profile.tokenAddress);
       if (!pair) continue;
       const stats = statsByToken.get(profile.tokenAddress);
@@ -2436,6 +2462,16 @@ export class Scanner {
       // + pool can be 60+ coins, but 50 entries keep the heartbeat small).
       const reject = (reason: string) => {
         if (rejects.length >= REJECT_LOG_MAX) return;
+        // Pool coins always log (up to the cap); feed coins may occupy only
+        // the first feedBudgetStart slots — the leftover after the pool
+        // slice's guaranteed share — so the feed's fresh bonding-curve coins
+        // cannot flood the list before any pool coin is logged.
+        if (
+          logBudget &&
+          pi < logBudget.poolStartIdx &&
+          rejects.length >= logBudget.feedBudgetStart
+        )
+          return;
         rejects.push({
           symbol: pair.baseToken.symbol || profile.symbol || "?",
           ageMin: Math.round(ageMs / 60_000),
