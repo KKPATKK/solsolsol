@@ -484,9 +484,33 @@ export function createBot(
         await ctx.answerCallbackQuery({ text: "数据库未配置，无法停止追蹤" });
         return;
       }
-      await db.setPushWatchState(token, "unwatched");
+      // Update-then-report: the tombstone UPDATE only matches a tracked row,
+      // so affected-row count distinguishes "stopped" from "this coin was
+      // never tracked (or already unwatched/pruned)" — previously BOTH
+      // answered the same 🔕 toast, so a no-op tap looked like it worked
+      // and a real failure looked like a dead button. A DB failure now
+      // answers honestly instead of silently swallowing the tap.
+      let updated = false;
+      try {
+        updated = await db.setPushWatchStateIfTracked(token, "unwatched");
+      } catch (err) {
+        console.error(
+          "[bot] unwatch state write failed:",
+          err instanceof Error ? err.message : err,
+        );
+        await ctx
+          .answerCallbackQuery({ text: "⚠️ 停止追蹤失败，请稍后再试" })
+          .catch(() => {});
+        return;
+      }
+      // Clear the keyboard either way (the coin is gone from tracking); the
+      // toast tells the truth about which case happened.
       await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-      await ctx.answerCallbackQuery({ text: "🔕 已停止追蹤，不再收到跟進警報" });
+      await ctx.answerCallbackQuery({
+        text: updated
+          ? "🔕 已停止追蹤，不再收到跟進警報"
+          : "ℹ️ 此幣已不在追蹤名單（可能早已停止/過期）",
+      });
       return;
     }
 

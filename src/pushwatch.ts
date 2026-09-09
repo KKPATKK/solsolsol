@@ -2,6 +2,7 @@ import type { AppConfig } from "./config";
 import type { Db } from "./db";
 import type { BirdeyeClient } from "./birdeye";
 import { fmtUsd } from "./format";
+import { tradeKeyboard } from "./bot";
 
 /**
  * Post-push tracker: every pushed coin is watched for a bounded window so
@@ -546,7 +547,28 @@ export class PushWatcher {
     private readonly pairsFor: (
       addresses: string[],
     ) => Promise<Map<string, import("./dexscreener").PairInfo>>,
+    /**
+     * Trade service (optional — null when BOT_WALLET_PRIVATE_KEY is unset).
+     * The heal-resend uses it to render the same buy/sell/mode buttons a
+     * normal first card carries; null degrades to link + unwatch only.
+     */
+    private readonly trade?: {
+      effectiveMode(): Promise<"off" | "manual" | "auto">;
+      buySizeLabel: string;
+    } | null,
   ) {}
+
+  private hasTrade(): boolean {
+    return Boolean(this.trade);
+  }
+
+  private tradeBuySizeLabel(): string {
+    return this.trade?.buySizeLabel ?? "";
+  }
+
+  private async tradeMode(): Promise<"off" | "manual" | "auto"> {
+    return this.trade ? await this.trade.effectiveMode() : "off";
+  }
 
   /** Called right after a successful push (ON CONFLICT DO NOTHING dedupes). */
   async onPush(
@@ -643,20 +665,17 @@ export class PushWatcher {
                   `📊 5m量 ${usd(pair.volume.m5)} | 5m ${pctStr(pair.priceChange.m5)}`,
                 {
                   reply_markup: {
-                    inline_keyboard: [
-                      [
-                        {
-                          text: "🔗 打开 Axiom 页面",
-                          url: `https://axiom.trade/t/${m.token}`,
-                        },
-                      ],
-                      [
-                        {
-                          text: "🔕 停止追蹤",
-                          callback_data: `unwatch:${m.token}`,
-                        },
-                      ],
-                    ],
+                    // Full first-card keyboard (axiom link + trade actions +
+                    // mode switch + unwatch): the original card never went
+                    // out, so the re-send must be indistinguishable from a
+                    // normal push card. Mode is resolved live so the buttons
+                    // match the operator's current /setmode.
+                    inline_keyboard: tradeKeyboard(
+                      m.token,
+                      this.tradeBuySizeLabel(),
+                      await this.tradeMode(),
+                      { modeSwitch: this.hasTrade(), unwatch: true },
+                    ),
                   },
                 },
               );

@@ -2193,6 +2193,22 @@ export class Db {
   }
 
   /**
+   * setPushWatchState that reports whether a row actually matched. The
+   * push_watch table survives on INSERT-OR-IGNORE upserts and bounded
+   * prunes, so a token can legitimately be absent (never enrolled, window
+   * pruned) or already tombstoned — the unwatch button needs that
+   * distinction to give honest feedback instead of a blanket "stopped"
+   * toast. Returns false on zero affected rows.
+   */
+  async setPushWatchStateIfTracked(token: string, state: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: "UPDATE push_watch SET last_state = ? WHERE token = ?",
+      args: [state, token],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
+  /**
    * Atomic per-tick claim (compare-and-swap on last_checked): bump the
    * stamp only if it still holds the value the caller read. Two isolates
    * can run overlapping tracker ticks (deploy soft-switch, cron overlap)

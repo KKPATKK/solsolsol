@@ -535,6 +535,9 @@ export class Scanner {
           this.birdeye,
           config,
           (addresses: string[]) => this.dex.fetchPairsForTokens(addresses),
+          // Trade service for the heal-resend card's buy/sell/mode buttons
+          // (null = trading unconfigured → link + unwatch only).
+          this.trade,
         )
       : null;
   }
