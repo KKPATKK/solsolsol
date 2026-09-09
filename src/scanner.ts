@@ -127,8 +127,18 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * ~11.2s and ~2/3 still tripped the 11s budget (13 ok / 25 T/O per 40).
  * 80/tick cuts evalMs ~1s (each slice coin costs one DexScreener batch
  * slot) while the sweep still covers every coin within the rotation bands.
+ *
+ * 2026-09-09: 80 → 70. After GeckoTerminal recovered (geo + geoTrend ≈ 40
+ * more feed coins/tick) and the pool grew to ~540–595 rows, ~half of ticks
+ * tripped even the raised 12s budget by only 100–300ms (12.2–12.8s) — the
+ * tick cost is bimodal (~9.5s vs ~12.3s) with the slow tail set by pool
+ * slice size × DexScreener batch latency. 70/tick shaves ~1s off evalMs,
+ * converting the marginal ticks into completions; the sweep stretches from
+ * ~7 to ~8 minutes, well inside the 6/18-min rotation bands, and the hot
+ * zone (latency-critical near-entry coins) is re-evaluated EVERY scan
+ * regardless of the slice size.
  */
-const RE_EVAL_PER_TICK_MAX = 80;
+const RE_EVAL_PER_TICK_MAX = 70;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
