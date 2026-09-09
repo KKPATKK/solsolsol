@@ -194,6 +194,13 @@ export class JupTokensClient {
    * Jupiter's organicScore separates real retail participation from
    * wash/coordinated volume (calibrated 2026-08-22: CONK 79 / 40M 75 /
    * BLC 61 vs DOTE 40 / BAOJIN 0 / Nudaeng 0). Display-only today.
+   *
+   * Trader count window fallback: Jupiter OMITS stats1h.numTraders
+   * entirely when the trailing hour has zero trades (ARMY at push time —
+   * stats1h only carried volumeChange), which silently dropped the
+   * "| 1h 交易者" half of the card line. Fall back to the 6h then 24h
+   * window and report which window the count came from (null = no
+   * trader data in any window).
    */
   async fetchOrganicScore(
     mint: string,
@@ -201,6 +208,7 @@ export class JupTokensClient {
     score: number | null;
     label: string | null;
     tradersH1: number | null;
+    tradersWindow: "1h" | "6h" | "24h" | null;
   } | null> {
     const data = await this.get(`/search?query=${mint}`);
     if (!Array.isArray(data)) return null;
@@ -215,14 +223,29 @@ export class JupTokensClient {
       typeof entry.organicScore === "number" && Number.isFinite(entry.organicScore)
         ? entry.organicScore
         : null;
-    const tradersRaw = s1.numTraders;
-    const tradersH1 =
-      typeof tradersRaw === "number" && Number.isFinite(tradersRaw) ? tradersRaw : null;
+    const tradersOf = (stats: Record<string, unknown> | undefined) => {
+      const raw = (stats ?? {}).numTraders;
+      return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+    };
+    const s6 = (entry.stats6h ?? {}) as Record<string, unknown>;
+    const s24 = (entry.stats24h ?? {}) as Record<string, unknown>;
+    let tradersH1 = tradersOf(s1);
+    let tradersWindow: "1h" | "6h" | "24h" | null = tradersH1 !== null ? "1h" : null;
+    if (tradersH1 === null) {
+      tradersH1 = tradersOf(s6);
+      if (tradersH1 !== null) {
+        tradersWindow = "6h";
+      } else {
+        tradersH1 = tradersOf(s24);
+        if (tradersH1 !== null) tradersWindow = "24h";
+      }
+    }
     if (score === null && tradersH1 === null) return null;
     return {
       score,
       label: typeof entry.organicScoreLabel === "string" ? entry.organicScoreLabel : null,
       tradersH1,
+      tradersWindow,
     };
   }
 

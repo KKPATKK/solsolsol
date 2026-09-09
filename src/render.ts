@@ -92,6 +92,9 @@ export function renderMessage(
     score: number | null;
     label: string | null;
     tradersH1: number | null;
+    /** Window the trader count actually came from (1h omitted by Jupiter
+     * when empty → falls back to 6h/24h). */
+    tradersWindow: "1h" | "6h" | "24h" | null;
   } | null,
   /** Axiom /token-info payload (null = fetch failed → legacy lines). */
   axiom: AxiomTokenInfo | null,
@@ -215,7 +218,7 @@ export function renderMessage(
         }${
           organic.tradersH1 === null
             ? ""
-            : ` | 1h 交易者 ${organic.tradersH1.toLocaleString("en-US")}`
+            : ` | ${organic.tradersWindow ?? "1h"} 交易者 ${organic.tradersH1.toLocaleString("en-US")}`
         }`;
   // Axiom summary replaces the five legacy enrichment lines when the
   // payload resolved; otherwise the card keeps today's exact shape.

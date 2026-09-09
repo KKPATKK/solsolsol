@@ -1095,6 +1095,7 @@ async function main() {
       score: 0,
       label: "low",
       tradersH1: 1,
+      tradersWindow: "1h",
     });
 
     // Absent fields (no organicScore / no stats1h) → nulls, and null result
@@ -1122,6 +1123,30 @@ async function main() {
     const r = await c3.fetchOrganicScore(mint);
     assert.equal(r.score.toFixed(1), "79.6");
     assert.equal(r.tradersH1, 224);
+    assert.equal(r.tradersWindow, "1h");
+  });
+
+  await test("fetchOrganicScore: trader count falls back 1h → 6h → 24h", async () => {
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const make = (entry) =>
+      new JupTokensClient(
+        { jupiterRequestIntervalMs: 0 },
+        async () => new Response(JSON.stringify([{ id: mint, ...entry }]), { status: 200 }),
+      );
+    // The ARMY push-time shape: stats1h exists but OMITS numTraders
+    // entirely (zero trades in the trailing hour); 6h has the count.
+    const r6 = await make({ organicScore: 1, stats1h: { volumeChange: -100 }, stats6h: { numTraders: 13 } }).fetchOrganicScore(mint);
+    assert.equal(r6.tradersH1, 13);
+    assert.equal(r6.tradersWindow, "6h");
+    // No 6h either → 24h.
+    const r24 = await make({ stats24h: { numTraders: 60 } }).fetchOrganicScore(mint);
+    assert.equal(r24.tradersH1, 60);
+    assert.equal(r24.tradersWindow, "24h");
+    // No trader data in any window → count nulls but a present score still renders.
+    const rNone = await make({ organicScore: 5 }).fetchOrganicScore(mint);
+    assert.equal(rNone.tradersH1, null);
+    assert.equal(rNone.tradersWindow, null);
+    assert.equal(rNone.score, 5);
   });
 
   await test("passesChgGate: compound 5m OR 1h momentum gate", () => {
