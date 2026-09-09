@@ -1206,14 +1206,21 @@ export class Scanner {
         // Graduated rotation (see Db.getReevalPool): near slots swept every
         // ~REEVAL_NEAR_SWEEP_MIN, far slots every ~REEVAL_FAR_SWEEP_MIN, hot
         // zone every scan. Bands order by qualification signal and coins
-        // repeatedly seen below half the market-cap gate are dropped, so
+        // repeatedly seen below 60% of the market-cap gate are dropped, so
         // the sweep budget concentrates on coins that can actually qualify.
+        // 2026-09-09: 0.5 → 0.6 (half-floor $20K → $24K) — prunes the
+        // "$20K–$24K lifelong peak" slice from every band, shortening the
+        // full sweep ~5–15% at the same tick budget. Accepted trade-off: a
+        // pruned coin stops updating max_mcap_observed, so a $23K-peak coin
+        // that later gaps straight past the gate is missed (the lenient 0.5
+        // was kept until the pool's growth made sweep latency the binding
+        // constraint).
         nearSlots: this.config.reevalNearSlots,
         farSlots: this.config.reevalFarSlots,
         // Rotation period must equal the cache TTL so each expiry advances
         // the slot (see Db.getReevalPool rotationPeriodMs).
         rotationPeriodMs: this.config.reevalPoolCacheMs,
-        minQualifyMcap: poolMinMcapUsd / 2,
+        minQualifyMcap: poolMinMcapUsd * 0.6,
         // Chat-aware seen exclusion: a token is dropped from the pool only
         // when EVERY enabled chat has already received it. Without this a
         // coin pushed to one chat (and marked seen there) vanished from the
