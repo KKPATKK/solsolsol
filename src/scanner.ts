@@ -144,8 +144,16 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * enough at this size. 60/tick shaves another ~0.5–1s off evalMs; the sweep
  * stretches to ~12 min (still inside the 6/18-min rotation bands, and the
  * hot zone is evaluated every scan regardless).
+ *
+ * 2026-09-10: 60 → 90, paired with the maxQualifyMcap ceiling prune. The
+ * 9/10 audit showed the signal ordering let pump-and-dump corpses (NVDA/
+ * HOOD/LAPTOP — liquidity $0, peaks in the millions) permanently occupy
+ * the band LIMITs; capping the pool at 2× the mcap ceiling removes them,
+ * so the same tick budget now evaluates live coins. The freed budget buys
+ * back the slice: 90/tick ≈ 1 extra batch (+0.7–1s), validated stepwise
+ * (green ticks → 120 next).
  */
-const RE_EVAL_PER_TICK_MAX = 60;
+const RE_EVAL_PER_TICK_MAX = 90;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
@@ -1202,6 +1210,7 @@ export class Scanner {
       const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
       const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
       const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
+      const poolMaxMcapUsd = Math.max(...chats.map((c) => c.maxMarketCapUsd));
       if (this.shouldStopEarly()) return;
       const poolStart = Date.now();
       const recentStats = await this.getReevalPoolCached(now, {
@@ -1228,6 +1237,12 @@ export class Scanner {
         // the slot (see Db.getReevalPool rotationPeriodMs).
         rotationPeriodMs: this.config.reevalPoolCacheMs,
         minQualifyMcap: poolMinMcapUsd * 0.6,
+        // Ceiling prune: drop coins whose historical peak already exceeded
+        // 2× the widest max-mcap gate. Under the signal ordering their huge
+        // max_mcap_observed ranks them first in every band, so pump-and-dump
+        // corpses starved live mid-cap coins out of the sweep (2026-09-10
+        // audit). Same permanent-exclusion trade-off as the floor prune.
+        maxQualifyMcap: poolMaxMcapUsd * 2,
         // Chat-aware seen exclusion: a token is dropped from the pool only
         // when EVERY enabled chat has already received it. Without this a
         // coin pushed to one chat (and marked seen there) vanished from the
@@ -2232,6 +2247,7 @@ export class Scanner {
       farSlots?: number;
       rotationPeriodMs?: number;
       minQualifyMcap?: number;
+      maxQualifyMcap?: number;
       seenChatIds?: string[];
     },
   ): Promise<TokenStats[]> {

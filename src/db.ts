@@ -1747,10 +1747,25 @@ export class Db {
     /**
      * Pre-qualification floor: when set, coins whose max_mcap_observed is
      * known and below this value are dropped from every band (NULL = never
-     * seen with pair data → kept). The scanner passes the widest chat's
-     * minMarketCapUsd / 2.
+     * seen with pair data → kept). The scanner passes 0.6× the widest
+     * chat's minMarketCapUsd.
      */
     minQualifyMcap?: number;
+    /**
+     * Pre-qualification ceiling: when set, coins whose max_mcap_observed is
+     * known and ABOVE this value are dropped from every band (NULL = never
+     * seen with pair data → kept). The scanner passes 2× the widest
+     * chat's maxMarketCapUsd. A coin that already peaked at double the
+     * ceiling usually retraces through the qualifying band long before it
+     * could re-qualify, yet its huge peak ranks FIRST under the signal
+     * ordering — pump-and-dump corpses (2026-09-10 audit: NVDA/HOOD/
+     * LAPTOP, liquidity $0, peaks in the millions) were permanently
+     * occupying the band LIMITs and starving live mid-cap coins out of the
+     * sweep. Same semantics as the floor: a pruned coin stops updating
+     * max_mcap_observed, so one that collapses back under the ceiling is
+     * missed.
+     */
+    maxQualifyMcap?: number;
     /**
      * Enabled chat IDs (chat_settings WHERE enabled = 1). When provided, a
      * token is excluded from the pool only when EVERY one of these chats has
@@ -1778,6 +1793,7 @@ export class Db {
           sinceMs: opts.sinceMs,
           limit: hotLimit,
           minQualifyMcap: opts.minQualifyMcap,
+          maxQualifyMcap: opts.maxQualifyMcap,
           seenChatIds: opts.seenChatIds,
           orderBy: "entry",
         })),
@@ -1809,6 +1825,7 @@ export class Db {
           sinceMs: opts.sinceMs,
           limit: nearLimit,
           minQualifyMcap: opts.minQualifyMcap,
+          maxQualifyMcap: opts.maxQualifyMcap,
           seenChatIds: opts.seenChatIds,
           orderBy: "signal",
         })),
@@ -1826,6 +1843,7 @@ export class Db {
           sinceMs: opts.sinceMs,
           limit: farLimit,
           minQualifyMcap: opts.minQualifyMcap,
+          maxQualifyMcap: opts.maxQualifyMcap,
           seenChatIds: opts.seenChatIds,
           orderBy: "signal",
         })),
@@ -1849,17 +1867,21 @@ export class Db {
       sinceMs: number;
       limit: number;
       minQualifyMcap?: number;
+      maxQualifyMcap?: number;
       seenChatIds?: string[];
       orderBy: "entry" | "signal";
     },
   ): Promise<TokenStats[]> {
-    const qualifyClause =
-      opts.minQualifyMcap !== undefined
-        ? ` AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)`
-        : "";
+    const clauses: string[] = [];
+    if (opts.minQualifyMcap !== undefined)
+      clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed >= ?)`);
+    if (opts.maxQualifyMcap !== undefined)
+      clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed <= ?)`);
+    const qualifyClause = clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : "";
     const seen = this.seenExclusion(opts.seenChatIds);
     const args: Array<string | number> = [lo, hi, opts.sinceMs];
     if (opts.minQualifyMcap !== undefined) args.push(opts.minQualifyMcap);
+    if (opts.maxQualifyMcap !== undefined) args.push(opts.maxQualifyMcap);
     args.push(...seen.args);
     const order =
       opts.orderBy === "signal"

@@ -825,11 +825,16 @@ async function main() {
       // Same far slot (age 25h → slot 2 at now=50×5min), differing mcap
       // history: FAR_HIGH 35K (above half-gate), FAR_LOW 3K (hopeless), and
       // FAR_NULL NULL (never seen with pair data yet). Hot coin with NULL.
+      // FAR_CORPSE 5M: a pump-and-dump peak far above the ceiling — its
+      // huge max_mcap_observed would rank it FIRST under the signal
+      // ordering, permanently occupying band LIMITs (the 2026-09-10
+      // starvation audit), so the ceiling prune must drop it.
       const now = 50 * 300e3;
       await seed("HOT", now - 6 * H, 0, null);
       await seed("FAR_HIGH", now - 25 * H, 0, 35000);
       await seed("FAR_LOW", now - 25 * H, 0, 3000);
       await seed("FAR_NULL", now - 25 * H, 0, null);
+      await seed("FAR_CORPSE", now - 25 * H, 0, 5_000_000);
 
       const pool = await db.getReevalPool({
         sinceMs: now - 42 * H,
@@ -838,6 +843,7 @@ async function main() {
         windowEntryLaunchMs: now - 360 * M,
         limit: 1000,
         minQualifyMcap: 20000,
+        maxQualifyMcap: 760000,
         now,
       });
       const tokens = pool.map((x) => x.token);
@@ -853,6 +859,10 @@ async function main() {
       assert.ok(
         !tokens.includes("FAR_LOW"),
         "coin repeatedly seen far below the gate is dropped from the pool",
+      );
+      assert.ok(
+        !tokens.includes("FAR_CORPSE"),
+        "coin whose peak far exceeded the ceiling is dropped from the pool",
       );
       // Rotation bands order by qualification signal: the known-promising
       // coin is ranked before the unknown (NULL) one, so a dense band's
