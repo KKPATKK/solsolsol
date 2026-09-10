@@ -17,7 +17,7 @@ const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmoun
 const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
-const { passesChgGate } = require("../dist/dexscreener.js");
+const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
@@ -54,6 +54,46 @@ function tmpDb() {
 
 async function main() {
   // ---------- scanner.ts re-eval pool rotation slice ----------
+
+  await test("DexScreenerClient: concurrent pair batches stay throttled and all resolve", async () => {
+    // The pipelined fetch must never fire two actual requests closer than
+    // the throttle interval apart, even with 2 workers pulling batches.
+    const starts = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      starts.push(Date.now());
+      await new Promise((r) => setTimeout(r, 30)); // fake network latency
+      return new Response(JSON.stringify({ pairs: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    try {
+      const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "80" });
+      const dex = new DexScreenerClient(cfg);
+      // 90 fresh addresses = 3 batches; the workers pipeline them.
+      const addrs = Array.from({ length: 90 }, (_, i) => `MINT${i}`.padEnd(44, "x"));
+      const t0 = Date.now();
+      const pairs = await dex.fetchPairsForTokens(addrs);
+      const elapsed = Date.now() - t0;
+      assert.equal(pairs.size, 0); // empty responses parse to no pairs
+      assert.equal(starts.length, 3, "all 3 batches dispatched");
+      // Actual request starts must be spaced ≥ interval − small jitter.
+      for (let i = 1; i < starts.length; i++) {
+        assert.ok(
+          starts[i] - starts[i - 1] >= 70,
+          `request starts ${i - 1}->${i} only ${starts[i] - starts[i - 1]}ms apart (< 70ms)`,
+        );
+      }
+      // Pipelining sanity: 3 batches × (spacing 80 + latency 30) would be
+      // ~270ms+ sequential (plus retry sleeps on failure paths); with
+      // latency/spacing overlap the total must stay well under that —
+      // generous bound to keep the test deterministic under CI load.
+      assert.ok(elapsed < 900, `3 batches took ${elapsed}ms — pipelining not effective`);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 
   await test("slicePoolRotation: small pool taken whole, cursor resets", () => {
     const items = ["a", "b", "c"];

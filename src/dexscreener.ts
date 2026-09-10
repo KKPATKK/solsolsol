@@ -45,16 +45,28 @@ export function passesChgGate(
   return chg5m >= min5mPct || chg1h >= min1hPct;
 }
 
-/** Spaces out HTTP requests so we stay well under DexScreener's rate limit. */
+/**
+ * Spaces out request DISPATCHES so actual request starts stay ≥ interval
+ * apart, globally across all concurrent callers. Calls chain on the previous
+ * dispatch (not its completion), so one caller's in-flight response may
+ * overlap the next caller's spacing wait — pipelining without bursting.
+ * (Without the chain, two concurrent callers would both compute the same
+ * wait from lastCallAt and fire simultaneously — the exact 429 shape this
+ * class exists to prevent.) Sequential callers behave exactly as before.
+ */
 class Throttle {
   private lastCallAt = 0;
+  private tail: Promise<void> = Promise.resolve();
   constructor(private readonly intervalMs: number) {}
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
-    if (wait > 0) await sleep(wait);
-    this.lastCallAt = Date.now();
-    return fn();
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const dispatched = this.tail.then(async () => {
+      const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
+      if (wait > 0) await sleep(wait);
+      this.lastCallAt = Date.now();
+    });
+    this.tail = dispatched;
+    return dispatched.then(() => fn());
   }
 }
 
@@ -78,6 +90,17 @@ const PAIR_CACHE_TTL_MS = 180_000;
 const PAIR_CACHE_MAX = 4_000;
 /** After a batched-endpoint 429, skip all batch calls for this long. */
 const PAIR_BATCH_BACKOFF_MS = 90_000;
+/**
+ * Batch requests kept in flight concurrently. The pair loop used to dispatch
+ * strictly sequentially — each batch waited for the previous response before
+ * even arming its throttle spacing — so fetch cost scaled as
+ * N × (spacing + latency). Two workers pulling from the shared batch queue
+ * overlap each batch's network latency with the next batch's spacing:
+ * 7 batches cost ~(N-1) × spacing + latency ≈ 2.6s where 5 sequential
+ * batches cost ~2.7s. Dispatch RATE is unchanged — the shared Throttle
+ * still spaces actual request starts globally.
+ */
+const PAIR_BATCH_CONCURRENCY = 2;
 
 export class DexScreenerClient {
   private readonly throttle: Throttle;
@@ -189,87 +212,103 @@ export class DexScreenerClient {
     if (Date.now() < this.batchBlockedUntil) return result;
 
     const deadline = now + PAIRS_FETCH_BUDGET_MS;
-    for (let i = 0; i < misses.length; i += 30) {
-      if (Date.now() > deadline) break; // keep the tick inside its budget
-      const batch = misses.slice(i, i + 30);
-      let data: { pairs?: Array<Record<string, unknown>> } | null;
-      try {
-        data = (await this.getJson(
-          `/latest/dex/tokens/${batch.join(",")}`,
-          deadline,
-        )) as { pairs?: Array<Record<string, unknown>> } | null;
-      } catch (err) {
-        // A rate-limited batch means the remaining ones will 429 too — stop
-        // instead of burning the rest of the tick's budget (and Cloudflare's
-        // wall clock) on doomed retries, and back off across ticks so the
-        // next scan goes straight to cache-only mode.
-        if (/429/.test(err instanceof Error ? err.message : String(err))) {
-          this.batchBlockedUntil = Date.now() + PAIR_BATCH_BACKOFF_MS;
-          break;
-        }
-        continue; // transient/other error — skip this batch, try the next
-      }
-      const pairs = data?.pairs;
-      if (!Array.isArray(pairs)) continue;
+    const batches: string[][] = [];
+    for (let i = 0; i < misses.length; i += 30) batches.push(misses.slice(i, i + 30));
+    let nextBatch = 0;
+    let saw429 = false;
 
-      for (const raw of pairs) {
-        if (raw.chainId !== "solana") continue;
-        const baseToken = raw.baseToken as
-          | { address?: string; name?: string; symbol?: string }
-          | undefined;
-        if (!baseToken?.address) continue;
-        if (result.has(baseToken.address)) continue; // first pair wins
-        const volume = raw.volume as { h24?: number; h1?: number; m5?: number } | undefined;
-        const txnsRaw = raw.txns as
-          | {
-              m5?: { buys?: number; sells?: number };
-              h1?: { buys?: number; sells?: number };
-            }
-          | undefined;
-        const priceChange = raw.priceChange as { m5?: number; h1?: number } | undefined;
-        result.set(baseToken.address, {
-          chainId: "solana",
-          url: String(raw.url ?? ""),
-          pairAddress: String(raw.pairAddress ?? ""),
-          baseToken: {
-            address: baseToken.address,
-            name: baseToken.name ?? "",
-            symbol: baseToken.symbol ?? "",
-          },
-          priceUsd: String(raw.priceUsd ?? "0"),
-          priceNative: Number(raw.priceNative),
-          marketCap: Number(raw.marketCap ?? 0),
-          volume: {
-            h24: Number(volume?.h24 ?? 0),
-            h1: Number(volume?.h1 ?? 0),
-            m5: Number(volume?.m5 ?? 0),
-          },
-          priceChange: {
-            m5: Number(priceChange?.m5 ?? 0),
-            h1: Number(priceChange?.h1 ?? 0),
-          },
-          txns: {
-            m5Buys: Number(txnsRaw?.m5?.buys ?? 0),
-            m5Sells: Number(txnsRaw?.m5?.sells ?? 0),
-            h1Buys: Number(txnsRaw?.h1?.buys ?? 0),
-            h1Sells: Number(txnsRaw?.h1?.sells ?? 0),
-          },
-          liquidity: {
-            // Preserve 0 — a drained pool reports usd: 0 and the push-watch
-            // rug rule must see it, not mistake it for "unknown" (null).
-            usd:
-              (raw.liquidity as { usd?: number } | undefined)?.usd ===
-                undefined
-                ? null
-                : Number((raw.liquidity as { usd?: number }).usd),
-          },
-          pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
-        });
-        this.pairCache.set(baseToken.address, {
-          pair: result.get(baseToken.address)!,
-          at: now,
-        });
+    const worker = async (): Promise<void> => {
+      while (nextBatch < batches.length && !saw429) {
+        if (Date.now() > deadline) return; // keep the tick inside its budget
+        const batch = batches[nextBatch++];
+        let data: { pairs?: Array<Record<string, unknown>> } | null;
+        try {
+          data = (await this.getJson(
+            `/latest/dex/tokens/${batch.join(",")}`,
+            deadline,
+          )) as { pairs?: Array<Record<string, unknown>> } | null;
+        } catch (err) {
+          // A rate-limited batch means the remaining ones will 429 too — stop
+          // instead of burning the rest of the tick's budget (and Cloudflare's
+          // wall clock) on doomed retries, and back off across ticks so the
+          // next scan goes straight to cache-only mode.
+          if (/429/.test(err instanceof Error ? err.message : String(err))) {
+            saw429 = true;
+            return;
+          }
+          continue; // transient/other error — skip this batch, try the next
+        }
+        const pairs = data?.pairs;
+        if (!Array.isArray(pairs)) continue;
+
+        for (const raw of pairs) {
+          if (raw.chainId !== "solana") continue;
+          const baseToken = raw.baseToken as
+            | { address?: string; name?: string; symbol?: string }
+            | undefined;
+          if (!baseToken?.address) continue;
+          if (result.has(baseToken.address)) continue; // first pair wins
+          const volume = raw.volume as { h24?: number; h1?: number; m5?: number } | undefined;
+          const txnsRaw = raw.txns as
+            | {
+                m5?: { buys?: number; sells?: number };
+                h1?: { buys?: number; sells?: number };
+              }
+            | undefined;
+          const priceChange = raw.priceChange as { m5?: number; h1?: number } | undefined;
+          result.set(baseToken.address, {
+            chainId: "solana",
+            url: String(raw.url ?? ""),
+            pairAddress: String(raw.pairAddress ?? ""),
+            baseToken: {
+              address: baseToken.address,
+              name: baseToken.name ?? "",
+              symbol: baseToken.symbol ?? "",
+            },
+            priceUsd: String(raw.priceUsd ?? "0"),
+            priceNative: Number(raw.priceNative),
+            marketCap: Number(raw.marketCap ?? 0),
+            volume: {
+              h24: Number(volume?.h24 ?? 0),
+              h1: Number(volume?.h1 ?? 0),
+              m5: Number(volume?.m5 ?? 0),
+            },
+            priceChange: {
+              m5: Number(priceChange?.m5 ?? 0),
+              h1: Number(priceChange?.h1 ?? 0),
+            },
+            txns: {
+              m5Buys: Number(txnsRaw?.m5?.buys ?? 0),
+              m5Sells: Number(txnsRaw?.m5?.sells ?? 0),
+              h1Buys: Number(txnsRaw?.h1?.buys ?? 0),
+              h1Sells: Number(txnsRaw?.h1?.sells ?? 0),
+            },
+            liquidity: {
+              // Preserve 0 — a drained pool reports usd: 0 and the push-watch
+              // rug rule must see it, not mistake it for "unknown" (null).
+              usd:
+                (raw.liquidity as { usd?: number } | undefined)?.usd ===
+                  undefined
+                  ? null
+                  : Number((raw.liquidity as { usd?: number }).usd),
+            },
+            pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
+          });
+          this.pairCache.set(baseToken.address, {
+            pair: result.get(baseToken.address)!,
+            at: now,
+          });
+        }
       }
+    };
+    // Pipelined dispatch: N workers pull batches from the shared queue so a
+    // batch's network latency overlaps the next batch's throttle spacing
+    // instead of stacking on it. All workers share one deadline; a 429 in any
+    // worker halts new dispatches and the caller backs off across ticks.
+    const workerCount = Math.min(PAIR_BATCH_CONCURRENCY, batches.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    if (saw429) {
+      this.batchBlockedUntil = Date.now() + PAIR_BATCH_BACKOFF_MS;
     }
     if (this.pairCache.size > PAIR_CACHE_MAX) {
       // Evolve oldest-first (Map preserves insertion order).
