@@ -171,6 +171,17 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * before; the pool's dominant rejection is now the liquidity gate
  * (dead-liquidity corpses, see the REJECT_LOG trace), so extra slice depth
  * mostly raises the chance a live coin is inside the evaluated window.
+ *
+ * 2026-09-10 (post-mortem): the zero-push stretch since 09-06 was NOT slice
+ * starvation — live /health showed ~215 of ~330 evaluated coins/tick failing
+ * the liquidity gate (LAPTOP/NEMOTRON/Ggwiz/ZenoCoin: mcap $100K–$500K over
+ * $0–$15 LP). These corpses survive the mcap floor/ceiling prunes (their
+ * peak mcap is inside/below the band) and their huge max_mcap_observed
+ * ranks them FIRST in every rotation band under the signal ordering, so the
+ * 300-coin slice re-checked the same dead tape every sweep. Fix: track peak
+ * liquidity per coin (max_liquidity_observed) and prune pool coins whose
+ * peak liquidity never reached 0.6× the widest chat's liquidity floor —
+ * the same pre-qualification semantics as the mcap prunes.
  */
 const RE_EVAL_PER_TICK_MAX = 300;
 
@@ -1230,6 +1241,9 @@ export class Scanner {
       const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
       const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
       const poolMaxMcapUsd = Math.max(...chats.map((c) => c.maxMarketCapUsd));
+      const poolMinLiquidityUsd = Math.min(
+        ...chats.map((c) => c.minLiquidityUsd),
+      );
       if (this.shouldStopEarly()) return;
       const poolStart = Date.now();
       const recentStats = await this.getReevalPoolCached(now, {
@@ -1262,6 +1276,16 @@ export class Scanner {
         // corpses starved live mid-cap coins out of the sweep (2026-09-10
         // audit). Same permanent-exclusion trade-off as the floor prune.
         maxQualifyMcap: poolMaxMcapUsd * 2,
+        // Liquidity floor prune: drop coins whose peak liquidity never
+        // reached 0.6× the widest chat's liquidity gate. Dead-liquidity
+        // corpses (mcap $100K+ over $0–$15 LP) survive the mcap floor/ceiling
+        // prunes and rank FIRST in every band under the signal ordering —
+        // live evidence 2026-09-10 13:xxZ: ~215 of ~330 evaluated coins/tick
+        // failed the liquidity gate (LAPTOP/NEMOTRON/Ggwiz/ZenoCoin…), so
+        // the 300-coin slice re-checked the same dead tape every sweep while
+        // nothing pushed since 2026-09-06. NULL max_liquidity_observed (not
+        // yet seen with pair data) is kept, exactly like the mcap prunes.
+        minQualifyLiquidity: poolMinLiquidityUsd * 0.6,
         // Chat-aware seen exclusion: a token is dropped from the pool only
         // when EVERY enabled chat has already received it. Without this a
         // coin pushed to one chat (and marked seen there) vanished from the
@@ -1410,7 +1434,11 @@ export class Scanner {
       // below the gate stop consuming sweep budget) and orders rotation
       // bands by it. One batched raise-only UPDATE; the raise list is empty
       // in steady state (only genuine new highs trigger a write).
-      const raises: Array<{ token: string; mcapUsd: number }> = [];
+      const raises: Array<{
+        token: string;
+        mcapUsd: number;
+        liquidityUsd?: number;
+      }> = [];
       for (const [token, pair] of pairsByToken) {
         const stats = statsByToken.get(token);
         if (
@@ -1419,20 +1447,44 @@ export class Scanner {
           pair.marketCap <= 0
         )
           continue;
-        if (
+        const liquidity = pair.liquidity?.usd ?? 0;
+        const mcapRaise =
           stats.maxMcapObserved === null ||
           stats.maxMcapObserved === undefined ||
-          pair.marketCap > stats.maxMcapObserved
-        ) {
-          raises.push({ token, mcapUsd: pair.marketCap });
-        }
+          pair.marketCap > stats.maxMcapObserved;
+        const liqRaise =
+          stats.maxLiquidityObserved === null ||
+          stats.maxLiquidityObserved === undefined ||
+          liquidity > stats.maxLiquidityObserved;
+        if (!mcapRaise && !liqRaise) continue;
+        raises.push({
+          token,
+          // No mcap raise → send the stored value so the CASE keeps it
+          // (updateTokenMaxMcaps writes both columns unconditionally).
+          mcapUsd: mcapRaise
+            ? pair.marketCap
+            : (stats.maxMcapObserved ?? 0),
+          // Always send a finite reading (0 included — a corpse's $0 LP is
+          // its identifying signal); callers without pair liquidity omit it.
+          liquidityUsd: liquidity,
+        });
       }
       if (raises.length > 0) {
         try {
           await this.db.updateTokenMaxMcaps(raises);
           for (const r of raises) {
             const s = statsByToken.get(r.token);
-            if (s) s.maxMcapObserved = r.mcapUsd;
+            if (!s) continue;
+            if (s.maxMcapObserved === null || s.maxMcapObserved === undefined || r.mcapUsd > s.maxMcapObserved)
+              s.maxMcapObserved = r.mcapUsd;
+            const liq = r.liquidityUsd;
+            if (
+              liq !== undefined &&
+              (s.maxLiquidityObserved === null ||
+                s.maxLiquidityObserved === undefined ||
+                liq > s.maxLiquidityObserved)
+            )
+              s.maxLiquidityObserved = liq;
           }
         } catch (err) {
           console.error(
@@ -2267,6 +2319,7 @@ export class Scanner {
       rotationPeriodMs?: number;
       minQualifyMcap?: number;
       maxQualifyMcap?: number;
+      minQualifyLiquidity?: number;
       seenChatIds?: string[];
     },
   ): Promise<TokenStats[]> {

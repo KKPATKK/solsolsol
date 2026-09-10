@@ -171,6 +171,17 @@ export interface TokenStats {
    * written before the v3 migration or never seen with pair data.
    */
   maxMcapObserved?: number | null;
+  /**
+   * Highest pooled liquidity (USD) ever observed by the scanner. The pool
+   * pre-filters on it: coins whose peak liquidity never reached the
+   * qualifying floor are dead corpses (a real mid-cap coin always holds
+   * $10K+ LP) — without this prune their huge max_mcap_observed ranked
+   * them FIRST in every rotation band under the signal ordering and they
+   * permanently occupied the per-band LIMITs (2026-09-10 audit: ~215 of
+   * ~330 coins evaluated per tick failed the liquidity gate). Null = never
+   * seen with pair data → kept.
+   */
+  maxLiquidityObserved?: number | null;
   /** Cached supply-flow detector result (JSON of SupplyFlowResult), null = not analyzed. */
   supplyFlowJson: string | null;
   /** When the cached supply-flow result was produced (epoch ms). */
@@ -274,6 +285,7 @@ export class Db {
           birdeye_sniper_pct REAL,
           min_mcap_observed REAL,
           max_mcap_observed REAL,
+          max_liquidity_observed REAL,
           supply_flow TEXT,
           supply_flow_at INTEGER
         );`,
@@ -595,6 +607,11 @@ export class Db {
     // coins. Unconditional because addColumnIfMissing is idempotent (fresh
     // databases already carry the column from CREATE TABLE).
     await this.addColumnIfMissing("token_stats", "max_mcap_observed", "REAL");
+    // Peak-liquidity tracking: the pool pre-filters on it (coins whose peak
+    // liquidity never reached the qualifying floor are dead corpses whose
+    // huge max_mcap_observed would otherwise rank them FIRST in every band).
+    // Unconditional because addColumnIfMissing is idempotent.
+    await this.addColumnIfMissing("token_stats", "max_liquidity_observed", "REAL");
     // Feed attribution: which discovery feed first registered each coin
     // (per-feed quality stats). Unconditional — idempotent.
     await this.addColumnIfMissing("token_stats", "discovered_via", "TEXT");
@@ -1593,6 +1610,11 @@ export class Db {
         row.max_mcap_observed === null || row.max_mcap_observed === undefined
           ? null
           : Number(row.max_mcap_observed),
+      maxLiquidityObserved:
+        row.max_liquidity_observed === null ||
+        row.max_liquidity_observed === undefined
+          ? null
+          : Number(row.max_liquidity_observed),
       supplyFlowJson:
         flowJson === null || flowJson === undefined ? null : String(flowJson),
       supplyFlowAt:
@@ -1767,6 +1789,20 @@ export class Db {
      */
     maxQualifyMcap?: number;
     /**
+     * Liquidity pre-qualification floor: when set, coins whose
+     * max_liquidity_observed is known and below this value are dropped from
+     * every band (NULL = never seen with pair data → kept). The scanner
+     * passes 0.6× the widest chat's minLiquidityUsd. Dead-liquidity
+     * corpses (ZenoCoin/NEMOTRON/Ggwiz — mcap $100K+ over $0–$15 LP)
+     * never had real liquidity, so the mcap prunes cannot remove them; their
+     * huge max_mcap_observed ranks them FIRST in every band and ~215 of
+     * ~330 coins evaluated per tick failed the liquidity gate (2026-09-10
+     * audit). Same trade-off as the mcap prunes: a pruned coin stops
+     * updating max_liquidity_observed, so one that later adds deep LP is
+     * missed.
+     */
+    minQualifyLiquidity?: number;
+    /**
      * Enabled chat IDs (chat_settings WHERE enabled = 1). When provided, a
      * token is excluded from the pool only when EVERY one of these chats has
      * already seen it — a coin pushed to one chat but missed by another
@@ -1794,6 +1830,7 @@ export class Db {
           limit: hotLimit,
           minQualifyMcap: opts.minQualifyMcap,
           maxQualifyMcap: opts.maxQualifyMcap,
+          minQualifyLiquidity: opts.minQualifyLiquidity,
           seenChatIds: opts.seenChatIds,
           orderBy: "entry",
         })),
@@ -1826,6 +1863,7 @@ export class Db {
           limit: nearLimit,
           minQualifyMcap: opts.minQualifyMcap,
           maxQualifyMcap: opts.maxQualifyMcap,
+          minQualifyLiquidity: opts.minQualifyLiquidity,
           seenChatIds: opts.seenChatIds,
           orderBy: "signal",
         })),
@@ -1844,6 +1882,7 @@ export class Db {
           limit: farLimit,
           minQualifyMcap: opts.minQualifyMcap,
           maxQualifyMcap: opts.maxQualifyMcap,
+          minQualifyLiquidity: opts.minQualifyLiquidity,
           seenChatIds: opts.seenChatIds,
           orderBy: "signal",
         })),
@@ -1868,6 +1907,7 @@ export class Db {
       limit: number;
       minQualifyMcap?: number;
       maxQualifyMcap?: number;
+      minQualifyLiquidity?: number;
       seenChatIds?: string[];
       orderBy: "entry" | "signal";
     },
@@ -1877,11 +1917,17 @@ export class Db {
       clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed >= ?)`);
     if (opts.maxQualifyMcap !== undefined)
       clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed <= ?)`);
+    if (opts.minQualifyLiquidity !== undefined)
+      clauses.push(
+        `(max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)`,
+      );
     const qualifyClause = clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : "";
     const seen = this.seenExclusion(opts.seenChatIds);
     const args: Array<string | number> = [lo, hi, opts.sinceMs];
     if (opts.minQualifyMcap !== undefined) args.push(opts.minQualifyMcap);
     if (opts.maxQualifyMcap !== undefined) args.push(opts.maxQualifyMcap);
+    if (opts.minQualifyLiquidity !== undefined)
+      args.push(opts.minQualifyLiquidity);
     args.push(...seen.args);
     const order =
       opts.orderBy === "signal"
@@ -2395,25 +2441,53 @@ export class Db {
   }
 
   async updateTokenMaxMcaps(
-    entries: Array<{ token: string; mcapUsd: number }>,
+    entries: Array<{ token: string; mcapUsd: number; liquidityUsd?: number }>,
   ): Promise<void> {
     if (entries.length === 0) return;
-    const cases = entries
+    const mcapCases = entries
       .map(
         () =>
           `WHEN token = ? AND (max_mcap_observed IS NULL OR max_mcap_observed < ?) THEN ?`,
       )
       .join(" ");
-    const args: Array<string | number> = [];
+    // A zero liquidity reading is still recorded (finite 0): it is the
+    // corpse signal the pool prune keys on. Entries WITHOUT a reading are
+    // excluded from the liquidity CASE entirely (no WHERE leg for them).
+    const liqEntries = entries.filter(
+      (e) => e.liquidityUsd !== undefined && Number.isFinite(e.liquidityUsd),
+    );
+    const liqCases = liqEntries
+      .map(
+        () =>
+          `WHEN token = ? AND (max_liquidity_observed IS NULL OR max_liquidity_observed < ?) THEN ?`,
+      )
+      .join(" ");
+    // Placeholder binding order MUST match the SQL: every mcap CASE arg
+    // first, then every liquidity CASE arg, then the IN-list — interleaving
+    // per entry binds the mcap CASE's later placeholders to liq values
+    // (caught by the unit test: the raise silently applied to the wrong
+    // column).
+    const mcapArgs: Array<string | number> = [];
+    const liqArgs: Array<string | number> = [];
     const tokens: string[] = [];
     for (const e of entries) {
-      args.push(e.token, e.mcapUsd, e.mcapUsd);
+      mcapArgs.push(e.token, e.mcapUsd, e.mcapUsd);
       tokens.push(e.token);
     }
+    for (const e of liqEntries) {
+      const liq = Math.max(0, e.liquidityUsd!);
+      liqArgs.push(e.token, liq, liq);
+    }
     await this.get().execute({
-      sql: `UPDATE token_stats SET max_mcap_observed = CASE ${cases} ELSE max_mcap_observed END
+      sql: `UPDATE token_stats SET
+              max_mcap_observed = CASE ${mcapCases} ELSE max_mcap_observed END,${
+                liqCases
+                  ? `
+              max_liquidity_observed = CASE ${liqCases} ELSE max_liquidity_observed END`
+                  : ""
+              }
             WHERE token IN (${tokens.map(() => "?").join(",")})`,
-      args: [...args, ...tokens],
+      args: [...mcapArgs, ...liqArgs, ...tokens],
     });
   }
 

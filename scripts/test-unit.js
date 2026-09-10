@@ -916,6 +916,148 @@ async function main() {
     }
   });
 
+  await test("getReevalPool: liquidity floor prune drops dead-liquidity corpses from every band", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const H = 3600e3;
+      const M = 60e3;
+      const seed = async (token, ageH, mcapObserved, liqObserved) => {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, max_liquidity_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
+          args: [
+            token,
+            nowSeed - ageH * H,
+            0,
+            nowSeed - ageH * H,
+            mcapObserved,
+            liqObserved,
+          ],
+        });
+      };
+      // Fix a deterministic now BEFORE seeding (seed reads it).
+      const nowSeed = 50 * 300e3;
+      const now = nowSeed;
+      // The 2026-09-10 starvation shape: corpses with huge peak mcap inside
+      // the qualifying band but $0–$15 LP — they pass the mcap floor/ceiling
+      // prunes and rank FIRST under the signal ordering, so they occupied
+      // every band LIMIT (~215/330 evaluated coins/tick failing the
+      // liquidity gate). The liquidity floor prune must drop them.
+      await seed("LIVE_COIN", 25, 150000, 25000); // healthy in-band coin
+      await seed("CORPSE_ZERO_LIQ", 25, 495642, 0.69); // ZenoCoin shape
+      await seed("CORPSE_TINY_LIQ", 25, 162733, 15.59); // MANATEE shape
+      await seed("NULL_LIQ", 25, 150000, null); // never seen with pair data → kept
+      // Hot zone corpse: evaluated EVERY scan — the prune must apply there too.
+      await seed("HOT_CORPSE", 6, 120000, 2.0);
+
+      const pool = await db.getReevalPool({
+        sinceMs: now - 42 * H,
+        minLaunchMs: now - (2400 + 180) * M,
+        maxLaunchMs: now - (360 - 180) * M,
+        windowEntryLaunchMs: now - 360 * M,
+        limit: 1000,
+        minQualifyMcap: 20000,
+        maxQualifyMcap: 760000,
+        minQualifyLiquidity: 6000, // 0.6 × the $10K chat gate
+        now,
+      });
+      const tokens = pool.map((x) => x.token);
+      assert.ok(tokens.includes("LIVE_COIN"), "healthy in-band coin is kept");
+      assert.ok(
+        tokens.includes("NULL_LIQ"),
+        "coin never seen with pair data (NULL liquidity) is kept",
+      );
+      assert.ok(
+        !tokens.includes("CORPSE_ZERO_LIQ"),
+        "mcap $495K over $0.69 LP corpse is dropped despite passing the mcap band",
+      );
+      assert.ok(
+        !tokens.includes("CORPSE_TINY_LIQ"),
+        "mcap $162K over $15 LP corpse is dropped",
+      );
+      assert.ok(
+        !tokens.includes("HOT_CORPSE"),
+        "hot-zone corpse is pruned too (the every-scan band)",
+      );
+      // Without the floor (legacy callers / tests) corpses stay — the prune
+      // is opt-in via minQualifyLiquidity, like the mcap prunes.
+      const poolNoFloor = await db.getReevalPool({
+        sinceMs: now - 42 * H,
+        minLaunchMs: now - (2400 + 180) * M,
+        maxLaunchMs: now - (360 - 180) * M,
+        windowEntryLaunchMs: now - 360 * M,
+        limit: 1000,
+        minQualifyMcap: 20000,
+        maxQualifyMcap: 760000,
+        now,
+      });
+      assert.ok(
+        poolNoFloor.map((x) => x.token).includes("CORPSE_ZERO_LIQ"),
+        "no liquidity floor configured → corpse kept (opt-in prune)",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("updateTokenMaxMcaps: raises peak mcap AND liquidity in one batch", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const H = 3600e3;
+      const now = 50 * 300e3;
+      const seed = async (token) => {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed) VALUES (?, ?, 0, ?, ?, ?, ?)",
+          args: [token, now - 6 * H, 0, now - 6 * H, 100000, 5000],
+        });
+      };
+      await seed("RAISE_BOTH");
+      await seed("NO_REGRESS");
+      await seed("ZERO_REGRESS");
+      // NULL liquidity: the row was never seen with pair data — the first
+      // $0 LP reading must still be recorded (it is the corpse signal the
+      // pool prune keys on).
+      await t.client.execute({
+        sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed) VALUES ('FIRST_ZERO', ?, 0, ?, ?, 100000, NULL)",
+        args: [now - 6 * H, 0, now - 6 * H],
+      });
+
+      await db.updateTokenMaxMcaps([
+        { token: "RAISE_BOTH", mcapUsd: 200000, liquidityUsd: 12000 }, // both up
+        { token: "NO_REGRESS", mcapUsd: 50000, liquidityUsd: 1000 }, // both lower → kept
+        { token: "ZERO_REGRESS", mcapUsd: 100000, liquidityUsd: 0 }, // mcap equal; $0 never lowers $5K
+        { token: "FIRST_ZERO", mcapUsd: 100000, liquidityUsd: 0 }, // NULL → 0 recorded
+      ]);
+
+      const stats = await db.getTokenStatsMany(["RAISE_BOTH", "NO_REGRESS", "ZERO_REGRESS", "FIRST_ZERO"]);
+      const raise = stats.get("RAISE_BOTH");
+      assert.equal(raise.maxMcapObserved, 200000);
+      assert.equal(raise.maxLiquidityObserved, 12000);
+      const noRegress = stats.get("NO_REGRESS");
+      assert.equal(noRegress.maxMcapObserved, 100000, "mcap never regresses");
+      assert.equal(noRegress.maxLiquidityObserved, 5000, "liquidity never regresses");
+      const zeroRegress = stats.get("ZERO_REGRESS");
+      assert.equal(zeroRegress.maxMcapObserved, 100000);
+      assert.equal(
+        zeroRegress.maxLiquidityObserved,
+        5000,
+        "a $0 reading never lowers a stored peak (monotonic like mcap)",
+      );
+      const firstZero = stats.get("FIRST_ZERO");
+      assert.equal(firstZero.maxMcapObserved, 100000);
+      assert.equal(
+        firstZero.maxLiquidityObserved,
+        0,
+        "the first $0 LP reading IS recorded on a NULL row (corpse signal)",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("getReevalPool: chat-aware seen exclusion keeps coins for chats that missed the push", async () => {
     const t = tmpDb();
     try {
