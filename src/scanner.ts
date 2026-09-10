@@ -152,8 +152,16 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * so the same tick budget now evaluates live coins. The freed budget buys
  * back the slice: 90/tick ≈ 1 extra batch (+0.7–1s), validated stepwise
  * (green ticks → 120 next).
+ *
+ * 2026-09-10 (later): 90 → 120. The green gate held: post-cap-prune ticks
+ * landed 6.5–9.8s against the 12s budget (vs 2/45 OK in the 45 ticks
+ * before the deploy, when a wedged isolate and budget overruns dominated).
+ * 120/tick ≈ 1 extra DexScreener batch (+0.7–1s); the full sweep at a
+ * ~650-row pool shortens from ~8 to ~6 ticks (~6 min), keeping the mid-age
+ * cohorts inside the 3-min NEAR band sweep. Step validated the same way:
+ * if ticks re-trip the 12s budget, drop back one step.
  */
-const RE_EVAL_PER_TICK_MAX = 90;
+const RE_EVAL_PER_TICK_MAX = 120;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
