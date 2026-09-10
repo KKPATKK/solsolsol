@@ -161,8 +161,18 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * budget: 6 batches (180 coins) cost ~2.7s pipelined vs ~4.6s sequential.
  * Full sweep at the ~730-row pool: ~6 ticks (~6 min). Same rollback rule:
  * budget rows re-appearing in scan-history → drop one step.
+ *
+ * 2026-09-10 (validated): 180 → 300. Two live /health ticks post-deploy
+ * measured total scan cost ~6s (feedsMs 3.7s + evalMs 2.1–2.4s) against the
+ * 20s tick budget / 12s target with zero budget trips — the pipelined
+ * batches left ~6s of headroom, which buys back the requested ~300/tick
+ * sweep volume (10 DexScreener batches ≈ ~4.5s pipelined). Full sweep at
+ * the ~710–755-row pool: ~3 ticks. Watch scan-history for budget rows as
+ * before; the pool's dominant rejection is now the liquidity gate
+ * (dead-liquidity corpses, see the REJECT_LOG trace), so extra slice depth
+ * mostly raises the chance a live coin is inside the evaluated window.
  */
-const RE_EVAL_PER_TICK_MAX = 180;
+const RE_EVAL_PER_TICK_MAX = 300;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
