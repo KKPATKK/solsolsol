@@ -412,6 +412,14 @@ export interface AppConfig {
    */
   axiomExternalRefresh: boolean;
   /**
+   * Jupiter API base. Kept out of wrangler.toml [vars]: the Worker hit the
+   * free tier's 64-variable cap (deploy ERROR 10055, 88 bound → 64 limit) and
+   * this value had a code default anyway. The env override (if any) is honored
+   * in config.trade.jupiterApiBase, and this top-level field is its read-only
+   * alias so nothing in the app ever sees an empty string.
+   */
+  jupiterApiBase: string;
+  /**
    * Periodic Birdeye new_listing backfill (BIRDEYE_BACKFILL_ENABLED, default
    * true): every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
    * BIRDEYE_BACKFILL_LOOKBACK_MIN of Birdeye's fresh-launch feed and seeds
@@ -778,6 +786,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         ? `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`
         : undefined,
     },
+    /**
+     * Top-level alias for config.trade.jupiterApiBase: kept in sync so the new
+     * top-level field is never the empty string (the wrangler.toml JUPITER_API_BASE
+     * var was removed to get under the Workers Free 64-variable cap).
+     */
+    jupiterApiBase: env.JUPITER_API_BASE || "https://api.jup.ag",
     adminIds: parseAdminIds(env.BOT_ADMIN_IDS),
   };
 }

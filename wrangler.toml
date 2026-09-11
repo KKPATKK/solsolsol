@@ -333,4 +333,6 @@ AXIOM_MIN_BOT_USERS = "90"
 # retired. Keyless works at 0.5 RPS; set JUPITER_API_KEY (a SECRET, via the
 # dashboard or `wrangler secret put`) as the x-api-key header to unlock
 # higher rate limits on the new developer platform (developers.jup.ag).
-JUPITER_API_BASE = "https://api.jup.ag"
+# JUPITER_API_BASE removed from [vars]: the deploy hit the Workers Free
+# tier's 64-variable cap (88 bound → ERROR 10055) and the code default
+# (https://api.jup.ag) is identical — see src/config.ts jupiterApiBase.
