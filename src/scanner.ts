@@ -182,8 +182,19 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * liquidity per coin (max_liquidity_observed) and prune pool coins whose
  * peak liquidity never reached 0.6× the widest chat's liquidity floor —
  * the same pre-qualification semantics as the mcap prunes.
+ *
+ * 2026-09-11: 300 → 180 (the documented rollback rule: budget rows
+ * re-appearing in scan-history → drop one step). Live evidence: 5 of the
+ * last 12 ticks tripped the 12s budget (12.1–12.8s) plus 2 dead ticks,
+ * while GeckoTerminal and GMGN re-entered 429 backoff — their per-feed
+ * backoff retries stretch feedsMs back toward the 5.5s cap, so the
+ * 10-batch (300-coin) eval phase no longer fits behind it. 180/tick ≈ 4
+ * pipelined batches (−1.5–2s evalMs) converts the marginal ticks back into
+ * completions; at the current ~285-row pool the full sweep still finishes
+ * in ~2 ticks. Raise back one step only after a full day of zero budget
+ * rows with the geo feeds healthy again.
  */
-const RE_EVAL_PER_TICK_MAX = 300;
+const RE_EVAL_PER_TICK_MAX = 180;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
