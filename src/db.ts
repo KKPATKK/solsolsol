@@ -1159,19 +1159,36 @@ export class Db {
     key: string,
     fallbackSql: string,
   ): Promise<number> {
+    let cached: number | null = null;
     try {
       const v = await this.getWorkerState(key);
-      if (v !== null && /^-?\d+$/.test(v)) return Number(v);
+      if (v !== null && /^-?\d+$/.test(v)) cached = Number(v);
     } catch {
       // fall through to the live count
     }
-    try {
-      const res = await this.get().execute({ sql: fallbackSql, args: [] });
-      const row = res.rows[0] as { n?: number | bigint } | undefined;
-      return Number(row?.n ?? 0);
-    } catch {
-      return 0;
+    // Self-heal (2026-09-11): the counter tracks a row COUNT, so it can
+    // never legitimately go negative. A negative cached value means the
+    // incremental bumps drifted past zero (prune deletions outweighing
+    // inserts across isolates — observed telemetry_token_stats_count =
+    // -3105), at which point every later bump is also off. Reconcile once
+    // per negative read: live COUNT(*) becomes the new truth and re-seeds
+    // the counter. Best-effort telemetry — if the live count fails, return
+    // the cached value rather than 0. The missing-cache path keeps the old
+    // behavior (no re-seed — the schema seed owns initial population).
+    if (cached === null || cached < 0) {
+      try {
+        const res = await this.get().execute({ sql: fallbackSql, args: [] });
+        const row = res.rows[0] as { n?: number | bigint } | undefined;
+        const live = Number(row?.n ?? 0);
+        if (cached !== null && cached < 0) {
+          await this.setWorkerState(key, String(live));
+        }
+        return live;
+      } catch {
+        return cached ?? 0;
+      }
     }
+    return cached;
   }
 
   /** Total pushed rows in seen_tokens (telemetry for /health). */

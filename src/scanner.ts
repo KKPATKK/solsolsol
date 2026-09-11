@@ -193,8 +193,17 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * completions; at the current ~285-row pool the full sweep still finishes
  * in ~2 ticks. Raise back one step only after a full day of zero budget
  * rows with the geo feeds healthy again.
+ *
+ * 2026-09-11 (later): 180 → 120. The 180 deploy (09:47Z) did NOT clear the
+ * budget rows: 14:00–15:06Z history shows the bimodal pattern unchanged
+ * (~85% of ticks at 12.1–12.9s, OK ticks 8–9.4s) — including ticks over a
+ * tiny 94-coin pool, proving slice size alone wasn't the binding cost; the
+ * 429/502-stretched feed phase (geo + GMGN backoffs, Axiom 502 outage) ate
+ * the headroom the rollback assumed. One more step down buys ~1s of evalMs
+ * back until the upstream feeds recover. Sweep at the ~240-row pool: ~2
+ * ticks; hot zone still evaluated every scan.
  */
-const RE_EVAL_PER_TICK_MAX = 180;
+const RE_EVAL_PER_TICK_MAX = 120;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
