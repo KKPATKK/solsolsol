@@ -68,35 +68,13 @@ REEVAL_POOL_CACHE_SECONDS = "90"
 # ~2026-08-20, so each tick only burns a doomed request. Jupiter recent covers
 # the brand-new-launchpad gap instead.
 PUMPFUN_PROFILE_LIMIT = "0"
-PUMPFUN_REQUEST_INTERVAL_MS = "350"
-# Jupiter Token v2 discovery (free, no key) — the pump.fun frontend-api
-# replacement (pump.fun 530-blocks Worker egress since ~2026-08-20):
-#   recent   = seconds-old launchpad launches, enters the re-eval pool with
-#              true birth time; trending = 24h momentum (mostly older than
-#              the age window — early catch of resurging mints).
-# Keep the limits modest while Turso's rows-read quota recovers: every
-# net-new coin grows token_stats and with it the pool band scans.
-JUPITER_RECENT_LIMIT = "20"
-JUPITER_TRENDING_LIMIT = "15"
 # 2026-09-08: halved from 1000 — Jupiter-recent pacing (20 coins × interval)
 # was consuming ~5s of the 5.5s feed cap every tick, so feedsMs+evalMs+overhead
 # blew the 11s tick budget on ~2/3 of ticks (timeout rows in scan-history).
 # Coverage unchanged: the feed cap still bounds the phase, it just fits more
 # coins inside it before the cap trips.
 JUPITER_REQUEST_INTERVAL_MS = "500"
-# Post-push tracker: every pushed coin is watched for a bounded window and
-# refreshed from ONE DexScreener batch call per tick. Follow-ups report
-# continuation (🚀 +50/100/200/400% stages), breakdown (⚠️ ≥35% off peak,
-# 💀 ≥55% → stop), liquidity collapse (💧 >55% drop) and Birdeye holder
-# growth (📈 ≥+10% vs the ROLLING baseline — each 📈 alert rolls the
-# baseline forward, so every card reports fresh incremental growth and a
-# +1 drift never re-fires; CU-bounded probes per tick).
-PUSH_WATCH_ENABLED = "true"
-PUSH_WATCH_MAX_TRACKED = "30"
 PUSH_WATCH_WINDOW_HOURS = "26"
-PUSH_WATCH_COOLDOWN_MIN = "30"
-PUSH_WATCH_HOLDERS_REFRESH_MIN = "30"
-PUSH_WATCH_MAX_HOLDER_CHECKS = "4"
 # Insider self-pump gate: rejects pushes where newWallets/checked top-holder
 # wallets exceeds WALLET_NEW_RATIO_MAX (the Cheems shape — 8/8 profiled
 # holders were brand-new wallets). Only judges once at least
@@ -111,54 +89,6 @@ WALLET_NEW_MIN_CHECKED = "5"
 # 0 disables that side.
 TOP10_PCT_MIN = "10"
 TOP10_PCT_MAX = "90"
-# Market-cap/liquidity ratio sanity gate: rejects candidates whose market cap
-# exceeds their pooled liquidity by more than MCAP_LIQ_RATIO_MAX times. A
-# price running on a sliver of depth is trivially wickable and nearly
-# un-exitable (Nudaeng, pushed 2026-08-22 at $297K mcap over $16K LP = 18x).
-# Calibrated on push history: healthy pushes measured 2.3-6.4x (BLC/MAPLE/
-# DOTE/CONK); the failures measured 18x (Nudaeng) and 27.9x (BAOJIN, which
-# then rugged to $2K LP). Default 10 splits the clusters with headroom on
-# both sides. 0 = disabled.
-MCAP_LIQ_RATIO_MAX = "10"
-# GeckoTerminal new-pools discovery (free, no key): newest Solana pools
-# across every DEX incl. pump.fun graduates. Pages × 20 pools per scan
-# (page size fixed at 20; each page ≈ 1 min of launches). Measured 2026-08-14:
-# 5 pages/scan triggers GeckoTerminal's 429 rate-limit window within one
-# round. 2026-08-21: dropped to 1 page — Workers' shared egress IP now gets
-# sustained 429s even at 2 pages (~2 req/min), so halving the request rate
-# improves the odds of catching the upstream quota windows (deeper coverage
-# remains with the Birdeye periodic backfill below).
-GECKOTERMINAL_POOL_PAGES = "1"
-# GeckoTerminal trending-pools momentum feed (free, no key) — the
-# replacement for GMGN trending (GMGN's edge blocks Cloudflare Worker
-# egress). 0 = disabled; default 20 (max 20 per call). NOTE: measured
-# 2026-08-16 — GeckoTerminal rate-limits Cloudflare Worker egress (shared
-# IP pool) with sustained 429s on trending_pools, which also started
-# starving new_pools. The client now backs off ALL gecko calls for 5 min
-# after one 429 and self-recovers; a round with geo/geoTrend 0 while the
-# feed is in backoff is expected, not an outage (the re-eval pool + Birdeye
-# backfill cover the gap). /debug/gecko-trending probes the raw status.
-GECKOTERMINAL_TRENDING_LIMIT = "20"
-GECKOTERMINAL_REQUEST_INTERVAL_MS = "1000"
-DEX_REQUEST_INTERVAL_MS = "350"
-BIRDEYE_REQUEST_INTERVAL_MS = "1100"
-# GMGN OpenAPI (requires GMGN_API_KEY, a SECRET — set in the Cloudflare
-# dashboard, never here): (a) enriches qualifying candidates with
-# smart-money / wash-trading / holder data before pushing
-# (GMGN_BLOCK_WASH_TRADING blocks flagged coins, default true), and (b)
-# adds GMGN Trending as a discovery feed (GMGN_TRENDING_LIMIT, 0 =
-# disabled, default 30). KEPT AT 0: GMGN's edge returns a bare 429 to
-# Cloudflare Worker egress (verified 2026-08-16 — same key works from
-# other IPs), so the feed/enrichment stay dormant until access is
-# confirmed (paid tier / IP whitelist / proxy). /debug/gmgn probes it.
-GMGN_TRENDING_LIMIT = "0"
-# Master switch for ALL GMGN usage (feed + candidate enrichment). 0 keeps
-# the client unconstructed even though GMGN_API_KEY remains set — every
-# scan tick was otherwise burning one doomed 429 request per qualifying
-# candidate. Flip to 1 once access is confirmed (proxy/paid tier).
-GMGN_ENABLED = "0"
-GMGN_REQUEST_INTERVAL_MS = "600"
-GMGN_BLOCK_WASH_TRADING = "true"
 # Arkham Intelligence (requires ARKHAM_API_KEY, a SECRET — set in the
 # Cloudflare dashboard, never here): smart-money attribution on push cards.
 # Each qualifying coin's top-100 holders are checked for entity types in
@@ -170,99 +100,8 @@ GMGN_BLOCK_WASH_TRADING = "true"
 # even if ARKHAM_API_KEY is set, so a stray key can never burn paid
 # credits. To reactivate, set ARKHAM_ENABLED="true" AND the API key.
 ARKHAM_ENABLED = "0"
-ARKHAM_REQUEST_INTERVAL_MS = "300"
 ARKHAM_SMART_MONEY_TYPES = "fund,hedgefund,hedge_fund,investor,marketmaker,market_maker,trader,vc,venture,whale"
-# Crime-wallet blocklist (community list, github.com/solguala/crimewallets —
-# no key needed): each pushed coin's creator (RugCheck) and top holder
-# owner wallets (Helius, 2 RPC calls/coin) are matched against ~4.8K wallets
-# flagged from aged-wallet sale listings. A match is a WARNING (the list's
-# own README says so) — default mode flags the card; CRIME_WALLETS_BLOCK
-# turns a hit into a push blocker. The list re-fetches every
-# CRIME_WALLETS_REFRESH_HOURS; /debug/crime-wallets shows status and
-# ?refresh=1 forces a re-fetch.
-CRIME_WALLETS_ENABLED = "true"
-CRIME_WALLETS_BLOCK = "false"
-CRIME_WALLETS_CHECK_HOLDERS = "true"
-CRIME_WALLETS_HOLDER_TOP_N = "8"
-CRIME_WALLETS_REFRESH_HOURS = "6"
-CRIME_WALLETS_FETCH_TIMEOUT_MS = "8000"
-# Wallet analysis on pushed coins (deeper than the blocklist match):
-#   A. creator profile — wallet age (oldest signature) + serial-launcher
-#      create count (pump.fun "create" memos in the sampled window),
-#   B. top-holder depth — how many top-holder owner wallets are brand-new
-#      (< WALLET_ANALYSIS_NEW_AGE_HOURS) and whether the creator is itself
-#      a top holder,
-#   C. cross-coin clustering — every pushed coin's top-holder snapshot is
-#      stored in pushed_holders; wallets appearing as top holders/creators
-#      of >= WALLET_ANALYSIS_CLUSTER_MIN_COINS distinct pushed coins get a
-#      🔁 關聯錢包 warning on the card (coordinated-activity detection —
-#      surfaces wallets that are NOT on any list yet; see
-#      /debug/holder-clusters for the global view).
-# Cost: the holder list reuses the crime check's resolved owners (no extra
-# RPC); each unique wallet then costs ONE cached Helius call
-# (getSignaturesForAddress), capped at WALLET_ANALYSIS_MAX_WALLETS per coin
-# and bounded by WALLET_ANALYSIS_BUDGET_MS — a slow RPC truncates the card
-# enrichment, never the push.
-WALLET_ANALYSIS_ENABLED = "true"
-WALLET_ANALYSIS_MAX_WALLETS = "9"
-WALLET_ANALYSIS_PROFILE_CACHE_MIN = "60"
-WALLET_ANALYSIS_BUDGET_MS = "8000"
-WALLET_ANALYSIS_MIN_CREATES = "3"
-WALLET_ANALYSIS_NEW_AGE_HOURS = "24"
-WALLET_ANALYSIS_CLUSTER_MIN_COINS = "2"
-WALLET_ANALYSIS_CLUSTER_WINDOW_DAYS = "14"
-# Flurry launch forensics (ported from github.com/NerdHerderDani/flurry,
-# Apache-2.0): deploy-slot bundle detection + one-hop funding lineage — the
-# classic Jito-bundle shape (N distinct wallets buying supply in the exact
-# slot the token was created). Runs as the LAST gate before each push, only
-# on coins that passed every other gate, via Helius RPC only (~5-12
-# calls/coin typical — negligible against the 1M-credit free tier; zero
-# Birdeye/GeckoTerminal/DexScreener calls). Fail-open: non-pump mints (no
-# bonding curve), RPC errors and budget exhaustion all pass without
-# blocking. Verdicts are cached per mint (FLURRY_CACHE_MS) so re-sweeps of
-# a blocked coin cost 0 RPC; /health exposes analyzed/rpcCalls/cacheHits
-# counters to watch actual spend.
-FLURRY_ENABLED = "true"
-# true = bundled launches are blocked before the push; false = observe-only
-# (the bundle flag is shown on the card but never blocks).
-FLURRY_BLOCK_BUNDLES = "true"
-FLURRY_MIN_WALLETS = "4"
-FLURRY_MIN_SUPPLY_PCT = "15"
-# Funding-lineage wallet cap (1 sig call + up to 10 txs per wallet,
-# early-exit on the first inbound SOL transfer).
-FLURRY_MAX_WALLETS = "12"
-FLURRY_CACHE_MS = "1800000"
-FLURRY_BUDGET_MS = "15000"
-RUGCHECK_REQUEST_INTERVAL_MS = "800"
 HELIUS_REQUEST_INTERVAL_MS = "300"
-# Periodic Birdeye new_listing backfill (safety net for discovery gaps):
-# every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
-# BIRDEYE_BACKFILL_LOOKBACK_MIN of Birdeye's fresh-launch feed (includes
-# pump.fun launches via meme_platform_enabled=true) and seeds unseen coins
-# into the re-eval pool. Catches coins created while the monitor paused
-# (GeckoTerminal's newest-pools pages roll past them). CU-bounded: 1 request
-# per run ≈ ~80 CU, 4 runs/day ≈ ~320 CU/month against the 30K free tier.
-BIRDEYE_BACKFILL_ENABLED = "true"
-BIRDEYE_BACKFILL_INTERVAL_MIN = "360"
-BIRDEYE_BACKFILL_LOOKBACK_MIN = "360"
-# On-chain supply-flow (rug/distribution) detector: flags coins whose
-# holders feed tokens to one collector wallet that keeps selling, then blocks
-# the push. Two views feed the same graph: each top account's OUT transfers
-# (who it fed) AND, when CHECK_INFLOW is on, its IN transfers (who fed it) —
-# so distributed feeders that are not themselves top holders still surface
-# when they converge on one big wallet. LP accounts never count as a feeder
-# or collector. Defaults catch clear-cut distribution (3+ feeders, >=1% of
-# supply consolidated, collector sold 3+ times in 12h).
-SUPPLY_FLOW_ENABLED = "true"
-SUPPLY_FLOW_MIN_FEEDERS = "3"
-SUPPLY_FLOW_MIN_FED_PCT = "1"
-SUPPLY_FLOW_MIN_SELLS = "3"
-SUPPLY_FLOW_WINDOW_HOURS = "12"
-SUPPLY_FLOW_REFRESH_MIN = "30"
-SUPPLY_FLOW_TOP_ACCOUNTS = "10"
-# Inbound-transfer analysis doubles the gTFA calls per coin (more Helius
-# credits); set to false if the credit budget gets tight.
-SUPPLY_FLOW_CHECK_INFLOW = "true"
 # ---------------------------------------------------------------------------
 # Jupiter direct trading (REAL MONEY — off by default, nothing ever buys
 # until you opt in). The trading wallet's base58 private key
@@ -280,15 +119,7 @@ SUPPLY_FLOW_CHECK_INFLOW = "true"
 # BOT_WALLET_PRIVATE_KEY and flipping TRADE_MODE) take effect WITHOUT a
 # redeploy: the worker detects the binding change and re-initializes.
 TRADE_MODE = "manual"
-# Buy size: TRADE_BUY_BALANCE_PCT (1–100) buys that % of the CURRENT wallet
-# balance, computed live at execution time (both manual button and auto).
-# Set to 0 to fall back to the fixed TRADE_AMOUNT_SOL size instead.
-TRADE_BUY_BALANCE_PCT = "80"
 TRADE_AMOUNT_SOL = "0.01"
-TRADE_SLIPPAGE_PCT = "25"
-TRADE_PRIORITY_FEE_SOL = "0.001"
-TRADE_MAX_DAILY_BUYS = "5"
-TRADE_TIMEOUT_MS = "15000"
 # Telegram user IDs (comma-separated) allowed to run /setmode and tap the
 # 🛒 buy button. Leave empty (or unset) to lock both (fail-closed). Find
 # your ID with @userinfobot. NOTE: /setmode stores a durable override in the
@@ -315,24 +146,3 @@ BOT_ADMIN_IDS = "530602939"
 # caches the feed for 3 min (AXIOM_TREND_CACHE_TTL_MS) — upstream sees at
 # most one call per 3 min, not one per 60s tick.
 AXIOM_TRENDING_LIMIT = "0"
-# External Axiom session refresher (single-writer rule). "1" = the Worker
-# NEVER refreshes the session itself; a scheduled GitHub Action
-# (.github/workflows/axiom-refresh.yml, curl_cffi Chrome-TLS) is the sole
-# writer of axiom_access_token/axiom_refresh_token in worker_state. Axiom
-# rotates the refresh token on every call, so flipping this on before the
-# Action is verified green will strand the session. Default "0".
-# ENABLED 2026-08-25: axiom-refresh.yml verified green (curl_cffi refresh
-# via GitHub runner) — the Action owns the session now.
-AXIOM_EXTERNAL_REFRESH = "0"
-# Axiom bot-users push gate: a final candidate whose pair reports fewer
-# distinct Axiom bot users than this floor is rejected as a dead/shill pool.
-# 0 disables. Missing data (session down, no pair address) never judges —
-# the push goes out rather than being silently dropped.
-AXIOM_MIN_BOT_USERS = "90"
-# Jupiter Swap API v1 (Metis) — the old v6 quote-api.jup.ag endpoints are
-# retired. Keyless works at 0.5 RPS; set JUPITER_API_KEY (a SECRET, via the
-# dashboard or `wrangler secret put`) as the x-api-key header to unlock
-# higher rate limits on the new developer platform (developers.jup.ag).
-# JUPITER_API_BASE removed from [vars]: the deploy hit the Workers Free
-# tier's 64-variable cap (88 bound → ERROR 10055) and the code default
-# (https://api.jup.ag) is identical — see src/config.ts jupiterApiBase.
