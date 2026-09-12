@@ -76,8 +76,20 @@ class Throttle {
  * for 4 batches of 30 addresses, when the tick's heartbeat budget is 26s).
  * Batches past the deadline are skipped; their tokens simply stay in the
  * re-evaluation pool and are retried next tick.
+ *
+ * 2026-09-12: 10000 → 5500. After the feed-deadline cut (5500 → 4500, same
+ * day) ticks STILL tripped the worker's 12s race budget (12.1–12.5s) — the
+ * pairs phase is the only remaining phase with a budget larger than what's
+ * left of the tick: 4.5s feeds + ~1s tracker/pool overhead + 10s pairs =
+ * ~14.5s worst case, so every DexScreener-throttled tick rides the pairs
+ * budget straight past the race. 5500 caps the worst-case envelope at
+ * ~11s, leaving ~1s of flush headroom inside the 12s race, independent of
+ * upstream health. Skipped batches are safe by design: those tokens stay
+ * in the re-eval pool and are retried next tick (cache hits still served
+ * instantly). Restore to 10000 only after a full day of zero budget rows
+ * with the pairs phase visibly finishing early (evalMs well under the cap).
  */
-const PAIRS_FETCH_BUDGET_MS = 10_000;
+const PAIRS_FETCH_BUDGET_MS = 5_500;
 /**
  * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
  * minute after minute), so re-fetching all ~550 addresses every tick burns
