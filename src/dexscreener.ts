@@ -88,8 +88,19 @@ class Throttle {
  * in the re-eval pool and are retried next tick (cache hits still served
  * instantly). Restore to 10000 only after a full day of zero budget rows
  * with the pairs phase visibly finishing early (evalMs well under the cap).
+ *
+ * 2026-09-12 (later): 5500 → 4500. The 5500 cap cleared the dead ticks
+ * (the unbounded Jupiter fallback was the hang) and converted most ticks
+ * into completions, but 08:39–08:47Z still showed the bimodal tail:
+ * green ticks 7.2–8.7s vs trips 12.1–12.2s — trips happen when BOTH the
+ * feed phase (4.5s) and pairs (5.5s) run to their caps, and 4.5 + 5.5 +
+ * ~1.5s DB/registration/tracker overhead rides the 12s race edge. 4500
+ * puts the combined worst case at 9s + overhead ≈ 10.5s with real flush
+ * headroom. Same rollback ladder as every cap above; skipped batches stay
+ * in the pool for the next tick. Raise only after a full day of zero
+ * budget rows with evalMs visibly under the cap.
  */
-const PAIRS_FETCH_BUDGET_MS = 5_500;
+const PAIRS_FETCH_BUDGET_MS = 4_500;
 /**
  * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
  * minute after minute), so re-fetching all ~550 addresses every tick burns
