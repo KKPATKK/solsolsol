@@ -89,6 +89,19 @@ const SCAN_TICK_DEADLINE_MS = 20_000;
  */
 const FEED_DEADLINE_MS = 4_500;
 /**
+ * Wall-clock cap for the re-eval pool DB read and the token_stats prune
+ * (both race against this deadline; see the call sites). Evidence
+ * 2026-09-12 09:23–09:41Z: dead-tick clusters with no completion row at
+ * all — the libsql client can hang in internal quota/5xx retries (the same
+ * hang the worker's flush-retry guard exists for), and an unbounded DB
+ * await wedges runOnce past the ~30s wall clock: abort() publishes the
+ * in-flight summary but the completion flush shares the wedged client and
+ * never lands. Racing these reads converts the wedge into a normal
+ * (diagnosable) timeout row whenever the client recovers, and keeps the
+ * scanner's phase budget honest when it doesn't.
+ */
+const POOL_FETCH_BUDGET_MS = 4_000;
+/**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the
  * operator runs 30h (28h + 2h slack): coins age into the window while
@@ -1298,7 +1311,10 @@ export class Scanner {
       );
       if (this.shouldStopEarly()) return;
       const poolStart = Date.now();
-      const recentStats = await this.getReevalPoolCached(now, {
+      const poolDeadline = Date.now() + POOL_FETCH_BUDGET_MS;
+      const recentStats = await this.fetchFeedCapped(
+        () =>
+          this.getReevalPoolCached(now, {
         sinceMs: now - RE_EVAL_WINDOW_MS,
         minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
@@ -1345,13 +1361,20 @@ export class Scanner {
         // chat NEVER got a retry — the cross-chat push inconsistency
         // observed between the private chat and the channel.
         seenChatIds: chats.map((c) => c.chatId),
-      });
+          }),
+        [],
+        poolDeadline,
+      );
       // token_stats grows with pump.fun discovery (100+ new coins per scan):
       // prune rows older than the re-eval window that were never pushed —
       // unreachable by the pool query and only wasting storage. Pushed coins
       // keep their rows so /flow and cached verdicts still work.
       try {
-        await this.db.pruneOldTokenStats(now - RE_EVAL_WINDOW_MS);
+        await this.fetchFeedCapped(
+          () => this.db.pruneOldTokenStats(now - RE_EVAL_WINDOW_MS),
+          undefined,
+          poolDeadline,
+        );
       } catch (err) {
         console.error(
           "[scanner] token_stats prune failed:",
