@@ -496,6 +496,18 @@ export class Scanner {
   /** Summary of the last completed scan, persisted into the heartbeat. */
   lastSummary: ScanSummary | null = null;
   /**
+   * Reference to the runOnce-local diag object while a scan is in flight.
+   * Lets abort() publish the partial summary the moment the tick's race
+   * budget trips — runOnce only publishes diag in its finally (after it
+   * settles), so before this a timed-out scan flushed summary:null and
+   * every budget trip was blind: no feedsMs, no pool, no phase timings
+   * (2026-09-12: the recurring 12.1–12.2s trip band carried zero
+   * diagnostics). Overwritten at every runOnce start, so a stale reference
+   * can never be published for the wrong scan; republishing an
+   * already-published diag via a late abort() is content-idempotent.
+   */
+  private inflightSummary: ScanSummary | null = null;
+  /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
    * without Cloudflare log access: "previous-scan-still-running",
@@ -788,6 +800,11 @@ export class Scanner {
   /** Worker hook: flag the running scan to stop at its next phase boundary. */
   abort(): void {
     this.abortRequested = true;
+    // Publish the in-flight diag snapshot so the tick's completion flush
+    // carries phase timings (see inflightSummary). The seq guard in
+    // runOnce's finally still rules: a straggler that settles late can
+    // never clobber a newer scan's published summary.
+    if (this.inflightSummary) this.lastSummary = this.inflightSummary;
   }
 
   /** True when the worker's race budget tripped; logs once and returns. */
@@ -876,6 +893,9 @@ export class Scanner {
       flurryCacheHits: 0,
       rejects: [],
     };
+    // abort() publishes this snapshot if the tick's race trips mid-scan
+    // (see inflightSummary — timeout rows otherwise flush summary:null).
+    this.inflightSummary = diag;
     // Watchdog: if the scan outlives its budget, release the lock so the next
     // tick can retry instead of the isolate wedging in a permanent skip loop.
     const watchdog = setTimeout(() => {
