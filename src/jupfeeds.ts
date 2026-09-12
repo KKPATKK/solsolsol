@@ -97,6 +97,13 @@ export function parseJupTokens(data: unknown): TokenProfile[] {
  */
 /** Number of mints per /search call — the endpoint's documented cap. */
 const JUP_BATCH_SIZE = 100;
+/**
+ * Wall-clock cap for one fetchTokenDataBatch fallback call (see the method
+ * comment for the 2026-09-12 dead-tick evidence). Sized to finish 2–3
+ * chunks at normal latency and to bail before the worker's 12s race when
+ * Jupiter throttles.
+ */
+const JUP_FALLBACK_BUDGET_MS = 3_500;
 
 function n(v: unknown): number {
   const x = Number(v);
@@ -275,12 +282,26 @@ export class JupTokensClient {
    * DexScreener's batched endpoint is 429-blocked. One call per 100 mints
    * covers every scan gate: mcap, liquidity, 5m/1h volume + change,
    * buy/sell counts and pool creation time.
+   *
+   * 2026-09-12: the chunk loop was unbounded in wall time — with a ~500-mint
+   * missing set it walked 5 chunks × (10s per-request timeout + throttle
+   * spacing) ≈ 50s+, and on 429/5xx-heavy ticks the scan never settled
+   * inside the worker's 12s race: the isolate was killed at the ~30s wall
+   * clock and the tick died before its completion flush (the recurring
+   * "died before its completion flush — backfilled by next tick" rows,
+   * 08:10–08:27Z). Capped at 3500ms: covers 2–3 chunks (~200–300 mints, more
+   * than the ~100–160-coin pool needs) at normal latency; chunks past the
+   * deadline keep their tokens in the re-eval pool for the next tick (same
+   * fail-safe as the DexScreener batch skip). Every phase is now
+   * deadline-bounded, so a tripped race still settles and flushes a
+   * diagnosable timeout row instead of dying as a dead tick.
    */
   async fetchTokenDataBatch(mints: string[], max = 500): Promise<Map<string, PairInfo>> {
     const out = new Map<string, PairInfo>();
     const list = mints.filter((m) => MINT_RE.test(m)).slice(0, Math.max(0, max));
+    const deadline = Date.now() + JUP_FALLBACK_BUDGET_MS;
     for (let i = 0; i < list.length; i += JUP_BATCH_SIZE) {
-      if (this.rateLimited()) break;
+      if (this.rateLimited() || Date.now() > deadline) break;
       const chunk = list.slice(i, i + JUP_BATCH_SIZE);
       for (const [k, v] of jupToPairInfos(
         await this.get(`/search?query=${chunk.join(",")}`),
