@@ -11,9 +11,23 @@ import { createClient, type Client } from "@libsql/client/web";
  * intermittently degraded (5s+ round trips, occasional 522s and hangs); a
  * hung request must fail fast and be retried next tick instead of wedging
  * the scan (DB calls have no timeout by default). Healthy round trips are
- * ~100-300ms, so 15s only ever cuts off genuine hangs.
+ * ~100-300ms, so the cap only ever cuts off genuine hangs.
+ *
+ * 2026-09-12: 15000 → 6000. Dead-tick anatomy (the recurring ~60s rows
+ * "died before its completion flush", clustering every ~3rd tick with the
+ * pair/pool cache TTL expiry): the tick envelope is pre-race ~1s + 12s
+ * scan race, so the completion flush starts at t≈13s with ~10s of wall
+ * time before Cloudflare's ~24s invocation kill. A single hung DB call —
+ * the flush itself, or a scan-phase call racing a 4s budget whose abort
+ * signal never fires — could previously wait out its full 15s timeout and
+ * die at t≈28s, AFTER the kill: the flush never landed, the heartbeat
+ * froze in phase=scanning, and the next tick backfilled a dead tick. At
+ * 6s the abort fires at t≈19s (inside the window), the flush lands by
+ * ~19-21s, and the flush's 2.5s racing retry fits too. One lever, three
+ * failure shapes fixed. Restore to 15000 only after a stretch with zero
+ * dead ticks AND Turso p99 round trips comfortably under 2s.
  */
-const DB_REQUEST_TIMEOUT_MS = 15_000;
+const DB_REQUEST_TIMEOUT_MS = 6_000;
 /**
  * Min gap between token_stats prunes. Discovery inflow is ~140 coins/min
  * and only rows older than the 30h re-eval window are removed, so a 10-min
