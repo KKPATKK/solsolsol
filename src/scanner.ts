@@ -74,8 +74,20 @@ const SCAN_TICK_DEADLINE_MS = 20_000;
  * budget (a hanging upstream call resolves empty at the deadline instead of
  * starving the core scan). The core phases — pool eval, candidates, pushes —
  * always get the remainder of the tick.
+ *
+ * 2026-09-11: 5500 → 4500. The pool-slice rollback ladder (300 → 180 →
+ * 120/tick) stopped converting ticks into completions — 14:00–15:47Z history
+ * is ~85% budget rows (12.1–12.9s) even over a 94-coin pool, with only OK
+ * ticks 7.9–9.2s: the residual tick cost is the feed phase itself, which
+ * under the geo/GMGN 429 backoffs + Axiom 502 outage stretches to the full
+ * 5.5s cap every tick (the deadline shapes the minimum, not the maximum).
+ * Cutting the cap to 4.5s yields ~1s of guaranteed evalMs headroom on EVERY
+ * tick, independent of upstream health; discovery loss is a later
+ * registration (feed coins still enter via the re-eval pool), never a lost
+ * coin. Restore to 5500 when the geo feeds recover (a full day of green
+ * ticks at 4500 with feedsMs well under the cap is the evidence).
  */
-const FEED_DEADLINE_MS = 5_500;
+const FEED_DEADLINE_MS = 4_500;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the
