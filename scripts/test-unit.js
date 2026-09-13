@@ -164,6 +164,96 @@ async function main() {
     }
   });
 
+  await test("Db: a libsql client that retries forever hits the hard wall and settles", async () => {
+    // Dead-tick fix 2026-09-13: the libsql HTTP client retries internally
+    // when the transport fetch aborts, so a request's promise can outlive
+    // DB_REQUEST_TIMEOUT_MS. The client-level Proxy wall must settle the
+    // CALLER'S promise shortly after the timeout instead of hanging forever
+    // (the shape that killed completion flushes and produced 60-93s dead
+    // ticks). Simulate with an injected client whose execute() never
+    // settles; the wall timer does the settling.
+    const { Db } = require("../dist/db.js");
+    const never = () => new Promise(() => {});
+    // Hang ONLY the probe statement; every other call (init DDL, telemetry)
+    // resolves instantly so setup is fast.
+    const hangingClient = {
+      execute(stmt) {
+        if (stmt.args && stmt.args[0] === "anything") return never();
+        return Promise.resolve({ rows: [], rowsAffected: 0 });
+      },
+      async batch(stmts) {
+        return stmts.map(() => ({ rows: [], rowsAffected: 1 }));
+      },
+    };
+    const db = new Db("libsql://unused", undefined, hangingClient);
+    await db.init();
+    const t0 = Date.now();
+    await assert.rejects(
+      db.getWorkerState("anything"),
+      /hard wall|never settled/i,
+      "hanging execute must reject via the wall, not hang",
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(
+      elapsed < 12_000,
+      `call settled in ${elapsed}ms — the wall must fire near DB_REQUEST_TIMEOUT_MS*1.2`,
+    );
+  });
+
+  await test("Db: a fast client passes through the Proxy wall untouched", async () => {
+    const { Db } = require("../dist/db.js");
+    const calls = [];
+    const fastClient = {
+      async execute(stmt) {
+        calls.push(stmt.sql);
+        return { rows: [{ value: "v1" }], rowsAffected: 0 };
+      },
+      async batch(stmts) {
+        calls.push(...stmts.map((s) => s.sql));
+        return stmts.map(() => ({ rows: [], rowsAffected: 1 }));
+      },
+    };
+    const db = new Db("libsql://unused", undefined, fastClient);
+    await db.init();
+    assert.equal(await db.getWorkerState("k"), "v1");
+    assert.ok(calls.length >= 1, "execute reached the underlying client");
+  });
+
+  await test("Db.persistScanCompletion: heartbeat-only flush skips the prune-check read", async () => {
+    // Dead-tick fix 2026-09-13: history=null (timeout/skip ticks) must
+    // return right after the batch — the prune-check read after it was an
+    // unraced await on the wall-clock-critical flush path.
+    const { Db } = require("../dist/db.js");
+    const seen = [];
+    const client = {
+      async execute(stmt) {
+        seen.push(stmt.sql);
+        return { rows: [], rowsAffected: 1 };
+      },
+      async batch(stmts) {
+        seen.push("BATCH:" + stmts.length);
+        return stmts.map(() => ({ rows: [], rowsAffected: 1 }));
+      },
+    };
+    const db = new Db("libsql://unused", undefined, client);
+    await db.init();
+    seen.length = 0; // drop init()'s own statements
+    await db.persistScanCompletion(
+      JSON.stringify({ at: Date.now(), ok: false, phase: "done" }),
+      null,
+      "lock-value",
+    );
+    assert.ok(
+      seen.some((s) => s.startsWith("BATCH:")),
+      "flush batch still ran",
+    );
+    assert.equal(
+      seen.filter((s) => s.includes("history_last_prune")).length,
+      0,
+      "no prune-check read on a heartbeat-only flush",
+    );
+  });
+
   await test("slicePoolRotation: small pool taken whole, cursor resets", () => {
     const items = ["a", "b", "c"];
     const r1 = slicePoolRotation(items, 2, 120);

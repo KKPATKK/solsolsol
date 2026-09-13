@@ -1379,7 +1379,13 @@ export class Scanner {
       const poolDeadline = Date.now() + POOL_FETCH_BUDGET_MS;
       const recentStats = await this.fetchFeedCapped(
         () =>
-          this.getReevalPoolCached(now, {
+// Dead-tick fix 2026-09-13: a budget-tripped tick used to keep
+          // spending its full 4s pool race as zombie work after abort() —
+          // starting the completion flush that much later against the
+          // wall-clock kill. Skip the read when the tick is already over.
+          this.shouldStopEarly()
+            ? Promise.resolve([])
+            : this.getReevalPoolCached(now, {
         sinceMs: now - RE_EVAL_WINDOW_MS,
         minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
         maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,

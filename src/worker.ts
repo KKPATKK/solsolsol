@@ -708,6 +708,18 @@ async function runScan(
       // the abort above stops the scan at its next phase boundary and the
       // seq guard in Scanner keeps a straggler from clobbering a newer
       // tick's state.
+      // Dead-tick fix 2026-09-13 (adaptive budget): the race used to be
+      // SCAN_TICK_BUDGET_MS from ITS OWN start, but the tick already spent
+      // ~1-4s on the pre-race phase (counter read+write, claim/heartbeat
+      // round trip, outage check). On a slow pre-race the envelope grew
+      // silently — race end at startedAt+budget+preRaceMs, flush after —
+      // and crossed Cloudflare's fluctuating ~20s kill, killing the tick
+      // before its completion flush ("died before its completion flush",
+      // clustered on ticks whose claim round trip ran long). The budget is
+      // now measured from the tick's startedAt, so the flush ALWAYS starts
+      // inside the same wall-clock window no matter how slow the pre-race
+      // phase was. The constant's floor still applies to ticks with a fast
+      // pre-race (the common case).
       await Promise.race([
         scanner.runOnce(),
         new Promise<void>((resolve) => {
@@ -722,7 +734,7 @@ async function runScan(
             // kill (the recurring 5-20 min zero-row holes).
             scanner?.abort();
             resolve();
-          }, SCAN_TICK_BUDGET_MS);
+          }, Math.max(4_000, SCAN_TICK_BUDGET_MS - (Date.now() - startedAt)));
         }),
       ]);
       lastScanOk = !timedOut;

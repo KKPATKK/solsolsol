@@ -211,6 +211,55 @@ export interface TokenStats {
 /**
  * Thin wrapper around the Turso (libSQL) client.
  *
+/**
+ * 2026-09-13 (dead-tick fix): hard wall around a libsql client's
+ * execute()/batch(). The HTTP client retries internally when its transport
+ * fetch aborts (our DB_REQUEST_TIMEOUT_MS signal), so a request's promise
+ * can outlive the signal 2-3x — the "hanging write" shape that killed
+ * completion flushes and produced the recurring 60-93s dead ticks. The
+ * wall races every call against a timer 1.2x DB_REQUEST_TIMEOUT_MS: if the
+ * client is still grinding through its retry ladder at that point, the
+ * CALLER gets a hard error instead of an eternity. The late-settling
+ * libsql promise is dropped (the race keeps its handlers attached, so a
+ * retry that eventually commits simply has no reader; every caller is
+ * idempotent by design — the flush deletes its own row before inserting).
+ * Exported so unit tests can verify the wall with mock clients.
+ */
+export function wrapClientWithHardWall<T extends object>(client: T): T {
+  return new Proxy(client, {
+    get(target, prop) {
+      if (prop !== "execute" && prop !== "batch") {
+        return Reflect.get(target, prop);
+      }
+      return (...args: unknown[]) => {
+        const op = (
+          Reflect.get(target, prop) as (...a: unknown[]) => Promise<unknown>
+        ).apply(target, args);
+        return Promise.race([
+          op,
+          new Promise<never>((_, reject) => {
+            const t = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `db ${String(prop)} hit the ${Math.round(
+                      DB_REQUEST_TIMEOUT_MS * 1.2,
+                    )}ms hard wall — libsql retry loop never settled`,
+                  ),
+                ),
+              DB_REQUEST_TIMEOUT_MS * 1.2,
+            );
+            // Release the timer as soon as the operation settles so a
+            // busy isolate never holds thousands of live timers.
+            op.finally(() => clearTimeout(t)).catch(() => {});
+          }),
+        ]);
+      };
+    },
+  });
+}
+
+/**
  * seen_tokens uses a composite primary key (chat_id, token) so a coin is
  * pushed at most once per chat, while the same coin may still qualify for
  * different chats with different filters.
@@ -232,13 +281,18 @@ export class Db {
   private connect(): Client {
     if (this.client) return this.client;
     if (this.injectedClient) {
-      this.client = this.injectedClient;
+      // Test clients go through the same hard wall: a mock (or a real
+      // client) that never settles must reject near the wall instead of
+      // hanging the caller — that behavior is exactly what the unit tests
+      // assert. Healthy local file clients settle in single-digit ms and
+      // never notice the wall.
+      this.client = wrapClientWithHardWall(this.injectedClient);
       return this.client;
     }
     // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
     // which works reliably on Workers (fetch) and in Node alike.
     const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
-    this.client = createClient({
+    const raw = createClient({
       url: httpUrl,
       authToken: this.authToken,
       // Bound every request (see DB_REQUEST_TIMEOUT_MS): a stalled Turso
@@ -249,6 +303,21 @@ export class Db {
           signal: AbortSignal.timeout(DB_REQUEST_TIMEOUT_MS),
         }),
     });
+    // 2026-09-13 (dead-tick fix): the fetch signal above bounds each
+    // TRANSPORT attempt, but the libsql HTTP client catches the abort and
+    // RETRIES internally — so execute()/batch() promises can outlive the
+    // signal 2-3x and hang the caller well past it (the flush's "hanging
+    // write" shape that produced the recurring 60-93s dead ticks). This
+    // wall wraps the CLIENT, not the request: every execute/batch races
+    // against a timer that fires 1.2x DB_REQUEST_TIMEOUT_MS after the call
+    // started — if the client is still grinding through its internal retry
+    // ladder at that point, the caller gets a hard error instead of an
+    // eternity. The late-settling libsql promise is dropped (its handlers
+    // are attached by the race), so a retry that eventually commits simply
+    // has no reader; every operation here is idempotent by design (the
+    // flush deletes its own row before inserting). Node tests inject their
+    // own client (local file DB) and are NOT wrapped.
+    this.client = wrapClientWithHardWall(raw);
     return this.client;
   }
 
@@ -1341,6 +1410,12 @@ export class Db {
     await c.batch(ops, "write");
     // Prune gate — cheap on the hot path: one read per hour per isolate at
     // most; the DELETE itself stays gated by the DB timestamp (once/day).
+    // Dead-tick fix 2026-09-13: skip the prune-check read entirely on a
+    // heartbeat-only flush (history=null) — one less unraced await on the
+    // wall-clock-critical flush path; hourly housekeeping can wait.
+    if (!history) {
+      return;
+    }
     if (Date.now() - this.lastHistoryPruneCheckAt < 3600_000) return;
     this.lastHistoryPruneCheckAt = Date.now();
     const lastPrune = await this.getWorkerState("history_last_prune");
