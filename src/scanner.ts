@@ -61,8 +61,22 @@ const SCAN_TIMEOUT_MS = 25_000;
  * remaining candidates are deferred to the next tick (they stay in the
  * re-evaluation pool, nothing is lost). Keeps every tick comfortably inside
  * the worker's 26s heartbeat budget and Cloudflare's ~30s wall clock.
+ *
+ * 2026-09-13: 20s → 11s. The worker's race cuts the scan at 12s MINUS
+ * pre-race spend (typically ~1-2s), i.e. ~10-11s of tick time — an 11s
+ * internal deadline now matches the race instead of running 8-9s PAST it:
+ * every internal phase and analyzer now stops at the same wall the worker
+ * enforces, instead of grinding as a zombie while the flush waits (zombie
+ * work overlapping the flush was the residual dead-tick shape).
+ * SIDE EFFECT (deliberate): Flurry's budget guard defers when
+ * `deadline - now < cfg.budgetMs` (15s). Under the 20s deadline it started
+ * at ~15.5s remaining and NEVER ran — the last anti-rug gate has been
+ * silently disabled since the 12s race era. At 11s it still never fits —
+ * FLURRY_BUDGET_MS is cut to 8s (wrangler.toml) so it fits whenever ≥8s
+ * remain (post-feed ticks with a fast pool read) and the gate is live
+ * again, bounded well inside the race.
  */
-const SCAN_TICK_DEADLINE_MS = 20_000;
+const SCAN_TICK_DEADLINE_MS = 11_000;
 /**
  * Wall-clock cap for the discovery-feed phase (feeds run sequentially, each
  * best-effort). Evidence 2026-09-07 ~18:30Z: timeout rows pinned at ms≈11.1s
