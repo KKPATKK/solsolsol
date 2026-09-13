@@ -3925,6 +3925,106 @@ async function main() {
     assert.equal(fakeHelius.rpcCount, 0);
   });
 
+  await test("FlurryAnalyzer: short remainder (~3s) still RUNS - the old full-budget guard deferred on every tick (silently disabled)", async () => {
+    const mint = "9dtmpyqK6gokJLVWrqPnhw6bq1kXGDJsuCoMtWQUpump";
+    const fakeHelius = {
+      rpcCount: 0,
+      async getSignatures() {
+        this.rpcCount++;
+        return [
+          { signature: "sig-a", slot: 500, err: null },
+          { signature: "sig-b", slot: 500, err: null },
+          { signature: "sig-c", slot: 500, err: null },
+          { signature: "sig-d", slot: 500, err: null },
+        ];
+      },
+      async getParsedTransaction(sig) {
+        this.rpcCount++;
+        return {
+          slot: 500,
+          meta: {
+            err: null,
+            preBalances: [0, 1000000],
+            postBalances: [1000000, 0],
+            preTokenBalances: [
+              { accountIndex: 0, mint, uiTokenAmount: { amount: "0" } },
+            ],
+            postTokenBalances: [
+              {
+                accountIndex: 0,
+                mint,
+                owner: `Wallet${sig}`,
+                uiTokenAmount: { amount: "50000000" },
+              },
+            ],
+          },
+          transaction: { message: { accountKeys: [`Wallet${sig}`, "FunderX"] } },
+        };
+      },
+      async getTokenSupply() {
+        this.rpcCount++;
+        return { value: { amount: "1000000000" } };
+      },
+    };
+    const analyzer = new FlurryAnalyzer(loadConfig({ FLURRY_BUDGET_MS: "8000" }), fakeHelius);
+    // Simulates the real candidate-phase shape: only ~3s left on the tick
+    // deadline. The old guard required the whole 8s budget -> always skip.
+    const out = await analyzer.analyze(mint, Date.now() + 3_000);
+    assert.equal(out.status, "report", "short-remainder analysis must run, not defer");
+    if (out.status === "report") assert.equal(out.report.bundled, true);
+  });
+
+  await test("FlurryAnalyzer: near-zero remainder still defers (fail-open floor)", async () => {
+    const fakeHelius = {
+      rpcCount: 0,
+      async getSignatures() {
+        this.rpcCount++;
+        return [];
+      },
+      async getParsedTransaction() {
+        return null;
+      },
+      async getTokenSupply() {
+        return null;
+      },
+    };
+    const analyzer = new FlurryAnalyzer(loadConfig({ FLURRY_BUDGET_MS: "8000" }), fakeHelius);
+    const out = await analyzer.analyze("9dtmpyqK6gokJLVWrqPnhw6bq1kXGDJsuCoMtWQUpump", Date.now() + 500);
+    assert.equal(out.status, "skip");
+    assert.equal(fakeHelius.rpcCount, 0, "floor below 2.5s must not start any RPC");
+  });
+
+  await test("FlurryAnalyzer: clamp to the tick deadline defers WITHOUT negative-caching (retry next tick)", async () => {
+    const mint = "9dtmpyqK6gokJLVWrqPnhw6bq1kXGDJsuCoMtWQUpump";
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const fakeHelius = {
+      rpcCount: 0,
+      async getSignatures() {
+        this.rpcCount++;
+        await gate; // hangs past the clamped hard deadline
+        return [];
+      },
+      async getParsedTransaction() {
+        return null;
+      },
+      async getTokenSupply() {
+        return null;
+      },
+    };
+    const analyzer = new FlurryAnalyzer(loadConfig({ FLURRY_BUDGET_MS: "8000" }), fakeHelius);
+    const deadline = Date.now() + 3_000; // clamp target
+    const p = analyzer.analyze(mint, deadline);
+    setTimeout(release, 3_500); // unblock the mock only after the clamp fired
+    const out = await p;
+    assert.equal(out.status, "skip");
+    // The clamp trip must NOT poison the cache - prove by retrying with a
+    // fresh deadline: it must re-issue RPC (no negative-cache skip).
+    const retry = await analyzer.analyze(mint, Date.now() + 60_000);
+    assert.equal(retry.status, "skip", "non-pump empty history -> skip verdict");
+    assert.ok(fakeHelius.rpcCount >= 2, "retry must re-issue RPC (no negative cache) - got " + fakeHelius.rpcCount);
+  });
+
   await test("loadConfig: flurry defaults and env overrides", () => {
     const def = loadConfig({}).flurry;
     assert.equal(def.enabled, true);

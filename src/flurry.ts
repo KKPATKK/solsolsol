@@ -36,6 +36,13 @@ const NEGATIVE_CACHE_MS = 5 * 60_000;
 const MAX_IN_SLOT_TXS = 8;
 /** Max deploy-slot signatures fetched from the curve account. */
 const CURVE_SIG_LIMIT = 50;
+/** Minimum usable time (ms) that must remain on the tick deadline before
+ * Flurry will start; a started analysis is hard-capped at min(budget,
+ * deadline). */
+const FLURRY_MIN_START_MS = 2_500;
+/** Error thrown when the clamp to the tick deadline trips — treated as a
+ * defer (no negative cache), not an analysis failure. */
+const FLURRY_DEADLINE_CLAMPED_MSG = "flurry deadline clamped to tick deadline";
 
 /** Verified against a live create_v2 tx (Flurry's pda.test.ts vector). */
 export function deriveBondingCurvePda(mint: string): string {
@@ -319,11 +326,27 @@ export class FlurryAnalyzer {
       this.cache.delete(mint);
     }
 
-    // Budget guard: only start when the whole analysis can fit in the tick
-    // deadline; beyond it, defer (fail-open — the coin stays in the pool).
-    if (deadline - Date.now() < cfg.budgetMs) return { status: "skip" };
-    const hardDeadline = Date.now() + cfg.budgetMs;
-    const expired = (): boolean => Date.now() > hardDeadline;
+    // Budget guard: only start when there is USABLE time left (floor, not
+    // the full budget — under an 11s tick deadline a candidate reaching this
+    // last gate typically has only 2-3.5s remaining, and requiring the whole
+    // budget deferred the gate on every single tick, i.e. disabled it). The
+    // hard deadline is additionally clamped to the tick deadline so the
+    // analysis can never run past the wall the worker enforces. Beyond the
+    // floor, defer (fail-open — the coin stays in the pool, unjudged).
+    if (deadline - Date.now() < FLURRY_MIN_START_MS) return { status: "skip" };
+    const hardDeadline = Math.min(
+      Date.now() + cfg.budgetMs,
+      deadline,
+    );
+    const expired = (): boolean => {
+      if (Date.now() <= hardDeadline) return false;
+      // Tripping the clamp (tick deadline reached, budget still left) is a
+      // defer, not a failure — throw so the caller retries next tick; the
+      // coin is NOT negative-cached. A pure budget trip still fails open
+      // via the normal negative-cache path.
+      if (hardDeadline >= deadline) throw new Error(FLURRY_DEADLINE_CLAMPED_MSG);
+      return true;
+    };
 
     // RPC seam counted per call for the /health spend counter.
     const transport: ForensicsTransport = {
@@ -337,30 +360,33 @@ export class FlurryAnalyzer {
       },
     };
 
-    try {
+    // Run the analysis inside a race against the clamp: a hung Helius RPC
+    // must not ride past the tick deadline on its own 10-15s client timeout —
+    // analyze() must always settle before the wall the worker enforces.
+    const run = async (): Promise<FlurryReport | null> => {
       // The bonding-curve PDA is deterministic — its signature history is the
       // create + every curve trade, no account-info walk needed.
       const curve = deriveBondingCurvePda(mint);
       const sigs = await transport.getSignatures(curve, CURVE_SIG_LIMIT) as
         | Array<{ signature: string; slot?: number; err?: unknown }>
         | null;
-      if (!sigs || sigs.length === 0) return this.neg(mint); // non-pump mint
+      if (!sigs || sigs.length === 0) return null; // non-pump mint → neg-cache
       // Deploy slot = slot of the oldest signature on the curve (the create).
       const create = sigs[sigs.length - 1];
-      if (typeof create.slot !== "number") return this.neg(mint);
+      if (typeof create.slot !== "number") return null;
 
       const supply = await this.helius.getTokenSupply(mint);
       this.rpcCalls++;
-      if (!supply) return this.neg(mint);
+      if (!supply) return null;
       const totalSupply = BigInt(supply.value.amount);
-      if (totalSupply <= 0n) return this.neg(mint);
+      if (totalSupply <= 0n) return null;
 
       const inSlot = sigs
         .filter((s) => s.slot === create.slot && !s.err)
         .slice(0, MAX_IN_SLOT_TXS);
       const activity: SlotActivity[] = [];
       for (const s of inSlot) {
-        if (expired()) return this.neg(mint);
+        if (expired()) return null;
         const tx = await transport.getParsedTransaction(s.signature);
         if (!tx) continue;
         activity.push(...slotActivityFromTransaction(tx, mint, totalSupply));
@@ -376,7 +402,7 @@ export class FlurryAnalyzer {
       let linkedWallets = 0;
       let clusterSize = 0;
       if (bundle.deploySlotWallets >= 2) {
-        if (expired()) return this.neg(mint);
+        if (expired()) return null;
         const withFunding = await attachFundingLineage(transport, activity, {
           maxWallets: cfg.maxWallets,
         });
@@ -402,15 +428,38 @@ export class FlurryAnalyzer {
         score,
         tier,
       };
-      this.setCache(mint, report);
-      this.analyzed++;
-      return { status: "report", report };
+      return report;
+    };
+    let out: FlurryReport | null;
+    try {
+      out = await Promise.race([
+        run(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(FLURRY_DEADLINE_CLAMPED_MSG)),
+            Math.max(0, hardDeadline - Date.now()),
+          ),
+        ),
+      ]);
     } catch (err) {
-      console.error(
-        "[flurry] analysis failed:",
-        err instanceof Error ? err.message : err,
-      );
-      return this.neg(mint);
+      // A clamp-trip (hard deadline = tick deadline reached) is NOT an
+      // analysis failure: negative-caching here would blind the gate to this
+      // coin for the whole 5-minute negative TTL. Instead, defer — the coin
+      // stays in the pool and the next tick retries with a fresh budget.
+      const clamped =
+        err instanceof Error &&
+        err.message === FLURRY_DEADLINE_CLAMPED_MSG;
+      if (!clamped) {
+        console.error(
+          "[flurry] analysis failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+      return clamped ? { status: "skip" } : this.neg(mint);
     }
+    if (out === null) return this.neg(mint);
+    this.setCache(mint, out);
+    this.analyzed++;
+    return { status: "report", report: out };
   }
 }
