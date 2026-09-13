@@ -86,6 +86,15 @@ const SCAN_TICK_DEADLINE_MS = 20_000;
  * registration (feed coins still enter via the re-eval pool), never a lost
  * coin. Restore to 5500 when the geo feeds recover (a full day of green
  * ticks at 4500 with feedsMs well under the cap is the evidence).
+ *
+ * 2026-09-12 (parallel fan-out): the feed chain ran SEQUENTIALLY — dex →
+ * gecko ×2 → gmgn → axiom → jup ×2 — so each feed's throttle spacing
+ * (gecko 1000ms, jupiter 500ms) + latency stacked and feedsMs rode the
+ * 4500ms cap on every observed tick (15+ live samples: 3846–4394ms), even
+ * with all upstreams healthy. The independent GETs now dispatch
+ * CONCURRENTLY: worst case is max(feed) not sum(feed), returning ~3s per
+ * tick to the pool evaluation + gates (the phases that actually qualify
+ * coins). Cap stays 4500 — it now bounds only genuinely hung feeds.
  */
 const FEED_DEADLINE_MS = 4_500;
 /**
@@ -950,21 +959,35 @@ export class Scanner {
       // instead of aborting it — an unguarded throw here produced ~6s
       // all-zero scans (3 attempts × 2/4s backoff) that skipped the entire
       // pool evaluation (observed 2026-08-16).
+      //
+      // 2026-09-12: the feeds now fan out CONCURRENTLY. The sequential
+      // chain (dex → gecko ×2 → gmgn → axiom → jup ×2 → backfill) rode the
+      // FEED_DEADLINE cap on every observed tick (feedsMs 3846-4394ms over
+      // 15+ live samples, vs the 4500ms cap) — each feed's throttle spacing
+      // (gecko 1000ms, jupiter 500ms) + latency stacked, so the phase
+      // consumed its whole budget and left nothing for the eval phase even
+      // when every upstream was healthy. Per-feed deadline races are kept
+      // (each feed still resolves empty at the shared feedDeadline, so
+      // upstream hangs cannot starve the core scan); only the ORDER is
+      // changed — worst case is now max(feed) instead of sum(feed),
+      // returning ~3s per tick to pool evaluation + candidates. The
+      // Birdeye backfill (interval-gated, writes to the DB) is excluded
+      // from the fan-out and runs after it so its DB writes never race the
+      // feeds.
       if (this.shouldStopEarly()) return;
       const feedsStart = Date.now();
-      let profiles: TokenProfile[] = [];
-      try {
-        profiles = await this.fetchFeedCapped(
-          () => this.dex.fetchLatestSolanaProfiles(),
-          [],
-          feedDeadline,
-        );
-      } catch (err) {
+      const feedJobs: Array<Promise<void>> = [];
+      const profiles = await this.fetchFeedCapped(
+        () => this.dex.fetchLatestSolanaProfiles(),
+        [],
+        feedDeadline,
+      ).catch((err: unknown): TokenProfile[] => {
         console.error(
           "[scanner] dexscreener profile feed failed:",
           err instanceof Error ? err.message : err,
         );
-      }
+        return [];
+      });
       diag.profiles = profiles.length;
       // pump.fun discovery — the widest free source of brand-new coins
       // (DexScreener's profiles feed only returns ~24 Solana profiles per
@@ -972,21 +995,25 @@ export class Scanner {
       // on DexScreener alone (see /health summary.pump to verify liveness).
       let pumpProfiles: TokenProfile[] = [];
       if (this.pumpfun && this.config.pumpfunProfileLimit > 0) {
-        try {
-          pumpProfiles = await this.fetchFeedCapped(
+        feedJobs.push(
+          this.fetchFeedCapped(
             () =>
               this.pumpfun!.fetchNewestCoins(this.config.pumpfunProfileLimit),
             [],
             feedDeadline,
-          );
-        } catch (err) {
-          console.error(
-            "[scanner] pump.fun discovery failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
+          )
+            .then((p) => {
+              pumpProfiles = p;
+              diag.pump = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] pump.fun discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
       }
-      diag.pump = pumpProfiles.length;
       // GeckoTerminal new-pools feed — the free (no-key) discovery source
       // covering every Solana DEX incl. pump.fun graduates, replacing the
       // CU-expensive Birdeye new_listing for live discovery. Pools are
@@ -994,10 +1021,13 @@ export class Scanner {
       // how DexScreener pairs age coins), so they enter the re-eval pool
       // and are evaluated once they reach the qualifying age window.
       let geckoProfiles: TokenProfile[] = [];
-      if (this.shouldStopEarly()) return;
+      if (this.shouldStopEarly()) {
+        await Promise.all(feedJobs);
+        return;
+      }
       if (this.gecko) {
-        try {
-          geckoProfiles = await this.fetchFeedCapped(
+        feedJobs.push(
+          this.fetchFeedCapped(
             async () => {
               const pools = [];
               for (
@@ -1018,24 +1048,27 @@ export class Scanner {
             },
             [],
             feedDeadline,
-          );
-        } catch (err) {
-          console.error(
-            "[scanner] geckoterminal discovery failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
+          )
+            .then((p) => {
+              geckoProfiles = p;
+              diag.geo = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] geckoterminal discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
       }
-      diag.geo = geckoProfiles.length;
       // GeckoTerminal trending-pools — momentum feed (free, no key), the
       // replacement for GMGN trending (GMGN's edge blocks Cloudflare Worker
       // egress with 429). Sized by GECKOTERMINAL_TRENDING_LIMIT (0 =
       // disabled); best-effort — failures return [] and the scan continues.
       let geoTrendProfiles: TokenProfile[] = [];
-      if (this.shouldStopEarly()) return;
       if (this.gecko && this.config.geckoterminalTrendingLimit > 0) {
-        try {
-          geoTrendProfiles = await this.fetchFeedCapped(
+        feedJobs.push(
+          this.fetchFeedCapped(
             async () => {
               const trending = await this.gecko!.fetchTrendingPools(
                 this.config.geckoterminalTrendingLimit,
@@ -1049,24 +1082,27 @@ export class Scanner {
             },
             [],
             feedDeadline,
-          );
-        } catch (err) {
-          console.error(
-            "[scanner] geckoterminal trending discovery failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
+          )
+            .then((p) => {
+              geoTrendProfiles = p;
+              diag.geoTrend = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] geckoterminal trending discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
       }
-      diag.geoTrend = geoTrendProfiles.length;
       // GMGN trending discovery — momentum-ranked candidates with GMGN's
       // smart-money/wash-trading-aware filters already applied server-side
       // (best-effort — failures return [] and the scan continues). Sized by
       // GMGN_TRENDING_LIMIT (0 = disabled).
       let gmgnProfiles: TokenProfile[] = [];
-      if (this.shouldStopEarly()) return;
       if (this.gmgn && this.config.gmgnTrendingLimit > 0) {
-        try {
-          gmgnProfiles = await this.fetchFeedCapped(
+        feedJobs.push(
+          this.fetchFeedCapped(
             async () => {
               const trending = await this.gmgn!.fetchTrending(
                 this.config.gmgnTrendingLimit,
@@ -1080,15 +1116,19 @@ export class Scanner {
             },
             [],
             feedDeadline,
-          );
-        } catch (err) {
-          console.error(
-            "[scanner] gmgn trending discovery failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
+          )
+            .then((p) => {
+              gmgnProfiles = p;
+              diag.gmgn = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] gmgn trending discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
       }
-      diag.gmgn = gmgnProfiles.length;
       // Axiom Trade trending — momentum feed with sniper/insider/bundle/
       // top10-holder signals Axiom computes server-side (no other free feed
       // has them). Needs a logged-in access token (see /debug/axiom-login);
@@ -1097,10 +1137,9 @@ export class Scanner {
       // (0 = disabled); best-effort — failures return [] and the scan
       // continues.
       let axiomProfiles: TokenProfile[] = [];
-      if (this.shouldStopEarly()) return;
       if (this.axiom && this.config.axiomTrendingLimit > 0) {
-        try {
-          axiomProfiles = await this.fetchFeedCapped(
+        feedJobs.push(
+          this.fetchFeedCapped(
             async () => {
               const trending = await this.fetchTrendingCached();
               return trending
@@ -1112,15 +1151,19 @@ export class Scanner {
             },
             [],
             feedDeadline,
-          );
-        } catch (err) {
-          console.error(
-            "[scanner] axiom trending discovery failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
+          )
+            .then((p) => {
+              axiomProfiles = p;
+              diag.axiom = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] axiom trending discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
       }
-      diag.axiom = axiomProfiles.length;
       // Jupiter Token v2 recent-launches — seconds-old launchpad launches
       // (pump.fun & co.), the free no-key replacement for the blocked
       // pump.fun frontend-api feed (HTTP 530 from Worker egress). Carries
@@ -1128,45 +1171,56 @@ export class Scanner {
       // time. Sized by JUPITER_RECENT_LIMIT (0 = disabled); best-effort —
       // failures return [] and the scan continues.
       let jupProfiles: TokenProfile[] = [];
-      if (this.shouldStopEarly()) return;
       if (this.jupiter && this.config.jupiterRecentLimit > 0) {
-        try {
-          jupProfiles = await this.fetchFeedCapped(
+        feedJobs.push(
+          this.fetchFeedCapped(
             () =>
               this.jupiter!.fetchRecentTokens(this.config.jupiterRecentLimit),
             [],
             feedDeadline,
-          );
-        } catch (err) {
-          console.error(
-            "[scanner] jupiter recent discovery failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
+          )
+            .then((p) => {
+              jupProfiles = p;
+              diag.jup = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] jupiter recent discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
       }
-      diag.jup = jupProfiles.length;
       // Jupiter Token v2 trending — momentum feed (free, no key). Mostly
       // older than the qualifying window; kept for early catch of
       // resurging mints. Sized by JUPITER_TRENDING_LIMIT (0 = disabled);
       // best-effort — failures return [] and the scan continues.
       let jupTrendProfiles: TokenProfile[] = [];
-      if (this.shouldStopEarly()) return;
       if (this.jupiter && this.config.jupiterTrendLimit > 0) {
-        try {
-          jupTrendProfiles = await this.fetchFeedCapped(
+        feedJobs.push(
+          this.fetchFeedCapped(
             () =>
               this.jupiter!.fetchTrendingTokens(this.config.jupiterTrendLimit),
             [],
             feedDeadline,
-          );
-        } catch (err) {
-          console.error(
-            "[scanner] jupiter trending discovery failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
+          )
+            .then((p) => {
+              jupTrendProfiles = p;
+              diag.jupTrend = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] jupiter trending discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
       }
-      diag.jupTrend = jupTrendProfiles.length;
+      // Await the fan-out (each job is individually deadline-raced and
+      // error-swallowed, so Promise.all here cannot reject and is bounded
+      // by the feed deadline). A tripped tick budget lands at the next
+      // phase boundary (below) instead of inside the fan-out.
+      await Promise.all(feedJobs);
       // Periodic Birdeye backfill — safety net for discovery gaps. Every
       // BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back the lookback
       // window of Birdeye's new_listing feed (which includes pump.fun
@@ -1192,8 +1246,17 @@ export class Scanner {
       // Post-push tracker pass: one DexScreener batch + bounded Birdeye
       // holder probes for the watched coins, then 🚀/⚠️/💀 follow-ups.
       // Best-effort — a tracker failure never affects the scan.
+      // 2026-09-12: the pass previously ran unconditionally BEFORE the pool
+      // evaluation, and when Turso was slow it consumed up to ~4.6s of the
+      // 12s tick budget (trackerMs 4556 observed live) — the pool slice for
+      // that tick then never got evaluated (timeout row, agedEval 0). The
+      // tracker's alerts are hour-scale follow-ups while the qualifying
+      // momentum windows are minutes long, so when the tick is already more
+      // than halfway spent the pass defers to the next tick (rows are
+      // re-claimed then; nothing is lost).
       const trackerStart = Date.now();
-      if (this.pushWatcher) {
+      const trackerDeferred = Date.now() - startedAt > SCAN_TICK_DEADLINE_MS / 2;
+      if (this.pushWatcher && !trackerDeferred) {
         if (this.shouldStopEarly()) return;
         try {
           const pw = await this.pushWatcher.runTick();
@@ -1203,6 +1266,8 @@ export class Scanner {
           console.error("[scanner] push-watch tick failed:", msg);
           diag.pushWatch = `err:${msg.slice(0, 140)}`;
         }
+      } else if (trackerDeferred) {
+        diag.pushWatch = "deferred:tick-budget";
       }
       diag.trackerMs = Date.now() - trackerStart;
       // Dedupe the feeds (mints overlap across all three); the DexScreener

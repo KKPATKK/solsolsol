@@ -95,6 +95,75 @@ async function main() {
     }
   });
 
+  await test("Scanner.abort publishes the in-flight summary so timeout rows carry diagnostics", async () => {
+    // Before the 2026-09-12 fix a tripped 12s race flushed summary:null —
+    // no feedsMs, no pool, no phase counts — because runOnce only publishes
+    // diag in its finally (after it settles). abort() must republish the
+    // in-flight diag object immediately.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const scanner = new Scanner(db, { api: { sendMessage: async () => ({}) } }, new DexScreenerClient(cfg), cfg, null, null, null);
+      assert.equal(scanner.lastSummary, null);
+      // Abort with no scan ever started: must not fabricate a summary.
+      scanner.abort();
+      assert.equal(scanner.lastSummary, null, "no in-flight scan → no summary published");
+      // Simulate the in-flight diag registration + abort publication path:
+      // register an object as the scanner would at runOnce start, then
+      // abort(). The published object must be the same instance (mutations
+      // by the still-running scan are visible in the flushed heartbeat).
+      const diag = { profiles: 3, pool: 42, candidates: 0, pushed: 0 };
+      scanner.lastSummary = null;
+      // Reach the private field via a controlled reflection (test-only).
+      Object.defineProperty(scanner, "inflightSummary", { value: diag, configurable: true });
+      scanner.abort();
+      assert.equal(scanner.lastSummary, diag, "abort republishes the in-flight diag");
+      assert.ok(scanner.lastSummary === diag, "same instance — live mutations visible");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: a hanging pool DB read is cut by POOL_FETCH_BUDGET_MS and the scan degrades to feed-only", async () => {
+    // The libsql client can hang in internal retries (the same hang the
+    // worker's flush-retry guard exists for). The pool read is raced against
+    // POOL_FETCH_BUDGET_MS; expiry must NOT wedge runOnce — it degrades to
+    // feed-only evaluation and the scan still settles.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      // DexScreener feed: return an empty profile list so the scan proceeds
+      // straight to the (hung) pool read.
+      return new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Hang forever on getReevalPool — simulating the wedged libsql client.
+      db.getReevalPool = () => new Promise(() => {});
+      const cfg = loadConfig({});
+      const scanner = new Scanner(db, { api: { sendMessage: async () => ({}) } }, new DexScreenerClient(cfg), cfg, null, null, null);
+      const t0 = Date.now();
+      await scanner.runOnce();
+      const elapsed = Date.now() - t0;
+      // runOnce must settle well within the tick budget: feed deadline (4.5s)
+      // + pool budget (4s) + slack. A wedged scan would never resolve.
+      assert.ok(elapsed < 12_000, `runOnce took ${elapsed}ms — pool read not budgeted`);
+      // The settle path always publishes the diag (possibly zeroed) — the
+      // degraded tick's feed-only shape: empty feed, pool read never landed.
+      assert.ok(scanner.lastSummary, "diag published on settle");
+      assert.equal(scanner.lastSummary.profiles, 0, "mocked feed returned nothing");
+      assert.equal(scanner.lastSummary.pool, 0, "hung pool read degraded the scan to feed-only");
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
   await test("slicePoolRotation: small pool taken whole, cursor resets", () => {
     const items = ["a", "b", "c"];
     const r1 = slicePoolRotation(items, 2, 120);
