@@ -78,6 +78,17 @@ const SCAN_TIMEOUT_MS = 25_000;
  */
 const SCAN_TICK_DEADLINE_MS = 11_000;
 /**
+ * Cap on how long one Flurry analyze() may wait inside the tick (see the
+ * call site). analyze() races its RPCs against the deadline it is given, so
+ * a hung Helius call otherwise holds the tick for the full remainder -
+ * including the seconds the completion flush needs to land before
+ * Cloudflare's invocation kill (2026-09-13 dead-tick shape: candidates on
+ * 12s-timeout ticks while the flush never landed). 3s bounds the worst-case
+ * wait to the typical pre-flush remainder while still allowing the
+ * analysis to start whenever >=2.5s of usable time remains.
+ */
+const FLURRY_ANALYZE_CAP_MS = 3_000;
+/**
  * Wall-clock cap for the discovery-feed phase (feeds run sequentially, each
  * best-effort). Evidence 2026-09-07 ~18:30Z: timeout rows pinned at ms≈11.1s
  * carried profiles=0 pool=0 cand=0 — the feed phase alone consumed the whole
@@ -1845,6 +1856,11 @@ export class Scanner {
               creator: rugcheck.creator,
               holders: crime.holders,
               crime,
+              // Clamp the analyzer's serial-RPC budget to the remaining
+              // tick time: an unclamped 8s wallet walk could outlive the
+              // 12s tick race on heavy ticks, pushing the completion flush
+              // past Cloudflare's invocation kill (the dead-tick shape).
+              deadline: tickDeadline,
             })
           : null;
         if (wallet?.ok) diag.walletAnalysis++;
@@ -1891,8 +1907,15 @@ export class Scanner {
         // here costs one extra envelope before the verdict is cached per
         // mint (0 RPC on re-sweeps). Fail-open: non-pump mints, RPC errors
         // and budget exhaustion all pass without blocking.
+        // Deadline is capped to min(tickDeadline, now+FLURRY_ANALYZE_CAP_MS):
+        // analyze() waits up to its deadline for a hung RPC (the clamp race),
+        // so an unclamped wait could stall the tick for the full remainder
+        // and delay the completion flush past the invocation kill.
         const flurryOut = this.flurry
-          ? await this.flurry.analyze(coin.stats.token, tickDeadline)
+          ? await this.flurry.analyze(
+              coin.stats.token,
+              Math.min(tickDeadline, Date.now() + FLURRY_ANALYZE_CAP_MS),
+            )
           : { status: "skip" as const };
         const flurryReport =
           flurryOut.status === "report" ? flurryOut.report : null;

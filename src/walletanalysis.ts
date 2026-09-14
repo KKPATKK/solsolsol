@@ -84,6 +84,13 @@ export interface WalletAnalyzeInput {
   holders: ResolvedHolder[];
   /** The crime check result (for crimeHit flags). */
   crime: CrimeCheckResult;
+  /** Wall-clock deadline for the whole analysis. When provided, the
+   * profiling budget is clamped to it — the configured budgetMs (8s) is a
+   * MAXIMUM, but the tick hosting this analysis may have less time left:
+   * an unclamped serial-RPC walk inside the 12s tick race delayed the
+   * completion flush past the invocation kill (the 2026-09-13 dead-tick
+   * shape). Optional so tests can drive the unclamped behavior. */
+  deadline?: number;
   /** Override for deterministic tests; defaults to Date.now(). */
   now?: number;
 }
@@ -251,11 +258,18 @@ export class WalletAnalyzer {
 
     // Profile wallets serially against the budget (the Helius throttle
     // serializes the RPC calls anyway; a serial loop with deadline checks
-    // gives clean truncation and a partial result).
+    // gives clean truncation and a partial result). The budget is clamped
+    // to the caller's tick deadline (see analyze signature) so the walk can
+    // never outlive the phase that hosts it — an unclamped budget turned
+    // every pre-flush second into dead-tick risk (2026-09-13).
+    const budgetMs =
+      input.deadline !== undefined
+        ? Math.max(0, Math.min(this.budgetMs, input.deadline - Date.now()))
+        : this.budgetMs;
     const profiles = new Map<string, WalletProfile | null>();
     let truncated = false;
     for (const w of wallets) {
-      if (Date.now() - startedAt > this.budgetMs) {
+      if (Date.now() - startedAt > budgetMs) {
         truncated = true;
         break;
       }

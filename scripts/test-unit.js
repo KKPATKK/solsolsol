@@ -2383,6 +2383,49 @@ async function main() {
     }
   });
 
+  await test("WalletAnalyzer: deadline clamps the profiling budget (dead-tick regression)", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const config = loadConfig({});
+      const slowHelius = {
+        // Each profile call takes ~150ms (simulating the throttle-paced RPC
+        // walk that produced the 2026-09-13 dead ticks when unclamped).
+        getWalletProfile: async () => {
+          await new Promise((r) => setTimeout(r, 150));
+          return { firstTxMs: 1_800_000_000_000, txCount: 1, capped: false, createCount: 0 };
+        },
+      };
+      const crime = {
+        hit: false, creatorHit: false, holderHits: [], checkedHolders: 0,
+        loaded: true,
+        holders: Array.from({ length: 12 }, (_, i) => ({
+          address: `a${i}`, owner: `WALLET${i}`, rank: i + 1, uiAmount: 1,
+        })),
+      };
+      const analyzer = new WalletAnalyzer(config, db, slowHelius);
+      const startedAt = Date.now();
+      // Deadline = now + 500ms: far less than the 8s configured budget. The
+      // clamp must cut the walk to ~3 wallets instead of running all 12
+      // (1.8s unclamped), so the host tick keeps flush margin.
+      const r = await analyzer.analyze({
+        token: "TDL",
+        creator: null,
+        holders: crime.holders,
+        crime,
+        deadline: Date.now() + 500,
+      });
+      const elapsed = Date.now() - startedAt;
+      assert.equal(r.truncated, true, "clamped walk must report truncation");
+      assert.ok(elapsed < 1500, `clamped walk took ${elapsed}ms - must stop near the deadline`);
+      // Sanity: the walk actually profiled someone before the clamp cut it.
+      assert.ok(r.holders.checked >= 1, "clamp must not skip profiling entirely");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("parseSmartMoneyTypes defaults and parses the comma list", () => {
     assert.equal(parseSmartMoneyTypes(undefined).has("fund"), true);
     assert.equal(parseSmartMoneyTypes("").has("whale"), true);

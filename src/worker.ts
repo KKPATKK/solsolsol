@@ -694,6 +694,11 @@ async function runScan(
   if (backfillEntry) deadTickStreak++;
   let rebuilt = false;
   let timedOut = false;
+  // Whether OUR completion batch settled (success or fast error). Set
+  // in the inner finally, read in the outer finally for streak
+  // bookkeeping: a settled flush is the isolate-liveness proof the old
+  // heartbeat re-read approximated one DB round trip later.
+  let flushSettled = false;
   try {
     // Liveness-first heartbeat (phase=scanning) already went out with the
     // claim batch: a tick killed by the ~30s wall clock mid-scan can no
@@ -807,6 +812,7 @@ async function runScan(
       const mark = attempt1.then(
         () => {
           settled = true;
+          flushSettled = true;
         },
         () => {
           settled = true;
@@ -831,30 +837,38 @@ async function runScan(
         console.error("[worker] completion write failed — retrying once:", err);
         await new Promise((resolve) => setTimeout(resolve, 300));
         try {
-          await flushCompletion();
+          // Bound the retry too: the previous unbounded await let a
+          // hanging retry consume every remaining pre-kill second
+          // (2026-09-13: the hard-wall error arrives only after
+          // DB_REQUEST_TIMEOUT_MS*1.2, which alone can outlive the
+          // flush window). The idempotent batch makes a late commit
+          // from the abandoned retry harmless.
+          const retry = flushCompletion();
+          await Promise.race([
+            retry,
+            new Promise((resolve) => setTimeout(resolve, 2500)),
+          ]);
+          await retry.catch(() => {});
         } catch (err2) {
           console.error("[worker] completion retry failed:", err2);
         }
       }
     }
   } finally {
-    // Streak bookkeeping AFTER the flush attempt: a landed completion
-    // (heartbeat reached phase=done) proves this isolate's state works —
-    // reset the streak. A tick that died before the flush (the isolate was
-    // killed mid-run, so this finally never ran) leaves the streak intact;
-    // the NEXT tick's backfill of this dead tick increments it.
-    if (db) {
-      try {
-        const hbRaw = await db.getWorkerState("scan_heartbeat");
-        const phase = hbRaw
-          ? ((JSON.parse(hbRaw) as { phase?: string } | null)?.phase ?? null)
-          : null;
-        if (phase === "done") {
-          deadTickStreak = 0;
-        }
-      } catch {
-        // best-effort — a failed read just skips the reset this tick
-      }
+    // Streak bookkeeping AFTER the flush attempt. The old check re-read
+    // scan_heartbeat from the DB and reset the streak on phase=done, but
+    // (a) that read is an extra unraced await on the wall-clock-critical
+    // tail, and (b) it can credit ANOTHER isolate's done heartbeat: the
+    // 2026-09-13 live pattern had reads landing every tick while this
+    // isolate's flushes hung, so the streak stayed pinned at 0 and the
+    // wedged-isolate rebuild never fired for hours. Reset on OUR OWN
+    // flush settling instead (the heartbeat+row batch landing here IS
+    // the phase=done proof); count our own failure/hang as a dead tick
+    // (matching the next tick's backfill of our dead heartbeat).
+    if (flushSettled) {
+      deadTickStreak = 0;
+    } else {
+      deadTickStreak++;
     }
     if (deadTickStreak >= DEAD_TICK_STREAK_RESET && scanner) {
       // This isolate has now seen DEAD_TICK_STREAK_RESET consecutive dead
