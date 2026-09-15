@@ -294,18 +294,24 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * back until the upstream feeds recover. Sweep at the ~240-row pool: ~2
  * ticks; hot zone still evaluated every scan.
  *
- * 2026-09-15: 120 → 300. The 120 cap had become the binding constraint, not
- * the upstream budget: ticks report pool 323–489 with poolSliced 120 while
- * poolMs spends ~1.5s of its 2.2s allowance, so most of every returned pool
- * was never looked at — pure lost coverage, and the reason a qualifying
- * coin could sit in the pool for hours unseen. The marginal cost is bounded
- * by the pair phase, not by this number: fetchPairsForTokens is
- * deadline-capped (PAIRS_FETCH_BUDGET_MS) and its 3-min pair cache serves
- * repeat coins for free, so a wider slice costs the cached coins nothing and
- * lets the fetch budget go to coins it has never seen. Coins left over stay
- * in the pool and are re-read on the next slot.
+ * 2026-09-15: 120 → 150, sized by the PAIR PHASE, not by the pool. The 120
+ * cap had become the binding constraint (ticks reported pool 323–489 with
+ * poolSliced 120 while poolMs spent only ~1.5s of its allowance, so most of
+ * every returned pool was never looked at), but the phase that caps the
+ * slice is the pair fetch: DexScreener batches are 30 addresses and every
+ * request start is spaced by the shared throttle (DEX_REQUEST_INTERVAL_MS,
+ * 350ms), so N batches cost N × spacing and 150 + the feed's ~20 coins is
+ * 6 batches ≈ 2.1s — the most that fits the ~5.3s race alongside the feed,
+ * pool and push-watch phases while still leaving the gate/push phase its
+ * ~1s. Measured: a 300-coin slice (11 batches ≈ 3.9s) pushed the tick past
+ * the race, so the abort landed BEFORE the gates and the whole fetch was
+ * discarded as `agedEval 0` — the exact waste this number now avoids.
+ * Raise it only together with a way to fetch more per second (smaller
+ * throttle spacing, or a batch cache that is warmer than 3 min); the pair
+ * cache already serves repeat coins for free, and coins left over stay in
+ * the pool and are re-read on the next slot.
  */
-const RE_EVAL_PER_TICK_MAX = 300;
+const RE_EVAL_PER_TICK_MAX = 150;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline

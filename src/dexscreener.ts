@@ -104,12 +104,15 @@ class Throttle {
  * (~5.6s minus the 1.8s feed phase), so on any throttled tick the pairs
  * phase ran past the race and the tick was cut BEFORE the gates saw the
  * data it had just fetched — the `agedEval 0 / candidates 0` rows, i.e.
- * upstream work paid for and thrown away. 2000 fits the pairs phase inside
- * the race (1.8s feeds + 2.0s pairs), so the fetched coins actually reach
- * the gates and the skip-anything-leftover behavior stays the safety net
- * for a genuinely slow endpoint. Skipped tokens keep their pool slot.
+ * upstream work paid for and thrown away. 2300 fits the pairs phase inside
+ * the race (1.8s feeds + 2.3s pairs behind the ~0.9s pool read and the
+ * 0.7s push-watch pass), so the fetched coins actually reach the gates
+ * instead of the tick being cut first; the skip-anything-leftover behavior
+ * stays the safety net for a genuinely slow endpoint. Skipped tokens keep
+ * their pool slot and are re-read on the next rotation slot, so the cost of
+ * the cap is latency, never coverage.
  */
-const PAIRS_FETCH_BUDGET_MS = 2_000;
+const PAIRS_FETCH_BUDGET_MS = 2_300;
 /**
  * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
  * minute after minute), so re-fetching all ~550 addresses every tick burns
