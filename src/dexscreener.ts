@@ -99,8 +99,17 @@ class Throttle {
  * headroom. Same rollback ladder as every cap above; skipped batches stay
  * in the pool for the next tick. Raise only after a full day of zero
  * budget rows with evalMs visibly under the cap.
+ *
+ * 2026-09-15: 4500 → 2000. The cap was larger than the whole scan race
+ * (~5.6s minus the 1.8s feed phase), so on any throttled tick the pairs
+ * phase ran past the race and the tick was cut BEFORE the gates saw the
+ * data it had just fetched — the `agedEval 0 / candidates 0` rows, i.e.
+ * upstream work paid for and thrown away. 2000 fits the pairs phase inside
+ * the race (1.8s feeds + 2.0s pairs), so the fetched coins actually reach
+ * the gates and the skip-anything-leftover behavior stays the safety net
+ * for a genuinely slow endpoint. Skipped tokens keep their pool slot.
  */
-const PAIRS_FETCH_BUDGET_MS = 4_500;
+const PAIRS_FETCH_BUDGET_MS = 2_000;
 /**
  * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
  * minute after minute), so re-fetching all ~550 addresses every tick burns
@@ -122,8 +131,15 @@ const PAIR_BATCH_BACKOFF_MS = 90_000;
  * 7 batches cost ~(N-1) × spacing + latency ≈ 2.6s where 5 sequential
  * batches cost ~2.7s. Dispatch RATE is unchanged — the shared Throttle
  * still spaces actual request starts globally.
+ *
+ * 2026-09-15: 2 → 3 (the same reasoning, one more worker): with the pairs
+ * budget at 2.0s the phase is latency-bound inside a short window, so the
+ * third worker overlaps one more batch's response with the throttle
+ * spacing instead of waiting behind it. Request STARTS stay spaced by the
+ * shared throttle, so upstream request rate is unchanged — only how much
+ * of the window is spent waiting on responses is.
  */
-const PAIR_BATCH_CONCURRENCY = 2;
+const PAIR_BATCH_CONCURRENCY = 3;
 
 export class DexScreenerClient {
   private readonly throttle: Throttle;

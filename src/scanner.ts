@@ -136,8 +136,18 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  * case, so the visible discovery loss is limited to the 429-backoff
  * stretches; leaving feeds 2.4s of the ~5.6s race is what keeps pool eval
  * + gates (the phases that qualify coins) funded on every tick.
+ *
+ * 2026-09-15 (later): 2400 → 1800. The coverage audit showed the binding
+ * constraint on QUALIFYING coins is not discovery but evaluation: 13,724
+ * never-pushed coins were eligible in the age window while a tick only got
+ * through ~120 of them, and the feed's own coins are overwhelmingly the
+ * sub-$10K-liquidity dust the pool prunes. Feeds now take 1.8s and the
+ * pair fetch (PAIRS_FETCH_BUDGET_MS, same day) 2.0s so BOTH fit inside the
+ * ~5.6s race and the gates still run at the end of the tick. A feed coin
+ * discovered a tick later is not lost — it enters the pool and the 3h
+ * pre-qualification margin covers its window entry.
  */
-const FEED_DEADLINE_MS = 2_400;
+const FEED_DEADLINE_MS = 1_800;
 /**
  * Wall-clock cap for the re-eval pool DB read and the token_stats prune
  * (both race against this deadline; see the call sites). Evidence
@@ -283,8 +293,19 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * the headroom the rollback assumed. One more step down buys ~1s of evalMs
  * back until the upstream feeds recover. Sweep at the ~240-row pool: ~2
  * ticks; hot zone still evaluated every scan.
+ *
+ * 2026-09-15: 120 → 300. The 120 cap had become the binding constraint, not
+ * the upstream budget: ticks report pool 323–489 with poolSliced 120 while
+ * poolMs spends ~1.5s of its 2.2s allowance, so most of every returned pool
+ * was never looked at — pure lost coverage, and the reason a qualifying
+ * coin could sit in the pool for hours unseen. The marginal cost is bounded
+ * by the pair phase, not by this number: fetchPairsForTokens is
+ * deadline-capped (PAIRS_FETCH_BUDGET_MS) and its 3-min pair cache serves
+ * repeat coins for free, so a wider slice costs the cached coins nothing and
+ * lets the fetch budget go to coins it has never seen. Coins left over stay
+ * in the pool and are re-read on the next slot.
  */
-const RE_EVAL_PER_TICK_MAX = 120;
+const RE_EVAL_PER_TICK_MAX = 300;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
