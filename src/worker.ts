@@ -784,11 +784,14 @@ async function runScan(
         }),
       ]);
       lastScanOk = !timedOut;
+      // Report the SCAN RACE window, not the whole tick budget: the race now
+      // ends SCAN_FLUSH_RESERVE_MS early, so quoting the budget sent the
+      // operator chasing a 9.5s timeout on ticks that were cut at ~6s.
       lastScanError = timedOut
-        ? `tick exceeded ${SCAN_TICK_BUDGET_MS}ms budget`
+        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms)`
         : null;
       if (timedOut) {
-        console.error(`[worker] scan exceeded ${SCAN_TICK_BUDGET_MS}ms — completion written with timeout flag`);
+        console.error(`[worker] scan ran past its ${scanRaceMs}ms race window — completion written with timeout flag`);
       }
     } catch (err) {
       lastScanOk = false;
