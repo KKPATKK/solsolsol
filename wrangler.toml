@@ -46,30 +46,30 @@ RE_EVAL_POOL_SIZE = "1000"
 # repeatedly seen below half the market-cap gate are dropped from the pool
 # (pre-qualification filter), so the sweep budget concentrates on realistic
 # candidates. Slots = sweep ÷ the pool cache TTL below (capped at 12 near
-# and 48 far by src/config.ts, which these values now saturate: 18/1.5 = 12
-# and 72/1.5 = 48).
+# and 48 far by src/config.ts; 3/1.5 = 2 and 18/1.5 = 12 slots here).
 #
-# WHY SO MANY SLOTS (2026-09-15 coverage audit): a band's per-visit LIMIT is
-# a hard cap, and the bands are read in signal order (max mcap first) — so
-# with only 2/6 slots each sub-window held far more coins than the LIMIT,
-# and every visit re-read that same signal-ordered head. The rest of the
-# band was never read at all, however often its slot came around: 13,724
-# never-pushed coins were eligible in the age window while the pool query
-# returned 623, and a whole age bucket (3,070 coins aged 6–12h) came back
-# EMPTY. Narrowing each sub-window until it fits under the LIMIT is what
-# makes the sweep actually cover the window: near ≈ 0.5h per slot (~250
-# coins vs a 490 limit), far ≈ 0.4h per slot (~200 vs 210). Cost: a coin in
-# the tail is re-checked every 72 min instead of every 9 — coverage beats
-# cadence, because a coin read once per hour can be pushed and one that is
-# never read cannot. Lower these (they must stay multiples of the pool
-# cache TTL) to trade coverage back for cadence.
-REEVAL_NEAR_SWEEP_MIN = "18"
-REEVAL_FAR_SWEEP_MIN = "72"
+# SIZING THE BANDS (2026-09-15 audit, measured against /debug/pool): a band's
+# per-visit LIMIT is a hard cap and bands are read in signal order (max mcap
+# first), so a sub-window holding MORE than its LIMIT is truncated to the
+# same signal-ordered head on every visit — the rest of that sub-window is
+# never read, however often its slot comes around. The live probe showed the
+# far band pinned exactly at its 210-row limit (12–24h: 111 + 24–43h: 99)
+# while the near band came back at 413 of its 490, i.e. the FAR zone starves
+# and the NEAR zone does not. 12 far slots narrow each sub-window to ~1.6h
+# (~105 prune-passing coins, comfortably under 210) so the far sweep covers
+# its zone instead of re-reading a head; a full far sweep is 18 min. NEAR
+# stays at 2 slots (~3 min) because its zone already fits. Sizing down from
+# here reintroduces far-zone starvation; sizing far UP only shrinks the
+# per-tick pool (each tick reads one near + one far sub-window), which costs
+# evaluations per minute for no extra coverage. Both must stay multiples of
+# the pool cache TTL.
+REEVAL_NEAR_SWEEP_MIN = "3"
+REEVAL_FAR_SWEEP_MIN = "18"
 # Re-eval pool query cache TTL + rotation period, in seconds. The pool query
 # is the scan's dominant Turso rows-read consumer; it re-runs once per TTL
 # per isolate, and each expiry advances the rotation slot (slots = sweep ÷
 # TTL, so this value MUST stay aligned with the sweep vars above). 90s =
-# 1.5-min cache: sweeps at 18/72 min, hot-zone membership refreshed every
+# 1.5-min cache: sweeps at 3/18 min, hot-zone membership refreshed every
 # 1.5 min, pool-query rows-read ≈ ×2 the 180s cadence — still a small
 # share of the Turso free tier's 500M rows-read/month (see /debug/pool for
 # live signals). NOTE: cron frequency is hard-capped at 1 scan/min (Cloudflare

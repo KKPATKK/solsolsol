@@ -55,33 +55,43 @@ function tmpDb() {
 async function main() {
   // ---------- re-eval pool coverage (config slot counts) ----------
 
-  // The 2026-09-15 coverage fix depends on the slot counts saturating the
-  // config caps: a band's per-visit LIMIT only stops starving the band when
-  // its sub-window fits under that LIMIT, and narrowing the sub-windows is
-  // what the short sweeps buy. If these ever silently drop back to 2/6 slots
-  // the pool query re-reads the same signal-ordered head every visit and
-  // whole age buckets go unread (13,724 eligible coins, pool returning 623,
-  // one 3,070-coin bucket empty) — the exact bug this test prevents.
-  await test("loadConfig: re-eval slot counts saturate the caps at the 18/72-min sweeps", () => {
+  // The 2026-09-15 coverage fix sizes the far zone so each of its
+  // sub-windows fits under the band's per-visit LIMIT: the live probe showed
+  // the far band pinned exactly at 210 rows (its cap) while the near band
+  // came back at 413 of 490, i.e. only the far zone re-read the same
+  // signal-ordered head every visit. 18-min sweeps give 12 far slots of
+  // ~1.6h each; the near zone needs no extra slots because it already fits.
+  // If these numbers drift, the far zone silently starves again (its oldest
+  // coins never read) — the bug this test prevents.
+  await test("loadConfig: 3/18-min sweeps give a full-coverage far zone", () => {
     const c = loadConfig({
-      REEVAL_NEAR_SWEEP_MIN: "18",
-      REEVAL_FAR_SWEEP_MIN: "72",
+      REEVAL_NEAR_SWEEP_MIN: "3",
+      REEVAL_FAR_SWEEP_MIN: "18",
       REEVAL_POOL_CACHE_SECONDS: "90",
     });
     assert.equal(c.reevalPoolCacheMs, 90_000);
-    assert.equal(c.reevalNearSlots, 12);
-    assert.equal(c.reevalFarSlots, 48);
+    assert.equal(c.reevalNearSlots, 2);
+    assert.equal(c.reevalFarSlots, 12);
     // Slots × cache TTL is the advertised full-sweep cadence.
-    assert.equal((c.reevalNearSlots * c.reevalPoolCacheMs) / 60_000, 18);
-    assert.equal((c.reevalFarSlots * c.reevalPoolCacheMs) / 60_000, 72);
-    // Legacy 3/9-min values still map to the old small slot counts.
-    const legacy = loadConfig({
-      REEVAL_NEAR_SWEEP_MIN: "3",
-      REEVAL_FAR_SWEEP_MIN: "9",
-      REEVAL_POOL_CACHE_SECONDS: "90",
-    });
-    assert.equal(legacy.reevalNearSlots, 2);
-    assert.equal(legacy.reevalFarSlots, 6);
+    assert.equal((c.reevalNearSlots * c.reevalPoolCacheMs) / 60_000, 3);
+    assert.equal((c.reevalFarSlots * c.reevalPoolCacheMs) / 60_000, 18);
+    // A far sub-window must stay under the far band LIMIT (210 rows at the
+    // 1000-row pool) for the sweep to actually cover the zone.
+    const farZoneHours = 26 - 6.8;
+    const rowsPerFarSlot = farZoneHours / c.reevalFarSlots;
+    assert.ok(
+      rowsPerFarSlot <= 2.5,
+      `far sub-window ${rowsPerFarSlot.toFixed(2)}h is too wide to fit under the band LIMIT`,
+    );
+    // Legacy 9-min value still maps to the old 6 slots.
+    assert.equal(
+      loadConfig({
+        REEVAL_NEAR_SWEEP_MIN: "3",
+        REEVAL_FAR_SWEEP_MIN: "9",
+        REEVAL_POOL_CACHE_SECONDS: "90",
+      }).reevalFarSlots,
+      6,
+    );
   });
 
   // ---------- scanner.ts re-eval pool rotation slice ----------
