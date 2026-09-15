@@ -75,19 +75,29 @@ const SCAN_TIMEOUT_MS = 25_000;
  * FLURRY_BUDGET_MS is cut to 8s (wrangler.toml) so it fits whenever ≥8s
  * remain (post-feed ticks with a fast pool read) and the gate is live
  * again, bounded well inside the race.
+ *
+ * 2026-09-15: 11s → 5s, tracking the worker's new envelope (see
+ * SCAN_TICK_BUDGET_MS / SCAN_FLUSH_RESERVE_MS there): the race now cuts the
+ * scan at ~5.6s so the completion flush always starts ~6s into the tick,
+ * and the internal deadline sits just under it (5s) so every phase stops
+ * on its own terms at a boundary — a full summary, no zombie tail — instead
+ * of being frozen by the invocation kill mid-await. Every phase budget
+ * below was scaled to the same window; the rotation slice + re-eval pool
+ * absorb the shorter scan (latency, not coverage).
  */
-const SCAN_TICK_DEADLINE_MS = 11_000;
+const SCAN_TICK_DEADLINE_MS = 5_000;
 /**
  * Cap on how long one Flurry analyze() may wait inside the tick (see the
  * call site). analyze() races its RPCs against the deadline it is given, so
  * a hung Helius call otherwise holds the tick for the full remainder -
  * including the seconds the completion flush needs to land before
  * Cloudflare's invocation kill (2026-09-13 dead-tick shape: candidates on
- * 12s-timeout ticks while the flush never landed). 3s bounds the worst-case
- * wait to the typical pre-flush remainder while still allowing the
- * analysis to start whenever >=2.5s of usable time remains.
+ * 12s-timeout ticks while the flush never landed). 1.5s bounds the
+ * worst-case wait inside the 5s deadline while still allowing the analysis
+ * to start whenever ~2s of usable time remains (FLURRY_BUDGET_MS is 2s in
+ * wrangler.toml, so the gate stays live on ticks with a fast feed phase).
  */
-const FLURRY_ANALYZE_CAP_MS = 3_000;
+const FLURRY_ANALYZE_CAP_MS = 1_500;
 /**
  * Wall-clock cap for the discovery-feed phase (feeds run sequentially, each
  * best-effort). Evidence 2026-09-07 ~18:30Z: timeout rows pinned at ms≈11.1s
@@ -120,8 +130,14 @@ const FLURRY_ANALYZE_CAP_MS = 3_000;
  * CONCURRENTLY: worst case is max(feed) not sum(feed), returning ~3s per
  * tick to the pool evaluation + gates (the phases that actually qualify
  * coins). Cap stays 4500 — it now bounds only genuinely hung feeds.
+ *
+ * 2026-09-15: 4500 → 2400 with the rest of the tick ladder (see
+ * SCAN_TICK_DEADLINE_MS). The fan-out already returns ~3s in the healthy
+ * case, so the visible discovery loss is limited to the 429-backoff
+ * stretches; leaving feeds 2.4s of the ~5.6s race is what keeps pool eval
+ * + gates (the phases that qualify coins) funded on every tick.
  */
-const FEED_DEADLINE_MS = 4_500;
+const FEED_DEADLINE_MS = 2_400;
 /**
  * Wall-clock cap for the re-eval pool DB read and the token_stats prune
  * (both race against this deadline; see the call sites). Evidence
@@ -133,8 +149,14 @@ const FEED_DEADLINE_MS = 4_500;
  * never lands. Racing these reads converts the wedge into a normal
  * (diagnosable) timeout row whenever the client recovers, and keeps the
  * scanner's phase budget honest when it doesn't.
+ *
+ * 2026-09-15: 4000 → 2200 with the tick ladder (see SCAN_TICK_DEADLINE_MS):
+ * the pool read plus the slice's pair fetches must fit the ~5.6s race
+ * alongside the feeds, and a pool read that needs more than 2.2s is the
+ * hang this race exists to convert into a timeout (the slice defers, the
+ * pool row survives, the next tick re-reads it).
  */
-const POOL_FETCH_BUDGET_MS = 4_000;
+const POOL_FETCH_BUDGET_MS = 2_200;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the

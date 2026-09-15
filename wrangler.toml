@@ -74,14 +74,14 @@ PUMPFUN_PROFILE_LIMIT = "0"
 # Coverage unchanged: the feed cap still bounds the phase, it just fits more
 # coins inside it before the cap trips.
 JUPITER_REQUEST_INTERVAL_MS = "500"
-# Flurry launch forensics per-coin budget. 2026-09-13: 15s → 8s. The scan's
-# internal deadline is now 11s (matching the worker's ~10-11s race cut), so
-# a 15s budget NEVER fit under it — the deploy-slot bundle gate has been
-# silently deferred (fail-open = disabled) since the 12s race era. At 8s it
-# fits whenever ≥8s remain (fast-pool ticks) and stays bounded inside the
-# race. Verdicts are cached per mint, so a deferred coin is analyzed on the
-# next sweep at 0 extra RPC.
-FLURRY_BUDGET_MS = "8000"
+# Flurry launch forensics per-coin budget. 2026-09-15: 8s → 2s, tracking the
+# tick ladder (the scan's internal deadline is 5s and the worker's race cuts
+# at ~5.6s so the completion flush always lands — see SCAN_TICK_BUDGET_MS).
+# The guard defers when less than the budget remains, so 2s is the largest
+# value that still lets the gate run on ticks with a fast feed phase; a
+# bigger value silently disables it (fail-open) again. Verdicts are cached
+# per mint, so a deferred coin is analyzed on the next sweep at 0 extra RPC.
+FLURRY_BUDGET_MS = "2000"
 PUSH_WATCH_WINDOW_HOURS = "26"
 # Insider self-pump gate: rejects pushes where newWallets/checked top-holder
 # wallets exceeds WALLET_NEW_RATIO_MAX (the Cheems shape — 8/8 profiled

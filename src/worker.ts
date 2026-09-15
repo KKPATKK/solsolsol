@@ -237,7 +237,37 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
  */
-const SCAN_TICK_BUDGET_MS = 12_000;
+const SCAN_TICK_BUDGET_MS = 9_500;
+/**
+ * Wall-clock slice RESERVED at the end of every tick for the completion
+ * flush (heartbeat + scan_history row + lock release) and the streak
+ * bookkeeping behind it. The race now ends at
+ * `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRaceSpend` instead of
+ * at the whole budget, so the flush ALWAYS starts ~6s in and every await
+ * on it is bounded by what is left of this reserve — the flush can no
+ * longer be pushed past the kill point by a slow scan or a slow Turso
+ * write.
+ *
+ * 2026-09-15 (dead-tick fix, the worst observed state): with the 12s
+ * budget every CRON tick died before its flush for hours (12:01-13:24Z:
+ * 60+ consecutive rows `previous tick died before its completion flush`,
+ * heartbeat frozen at phase=scanning while the claim landed every minute;
+ * 20+ more at 12:52-13:14Z). Signature: HTTP-triggered runs (generous
+ * wall clock) completed the SAME work in 9.6-12.5s and flushed fine,
+ * while cron invocations never did — so the effective cron kill had
+ * drifted BELOW the ~12.3s flush start, not into the mid-teens window the
+ * earlier cuts were chasing. Evidence for the new envelope: cron ticks
+ * that DID land flushed at 8.7-9.6s (13:07:31 ms=8657, 11:18:36 ms=5384,
+ * 11:19:37 ms=6414), i.e. the kill sits just past ~9.6s. A 9.5s total
+ * tick with a 3.5s flush reserve starts the flush at ~6s and lands it at
+ * ~6.5-7s — ~2.5-3s of margin against the earliest observed kill, instead
+ * of the ~0.2s the old layout had. The lost scan seconds are absorbed by
+ * the rotation slice + re-eval pool (a shorter budget costs tick latency,
+ * never coin coverage), and a completed 6s scan every minute beats a dead
+ * 12s tick that evaluates nothing — which is exactly why no qualifying
+ * coin has been pushed since 2026-09-06.
+ */
+const SCAN_FLUSH_RESERVE_MS = 3_500;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -725,6 +755,17 @@ async function runScan(
       // inside the same wall-clock window no matter how slow the pre-race
       // phase was. The constant's floor still applies to ticks with a fast
       // pre-race (the common case).
+      // The race ends EARLY, leaving SCAN_FLUSH_RESERVE_MS for the
+      // completion flush below: the tick envelope is then
+      // preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS no matter how slow
+      // the pre-race phase was, so there is always time left to land the
+      // flush before Cloudflare kills the invocation.
+      const scanRaceMs = Math.max(
+        2_500,
+        SCAN_TICK_BUDGET_MS -
+          SCAN_FLUSH_RESERVE_MS -
+          (Date.now() - startedAt),
+      );
       await Promise.race([
         scanner.runOnce(),
         new Promise<void>((resolve) => {
@@ -739,7 +780,7 @@ async function runScan(
             // kill (the recurring 5-20 min zero-row holes).
             scanner?.abort();
             resolve();
-          }, Math.max(4_000, SCAN_TICK_BUDGET_MS - (Date.now() - startedAt)));
+          }, scanRaceMs);
         }),
       ]);
       lastScanOk = !timedOut;
@@ -807,6 +848,18 @@ async function runScan(
           },
           scanLock,
         ) ?? Promise.resolve();
+      const flushStartedAt = Date.now();
+      // Every await on the flush path is bounded by what is LEFT of the
+      // reserve (never by a fixed 2.5s that could overrun it): the tick can
+      // no longer spend its last seconds inside an abandoned retry while
+      // Cloudflare kills the invocation just before the batch commits.
+      const flushDeadline = flushStartedAt + SCAN_FLUSH_RESERVE_MS;
+      // The 250ms floor keeps a last-gasp attempt alive long enough to be
+      // useful, but every step re-reads the deadline and the retries below
+      // are skipped outright once it has passed — so stacked attempts can
+      // never walk the tick past the reserve into the kill window.
+      const remainingFlushMs = () =>
+        Math.max(250, flushDeadline - Date.now());
       let settled = false;
       const attempt1 = flushCompletion();
       const mark = attempt1.then(
@@ -821,13 +874,28 @@ async function runScan(
       try {
         await Promise.race([
           mark,
-          new Promise((resolve) => setTimeout(resolve, 2500)),
+          new Promise((resolve) =>
+            setTimeout(resolve, Math.min(2_500, remainingFlushMs())),
+          ),
         ]);
-        if (!settled) {
+        if (!settled && Date.now() < flushDeadline) {
           console.error(
             "[worker] completion write hung — firing racing retry",
           );
-          await flushCompletion();
+          // The racing retry is bounded by the reserve too. It is awaited
+          // only through the race; its own settlement still records the
+          // flush proof when it lands in time (the batch is idempotent).
+          const racing = flushCompletion();
+          racing.then(
+            () => {
+              flushSettled = true;
+            },
+            () => {},
+          );
+          await Promise.race([
+            racing.catch(() => {}),
+            new Promise((resolve) => setTimeout(resolve, remainingFlushMs())),
+          ]);
         } else {
           // Success resolves here; a settled rejection throws into the
           // catch below for the backoff retry.
@@ -835,22 +903,34 @@ async function runScan(
         }
       } catch (err) {
         console.error("[worker] completion write failed — retrying once:", err);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (Date.now() >= flushDeadline) {
+          console.error(
+            "[worker] flush reserve exhausted — leaving the row to the next tick's backfill",
+          );
+        } else {
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(300, remainingFlushMs() / 2)),
+        );
         try {
-          // Bound the retry too: the previous unbounded await let a
-          // hanging retry consume every remaining pre-kill second
-          // (2026-09-13: the hard-wall error arrives only after
-          // DB_REQUEST_TIMEOUT_MS*1.2, which alone can outlive the
-          // flush window). The idempotent batch makes a late commit
-          // from the abandoned retry harmless.
+          // Bound the retry by the reserve: the hard-wall error arrives
+          // only after DB_REQUEST_TIMEOUT_MS*1.2, which alone can outlive
+          // the flush window. The idempotent batch makes a late commit
+          // from the abandoned retry harmless. A retry that lands inside
+          // the bound IS the flush proof (it clears the dead-tick streak).
           const retry = flushCompletion();
+          retry.then(
+            () => {
+              flushSettled = true;
+            },
+            () => {},
+          );
           await Promise.race([
             retry,
-            new Promise((resolve) => setTimeout(resolve, 2500)),
+            new Promise((resolve) => setTimeout(resolve, remainingFlushMs())),
           ]);
-          await retry.catch(() => {});
         } catch (err2) {
           console.error("[worker] completion retry failed:", err2);
+        }
         }
       }
     }
@@ -901,7 +981,12 @@ async function runScan(
       wedgedStateResets++;
       rebuilt = true;
     }
-    if (rebuilt) {
+    // Only rebuild when the tick still has room: re-init costs DB round
+    // trips, and spending them here would eat the very margin that lets the
+    // next tick's flush land (the failure this guard exists to prevent).
+    // When it is too late, defer: initPromise stays null and the next tick's
+    // ensureInitialized (called by the handler before runScan) rebuilds.
+    if (rebuilt && Date.now() - startedAt < SCAN_TICK_BUDGET_MS) {
       // Rebuild synchronously so the NEXT request (likely the UptimeRobot
       // /health poll seconds later) finds a ready scanner instead of paying
       // the init cost inside its own wall-clock window.
@@ -913,6 +998,10 @@ async function runScan(
           err instanceof Error ? err.message : err,
         );
       }
+    } else if (rebuilt) {
+      console.warn(
+        "[worker] module state rebuilt after the tick budget — deferring re-init to the next tick",
+      );
     }
     // Safety net only: normally the completion batch already released the
     // lock (exact-value DELETE). This runs when the flush itself threw
