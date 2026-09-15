@@ -108,7 +108,8 @@ class Throttle {
  * timings the scanner reports live (feeds ~0.9s + pool read ~1.0s +
  * push-watch ~0.7s before this phase, so ~2.6s of the ~5.1s race is already
  * spent): the fetch dispatches a batch every DEX_REQUEST_INTERVAL_MS
- * (350ms) and cannot usefully start more than ~4 inside that remainder, so
+ * (350ms → 250ms via wrangler.toml; ~5 → ~6 batches inside the pairs cap)
+ * and cannot usefully start more than ~6 inside that remainder, so
  * a larger cap only delays the GATE phase past the race — which is how a
  * tick ends up with `agedEval 0`, every fails counter at 0 and a whole
  * fetch discarded. Capping earlier converts those into ticks whose gates
@@ -116,6 +117,17 @@ class Throttle {
  * slice, which costs no request at all). Skipped tokens keep their pool slot
  * and are re-read on the next rotation slot: the cost of the cap is
  * latency, never coverage.
+ *
+ * 2026-09-15 (later): dispatch spacing 350 → 250ms (DEX_REQUEST_INTERVAL_MS,
+ * wrangler.toml). This cap is unchanged — what changes is how many
+ * 30-address batches fit inside it. Starts are spaced globally by the shared
+ * Throttle, so a 1.5s window held 5 dispatch slots at 350ms and holds 6 at
+ * 250ms: ~30 more addresses fetched per tick for the same wall clock and the
+ * same rows read from Turso. This is the "smaller throttle spacing" lever
+ * the scanner's slice sizing points at. Watch /health → dex.http429: a
+ * rising counter means the shared egress IP is being rate-limited again, and
+ * the fix is to restore 350 (or higher) via DEX_REQUEST_INTERVAL_MS rather
+ * than to touch this cap.
  */
 const PAIRS_FETCH_BUDGET_MS = 1_500;
 /**
@@ -149,6 +161,20 @@ const PAIR_BATCH_BACKOFF_MS = 90_000;
  */
 const PAIR_BATCH_CONCURRENCY = 3;
 
+/**
+ * Telemetry hooks so the worker can persist rate-limit events cross-isolate:
+ * the client itself has no DB handle, and a 429 arms a 90s cache-only backoff
+ * that must be visible from any isolate serving /health, not just the one
+ * that happened to run the scan.
+ */
+export interface DexScreenerHooks {
+  /**
+   * Fired once per rate-limit episode (the first 429, not every retry
+   * attempt of it), after the cache-only backoff is armed.
+   */
+  onBatch429?: (at: number) => void;
+}
+
 export class DexScreenerClient {
   private readonly throttle: Throttle;
   /** Fresh pair data by token (see PAIR_CACHE_TTL_MS). Insertion-ordered. */
@@ -156,11 +182,70 @@ export class DexScreenerClient {
     string,
     { pair: PairInfo; at: number }
   >();
-  /** Until this epoch the batched endpoint 429'd — serve cache only. */
+  /** Until this epoch the endpoint 429'd — serve pair cache only. */
   private batchBlockedUntil = 0;
+  /** 429 responses seen by this isolate (incl. retry attempts). */
+  private http429Total = 0;
+  /** Epoch of the most recent 429 response, or null if never. */
+  private last429At: number | null = null;
 
-  constructor(private readonly config: AppConfig) {
+  constructor(
+    private readonly config: AppConfig,
+    private readonly hooks: DexScreenerHooks = {},
+  ) {
     this.throttle = new Throttle(config.dexRequestIntervalMs);
+  }
+
+  /**
+   * Live rate-limit telemetry for /health: the configured dispatch spacing
+   * (DEX_REQUEST_INTERVAL_MS), how often the shared egress IP has been 429'd
+   * since this isolate booted, and how long the cache-only backoff still has
+   * to run. `blockedForMs > 0` means the batched endpoint is refusing us and
+   * every tick is serving cache-only until it clears.
+   */
+  getStats(): {
+    intervalMs: number;
+    http429: number;
+    last429At: number | null;
+    blockedForMs: number;
+    cacheSize: number;
+  } {
+    return {
+      intervalMs: this.config.dexRequestIntervalMs,
+      http429: this.http429Total,
+      last429At: this.last429At,
+      blockedForMs: Math.max(0, this.batchBlockedUntil - Date.now()),
+      cacheSize: this.pairCache.size,
+    };
+  }
+
+  /**
+   * Record a 429 and arm the cache-only backoff. Called from getJson — the
+   * only place the status is visible — because the pair path's retry loop
+   * turns a budgeted 429 into a `null` response (attempt 2 sees the deadline
+   * already gone and returns null instead of throwing), so the batch loop's
+   * own /429/ check never ran on the real path: the backoff never armed and a
+   * rate-limited tick looked identical to an empty one. Counting here makes
+   * the limit observable (getStats → scan summary → /health) and lets the
+   * next tick go straight to cache-only.
+   *
+   * One hook per episode: a storm is 3 retry attempts × N batches, and the
+   * hook writes to Turso, so re-notifying while the backoff is already armed
+   * would turn a rate limit into a write flood. The counter still increments
+   * per response (that is the drip signal); only the notify is debounced.
+   */
+  private note429(): void {
+    const now = Date.now();
+    const episodeStart = now >= this.batchBlockedUntil;
+    this.http429Total++;
+    this.last429At = now;
+    this.batchBlockedUntil = now + PAIR_BATCH_BACKOFF_MS;
+    if (!episodeStart) return;
+    try {
+      this.hooks.onBatch429?.(now);
+    } catch {
+      // telemetry only — never fail a request over a counter write
+    }
   }
 
   /**
@@ -187,6 +272,7 @@ export class DexScreenerClient {
             ),
           }),
         );
+        if (res.status === 429) this.note429();
         if (res.status === 429 || res.status >= 500) {
           throw new Error(`DexScreener HTTP ${res.status}`);
         }
@@ -354,9 +440,9 @@ export class DexScreenerClient {
     // worker halts new dispatches and the caller backs off across ticks.
     const workerCount = Math.min(PAIR_BATCH_CONCURRENCY, batches.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
-    if (saw429) {
-      this.batchBlockedUntil = Date.now() + PAIR_BATCH_BACKOFF_MS;
-    }
+    // `saw429` only stops the remaining batches of THIS call; the backoff and
+    // the telemetry were already handled by note429 in getJson (which sees the
+    // status even when the retry loop degrades it to a null response).
     if (this.pairCache.size > PAIR_CACHE_MAX) {
       // Evolve oldest-first (Map preserves insertion order).
       for (const k of this.pairCache.keys()) {

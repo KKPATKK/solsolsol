@@ -310,8 +310,16 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * throttle spacing, or a batch cache that is warmer than 3 min); the pair
  * cache already serves repeat coins for free, and coins left over stay in
  * the pool and are re-read on the next slot.
+ *
+ * 2026-09-15 (later): 150 → 160, sized to the new dispatch spacing. The
+ * throttle went 350 → 250ms (DEX_REQUEST_INTERVAL_MS), which fits ~6 batches
+ * inside the same 1.5s pairs cap instead of ~5; 160 slice + the feed's ~20
+ * coins = 180 addresses = exactly 6 batches of 30, so every requested address
+ * is now actually fetched instead of the last 20 being silently dropped past
+ * the deadline. Same rule as above: this number moves only with the fetch
+ * rate, and the pair cache keeps serving repeat coins for free on top.
  */
-const RE_EVAL_PER_TICK_MAX = 150;
+const RE_EVAL_PER_TICK_MAX = 160;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
@@ -424,6 +432,26 @@ export interface ScanSummary {
   flurryRpcCalls: number;
   /** Flurry cache hits (verdicts reused without RPC). */
   flurryCacheHits: number;
+  /**
+   * DexScreener rate-limit telemetry (DexScreenerClient.getStats), the
+   * monitor for the DEX_REQUEST_INTERVAL_MS dispatch spacing: `intervalMs`
+   * is the live spacing, `http429` the 429 responses this isolate's client
+   * has seen since boot (retry attempts included — a batch retries 3×), and
+   * `blockedForMs` the cache-only backoff still to run (>0 = the shared
+   * egress IP is limiting the endpoint right now, so every tick is serving
+   * pair-cache hits only), and `cacheSize` how many fresh pair rows are
+   * served for free instead of refetched. Carried
+   * on the summary because that is what reaches Turso with the heartbeat —
+   * so the numbers are readable from any isolate, not just the one that
+   * scanned. Sampling it after a spacing change is the whole 429 check.
+   */
+  dex?: {
+    intervalMs: number;
+    http429: number;
+    last429At: number | null;
+    blockedForMs: number;
+    cacheSize: number;
+  };
   /** Per-coin rejection trace for the last scan (bounded). */
   rejects: RejectionEntry[];
 }
@@ -987,6 +1015,7 @@ export class Scanner {
       flurryAnalyzed: 0,
       flurryRpcCalls: 0,
       flurryCacheHits: 0,
+      dex: this.dex.getStats(),
       rejects: [],
     };
     // abort() publishes this snapshot if the tick's race trips mid-scan

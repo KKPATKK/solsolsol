@@ -824,6 +824,62 @@ export class Db {
     );
   }
 
+  /**
+   * Record a DexScreener batched-endpoint 429, cross-isolate. The scan that
+   * trips the limit can run in any isolate, so a per-isolate counter would
+   * read 0 from whichever isolate answers /health — the total and the recent
+   * event ring live in Turso instead (same shape as bumpScheduledTick: one
+   * read for all three keys, one batched write). Cheap by construction: a 429
+   * also arms the client's 90s cache-only backoff, so this fires at most a
+   * few times an hour even when the shared egress IP is being limited.
+   */
+  async bumpDex429(at: number): Promise<void> {
+    const c = this.connect();
+    const res = await c.execute({
+      sql: `SELECT key, value FROM worker_state
+            WHERE key IN ('dex_429_total', 'dex_429_at', 'dex_429_ring')`,
+      args: [],
+    });
+    const vals = new Map<string, string>();
+    for (const r of res.rows) {
+      vals.set(String(r.key), String(r.value));
+    }
+    const prev = parseInt(vals.get("dex_429_total") ?? "0", 10) || 0;
+    // Ring of the last 50 rate-limit events, so a burst is diagnosable
+    // afterwards (are they clustered around a deploy, a feed storm, or a
+    // steady drip?) instead of collapsing into a single "last seen" time.
+    let ring: number[] = [];
+    const rawRing = vals.get("dex_429_ring");
+    if (rawRing) {
+      try {
+        const parsed = JSON.parse(rawRing);
+        if (Array.isArray(parsed)) {
+          ring = parsed.filter((v): v is number => typeof v === "number");
+        }
+      } catch {
+        // corrupted ring — start fresh
+      }
+    }
+    ring.push(at);
+    await c.batch(
+      [
+        {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('dex_429_total', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [String(prev + 1)],
+        },
+        {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('dex_429_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [String(at)],
+        },
+        {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('dex_429_ring', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [JSON.stringify(ring.slice(-50))],
+        },
+      ],
+      "write",
+    );
+  }
+
   private async addColumnIfMissing(
     table: string,
     column: string,

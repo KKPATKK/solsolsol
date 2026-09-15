@@ -87,6 +87,22 @@ PUMPFUN_PROFILE_LIMIT = "0"
 # Coverage unchanged: the feed cap still bounds the phase, it just fits more
 # coins inside it before the cap trips.
 JUPITER_REQUEST_INTERVAL_MS = "500"
+# DexScreener dispatch spacing, ms (code default 350). 2026-09-15: 350 → 250.
+# The pair phase is a fixed 1.5s window (PAIRS_FETCH_BUDGET_MS) and the shared
+# throttle spaces every request START, so the window held 5 dispatch slots at
+# 350ms and holds 6 at 250ms — one more 30-address batch per tick, i.e. ~30
+# more coins actually fetched/evaluated per scan for the same wall clock and
+# the same Turso rows read (the slice was raised to 160 to match). This is the
+# shared egress IP's rate limit, so it is measured, not assumed: /health →
+# heartbeat.summary.dex (and /health.summary.dex) reports intervalMs /
+# http429 / blockedForMs per tick, and the heartbeat's dex429Total plus the
+# Turso row behind db.bumpDex429 count every rate-limit episode fleet-wide. A
+# flat http429 with blockedForMs 0 means 250ms is being absorbed; a climbing
+# count means the endpoint is limiting us again and this goes back to 350 (or
+# higher). The 429 path itself is unchanged: one hit arms a 90s cache-only
+# backoff (PAIR_BATCH_BACKOFF_MS), so the failure mode is lost coverage for a
+# minute, never a hammering loop.
+DEX_REQUEST_INTERVAL_MS = "250"
 # Flurry launch forensics per-coin budget. 2026-09-15: 8s → 2s, tracking the
 # tick ladder (the scan's internal deadline is 5s and the worker's race cuts
 # at ~5.6s so the completion flush always lands — see SCAN_TICK_BUDGET_MS).

@@ -133,6 +133,29 @@ let tradeConfigured = false;
 // Whether the JUPITER_API_KEY secret reached the Worker (presence only —
 // requests then carry the x-api-key header for higher rate limits).
 let jupiterKeyed = false;
+// DexScreener rate-limit telemetry. The per-isolate client counter (see
+// DexScreenerClient.getStats) only ever reflects the isolate answering a
+// request, so a 429 is also persisted cross-isolate in Turso (db.bumpDex429)
+// and mirrored here for the cheap /health read.
+let dex429Total = 0;
+let dex429At: number | null = null;
+
+/**
+ * Cross-isolate 429 bookkeeping: the scan that trips DexScreener's batched
+ * limit may run in any isolate, so the count lives in Turso while this
+ * module-local mirror keeps /health from reading it twice per request. This
+ * is the "is 250ms spacing safe?" monitor for DEX_REQUEST_INTERVAL_MS —
+ * fired from the client's hook, never from the scan's critical path.
+ */
+async function recordDex429(at: number): Promise<void> {
+  dex429Total++;
+  dex429At = at;
+  try {
+    await db?.bumpDex429(at);
+  } catch {
+    // telemetry only — never fail a scan over a counter write
+  }
+}
 
 /**
  * Fingerprint of the env-derived trade settings (presence only — never the
@@ -415,7 +438,11 @@ async function ensureInitialized(env: Env): Promise<void> {
       console.warn("[worker] TURSO_DATABASE_URL missing — persistence disabled");
     }
 
-    dex = new DexScreenerClient(config);
+    dex = new DexScreenerClient(config, {
+      onBatch429: (at) => {
+        void recordDex429(at);
+      },
+    });
 
     if (config.telegramBotToken) {
       birdeye = null;
@@ -660,6 +687,17 @@ async function runScan(
     ms: null,
     err: null,
     skip: scanner?.lastSkip ?? null,
+    // DexScreener rate-limit watch for the 250ms dispatch spacing: the live
+    // client stats (intervalMs / http429 / blockedForMs / cacheSize) plus the
+    // fleet-wide 429-episode total mirrored in Turso by db.bumpDex429. Written
+    // every tick with the claim, so /health.heartbeat always carries it —
+    // `blockedForMs > 0` is the "we are being limited right now" signal and
+    // a rising dex429Total is the "250ms is too fast, restore 350" signal.
+    // The completed-scan copy rides the summary (scanner publishes the same
+    // getStats object), so a 429 is visible whichever heartbeat is freshest.
+    dex: dex?.getStats() ?? null,
+    dex429Total,
+    dex429At,
   });
   if (db) {
     try {

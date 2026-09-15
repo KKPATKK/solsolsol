@@ -136,6 +136,52 @@ async function main() {
     }
   });
 
+  await test("DexScreenerClient: a 429 is observable and arms the cache-only backoff", async () => {
+    // The pair path retries with a deadline, so a budgeted 429 comes back as
+    // a `null` response instead of a throw — the batch loop's own /429/ check
+    // never ran and a rate-limited tick was indistinguishable from an empty
+    // one. The status is now recorded in getJson (the only place it is
+    // visible), which is what getStats() and the /health dex block report.
+    const origFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return new Response("rate limited", { status: 429 });
+    };
+    const episodes = [];
+    try {
+      const cfg = loadConfig({
+        DEX_REQUEST_INTERVAL_MS: "0",
+        REEVAL_POOL_CACHE_SECONDS: "90",
+      });
+      const dex = new DexScreenerClient(cfg, {
+        onBatch429: (at) => episodes.push(at),
+      });
+      assert.equal(dex.getStats().http429, 0, "starts with no 429s");
+      assert.equal(dex.getStats().intervalMs, 0, "spacing comes from config");
+
+      const addrs = Array.from({ length: 30 }, (_, i) => `MINT${i}`.padEnd(44, "x"));
+      const pairs = await dex.fetchPairsForTokens(addrs);
+      assert.equal(pairs.size, 0, "a limited batch contributes no pairs");
+
+      const stats = dex.getStats();
+      assert.ok(stats.http429 >= 1, `http429 should count the 429 (got ${stats.http429})`);
+      assert.ok(stats.last429At !== null, "last429At is set");
+      assert.ok(stats.blockedForMs > 0, "the cache-only backoff is armed");
+      // One notify per episode, not per retry attempt / batch.
+      assert.equal(episodes.length, 1, `one hook per episode (got ${episodes.length})`);
+
+      // While the backoff is armed the next tick must not touch the wire at
+      // all — that is the whole point of arming it from getJson.
+      const before = calls;
+      await dex.fetchPairsForTokens(addrs);
+      assert.equal(calls, before, "blocked calls serve cache only (no requests)");
+      assert.equal(episodes.length, 1, "no duplicate episode notify while blocked");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   await test("Scanner.abort publishes the in-flight summary so timeout rows carry diagnostics", async () => {
     // Before the 2026-09-12 fix a tripped 12s race flushed summary:null —
     // no feedsMs, no pool, no phase counts — because runOnce only publishes
