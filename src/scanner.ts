@@ -85,7 +85,7 @@ const SCAN_TIMEOUT_MS = 25_000;
  * below was scaled to the same window; the rotation slice + re-eval pool
  * absorb the shorter scan (latency, not coverage).
  *
- * 2026-09-16: 5s → 4.6s, and — the actual fix — the front phases are now
+ * 2026-09-16: 5s → 4.2s, and — the actual fix — the front phases are now
  * capped so their SUM fits the front window (see SCAN_GATE_RESERVE_MS),
  * instead of each phase holding a cap that was sized in the 12s-race era.
  * Live evidence for why: the caps were FEED 1800 + POOL 2200 + PAIRS 1500 =
@@ -98,12 +98,20 @@ const SCAN_TIMEOUT_MS = 25_000;
  * `scan exceeded its ~5964ms race window … candidates 1, pushed 0`, and
  * from 06:36Z every tick died before its completion flush. A tick that
  * discovers candidates but never reaches the gates cannot push, which is
- * the zero-push stretch this fixes. 4.6s also sits a little under the
- * worker's ~5.0s race (see SCAN_FLUSH_RESERVE_MS there), so the scan still
- * ends on its own terms (a full summary, no zombie tail) instead of being
- * frozen mid-await.
+ * the zero-push stretch this fixes.
+ *
+ * The value itself must stay UNDER the worker's race window, not merely
+ * near it: the race is `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS -
+ * preRace` ≈ 4.5s at the current numbers, and a deadline above that is
+ * useless — the race freezes the scan mid-await before any deadline-clamped
+ * analyzer (supply flow, wallet analysis, Flurry) ever sees its own clamps,
+ * so the gate chain is cut half-done and the coin is never pushed. A live
+ * /debug/tick with the deadline at 4.6s did exactly that: race 4515ms fired
+ * first, `candidates: 1, pushed: 0`. 4.2s leaves ~300ms of margin for the
+ * widest pre-race spend, so every gate returns on its own terms and the
+ * push still lands inside the race.
  */
-const SCAN_TICK_DEADLINE_MS = 4_600;
+const SCAN_TICK_DEADLINE_MS = 4_200;
 /**
  * Wall-clock slice of the tick RESERVED for the gate/push phase — the ONLY
  * phase that can actually push a coin. The three front phases (discovery
@@ -111,7 +119,7 @@ const SCAN_TICK_DEADLINE_MS = 4_600;
  * `SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS` between them, and each of
  * their budgets is clamped to it, so their SUM can never consume the tick
  * again (the 2026-09-16 zero-push root cause: 1800 + 2200 + 1500 = 5500ms of
- * caps against a 5s deadline). Front-phase caps are ≥ their healthy-case
+ * caps against a 4.2s deadline). Front-phase caps are ≥ their healthy-case
  * need, so a healthy tick is unchanged — the reserve only becomes real
  * when an upstream is slow, and then it buys the gates/push the time the
  * starved tick used to lose. The re-eval pool absorbs anything the shorter
