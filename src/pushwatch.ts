@@ -39,14 +39,14 @@ import { tradeKeyboard } from "./bot";
  * re-claimed then and nothing is lost — see the checks in runTick).
  *
  * Sized as the tracker's SHARE of the scanner's front-phase window: feeds
- * 700 + tracker 700 + pool read 800 + pair fetch 1500 = 3700ms against the
- * 4.6s internal deadline, leaving the gate/push phase ~900ms even on a tick
+ * 600 + tracker 500 + pool read 600 + pair fetch 1250 = 2950ms against the
+ * 4.2s internal deadline, leaving the gate/push phase ≥1.25s even on a tick
  * where every front phase rides its cap (and ~2.5s on a normal tick, where
  * the caps are nowhere near binding). Before this bound the tracker was
  * awaited unbounded inside that window. The normal pass — one batched pair
  * lookup plus a handful of DB writes — costs ~300–600ms.
  */
-const TRACKER_TICK_BUDGET_MS = 700;
+const TRACKER_TICK_BUDGET_MS = 500;
 /** Rising-stage thresholds (%) above the push-time mcap → state suffix. */
 const RISING_STAGES = [50, 100, 200, 400] as const;
 /**

@@ -120,6 +120,15 @@ class Throttle {
  *
  * 2026-09-15 (later): dispatch spacing 350 → 250ms (DEX_REQUEST_INTERVAL_MS,
  * wrangler.toml). This cap is unchanged — what changes is how many
+ * 2026-09-16 (later): 1500 → 1250, funding the gate window on the re-cut
+ * tick ladder. The pair phase is the last front phase, and the candidate it
+ * fetches still has to be GATED before it can be pushed: live ticks that
+ * found one ended `candidates: 1, pushed: 0` because the ~2–3s gate chain
+ * (≈10 sequential awaits) only got ~1s. 1250ms still dispatches 5 slots at
+ * the 250ms spacing (150 addresses, minus the feed's ~15–20 — the slice is
+ * re-sized to match), so the coins actually fetched are unchanged in kind
+ * while the gates gain 250ms.
+ *
  * 30-address batches fit inside it. Starts are spaced globally by the shared
  * Throttle, so a 1.5s window held 5 dispatch slots at 350ms and holds 6 at
  * 250ms: ~30 more addresses fetched per tick for the same wall clock and the
@@ -129,7 +138,7 @@ class Throttle {
  * the fix is to restore 350 (or higher) via DEX_REQUEST_INTERVAL_MS rather
  * than to touch this cap.
  */
-const PAIRS_FETCH_BUDGET_MS = 1_500;
+const PAIRS_FETCH_BUDGET_MS = 1_250;
 /**
  * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
  * minute after minute), so re-fetching all ~550 addresses every tick burns

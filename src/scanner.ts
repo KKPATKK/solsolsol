@@ -201,7 +201,7 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  * overwhelmingly the sub-$10K-liquidity dust the pool prunes anyway (see
  * the RE_EVAL_PER_TICK_MAX notes).
  */
-const FEED_DEADLINE_MS = 700;
+const FEED_DEADLINE_MS = 600;
 /**
  * Wall-clock cap for the re-eval pool DB read and the token_stats prune
  * (both race against this deadline; see the call sites). Evidence
@@ -227,8 +227,14 @@ const FEED_DEADLINE_MS = 700;
  * is the hang this race exists to convert into a fast, diagnosable miss.
  * What it must NOT do is hold 2.2s while the pair phase and the gates wait
  * behind it — the shape that produced candidate-starved timeout rows.
+ *
+ * 2026-09-16 (later): 800 → 600, same gate-window funding: the pool read is
+ * a cache hit (90s TTL) on most ticks, so the cap only bites on the
+ * TTL-expiry tick or a slow Turso — and on those a fast, diagnosable miss
+ * (slice deferred to the next rotation slot) beats a pool that spent the
+ * candidate's gate window.
  */
-const POOL_FETCH_BUDGET_MS = 800;
+const POOL_FETCH_BUDGET_MS = 600;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the
@@ -381,7 +387,7 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * the deadline. Same rule as above: this number moves only with the fetch
  * rate, and the pair cache keeps serving repeat coins for free on top.
  */
-const RE_EVAL_PER_TICK_MAX = 160;
+const RE_EVAL_PER_TICK_MAX = 130;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
