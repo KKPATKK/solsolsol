@@ -103,6 +103,16 @@ JUPITER_REQUEST_INTERVAL_MS = "500"
 # backoff (PAIR_BATCH_BACKOFF_MS), so the failure mode is lost coverage for a
 # minute, never a hammering loop.
 DEX_REQUEST_INTERVAL_MS = "250"
+# Supply-flow (rug/distribution) per-coin budget. Two jobs: the upper bound
+# for what the analyzer may spend, and the unit the gate's start guard uses.
+# 2026-09-16: the guard compared the remaining tick time against this budget
+# with 15s as the default — larger than the whole scan deadline (~4.2s) — so
+# the gate deferred on EVERY coin and the check was silently dead (every card
+# showed 未分析). The guard now uses a 1.2s floor with this as the slice cap,
+# and the hard cap is clamped to the tick's remaining time, so the analysis
+# can neither be dead nor outlive the tick. Verdicts are cached per mint for
+# SUPPLY_FLOW_REFRESH_MIN, so re-sweeps cost 0 RPC.
+SUPPLY_FLOW_BUDGET_MS = "1500"
 # Flurry launch forensics per-coin budget. 2026-09-16: 2s → 1.2s, tracking
 # the re-cut tick ladder. The scan now reserves a GATE window for the
 # gate/push phase (scanner.ts SCAN_GATE_RESERVE_MS): the front phases must

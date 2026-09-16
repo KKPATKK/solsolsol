@@ -251,6 +251,61 @@ async function main() {
     }
   });
 
+  await test("Scanner.bestEffort: a hung chain step resolves with its fallback at the chain deadline", async () => {
+    // The 2026-09-16 zero-push shape: the candidate chain awaits ~11 live
+    // calls SERIALLY (RugCheck, crime checkToken, Axiom, Birdeye ×2, GMGN,
+    // Arkham, Jupiter organic, wallet analysis, Flurry), so a single hung
+    // upstream held the tick past the worker's race window and the coin —
+    // already through every gate — was never pushed (`candidates: 1,
+    // pushed: 0` on every such tick). bestEffort must (a) never fire a call
+    // when the deadline has already passed and (b) resolve with the caller's
+    // fallback when the call outlives the deadline, so the chain always
+    // reaches renderMessage + sendMessage.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const scanner = new Scanner(db, { api: { sendMessage: async () => ({}) } }, new DexScreenerClient(cfg), cfg, null, null, null);
+      // (a) No usable time left → the network call must not even start.
+      let fired = false;
+      const skipped = await scanner.bestEffort(
+        () => {
+          fired = true;
+          return Promise.resolve("live");
+        },
+        Date.now() - 1,
+        "fallback",
+      );
+      assert.equal(skipped, "fallback");
+      assert.equal(fired, false, "a step with no time left must not fire its call");
+      // (b) Hung upstream → fallback AT the deadline, not when it settles.
+      const t0 = Date.now();
+      const hung = await scanner.bestEffort(() => new Promise(() => {}), Date.now() + 60, "fallback");
+      assert.equal(hung, "fallback", "hung step degrades to the caller's fallback");
+      assert.ok(Date.now() - t0 < 1_000, `waited ${Date.now() - t0}ms — not clamped to the deadline`);
+      // (c) A step that lands in time still returns its own value.
+      assert.equal(
+        await scanner.bestEffort(() => Promise.resolve("live"), Date.now() + 500, "fallback"),
+        "live",
+      );
+      // (d) Not applicable (feature disabled / no pair address) → fallback.
+      assert.equal(await scanner.bestEffort(null, Date.now() + 500, "fallback"), "fallback");
+      // (e) A rejection arriving AFTER the race settled is absorbed, so a
+      // slow upstream cannot surface as an unhandled rejection.
+      const late = await scanner.bestEffort(
+        () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("late")), 80)),
+        Date.now() + 25,
+        "fallback",
+      );
+      assert.equal(late, "fallback");
+      await new Promise((r) => setTimeout(r, 120)); // let the late rejection land
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("Db: a libsql client that retries forever hits the hard wall and settles", async () => {
     // Dead-tick fix 2026-09-13: the libsql HTTP client retries internally
     // when the transport fetch aborts, so a request's promise can outlive

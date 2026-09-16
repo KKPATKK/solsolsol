@@ -14,12 +14,12 @@ import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTokenInfo, AxiomTrendingToken } from "./axiom";
 import { parseAxiomTokenInfo } from "./axiom";
 import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
-import type { CrimeWalletClient } from "./crimewallets";
+import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
 import type { JupTokensClient } from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
 import { PushWatcher } from "./pushwatch";
-import { FlurryAnalyzer, type FlurryReport } from "./flurry";
+import { FlurryAnalyzer, type FlurryOutcome, type FlurryReport } from "./flurry";
 
 
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -110,6 +110,13 @@ const SCAN_TIMEOUT_MS = 25_000;
  * first, `candidates: 1, pushed: 0`. 4.2s leaves ~300ms of margin for the
  * widest pre-race spend, so every gate returns on its own terms and the
  * push still lands inside the race.
+ *
+ * 2026-09-16 (later): the deadline alone was NOT enough — a tick that found
+ * a candidate still pushed nothing, because the gate chain below the
+ * deadline is SERIAL and unclamped (~11 live calls whose client timeouts sum
+ * far past the tick). Every step now races its own chain deadline (see
+ * CANDIDATE_PUSH_RESERVE_MS / bestEffort), so the coin that cleared its
+ * gates always reaches the send.
  */
 const SCAN_TICK_DEADLINE_MS = 4_200;
 /**
@@ -130,6 +137,44 @@ const SCAN_TICK_DEADLINE_MS = 4_200;
 const SCAN_GATE_RESERVE_MS = 1_600;
 /** The front phases' shared window (feeds + pool read + pair fetch). */
 const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
+/**
+ * Slice of the gate reserve RESERVED for actually DELIVERING the card once a
+ * coin has cleared its gates: claim + Telegram sendMessage + delivery audit +
+ * push-watcher seed (+ the auto-mode buy). Everything in the candidate chain
+ * races `chainDeadline` (= SCAN_TICK_DEADLINE_MS - this) so no slow upstream
+ * can leave the tick without the seconds the send itself needs.
+ *
+ * Why this exists (2026-09-16, live on /debug/scan-history): ticks that DID
+ * find a candidate never pushed one — every one of them was frozen at the
+ * worker's ~4.8s race window with `candidates: 1, pushed: 0`, because the
+ * chain AWAITS ~11 live calls serially (RugCheck, crime checkToken, Axiom,
+ * Birdeye ×2, GMGN, Arkham, Jupiter organic, wallet analysis, Flurry, trade
+ * mode) and no individual client timeout is aware of the tick. Capping the
+ * front phases (SCAN_GATE_RESERVE_MS) was not enough: the reserve is consumed
+ * by the chain itself. Whatever has not answered by the deadline now degrades
+ * to the same "未分析 / —" the card renders on an upstream failure, and the
+ * coin — already through every real gate — still gets pushed.
+ */
+const CANDIDATE_PUSH_RESERVE_MS = 900;
+/**
+ * Slice of the chain kept for the gates that run LAST (wallet analysis, the
+ * top-10 band, Flurry deploy-slot forensics) so the CARD-ONLY enrichments in
+ * the middle of the chain (Birdeye trader/overview, GMGN, Arkham, Jupiter
+ * organic) cannot spend the whole window on decoration and leave a real gate
+ * unjudged. Those four race this earlier deadline; when it passes they render
+ * as "—" and the gates still get their turn.
+ */
+const CANDIDATE_GATE_TAIL_MS = 500;
+/**
+ * Minimum remaining tick time that makes a supply-flow analysis worth
+ * STARTING (~2 Helius round trips). The configured budget (default 15s)
+ * cannot be used as the guard: it is larger than the whole scan deadline
+ * (~4.2s), so `remaining < cfg.budgetMs` was true on every coin since the
+ * 12s-race era — the gate returned "hold" 100% of the time, i.e. it was
+ * silently dead and every card showed 未分析. Same floor-not-budget shape as
+ * flurry.ts FLURRY_MIN_START_MS.
+ */
+const SUPPLY_FLOW_MIN_START_MS = 1_200;
 /**
  * Cap on how long one Flurry analyze() may wait inside the tick (see the
  * call site). analyze() races its RPCs against the deadline it is given, so
@@ -821,6 +866,42 @@ export class Scanner {
           this.trade,
         )
       : null;
+  }
+
+  /**
+   * Race ONE step of the candidate chain against the chain deadline (see
+   * CANDIDATE_PUSH_RESERVE_MS). `make` is only invoked when there is time
+   * left, so a step that cannot possibly finish never fires its network
+   * call, and a step that starts can never hold the chain past the deadline:
+   * the race resolves with `fallback` — the exact value its resolver returns
+   * on an upstream failure — and the caller renders the same "未分析 / —" it
+   * would have shown for missing data. The work itself is not cancelled
+   * (every client owns its own timeout); a late settle/rejection is
+   * discarded by the race.
+   *
+   * Without this the chain was serial and unclamped, which is why a tick that
+   * found a candidate never pushed one (2026-09-16: `candidates: 1,
+   * pushed: 0`, frozen at the worker's ~4.8s race on every such tick).
+   */
+  private async bestEffort<T>(
+    make: (() => Promise<T>) | null,
+    deadline: number,
+    fallback: T,
+  ): Promise<T> {
+    if (!make) return fallback;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return fallback;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        make(),
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(fallback), remaining);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /**
@@ -1850,14 +1931,27 @@ export class Scanner {
         else groups.set(key, [coin]);
       }
       let processedCandidates = 0;
+      // Two deadlines for the candidate chain, both derived from the tick's
+      // own deadline. `chainDeadline` is the hard wall for EVERYTHING that
+      // must happen before the card is sent (see CANDIDATE_PUSH_RESERVE_MS);
+      // `enrichDeadline` is the earlier wall used by the CARD-ONLY
+      // enrichments, so decoration can never eat the tail gates
+      // (CANDIDATE_GATE_TAIL_MS).
+      const chainDeadline = tickDeadline - CANDIDATE_PUSH_RESERVE_MS;
+      const enrichDeadline = chainDeadline - CANDIDATE_GATE_TAIL_MS;
       for (const group of groups.values()) {
         // Hard tick deadline: each token's expensive lookups (Helius up to
         // 16s + RugCheck + Birdeye) can exceed the remaining budget fast.
         // Defer the rest to the next tick — they stay in the re-evaluation
         // pool, so this only delays a push by a minute, never loses it.
-        if (this.abortRequested || Date.now() > tickDeadline) {
+        // Checked against `chainDeadline`, not the tick deadline: below it
+        // the chain still has to run AND the card still has to be sent, so
+        // starting a coin with less than that left only guaranteed a
+        // half-processed coin cut off by the worker's race (2026-09-16:
+        // `candidates: 1, pushed: 0` on every such tick).
+        if (this.abortRequested || Date.now() > chainDeadline) {
           console.log(
-            `[scanner] tick deadline reached — deferring ${candidates.length - processedCandidates} candidate(s) to next tick`,
+            `[scanner] chain deadline reached — deferring ${candidates.length - processedCandidates} candidate(s) to next tick`,
           );
           break;
         }
@@ -1879,7 +1973,7 @@ export class Scanner {
         // display lookups so a flagged coin never wastes the tick. Only a
         // confirmed flag blocks the push; a pending/incomplete analysis
         // (hold/unknown) pushes anyway with the card showing 未分析.
-        const flow = await this.resolveSupplyFlow(coin, tickDeadline);
+        const flow = await this.resolveSupplyFlow(coin, chainDeadline);
         if (flow.status === "flagged") {
           diag.fails.flow++;
           this.addReject(
@@ -1895,29 +1989,55 @@ export class Scanner {
         // Bundler + top-10 holder share is resolved for the message card but
         // no longer filters — those filters were removed, so coins push even
         // when the RugCheck report is not ready yet (the card shows 未检测).
-        const rugcheck = await this.resolveRugcheckData(coin);
+        // From here to the Flurry gate every step is a live network call and
+        // they are awaited SERIALLY, so the chain — not the front phases — is
+        // what the tick race actually cuts. Each step now races the chain
+        // deadline with the exact value its resolver returns when the
+        // upstream fails, so a miss degrades the card ("未检测" / "—") and
+        // never the push. See bestEffort().
+        const rugcheck = await this.bestEffort(
+          () => this.resolveRugcheckData(coin),
+          chainDeadline,
+          {
+            // The resolver's own cache, so a deadline miss still renders
+            // whatever RugCheck already told us about this coin.
+            bundlerPct: coin.stats.rugcheckBundlerPct,
+            top10Pct: coin.stats.rugcheckTop10Pct,
+            creator: this.rugcheckCreator.get(coin.stats.token) ?? null,
+          },
+        );
         // Crime-wallet check: the coin's creator (RugCheck) and top holder
         // owner wallets are matched against the community blocklist. A hit
         // is a warning (flagged on the card) unless CRIME_WALLETS_BLOCK
         // turns it into a push blocker.
-        const crime = this.crimeWallets
-          ? await this.crimeWallets.checkToken(
-              coin.stats.token,
-              rugcheck.creator,
-              this.helius,
-              {
-                checkHolders: this.config.crimeWallets.checkHolders,
-                holderTopN: this.config.crimeWallets.holderTopN,
-              },
-            )
-          : {
-              hit: false,
-              creatorHit: false,
-              holderHits: [],
-              checkedHolders: 0,
-              loaded: false,
-              holders: [],
-            };
+        const crimeClient = this.crimeWallets;
+        const crime = await this.bestEffort<CrimeCheckResult>(
+          crimeClient
+            ? () =>
+                crimeClient.checkToken(
+                  coin.stats.token,
+                  rugcheck.creator,
+                  this.helius,
+                  {
+                    checkHolders: this.config.crimeWallets.checkHolders,
+                    holderTopN: this.config.crimeWallets.holderTopN,
+                  },
+                )
+            : null,
+          chainDeadline,
+          {
+            // A deadline miss fails OPEN — the same stance this check already
+            // ships with (a missing/stale blocklist must never silence the
+            // bot). The holder list it would have resolved is simply absent
+            // from the wallet analysis below.
+            hit: false,
+            creatorHit: false,
+            holderHits: [],
+            checkedHolders: 0,
+            loaded: false,
+            holders: [],
+          },
+        );
         if (crime.hit) diag.crime++;
         if (this.config.crimeWallets.block && crime.hit) {
           diag.fails.crime++;
@@ -1939,10 +2059,15 @@ export class Scanner {
         // Birdeye/GMGN/Arkham/Jupiter/wallet budget entirely. Missing data
         // (session down, no pair address) never judges and hides the card
         // line instead — a dead session must not silence the bot.
-        const axiomInfo =
-          this.axiom && coin.pair.pairAddress
-            ? await this.resolveAxiomTokenInfo(coin.pair.pairAddress)
-            : null;
+        const axiom = this.axiom;
+        const axiomPair = coin.pair.pairAddress;
+        const axiomInfo = await this.bestEffort(
+          axiom && axiomPair
+            ? () => this.resolveAxiomTokenInfo(axiomPair)
+            : null,
+          chainDeadline,
+          null,
+        );
         if (this.config.axiomMinBotUsers > 0) {
           const botReason = botUsersBlockReason(
             axiomInfo?.numBotUsers ?? null,
@@ -1960,17 +2085,32 @@ export class Scanner {
         // Trader data is resolved for the message card but no longer
         // filters — the sniper filter was removed, so coins push even when
         // the data is not ready yet.
-        const trader = await this.resolveTraderData(coin);
+        const trader = await this.bestEffort(
+          () => this.resolveTraderData(coin),
+          enrichDeadline,
+          {
+            proTraders: coin.stats.birdeyeProTraders,
+            sniperPct: coin.stats.birdeyeSniperPct,
+          },
+        );
         // Holder count (Birdeye token overview) — card-only enrichment,
         // best-effort like the trader data above. Creator comes from the
         // RugCheck report (this.rugcheck.creator).
-        const holders = await this.resolveHolderCount(coin);
+        const holders = await this.bestEffort(
+          () => this.resolveHolderCount(coin),
+          enrichDeadline,
+          { holderCount: null },
+        );
         // GMGN enrichment — smart money count, holders and the wash-trading
         // flag, shown on the card. Best-effort: failures degrade to no
         // enrichment. The wash-trading flag can block the push entirely
         // (GMGN_BLOCK_WASH_TRADING, default on) — same stance as the
         // gmgn-vl-radar filters (not_wash_trading).
-        const gmgn = await this.resolveGmgnInfo(coin);
+        const gmgn = await this.bestEffort(
+          () => this.resolveGmgnInfo(coin),
+          enrichDeadline,
+          null,
+        );
         if (
           this.gmgn &&
           this.config.gmgnBlockWashTrading &&
@@ -1984,15 +2124,22 @@ export class Scanner {
           continue;
         }
         // Arkham smart-money attribution (card-only enrichment).
-        const arkham = await this.resolveArkhamInfo(coin);
+        const arkham = await this.bestEffort(
+          () => this.resolveArkhamInfo(coin),
+          enrichDeadline,
+          null,
+        );
         if (arkham) diag.arkham++;
         // Jupiter organic score — card-only enrichment (display-first; the
         // calibrated separation on 2026-08-22 winners vs losers was clean,
         // but n=6 is too small to gate on). Best-effort: failures degrade
         // to an unrendered line.
-        const organic = this.jupiter
-          ? await this.jupiter.fetchOrganicScore(coin.stats.token)
-          : null;
+        const jupiter = this.jupiter;
+        const organic = await this.bestEffort(
+          jupiter ? () => jupiter.fetchOrganicScore(coin.stats.token) : null,
+          enrichDeadline,
+          null,
+        );
         // Wallet analysis — creator profile (age + serial-launcher create
         // count), top-holder wallet ages and cross-coin holder clustering.
         // Runs only for coins that pass every block gate (its pushed_holders
@@ -2001,19 +2148,27 @@ export class Scanner {
         // holder list itself); each unique wallet costs one cached Helius
         // call inside a hard budget, so a slow RPC degrades the card, never
         // the push.
-        const wallet = this.walletAnalyzer
-          ? await this.walletAnalyzer.analyze({
-              token: coin.stats.token,
-              creator: rugcheck.creator,
-              holders: crime.holders,
-              crime,
-              // Clamp the analyzer's serial-RPC budget to the remaining
-              // tick time: an unclamped 8s wallet walk could outlive the
-              // 12s tick race on heavy ticks, pushing the completion flush
-              // past Cloudflare's invocation kill (the dead-tick shape).
-              deadline: tickDeadline,
-            })
-          : null;
+        const analyzer = this.walletAnalyzer;
+        const wallet = await this.bestEffort(
+          analyzer
+            ? () =>
+                analyzer.analyze({
+                  token: coin.stats.token,
+                  creator: rugcheck.creator,
+                  holders: crime.holders,
+                  crime,
+                  // Clamp the analyzer's serial-RPC budget to the CHAIN
+                  // deadline (not the tick deadline): an unclamped 8s wallet
+                  // walk could outlive the tick race on heavy ticks, pushing
+                  // the completion flush past Cloudflare's invocation kill
+                  // (the dead-tick shape) — and, with the push reserve
+                  // subtracted, it would spend the seconds the send needs.
+                  deadline: chainDeadline,
+                })
+            : null,
+          chainDeadline,
+          null,
+        );
         if (wallet?.ok) diag.walletAnalysis++;
         // Insider self-pump gate: top holders almost all brand-new wallets
         // (the Cheems shape — 8/8 fresh). Runs after analysis so the data is
@@ -2062,12 +2217,18 @@ export class Scanner {
         // analyze() waits up to its deadline for a hung RPC (the clamp race),
         // so an unclamped wait could stall the tick for the full remainder
         // and delay the completion flush past the invocation kill.
-        const flurryOut = this.flurry
-          ? await this.flurry.analyze(
-              coin.stats.token,
-              Math.min(tickDeadline, Date.now() + FLURRY_ANALYZE_CAP_MS),
-            )
-          : { status: "skip" as const };
+        const flurryClient = this.flurry;
+        const flurryOut = await this.bestEffort<FlurryOutcome>(
+          flurryClient
+            ? () =>
+                flurryClient.analyze(
+                  coin.stats.token,
+                  Math.min(chainDeadline, Date.now() + FLURRY_ANALYZE_CAP_MS),
+                )
+            : null,
+          chainDeadline,
+          { status: "skip" },
+        );
         const flurryReport =
           flurryOut.status === "report" ? flurryOut.report : null;
         if (flurryReport) diag.flurryAnalyzed++;
@@ -2474,7 +2635,17 @@ export class Scanner {
     if (this.dataNegativeCached(stats.token)) return { status: "hold" };
     // Budget guard: the analysis makes ~10 RPC calls; only start it when it
     // can finish within the tick deadline, else defer to the next tick.
-    if (tickDeadline - Date.now() < cfg.budgetMs) return { status: "hold" };
+    // The FLOOR (not cfg.budgetMs — see SUPPLY_FLOW_MIN_START_MS) is what
+    // makes the gate actually run at all: against the configured 15s budget
+    // and a ~4.2s scan deadline this check was true for every coin, i.e. the
+    // gate was silently dead and every card showed 未分析. The hard cap below
+    // is clamped to the tick's remaining time, so the analysis can never
+    // outlive the wall the worker enforces.
+    const flowBudgetMs = Math.min(
+      cfg.budgetMs,
+      Math.max(0, tickDeadline - Date.now()),
+    );
+    if (flowBudgetMs < SUPPLY_FLOW_MIN_START_MS) return { status: "hold" };
 
     try {
       const price = Number(pair.priceUsd);
@@ -2505,7 +2676,7 @@ export class Scanner {
                 analyzedAt: Date.now(),
                 windowMs: cfg.windowMs,
               }),
-            cfg.budgetMs,
+            flowBudgetMs,
           ),
         ),
       ]);
