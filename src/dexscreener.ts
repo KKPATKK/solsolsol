@@ -325,7 +325,18 @@ export class DexScreenerClient {
    * the whole scan tick: batches past the deadline are skipped and their
    * tokens are simply re-tried on the next scan.
    */
-  async fetchPairsForTokens(addresses: string[]): Promise<Map<string, PairInfo>> {
+  async fetchPairsForTokens(
+    addresses: string[],
+    /**
+     * Absolute epoch ms the CALLER's phase must be done by (the scanner's
+     * front-phase window, see FRONT_PHASE_WINDOW_MS). The pair fetch is the
+     * last front phase, so when a deadline is supplied it yields to whichever
+     * comes first: its own PAIRS_FETCH_BUDGET_MS or that deadline. Omitted
+     * (tests, ad-hoc calls, and the scanner today, whose front-phase caps
+     * already sum inside the window) → the local budget only.
+     */
+    callerDeadlineMs?: number,
+  ): Promise<Map<string, PairInfo>> {
     const result = new Map<string, PairInfo>();
     const now = Date.now();
     // Serve whatever is still fresh from the cache first; only cache misses
@@ -344,7 +355,12 @@ export class DexScreenerClient {
     // burn the tick's budget on doomed retries) — cache-only for now.
     if (Date.now() < this.batchBlockedUntil) return result;
 
-    const deadline = now + PAIRS_FETCH_BUDGET_MS;
+    const deadline = Math.min(
+      now + PAIRS_FETCH_BUDGET_MS,
+      typeof callerDeadlineMs === "number" && callerDeadlineMs > now
+        ? callerDeadlineMs
+        : Number.POSITIVE_INFINITY,
+    );
     const batches: string[][] = [];
     for (let i = 0; i < misses.length; i += 30) batches.push(misses.slice(i, i + 30));
     let nextBatch = 0;

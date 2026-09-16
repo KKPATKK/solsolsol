@@ -289,8 +289,33 @@ const SCAN_TICK_BUDGET_MS = 9_500;
  * never coin coverage), and a completed 6s scan every minute beats a dead
  * 12s tick that evaluates nothing — which is exactly why no qualifying
  * coin has been pushed since 2026-09-06.
+ *
+ * 2026-09-16: 3500 → 4500. The 9.5s/3.5s pair starts the flush at ~6.0s,
+ * and the live scan-history shows what that costs: ticks whose flush began
+ * at 6.0s landed while the invocation still had wall clock (06:32–06:35Z
+ * timeout rows), then from 06:36Z EVERY tick died before its flush for
+ * 70+ minutes (120 consecutive "died before its completion flush" rows,
+ * heartbeat frozen in phase=scanning, zero pushes). The kill point
+ * fluctuates in the ~6–9s range, so a flush starting at 6.0s is a coin
+ * flip; the same 9.5s budget with a 4.5s reserve starts it at ~5.0s and
+ * still leaves the flush its full retry ladder. Nothing is given up by the
+ * earlier start: the scan's internal deadline (SCAN_TICK_DEADLINE_MS,
+ * 4.6s) already ends the scan before it, and a scan cut a second earlier
+ * defers its work to the re-eval pool exactly as every other budget cut
+ * has (latency, never coverage).
  */
-const SCAN_FLUSH_RESERVE_MS = 3_500;
+const SCAN_FLUSH_RESERVE_MS = 4_500;
+/**
+ * How long the flush waits for its FIRST completion-write attempt before
+ * firing the concurrent retry. The batch is idempotent (it clears its own
+ * `at` row before inserting), so a racing retry can only help; what the
+ * bound controls is how long a WEDGED write holds the tick. 2.5s meant a
+ * hung attempt + its retry could still be in flight when Cloudflare killed
+ * the invocation (the flush starts at ~5s, the kill lands ~6–9s in), so a
+ * hung write was a guaranteed dead tick. 1.2s fires the retry while there
+ * is still room for a settled second attempt to land.
+ */
+const FLUSH_ATTEMPT_BOUND_MS = 1_200;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -302,8 +327,21 @@ const SCAN_FLUSH_RESERVE_MS = 3_500;
  * scan envelope (15s budget + ~1s flush + pre-race round trip) with margin
  * and still expires fast if the holder isolate dies mid-scan (Cloudflare
  * kills invocations around ~20-30s).
+ *
+ * 2026-09-16: 55000 → 15000, tracking the tick envelope (9.5s budget, race
+ * at ~5.0s, flush done by ~6s). 55s was sized for a 15s-scan era and it
+ * silently disabled the HTTP rescue path in exactly the failure it exists
+ * for: a tick that dies before its flush NEVER releases the lease, so for
+ * the next 55s every trigger — including the external /health fallback that
+ * is supposed to complete a scan with its generous wall clock — lost the
+ * CAS claim and skipped. Live proof: /debug/tick during the 2026-09-16
+ * 06:36Z+ dead-tick stretch returned `ok:false, ms:548, summary:null` — the
+ * lost lease, not a failed scan. 15s is ~1.5× the whole honest envelope, so
+ * a live scan keeps its lease while a dead holder frees it well inside one
+ * cron period (the previous fix in this file — the takeover branch below —
+ * then re-claims it and the scan proceeds).
  */
-const SCAN_LOCK_TTL_MS = 55_000;
+const SCAN_LOCK_TTL_MS = 15_000;
 /**
  * Slack allowed between two scans beyond SCAN_INTERVAL_SECONDS when the
  * cadence gate compares against the previous tick's CLAIM time. The gate is
@@ -916,7 +954,7 @@ async function runScan(
         await Promise.race([
           mark,
           new Promise((resolve) =>
-            setTimeout(resolve, Math.min(2_500, remainingFlushMs())),
+            setTimeout(resolve, Math.min(FLUSH_ATTEMPT_BOUND_MS, remainingFlushMs())),
           ),
         ]);
         if (!settled && Date.now() < flushDeadline) {

@@ -103,14 +103,18 @@ JUPITER_REQUEST_INTERVAL_MS = "500"
 # backoff (PAIR_BATCH_BACKOFF_MS), so the failure mode is lost coverage for a
 # minute, never a hammering loop.
 DEX_REQUEST_INTERVAL_MS = "250"
-# Flurry launch forensics per-coin budget. 2026-09-15: 8s → 2s, tracking the
-# tick ladder (the scan's internal deadline is 5s and the worker's race cuts
-# at ~5.6s so the completion flush always lands — see SCAN_TICK_BUDGET_MS).
-# The guard defers when less than the budget remains, so 2s is the largest
-# value that still lets the gate run on ticks with a fast feed phase; a
-# bigger value silently disables it (fail-open) again. Verdicts are cached
-# per mint, so a deferred coin is analyzed on the next sweep at 0 extra RPC.
-FLURRY_BUDGET_MS = "2000"
+# Flurry launch forensics per-coin budget. 2026-09-16: 2s → 1.2s, tracking
+# the re-cut tick ladder. The scan now reserves a GATE window for the
+# gate/push phase (scanner.ts SCAN_GATE_RESERVE_MS): the front phases must
+# all be done by 3.0s, the scan's internal deadline is 4.6s and the worker's
+# race cuts at ~5.0s so the completion flush always lands (see
+# SCAN_TICK_BUDGET_MS in worker.ts). The guard defers when less than the
+# budget remains, so this value must stay below the reserve — at 1.2s the
+# gate still runs on a normal tick (the gate phase starts with ~1.6s left)
+# while a slow tick defers it (fail-open: the coin still pushes). Verdicts
+# are cached per mint, so a deferred coin is analyzed on the next sweep at
+# 0 extra RPC.
+FLURRY_BUDGET_MS = "1200"
 PUSH_WATCH_WINDOW_HOURS = "26"
 # Insider self-pump gate: rejects pushes where newWallets/checked top-holder
 # wallets exceeds WALLET_NEW_RATIO_MAX (the Cheems shape — 8/8 profiled

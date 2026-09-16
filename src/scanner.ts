@@ -84,8 +84,44 @@ const SCAN_TIMEOUT_MS = 25_000;
  * of being frozen by the invocation kill mid-await. Every phase budget
  * below was scaled to the same window; the rotation slice + re-eval pool
  * absorb the shorter scan (latency, not coverage).
+ *
+ * 2026-09-16: 5s → 4.6s, and — the actual fix — the front phases are now
+ * capped so their SUM fits the front window (see SCAN_GATE_RESERVE_MS),
+ * instead of each phase holding a cap that was sized in the 12s-race era.
+ * Live evidence for why: the caps were FEED 1800 + POOL 2200 + PAIRS 1500 =
+ * 5500ms, i.e. LARGER than this 5s deadline (and larger than the worker's
+ * ~6s race), so on any tick where the upstreams were slow enough for every
+ * phase to ride its cap, the gate/push phase started AFTER the deadline:
+ * the candidate loop's first check (`Date.now() > tickDeadline`) broke
+ * immediately and the tick ended with `candidates: 1, pushed: 0`. The
+ * 2026-09-16 06:2x–06:35Z history is exactly that shape — every tick
+ * `scan exceeded its ~5964ms race window … candidates 1, pushed 0`, and
+ * from 06:36Z every tick died before its completion flush. A tick that
+ * discovers candidates but never reaches the gates cannot push, which is
+ * the zero-push stretch this fixes. 4.6s also sits a little under the
+ * worker's ~5.0s race (see SCAN_FLUSH_RESERVE_MS there), so the scan still
+ * ends on its own terms (a full summary, no zombie tail) instead of being
+ * frozen mid-await.
  */
-const SCAN_TICK_DEADLINE_MS = 5_000;
+const SCAN_TICK_DEADLINE_MS = 4_600;
+/**
+ * Wall-clock slice of the tick RESERVED for the gate/push phase — the ONLY
+ * phase that can actually push a coin. The three front phases (discovery
+ * feeds, re-eval pool read, DexScreener pair fetch) get the window
+ * `SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS` between them, and each of
+ * their budgets is clamped to it, so their SUM can never consume the tick
+ * again (the 2026-09-16 zero-push root cause: 1800 + 2200 + 1500 = 5500ms of
+ * caps against a 5s deadline). Front-phase caps are ≥ their healthy-case
+ * need, so a healthy tick is unchanged — the reserve only becomes real
+ * when an upstream is slow, and then it buys the gates/push the time the
+ * starved tick used to lose. The re-eval pool absorbs anything the shorter
+ * front phases defer: a coin left unfetched is re-read on its next rotation
+ * slot, a feed coin discovered a tick later is not lost (the 3h
+ * pre-qualification margin covers its window entry).
+ */
+const SCAN_GATE_RESERVE_MS = 1_600;
+/** The front phases' shared window (feeds + pool read + pair fetch). */
+const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
 /**
  * Cap on how long one Flurry analyze() may wait inside the tick (see the
  * call site). analyze() races its RPCs against the deadline it is given, so
@@ -146,8 +182,18 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  * ~5.6s race and the gates still run at the end of the tick. A feed coin
  * discovered a tick later is not lost — it enters the pool and the 3h
  * pre-qualification margin covers its window entry.
+ *
+ * 2026-09-16: 1800 → 700, clamped to the front window (see
+ * SCAN_GATE_RESERVE_MS). The fan-out runs CONCURRENTLY and its healthy-case
+ * cost is the slowest single feed (DexScreener profiles, ~200–400ms), so
+ * 700ms covers a healthy tick; what the smaller cap changes is the bad
+ * tick, where the feeds used to hold 1.8s of a 5s tick and hand the gates
+ * nothing. Discovery is the cheapest phase to defer: a feed coin enters
+ * the pool and is evaluated on a later sweep, and feed coins are
+ * overwhelmingly the sub-$10K-liquidity dust the pool prunes anyway (see
+ * the RE_EVAL_PER_TICK_MAX notes).
  */
-const FEED_DEADLINE_MS = 1_800;
+const FEED_DEADLINE_MS = 700;
 /**
  * Wall-clock cap for the re-eval pool DB read and the token_stats prune
  * (both race against this deadline; see the call sites). Evidence
@@ -165,8 +211,16 @@ const FEED_DEADLINE_MS = 1_800;
  * alongside the feeds, and a pool read that needs more than 2.2s is the
  * hang this race exists to convert into a timeout (the slice defers, the
  * pool row survives, the next tick re-reads it).
+ *
+ * 2026-09-16: 2200 → 800, clamped to the front window (see
+ * SCAN_GATE_RESERVE_MS). Most ticks are a pool-cache hit (the 90s TTL), so
+ * the typical cost is ~0; the cap only bites on the TTL-expiry tick or when
+ * Turso is slow, and 800ms is the point where the read has either landed or
+ * is the hang this race exists to convert into a fast, diagnosable miss.
+ * What it must NOT do is hold 2.2s while the pair phase and the gates wait
+ * behind it — the shape that produced candidate-starved timeout rows.
  */
-const POOL_FETCH_BUDGET_MS = 2_200;
+const POOL_FETCH_BUDGET_MS = 800;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the
@@ -985,7 +1039,12 @@ export class Scanner {
     this.abortRequested = false;
     const startedAt = Date.now();
     const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
-    const feedDeadline = startedAt + FEED_DEADLINE_MS;
+    // The front phases (feeds + pool read + pair fetch) must ALL be done by
+    // here, so the gate/push phase below always keeps its reserved slice of
+    // the tick (see SCAN_GATE_RESERVE_MS). Every front-phase budget is
+    // clamped to this, so no combination of them can consume the tick.
+    const frontDeadline = startedAt + FRONT_PHASE_WINDOW_MS;
+    const feedDeadline = Math.min(startedAt + FEED_DEADLINE_MS, frontDeadline);
     const diag: ScanSummary = {
       profiles: 0,
       pump: 0,

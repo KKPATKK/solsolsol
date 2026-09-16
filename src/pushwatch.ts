@@ -27,6 +27,26 @@ import { tradeKeyboard } from "./bot";
  *   📈 holders        — holder count +10% / +25% / +50% vs push (Birdeye)
  */
 
+/**
+ * Wall-clock slice the post-push tracker pass may use INSIDE one scan tick.
+ * The tracker is awaited by the scanner in its front-phase window (right
+ * after the discovery feeds, before the re-eval pool read and the pair
+ * fetch), so an unbounded pass starves everything behind it — 2026-09-12
+ * live: trackerMs 4556 on a slow-Turso tick, after which that tick's pool
+ * slice was never evaluated (timeout row, agedEval 0). Its alerts are
+ * hour-scale follow-ups while the qualifying momentum windows are minutes
+ * long, so a clamped remainder simply runs on the next tick (rows are
+ * re-claimed then and nothing is lost — see the checks in runTick).
+ *
+ * Sized as the tracker's SHARE of the scanner's front-phase window: feeds
+ * 700 + tracker 700 + pool read 800 + pair fetch 1500 = 3700ms against the
+ * 4.6s internal deadline, leaving the gate/push phase ~900ms even on a tick
+ * where every front phase rides its cap (and ~2.5s on a normal tick, where
+ * the caps are nowhere near binding). Before this bound the tracker was
+ * awaited unbounded inside that window. The normal pass — one batched pair
+ * lookup plus a handful of DB writes — costs ~300–600ms.
+ */
+const TRACKER_TICK_BUDGET_MS = 700;
 /** Rising-stage thresholds (%) above the push-time mcap → state suffix. */
 const RISING_STAGES = [50, 100, 200, 400] as const;
 /**
@@ -592,8 +612,17 @@ export class PushWatcher {
    * One tracker pass: prune expired rows, refresh ≤30 coins via one
    * DexScreener batch, evaluate rules, deliver alerts, and refresh holder
    * counts for at most `maxHolderChecksPerTick` coins (oldest check first).
+   *
+   * `deadlineMs` (optional) is an absolute epoch ms the CALLER's tick must be
+   * done by (the scanner's front-phase window — the tracker runs inside it,
+   * right after the feeds). When provided, the pass is clamped to that AND to
+   * TRACKER_TICK_BUDGET_MS; without it the share alone applies, which is what
+   * the scanner's current call does. Either way the limit is checked only
+   * BETWEEN stages and rows, so a truncated pass can never cut an alert after
+   * its reservation was written (left-over rows are claimed and evaluated on
+   * the next tick).
    */
-  async runTick(): Promise<{
+  async runTick(deadlineMs?: number): Promise<{
     checked: number;
     alerted: number;
     /** Why nothing was checked (empty in the heartbeat when work happened). */
@@ -601,6 +630,13 @@ export class PushWatcher {
   }> {
     const cfg = this.config.pushWatch;
     const now = Date.now();
+    const budgetMs =
+      typeof deadlineMs === "number" && Number.isFinite(deadlineMs)
+        ? Math.max(0, Math.min(TRACKER_TICK_BUDGET_MS, deadlineMs - now))
+        : TRACKER_TICK_BUDGET_MS;
+    const deadline = now + budgetMs;
+    const past = () => Date.now() > deadline;
+    const deferred = { checked: 0, alerted: 0, note: "deferred:tick-budget" };
     // Case-closed recaps: every coin leaving the window gets ONE summary
     // card before the bulk prune deletes it. Best-effort send — a failed
     // delivery must never keep a dead row alive forever.
@@ -623,6 +659,10 @@ export class PushWatcher {
       /* listing failed — the prune below still runs */
     }
     await this.db.prunePushWatch(windowCutoff);
+    // Budget gate BETWEEN stages: the recap/prune above is idempotent (a
+    // recap claims its row as it sends), so bailing here costs only latency —
+    // the remaining stages run on the next tick with fresh rows.
+    if (past()) return deferred;
     // Heal missed enrollments: pushes recorded in seen_tokens but absent
     // from push_watch (an old pre-tracker isolate handled that scan, or the
     // process died between the push and the upsert). Seeded with the CURRENT
@@ -715,6 +755,7 @@ export class PushWatcher {
     } catch {
       /* healing is best-effort */
     }
+    if (past()) return deferred;
     const rows = await this.db.listPushWatch(cfg.maxTracked);
     // Only rug (drained LP) rows are terminal: kept so the self-heal does
     // not re-enroll them, and skipped here. Dead rows stay ACTIVE but the
@@ -746,6 +787,10 @@ export class PushWatcher {
     let checked = 0;
     let alerted = 0;
     for (const row of activeRows) {
+      // Budget check BETWEEN rows: the claim and the alert reservation for a
+      // row both happen after this point, so leaving a row to the next tick
+      // can never drop an alert (it is re-claimed and re-evaluated then).
+      if (past()) break;
       const pair = pairs.get(row.token);
       if (!pair) {
         // Delisted/unfindable: drop after a grace period so stale rows don't
@@ -867,6 +912,9 @@ export class PushWatcher {
         .sort((a, b) => (a.holdersCheckedAt ?? 0) - (b.holdersCheckedAt ?? 0))
         .slice(0, cfg.maxHolderChecksPerTick);
       for (const r of due) {
+        // Holder counts are a slow-moving card detail; drop the rest of the
+        // batch rather than carry the tick past its front-phase window.
+        if (past()) break;
         try {
           const overview = await this.birdeye.getTokenOverview(r.token);
           if (overview.holderCount !== null) {

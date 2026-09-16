@@ -102,8 +102,19 @@ const JUP_BATCH_SIZE = 100;
  * comment for the 2026-09-12 dead-tick evidence). Sized to finish 2–3
  * chunks at normal latency and to bail before the worker's 12s race when
  * Jupiter throttles.
+ *
+ * 2026-09-16: 3500 → 900. The fallback is the LAST front phase on exactly
+ * the ticks with the least room (it only fires when DexScreener returned
+ * under half the requested pairs — i.e. a 429/blocked tick), and it ran
+ * from its own start, so 3.5s carried the pair phase (and the gates behind
+ * it) past the scan's internal deadline. 900ms fits the front-phase window
+ * (see FRONT_PHASE_WINDOW_MS in scanner.ts: feeds + pool + pairs must all
+ * land inside it) and covers the ~100-address chunk that carries the pool
+ * slice's live coins; addresses left over keep their tokens in the re-eval
+ * pool and are re-read on the next tick, the same fail-safe as every other
+ * budget here.
  */
-const JUP_FALLBACK_BUDGET_MS = 3_500;
+const JUP_FALLBACK_BUDGET_MS = 900;
 
 function n(v: unknown): number {
   const x = Number(v);
@@ -303,10 +314,19 @@ export class JupTokensClient {
     for (let i = 0; i < list.length; i += JUP_BATCH_SIZE) {
       if (this.rateLimited() || Date.now() > deadline) break;
       const chunk = list.slice(i, i + JUP_BATCH_SIZE);
-      for (const [k, v] of jupToPairInfos(
-        await this.get(`/search?query=${chunk.join(",")}`),
-      ))
-        out.set(k, v);
+      // Race the request itself against the remaining budget: checking the
+      // deadline BETWEEN chunks bounds the loop but not a single hung
+      // request (each get() carries its own multi-second transport
+      // timeout), so one stalled call could carry this phase — and the
+      // gate/push phase behind it — past the scan's deadline. A chunk that
+      // expires contributes nothing and the loop exits on the next check.
+      const remaining = deadline - Date.now();
+      if (remaining <= 250) break;
+      const data = await Promise.race([
+        this.get(`/search?query=${chunk.join(",")}`),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), remaining)),
+      ]);
+      for (const [k, v] of jupToPairInfos(data)) out.set(k, v);
     }
     return out;
   }
