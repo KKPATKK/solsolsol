@@ -135,6 +135,14 @@ const SCAN_TICK_DEADLINE_MS = 4_200;
  * pre-qualification margin covers its window entry).
  */
 const SCAN_GATE_RESERVE_MS = 1_600;
+/**
+ * Slice of the scan deadline kept free for FINISHING the tick: the summary
+ * build plus the worker's completion flush must still land inside the race
+ * window even when the post-push tracker pass uses its whole budget. The pass
+ * runs LAST (after the candidate/push phase) and races this deadline, so a
+ * busy tick defers part of its follow-up rotation instead of delaying a push.
+ */
+const SCAN_FINISH_RESERVE_MS = 600;
 /** The front phases' shared window (feeds + pool read + pair fetch). */
 const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
 /**
@@ -1514,46 +1522,6 @@ export class Scanner {
         );
       }
       diag.feedsMs = Date.now() - feedsStart;
-      // Post-push tracker pass: one DexScreener batch + bounded Birdeye
-      // holder probes for the watched coins, then 🚀/⚠️/💀 follow-ups.
-      // Best-effort — a tracker failure never affects the scan.
-      // 2026-09-12: the pass previously ran unconditionally BEFORE the pool
-      // evaluation, and when Turso was slow it consumed up to ~4.6s of the
-      // 12s tick budget (trackerMs 4556 observed live) — the pool slice for
-      // that tick then never got evaluated (timeout row, agedEval 0). The
-      // tracker's alerts are hour-scale follow-ups while the qualifying
-      // momentum windows are minutes long, so when the tick is already more
-      // than halfway spent the pass defers to the next tick (rows are
-      // re-claimed then; nothing is lost).
-      // 2026-09-17: its own budget must cover the pass's mandatory stages
-      // (recap/prune, self-heal, one pair batch) AND row work, and the row
-      // loop must always evaluate at least one row (see pushwatch.ts
-      // TRACKER_TICK_BUDGET_MS). Before that, the pair batch ate the whole
-      // allowance, the loop broke at its first check, and the pass reported
-      // a healthy-looking `ok:0/0` while every tracked coin went unrefreshed.
-      const trackerStart = Date.now();
-      const trackerDeferred = Date.now() - startedAt > SCAN_TICK_DEADLINE_MS / 2;
-      if (this.pushWatcher && !trackerDeferred) {
-        if (this.shouldStopEarly()) return;
-        try {
-          // The pass gets the FRONT WINDOW as its deadline (it runs inside
-          // that window, before the pool read and the pair fetch): its own
-          // budget decides how long it works, this bounds how late it can
-          // ever be — so the pool/pair phases and the 1.6s gate reserve can
-          // never be eaten by a slow tracker tick.
-          const pw = await this.pushWatcher.runTick(
-            startedAt + FRONT_PHASE_WINDOW_MS,
-          );
-          diag.pushWatch = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error("[scanner] push-watch tick failed:", msg);
-          diag.pushWatch = `err:${msg.slice(0, 140)}`;
-        }
-      } else if (trackerDeferred) {
-        diag.pushWatch = "deferred:tick-budget";
-      }
-      diag.trackerMs = Date.now() - trackerStart;
       // Dedupe the feeds (mints overlap across all three); the DexScreener
       // entry wins — it carries richer profile data.
       const dexMints = new Set(profiles.map((p) => p.tokenAddress));
@@ -2418,6 +2386,41 @@ export class Scanner {
       }
       diag.pushed = pushed;
       diag.evalMs = Date.now() - evalStart;
+      // Post-push tracker pass: one DexScreener batch + bounded Birdeye
+      // holder probes for the watched coins, then 🚀/⚠️/💀 follow-ups.
+      // Best-effort — a tracker failure never affects the scan.
+      //
+      // 2026-09-17 (priority order): this pass used to run right after the
+      // discovery feeds, i.e. IN FRONT OF the pool read, the pair fetch and
+      // the entire candidate chain. That was harmless only while the pass was
+      // starved into doing nothing; once its row allowance became real it
+      // cost 1.1-1.7s per tick and pushed the tick past its chain deadline
+      // (SCAN_TICK_DEADLINE_MS - CANDIDATE_PUSH_RESERVE_MS) before any
+      // candidate group could run: live quiet-market ticks with a qualifying
+      // coin showed `candidates: 1, pushed: 0` minute after minute with every
+      // `fails` counter at 0 — the coin was deferred, not rejected. Follow-up
+      // monitoring is hour-scale (every row is re-claimed on the next tick,
+      // nothing is lost), while a qualifying push is only actionable in the
+      // minutes after it qualifies, so the tracker now runs AFTER the push
+      // phase and spends whatever time is left.
+      //
+      // Its deadline also leaves SCAN_FINISH_RESERVE_MS for the summary build
+      // and the worker's completion flush, so the pass can never become the
+      // reason a tick dies before its flush.
+      const trackerStart = Date.now();
+      if (this.pushWatcher) {
+        try {
+          const pw = await this.pushWatcher.runTick(
+            startedAt + SCAN_TICK_DEADLINE_MS - SCAN_FINISH_RESERVE_MS,
+          );
+          diag.pushWatch = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("[scanner] push-watch tick failed:", msg);
+          diag.pushWatch = `err:${msg.slice(0, 140)}`;
+        }
+      }
+      diag.trackerMs = Date.now() - trackerStart;
       console.log(
         `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${scannedProfiles.length}/${poolProfiles.length} pooled, ${candidates.length} candidates, ${pushed} pushed` +
           (this.birdeye ? "" : " (Birdeye not configured)"),

@@ -654,8 +654,11 @@ export class PushWatcher {
    * counts for at most `maxHolderChecksPerTick` coins (oldest check first).
    *
    * `deadlineMs` (optional) is an absolute epoch ms the CALLER's tick must be
-   * done by (the scanner's front-phase window — the tracker runs inside it,
-   * right after the feeds). When provided, the pass is clamped to that AND to
+   * done by. The scanner calls this pass LAST, after the candidate/push
+   * phase, so the deadline is whatever the tick has left (minus its finish
+   * reserve) — follow-ups are hour-scale and every row is re-claimed on the
+   * next tick, so a truncated pass loses only latency while a delayed push is
+   * gone for good. When provided, the pass is clamped to that AND to
    * TRACKER_TICK_BUDGET_MS. Either way the limit is checked only BETWEEN
    * stages and rows, so a truncated pass can never cut an alert after its
    * reservation was written (left-over rows are claimed and evaluated on the
