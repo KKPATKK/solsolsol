@@ -38,15 +38,53 @@ import { tradeKeyboard } from "./bot";
  * long, so a clamped remainder simply runs on the next tick (rows are
  * re-claimed then and nothing is lost — see the checks in runTick).
  *
- * Sized as the tracker's SHARE of the scanner's front-phase window: feeds
- * 600 + tracker 500 + pool read 600 + pair fetch 1250 = 2950ms against the
- * 4.2s internal deadline, leaving the gate/push phase ≥1.25s even on a tick
- * where every front phase rides its cap (and ~2.5s on a normal tick, where
- * the caps are nowhere near binding). Before this bound the tracker was
- * awaited unbounded inside that window. The normal pass — one batched pair
- * lookup plus a handful of DB writes — costs ~300–600ms.
+ * 2026-09-17 (zero-row fix): 500 → 1000. At 500ms the pass had NO usable
+ * row allowance at all: its mandatory stages (recap/prune, the self-heal
+ * scan, one DexScreener batch for the watched tokens, then the row loop)
+ * come to ~550–700ms on a healthy tick, so the loop hit its first budget
+ * check already past the deadline, broke immediately, and returned
+ * `checked:0, alerted:0` with no note — indistinguishable in /health from a
+ * tick with nothing to watch. Live proof: 33 tracked rows, 28 of them
+ * ACTIVE, `pushWatch: "ok:0/0"` on every tick, and not one row carrying a
+ * tracker write (peak/lastMcap/lastVol5m all still at their insert values)
+ * — post-push monitoring had stopped entirely while looking healthy. The
+ * budget now covers the batch (TRACKER_PAIRS_BUDGET_MS) PLUS ≥400ms of row
+ * work, and the loop never skips its first row, so progress per tick is
+ * structurally guaranteed instead of depending on how fast DexScreener
+ * answered. Sized as the tracker's SHARE of the scanner's front-phase
+ * window (feed 600 + tracker 1000 + pool read 600 + pair fetch 1250 against
+ * the 2600ms front window and the 4.2s internal deadline): the front phases
+ * individually clamp to that window, so an oversubscribed worst case only
+ * shortens the LATER phases — the gate/push reserve is untouched, and a
+ * healthy tick (feeds ~450ms, tracker ~700ms, pool ~150ms) never comes
+ * close.
  */
-const TRACKER_TICK_BUDGET_MS = 500;
+const TRACKER_TICK_BUDGET_MS = 1_000;
+/**
+ * Hard cap on the tracker's OWN DexScreener batch (the pass's one mandatory
+ * request, handed to the client as a caller deadline so it stops dispatching
+ * past it). Without this cap the batch ran on the client's own
+ * PAIRS_FETCH_BUDGET_MS (1250ms) — LONGER than the pass budget — so a slow
+ * batch silently consumed the entire pass and left the row loop with
+ * nothing (see TRACKER_TICK_BUDGET_MS). 600ms still fits the shared
+ * 250ms dispatch spacing plus a healthy round trip; a batch that misses it
+ * is retried on the next tick (the pair cache makes the retry cheap).
+ */
+const TRACKER_PAIRS_BUDGET_MS = 600;
+/**
+ * Age past which a row the tracker has NEVER evaluated is treated as a
+ * BACKFILL instead of a live follow-up: its push is older than the alert
+ * cooldown (30 min) and nothing was observing the coin since, so whatever
+ * its price did happened in a blind window. The first pass then absorbs the
+ * state silently — bookkeeping (peak, liquidity, mcap, stage marks) is
+ * written exactly as a normal pass would, but no card is sent — and only NEW
+ * information alerts from the next check on. Without it, recovering from a
+ * tracking outage fires a one-off burst of ~30 stale ⚠️/💀/💧 cards for
+drawdowns that are hours old, and re-announces 🚀 milestones the operator
+never had a chance to act on. The peak is still recorded, so the window's
+🏁 recap reports the ride honestly ("峰值 +190%") without the spam.
+ */
+const STALE_BACKFILL_MS = 45 * 60_000;
 /** Rising-stage thresholds (%) above the push-time mcap → state suffix. */
 const RISING_STAGES = [50, 100, 200, 400] as const;
 /**
@@ -566,6 +604,8 @@ export class PushWatcher {
     /** Live pair data for ≤30 addresses (the DexScreener client method). */
     private readonly pairsFor: (
       addresses: string[],
+      /** Optional epoch-ms cap for this call (see TRACKER_PAIRS_BUDGET_MS). */
+      deadlineMs?: number,
     ) => Promise<Map<string, import("./dexscreener").PairInfo>>,
     /**
      * Trade service (optional — null when BOT_WALLET_PRIVATE_KEY is unset).
@@ -616,16 +656,27 @@ export class PushWatcher {
    * `deadlineMs` (optional) is an absolute epoch ms the CALLER's tick must be
    * done by (the scanner's front-phase window — the tracker runs inside it,
    * right after the feeds). When provided, the pass is clamped to that AND to
-   * TRACKER_TICK_BUDGET_MS; without it the share alone applies, which is what
-   * the scanner's current call does. Either way the limit is checked only
-   * BETWEEN stages and rows, so a truncated pass can never cut an alert after
-   * its reservation was written (left-over rows are claimed and evaluated on
-   * the next tick).
+   * TRACKER_TICK_BUDGET_MS. Either way the limit is checked only BETWEEN
+   * stages and rows, so a truncated pass can never cut an alert after its
+   * reservation was written (left-over rows are claimed and evaluated on the
+   * next tick) — with ONE exception: the loop's first row always runs, so a
+   * pass structurally cannot end with zero rows evaluated (the 2026-09-17
+   * silent-stop shape).
+   *
+   * The returned `note` is the pass's coverage line: whenever any active row
+   * went unchecked it names how many rows ran, how many of the requested
+   * tokens came back from the pair batch, and why the rest were skipped. That
+   * exists so a starved tracker is visible in /health instead of reporting a
+   * healthy-looking `ok:0/0`.
    */
   async runTick(deadlineMs?: number): Promise<{
     checked: number;
     alerted: number;
-    /** Why nothing was checked (empty in the heartbeat when work happened). */
+    /**
+     * Coverage/skip reason. Present whenever work was skipped — including
+     * `rows 0/28 …` for a pass that evaluated nothing (previously omitted
+     * exactly in the starvation case).
+     */
     note?: string;
   }> {
     const cfg = this.config.pushWatch;
@@ -675,7 +726,10 @@ export class PushWatcher {
         10,
       );
       if (missing.length > 0) {
-        const missPairs = await this.pairsFor(missing.map((m) => m.token));
+        const missPairs = await this.pairsFor(
+          missing.map((m) => m.token),
+          now + TRACKER_PAIRS_BUDGET_MS,
+        );
         for (const m of missing) {
           const pair = missPairs.get(m.token);
           if (!pair) continue;
@@ -770,11 +824,24 @@ export class PushWatcher {
         note: rows.length === 0 ? "no-rows" : "all-terminal",
       };
 
-    // One DexScreener batch covers the whole watch list (≤30 addresses).
-    const tokens = activeRows.map((r) => r.token).slice(0, 30);
+    // Rotation: LEAST-recently-checked first. The loop only fits a few rows
+    // per tick (each one costs a claim plus an update round trip), and
+    // iterating newest-first re-read the same head every tick — every pushed
+    // coin outside the head would sit unmonitored for its whole tracking
+    // window (the sibling of the 2026-09-17 zero-row bug: with the row
+    // allowance restored, a fixed head would monitor ~3 of 30 coins).
+    // Ordered this way each tick advances the round-robin; a freshly pushed
+    // coin (last_checked = its insert stamp) joins the back of that queue and
+    // is watched within one cycle. Same rotation idea as the re-eval pool.
+    const queue = [...activeRows].sort(
+      (a, b) => (a.lastChecked ?? 0) - (b.lastChecked ?? 0),
+    );
+    // One DexScreener batch covers the whole watch list (≤30 addresses) —
+    // capped so it cannot eat the row allowance (see TRACKER_PAIRS_BUDGET_MS).
+    const tokens = queue.map((r) => r.token).slice(0, 30);
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
     try {
-      pairs = await this.pairsFor(tokens);
+      pairs = await this.pairsFor(tokens, now + TRACKER_PAIRS_BUDGET_MS);
     } catch (err) {
       // feed down — retry next tick; surface the reason via the heartbeat.
       return {
@@ -786,17 +853,33 @@ export class PushWatcher {
 
     let checked = 0;
     let alerted = 0;
-    for (const row of activeRows) {
+    let backfilled = 0;
+    let pairMiss = 0;
+    let claimLost = 0;
+    let budgetCut = false;
+    let firstRow = true;
+    for (const row of queue) {
       // Budget check BETWEEN rows: the claim and the alert reservation for a
       // row both happen after this point, so leaving a row to the next tick
       // can never drop an alert (it is re-claimed and re-evaluated then).
-      if (past()) break;
+      // The FIRST row is never skipped: when the front stages (recap/prune,
+      // self-heal, pair batch) run long, breaking here is what silently
+      // stopped all post-push monitoring — the pass reported `ok:0/0` with no
+      // note while 28 active rows went unrefreshed (2026-09-17). One row per
+      // tick is the floor that keeps the tracker moving no matter what
+      // DexScreener or Turso are doing.
+      if (!firstRow && past()) {
+        budgetCut = true;
+        break;
+      }
+      firstRow = false;
       const pair = pairs.get(row.token);
       if (!pair) {
         // Delisted/unfindable: drop after a grace period so stale rows don't
         // linger. The clock runs from the LAST SUCCESSFUL CHECK, not the
         // push time — the batched feed occasionally omits pairs (flaky
         // shared egress), and a single miss must not delete a live row.
+        pairMiss += 1;
         const lastSeen = Math.max(row.pushedAt, row.lastChecked);
         if (now - lastSeen > 2 * 3_600_000) await this.db.deletePushWatch(row.token);
         continue;
@@ -804,8 +887,10 @@ export class PushWatcher {
       // Cross-isolate claim: only one concurrent tick may alert this row.
       // The loser's snapshot is stale — it would re-fire state-machine
       // transitions (duplicate ⚠️/🚀 cards). Skip silently on lost race.
-      if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now)))
+      if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now))) {
+        claimLost += 1;
         continue;
+      }
       checked += 1;
       const evalResult = evaluateWatch(
         row,
@@ -821,13 +906,24 @@ export class PushWatcher {
         { cooldownMs: cfg.cooldownMin * 60_000 },
       );
 
+      // Backfill pass (see STALE_BACKFILL_MS): a row the tracker has never
+      // evaluated (last_mcap is written by every real pass) whose push is
+      // already older than the alert cooldown. This is the shape of a
+      // recovered tracking outage — evaluate it and write the bookkeeping,
+      // but suppress delivery: the drop/run happened while nothing was
+      // watching, and 30 such cards at once is noise, not signal.
+      const backfill =
+        row.lastMcap === null && now - row.pushedAt > STALE_BACKFILL_MS;
+      if (backfill) backfilled += 1;
       // Authoritative duplicate guard: reserve the state transition
       // BEFORE delivering. The last_checked claim alone cannot stop an
       // isolate that reads between this isolate's claim and its final
       // write — it inherits the claimed stamp but the pre-alert state.
       // Matching on (last_state, last_alert_at) makes exactly one
-      // contender's UPDATE win; the loser skips delivery.
+      // contender's UPDATE win; the loser skips delivery. Skipped entirely
+      // on a backfill pass, which sends nothing.
       if (
+        !backfill &&
         evalResult.alerts.length > 0 &&
         !(await this.db.reservePushWatchAlert(
           row.token,
@@ -854,6 +950,7 @@ export class PushWatcher {
         continue;
       }
       for (const a of evalResult.alerts) {
+        if (backfill) break;
         try {
           const sent = await this.bot.api.sendMessage(row.chatId, a.text);
           alerted += 1;
@@ -885,9 +982,14 @@ export class PushWatcher {
         peakMcap: evalResult.peakMcap,
         lastLiquidity: pair.liquidity.usd,
         lastVol5m: pair.volume.m5,
-        followupsSent: evalResult.followupsSent,
+        // A backfill pass delivers nothing: the counters and the alert clock
+        // stay where they were, while the PERSISTENT state markers land —
+        // that is what keeps every already-crossed 🚀/w35/dead transition
+        // from being re-announced, and what makes the next check report only
+        // genuinely new information.
+        followupsSent: backfill ? row.followupsSent : evalResult.followupsSent,
         lastState: evalResult.lastState,
-        lastAlertAt: evalResult.lastAlertAt,
+        lastAlertAt: backfill ? row.lastAlertAt : evalResult.lastAlertAt,
         mcapAtPush: evalResult.resetBaselineMcap,
         // Roll the 📈 baseline forward — omitting this made every later
         // holder check re-fire against the stale push-time baseline
@@ -929,6 +1031,21 @@ export class PushWatcher {
       }
     }
 
-    return { checked, alerted };
+    // Coverage note: present whenever any active row went unchecked OR a
+    // stale row was absorbed, so a starved tracker can never again look like
+    // a healthy `ok:0/0` in /health — the exact shape that hid the 2026-09-17
+    // stop for hours. One line names every skip reason: tokens the batch did
+    // not return (miss), cross-isolate claim races (lost), the pass running
+    // out of budget before the rest of the rotation (budget-cut), and rows
+    // whose first observation landed after a tracking gap (backfill).
+    const skipped = activeRows.length - checked;
+    const note =
+      skipped <= 0 && backfilled === 0
+        ? undefined
+        : `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
+          ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
+          `${budgetCut ? " budget-cut" : ""}`;
+
+    return { checked, alerted, note };
   }
 }

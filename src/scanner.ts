@@ -860,7 +860,8 @@ export class Scanner {
           this.bot,
           this.birdeye,
           config,
-          (addresses: string[]) => this.dex.fetchPairsForTokens(addresses),
+          (addresses: string[], deadlineMs?: number) =>
+            this.dex.fetchPairsForTokens(addresses, deadlineMs),
           // Trade service for the heal-resend card's buy/sell/mode buttons
           // (null = trading unconfigured → link + unwatch only).
           this.trade,
@@ -1511,12 +1512,25 @@ export class Scanner {
       // momentum windows are minutes long, so when the tick is already more
       // than halfway spent the pass defers to the next tick (rows are
       // re-claimed then; nothing is lost).
+      // 2026-09-17: its own budget must cover the pass's mandatory stages
+      // (recap/prune, self-heal, one pair batch) AND row work, and the row
+      // loop must always evaluate at least one row (see pushwatch.ts
+      // TRACKER_TICK_BUDGET_MS). Before that, the pair batch ate the whole
+      // allowance, the loop broke at its first check, and the pass reported
+      // a healthy-looking `ok:0/0` while every tracked coin went unrefreshed.
       const trackerStart = Date.now();
       const trackerDeferred = Date.now() - startedAt > SCAN_TICK_DEADLINE_MS / 2;
       if (this.pushWatcher && !trackerDeferred) {
         if (this.shouldStopEarly()) return;
         try {
-          const pw = await this.pushWatcher.runTick();
+          // The pass gets the FRONT WINDOW as its deadline (it runs inside
+          // that window, before the pool read and the pair fetch): its own
+          // budget decides how long it works, this bounds how late it can
+          // ever be — so the pool/pair phases and the 1.6s gate reserve can
+          // never be eaten by a slow tracker tick.
+          const pw = await this.pushWatcher.runTick(
+            startedAt + FRONT_PHASE_WINDOW_MS,
+          );
           diag.pushWatch = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);

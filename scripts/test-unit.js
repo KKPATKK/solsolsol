@@ -18,7 +18,7 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -1655,6 +1655,127 @@ async function main() {
     assert.equal(passesChgGate(19.9, 39.9, 20, 40), false);
     // Negative values never qualify.
     assert.equal(passesChgGate(-41.2, -10, 20, 40), false);
+  });
+
+  // ---------- post-push tracker pass (row floor + coverage note) ----------
+  //
+  // 2026-09-17 live shape: 33 push_watch rows, 28 of them ACTIVE, every tick
+  // reporting `pushWatch: "ok:0/0"` — and not one row carrying a tracker
+  // write. The pass's mandatory stages (recap/prune, self-heal scan, one
+  // DexScreener batch for the watched tokens) cost more than the whole 500ms
+  // budget, so the row loop hit its first budget check already past the
+  // deadline, broke immediately and returned `checked: 0` with NO note —
+  // indistinguishable from a tick with nothing to watch, i.e. post-push
+  // monitoring had stopped while looking healthy. These tests pin the two
+  // guarantees that close that hole.
+
+  // Fixture shaped like db.listPushWatch's row mapping.
+  const watchRow = (token, over = {}) => {
+    const pushedAt = Date.now() - 30 * 60_000;
+    return {
+      token, chatId: "c", symbol: token, pushedAt,
+      mcapAtPush: 100_000, peakMcap: 100_000, lastLiquidity: 50_000,
+      lastVol5m: 1_000, deadTroughMcap: null, holdersAtPush: null,
+      holdersLast: null, holdersCheckedAt: null, sellDomStreak: 0,
+      lastMcap: null, lastChecked: pushedAt, lastAlertAt: 0,
+      followupsSent: 0, lastState: null, upStages: null,
+      ...over,
+    };
+  };
+  // Flat live pair: no rising/weak/ignition/liquidity alert can fire, so the
+  // tests observe the pass's bookkeeping instead of its alerting.
+  const watchPair = (token) => ({
+    chainId: "solana", url: "", pairAddress: `p-${token}`,
+    baseToken: { address: token, name: token, symbol: token },
+    priceUsd: "0.001", marketCap: 100_000,
+    volume: { h24: 1_000_000, h1: 20_000, m5: 1_000 },
+    priceChange: { m5: 1, h1: 5 },
+    txns: { m5Buys: 10, m5Sells: 8, h1Buys: 100, h1Sells: 80 },
+    liquidity: { usd: 50_000 }, pairCreatedAt: Date.now() - 3 * 3_600_000,
+  });
+  const watchDb = (rows, updated) => ({
+    listPushWatch: async () => rows,
+    prunePushWatch: async () => 0,
+    findUntrackedPushes: async () => [],
+    markRecapClaimed: async () => false,
+    claimPushWatch: async () => true,
+    reservePushWatchAlert: async () => true,
+    updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
+    deletePushWatch: async () => {},
+    setPushWatchHolders: async () => {},
+  });
+  const watchBot = { api: { sendMessage: async () => ({ message_id: 1 }) } };
+
+  await test("PushWatcher: the row loop always evaluates a row, even when the pair batch ate the budget", async () => {
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const updated = [];
+    const deadlines = [];
+    const pairsFor = async (addrs, deadlineMs) => {
+      deadlines.push(deadlineMs);
+      await new Promise((r) => setTimeout(r, 250));
+      return new Map(addrs.map((a) => [a, watchPair(a)]));
+    };
+    const pw = new PushWatcher(
+      watchDb(rows, updated), watchBot, null, loadConfig({}), pairsFor, null,
+    );
+    // 100ms budget against a 250ms batch: the pass is past its deadline
+    // before the loop even starts — the live shape. The first row must run.
+    const out = await pw.runTick(Date.now() + 100);
+    assert.equal(out.checked, 1, "one row must be evaluated however late the pass is");
+    assert.equal(updated.length, 1);
+    assert.match(String(out.note), /budget-cut/);
+    assert.equal(
+      typeof deadlines[0],
+      "number",
+      "the batch gets a caller deadline so it cannot overrun the pass",
+    );
+  });
+
+  await test("PushWatcher: tokens the pair batch did not return are reported, not silently skipped", async () => {
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const updated = [];
+    const pw = new PushWatcher(
+      watchDb(rows, updated), watchBot, null, loadConfig({}),
+      async () => new Map(), null,
+    );
+    const out = await pw.runTick();
+    assert.equal(out.checked, 0);
+    assert.equal(updated.length, 0);
+    // The old code returned no note at all here — the silent-starve shape.
+    assert.match(String(out.note), /rows 0\/2/);
+    assert.match(String(out.note), /miss 2/);
+  });
+
+  await test("PushWatcher: a recovered tracking gap absorbs state silently instead of firing a stale burst", async () => {
+    // The pass's delivery is suppressed for a row the tracker has NEVER
+    // evaluated (last_mcap still null) whose push is older than the alert
+    // cooldown: that is exactly what every tracked coin looks like when the
+    // tracker was starved. Bookkeeping must still land, so the next check
+    // reports only new information and the window's recap still tells the
+    // story.
+    const rows = [watchRow("AAA", { pushedAt: Date.now() - 3 * 3_600_000 })];
+    const updated = [];
+    let sent = 0;
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      { api: { sendMessage: async () => { sent += 1; return { message_id: 1 }; } } },
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, { ...watchPair(a), marketCap: 200_000 }])),
+      null,
+    );
+    const out = await pw.runTick();
+    assert.equal(out.checked, 1);
+    assert.equal(sent, 0, "a stale first observation must not deliver cards");
+    assert.match(String(out.note), /backfill 1/);
+    const written = updated[0][1];
+    assert.equal(written.lastMcap, 200_000, "the observation is still recorded");
+    assert.equal(written.lastState, "up100", "already-crossed stages are marked as absorbed");
+    assert.equal(written.followupsSent, 0, "suppressed alerts are not counted as delivered");
+    assert.equal(written.lastAlertAt, 0, "the alert clock is left alone");
+    // Only the highest crossed stage is marked (one stage per check), so
+    // no 🚀 card can be re-announced when tracking resumes.
+    assert.equal(written.upStages, "up100");
   });
 
   await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {
