@@ -29,6 +29,26 @@ import { createClient, type Client } from "@libsql/client/web";
  */
 const DB_REQUEST_TIMEOUT_MS = 6_000;
 /**
+ * Tick-scoped cap for the round trips the SCAN makes (see
+ * Db.enterScanMode). DB_REQUEST_TIMEOUT_MS is sized for the completion flush
+ * and command handlers, which have seconds of wall time of their own; the
+ * scan does not. Its ladder gives the eval region ~3.3s of a 4.2s deadline
+ * and the worker kills the tick at ~4.85s, so a single un-raced round trip
+ * allowed 6s of transport (7.2s to the hard wall) is guaranteed to outlive
+ * the WHOLE tick. Live 2026-09-17 08:38:30Z: a tick with a candidate died at
+ * 5000ms carrying feedsMs/poolMs/pairs but no evalMs — that field is written
+ * after the candidate/push loop, so the death was inside an un-raced round
+ * trip, exactly the 1-in-8-tick shape that also dropped candidate pushes
+ * (`candidates: 1, pushed: 0` with every `fails` counter at 0).
+ *
+ * 1.2s is 2x the slowest HEALTHY scan round trip measured in production
+ * (poolMs 145-600ms for the biggest query the tick makes), so a healthy tick
+ * never notices it, while a stalled call now fails inside the eval window
+ * and lets the rest of the ladder run. The hard wall is 1.2x this, so even a
+ * stalling libsql retry ladder lands at ~1.44s.
+ */
+export const SCAN_DB_TIMEOUT_MS = 1_200;
+/**
  * Min gap between token_stats prunes. Discovery inflow is ~140 coins/min
  * and only rows older than the 30h re-eval window are removed, so a 10-min
  * lag has zero functional impact while cutting the prune's rows-read by
@@ -217,7 +237,8 @@ export interface TokenStats {
  * fetch aborts (our DB_REQUEST_TIMEOUT_MS signal), so a request's promise
  * can outlive the signal 2-3x — the "hanging write" shape that killed
  * completion flushes and produced the recurring 60-93s dead ticks. The
- * wall races every call against a timer 1.2x DB_REQUEST_TIMEOUT_MS: if the
+ * wall races every call against a timer 1.2x `timeoutMs` (DB_REQUEST_TIMEOUT_MS
+ * by default, SCAN_DB_TIMEOUT_MS for a tick — see Db.enterScanMode): if the
  * client is still grinding through its retry ladder at that point, the
  * CALLER gets a hard error instead of an eternity. The late-settling
  * libsql promise is dropped (the race keeps its handlers attached, so a
@@ -225,17 +246,28 @@ export interface TokenStats {
  * idempotent by design — the flush deletes its own row before inserting).
  * Exported so unit tests can verify the wall with mock clients.
  */
-export function wrapClientWithHardWall<T extends object>(client: T): T {
+export function wrapClientWithHardWall<T extends object>(
+  client: T,
+  /** Transport budget this wrapper's wall is derived from (1.2x). */
+  timeoutMs: number = DB_REQUEST_TIMEOUT_MS,
+  /**
+   * Called with the ms the CALLER actually waited for each call — wall time
+   * included, because a stalled call is exactly the cost this measures (see
+   * Db.enterScanMode).
+   */
+  onCost?: (ms: number) => void,
+): T {
   return new Proxy(client, {
     get(target, prop) {
       if (prop !== "execute" && prop !== "batch") {
         return Reflect.get(target, prop);
       }
       return (...args: unknown[]) => {
+        const t0 = Date.now();
         const op = (
           Reflect.get(target, prop) as (...a: unknown[]) => Promise<unknown>
         ).apply(target, args);
-        return Promise.race([
+        const raced = Promise.race([
           op,
           new Promise<never>((_, reject) => {
             const t = setTimeout(
@@ -243,17 +275,21 @@ export function wrapClientWithHardWall<T extends object>(client: T): T {
                 reject(
                   new Error(
                     `db ${String(prop)} hit the ${Math.round(
-                      DB_REQUEST_TIMEOUT_MS * 1.2,
+                      timeoutMs * 1.2,
                     )}ms hard wall — libsql retry loop never settled`,
                   ),
                 ),
-              DB_REQUEST_TIMEOUT_MS * 1.2,
+              timeoutMs * 1.2,
             );
             // Release the timer as soon as the operation settles so a
             // busy isolate never holds thousands of live timers.
             op.finally(() => clearTimeout(t)).catch(() => {});
           }),
         ]);
+        if (onCost) {
+          raced.finally(() => onCost(Date.now() - t0)).catch(() => {});
+        }
+        return raced;
       };
     },
   });
@@ -270,6 +306,16 @@ export class Db {
   private readonly authToken?: string;
   /** Pre-built client (unit tests: local `file:` libsql, no network). */
   private readonly injectedClient?: Client;
+  /**
+   * Tick-scoped client, created on the first enterScanMode() and reused for
+   * the isolate's lifetime. See SCAN_DB_TIMEOUT_MS: same connection settings,
+   * 5x shorter leash, so a scan round trip cannot outlive the tick.
+   */
+  private scanClient: Client | null = null;
+  /** True while a scan is running (see enterScanMode). */
+  private scanMode = false;
+  /** Ms spent inside tick-scoped round trips since the last enterScanMode(). */
+  private scanDbMs = 0;
 
   constructor(url: string, authToken?: string, injectedClient?: Client) {
     this.url = url;
@@ -289,36 +335,80 @@ export class Db {
       this.client = wrapClientWithHardWall(this.injectedClient);
       return this.client;
     }
+    this.client = wrapClientWithHardWall(this.createRawClient(DB_REQUEST_TIMEOUT_MS));
+    return this.client;
+  }
+
+  /**
+   * Builds a raw (unwrapped) libsql client whose TRANSPORT aborts at
+   * `timeoutMs`. The hard wall around it is 1.2x that — see
+   * wrapClientWithHardWall for why one signal is not enough (the HTTP client
+   * retries internally after an abort, so its promise can outlive the
+   * signal 2-3x).
+   */
+  private createRawClient(timeoutMs: number): Client {
     // libsql:// is a WebSocket scheme; https:// drives the HTTP transport,
     // which works reliably on Workers (fetch) and in Node alike.
     const httpUrl = this.url.replace(/^libsql:\/\//, "https://");
-    const raw = createClient({
+    return createClient({
       url: httpUrl,
       authToken: this.authToken,
-      // Bound every request (see DB_REQUEST_TIMEOUT_MS): a stalled Turso
-      // call aborts instead of hanging the tick indefinitely.
+      // Bound every request: a stalled Turso call aborts instead of hanging
+      // the caller indefinitely.
       fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
         fetch(input, {
           ...init,
-          signal: AbortSignal.timeout(DB_REQUEST_TIMEOUT_MS),
+          signal: AbortSignal.timeout(timeoutMs),
         }),
     });
-    // 2026-09-13 (dead-tick fix): the fetch signal above bounds each
-    // TRANSPORT attempt, but the libsql HTTP client catches the abort and
-    // RETRIES internally — so execute()/batch() promises can outlive the
-    // signal 2-3x and hang the caller well past it (the flush's "hanging
-    // write" shape that produced the recurring 60-93s dead ticks). This
-    // wall wraps the CLIENT, not the request: every execute/batch races
-    // against a timer that fires 1.2x DB_REQUEST_TIMEOUT_MS after the call
-    // started — if the client is still grinding through its internal retry
-    // ladder at that point, the caller gets a hard error instead of an
-    // eternity. The late-settling libsql promise is dropped (its handlers
-    // are attached by the race), so a retry that eventually commits simply
-    // has no reader; every operation here is idempotent by design (the
-    // flush deletes its own row before inserting). Node tests inject their
-    // own client (local file DB) and are NOT wrapped.
-    this.client = wrapClientWithHardWall(raw);
-    return this.client;
+  }
+
+  /**
+   * Tick-scoped client: same connection, SCAN_DB_TIMEOUT_MS leash. Built on
+   * first use and kept for the isolate's lifetime (the wrapped client holds
+   * no request state, and re-creating it per tick would re-allocate the
+   * transport on the hot path).
+   */
+  private ensureScanClient(): Client {
+    if (this.scanClient) return this.scanClient;
+    const raw = this.injectedClient ?? this.createRawClient(SCAN_DB_TIMEOUT_MS);
+    const wrapped = wrapClientWithHardWall(raw, SCAN_DB_TIMEOUT_MS, (ms) => {
+      // Reachable only in scan mode (see get()), so this counter is the
+      // tick's own un-raced Turso cost. A call that started inside a scan and
+      // settles after exitScanMode() adds its ms to the NEXT tick's count
+      // (the tick had already given up on it); that bias is a few ms wide and
+      // only ever overstates, never hides, the cost.
+      this.scanDbMs += ms;
+    });
+    return (this.scanClient = wrapped);
+  }
+
+  /**
+   * Enters the tick-scoped DB cap for one scan (see SCAN_DB_TIMEOUT_MS).
+   * From here until exitScanMode() every round trip — the scanner's own and
+   * the post-push tracker's, since both live inside the tick — fails inside
+   * the tick instead of outliving it.
+   *
+   * Scope note: this is a flag on the shared Db instance, so a command
+   * handler running on the SAME isolate during a scan window also gets the
+   * shorter leash. That is the safe direction — the alternative is a stalled
+   * call that kills the tick — and handlers surface their own errors.
+   */
+  enterScanMode(): void {
+    this.scanMode = true;
+    this.scanDbMs = 0;
+  }
+
+  /**
+   * Leaves scan mode and returns the ms the scan spent in tick-scoped round
+   * trips. Reported in the scan summary (`diag.dbMs`) so the un-raced Turso
+   * cost is visible per tick instead of inferred after a death.
+   */
+  exitScanMode(): number {
+    this.scanMode = false;
+    const ms = this.scanDbMs;
+    this.scanDbMs = 0;
+    return ms;
   }
 
   async init(): Promise<void> {
@@ -950,7 +1040,7 @@ export class Db {
     if (!this.client) {
       throw new Error("Database is not initialized");
     }
-    return this.client;
+    return this.scanMode ? this.ensureScanClient() : this.client;
   }
 
   private mapRow(row: Record<string, unknown>): ChatSettings {

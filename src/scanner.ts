@@ -527,6 +527,20 @@ export interface ScanSummary {
   poolMs?: number;
   /** Wall-clock ms for matching + candidate gate evaluation. */
   evalMs?: number;
+  /**
+   * Wall-clock ms the scan spent in tick-scoped Turso round trips (see
+   * Db.enterScanMode / SCAN_DB_TIMEOUT_MS). The ladder's biggest UN-RACED
+   * cost: the eval region only has ~3.3s of the 4.2s deadline, so this is
+   * the number to read when a tick dies at the race window with candidates
+   * it never pushed (2026-09-17 08:38:30Z shape).
+   */
+  dbMs?: number;
+  /**
+   * Which tick-critical DB step degraded this tick (`stats-read`), or
+   * undefined when all of them answered. Present so a fast-failing round
+   * trip is visible in /health instead of only in the console.
+   */
+  dbDegraded?: string;
   /** Pool coins actually evaluated this tick (rotation slice of `pool`,
    * see RE_EVAL_PER_TICK_MAX). Undefined on pre-fix summaries. */
   poolSliced?: number;
@@ -1197,6 +1211,15 @@ export class Scanner {
     // abort() publishes this snapshot if the tick's race trips mid-scan
     // (see inflightSummary — timeout rows otherwise flush summary:null).
     this.inflightSummary = diag;
+    // Tick-scoped DB cap (see Db.enterScanMode / SCAN_DB_TIMEOUT_MS): every
+    // round trip this scan makes — front phases, candidate chain, delivery,
+    // and the post-push tracker pass, which all live inside the tick — gets
+    // SCAN_DB_TIMEOUT_MS instead of the 6s the flush and command handlers
+    // need. The scan's own work is fully deadline-budgeted everywhere else;
+    // the round trips were the last unbounded await in it, and one stalled
+    // call was worth more than the whole tick (they cannot be started from
+    // outside the scan: get() gates on this flag).
+    this.db.enterScanMode();
     // Watchdog: if the scan outlives its budget, release the lock so the next
     // tick can retry instead of the isolate wedging in a permanent skip loop.
     const watchdog = setTimeout(() => {
@@ -1778,11 +1801,28 @@ export class Scanner {
       // simply re-registers next tick once the pair is fetched).
       const statsByToken = new Map<string, TokenStats>();
       if (this.shouldStopEarly()) return;
-      const existingStats = await this.db.getTokenStatsMany(
-        feedProfiles.map((p) => p.tokenAddress),
-      );
+      // Tick-critical READ under the scan cap: when it fails fast (a stalled
+      // Turso call hits SCAN_DB_TIMEOUT_MS) registration is SKIPPED for this
+      // tick rather than degraded, because writing a fresh row for a token we
+      // could not look up would reset its firstSeenAt — the pool's age and
+      // qualification signal. The feed re-registers it next tick.
+      let existingStats: Map<string, TokenStats> | null = null;
+      try {
+        existingStats = await this.db.getTokenStatsMany(
+          feedProfiles.map((p) => p.tokenAddress),
+        );
+      } catch (err) {
+        diag.dbDegraded = "stats-read";
+        console.error(
+          "[scanner] token stats read failed — skipping registration this tick:",
+          err instanceof Error ? err.message : err,
+        );
+      }
       const newStats: TokenStats[] = [];
       for (const profile of feedProfiles) {
+        // Read failed → register nothing: `existingStats` missing means we
+        // cannot tell new tokens from known ones (see the guard above).
+        if (!existingStats) break;
         const existing = existingStats.get(profile.tokenAddress);
         if (existing) {
           statsByToken.set(profile.tokenAddress, existing);
@@ -1819,8 +1859,20 @@ export class Scanner {
         newStats.push(stats);
         statsByToken.set(profile.tokenAddress, stats);
       }
-      if (newStats.length > 0) {
-        await this.db.recordTokenStatsMany(newStats);
+      // Same guard as the read above: without a successful lookup we do not
+      // know which tokens are new, so we write nothing (see the comment on
+      // getTokenStatsMany). One lost registration tick costs a coin nothing —
+      // it re-registers as soon as it appears in a feed again.
+      if (newStats.length > 0 && existingStats) {
+        try {
+          await this.db.recordTokenStatsMany(newStats);
+        } catch (err) {
+          diag.dbDegraded = "stats-write";
+          console.error(
+            "[scanner] token stats registration failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
       // Pool-only tokens (not in the current feed) reuse their cached stats.
       for (const stats of recentStats) {
@@ -1957,8 +2009,19 @@ export class Scanner {
         // skips the slow lookups when every chat already has it).
         const unseen: QualifyingCoin[] = [];
         for (const coin of group) {
-          if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
-            continue;
+          try {
+            if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
+              continue;
+            }
+          } catch (err) {
+            // Degrade to "not seen": the INSERT OR IGNORE claim inside sendTo
+            // is the real duplicate guard, and an unreadable dedupe table must
+            // not abort the tick with a candidate already in hand.
+            diag.dbDegraded = "seen-read";
+            console.error(
+              "[scanner] seen-check failed — treating as unseen:",
+              err instanceof Error ? err.message : err,
+            );
           }
           unseen.push(coin);
         }
@@ -2349,8 +2412,18 @@ export class Scanner {
           // Re-check right before sending: a concurrent scan (rare, only
           // when a scan outlives the 1-min cron) could have pushed it
           // meanwhile, or a previous tick's retry may have landed.
-          if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
-            continue;
+          // Failure degrades to "not seen" — the claim inside sendTo is what
+          // actually prevents a duplicate card.
+          try {
+            if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
+              continue;
+            }
+          } catch (err) {
+            diag.dbDegraded = "seen-read";
+            console.error(
+              "[scanner] delivery seen-check failed — treating as unseen:",
+              err instanceof Error ? err.message : err,
+            );
           }
           const symbol = c.profile.symbol ?? c.pair.baseToken.symbol ?? c.profile.tokenAddress;
           try {
@@ -2368,8 +2441,16 @@ export class Scanner {
             );
             if (info.transient) {
               await sleep(1200);
-              if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
-                continue;
+              try {
+                if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
+                  continue;
+                }
+              } catch (err) {
+                diag.dbDegraded = "seen-read";
+                console.error(
+                  "[scanner] retry seen-check failed — treating as unseen:",
+                  err instanceof Error ? err.message : err,
+                );
               }
               try {
                 await sendTo(c);
@@ -2432,6 +2513,8 @@ export class Scanner {
       );
     } finally {
       clearTimeout(watchdog);
+      // Ends the tick-scoped cap and yields the round trips' wall time.
+      const scanDbMs = this.db.exitScanMode();
       // Only a still-current scan may publish summary/state; a timed-out scan
       // that eventually settles must not clobber a newer scan's results.
       if (seq === this.scanSeq) {
@@ -2440,6 +2523,7 @@ export class Scanner {
         const fs = this.flurry?.stats();
         diag.flurryRpcCalls = fs?.rpcCalls ?? 0;
         diag.flurryCacheHits = fs?.cacheHits ?? 0;
+        diag.dbMs = scanDbMs;
         this.lastSummary = diag;
         this.lastSkip = null;
         this.running = false;

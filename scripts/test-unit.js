@@ -374,6 +374,52 @@ async function main() {
     assert.ok(calls.length >= 1, "execute reached the underlying client");
   });
 
+  await test("Db: a scan runs under the short tick cap and reports its round-trip cost", async () => {
+    // 2026-09-17 tick fix: the scan's round trips were the last unbounded
+    // await in the tick — DB_REQUEST_TIMEOUT_MS (6s, +1.2x hard wall) outlives
+    // the whole 4.2s ladder, so one stalled call killed a tick that already
+    // had a candidate in hand (live: died at 5000ms with feedsMs/poolMs/pairs
+    // published but no evalMs, which is written after the candidate loop).
+    // enterScanMode() must shorten BOTH the transport signal and the wall for
+    // the duration of the scan, and report the time the round trips took.
+    const { Db, SCAN_DB_TIMEOUT_MS } = require("../dist/db.js");
+    assert.ok(
+      SCAN_DB_TIMEOUT_MS > 0 && SCAN_DB_TIMEOUT_MS <= 2_000,
+      "the scan cap must sit well inside the tick, not at the 6s flush cap",
+    );
+    const hangingClient = {
+      execute(stmt) {
+        // Hang only the probe statement; init DDL and reads resolve fast.
+        if (stmt.args && stmt.args[0] === "hang") return new Promise(() => {});
+        return Promise.resolve({ rows: [{ value: "v1" }], rowsAffected: 0 });
+      },
+      async batch(stmts) {
+        return stmts.map(() => ({ rows: [], rowsAffected: 1 }));
+      },
+    };
+    const db = new Db("libsql://unused", undefined, hangingClient);
+    await db.init();
+    db.enterScanMode();
+    const t0 = Date.now();
+    await assert.rejects(
+      db.getWorkerState("hang"),
+      /hard wall|never settled/i,
+      "a stalled scan round trip must reject via the short wall",
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(
+      elapsed < SCAN_DB_TIMEOUT_MS * 2 && elapsed < 3_000,
+      `scan call settled in ${elapsed}ms — must be near SCAN_DB_TIMEOUT_MS (${SCAN_DB_TIMEOUT_MS}ms), not the 6s flush cap`,
+    );
+    const cost = db.exitScanMode();
+    assert.ok(
+      cost >= SCAN_DB_TIMEOUT_MS,
+      `exitScanMode must report the round trip's wall time (got ${cost}ms)`,
+    );
+    // Leaving scan mode restores the normal client: the same read works.
+    assert.equal(await db.getWorkerState("fine"), "v1");
+  });
+
   await test("Db.persistScanCompletion: heartbeat-only flush skips the prune-check read", async () => {
     // Dead-tick fix 2026-09-13: history=null (timeout/skip ticks) must
     // return right after the batch — the prune-check read after it was an
