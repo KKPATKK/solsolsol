@@ -1797,13 +1797,27 @@ export class Db {
    * of silently enrolling tracking for a card nobody ever received.
    */
   async hasInitialPushAudit(token: string): Promise<boolean> {
+    return (await this.getInitialPushAuditTokens()).has(token);
+  }
+
+  /**
+   * Every token with an "initial" audit entry, in ONE read. The self-heal
+   * asks this per candidate coin, and each ask re-read the SAME worker_state
+   * row (up to 10 identical round trips on a pass that only has ~1s of tick
+   * budget) — the same merge as the rest of this change (2026-09-17).
+   */
+  async getInitialPushAuditTokens(): Promise<Set<string>> {
     const raw = await this.getWorkerState("push_audit");
-    if (!raw) return false;
+    if (!raw) return new Set();
     try {
       const list = JSON.parse(raw) as Array<{ kind?: string; token?: string }>;
-      return list.some((e) => e.kind === "initial" && e.token === token);
+      return new Set(
+        list
+          .filter((e) => e.kind === "initial" && e.token)
+          .map((e) => String(e.token)),
+      );
     } catch {
-      return false;
+      return new Set();
     }
   }
 
@@ -2296,13 +2310,30 @@ export class Db {
     mcapAtPush: number;
     liquidityUsd: number | null;
   }): Promise<void> {
-    await this.get().execute({
-      sql: `INSERT INTO push_watch
-              (token, chat_id, symbol, pushed_at, mcap_at_push, peak_mcap,
-               last_liquidity, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(token) DO NOTHING`,
-      args: [
+    await this.upsertPushWatchMany([row]);
+  }
+
+  /**
+   * One round trip for N enrollments (multi-VALUES INSERT, the same shape
+   * recordTokenStatsMany uses). The self-heal used to upsert per healed coin
+   * — one round trip each, against the pass's ~1s tick budget.
+   */
+  async upsertPushWatchMany(
+    rows: Array<{
+      token: string;
+      chatId: string;
+      symbol: string | null;
+      pushedAt: number;
+      mcapAtPush: number;
+      liquidityUsd: number | null;
+    }>,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const now = Date.now();
+    const placeholders = rows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(",");
+    const args: Array<string | number | null> = [];
+    for (const row of rows) {
+      args.push(
         row.token,
         row.chatId,
         row.symbol,
@@ -2310,8 +2341,16 @@ export class Db {
         row.mcapAtPush,
         row.mcapAtPush,
         row.liquidityUsd,
-        Date.now(),
-      ],
+        now,
+      );
+    }
+    await this.get().execute({
+      sql: `INSERT INTO push_watch
+              (token, chat_id, symbol, pushed_at, mcap_at_push, peak_mcap,
+               last_liquidity, last_checked)
+            VALUES ${placeholders}
+            ON CONFLICT(token) DO NOTHING`,
+      args,
     });
   }
 
@@ -2582,11 +2621,28 @@ export class Db {
   }
 
   async markRecapClaimed(token: string): Promise<boolean> {
-    const res = await this.get().execute({
-      sql: "UPDATE push_watch SET last_state = 'expired'\n            WHERE token = ?\n              AND (last_state IS NULL OR last_state NOT IN ('expired', 'unwatched'))",
-      args: [token],
-    });
-    return Number(res.rowsAffected ?? 0) > 0;
+    const [won] = await this.markRecapClaimedMany([token]);
+    return won === true;
+  }
+
+  /**
+   * Batched recap claims: ONE round trip for every row leaving the tracking
+   * window, with per-row results so the caller still sends a 🏁 card only for
+   * the claims it actually won. A single multi-row UPDATE cannot say WHICH
+   * rows matched, and answering it with SELECT-then-UPDATE would reopen the
+   * duplicate-recap race this compare-and-swap exists to close — so the
+   * statements ride in one batch() instead (one request, executed in order).
+   */
+  async markRecapClaimedMany(tokens: string[]): Promise<boolean[]> {
+    if (tokens.length === 0) return [];
+    const res = await this.get().batch(
+      tokens.map((token) => ({
+        sql: "UPDATE push_watch SET last_state = 'expired'\n            WHERE token = ?\n              AND (last_state IS NULL OR last_state NOT IN ('expired', 'unwatched'))",
+        args: [token],
+      })),
+      "write",
+    );
+    return res.map((r) => Number(r.rowsAffected ?? 0) > 0);
   }
 
   async prunePushWatch(olderThanMs: number): Promise<number> {

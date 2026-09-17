@@ -1757,6 +1757,9 @@ async function main() {
     prunePushWatch: async () => 0,
     findUntrackedPushes: async () => [],
     markRecapClaimed: async () => false,
+    markRecapClaimedMany: async (tokens) => tokens.map(() => false),
+    getInitialPushAuditTokens: async () => new Set(),
+    upsertPushWatchMany: async () => {},
     claimPushWatch: async () => true,
     reservePushWatchAlert: async () => true,
     updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
@@ -1835,6 +1838,89 @@ async function main() {
     // Only the highest crossed stage is marked (one stage per check), so
     // no 🚀 card can be re-announced when tracking resumes.
     assert.equal(written.upStages, "up100");
+  });
+
+  await test("PushWatcher: one listing per tick, recap claims batched, no no-op prune, trips reported", async () => {
+    // 2026-09-17 round-trip merge: the pass read push_watch TWICE per tick
+    // (recap pass + row loop), claimed every expiring row with its own request,
+    // and always ran the prune even when it provably deleted nothing. On a
+    // pass budget of ~1s those round trips are what starves the rotation, so
+    // the mocks count every call and the pass must report the same number.
+    const window = loadConfig({}).pushWatch.windowHours * 3_600_000;
+    const rows = [
+      watchRow("OLD", { pushedAt: Date.now() - window - 60_000 }),
+      watchRow("AAA"),
+    ];
+    const calls = { list: 0, prune: 0, claims: [], total: 0, updated: [] };
+    const db = {
+      listPushWatch: async () => { calls.list += 1; calls.total += 1; return rows; },
+      prunePushWatch: async () => { calls.prune += 1; calls.total += 1; return 1; },
+      markRecapClaimedMany: async (tokens) => {
+        calls.claims.push(tokens);
+        calls.total += 1;
+        return tokens.map(() => true);
+      },
+      findUntrackedPushes: async () => { calls.total += 1; return []; },
+      claimPushWatch: async () => { calls.total += 1; return true; },
+      reservePushWatchAlert: async () => { calls.total += 1; return true; },
+      updatePushWatchCheck: async (token, v) => {
+        calls.total += 1;
+        calls.updated.push([token, v]);
+      },
+      deletePushWatch: async () => { calls.total += 1; },
+      setPushWatchHolders: async () => { calls.total += 1; },
+    };
+    let cards = 0;
+    const pw = new PushWatcher(
+      db,
+      { api: { sendMessage: async () => { cards += 1; return { message_id: 1 }; } } },
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick();
+    assert.equal(calls.list, 1, "push_watch must be read ONCE per tick (recap + loop share it)");
+    assert.equal(calls.claims.length, 1, "recap claims for N rows must ride in ONE batch");
+    assert.deepEqual(calls.claims[0], ["OLD"], "only the expiring row is claimed");
+    assert.equal(cards, 1, "the expiring row still gets its recap card");
+    assert.equal(calls.prune, 1, "a row past the window still triggers the prune");
+    assert.deepEqual(
+      calls.updated.map(([t]) => t), ["AAA"],
+      "a recapped row must never be evaluated again (the prune removes it)",
+    );
+    assert.equal(out.trips, calls.total, "the reported round trips are the ones actually made");
+    assert.match(String(out.note), /trips \d+/, "the coverage note names the round-trip count");
+  });
+
+  await test("PushWatcher: the prune is skipped when it provably deletes nothing", async () => {
+    // Same merge: the prune is `DELETE ... WHERE pushed_at < cutoff`, so with a
+    // COMPLETE listing (fewer rows than the limit, nothing outside the
+    // snapshot) that holds no past-window row it cannot match anything — one
+    // saved round trip on the common tick.
+    const rows = [watchRow("AAA")];
+    const calls = { list: 0, prune: 0, total: 0 };
+    const db = {
+      listPushWatch: async () => { calls.list += 1; calls.total += 1; return rows; },
+      prunePushWatch: async () => { calls.prune += 1; calls.total += 1; return 0; },
+      markRecapClaimedMany: async (tokens) => { calls.total += 1; return tokens.map(() => true); },
+      findUntrackedPushes: async () => { calls.total += 1; return []; },
+      claimPushWatch: async () => { calls.total += 1; return true; },
+      reservePushWatchAlert: async () => { calls.total += 1; return true; },
+      updatePushWatchCheck: async () => { calls.total += 1; },
+      deletePushWatch: async () => { calls.total += 1; },
+      setPushWatchHolders: async () => { calls.total += 1; },
+    };
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick();
+    assert.equal(calls.prune, 0, "a no-op prune must not spend a round trip");
+    assert.equal(calls.list, 1);
+    assert.equal(out.checked, 1);
+    assert.equal(out.trips, calls.total);
   });
 
   await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {

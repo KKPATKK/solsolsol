@@ -676,11 +676,14 @@ export class PushWatcher {
     checked: number;
     alerted: number;
     /**
-     * Coverage/skip reason. Present whenever work was skipped — including
-     * `rows 0/28 …` for a pass that evaluated nothing (previously omitted
-     * exactly in the starvation case).
+     * Coverage/skip line: rows evaluated, tokens the pair batch returned,
+     * every skip reason, and the pass's Turso round-trip count (`trips N`).
+     * Always present — it used to be omitted on a "clean" pass, which is
+     * exactly how a starved tracker looked healthy in /health.
      */
     note?: string;
+    /** Turso round trips this pass made (see the merge notes inside). */
+    trips: number;
   }> {
     const cfg = this.config.pushWatch;
     const now = Date.now();
@@ -690,29 +693,72 @@ export class PushWatcher {
         : TRACKER_TICK_BUDGET_MS;
     const deadline = now + budgetMs;
     const past = () => Date.now() > deadline;
-    const deferred = { checked: 0, alerted: 0, note: "deferred:tick-budget" };
+    // Round-trip ledger for the pass (reported in the coverage note). Every
+    // Turso call below is a full request on a pass that only holds
+    // TRACKER_TICK_BUDGET_MS, so this count is the tracker's real cost driver.
+    let trips = 0;
+    const deferred = {
+      checked: 0,
+      alerted: 0,
+      note: "deferred:tick-budget",
+      // Read at return time, so a deferral reports the trips made before it.
+      get trips() {
+        return trips;
+      },
+    };
     // Case-closed recaps: every coin leaving the window gets ONE summary
     // card before the bulk prune deletes it. Best-effort send — a failed
     // delivery must never keep a dead row alive forever.
     const windowCutoff = now - cfg.windowHours * 3_600_000;
+    // ONE listing per tick. The recap pass and the row loop below used to read
+    // the SAME table separately — two round trips of ~150-300ms each on a pass
+    // with ~1s of budget (2026-09-17). The snapshot is taken BEFORE
+    // recap/prune/heal and reused for the loop; the loop keeps only the rows
+    // the prune would have kept, so a row that just got its 🏁 recap is still
+    // never evaluated again.
+    let snapshot: PushWatchRow[] | null = null;
     try {
-      const allRows = await this.db.listPushWatch(cfg.maxTracked);
-      for (const r of allRows.filter(
-        (x) => x.pushedAt < windowCutoff && x.lastState !== "unwatched",
-      )) {
+      snapshot = await this.db.listPushWatch(cfg.maxTracked);
+      trips += 1;
+    } catch {
+      /* listing failed — the loop re-reads below, the prune still runs */
+    }
+    const expiring = (snapshot ?? []).filter(
+      (x) => x.pushedAt < windowCutoff && x.lastState !== "unwatched",
+    );
+    if (expiring.length > 0) {
+      // Claims FIRST, in ONE batched round trip, then the cards: the
+      // claim-before-send guarantee is unchanged (a batch is one request,
+      // executed in order), but N expiring rows now cost 1 trip instead of N.
+      let won: boolean[];
+      try {
+        won = await this.db.markRecapClaimedMany(expiring.map((r) => r.token));
+        trips += 1;
+      } catch {
+        won = expiring.map(() => false); // best-effort: no card without a claim
+      }
+      for (let i = 0; i < expiring.length; i++) {
+        if (!won[i]) continue;
         try {
-          // Claim first: overlapping ticks (deploy soft-switch) must not
-          // deliver the same 🏁 card twice. Unwatched rows never claim.
-          if (!(await this.db.markRecapClaimed(r.token))) continue;
-          await this.bot.api.sendMessage(r.chatId, recapMessage(r));
+          await this.bot.api.sendMessage(
+            expiring[i].chatId,
+            recapMessage(expiring[i]),
+          );
         } catch {
           /* best-effort */
         }
       }
-    } catch {
-      /* listing failed — the prune below still runs */
     }
-    await this.db.prunePushWatch(windowCutoff);
+    // The prune deletes exactly the rows past the window. When the listing was
+    // COMPLETE (fewer rows than the limit, so nothing sat outside it) and held
+    // no such row, the DELETE provably matches nothing — skip the round trip.
+    const listingComplete = snapshot !== null && snapshot.length < cfg.maxTracked;
+    const pruneNeeded =
+      !listingComplete || (snapshot ?? []).some((r) => r.pushedAt < windowCutoff);
+    if (pruneNeeded) {
+      await this.db.prunePushWatch(windowCutoff);
+      trips += 1;
+    }
     // Budget gate BETWEEN stages: the recap/prune above is idempotent (a
     // recap claims its row as it sends), so bailing here costs only latency —
     // the remaining stages run on the next tick with fresh rows.
@@ -724,11 +770,29 @@ export class PushWatcher {
     // the original push moment. Extra DexScreener call only when something
     // is actually missing; a no-pair coin retries on the next tick.
     try {
+      trips += 1;
       const missing = await this.db.findUntrackedPushes(
         now - cfg.windowHours * 3_600_000,
         10,
       );
       if (missing.length > 0) {
+        // Two reads hoisted out of the per-coin loop: the audit ring is ONE
+        // worker_state row (hasInitialPushAudit re-read it for every coin) and
+        // the trade mode is ONE setting (the re-send keyboard asked for it per
+        // coin). Both are one trip for the whole batch now, and the
+        // enrollments land in a single batched INSERT at the end.
+        const audited = await this.db.getInitialPushAuditTokens();
+        trips += 1;
+        const resendMode = await this.tradeMode();
+        if (this.hasTrade()) trips += 1;
+        const enroll: Array<{
+          token: string;
+          chatId: string;
+          symbol: string | null;
+          pushedAt: number;
+          mcapAtPush: number;
+          liquidityUsd: number | null;
+        }> = [];
         const missPairs = await this.pairsFor(
           missing.map((m) => m.token),
           now + TRACKER_PAIRS_BUDGET_MS,
@@ -744,7 +808,7 @@ export class PushWatcher {
           // ring and were delivered normally — keep silent enrollment.
           const recentClaim = now - m.pushedAt <= FIRST_CARD_RESEND_GRACE_MS;
           let resent = false;
-          if (recentClaim && !(await this.db.hasInitialPushAudit(m.token))) {
+          if (recentClaim && !audited.has(m.token)) {
             try {
               const usd = (n: number | null | undefined) =>
                 n == null || !Number.isFinite(n)
@@ -770,7 +834,7 @@ export class PushWatcher {
                     inline_keyboard: tradeKeyboard(
                       m.token,
                       this.tradeBuySizeLabel(),
-                      await this.tradeMode(),
+                      resendMode,
                       { modeSwitch: this.hasTrade(), unwatch: true },
                     ),
                   },
@@ -778,6 +842,7 @@ export class PushWatcher {
               );
               resent = true;
               try {
+                trips += 1;
                 await this.db.recordPushDelivery({
                   chatId: m.chatId,
                   token: m.token,
@@ -798,7 +863,7 @@ export class PushWatcher {
               );
             }
           }
-          await this.db.upsertPushWatch({
+          enroll.push({
             token: m.token,
             chatId: m.chatId,
             symbol: pair.baseToken.symbol ?? null,
@@ -808,23 +873,44 @@ export class PushWatcher {
           });
           if (resent) continue; // fresh card just went out — skip holder seed noise
         }
+        // ONE round trip for every healed coin (was one per coin). The insert
+        // is idempotent (ON CONFLICT DO NOTHING) and the self-heal re-runs next
+        // tick, so batching late cannot lose an enrollment.
+        if (enroll.length > 0) {
+          await this.db.upsertPushWatchMany(enroll);
+          trips += 1;
+        }
       }
     } catch {
       /* healing is best-effort */
     }
     if (past()) return deferred;
-    const rows = await this.db.listPushWatch(cfg.maxTracked);
+    // Reuse the snapshot (see the merge note at the top of the pass). Rows the
+    // prune removed — everything past the window, i.e. exactly the ones the
+    // recap just handled — are filtered out here; rows the self-heal enrolled
+    // this tick simply join the rotation on the next one. The table is read
+    // again ONLY when the listing failed (nothing to reuse).
+    const rows: PushWatchRow[] =
+      snapshot !== null
+        ? snapshot.filter((r) => r.pushedAt >= windowCutoff)
+        : ((trips += 1), await this.db.listPushWatch(cfg.maxTracked));
     // Only rug (drained LP) rows are terminal: kept so the self-heal does
     // not re-enroll them, and skipped here. Dead rows stay ACTIVE but the
     // rules engine keeps them silent until a resurrection.
     const activeRows = rows.filter(
-      (r) => r.lastState !== "rug" && r.lastState !== "unwatched",
+      (r) =>
+        r.lastState !== "rug" &&
+        r.lastState !== "unwatched" &&
+        // A concurrent isolate's recap can tombstone a row between our
+        // snapshot and here; it must not be evaluated after its 🏁 card.
+        r.lastState !== "expired",
     );
     if (activeRows.length === 0)
       return {
         checked: 0,
         alerted: 0,
-        note: rows.length === 0 ? "no-rows" : "all-terminal",
+        note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"} trips ${trips}`,
+        trips,
       };
 
     // Rotation: LEAST-recently-checked first. The loop only fits a few rows
@@ -850,7 +936,8 @@ export class PushWatcher {
       return {
         checked: 0,
         alerted: 0,
-        note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`,
+        note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)} trips ${trips}`,
+        trips,
       };
     }
 
@@ -884,12 +971,16 @@ export class PushWatcher {
         // shared egress), and a single miss must not delete a live row.
         pairMiss += 1;
         const lastSeen = Math.max(row.pushedAt, row.lastChecked);
-        if (now - lastSeen > 2 * 3_600_000) await this.db.deletePushWatch(row.token);
+        if (now - lastSeen > 2 * 3_600_000) {
+          trips += 1;
+          await this.db.deletePushWatch(row.token);
+        }
         continue;
       }
       // Cross-isolate claim: only one concurrent tick may alert this row.
       // The loser's snapshot is stale — it would re-fire state-machine
       // transitions (duplicate ⚠️/🚀 cards). Skip silently on lost race.
+      trips += 1;
       if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now))) {
         claimLost += 1;
         continue;
@@ -925,17 +1016,24 @@ export class PushWatcher {
       // Matching on (last_state, last_alert_at) makes exactly one
       // contender's UPDATE win; the loser skips delivery. Skipped entirely
       // on a backfill pass, which sends nothing.
-      if (
-        !backfill &&
-        evalResult.alerts.length > 0 &&
-        !(await this.db.reservePushWatchAlert(
+      // Wrapped so the ledger counts the reservation exactly when it runs
+      // (the && chain short-circuits when there is nothing to alert).
+      const reserveAlert = async (): Promise<boolean> => {
+        trips += 1;
+        return this.db.reservePushWatchAlert(
           row.token,
           row.lastState ?? null,
           row.lastAlertAt ?? 0,
           evalResult.lastState ?? null,
           evalResult.lastAlertAt,
-        ))
+        );
+      };
+      if (
+        !backfill &&
+        evalResult.alerts.length > 0 &&
+        !(await reserveAlert())
       ) {
+        trips += 1;
         await this.db.updatePushWatchCheck(row.token, {
           peakMcap: evalResult.peakMcap,
           lastLiquidity: pair.liquidity.usd,
@@ -957,6 +1055,7 @@ export class PushWatcher {
         try {
           const sent = await this.bot.api.sendMessage(row.chatId, a.text);
           alerted += 1;
+          trips += 1; // the delivery audit insert below
           // Audit follow-ups as well: comparing this ring against the
           // initial-card ring distinguishes "the client drops everything"
           // from "only first cards go missing".
@@ -981,6 +1080,7 @@ export class PushWatcher {
         }
       }
 
+      trips += 1;
       await this.db.updatePushWatchCheck(row.token, {
         peakMcap: evalResult.peakMcap,
         lastLiquidity: pair.liquidity.usd,
@@ -1023,6 +1123,7 @@ export class PushWatcher {
         try {
           const overview = await this.birdeye.getTokenOverview(r.token);
           if (overview.holderCount !== null) {
+            trips += 1;
             await this.db.setPushWatchHolders(r.token, overview.holderCount, now);
           }
         } catch (err) {
@@ -1041,14 +1142,14 @@ export class PushWatcher {
     // not return (miss), cross-isolate claim races (lost), the pass running
     // out of budget before the rest of the rotation (budget-cut), and rows
     // whose first observation landed after a tracking gap (backfill).
-    const skipped = activeRows.length - checked;
+    // The note is ALWAYS present now: it ends with the pass's round-trip
+    // count, the number this merge exists to keep down. (It used to be omitted
+    // on a fully-clean pass, which is how a starved tracker looked healthy.)
     const note =
-      skipped <= 0 && backfilled === 0
-        ? undefined
-        : `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
-          ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
-          `${budgetCut ? " budget-cut" : ""}`;
+      `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
+      ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
+      `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
 
-    return { checked, alerted, note };
+    return { checked, alerted, note, trips };
   }
 }
