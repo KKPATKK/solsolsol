@@ -1923,6 +1923,89 @@ async function main() {
     assert.equal(out.trips, calls.total);
   });
 
+  await test("PushWatcher: a hanging alert send is capped instead of carrying the pass", async () => {
+    // The two network stages were awaited with NOTHING bounding them, and a
+    // budget check only runs BETWEEN stages — so one slow Telegram response
+    // held the pass open regardless of its budget (live: trackerMs 1962
+    // against a 1000ms budget). The send now races TRACKER_SEND_CAP_MS and a
+    // miss is treated exactly like a failed send (logged, never retried — the
+    // transition was reserved before the send, so a retry would risk the
+    // duplicate card that guard exists to prevent).
+    const rows = [watchRow("AAA", { mcapAtPush: 10_000, peakMcap: 10_000 })];
+    const updated = [];
+    let sends = 0;
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      { api: { sendMessage: async () => { sends += 1; return new Promise(() => {}); } } },
+      null,
+      loadConfig({}),
+      // 10x the push mcap: four 🚀 stages want to fire — a hanging Telegram
+      // must not spend the cap once per card.
+      async (addrs) => new Map(addrs.map((a) => [a, { ...watchPair(a), marketCap: 100_000 }])),
+      null,
+    );
+    const t0 = Date.now();
+    const out = await pw.runTick();
+    const elapsed = Date.now() - t0;
+    assert.equal(sends, 1, "only ONE card is attempted — the budget is per row, not per card");
+    assert.equal(out.alerted, 0, "a hanging send delivers nothing");
+    assert.equal(out.checked, 1, "the row's bookkeeping still lands");
+    assert.equal(updated.length, 1, "the pass finishes the row it started");
+    assert.ok(elapsed < 2_500, `the pass must return near the send cap, took ${elapsed}ms`);
+  });
+
+  await test("PushWatcher: a hanging Birdeye holder probe is capped and skipped", async () => {
+    // The holder probe is purely additive (nothing is reserved before it and
+    // holders_checked_at is only written on success), so a miss costs nothing
+    // and is retried next tick — it must never hold the pass open.
+    const rows = [watchRow("AAA")];
+    const updated = [];
+    let probes = 0;
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      watchBot,
+      { getTokenOverview: async () => { probes += 1; return new Promise(() => {}); } },
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const t0 = Date.now();
+    const out = await pw.runTick();
+    const elapsed = Date.now() - t0;
+    assert.equal(probes, 1, "the probe is attempted once");
+    assert.equal(out.checked, 1);
+    assert.ok(elapsed < 2_000, `the pass must return near the holder cap, took ${elapsed}ms`);
+  });
+
+  await test("PushWatcher: a row is only started when its own cost still fits the pass", async () => {
+    // The loop used to ask only "am I past the deadline?", so it started a row
+    // it could not finish and the pass overran by a whole row.
+    // TRACKER_ROW_RESERVE_MS is checked before the claim: a row that cannot
+    // finish is left to the next tick, where it is re-claimed (nothing lost).
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const claims = [];
+    const updated = [];
+    const db = {
+      ...watchDb(rows, updated),
+      claimPushWatch: async (token) => {
+        claims.push(token);
+        await new Promise((r) => setTimeout(r, 700));
+        return true;
+      },
+    };
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    // 1500ms budget: row 1 burns ~700ms, leaving 800ms — under the 900ms row
+    // reserve, so row 2 must not start.
+    const out = await pw.runTick(Date.now() + 1_500);
+    assert.equal(out.checked, 1, "only the row whose cost fits is started");
+    assert.deepEqual(claims, ["AAA"], "the second row waits for the next tick");
+    assert.match(String(out.note), /budget-cut/);
+  });
+
   await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {
     const row = (over = {}) => ({
       token: "T", chatId: "c", symbol: "GOAT", pushedAt: 0,

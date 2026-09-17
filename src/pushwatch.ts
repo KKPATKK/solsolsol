@@ -58,8 +58,49 @@ import { tradeKeyboard } from "./bot";
  * shortens the LATER phases — the gate/push reserve is untouched, and a
  * healthy tick (feeds ~450ms, tracker ~700ms, pool ~150ms) never comes
  * close.
+ *
+ * 2026-09-17 (overrun fix): 1000 → 1600, and the front-window sizing above no
+ * longer applies — the pass now runs LAST, against the scanner's finish
+ * deadline (startedAt + SCAN_TICK_DEADLINE_MS - SCAN_FINISH_RESERVE_MS), so
+ * its real allowance is whatever the tick has left. At 1000ms the ceiling was
+ * binding on a healthy tick and the pass simply overran it: live
+ * `trackerMs 1962` with `rows 2/24`, an alert card and a holder probe — the
+ * pass needed ~1.9s of work while being allowed 1.0s, so every tick ended
+ * past its budget and the run-time came out of the finish reserve. The
+ * ceiling now matches one full row (see TRACKER_ROW_RESERVE_MS) plus a second
+ * row's worth of slack, and the deadline still clamps it down whenever the
+ * scan itself ran long.
  */
-const TRACKER_TICK_BUDGET_MS = 1_000;
+const TRACKER_TICK_BUDGET_MS = 1_600;
+/**
+ * Budget reserved BEFORE a row is claimed (see the row loop). A row's work —
+ * claim, card sends, delivery audit, final bookkeeping write — costs ~600-
+ * 1000ms at healthy latencies, so a loop that only asks "am I past the
+ * deadline?" happily starts a row it cannot finish and overruns the pass by a
+ * whole row. The FIRST row of a pass is exempt (the progress floor that keeps
+ * post-push monitoring alive — see the 2026-09-17 zero-row fix), and the caps
+ * below are the hard ceiling for everything after it.
+ */
+const TRACKER_ROW_RESERVE_MS = 900;
+/**
+ * Hard ceiling on the time ONE ROW may spend sending its cards. A row can
+ * carry up to four 🚀 stage cards and the sends were awaited with NOTHING
+ * bounding them, so one slow Telegram response held the whole pass (and, when
+ * the pass ran in front of the push path, the whole tick) open. Telegram
+ * answers in a few hundred ms; a send that misses this ceiling is treated
+ * exactly like a failed one — logged, not retried, because the state
+ * transition was already reserved (see reservePushWatchAlert) and a retry
+ * could deliver the duplicate card that guard exists to prevent.
+ */
+const TRACKER_SEND_CAP_MS = 1_000;
+/**
+ * Cap on the Birdeye holder probe, which is purely ADDITIVE (a card detail):
+ * nothing is reserved before it, `holders_checked_at` is only written on
+ * success, so a miss costs nothing and is retried on the next tick. It was
+ * the other unbounded await in the pass (a cold Birdeye round trip is
+ * ~400-1500ms against a 1000ms budget).
+ */
+const TRACKER_HOLDER_CAP_MS = 400;
 /**
  * Hard cap on the tracker's OWN DexScreener batch (the pass's one mandatory
  * request, handed to the client as a caller deadline so it stops dispatching
@@ -630,6 +671,40 @@ export class PushWatcher {
     return this.trade ? await this.trade.effectiveMode() : "off";
   }
 
+  /**
+   * Bounds ONE network stage to `capMs`. The work is NOT cancelled — the
+   * caller stops waiting and a late settle is dropped, the same contract as
+   * the scanner's bestEffort(). Callers decide what a miss MEANS (the alert
+   * loop treats it as a failed send, the holder probe as a skip).
+   *
+   * Why this exists: the pass awaited its two network stages with nothing
+   * bounding them. Every budget check happens BETWEEN stages, so a stage that
+   * never returns held the pass open regardless of its budget — live
+   * 2026-09-17: `trackerMs 1962` against a 1000ms budget (tick 4310ms of a
+   * 4839ms race window). The DB layer has had a cap since the scan-cap change
+   * (SCAN_DB_TIMEOUT_MS); these two were the remaining unbounded awaits.
+   */
+  private async bounded<T>(
+    work: Promise<T>,
+    capMs: number,
+    fallback: T,
+  ): Promise<T> {
+    if (capMs <= 0) return fallback;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(fallback), capMs);
+        }),
+      ]);
+    } finally {
+      // Release the timer as soon as the stage settles (same discipline as
+      // the DB hard wall) so a busy isolate holds no idle timers.
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   /** Called right after a successful push (ON CONFLICT DO NOTHING dedupes). */
   async onPush(
     chatId: string,
@@ -819,27 +894,40 @@ export class PushWatcher {
                 0,
                 Math.round((Date.now() - pair.pairCreatedAt) / 60_000),
               );
-              const sent = await this.bot.api.sendMessage(m.chatId,
-                `📤 補發推送 ${pair.baseToken.symbol}（首次卡片未送達）\n` +
-                  `💰 市值 ${usd(pair.marketCap)}\n` +
-                  `💧 流動性 ${usd(pair.liquidity.usd)} | ⏱ 年齡 ${ageMin} 分鐘\n` +
-                  `📊 5m量 ${usd(pair.volume.m5)} | 5m ${pctStr(pair.priceChange.m5)}`,
-                {
-                  reply_markup: {
-                    // Full first-card keyboard (axiom link + trade actions +
-                    // mode switch + unwatch): the original card never went
-                    // out, so the re-send must be indistinguishable from a
-                    // normal push card. Mode is resolved live so the buttons
-                    // match the operator's current /setmode.
-                    inline_keyboard: tradeKeyboard(
-                      m.token,
-                      this.tradeBuySizeLabel(),
-                      resendMode,
-                      { modeSwitch: this.hasTrade(), unwatch: true },
-                    ),
+              // Bounded like the alert sends: a timed-out re-send throws into
+              // the catch below (logged, no audit entry), and the audit ring
+              // staying unwritten is what makes the next pass try again.
+              const sent = await this.bounded(
+                this.bot.api.sendMessage(
+                  m.chatId,
+                  `📤 補發推送 ${pair.baseToken.symbol}（首次卡片未送達）\n` +
+                    `💰 市值 ${usd(pair.marketCap)}\n` +
+                    `💧 流動性 ${usd(pair.liquidity.usd)} | ⏱ 年齡 ${ageMin} 分鐘\n` +
+                    `📊 5m量 ${usd(pair.volume.m5)} | 5m ${pctStr(pair.priceChange.m5)}`,
+                  {
+                    reply_markup: {
+                      // Full first-card keyboard (axiom link + trade actions +
+                      // mode switch + unwatch): the original card never went
+                      // out, so the re-send must be indistinguishable from a
+                      // normal push card. Mode is resolved live so the buttons
+                      // match the operator's current /setmode.
+                      inline_keyboard: tradeKeyboard(
+                        m.token,
+                        this.tradeBuySizeLabel(),
+                        resendMode,
+                        { modeSwitch: this.hasTrade(), unwatch: true },
+                      ),
+                    },
                   },
-                },
+                ),
+                TRACKER_SEND_CAP_MS,
+                null,
               );
+              if (sent === null) {
+                throw new Error(
+                  `re-send timed out after ${TRACKER_SEND_CAP_MS}ms`,
+                );
+              }
               resent = true;
               try {
                 trips += 1;
@@ -958,7 +1046,7 @@ export class PushWatcher {
       // note while 28 active rows went unrefreshed (2026-09-17). One row per
       // tick is the floor that keeps the tracker moving no matter what
       // DexScreener or Turso are doing.
-      if (!firstRow && past()) {
+      if (!firstRow && Date.now() + TRACKER_ROW_RESERVE_MS > deadline) {
         budgetCut = true;
         break;
       }
@@ -1050,11 +1138,37 @@ export class PushWatcher {
         });
         continue;
       }
+      // ONE send budget for the whole row (see TRACKER_SEND_CAP_MS): a row
+      // can carry four stage cards, and a slow Telegram must not spend the
+      // ceiling once per card.
+      const sendBudgetEnd = Date.now() + TRACKER_SEND_CAP_MS;
+      let sentCount = 0;
       for (const a of evalResult.alerts) {
         if (backfill) break;
+        const sendLeft = sendBudgetEnd - Date.now();
+        if (sendLeft <= 0) {
+          console.error(
+            `[push-watch] send budget spent for ${row.symbol ?? row.token} — ${evalResult.alerts.length - sentCount} card(s) dropped (their transition is already reserved)`,
+          );
+          break;
+        }
         try {
-          const sent = await this.bot.api.sendMessage(row.chatId, a.text);
+          const sent = await this.bounded(
+            this.bot.api.sendMessage(row.chatId, a.text),
+            sendLeft,
+            null,
+          );
+          if (sent === null) {
+            // Timed out: treated exactly like a failed send (logged, never
+            // retried) — the transition was reserved before this point, so a
+            // retry could deliver a duplicate card.
+            console.error(
+              `[push-watch] alert send timed out after ${TRACKER_SEND_CAP_MS}ms for ${row.symbol ?? row.token} — card dropped`,
+            );
+            break;
+          }
           alerted += 1;
+          sentCount += 1;
           trips += 1; // the delivery audit insert below
           // Audit follow-ups as well: comparing this ring against the
           // initial-card ring distinguishes "the client drops everything"
@@ -1118,11 +1232,18 @@ export class PushWatcher {
         .slice(0, cfg.maxHolderChecksPerTick);
       for (const r of due) {
         // Holder counts are a slow-moving card detail; drop the rest of the
-        // batch rather than carry the tick past its front-phase window.
-        if (past()) break;
+        // batch rather than carry the tick past its window. The check reserves
+        // the probe's own cap (not just "are we past the deadline?"), and the
+        // probe itself is raced — it was one of the two unbounded awaits in
+        // the pass.
+        if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) break;
         try {
-          const overview = await this.birdeye.getTokenOverview(r.token);
-          if (overview.holderCount !== null) {
+          const overview = await this.bounded(
+            this.birdeye.getTokenOverview(r.token),
+            TRACKER_HOLDER_CAP_MS,
+            null,
+          );
+          if (overview && overview.holderCount !== null) {
             trips += 1;
             await this.db.setPushWatchHolders(r.token, overview.holderCount, now);
           }
