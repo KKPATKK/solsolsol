@@ -301,6 +301,19 @@ async function main() {
       );
       assert.equal(late, "fallback");
       await new Promise((r) => setTimeout(r, 120)); // let the late rejection land
+      // (f) A THROWING step degrades exactly like a timeout. The card-only
+      // display batch dispatches five bestEffort slots into ONE Promise.all
+      // (2026-09-17: the 🌱 有機度 line was starved by the serial chain), so a
+      // rejection must never escape — one flaky upstream would otherwise
+      // blank every line of the card.
+      assert.equal(
+        await scanner.bestEffort(
+          () => Promise.reject(new Error("upstream 502")),
+          Date.now() + 500,
+          "fallback",
+        ),
+        "fallback",
+      );
     } finally {
       await t.cleanup();
     }

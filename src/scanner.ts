@@ -500,6 +500,10 @@ export interface ScanSummary {
   axiom: number;
   /** Arkham smart-money enrichments this scan (0 when no key configured). */
   arkham: number;
+  /** Jupiter organic-score card enrichments this scan (0 = the 🌱 有機度 line
+   * had no data). Counted so a line that vanishes from the card is visible in
+   * /health instead of only being noticed on the card itself. */
+  organic: number;
   /** Coins whose creator/top-holder wallets matched the crime-wallet list. */
   crime: number;
   /** Coins that got a wallet analysis (creator/holder/cluster enrichment). */
@@ -900,6 +904,14 @@ export class Scanner {
           timer = setTimeout(() => resolve(fallback), remaining);
         }),
       ]);
+    } catch {
+      // A resolver that THREW degrades exactly like one that ran out of
+      // time: the caller renders its own fallback. Swallowing it here is
+      // what lets the display batch be dispatched as one Promise.all — a
+      // rejection would otherwise fail every line of the card over one
+      // flaky upstream, and one raised while the caller is still awaiting
+      // another step would surface as an unhandled rejection.
+      return fallback;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -1151,6 +1163,7 @@ export class Scanner {
       gmgn: 0,
       axiom: 0,
       arkham: 0,
+      organic: 0,
       crime: 0,
       walletAnalysis: 0,
       backfill: 0,
@@ -2020,6 +2033,59 @@ export class Scanner {
             creator: this.rugcheckCreator.get(coin.stats.token) ?? null,
           },
         );
+        // Card-only display batch, dispatched HERE — concurrently with the
+        // crime check and the Axiom token-info that follow — instead of being
+        // awaited one call at a time later in the chain. Two measured
+        // reasons:
+        //  - Serially the batch cost the SUM of five upstream round trips
+        //    (~1-2.5s) while racing a single shared deadline, so whatever sat
+        //    at the back of the queue started with an empty window and
+        //    silently dropped off the card. Live report 2026-09-17: the
+        //    Jupiter 🌱 有機度 / 1h 交易者 line stopped appearing (upstream
+        //    verified healthy — the Jupiter search endpoint still returns
+        //    organicScore for the same mints).
+        //  - Starting it here gives the batch the chain's whole remaining
+        //    window AND overlaps it with two other awaits, so the chain's
+        //    total wall time drops and the gate tail below (wallet analysis,
+        //    top-10 band, Flurry) starts earlier — better for the push path
+        //    too.
+        // Same calls, same count, same deadline: only the overlap changes.
+        // Nothing in the batch gates anything — GMGN's wash-trading flag is
+        // judged where the batch is awaited, and each slot that misses its
+        // deadline degrades to exactly the value the old code used.
+        const jupiterOrganic = this.jupiter;
+        const displayBatch = Promise.all([
+          this.bestEffort(
+            () => this.resolveTraderData(coin),
+            enrichDeadline,
+            {
+              proTraders: coin.stats.birdeyeProTraders,
+              sniperPct: coin.stats.birdeyeSniperPct,
+            },
+          ),
+          this.bestEffort(
+            () => this.resolveHolderCount(coin),
+            enrichDeadline,
+            { holderCount: null },
+          ),
+          this.bestEffort(
+            () => this.resolveGmgnInfo(coin),
+            enrichDeadline,
+            null,
+          ),
+          this.bestEffort(
+            () => this.resolveArkhamInfo(coin),
+            enrichDeadline,
+            null,
+          ),
+          this.bestEffort(
+            jupiterOrganic
+              ? () => jupiterOrganic.fetchOrganicScore(coin.stats.token)
+              : null,
+            enrichDeadline,
+            null,
+          ),
+        ]);
         // Crime-wallet check: the coin's creator (RugCheck) and top holder
         // owner wallets are matched against the community blocklist. A hit
         // is a warning (flagged on the card) unless CRIME_WALLETS_BLOCK
@@ -2096,35 +2162,14 @@ export class Scanner {
             continue;
           }
         }
-        // Trader data is resolved for the message card but no longer
-        // filters — the sniper filter was removed, so coins push even when
-        // the data is not ready yet.
-        const trader = await this.bestEffort(
-          () => this.resolveTraderData(coin),
-          enrichDeadline,
-          {
-            proTraders: coin.stats.birdeyeProTraders,
-            sniperPct: coin.stats.birdeyeSniperPct,
-          },
-        );
-        // Holder count (Birdeye token overview) — card-only enrichment,
-        // best-effort like the trader data above. Creator comes from the
-        // RugCheck report (this.rugcheck.creator).
-        const holders = await this.bestEffort(
-          () => this.resolveHolderCount(coin),
-          enrichDeadline,
-          { holderCount: null },
-        );
-        // GMGN enrichment — smart money count, holders and the wash-trading
-        // flag, shown on the card. Best-effort: failures degrade to no
-        // enrichment. The wash-trading flag can block the push entirely
-        // (GMGN_BLOCK_WASH_TRADING, default on) — same stance as the
-        // gmgn-vl-radar filters (not_wash_trading).
-        const gmgn = await this.bestEffort(
-          () => this.resolveGmgnInfo(coin),
-          enrichDeadline,
-          null,
-        );
+        // Await the display batch dispatched above (it has been running
+        // concurrently with the crime check and the Axiom token-info), then
+        // judge the one thing in it that can block a push. Trader data is
+        // display-only (the sniper filter was removed): a coin pushes even
+        // when the data is not ready and the card shows 未检测/—.
+        const [trader, holders, gmgn, arkham, organic] = await displayBatch;
+        if (arkham) diag.arkham++;
+        if (organic) diag.organic++;
         if (
           this.gmgn &&
           this.config.gmgnBlockWashTrading &&
@@ -2137,23 +2182,6 @@ export class Scanner {
           );
           continue;
         }
-        // Arkham smart-money attribution (card-only enrichment).
-        const arkham = await this.bestEffort(
-          () => this.resolveArkhamInfo(coin),
-          enrichDeadline,
-          null,
-        );
-        if (arkham) diag.arkham++;
-        // Jupiter organic score — card-only enrichment (display-first; the
-        // calibrated separation on 2026-08-22 winners vs losers was clean,
-        // but n=6 is too small to gate on). Best-effort: failures degrade
-        // to an unrendered line.
-        const jupiter = this.jupiter;
-        const organic = await this.bestEffort(
-          jupiter ? () => jupiter.fetchOrganicScore(coin.stats.token) : null,
-          enrichDeadline,
-          null,
-        );
         // Wallet analysis — creator profile (age + serial-launcher create
         // count), top-holder wallet ages and cross-coin holder clustering.
         // Runs only for coins that pass every block gate (its pushed_holders
