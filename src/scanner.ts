@@ -165,6 +165,20 @@ const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
  */
 const CANDIDATE_PUSH_RESERVE_MS = 900;
 /**
+ * Floor for the initial-card Telegram send (see the send in sendTo). The
+ * send is the LAST step of the push path and the only one that was never
+ * bounded: the reserve above is time kept for it, not a cap on it, so a
+ * slow Telegram held the tick open past the worker's race window and the
+ * whole tick lost its completion flush. The new push-phase marker caught it
+ * live (2026-09-18 02:52:18Z: `pushPhase: send:telegram`, tick 5000ms of a
+ * 4792ms race window, `candidates 1, pushed 0`). The card send now races
+ * the tick's own internal deadline (SCAN_TICK_DEADLINE_MS), floored here so
+ * a late send still gets a real attempt; a send that misses is treated as a
+ * delivery failure — its claim is released and the coin stays in the
+ * re-eval pool, so the next tick retries it.
+ */
+const CARD_SEND_FLOOR_MS = 600;
+/**
  * Slice of the chain kept for the gates that run LAST (wallet analysis, the
  * top-10 band, Flurry deploy-slot forensics) so the CARD-ONLY enrichments in
  * the middle of the chain (Birdeye trader/overview, GMGN, Arkham, Jupiter
@@ -2452,17 +2466,34 @@ export class Scanner {
             return;
           }
           try {
+            // Bounded by the tick's internal deadline (see CARD_SEND_FLOOR_MS):
+            // a null here means the send missed its slice, and the caller's
+            // failure path releases the claim so the coin is retried.
             this.markPhase(diag, "send:telegram", startedAt);
-            const sent = await this.bot.api.sendMessage(c.chatId, message, {
-              reply_markup: {
-                inline_keyboard: tradeKeyboard(
-                  tokenAddress,
-                  this.trade ? this.trade.buySizeLabel : "",
-                  tradeMode,
-                  { modeSwitch: Boolean(this.trade), unwatch: true },
-                ),
-              },
-            });
+            const sent = await this.bestEffort(
+              () =>
+                this.bot.api.sendMessage(c.chatId, message, {
+                  reply_markup: {
+                    inline_keyboard: tradeKeyboard(
+                      tokenAddress,
+                      this.trade ? this.trade.buySizeLabel : "",
+                      tradeMode,
+                      { modeSwitch: Boolean(this.trade), unwatch: true },
+                    ),
+                  },
+                }),
+              Math.max(tickDeadline, Date.now() + CARD_SEND_FLOOR_MS),
+              null,
+            );
+            if (sent === null) {
+              const cut = new Error(
+                `initial-card send exceeded its deadline (card may not have been delivered)`,
+              ) as Error & { cardSendTimeout?: boolean };
+              // Tagged so the delivery retry below does NOT sleep 1200ms and
+              // re-send inside a tick that has already run out of room.
+              cut.cardSendTimeout = true;
+              throw cut;
+            }
             // Delivery audit: Telegram returned a message_id, so the card
             // left us and was accepted. Recording it lets a later "never
             // got the first card" report be answered with hard evidence.
@@ -2547,7 +2578,11 @@ export class Scanner {
             console.error(
               `[scanner] failed to push ${symbol} to ${c.chatId}: ${info.line}`,
             );
-            if (info.transient) {
+            // A send cut by the deadline is NOT retried inside this tick:
+            // there is no room left by definition, and the 1200ms sleep would
+            // only push the completion flush past the race window. The claim
+            // was released, so the next tick's re-eval pool re-pushes it.
+            if (info.transient && !(err as { cardSendTimeout?: boolean }).cardSendTimeout) {
               await sleep(1200);
               try {
                 if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {

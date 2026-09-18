@@ -1929,6 +1929,33 @@ async function main() {
     assert.match(String(out.note), /miss 2/);
   });
 
+  await test("PushWatcher: a card that cannot be sent leaves its row untouched", async () => {
+    // The reservation happens BEFORE the send and is never retried, so a row
+    // started without the send slice loses its card for good (live 2026-09-18
+    // 02:58Z and 03:00Z: `dropped 1` on two consecutive passes). The pass must
+    // therefore refuse the row outright — no claim, no write — so the next
+    // tick delivers the card with a fresh budget.
+    const rows = [watchRow("MOON", { mcapAtPush: 50_000 })];
+    const updated = [];
+    let sends = 0;
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      { api: { sendMessage: async () => { sends += 1; return { message_id: 1 }; } } },
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    // Pass deadline already gone: the slice is smaller than one send.
+    const out = await pw.runTick(Date.now() - 500);
+    assert.equal(sends, 0, "nothing may be sent without the slice to send it");
+    assert.equal(out.checked, 0, "the row is not claimed");
+    assert.equal(updated.length, 0, "and nothing is written — the row keeps its state");
+    assert.match(String(out.note), /defer-send 1/);
+    assert.match(String(out.note), /budget-cut/);
+    assert.equal(out.alerted, 0);
+  });
+
   await test("PushWatcher: the pair batch covers only the rows the pass can actually reach", async () => {
     // Ten tracked coins, one DexScreener request. Asking for all of them spent
     // the pass's only mandatory call on addresses the loop never evaluates —

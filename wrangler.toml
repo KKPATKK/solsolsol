@@ -98,21 +98,22 @@ JUPITER_REQUEST_INTERVAL_MS = "500"
 # heartbeat's dex429Total plus the Turso row behind db.bumpDex429 count every
 # rate-limit episode fleet-wide.
 #
-# 2026-09-18: REVERTED to 350 — the measurement said so. Live at 02:41Z the
-# client reported { intervalMs: 250, http429: 4, blockedForMs: 30256,
-# cacheSize: 0 } on a single isolate: four rate-limit episodes had armed the
-# 90s cache-only backoff (30s still to run) and the cache was empty, so
-# DexScreener contributed ZERO pair data for that whole window — the scan only
-# kept its 130/130 pair coverage because of the Jupiter fallback, and the
-# post-push tracker (whose own batch had nothing to fall back on) evaluated no
-# rows at all (`rows 0/30 pairs 0/6 miss 1`). The extra dispatch slot per tick
-# is not worth losing the endpoint outright: a 429 costs multiple ticks of
-# coverage, and each episode also arms the backoff for every later call in the
-# same isolate. One hit still arms the same 90s backoff
+# 2026-09-18: tried 350 for ten minutes and put it back to 250 — the spacing
+# is NOT what the endpoint is limiting. Measured at 350ms on a single isolate
+# (02:50–03:00Z): http429 went 0 → 8 with the 90s cache-only backoff
+# re-arming (blockedForMs ~30s on four separate ticks) — the same shape the
+# 250ms setting showed ({intervalMs: 250, http429: 14, blockedForMs: 32200}),
+# so the extra 100ms bought nothing while costing one 30-address batch per
+# tick. The limiter is the request PATTERN (3 concurrent batches per pair
+# phase on one shared egress IP, plus the profiles feed), not the dispatch
+# spacing. Coverage is protected where it matters instead: the pair phase
+# falls back to Jupiter's token API whenever DexScreener returns under half
+# the addresses, and that fallback carried 130/130 pairs through the whole
+# 429 window. One hit still arms the same 90s backoff
 # (PAIR_BATCH_BACKOFF_MS), so the failure mode stays "lost coverage for a
-# minute", never a hammering loop. Watch http429 here: flat with
-# blockedForMs 0 means 350 is being absorbed.
-DEX_REQUEST_INTERVAL_MS = "350"
+# minute", never a hammering loop. Watch http429/blockedForMs here: they are
+# the signal for the CONCURRENCY (PAIR_BATCH_CONCURRENCY), not this value.
+DEX_REQUEST_INTERVAL_MS = "250"
 # Supply-flow (rug/distribution) per-coin budget. Two jobs: the upper bound
 # for what the analyzer may spend, and the unit the gate's start guard uses.
 # 2026-09-16: the guard compared the remaining tick time against this budget

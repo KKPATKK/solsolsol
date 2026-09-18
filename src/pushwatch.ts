@@ -108,6 +108,19 @@ const TRACKER_SEND_CAP_MS = 1_000;
  */
 const TRACKER_SEND_FLOOR_MS = 350;
 /**
+ * Send slice a card needs before its row may be STARTED. The reservation
+ * below happens BEFORE the send and is never retried, so a row that begins
+ * without this much left cannot deliver its card — and the card is then
+ * lost for good (`dropped N` in the note, live on two consecutive passes
+ * 2026-09-18 02:58Z/03:00Z). The pass therefore refuses such a row
+ * outright: no claim, no reservation, no write at all, so the card is
+ * delivered by the next tick with a fresh budget and the row keeps its
+ * place at the front of the rotation. 350ms is a healthy Telegram round
+ * trip; the slice a row gets is TRACKER_SEND_CAP_MS, so a pass that starts
+ * late still delivers one or two cards.
+ */
+const TRACKER_SEND_MIN_MS = 350;
+/**
  * Cap on the Birdeye holder probe, which is purely ADDITIVE (a card detail):
  * nothing is reserved before it, `holders_checked_at` is only written on
  * success, so a miss costs nothing and is retried on the next tick. It was
@@ -1088,6 +1101,8 @@ export class PushWatcher {
     let budgetCut = false;
     /** Cards the row's send slice could not deliver (logged, never retried). */
     let dropped = 0;
+    /** Rows refused because their cards did not fit the pass (no card lost). */
+    let sendDeferred = 0;
     let firstRow = true;
     for (const row of head) {
       // Budget check BETWEEN rows: the claim and the alert reservation for a
@@ -1118,15 +1133,14 @@ export class PushWatcher {
         }
         continue;
       }
-      // Cross-isolate claim: only one concurrent tick may alert this row.
-      // The loser's snapshot is stale — it would re-fire state-machine
-      // transitions (duplicate ⚠️/🚀 cards). Skip silently on lost race.
-      trips += 1;
-      if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now))) {
-        claimLost += 1;
-        continue;
-      }
-      checked += 1;
+      // Evaluate BEFORE claiming. The rules engine is local (no network, no
+      // DB), and knowing whether this row carries cards is what lets the
+      // pass refuse a row it cannot finish: every alerting row reserves its
+      // state transition before sending and never retries (see
+      // reservePushWatchAlert), so starting one without the send slice
+      // DROPS its card forever. A refused row is left completely untouched —
+      // last_checked included — so the next tick claims it with a fresh
+      // budget and its place at the front of the rotation is preserved.
       const evalResult = evaluateWatch(
         row,
         now,
@@ -1149,6 +1163,32 @@ export class PushWatcher {
       // watching, and 30 such cards at once is noise, not signal.
       const backfill =
         row.lastMcap === null && now - row.pushedAt > STALE_BACKFILL_MS;
+      // Send slice this row would get, computed before it is claimed (see
+      // TRACKER_SEND_FLOOR_MS / TRACKER_SEND_MIN_MS).
+      const sendBudgetEnd = Math.min(
+        Date.now() + TRACKER_SEND_CAP_MS,
+        deadline + TRACKER_SEND_FLOOR_MS,
+      );
+      if (!backfill && evalResult.alerts.length > 0) {
+        const needMs = Math.min(
+          TRACKER_SEND_CAP_MS,
+          TRACKER_SEND_MIN_MS * evalResult.alerts.length,
+        );
+        if (sendBudgetEnd - Date.now() < needMs) {
+          sendDeferred += 1;
+          budgetCut = true;
+          break;
+        }
+      }
+      // Cross-isolate claim: only one concurrent tick may alert this row.
+      // The loser's snapshot is stale — it would re-fire state-machine
+      // transitions (duplicate ⚠️/🚀 cards). Skip silently on lost race.
+      trips += 1;
+      if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now))) {
+        claimLost += 1;
+        continue;
+      }
+      checked += 1;
       if (backfill) backfilled += 1;
       // Authoritative duplicate guard: reserve the state transition
       // BEFORE delivering. The last_checked claim alone cannot stop an
@@ -1191,16 +1231,10 @@ export class PushWatcher {
         });
         continue;
       }
-      // ONE send budget for the whole row (see TRACKER_SEND_CAP_MS): a row
-      // can carry four stage cards, and a slow Telegram must not spend the
-      // ceiling once per card.
-      // Clamped to the pass's own tail (see TRACKER_SEND_FLOOR_MS): the first
-      // row runs even when it has already passed the deadline, and its sends
-      // must not carry the tick past the worker's race window.
-      const sendBudgetEnd = Math.min(
-        Date.now() + TRACKER_SEND_CAP_MS,
-        deadline + TRACKER_SEND_FLOOR_MS,
-      );
+      // ONE send budget for the whole row, computed before the row was
+      // claimed (see the send-ability gate above): a row can carry four
+      // stage cards, and a slow Telegram must not spend the ceiling once
+      // per card.
       let sentCount = 0;
       for (const a of evalResult.alerts) {
         if (backfill) break;
@@ -1330,6 +1364,7 @@ export class PushWatcher {
     const note =
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
+      `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
       `${dropped > 0 ? ` dropped ${dropped}` : ""}` +
       `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
 
