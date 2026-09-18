@@ -165,19 +165,63 @@ const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
  */
 const CANDIDATE_PUSH_RESERVE_MS = 900;
 /**
- * Floor for the initial-card Telegram send (see the send in sendTo). The
- * send is the LAST step of the push path and the only one that was never
- * bounded: the reserve above is time kept for it, not a cap on it, so a
- * slow Telegram held the tick open past the worker's race window and the
- * whole tick lost its completion flush. The new push-phase marker caught it
- * live (2026-09-18 02:52:18Z: `pushPhase: send:telegram`, tick 5000ms of a
- * 4792ms race window, `candidates 1, pushed 0`). The card send now races
- * the tick's own internal deadline (SCAN_TICK_DEADLINE_MS), floored here so
- * a late send still gets a real attempt; a send that misses is treated as a
- * delivery failure — its claim is released and the coin stays in the
+ * Preferred slice for the initial-card Telegram send (see the send in
+ * sendTo). The send is the LAST step of the push path and the only one that
+ * was never bounded: the reserve above is time kept for it, not a cap on
+ * it, so a slow Telegram held the tick open past the worker's race window
+ * and the whole tick lost its completion flush. The new push-phase marker
+ * caught it live (2026-09-18 02:52:18Z: `pushPhase: send:telegram`, tick
+ * 5000ms of a 4792ms race window, `candidates 1, pushed 0`). The slice is
+ * clamped by CARD_SEND_TAIL_MS below, and a send that misses it is treated
+ * as a delivery failure — its claim is released and the coin stays in the
  * re-eval pool, so the next tick retries it.
  */
 const CARD_SEND_FLOOR_MS = 600;
+/**
+ * Hard tail for the initial-card send: it may never be allowed to run past
+ * `startedAt + SCAN_TICK_DEADLINE_MS + 200`, and it is only STARTED while at
+ * least CARD_SEND_MIN_MS of that tail is still left.
+ *
+ * Why, with the live number (2026-09-18 03:44:18Z): the floor above was
+ * applied as `max(tickDeadline, now + 600)`, which is not a bound at all
+ * once the chain runs late — a send starting at 4.31s was granted until
+ * 4.91s, while that tick's race window was 4742ms, so the tick still died at
+ * 5000ms with `pushPhase send:telegram` and the second candidate unsent. A
+ * cap the tick cannot reach is not a cap. The tail sits ~340ms inside the
+ * smallest race window observed so far (4742ms), leaving room for the
+ * summary build and the worker's completion flush.
+ */
+const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
+/**
+ * Least send slice worth starting. Below it the card is DEFERRED rather than
+ * attempted: the claim and the delivery audit are written BEFORE the send
+ * and are not retried, so a send that cannot finish loses the card, while a
+ * deferral leaves the row completely untouched (the re-eval pool re-pushes
+ * the coin next tick).
+ */
+const CARD_SEND_MIN_MS = 250;
+
+/**
+ * Deadline for the initial-card Telegram send, or `null` when the tick has
+ * no slice left to start one (the card is deferred, never released as a
+ * failure). Pure so the boundary is unit-testable: the send itself lives in
+ * a closure inside runOnce, which has no offline fixture.
+ *
+ * The slice is `max(now + floor, tickDeadline)` clamped by the tail, so a
+ * healthy send gets EXACTLY what it got before this existed (until the
+ * tick's internal deadline) — the cap only becomes real for a chain that
+ * runs past it, which is the case that used to kill the tick.
+ */
+export function cardSendDeadline(
+  startedAt: number,
+  now: number,
+): number | null {
+  const deadline = Math.min(
+    Math.max(now + CARD_SEND_FLOOR_MS, startedAt + SCAN_TICK_DEADLINE_MS),
+    startedAt + CARD_SEND_TAIL_MS,
+  );
+  return deadline - now < CARD_SEND_MIN_MS ? null : deadline;
+}
 /**
  * Per-token GeckoTerminal lookups the post-push tracker may make in one
  * pass (see pairsForTracker). Two is one tick's worth of rows plus slack:
@@ -589,6 +633,15 @@ export interface ScanSummary {
   pushPhase?: string;
   /** Tick-relative ms when pushPhase was STAMPED (i.e. the step started). */
   pushPhaseMs?: number;
+  /**
+   * Initial cards this tick REFUSED to start because no send slice was left
+   * before the race window (see cardSendDeadline). The coin is untouched —
+   * no claim, no delivery audit, no failure record — and the re-eval pool
+   * re-pushes it on the next tick, so a deferral is a one-minute delay,
+   * never a loss. Present so a late tick's "candidates 1, pushed 0" can be
+   * told apart from a real gate rejection.
+   */
+  cardSendDeferred?: number;
   /** Pool+feed coins with live DexScreener pair data this scan (vs pool count). */
   pairs?: number;
   fails: {
@@ -2516,18 +2569,50 @@ export class Scanner {
           this.flurry ? { report: flurryReport } : null,
         );
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
+          const deferCard = (why: string): void => {
+            diag.cardSendDeferred = (diag.cardSendDeferred ?? 0) + 1;
+            console.log(
+              `[scanner] initial card deferred (${why}): ${c.profile.symbol ?? c.profile.tokenAddress}`,
+            );
+          };
           // Atomic claim BEFORE sending: overlapping isolates can both pass
           // the isTokenSeen check-then-act window above, but only one wins
           // this INSERT OR IGNORE — duplicate cards (e.g. double TRILLY)
           // are impossible at the storage layer.
+          // A tick with no send slice left never reaches the claim: the
+          // claim and the delivery audit are both written before the send
+          // and neither is retried, so a send that cannot finish loses the
+          // card — and holding the tick open past its race window also
+          // loses the tick's flush. Deferring touches nothing (no claim,
+          // no audit, no failure record) and the re-eval pool re-pushes
+          // the coin on the next tick.
+          if (cardSendDeadline(startedAt, Date.now()) === null) {
+            deferCard("no slice left before the race window");
+            return;
+          }
           this.markPhase(diag, "send:claim", startedAt);
           if (!(await this.db.claimTokenPush(c.chatId, c.profile.tokenAddress))) {
             return;
           }
+          // The claim's round trip comes out of the same slice, so the
+          // deadline is re-read after it: a slice that has gone in the
+          // meantime gives the claim back instead of burning a zero-length
+          // send (and a false delivery-failure record) on it.
+          const sendDeadline = cardSendDeadline(startedAt, Date.now());
+          if (sendDeadline === null) {
+            try {
+              await this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress);
+            } catch {
+              /* best-effort */
+            }
+            deferCard("claim round trip used the whole slice");
+            return;
+          }
           try {
-            // Bounded by the tick's internal deadline (see CARD_SEND_FLOOR_MS):
-            // a null here means the send missed its slice, and the caller's
-            // failure path releases the claim so the coin is retried.
+            // Bounded by the card-send tail (see CARD_SEND_TAIL_MS): a
+            // null here means the send missed its slice, and the
+            // caller's failure path releases the claim so the coin is
+            // retried.
             this.markPhase(diag, "send:telegram", startedAt);
             const sent = await this.bestEffort(
               () =>
@@ -2541,7 +2626,7 @@ export class Scanner {
                     ),
                   },
                 }),
-              Math.max(tickDeadline, Date.now() + CARD_SEND_FLOOR_MS),
+              sendDeadline,
               null,
             );
             if (sent === null) {

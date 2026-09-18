@@ -19,7 +19,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../d
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -691,6 +691,28 @@ async function main() {
     const r3 = slicePoolRotation(items, 10_007, 5);
     assert.deepEqual(r3.slice, [7, 8, 9]);
     assert.equal(r3.nextCursor, 0);
+  });
+
+  await test("cardSendDeadline: a healthy send keeps the internal deadline, a late one is refused", () => {
+    const t0 = 1_000_000;
+    // Healthy: unchanged from the pre-fix behaviour — the send still runs to
+    // the tick's own internal deadline (4.2s), because the floor is only a
+    // minimum slice, not a cap.
+    assert.equal(cardSendDeadline(t0, t0 + 2_000), t0 + 4_200);
+    assert.equal(cardSendDeadline(t0, t0 + 3_000), t0 + 4_200);
+    // Late but still usable: clamped by the tail, not by `now + floor`.
+    assert.equal(cardSendDeadline(t0, t0 + 4_000), t0 + 4_400);
+    // The live 2026-09-18 03:44:18Z shape — the send started 4309ms in while
+    // that tick's race window was 4742ms. The old `max(tickDeadline, now +
+    // 600)` granted it until 4909ms, past the window, and the tick died at
+    // 5000ms with the second candidate unsent; now it is refused instead.
+    assert.equal(cardSendDeadline(t0, t0 + 4_309), null);
+    // Boundary: exactly the minimum slice is still attempted, one ms more is
+    // not (the card is deferred, not dropped).
+    assert.equal(cardSendDeadline(t0, t0 + 4_150), t0 + 4_400);
+    assert.equal(cardSendDeadline(t0, t0 + 4_151), null);
+    // A tick already past the tail can never start one.
+    assert.equal(cardSendDeadline(t0, t0 + 9_000), null);
   });
 
   // ---------- scanner.ts push gates ----------
