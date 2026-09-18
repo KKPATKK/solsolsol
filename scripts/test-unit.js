@@ -19,7 +19,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../d
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -799,6 +799,34 @@ async function main() {
     assert.equal(r, null, "a hung DB call must not hold the tick");
     await new Promise((res) => setTimeout(res, 120));
     assert.equal(releases, 0, "nothing settled, so there is nothing to release");
+  });
+
+  await test("DeferredPushLedger: a deferred coin is counted as recovered when it is pushed later", () => {
+    // A deferred card writes NOTHING (no claim, no audit, no failure record),
+    // so "the re-eval pool pushes it back next tick" was only ever argued from
+    // the code path. The ledger is what makes it countable — and observable in
+    // /health once the cumulative counters ride the summary.
+    const led = new DeferredPushLedger(3);
+    assert.equal(led.recovered, 0, "nothing recovered before anything was deferred");
+    led.defer("A", 1);
+    led.defer("A", 2); // same coin deferred again in a later tick: one slot
+    assert.equal(led.pendingCount, 1);
+    assert.equal(led.recover("A"), true, "the push IS the make-up send");
+    assert.equal(led.recovered, 1);
+    assert.equal(led.pendingCount, 0, "and the coin leaves the backlog");
+    assert.equal(led.recover("A"), false, "a second push is not a recovery");
+    assert.equal(led.recovered, 1);
+    // Bounded: a deferred coin that never comes back must not grow the set.
+    led.defer("B", 3);
+    led.defer("C", 4);
+    led.defer("D", 5);
+    assert.equal(led.pendingCount, 3, "at the cap nothing is dropped yet");
+    led.defer("E", 6);
+    assert.equal(led.pendingCount, 3, "the cap holds");
+    assert.equal(led.recover("B"), false, "the oldest entry is the one evicted");
+    assert.equal(led.recover("E"), true, "the newest one is still tracked");
+    led.defer("", 7);
+    assert.equal(led.pendingCount, 2, "a token-less deferral is never recorded");
   });
 
   // ---------- scanner.ts push gates ----------
@@ -2288,6 +2316,45 @@ async function main() {
     assert.equal(first.lastAlertAt, rows[0].lastAlertAt);
     assert.equal(second.followupsSent, 1, "the delivered row is NOT");
     assert.ok(second.lastAlertAt > 0);
+  });
+
+  await test("PushWatcher: a held-back card is re-announced on the next pass (at-least-once, counted)", async () => {
+    // The rollback exists so an undelivered card is re-derived next tick — but
+    // nothing recorded whether that actually happened: the pass note showed the
+    // loss and the next tick's note overwrote it. Two passes on ONE watcher:
+    // the first times out (held back), the second delivers the same card.
+    const rows = [watchRow("MOON", { mcapAtPush: 50_000 })];
+    const updated = [];
+    let hang = true;
+    const bot = {
+      api: {
+        sendMessage: () =>
+          hang
+            ? new Promise(() => {}) // never answers: the send misses its slice
+            : Promise.resolve({ message_id: 9 }),
+      },
+    };
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      bot,
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const first = await pw.runTick(Date.now() + 60);
+    assert.equal(first.undelivered, 1, "the pass reports the held-back card");
+    assert.equal(first.undeliveredTotal, 1);
+    assert.equal(first.recoveredUndelivered, 0, "nothing delivered yet");
+    assert.equal(first.pendingUndelivered, 1, "the coin waits for its make-up send");
+    hang = false;
+    const second = await pw.runTick(Date.now() + 5_000);
+    assert.equal(second.alerted, 1, "the held-back card is delivered on the next pass");
+    assert.equal(second.recoveredUndelivered, 1, "and counted as recovered");
+    assert.equal(second.undeliveredTotal, 1, "no new loss in the second pass");
+    assert.equal(second.pendingUndelivered, 0, "the backlog clears");
+    assert.match(String(second.note), /recovered 1/, "the note names the recovery");
+    assert.doesNotMatch(String(second.note), /undelivered/, "and not the old loss");
   });
 
   await test("PushWatcher: the rotation head is published for the scanner's next pair phase", async () => {

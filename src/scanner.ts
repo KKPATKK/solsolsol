@@ -303,6 +303,61 @@ export function boundClaim(
       if (timer !== undefined) clearTimeout(timer);
     });
 }
+
+/**
+ * Cross-tick ledger of coins a late tick REFUSED to push (see
+ * cardClaimDeadline / cardSendDeadline) and whether the re-eval pool then
+ * pushed them.
+ *
+ * The deferral is deliberately invisible in storage — nothing is claimed,
+ * nothing is written, and the coin keeps its place in the pool — which is why
+ * "the coin really does come back next tick" could not be observed before
+ * this: a tick that deferred a card and the tick that finally pushed it were
+ * unrelated summaries. `recovered` rising is that proof, live.
+ *
+ * Bounded: a deferred coin that never returns (the market moved, the pool
+ * pruned it) must not grow the set forever, so the oldest entry is evicted at
+ * the cap. Pure and exported so the accounting is unit-testable — its caller
+ * sits inside runOnce, which has no offline qualifying-coin fixture.
+ */
+export class DeferredPushLedger {
+  private readonly pending = new Map<string, number>();
+  private recoveredCount = 0;
+
+  constructor(private readonly maxEntries = 500) {}
+
+  /** Record that `token` was refused a card (idempotent per token). */
+  defer(token: string, at: number): void {
+    if (token.length === 0 || this.pending.has(token)) return;
+    this.pending.set(token, at);
+    while (this.pending.size > this.maxEntries) {
+      const oldest = this.pending.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.pending.delete(oldest);
+    }
+  }
+
+  /**
+   * Record a successful push: returns true when this token had been deferred
+   * (so this push IS the make-up send the deferral promised).
+   */
+  recover(token: string): boolean {
+    if (!this.pending.delete(token)) return false;
+    this.recoveredCount += 1;
+    return true;
+  }
+
+  /** Coins deferred and not yet pushed back (visibility into the backlog). */
+  get pendingCount(): number {
+    return this.pending.size;
+  }
+
+  /** Deferrals that were followed by a real push — the at-least-once proof. */
+  get recovered(): number {
+    return this.recoveredCount;
+  }
+}
+
 /**
  * Per-token GeckoTerminal lookups the post-push tracker may make in one
  * pass (see pairsForTracker). Two is one tick's worth of rows plus slack:
@@ -723,6 +778,30 @@ export interface ScanSummary {
    * told apart from a real gate rejection.
    */
   cardSendDeferred?: number;
+  /**
+   * Cumulative deferrals since the isolate started (the same shape the
+   * worker's dex429Total uses). `cardSendDeferred` above only survives in
+   * /health until the next tick publishes its own summary, so a deferral
+   * could never be counted across ticks nor correlated with the push that
+   * eventually paid it back. See DeferredPushLedger.
+   */
+  cardSendDeferredTotal?: number;
+  /**
+   * Deferred cards the re-eval pool has since pushed: when this rises, "a
+   * deferred coin really is pushed back on a later tick" is proven live
+   * rather than only argued from the code path.
+   */
+  deferRecovered?: number;
+  /** Coins still waiting for that make-up push (deferred and never pushed). */
+  deferPending?: number;
+  /**
+   * Cumulative tracker cards a pass could not deliver (PushWatcher's
+   * `undelivered`): the per-pass note only reports the pass it happened in,
+   * so the fleet-wide rate was invisible across ticks.
+   */
+  pushWatchUndeliveredTotal?: number;
+  /** Of those, the ones a later pass re-announced — the tracker's at-least-once proof. */
+  pushWatchRecovered?: number;
   /** Pool+feed coins with live DexScreener pair data this scan (vs pool count). */
   pairs?: number;
   fails: {
@@ -952,6 +1031,16 @@ export class Scanner {
    * pairs 0/6 miss 6 trips 5` in 36ms). Reusing this map costs nothing.
    */
   private lastPairs = new Map<string, PairInfo>();
+  /**
+   * Cross-tick bookkeeping for deferred initial cards (see
+   * DeferredPushLedger): the deferral writes nothing, so this is the only
+   * place that can say whether the deferred coin ever came back.
+   */
+  private readonly deferredPushes = new DeferredPushLedger();
+  /** Cumulative initial-card deferrals this isolate has refused. */
+  private cardSendDeferredTotal = 0;
+  /** Cumulative tracker cards this isolate failed to deliver (from PushWatcher). */
+  private pushWatchUndeliveredTotal = 0;
   /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
@@ -1491,6 +1580,15 @@ export class Scanner {
       flurryRpcCalls: 0,
       flurryCacheHits: 0,
       dex: this.dex.getStats(),
+      // Per-tick deferral count plus the cumulative ledger: the per-tick
+      // value is overwritten by the next tick's summary, the cumulative
+      // one is what makes "how often does the tick refuse a card?"
+      // answerable across ticks (and deferRecovered rising is the live
+      // proof that a deferred coin really is pushed back later).
+      cardSendDeferred: 0,
+      cardSendDeferredTotal: this.cardSendDeferredTotal,
+      deferRecovered: this.deferredPushes.recovered,
+      deferPending: this.deferredPushes.pendingCount,
       rejects: [],
     };
     // abort() publishes this snapshot if the tick's race trips mid-scan
@@ -2652,6 +2750,12 @@ export class Scanner {
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
           const deferCard = (why: string): void => {
             diag.cardSendDeferred = (diag.cardSendDeferred ?? 0) + 1;
+            this.cardSendDeferredTotal += 1;
+            diag.cardSendDeferredTotal = this.cardSendDeferredTotal;
+            // The coin is re-pushed by a LATER tick's runOnce, so only the
+            // cross-tick ledger can show whether that make-up send happened.
+            this.deferredPushes.defer(c.profile.tokenAddress, Date.now());
+            diag.deferPending = this.deferredPushes.pendingCount;
             console.log(
               `[scanner] initial card deferred (${why}): ${c.profile.symbol ?? c.profile.tokenAddress}`,
             );
@@ -2758,6 +2862,12 @@ export class Scanner {
               /* best-effort */
             }
             throw err;
+          }
+          // A deferred coin that reaches the send IS the make-up push the
+          // deferral promised (see DeferredPushLedger).
+          if (this.deferredPushes.recover(c.profile.tokenAddress)) {
+            diag.deferRecovered = this.deferredPushes.recovered;
+            diag.deferPending = this.deferredPushes.pendingCount;
           }
           pushed++;
           // Start post-push tracking (🚀/⚠️/💀 follow-ups). Best-effort and
@@ -2877,6 +2987,14 @@ export class Scanner {
             startedAt + SCAN_TICK_DEADLINE_MS - SCAN_FINISH_RESERVE_MS,
           );
           diag.pushWatch = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
+          // Cumulative tracker telemetry (the pass note above only ever
+          // reports the pass it happened in — /health shows the latest
+          // summary, so a loss vanished with the next tick).
+          this.pushWatchUndeliveredTotal = Number(
+            pw.undeliveredTotal ?? this.pushWatchUndeliveredTotal,
+          );
+          diag.pushWatchUndeliveredTotal = this.pushWatchUndeliveredTotal;
+          diag.pushWatchRecovered = Number(pw.recoveredUndelivered ?? 0);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error("[scanner] push-watch tick failed:", msg);

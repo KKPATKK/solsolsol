@@ -166,6 +166,13 @@ drawdowns that are hours old, and re-announces 🚀 milestones the operator
 never had a chance to act on. The peak is still recorded, so the window's
 🏁 recap reports the ride honestly ("峰值 +190%") without the spam.
  */
+/**
+ * Cap on the tokens waiting for a make-up send (see pendingUndelivered). A
+ * held-back row normally comes back within one or two passes; the cap only
+ * exists so a row that never re-fires (or was tombstoned meanwhile) cannot
+ * grow the set forever — the oldest entry is evicted first.
+ */
+const TRACKER_UNDELIVERED_MAX = 200;
 const STALE_BACKFILL_MS = 45 * 60_000;
 /** Rising-stage thresholds (%) above the push-time mcap → state suffix. */
 const RISING_STAGES = [50, 100, 200, 400] as const;
@@ -684,10 +691,43 @@ export class PushWatcher {
    * or two per pass, so yesterday's head covers today's.
    */
   private lastHeadTokens: string[] = [];
+  /**
+   * Cross-tick ledger for cards a pass could not deliver. `undelivered`
+   * is per PASS (it feeds the note), so the rate vanished with the next
+   * tick's note and "the card really was re-announced later" could not be
+   * observed at all — the note only ever showed the loss, never the
+   * recovery. These counters are per ISOLATE and ride every runTick
+   * result, so /health carries the running totals across ticks.
+   */
+  private undeliveredTotal = 0;
+  private recoveredUndeliveredTotal = 0;
+  /**
+   * Tokens whose last pass held a card back (rolled back, not recorded as
+   * announced). Bounded — a row that never re-fires (or is tombstoned)
+   * must not grow this forever; the oldest entry is evicted first.
+   */
+  private readonly pendingUndelivered = new Set<string>();
 
   /** Tokens the last pass put at the front of its rotation queue. */
   headTokens(): string[] {
     return [...this.lastHeadTokens];
+  }
+
+  /**
+   * Record that `cards` cards for this row could not be delivered, so the
+   * cumulative counter and the make-up backlog move together (and the backlog
+   * stays bounded).
+   */
+  private markUndelivered(token: string, cards: number): void {
+    this.undeliveredTotal += cards;
+    this.pendingUndelivered.add(token);
+    while (this.pendingUndelivered.size > TRACKER_UNDELIVERED_MAX) {
+      const oldest = this.pendingUndelivered.values().next().value as
+        | string
+        | undefined;
+      if (oldest === undefined) break;
+      this.pendingUndelivered.delete(oldest);
+    }
   }
 
   constructor(
@@ -820,6 +860,17 @@ export class PushWatcher {
     note?: string;
     /** Turso round trips this pass made (see the merge notes inside). */
     trips: number;
+    /**
+     * Cards THIS pass could not deliver (send slice spent, timed out, or
+     * the call threw). Every one is rolled back and re-announced later.
+     */
+    undelivered: number;
+    /** Cumulative undelivered cards this isolate (survives the pass note). */
+    undeliveredTotal: number;
+    /** Of those, the ones a later pass actually re-announced. */
+    recoveredUndelivered: number;
+    /** Tokens still waiting for their make-up send. */
+    pendingUndelivered: number;
   }> {
     const cfg = this.config.pushWatch;
     const now = Date.now();
@@ -837,6 +888,13 @@ export class PushWatcher {
       checked: 0,
       alerted: 0,
       note: "deferred:tick-budget",
+      // Both deferral returns happen BEFORE the row loop, so no card was
+      // even attempted — the per-pass count is 0 and the cumulative
+      // totals are the isolate's running values.
+      undelivered: 0,
+      undeliveredTotal: this.undeliveredTotal,
+      recoveredUndelivered: this.recoveredUndeliveredTotal,
+      pendingUndelivered: this.pendingUndelivered.size,
       // Read at return time, so a deferral reports the trips made before it.
       get trips() {
         return trips;
@@ -1060,6 +1118,10 @@ export class PushWatcher {
         alerted: 0,
         note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"} trips ${trips}`,
         trips,
+        undelivered: 0,
+        undeliveredTotal: this.undeliveredTotal,
+        recoveredUndelivered: this.recoveredUndeliveredTotal,
+        pendingUndelivered: this.pendingUndelivered.size,
       };
 
     // Rotation: LEAST-recently-checked first. The loop only fits a few rows
@@ -1093,6 +1155,10 @@ export class PushWatcher {
         alerted: 0,
         note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)} trips ${trips}`,
         trips,
+        undelivered: 0,
+        undeliveredTotal: this.undeliveredTotal,
+        recoveredUndelivered: this.recoveredUndeliveredTotal,
+        pendingUndelivered: this.pendingUndelivered.size,
       };
     }
 
@@ -1111,6 +1177,8 @@ export class PushWatcher {
      * that, the reservation simply stood and the card was lost for good.
      */
     let undelivered = 0;
+    /** Cards THIS pass re-announced after a previous pass held them back. */
+    let recoveredThisPass = 0;
     /** Rows refused because their cards did not fit the pass (no card lost). */
     let sendDeferred = 0;
     let firstRow = true;
@@ -1257,6 +1325,7 @@ export class PushWatcher {
             `[push-watch] send budget spent for ${row.symbol ?? row.token} — ${evalResult.alerts.length - sentCount} card(s) held back for the next tick`,
           );
           undelivered += evalResult.alerts.length - sentCount;
+          this.markUndelivered(row.token, evalResult.alerts.length - sentCount);
           break;
         }
         try {
@@ -1277,6 +1346,7 @@ export class PushWatcher {
               `[push-watch] alert send timed out for ${row.symbol ?? row.token} — held back for the next tick (send slice ${Math.max(0, sendBudgetEnd - Date.now())}ms left)`,
             );
             undelivered += 1;
+            this.markUndelivered(row.token, 1);
             break;
           }
           alerted += 1;
@@ -1303,6 +1373,7 @@ export class PushWatcher {
           // card too — it used to be logged and then silently recorded as
           // announced, a third way for a card to vanish.
           undelivered += 1;
+          this.markUndelivered(row.token, 1);
           console.error(
             `[push-watch] alert send failed for ${row.symbol ?? row.token} (held back for the next tick):`,
             err instanceof Error ? err.message : err,
@@ -1310,6 +1381,14 @@ export class PushWatcher {
         }
       }
 
+      // The make-up send: this row's card was held back by an earlier pass
+      // (rolled back, never recorded as announced) and is delivered now —
+      // the at-least-once promise, counted so it is observable instead of
+      // merely argued from the rollback code.
+      if (sentCount > 0 && this.pendingUndelivered.delete(row.token)) {
+        this.recoveredUndeliveredTotal += 1;
+        recoveredThisPass += 1;
+      }
       trips += 1;
       // An UNDELIVERED card must not be recorded as announced: the
       // reservation written before the send is rolled back to the
@@ -1410,8 +1489,18 @@ export class PushWatcher {
       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
       `${undelivered > 0 ? ` undelivered ${undelivered}` : ""}` +
+      `${recoveredThisPass > 0 ? ` recovered ${recoveredThisPass}` : ""}` +
       `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
 
-    return { checked, alerted, note, trips };
+    return {
+      checked,
+      alerted,
+      note,
+      trips,
+      undelivered,
+      undeliveredTotal: this.undeliveredTotal,
+      recoveredUndelivered: this.recoveredUndeliveredTotal,
+      pendingUndelivered: this.pendingUndelivered.size,
+    };
   }
 }
