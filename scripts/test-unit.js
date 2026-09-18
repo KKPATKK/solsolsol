@@ -2095,7 +2095,9 @@ async function main() {
     // The first row runs even when the pass has no budget left (the progress
     // floor), so its send slice — not the whole per-row cap — is what bounds
     // the tick: the old 1000ms cap let a candidate tick finish at 4857ms of a
-    // ~4840ms race window and lose its flush entirely.
+    // ~4840ms race window and lose its flush entirely. A send that misses
+    // the slice is now ROLLED BACK rather than recorded as announced, so
+    // the card is re-announced next tick instead of vanishing.
     const rows = [watchRow("MOON", { mcapAtPush: 50_000 })];
     const updated = [];
     let sends = 0;
@@ -2120,12 +2122,86 @@ async function main() {
     const elapsed = Date.now() - t0;
     assert.equal(sends, 1, "the alert is attempted exactly once");
     assert.equal(out.alerted, 0, "a send that misses the slice is not counted as delivered");
-    assert.match(String(out.note), /dropped 1/, "the dropped card is reported, not hidden");
+    assert.match(
+      String(out.note),
+      /undelivered 1/,
+      "the undelivered card is reported, not hidden",
+    );
     assert.ok(
       elapsed < 900,
       `a late row must finish inside the pass tail, took ${elapsed}ms`,
     );
     assert.equal(updated.length, 1, "the row's bookkeeping still lands");
+    // The rollback: the transition this card carried stays unannounced, so
+    // the next tick re-derives it and sends the card. Before this the
+    // reservation simply stood and the card was lost for good.
+    const [, written] = updated[0];
+    assert.equal(written.followupsSent, rows[0].followupsSent, "not counted as sent");
+    assert.equal(written.lastAlertAt, rows[0].lastAlertAt, "the alert clock is rolled back");
+    assert.equal(written.lastState, rows[0].lastState, "and so is the state");
+    assert.equal(written.upStages, rows[0].upStages, "and the announced rocket stage");
+    assert.equal(written.lastMcap, 100_000, "while the measurements still advance");
+  });
+
+  await test("PushWatcher: a DELIVERED alert still records its transition", async () => {
+    // The rollback must be conditional — if a delivered card left its
+    // transition unannounced, the same card would be re-sent every tick.
+    const rows = [watchRow("MOON", { mcapAtPush: 50_000 })];
+    const updated = [];
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      watchBot,
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick(Date.now() + 5_000);
+    assert.equal(out.alerted, 1, "the rising alert is delivered");
+    assert.doesNotMatch(String(out.note), /undelivered/);
+    const [, written] = updated[0];
+    assert.equal(written.followupsSent, 1, "the delivered card is counted");
+    assert.ok(written.lastAlertAt > 0, "and the alert clock advances");
+  });
+
+  await test("PushWatcher: one failed row does not roll back a later row", async () => {
+    // The undelivered counter is per PASS (it feeds the note), so the
+    // rollback flag must be per ROW: comparing the pass total would roll
+    // back every row after the first failure — re-sending cards that were
+    // already delivered. Row A's send throws, row B's succeeds.
+    const rows = [
+      watchRow("AAA", { mcapAtPush: 50_000 }),
+      watchRow("BBB", { mcapAtPush: 50_000 }),
+    ];
+    const updated = [];
+    let calls = 0;
+    const flakyBot = {
+      api: {
+        sendMessage: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error("Telegram 500");
+          return { message_id: 7 };
+        },
+      },
+    };
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      flakyBot,
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick(Date.now() + 5_000);
+    assert.equal(updated.length, 2, "both rows were evaluated");
+    assert.match(String(out.note), /undelivered 1/);
+    assert.equal(out.alerted, 1, "only the delivered card counts");
+    const [, first] = updated[0];
+    const [, second] = updated[1];
+    assert.equal(first.followupsSent, 0, "the failed row is rolled back");
+    assert.equal(first.lastAlertAt, rows[0].lastAlertAt);
+    assert.equal(second.followupsSent, 1, "the delivered row is NOT");
+    assert.ok(second.lastAlertAt > 0);
   });
 
   await test("PushWatcher: the rotation head is published for the scanner's next pair phase", async () => {

@@ -103,16 +103,19 @@ const TRACKER_SEND_CAP_MS = 1_000;
  * worker's kill window (live 2026-09-18: trackerMs 1895 against a 640ms
  * allowance, tick 4857ms of a ~4840ms race window, the flush landing on the
  * edge). A late row now gets one Telegram round trip's worth instead: a card
- * that misses it is logged and counted in the pass note (`dropped N`), never
- * retried — the state transition was already reserved before the send.
+ * that misses it is logged and counted in the pass note (`undelivered N`)
+ * and its transition is rolled back, so the next tick re-announces it —
+ * the reservation only has to hold for the rest of THIS pass.
  */
 const TRACKER_SEND_FLOOR_MS = 350;
 /**
  * Send slice a card needs before its row may be STARTED. The reservation
- * below happens BEFORE the send and is never retried, so a row that begins
- * without this much left cannot deliver its card — and the card is then
- * lost for good (`dropped N` in the note, live on two consecutive passes
- * 2026-09-18 02:58Z/03:00Z). The pass therefore refuses such a row
+ * below happens BEFORE the send, so a row that begins without this much
+ * left cannot deliver its card inside this pass; it is then rolled back
+ * and re-announced on the next tick (`undelivered N` in the note). The
+ * pass still refuses such a row outright rather than collect the rollback,
+ * because a refused row costs nothing at all (live 2026-09-18
+ * 02:58Z/03:00Z: the reservation stood and the card was lost for good).
  * outright: no claim, no reservation, no write at all, so the card is
  * delivered by the next tick with a fresh budget and the row keeps its
  * place at the front of the rotation. 350ms is a healthy Telegram round
@@ -1099,8 +1102,15 @@ export class PushWatcher {
     let pairMiss = 0;
     let claimLost = 0;
     let budgetCut = false;
-    /** Cards the row's send slice could not deliver (logged, never retried). */
-    let dropped = 0;
+    /**
+     * Cards this pass could not deliver — the send slice was spent, the send
+     * timed out, or the call threw. Every one of them rolls the row's
+     * announcement bookkeeping back to its pre-send snapshot (see the final
+     * check write), so the next tick re-derives the same transition and
+     * re-announces it: at-least-once, like the initial-card send. Before
+     * that, the reservation simply stood and the card was lost for good.
+     */
+    let undelivered = 0;
     /** Rows refused because their cards did not fit the pass (no card lost). */
     let sendDeferred = 0;
     let firstRow = true;
@@ -1234,16 +1244,19 @@ export class PushWatcher {
       // ONE send budget for the whole row, computed before the row was
       // claimed (see the send-ability gate above): a row can carry four
       // stage cards, and a slow Telegram must not spend the ceiling once
-      // per card.
+      // per card. The counter is per PASS (for the note), so the rollback
+      // flag below compares it against this row's starting value — a
+      // failed row must not roll back a later row's delivered cards.
+      const undeliveredBefore = undelivered;
       let sentCount = 0;
       for (const a of evalResult.alerts) {
         if (backfill) break;
         const sendLeft = sendBudgetEnd - Date.now();
         if (sendLeft <= 0) {
           console.error(
-            `[push-watch] send budget spent for ${row.symbol ?? row.token} — ${evalResult.alerts.length - sentCount} card(s) dropped (their transition is already reserved)`,
+            `[push-watch] send budget spent for ${row.symbol ?? row.token} — ${evalResult.alerts.length - sentCount} card(s) held back for the next tick`,
           );
-          dropped += evalResult.alerts.length - sentCount;
+          undelivered += evalResult.alerts.length - sentCount;
           break;
         }
         try {
@@ -1253,13 +1266,17 @@ export class PushWatcher {
             null,
           );
           if (sent === null) {
-            // Timed out: treated exactly like a failed send (logged, never
-            // retried) — the transition was reserved before this point, so a
-            // retry could deliver a duplicate card.
+            // Timed out: the transition stays reserved for the rest of this
+            // pass (a concurrent isolate must not re-send it), but the final
+            // write below rolls the row's announcement bookkeeping back, so
+            // the next tick re-announces it. The send may in fact have
+            // landed, so that retry can duplicate — the accepted price of
+            // never losing a card (the initial-card send makes the same
+            // trade-off).
             console.error(
-              `[push-watch] alert send timed out for ${row.symbol ?? row.token} — card dropped (send slice ${Math.max(0, sendBudgetEnd - Date.now())}ms left)`,
+              `[push-watch] alert send timed out for ${row.symbol ?? row.token} — held back for the next tick (send slice ${Math.max(0, sendBudgetEnd - Date.now())}ms left)`,
             );
-            dropped += 1;
+            undelivered += 1;
             break;
           }
           alerted += 1;
@@ -1282,14 +1299,25 @@ export class PushWatcher {
             /* audit is best-effort */
           }
         } catch (err) {
+          // A thrown send (Telegram 4xx/5xx, network) is an undelivered
+          // card too — it used to be logged and then silently recorded as
+          // announced, a third way for a card to vanish.
+          undelivered += 1;
           console.error(
-            `[push-watch] alert send failed for ${row.symbol ?? row.token}:`,
+            `[push-watch] alert send failed for ${row.symbol ?? row.token} (held back for the next tick):`,
             err instanceof Error ? err.message : err,
           );
         }
       }
 
       trips += 1;
+      // An UNDELIVERED card must not be recorded as announced: the
+      // reservation written before the send is rolled back to the
+      // pre-send snapshot, so the next tick re-derives the same
+      // transition and re-announces it. The measurement fields (peak,
+      // liquidity, volume, last mcap) still advance — they describe the
+      // coin, not the announcement.
+      const holdAnnouncements = undelivered > undeliveredBefore;
       await this.db.updatePushWatchCheck(row.token, {
         peakMcap: evalResult.peakMcap,
         lastLiquidity: pair.liquidity.usd,
@@ -1299,17 +1327,31 @@ export class PushWatcher {
         // that is what keeps every already-crossed 🚀/w35/dead transition
         // from being re-announced, and what makes the next check report only
         // genuinely new information.
-        followupsSent: backfill ? row.followupsSent : evalResult.followupsSent,
-        lastState: evalResult.lastState,
-        lastAlertAt: backfill ? row.lastAlertAt : evalResult.lastAlertAt,
-        mcapAtPush: evalResult.resetBaselineMcap,
+        followupsSent:
+          backfill || holdAnnouncements
+            ? row.followupsSent
+            : evalResult.followupsSent,
+        lastState: holdAnnouncements
+          ? (row.lastState ?? null)
+          : evalResult.lastState,
+        lastAlertAt:
+          backfill || holdAnnouncements ? row.lastAlertAt : evalResult.lastAlertAt,
+        mcapAtPush: holdAnnouncements
+          ? row.mcapAtPush
+          : evalResult.resetBaselineMcap,
         // Roll the 📈 baseline forward — omitting this made every later
         // holder check re-fire against the stale push-time baseline
         // (BABYCATE 1,000 → 2,441 then 1,000 → 2,458).
-        holdersAtPush: evalResult.resetBaselineHolders,
-        upStages: evalResult.announcedUpStages,
-        deadTroughMcap: evalResult.deadTroughMcap ?? null,
-        sellDomStreak: evalResult.sellDomStreak,
+        holdersAtPush: holdAnnouncements
+          ? (row.holdersAtPush ?? undefined)
+          : evalResult.resetBaselineHolders,
+        upStages: holdAnnouncements ? row.upStages : evalResult.announcedUpStages,
+        deadTroughMcap: holdAnnouncements
+          ? (row.deadTroughMcap ?? null)
+          : (evalResult.deadTroughMcap ?? null),
+        sellDomStreak: holdAnnouncements
+          ? row.sellDomStreak
+          : evalResult.sellDomStreak,
         lastMcap: pair.marketCap,
       });
     }
@@ -1356,8 +1398,10 @@ export class PushWatcher {
     // a healthy `ok:0/0` in /health — the exact shape that hid the 2026-09-17
     // stop for hours. One line names every skip reason: tokens the batch did
     // not return (miss), cross-isolate claim races (lost), the pass running
-    // out of budget before the rest of the rotation (budget-cut), and rows
-    // whose first observation landed after a tracking gap (backfill).
+    // out of budget before the rest of the rotation (budget-cut), rows
+    // whose first observation landed after a tracking gap (backfill), and
+    // cards the pass could not deliver (undelivered — rolled back and
+    // re-announced next tick, never lost).
     // The note is ALWAYS present now: it ends with the pass's round-trip
     // count, the number this merge exists to keep down. (It used to be omitted
     // on a fully-clean pass, which is how a starved tracker looked healthy.)
@@ -1365,7 +1409,7 @@ export class PushWatcher {
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
-      `${dropped > 0 ? ` dropped ${dropped}` : ""}` +
+      `${undelivered > 0 ? ` undelivered ${undelivered}` : ""}` +
       `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
 
     return { checked, alerted, note, trips };
