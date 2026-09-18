@@ -1933,21 +1933,31 @@ async function main() {
     // The reservation happens BEFORE the send and is never retried, so a row
     // started without the send slice loses its card for good (live 2026-09-18
     // 02:58Z and 03:00Z: `dropped 1` on two consecutive passes). The pass must
-    // therefore refuse the row outright — no claim, no write — so the next
-    // tick delivers the card with a fresh budget.
+    // refuse such a row outright — no claim, no write — so the next tick
+    // delivers the card with a fresh budget. The reachable trigger is the
+    // failed-listing fallback below: it re-reads the table AFTER the pass's
+    // last deadline check, so a slow re-listing is what carries the pass past
+    // its budget without it noticing.
     const rows = [watchRow("MOON", { mcapAtPush: 50_000 })];
     const updated = [];
     let sends = 0;
+    let listCalls = 0;
+    const db = watchDb(rows, updated);
+    db.listPushWatch = async () => {
+      listCalls += 1;
+      if (listCalls === 1) throw new Error("listing failed");
+      await new Promise((r) => setTimeout(r, 250)); // the fallback re-read
+      return rows;
+    };
     const pw = new PushWatcher(
-      watchDb(rows, updated),
+      db,
       { api: { sendMessage: async () => { sends += 1; return { message_id: 1 }; } } },
       null,
       loadConfig({}),
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
-    // Pass deadline already gone: the slice is smaller than one send.
-    const out = await pw.runTick(Date.now() - 500);
+    const out = await pw.runTick(Date.now() + 100);
     assert.equal(sends, 0, "nothing may be sent without the slice to send it");
     assert.equal(out.checked, 0, "the row is not claimed");
     assert.equal(updated.length, 0, "and nothing is written — the row keeps its state");
