@@ -202,6 +202,21 @@ const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
 const CARD_SEND_MIN_MS = 250;
 
 /**
+ * Slice the push claim (claimTokenPush) may have, and the room the tick must
+ * have left before it is even attempted. The claim is a Turso round trip whose
+ * own cap (SCAN_DB_TIMEOUT_MS = 1200ms, hard wall 1.44s with libsql's
+ * post-abort retry) is LARGER than the tail a late chain leaves, so it became
+ * the next step a candidate tick died on once the send was bounded: live
+ * 2026-09-18 04:32:18Z and 04:33:18Z, both `pushPhase send:claim` (stamped at
+ * 3.79s) cut at 5000ms of a 4728/4751ms race window, with only 608ms of tail
+ * left for a step allowed to run for 1.2s. 400ms is a healthy insert plus
+ * slack — deliberately smaller than the client's own cap, because a claim
+ * that misses this slice is DEFERRED (the coin keeps its place in the re-eval
+ * pool, nothing is written) rather than allowed to hold the tick open.
+ */
+const CARD_CLAIM_BUDGET_MS = 400;
+
+/**
  * Deadline for the initial-card Telegram send, or `null` when the tick has
  * no slice left to start one (the card is deferred, never released as a
  * failure). Pure so the boundary is unit-testable: the send itself lives in
@@ -221,6 +236,23 @@ export function cardSendDeadline(
     startedAt + CARD_SEND_TAIL_MS,
   );
   return deadline - now < CARD_SEND_MIN_MS ? null : deadline;
+}
+
+/**
+ * Deadline for the push CLAIM, or `null` when the tick has no room for the
+ * claim plus the minimum send slice — in which case the coin is deferred
+ * before anything is written. Same contract as cardSendDeadline (pure, so the
+ * boundary is unit-testable), and the reason the claim can no longer be the
+ * step a late tick dies on.
+ */
+export function cardClaimDeadline(
+  startedAt: number,
+  now: number,
+): number | null {
+  const send = cardSendDeadline(startedAt, now);
+  if (send === null) return null;
+  if (send - now < CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS) return null;
+  return now + CARD_CLAIM_BUDGET_MS;
 }
 /**
  * Per-token GeckoTerminal lookups the post-push tracker may make in one
@@ -2579,19 +2611,49 @@ export class Scanner {
           // the isTokenSeen check-then-act window above, but only one wins
           // this INSERT OR IGNORE — duplicate cards (e.g. double TRILLY)
           // are impossible at the storage layer.
-          // A tick with no send slice left never reaches the claim: the
-          // claim and the delivery audit are both written before the send
-          // and neither is retried, so a send that cannot finish loses the
-          // card — and holding the tick open past its race window also
-          // loses the tick's flush. Deferring touches nothing (no claim,
-          // no audit, no failure record) and the re-eval pool re-pushes
-          // the coin on the next tick.
-          if (cardSendDeadline(startedAt, Date.now()) === null) {
-            deferCard("no slice left before the race window");
+          // A tick with no slice left never reaches the claim: the claim and
+          // the delivery audit are both written before the send and neither
+          // is retried, so a send that cannot finish loses the card — and
+          // holding the tick open past its race window also loses the tick's
+          // flush. The room checked here covers the CLAIM as well as the send
+          // (see CARD_CLAIM_BUDGET_MS), because the claim is a round trip with
+          // a cap larger than a late tick's tail. Deferring touches nothing
+          // (no claim, no audit, no failure record) and the re-eval pool
+          // re-pushes the coin on the next tick.
+          const claimDeadline = cardClaimDeadline(startedAt, Date.now());
+          if (claimDeadline === null) {
+            deferCard("no slice left for the claim plus the send");
             return;
           }
           this.markPhase(diag, "send:claim", startedAt);
-          if (!(await this.db.claimTokenPush(c.chatId, c.profile.tokenAddress))) {
+          // The promise is kept so an abandoned claim can be released below.
+          const claimPromise = this.db.claimTokenPush(
+            c.chatId,
+            c.profile.tokenAddress,
+          );
+          const claimed = await this.bestEffort(
+            () => claimPromise,
+            claimDeadline,
+            null,
+          );
+          if (claimed === null) {
+            // Still in flight. An orphan claim row is PERMANENT — it is the
+            // only INSERT that can win this coin, and every later tick's
+            // claim would fail against it, so the coin could never be pushed.
+            // Release it once the call settles, whichever way it settles
+            // (deleting a row that never landed is a no-op).
+            void claimPromise
+              .then(
+                () => this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress),
+                () => this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress),
+              )
+              .catch(() => {
+                /* cleanup is best-effort */
+              });
+            deferCard("claim exceeded its slice");
+            return;
+          }
+          if (!claimed) {
             return;
           }
           // The claim's round trip comes out of the same slice, so the

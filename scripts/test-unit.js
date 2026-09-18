@@ -19,7 +19,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../d
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -713,6 +713,26 @@ async function main() {
     assert.equal(cardSendDeadline(t0, t0 + 4_151), null);
     // A tick already past the tail can never start one.
     assert.equal(cardSendDeadline(t0, t0 + 9_000), null);
+  });
+
+  await test("cardClaimDeadline: the claim needs room for itself AND the send", () => {
+    const t0 = 1_000_000;
+    // Healthy chain: the claim gets its own 400ms slice.
+    assert.equal(cardClaimDeadline(t0, t0 + 2_000), t0 + 2_400);
+    // Late but affordable: 700ms of tail still covers 400 (claim) + 250
+    // (least send).
+    assert.equal(cardClaimDeadline(t0, t0 + 3_500), t0 + 3_900);
+    // Boundary: exactly 650ms of tail, one ms less is refused.
+    assert.equal(cardClaimDeadline(t0, t0 + 3_550), t0 + 3_950);
+    assert.equal(cardClaimDeadline(t0, t0 + 3_551), null);
+    // The live shape this exists for (2026-09-18 04:32:18Z): the chain
+    // reached the claim at 3.79s with 608ms of tail left, the claim's own
+    // cap is 1200ms, and the tick died at 5000ms with `pushPhase
+    // send:claim`. It is now deferred before anything is written.
+    assert.equal(cardClaimDeadline(t0, t0 + 3_792), null);
+    // Past the send tail as well.
+    assert.equal(cardClaimDeadline(t0, t0 + 4_200), null);
+    assert.equal(cardClaimDeadline(t0, t0 + 9_000), null);
   });
 
   // ---------- scanner.ts push gates ----------
