@@ -19,7 +19,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../d
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -733,6 +733,72 @@ async function main() {
     // Past the send tail as well.
     assert.equal(cardClaimDeadline(t0, t0 + 4_200), null);
     assert.equal(cardClaimDeadline(t0, t0 + 9_000), null);
+  });
+
+  await test("boundClaim: a claim that answers inside its slice is used as-is", async () => {
+    let releases = 0;
+    const release = async () => {
+      releases += 1;
+    };
+    assert.equal(await boundClaim(Promise.resolve(true), 50, release), true);
+    assert.equal(
+      await boundClaim(Promise.resolve(false), 50, release),
+      false,
+      "a lost CAS is false, and must not be reported as a deferral",
+    );
+    assert.equal(releases, 0, "nothing is released when the claim answered");
+  });
+
+  await test("boundClaim: a claim that misses its slice defers and releases its row", async () => {
+    // The live shape this exists for (2026-09-18 04:32:18Z): the chain
+    // reached the claim with less tail left than the claim's own cap. The
+    // tick must move on, and the claim that lands late must not orphan the
+    // coin (an INSERT OR IGNORE row no later tick can win against).
+    let settled = false;
+    let releases = 0;
+    // The gap between the slice (20ms) and the claim's own answer (150ms)
+    // is wide on purpose: the assertion is about ORDERING, so a loaded CI
+    // runner firing its timers late cannot turn this into a flake.
+    const late = new Promise((resolve) =>
+      setTimeout(() => {
+        settled = true;
+        resolve(true);
+      }, 150),
+    );
+    const r = await boundClaim(late, 20, async () => {
+      releases += 1;
+    });
+    assert.equal(r, null, "a claim that missed its slice defers the card");
+    assert.equal(settled, false, "it returned at the slice, not when the call settled");
+    assert.equal(releases, 0, "nothing may be released while the claim is in flight");
+    await new Promise((res) => setTimeout(res, 250));
+    assert.equal(settled, true);
+    assert.equal(releases, 1, "the abandoned claim releases its row exactly once");
+  });
+
+  await test("boundClaim: a claim that throws also defers and releases", async () => {
+    let releases = 0;
+    const failing = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("libsql aborted")), 150),
+    );
+    const r = await boundClaim(failing, 20, async () => {
+      releases += 1;
+    });
+    assert.equal(r, null, "an unconfirmed claim is never treated as won");
+    await new Promise((res) => setTimeout(res, 250));
+    assert.equal(releases, 1);
+  });
+
+  await test("boundClaim: a claim that never answers still frees the tick", async () => {
+    let releases = 0;
+    const r = await boundClaim(new Promise(() => {}), 20, async () => {
+      releases += 1;
+    });
+    // Only the slice can produce a value from a promise that never settles,
+    // so returning at all is the assertion (no wall-clock bound to flake).
+    assert.equal(r, null, "a hung DB call must not hold the tick");
+    await new Promise((res) => setTimeout(res, 120));
+    assert.equal(releases, 0, "nothing settled, so there is nothing to release");
   });
 
   // ---------- scanner.ts push gates ----------

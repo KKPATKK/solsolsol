@@ -254,6 +254,55 @@ export function cardClaimDeadline(
   if (send - now < CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS) return null;
   return now + CARD_CLAIM_BUDGET_MS;
 }
+
+/**
+ * Race a push claim against the slice the tick can give it. Returns `true`
+ * (this isolate won the coin), `false` (another isolate already owns it), or
+ * `null` (the claim did not answer, or threw, inside the slice — the caller
+ * defers the card).
+ *
+ * The promise is kept and the row is RELEASED on `null`: the claim is an
+ * INSERT OR IGNORE, so a row that lands after we stopped waiting is permanent
+ * — it is the only insert that can win that coin, every later tick's claim
+ * loses against it, and the coin could never be pushed at all. Releasing on
+ * either settle outcome is safe because deleting a row that never landed is a
+ * no-op.
+ *
+ * Exported (and therefore unit-tested) because its only caller sits inside
+ * runOnce, which has no offline qualifying-coin fixture.
+ */
+export function boundClaim(
+  claim: Promise<boolean>,
+  timeoutMs: number,
+  release: () => Promise<unknown>,
+): Promise<boolean | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), Math.max(0, timeoutMs));
+  });
+  return Promise.race([
+    claim.then(
+      (won) => won,
+      () => null,
+    ),
+    expired,
+  ])
+    .then((won) => {
+      if (won !== null) return won;
+      void claim
+        .then(
+          () => release(),
+          () => release(),
+        )
+        .catch(() => {
+          /* cleanup is best-effort */
+        });
+      return null;
+    })
+    .finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
+}
 /**
  * Per-token GeckoTerminal lookups the post-push tracker may make in one
  * pass (see pairsForTracker). Two is one tick's worth of rows plus slack:
@@ -2626,30 +2675,13 @@ export class Scanner {
             return;
           }
           this.markPhase(diag, "send:claim", startedAt);
-          // The promise is kept so an abandoned claim can be released below.
-          const claimPromise = this.db.claimTokenPush(
-            c.chatId,
-            c.profile.tokenAddress,
-          );
-          const claimed = await this.bestEffort(
-            () => claimPromise,
-            claimDeadline,
-            null,
+          // Bounded, and self-releasing if abandoned (see boundClaim).
+          const claimed = await boundClaim(
+            this.db.claimTokenPush(c.chatId, c.profile.tokenAddress),
+            claimDeadline - Date.now(),
+            () => this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress),
           );
           if (claimed === null) {
-            // Still in flight. An orphan claim row is PERMANENT — it is the
-            // only INSERT that can win this coin, and every later tick's
-            // claim would fail against it, so the coin could never be pushed.
-            // Release it once the call settles, whichever way it settles
-            // (deleting a row that never landed is a no-op).
-            void claimPromise
-              .then(
-                () => this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress),
-                () => this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress),
-              )
-              .catch(() => {
-                /* cleanup is best-effort */
-              });
             deferCard("claim exceeded its slice");
             return;
           }
