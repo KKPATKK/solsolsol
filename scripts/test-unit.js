@@ -214,6 +214,77 @@ async function main() {
     }
   });
 
+  await test("Scanner: a race-cut tick flushes the candidate-chain step it was inside", async () => {
+    // The chain is the tick's longest serial section (eleven awaited upstream
+    // steps) and the thing the worker's race cuts, but a cut tick only
+    // reported `candidates 1, pushed 0`. markPhase stamps the in-flight diag
+    // — the SAME object abort() republishes — so the flushed row names the
+    // step and the tick-relative ms it started at.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const scanner = new Scanner(db, { api: { sendMessage: async () => ({}) } }, new DexScreenerClient(cfg), cfg, null, null, null);
+      const diag = { profiles: 0, pool: 0, candidates: 1, pushed: 0, evalMs: undefined };
+      Object.defineProperty(scanner, "inflightSummary", { value: diag, configurable: true });
+      scanner.markPhase(diag, "flurry", Date.now() - 1500);
+      scanner.abort();
+      assert.equal(
+        scanner.lastSummary.pushPhase,
+        "flurry",
+        "the cut tick must name the chain step it died in",
+      );
+      assert.ok(
+        scanner.lastSummary.pushPhaseMs >= 1400,
+        `phase age must be tick-relative (got ${scanner.lastSummary.pushPhaseMs})`,
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: the tracker's pair lookup reuses the tick's pairs and falls back to Jupiter", async () => {
+    // The tracked coins are PUSHED coins, which the re-eval pool query
+    // excludes, so the tracker's batch is a second request — and when
+    // DexScreener is 429-blocked that request returns an empty map and the
+    // whole pass evaluates zero rows (live: `rows 0/30 pairs 0/6 miss 6` in
+    // 36ms). The pass must reuse what the scan already fetched and take the
+    // same Jupiter fallback the front pair phase takes.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      let wire = 0;
+      dex.fetchPairsForTokens = async () => {
+        wire += 1;
+        return new Map(); // the 429 shape: resolves immediately, empty
+      };
+      const jupiter = {
+        fetchTokenDataBatch: async (addrs) =>
+          new Map(addrs.map((a) => [a, { marketCap: 1000, liquidity: { usd: 5000 } }])),
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, null, jupiter,
+      );
+      scanner.lastPairs = new Map([["AAA", { marketCap: 1 }]]);
+      const out = await scanner.pairsForTracker(["AAA", "BBB"], Date.now() + 800);
+      assert.equal(out.get("AAA").marketCap, 1, "the tick's own pair data wins (no wire call)");
+      assert.equal(wire, 1, "only the tokens the tick does not have hit DexScreener");
+      assert.ok(out.has("BBB"), "the Jupiter fallback supplies the blocked tokens");
+      // A deadline-less call must not go to Jupiter (it would be unbounded).
+      const noDeadline = await scanner.pairsForTracker(["CCC"]);
+      assert.ok(!noDeadline.has("CCC"), "no deadline → no unbounded fallback leg");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("Scanner: a hanging pool DB read is cut by POOL_FETCH_BUDGET_MS and the scan degrades to feed-only", async () => {
     // The libsql client can hang in internal retries (the same hang the
     // worker's flush-retry guard exists for). The pool read is raced against

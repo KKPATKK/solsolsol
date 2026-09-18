@@ -551,6 +551,21 @@ export interface ScanSummary {
   pushed: number;
   /** Post-push tracker pass result: "ok:<checked>/<alerted>" or "err:<msg>". */
   pushWatch?: string;
+  /**
+   * WHICH step of the candidate chain the tick was inside when its summary
+   * was published (see Scanner.markPhase). The chain is the tick's longest
+   * serial section — eleven awaited steps, each a live upstream call — and
+   * it is what the worker's race actually cuts, but a cut tick used to flush
+   * `candidates 1, pushed 0` and nothing else, so the step that ate the
+   * budget was invisible (2026-09-18: two candidate ticks raced out at 4.79s
+   * and 5.0s with evalMs never written). Values: seen | flow | rugcheck |
+   * enrich-dispatch | crime | axiom | enrich-await | wallets | flurry |
+   * render | send:claim | send:telegram | send:track | send:autobuy |
+   * tracker | done | deferred.
+   */
+  pushPhase?: string;
+  /** Tick-relative ms when pushPhase was STAMPED (i.e. the step started). */
+  pushPhaseMs?: number;
   /** Pool+feed coins with live DexScreener pair data this scan (vs pool count). */
   pairs?: number;
   fails: {
@@ -771,6 +786,16 @@ export class Scanner {
    */
   private inflightSummary: ScanSummary | null = null;
   /**
+   * Pair data THIS tick's pair phase already paid for (the DexScreener
+   * batch plus its Jupiter fallback). Kept for the post-push tracker pass:
+   * the tracked coins are PUSHED coins, which the re-eval pool query
+   * excludes, so the tracker's own batch is a second request — and while
+   * DexScreener is 429-blocked that request returns an empty map and the
+   * whole pass checks zero rows (live 2026-09-18 02:18:20: `rows 0/30
+   * pairs 0/6 miss 6 trips 5` in 36ms). Reusing this map costs nothing.
+   */
+  private lastPairs = new Map<string, PairInfo>();
+  /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
    * without Cloudflare log access: "previous-scan-still-running",
@@ -887,7 +912,7 @@ export class Scanner {
           this.birdeye,
           config,
           (addresses: string[], deadlineMs?: number) =>
-            this.dex.fetchPairsForTokens(addresses, deadlineMs),
+            this.pairsForTracker(addresses, deadlineMs),
           // Trade service for the heal-resend card's buy/sell/mode buttons
           // (null = trading unconfigured → link + unwatch only).
           this.trade,
@@ -1103,6 +1128,59 @@ export class Scanner {
         err instanceof Error ? err.message : err,
       );
     }
+  }
+
+  /**
+   * Stamp the candidate-chain progress marker (see ScanSummary.pushPhase).
+   * diag IS the live inflightSummary object, so whatever step is stamped is
+   * exactly what a race-out tick's flushed row reports — the tick's abort()
+   * republishes this same object.
+   */
+  private markPhase(diag: ScanSummary, name: string, startedAt: number): void {
+    diag.pushPhase = name;
+    diag.pushPhaseMs = Date.now() - startedAt;
+  }
+
+  /**
+   * Pair lookup for the post-push tracker pass (see lastPairs): serve what
+   * this tick already fetched, ask DexScreener for the rest, then fall back
+   * to Jupiter exactly like the front pair phase does — the same rescue for
+   * the same 429 episode, which otherwise leaves the pass with no pair data
+   * at all and zero rows evaluated.
+   *
+   * The Jupiter leg is raced against the CALLER's deadline (the tracker's
+   * own pair budget), so a slow fallback can never become the unbounded
+   * await this pass was rebuilt to eliminate.
+   */
+  private async pairsForTracker(
+    addresses: string[],
+    deadlineMs?: number,
+  ): Promise<Map<string, PairInfo>> {
+    const out = new Map<string, PairInfo>();
+    const missing: string[] = [];
+    for (const a of addresses) {
+      const hit = this.lastPairs.get(a);
+      if (hit) out.set(a, hit);
+      else missing.push(a);
+    }
+    if (missing.length === 0) return out;
+    try {
+      for (const [k, v] of await this.dex.fetchPairsForTokens(missing, deadlineMs)) {
+        out.set(k, v);
+      }
+    } catch {
+      /* transient — the Jupiter fallback below may still answer */
+    }
+    const still = missing.filter((a) => !out.has(a));
+    if (still.length > 0 && this.jupiter && typeof deadlineMs === "number") {
+      const jup = await this.bestEffort(
+        () => this.jupiter!.fetchTokenDataBatch(still),
+        deadlineMs,
+        new Map<string, PairInfo>(),
+      );
+      for (const [k, v] of jup) out.set(k, v);
+    }
+    return out;
   }
 
   /** Worker hook: flag the running scan to stop at its next phase boundary. */
@@ -1788,6 +1866,8 @@ export class Scanner {
         }
       }
       diag.pairs = pairsByToken.size;
+      // Kept for the post-push tracker pass (see lastPairs).
+      this.lastPairs = pairsByToken;
 
       // Capture each token's opening stats the first time we ever see it.
       // One batched lookup for the whole feed, then one batched insert for
@@ -1997,6 +2077,7 @@ export class Scanner {
         // half-processed coin cut off by the worker's race (2026-09-16:
         // `candidates: 1, pushed: 0` on every such tick).
         if (this.abortRequested || Date.now() > chainDeadline) {
+          this.markPhase(diag, "deferred", startedAt);
           console.log(
             `[scanner] chain deadline reached — deferring ${candidates.length - processedCandidates} candidate(s) to next tick`,
           );
@@ -2007,6 +2088,7 @@ export class Scanner {
         // dedupe: a coin already pushed to one chat is still pending for the
         // others, e.g. after a failed delivery — this is the fast path that
         // skips the slow lookups when every chat already has it).
+        this.markPhase(diag, "seen", startedAt);
         const unseen: QualifyingCoin[] = [];
         for (const coin of group) {
           try {
@@ -2031,6 +2113,7 @@ export class Scanner {
         // display lookups so a flagged coin never wastes the tick. Only a
         // confirmed flag blocks the push; a pending/incomplete analysis
         // (hold/unknown) pushes anyway with the card showing 未分析.
+        this.markPhase(diag, "flow", startedAt);
         const flow = await this.resolveSupplyFlow(coin, chainDeadline);
         if (flow.status === "flagged") {
           diag.fails.flow++;
@@ -2053,6 +2136,7 @@ export class Scanner {
         // deadline with the exact value its resolver returns when the
         // upstream fails, so a miss degrades the card ("未检测" / "—") and
         // never the push. See bestEffort().
+        this.markPhase(diag, "rugcheck", startedAt);
         const rugcheck = await this.bestEffort(
           () => this.resolveRugcheckData(coin),
           chainDeadline,
@@ -2085,6 +2169,7 @@ export class Scanner {
         // judged where the batch is awaited, and each slot that misses its
         // deadline degrades to exactly the value the old code used.
         const jupiterOrganic = this.jupiter;
+        this.markPhase(diag, "enrich-dispatch", startedAt);
         const displayBatch = Promise.all([
           this.bestEffort(
             () => this.resolveTraderData(coin),
@@ -2122,6 +2207,7 @@ export class Scanner {
         // is a warning (flagged on the card) unless CRIME_WALLETS_BLOCK
         // turns it into a push blocker.
         const crimeClient = this.crimeWallets;
+        this.markPhase(diag, "crime", startedAt);
         const crime = await this.bestEffort<CrimeCheckResult>(
           crimeClient
             ? () =>
@@ -2172,6 +2258,7 @@ export class Scanner {
         // line instead — a dead session must not silence the bot.
         const axiom = this.axiom;
         const axiomPair = coin.pair.pairAddress;
+        this.markPhase(diag, "axiom", startedAt);
         const axiomInfo = await this.bestEffort(
           axiom && axiomPair
             ? () => this.resolveAxiomTokenInfo(axiomPair)
@@ -2198,6 +2285,7 @@ export class Scanner {
         // judge the one thing in it that can block a push. Trader data is
         // display-only (the sniper filter was removed): a coin pushes even
         // when the data is not ready and the card shows 未检测/—.
+        this.markPhase(diag, "enrich-await", startedAt);
         const [trader, holders, gmgn, arkham, organic] = await displayBatch;
         if (arkham) diag.arkham++;
         if (organic) diag.organic++;
@@ -2222,6 +2310,7 @@ export class Scanner {
         // call inside a hard budget, so a slow RPC degrades the card, never
         // the push.
         const analyzer = this.walletAnalyzer;
+        this.markPhase(diag, "wallets", startedAt);
         const wallet = await this.bestEffort(
           analyzer
             ? () =>
@@ -2291,6 +2380,7 @@ export class Scanner {
         // so an unclamped wait could stall the tick for the full remainder
         // and delay the completion flush past the invocation kill.
         const flurryClient = this.flurry;
+        this.markPhase(diag, "flurry", startedAt);
         const flurryOut = await this.bestEffort<FlurryOutcome>(
           flurryClient
             ? () =>
@@ -2317,6 +2407,7 @@ export class Scanner {
         // very next card. Buy button renders in manual mode; sell buttons in
         // any non-off mode (in auto the coin was already bought — exits are
         // what matter).
+        this.markPhase(diag, "render", startedAt);
         const tradeMode = this.trade
           ? await this.trade.effectiveMode()
           : "off";
@@ -2344,10 +2435,12 @@ export class Scanner {
           // the isTokenSeen check-then-act window above, but only one wins
           // this INSERT OR IGNORE — duplicate cards (e.g. double TRILLY)
           // are impossible at the storage layer.
+          this.markPhase(diag, "send:claim", startedAt);
           if (!(await this.db.claimTokenPush(c.chatId, c.profile.tokenAddress))) {
             return;
           }
           try {
+            this.markPhase(diag, "send:telegram", startedAt);
             const sent = await this.bot.api.sendMessage(c.chatId, message, {
               reply_markup: {
                 inline_keyboard: tradeKeyboard(
@@ -2389,6 +2482,7 @@ export class Scanner {
           // Start post-push tracking (🚀/⚠️/💀 follow-ups). Best-effort and
           // deduped by the table's PK — never affects the push itself.
           try {
+            this.markPhase(diag, "send:track", startedAt);
             await this.pushWatcher?.onPush(
               c.chatId,
               c.profile.tokenAddress,
@@ -2404,10 +2498,12 @@ export class Scanner {
           // re-checks the mode gate internally. Dedupe is guaranteed twice
           // over — the coin is already in seen_tokens, and trade_log has
           // UNIQUE(token) — so a slow buy can never double-spend.
+          this.markPhase(diag, "send:autobuy", startedAt);
           if (this.trade && (await this.trade.effectiveMode()) === "auto") {
             await this.autoBuy(c);
           }
         };
+        this.markPhase(diag, "send", startedAt);
         for (const c of unseen) {
           // Re-check right before sending: a concurrent scan (rare, only
           // when a scan outlives the 1-min cron) could have pushed it
@@ -2488,6 +2584,7 @@ export class Scanner {
       // Its deadline also leaves SCAN_FINISH_RESERVE_MS for the summary build
       // and the worker's completion flush, so the pass can never become the
       // reason a tick dies before its flush.
+      this.markPhase(diag, "tracker", startedAt);
       const trackerStart = Date.now();
       if (this.pushWatcher) {
         try {
@@ -2501,6 +2598,7 @@ export class Scanner {
           diag.pushWatch = `err:${msg.slice(0, 140)}`;
         }
       }
+      this.markPhase(diag, "done", startedAt);
       diag.trackerMs = Date.now() - trackerStart;
       console.log(
         `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${scannedProfiles.length}/${poolProfiles.length} pooled, ${candidates.length} candidates, ${pushed} pushed` +
