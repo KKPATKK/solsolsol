@@ -83,6 +83,48 @@ export function parseNewPools(json: unknown): NewPool[] {
 }
 
 /**
+ * One token's live economics, as GeckoTerminal's `/tokens/{address}` reports
+ * them. Used by the post-push tracker as a THIRD pair source (see
+ * Scanner.pairsForTracker): DexScreener's batched endpoint can be 429-blocked
+ * for its whole 90s backoff AND Jupiter's search does not index every pushed
+ * memecoin, which left the tracker blind to its own coins for the duration.
+ *
+ * Field notes (verified against the live API on a tracked XCAT pool,
+ * 2026-09-18): `fdv_usd` is the value that works for Solana memecoins because
+ * `market_cap_usd` comes back null for them, and `total_reserve_in_usd` is the
+ * reserve SUMMED over the token's pools (the closest analogue of DexScreener's
+ * per-pool liquidity). The payload carries NO 5-minute volume/change and no
+ * hourly txn counts, so those stay zero — see the call site for why that is
+ * the safe direction.
+ */
+export interface GeckoTokenSnapshot {
+  priceUsd: number | null;
+  fdvUsd: number | null;
+  reserveUsd: number | null;
+}
+
+/**
+ * Parse `/networks/solana/tokens/{address}` (pure — unit-testable). Returns
+ * null when the payload carries none of the three numbers, so callers treat
+ * "no data" and "not found" the same way.
+ */
+export function parseTokenSnapshot(json: unknown): GeckoTokenSnapshot | null {
+  const attrs = (json as { data?: { attributes?: unknown } } | null)?.data
+    ?.attributes;
+  if (!attrs || typeof attrs !== "object") return null;
+  const rec = attrs as Record<string, unknown>;
+  const num = (v: unknown): number | null => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const priceUsd = num(rec.price_usd);
+  const fdvUsd = num(rec.fdv_usd) ?? num(rec.market_cap_usd);
+  const reserveUsd = num(rec.total_reserve_in_usd) ?? num(rec.reserve_in_usd);
+  if (priceUsd === null && fdvUsd === null && reserveUsd === null) return null;
+  return { priceUsd, fdvUsd, reserveUsd };
+}
+
+/**
  * Free live discovery of brand-new Solana pools (every DEX, incl. pump.fun
  * graduates) — no API key, reachable from datacenter egress. Each page holds
  * ~20 pools created within the last few minutes. This is the zero-CU
@@ -127,6 +169,16 @@ export class GeckoTerminalClient {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * One token's snapshot (see GeckoTokenSnapshot). Shares the client's
+   * throttle and 429 backoff with the discovery feeds: after a 429 this
+   * returns null for the whole backoff window, exactly like the feeds do.
+   */
+  async fetchTokenSnapshot(mint: string): Promise<GeckoTokenSnapshot | null> {
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) return null;
+    return parseTokenSnapshot(await this.get(`/networks/solana/tokens/${mint}`));
   }
 
   async fetchNewPools(page = 1): Promise<NewPool[]> {

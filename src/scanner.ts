@@ -179,6 +179,15 @@ const CANDIDATE_PUSH_RESERVE_MS = 900;
  */
 const CARD_SEND_FLOOR_MS = 600;
 /**
+ * Per-token GeckoTerminal lookups the post-push tracker may make in one
+ * pass (see pairsForTracker). Two is one tick's worth of rows plus slack:
+ * the client's throttle spaces every Gecko call by
+ * geckoterminalRequestIntervalMs (1s by default, shared with the discovery
+ * feeds that ran earlier in this same tick), so each lookup can wait most
+ * of the tracker's pair budget before its request even starts.
+ */
+const TRACKER_GECKO_LOOKUPS = 2;
+/**
  * Slice of the chain kept for the gates that run LAST (wallet analysis, the
  * top-10 band, Flurry deploy-slot forensics) so the CARD-ONLY enrichments in
  * the middle of the chain (Birdeye trader/overview, GMGN, Arkham, Jupiter
@@ -1193,6 +1202,56 @@ export class Scanner {
         new Map<string, PairInfo>(),
       );
       for (const [k, v] of jup) out.set(k, v);
+    }
+    // THIRD source: GeckoTerminal's per-token snapshot (free, keyless).
+    // Reached only when DexScreener AND Jupiter both came back empty for a
+    // token — the shape of a DexScreener 429 episode on a pushed memecoin
+    // Jupiter does not index, which left the pass evaluating zero rows for
+    // the whole backoff window (live 2026-09-18: `rows 0/30 pairs 0/6 miss 1`
+    // while the front phase resolved 130/130 through its own fallback).
+    //
+    // GeckoTerminal reports FDV and summed reserve — the market cap and
+    // liquidity every follow-up rule is built on. The intraday fields
+    // DexScreener carries (5m volume/change, 1h buy/sell counts) are NOT in
+    // this payload, so they are left at zero: the rules that need them
+    // (🔥 ignition, 🩸 sell-pressure) then stay quiet on a Gecko-sourced
+    // tick instead of judging off fabricated numbers. One caveat is
+    // deliberate: the check writes `last_vol_5m` back from the pair, so such
+    // a tick lowers that row's ignition baseline — the next DexScreener
+    // check can then fire 🔥 one window earlier. That is a card the coin has
+    // earned anyway (its 5m volume is genuinely above the threshold).
+    //
+    // Bounded like the other two legs: at most TRACKER_GECKO_LOOKUPS tokens
+    // (the client's own throttle, geckoterminalRequestIntervalMs = 1s by
+    // default, can eat the whole tracker budget by itself), each raced
+    // against the caller's deadline.
+    const geckoMissing = missing.filter((a) => !out.has(a));
+    if (
+      geckoMissing.length > 0 &&
+      this.gecko &&
+      typeof deadlineMs === "number"
+    ) {
+      for (const mint of geckoMissing.slice(0, TRACKER_GECKO_LOOKUPS)) {
+        const snap = await this.bestEffort(
+          () => this.gecko!.fetchTokenSnapshot(mint),
+          deadlineMs,
+          null,
+        );
+        if (!snap || (snap.fdvUsd === null && snap.reserveUsd === null)) continue;
+        out.set(mint, {
+          chainId: "solana",
+          url: "",
+          pairAddress: mint,
+          baseToken: { address: mint, name: "", symbol: "" },
+          priceUsd: String(snap.priceUsd ?? ""),
+          marketCap: snap.fdvUsd ?? 0,
+          volume: { h24: 0, h1: 0, m5: 0 },
+          priceChange: { m5: 0, h1: 0 },
+          txns: { m5Buys: 0, m5Sells: 0, h1Buys: 0, h1Sells: 0 },
+          liquidity: { usd: snap.reserveUsd },
+          pairCreatedAt: 0,
+        });
+      }
     }
     return out;
   }

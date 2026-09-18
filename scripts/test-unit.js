@@ -15,7 +15,7 @@ const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("..
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
-const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js");
+const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
@@ -331,6 +331,78 @@ async function main() {
       );
     } finally {
       globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("parseTokenSnapshot: FDV and summed reserve are the usable numbers", () => {
+    // Verified against the live API on a tracked XCAT pool (2026-09-18):
+    // market_cap_usd comes back null for Solana memecoins, fdv_usd is the
+    // value that works, and total_reserve_in_usd is the reserve summed over
+    // the token's pools.
+    const real = {
+      data: {
+        attributes: {
+          address: "XCAT",
+          price_usd: "0.0001338104648",
+          fdv_usd: "133810.464817828",
+          market_cap_usd: null,
+          total_reserve_in_usd: "15992.629169660797",
+        },
+      },
+    };
+    assert.deepEqual(parseTokenSnapshot(real), {
+      priceUsd: 0.0001338104648,
+      fdvUsd: 133810.464817828,
+      reserveUsd: 15992.629169660797,
+    });
+    // market_cap_usd is the fallback when fdv is absent.
+    const mc = { data: { attributes: { market_cap_usd: 5000, price_usd: "1" } } };
+    assert.equal(parseTokenSnapshot(mc).fdvUsd, 5000);
+    // Nothing usable → null, so callers treat it as "not found" and the
+    // tracker counts a pair miss instead of evaluating on invented numbers.
+    assert.equal(parseTokenSnapshot({ data: { attributes: { name: "x" } } }), null);
+    assert.equal(parseTokenSnapshot(null), null);
+    assert.equal(parseTokenSnapshot({ data: {} }), null);
+    assert.equal(parseTokenSnapshot({ data: { attributes: { price_usd: "0" } } }), null);
+  });
+
+  await test("Scanner: the tracker's pair lookup falls back to GeckoTerminal when DexScreener and Jupiter are empty", async () => {
+    // The shape that left the tracker blind: DexScreener batched endpoint
+    // 429-blocked (empty map) and Jupiter's search not indexing the pushed
+    // memecoin. GeckoTerminal is free and keyless, so it is the third source.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchPairsForTokens = async () => new Map();
+      const gecko = {
+        fetchTokenSnapshot: async (mint) =>
+          mint === "XCAT"
+            ? { priceUsd: 0.0001, fdvUsd: 133810, reserveUsd: 15992 }
+            : null,
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, gecko, null,
+      );
+      const out = await scanner.pairsForTracker(["XCAT", "GONE"], Date.now() + 800);
+      assert.equal(out.get("XCAT").marketCap, 133810, "FDV stands in for the market cap");
+      assert.equal(out.get("XCAT").liquidity.usd, 15992, "summed reserve stands in for liquidity");
+      assert.equal(
+        out.get("XCAT").volume.m5,
+        0,
+        "the 5m tape is NOT in this payload — it must stay zero, not be invented",
+      );
+      assert.equal(out.get("XCAT").priceChange.m5, 0);
+      assert.ok(!out.has("GONE"), "a token GeckoTerminal does not know is still a miss");
+      // Deadline-less calls never reach out (the leg would be unbounded).
+      const noDeadline = await scanner.pairsForTracker(["XCAT"]);
+      assert.ok(!noDeadline.has("XCAT"));
+    } finally {
       await t.cleanup();
     }
   });
