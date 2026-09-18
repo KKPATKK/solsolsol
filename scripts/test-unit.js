@@ -285,6 +285,56 @@ async function main() {
     }
   });
 
+  await test("Scanner: the front pair phase also fetches the post-push tracker's rotation head", async () => {
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      // runOnce skips outright with no enabled chat — and a skipped scan
+      // never reaches the pair phase this test is about.
+      await db.saveChatSettings({
+        chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
+        minAgeMinutes: 0, maxAgeMinutes: 100_000,
+        min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+        enabled: true,
+      });
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: "FEEDCOIN1" }];
+      let asked = null;
+      dex.fetchPairsForTokens = async (addrs) => {
+        asked = addrs.slice();
+        return new Map(addrs.map((a) => [a, { marketCap: 1000, liquidity: { usd: 5000 } }]));
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg, null, null, null,
+      );
+      scanner.pushWatcher = {
+        headTokens: () => ["TRACKEDTOKEN"],
+        runTick: async () => ({ checked: 0, alerted: 0, trips: 0 }),
+        onPush: async () => {},
+      };
+      await scanner.runOnce();
+      assert.ok(asked, "the pair phase ran");
+      assert.ok(asked.includes("FEEDCOIN1"), "the feed coin is still fetched");
+      assert.ok(
+        asked.includes("TRACKEDTOKEN"),
+        `the tracker's rotation head must ride along (got ${JSON.stringify(asked)})`,
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
   await test("Scanner: a hanging pool DB read is cut by POOL_FETCH_BUDGET_MS and the scan degrades to feed-only", async () => {
     // The libsql client can hang in internal retries (the same hang the
     // worker's flush-retry guard exists for). The pool read is raced against
@@ -1945,6 +1995,27 @@ async function main() {
       `a late row must finish inside the pass tail, took ${elapsed}ms`,
     );
     assert.equal(updated.length, 1, "the row's bookkeeping still lands");
+  });
+
+  await test("PushWatcher: the rotation head is published for the scanner's next pair phase", async () => {
+    // Tracked coins are PUSHED coins, which the re-eval pool query excludes —
+    // so unless the scanner fetches them alongside the pool, the tracker's own
+    // batch is the only request that ever asks for them and a rate-limited
+    // DexScreener leaves the pass with no prices at all.
+    const rows = [];
+    for (let i = 0; i < 8; i++) {
+      rows.push(watchRow(`T${i}`, { lastChecked: Date.now() - (8 - i) * 60_000 }));
+    }
+    const updated = [];
+    const pw = new PushWatcher(
+      watchDb(rows, updated), watchBot, null, loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])), null,
+    );
+    assert.deepEqual(pw.headTokens(), [], "nothing published before the first pass");
+    await pw.runTick();
+    const head = pw.headTokens();
+    assert.ok(head.length > 0 && head.length <= 6, `head size ${head.length}`);
+    assert.equal(head[0], "T0", "least-recently-checked first, i.e. the rotation order");
   });
 
   await test("PushWatcher: a recovered tracking gap absorbs state silently instead of firing a stale burst", async () => {

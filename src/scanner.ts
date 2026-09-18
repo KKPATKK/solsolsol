@@ -1846,7 +1846,19 @@ export class Scanner {
         poolSlice.length,
         REJECT_LOG_MAX,
       );
-      const addresses = [...new Set(scannedProfiles.map((p) => p.tokenAddress))];
+      // The post-push tracker's queue head rides along with the pool: its
+      // coins are PUSHED coins, which the re-eval pool query excludes, so
+      // this batch is what keeps them in Scanner.lastPairs — without it the
+      // tracker's own request is the only one that ever asks for them and
+      // the pair cache stays empty for them (see pairsForTracker). At most
+      // TRACKER_PAIR_HEAD extra addresses, so the extra cost is at most one
+      // more batch in a phase that already dispatches several.
+      const addresses = [
+        ...new Set([
+          ...scannedProfiles.map((p) => p.tokenAddress),
+          ...(this.pushWatcher?.headTokens() ?? []),
+        ]),
+      ];
       if (this.shouldStopEarly()) return;
       const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
       // Fallback: when DexScreener's batched endpoint is blocked (shared

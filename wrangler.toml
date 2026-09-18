@@ -94,15 +94,25 @@ JUPITER_REQUEST_INTERVAL_MS = "500"
 # more coins actually fetched/evaluated per scan for the same wall clock and
 # the same Turso rows read (the slice was raised to 160 to match). This is the
 # shared egress IP's rate limit, so it is measured, not assumed: /health →
-# heartbeat.summary.dex (and /health.summary.dex) reports intervalMs /
-# http429 / blockedForMs per tick, and the heartbeat's dex429Total plus the
-# Turso row behind db.bumpDex429 count every rate-limit episode fleet-wide. A
-# flat http429 with blockedForMs 0 means 250ms is being absorbed; a climbing
-# count means the endpoint is limiting us again and this goes back to 350 (or
-# higher). The 429 path itself is unchanged: one hit arms a 90s cache-only
-# backoff (PAIR_BATCH_BACKOFF_MS), so the failure mode is lost coverage for a
-# minute, never a hammering loop.
-DEX_REQUEST_INTERVAL_MS = "250"
+# heartbeat.dex reports intervalMs / http429 / blockedForMs per tick, and the
+# heartbeat's dex429Total plus the Turso row behind db.bumpDex429 count every
+# rate-limit episode fleet-wide.
+#
+# 2026-09-18: REVERTED to 350 — the measurement said so. Live at 02:41Z the
+# client reported { intervalMs: 250, http429: 4, blockedForMs: 30256,
+# cacheSize: 0 } on a single isolate: four rate-limit episodes had armed the
+# 90s cache-only backoff (30s still to run) and the cache was empty, so
+# DexScreener contributed ZERO pair data for that whole window — the scan only
+# kept its 130/130 pair coverage because of the Jupiter fallback, and the
+# post-push tracker (whose own batch had nothing to fall back on) evaluated no
+# rows at all (`rows 0/30 pairs 0/6 miss 1`). The extra dispatch slot per tick
+# is not worth losing the endpoint outright: a 429 costs multiple ticks of
+# coverage, and each episode also arms the backoff for every later call in the
+# same isolate. One hit still arms the same 90s backoff
+# (PAIR_BATCH_BACKOFF_MS), so the failure mode stays "lost coverage for a
+# minute", never a hammering loop. Watch http429 here: flat with
+# blockedForMs 0 means 350 is being absorbed.
+DEX_REQUEST_INTERVAL_MS = "350"
 # Supply-flow (rug/distribution) per-coin budget. Two jobs: the upper bound
 # for what the analyzer may spend, and the unit the gate's start guard uses.
 # 2026-09-16: the guard compared the remaining tick time against this budget

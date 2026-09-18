@@ -654,6 +654,26 @@ export function recapMessage(row: PushWatchRow): string {
  * the scan or a push.
  */
 export class PushWatcher {
+  /**
+   * The rotation queue's HEAD from the last pass (see runTick). The scanner's
+   * front pair phase reads it so the tracker's coins are fetched alongside
+   * the pool (see Scanner.lastPairs / pairsForTracker): tracked coins are
+   * PUSHED coins, which the re-eval pool query excludes, so without this the
+   * tracker's own batch is the only thing that ever asks for them — and while
+   * DexScreener is rate-limited that batch comes back empty and the pass
+   * evaluates zero rows (live 2026-09-18 02:37Z and 02:41Z: `pairs 0/6 miss 1`
+   * on both, from a client reporting `http429 4, blockedForMs 30256,
+   * cacheSize 0` — while the front phase still resolved 130/130 through the
+   * Jupiter fallback). One tick of lag is enough: the head advances by a row
+   * or two per pass, so yesterday's head covers today's.
+   */
+  private lastHeadTokens: string[] = [];
+
+  /** Tokens the last pass put at the front of its rotation queue. */
+  headTokens(): string[] {
+    return [...this.lastHeadTokens];
+  }
+
   constructor(
     private readonly db: Db,
     private readonly bot: {
@@ -1045,6 +1065,8 @@ export class PushWatcher {
     // was never part of.
     const head = queue.slice(0, TRACKER_PAIR_HEAD);
     const tokens = head.map((r) => r.token);
+    // Published for the scanner's next pair phase (see lastHeadTokens).
+    this.lastHeadTokens = tokens;
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
     try {
       pairs = await this.pairsFor(tokens, now + TRACKER_PAIRS_BUDGET_MS);
