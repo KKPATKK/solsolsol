@@ -78,8 +78,9 @@ const TRACKER_TICK_BUDGET_MS = 1_600;
  * 1000ms at healthy latencies, so a loop that only asks "am I past the
  * deadline?" happily starts a row it cannot finish and overruns the pass by a
  * whole row. The FIRST row of a pass is exempt (the progress floor that keeps
- * post-push monitoring alive — see the 2026-09-17 zero-row fix), and the caps
- * below are the hard ceiling for everything after it.
+ * post-push monitoring alive — see the 2026-09-17 zero-row fix); its send
+ * slice is clamped instead (TRACKER_SEND_FLOOR_MS), and the caps below are the
+ * hard ceiling for every row after it.
  */
 const TRACKER_ROW_RESERVE_MS = 900;
 /**
@@ -93,6 +94,19 @@ const TRACKER_ROW_RESERVE_MS = 900;
  * could deliver the duplicate card that guard exists to prevent.
  */
 const TRACKER_SEND_CAP_MS = 1_000;
+/**
+ * Send slice for a row that starts AFTER the pass deadline. The first row of a
+ * pass is exempt from the row reserve (the progress floor that keeps post-push
+ * monitoring alive — see the 2026-09-17 zero-row fix), so it can begin with no
+ * time left at all; bounding its sends at the full TRACKER_SEND_CAP_MS is what
+ * let the pass finish ~1.3s past its deadline and push the whole tick into the
+ * worker's kill window (live 2026-09-18: trackerMs 1895 against a 640ms
+ * allowance, tick 4857ms of a ~4840ms race window, the flush landing on the
+ * edge). A late row now gets one Telegram round trip's worth instead: a card
+ * that misses it is logged and counted in the pass note (`dropped N`), never
+ * retried — the state transition was already reserved before the send.
+ */
+const TRACKER_SEND_FLOOR_MS = 350;
 /**
  * Cap on the Birdeye holder probe, which is purely ADDITIVE (a card detail):
  * nothing is reserved before it, `holders_checked_at` is only written on
@@ -112,6 +126,17 @@ const TRACKER_HOLDER_CAP_MS = 400;
  * is retried on the next tick (the pair cache makes the retry cheap).
  */
 const TRACKER_PAIRS_BUDGET_MS = 600;
+/**
+ * Rows the pair batch covers: the HEAD of the rotation queue, not the whole
+ * watch list. The row loop fits one or two rows inside the pass budget, so
+ * asking DexScreener for all 30 addresses spent the pass's one mandatory
+ * request on coins that were never evaluated this tick — and a batch that
+ * missed its cap then made EVERY row a pair miss, so the pass did nothing at
+ * all and reported `pairs 0/30 miss 30` (live 2026-09-18 02:01Z). Six rows is
+ * three passes' worth of headroom and keeps the request inside the cache
+ * window of the coins actually being checked.
+ */
+const TRACKER_PAIR_HEAD = 6;
 /**
  * Age past which a row the tracker has NEVER evaluated is treated as a
  * BACKFILL instead of a live follow-up: its push is older than the alert
@@ -1013,9 +1038,13 @@ export class PushWatcher {
     const queue = [...activeRows].sort(
       (a, b) => (a.lastChecked ?? 0) - (b.lastChecked ?? 0),
     );
-    // One DexScreener batch covers the whole watch list (≤30 addresses) —
-    // capped so it cannot eat the row allowance (see TRACKER_PAIRS_BUDGET_MS).
-    const tokens = queue.map((r) => r.token).slice(0, 30);
+    // Pairs for the HEAD of the queue only (see TRACKER_PAIR_HEAD), capped so
+    // the batch cannot eat the row allowance (see TRACKER_PAIRS_BUDGET_MS).
+    // Rows past the head are simply the next tick's work: they are NOT counted
+    // as pair misses, so a delisted coin can never be dropped off a request it
+    // was never part of.
+    const head = queue.slice(0, TRACKER_PAIR_HEAD);
+    const tokens = head.map((r) => r.token);
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
     try {
       pairs = await this.pairsFor(tokens, now + TRACKER_PAIRS_BUDGET_MS);
@@ -1035,8 +1064,10 @@ export class PushWatcher {
     let pairMiss = 0;
     let claimLost = 0;
     let budgetCut = false;
+    /** Cards the row's send slice could not deliver (logged, never retried). */
+    let dropped = 0;
     let firstRow = true;
-    for (const row of queue) {
+    for (const row of head) {
       // Budget check BETWEEN rows: the claim and the alert reservation for a
       // row both happen after this point, so leaving a row to the next tick
       // can never drop an alert (it is re-claimed and re-evaluated then).
@@ -1141,7 +1172,13 @@ export class PushWatcher {
       // ONE send budget for the whole row (see TRACKER_SEND_CAP_MS): a row
       // can carry four stage cards, and a slow Telegram must not spend the
       // ceiling once per card.
-      const sendBudgetEnd = Date.now() + TRACKER_SEND_CAP_MS;
+      // Clamped to the pass's own tail (see TRACKER_SEND_FLOOR_MS): the first
+      // row runs even when it has already passed the deadline, and its sends
+      // must not carry the tick past the worker's race window.
+      const sendBudgetEnd = Math.min(
+        Date.now() + TRACKER_SEND_CAP_MS,
+        deadline + TRACKER_SEND_FLOOR_MS,
+      );
       let sentCount = 0;
       for (const a of evalResult.alerts) {
         if (backfill) break;
@@ -1150,6 +1187,7 @@ export class PushWatcher {
           console.error(
             `[push-watch] send budget spent for ${row.symbol ?? row.token} — ${evalResult.alerts.length - sentCount} card(s) dropped (their transition is already reserved)`,
           );
+          dropped += evalResult.alerts.length - sentCount;
           break;
         }
         try {
@@ -1163,8 +1201,9 @@ export class PushWatcher {
             // retried) — the transition was reserved before this point, so a
             // retry could deliver a duplicate card.
             console.error(
-              `[push-watch] alert send timed out after ${TRACKER_SEND_CAP_MS}ms for ${row.symbol ?? row.token} — card dropped`,
+              `[push-watch] alert send timed out for ${row.symbol ?? row.token} — card dropped (send slice ${Math.max(0, sendBudgetEnd - Date.now())}ms left)`,
             );
+            dropped += 1;
             break;
           }
           alerted += 1;
@@ -1269,6 +1308,7 @@ export class PushWatcher {
     const note =
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
+      `${dropped > 0 ? ` dropped ${dropped}` : ""}` +
       `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
 
     return { checked, alerted, note, trips };

@@ -2413,9 +2413,22 @@ export class Db {
       // leftovers. Without this, a burst of pushes inside the 24h window
       // could evict older ACTIVE coins from the listing — they would
       // silently stop being refreshed.
+      //
+      // Active rows are ordered by LAST CHECKED, oldest first — the same
+      // order the row loop itself rotates in (see PushWatcher.runTick).
+      // PUSH_WATCH_MAX_TRACKED (30) is a hard LIMIT, and ordering the active
+      // rows by pushed_at DESC meant that once MORE than 30 coins were alive
+      // the oldest ones dropped out of every snapshot for good: the loop can
+      // only pick within the listing, so those rows were never claimed,
+      // re-checked or recapped — they just aged out silently (measured
+      // 2026-09-18: 40 active rows, one last checked 267 minutes earlier,
+      // `rows 0/30` while the listing was full of freshly-pushed coins).
+      // Terminal rows sort by pushed_at so a tombstone burst still drains
+      // oldest-first.
       sql: `SELECT * FROM push_watch
             ORDER BY CASE WHEN COALESCE(last_state, '') IN ('rug', 'unwatched', 'expired') THEN 1 ELSE 0 END,
-                     pushed_at DESC
+                     CASE WHEN COALESCE(last_state, '') IN ('rug', 'unwatched', 'expired')
+                          THEN pushed_at ELSE last_checked END ASC
             LIMIT ?`,
       args: [limit],
     });

@@ -1808,6 +1808,74 @@ async function main() {
     assert.match(String(out.note), /miss 2/);
   });
 
+  await test("PushWatcher: the pair batch covers only the rows the pass can actually reach", async () => {
+    // Ten tracked coins, one DexScreener request. Asking for all of them spent
+    // the pass's only mandatory call on addresses the loop never evaluates —
+    // and a slow batch then made every row a pair miss, so the pass did
+    // nothing at all (`pairs 0/30 miss 30`, live 2026-09-18).
+    const rows = [];
+    for (let i = 0; i < 10; i++) rows.push(watchRow(`T${i}`));
+    const updated = [];
+    const asked = [];
+    const pairsFor = async (addrs) => {
+      asked.push(addrs.length);
+      return new Map([["T0", watchPair("T0")]]);
+    };
+    const pw = new PushWatcher(
+      watchDb(rows, updated), watchBot, null, loadConfig({}), pairsFor, null,
+    );
+    const out = await pw.runTick();
+    assert.equal(asked.length, 1);
+    assert.ok(asked[0] <= 6, `batch asked for ${asked[0]} addresses, expected the queue head`);
+    assert.equal(out.checked, 1, "the row that did resolve a pair is evaluated");
+    assert.match(String(out.note), /rows 1\/10/);
+    assert.match(String(out.note), /pairs 1\/6/);
+    // Only the rows the batch COVERED may be counted as misses — a coin can
+    // never be judged delisted off a request it was not part of.
+    assert.match(String(out.note), /miss 5/);
+    assert.ok(
+      !/miss 10/.test(String(out.note)),
+      `rows outside the batch must not be reported as misses: ${out.note}`,
+    );
+  });
+
+  await test("PushWatcher: a row that starts after the deadline sends inside the pass tail", async () => {
+    // The first row runs even when the pass has no budget left (the progress
+    // floor), so its send slice — not the whole per-row cap — is what bounds
+    // the tick: the old 1000ms cap let a candidate tick finish at 4857ms of a
+    // ~4840ms race window and lose its flush entirely.
+    const rows = [watchRow("MOON", { mcapAtPush: 50_000 })];
+    const updated = [];
+    let sends = 0;
+    const hangingBot = {
+      api: {
+        sendMessage: () => {
+          sends += 1;
+          return new Promise(() => {}); // never answers
+        },
+      },
+    };
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      hangingBot,
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const t0 = Date.now();
+    const out = await pw.runTick(Date.now() + 60);
+    const elapsed = Date.now() - t0;
+    assert.equal(sends, 1, "the alert is attempted exactly once");
+    assert.equal(out.alerted, 0, "a send that misses the slice is not counted as delivered");
+    assert.match(String(out.note), /dropped 1/, "the dropped card is reported, not hidden");
+    assert.ok(
+      elapsed < 900,
+      `a late row must finish inside the pass tail, took ${elapsed}ms`,
+    );
+    assert.equal(updated.length, 1, "the row's bookkeeping still lands");
+  });
+
   await test("PushWatcher: a recovered tracking gap absorbs state silently instead of firing a stale burst", async () => {
     // The pass's delivery is suppressed for a row the tracker has NEVER
     // evaluated (last_mcap still null) whose push is older than the alert
