@@ -323,6 +323,125 @@ export class Db {
     this.injectedClient = injectedClient;
   }
 
+  /**
+   * One-round-trip variant of getReevalPool (2026-09-19).
+   *
+   * Why a second method and not a reshape of getReevalPool: the original plus
+   * its band helper queryReevalBand sit past the ~48KB file-sync window, so the
+   * production path has to be adjusted from the reachable part of this class.
+   * The Worker hands the scanner src/poolfallback.ts's subclass, which calls
+   * this method. The band split below MUST stay identical to getReevalPool's —
+   * the unit test "getReevalPoolBatched: same bands, one round trip" pins both
+   * to the same tokens in the same order, so drift in either copy fails the
+   * suite.
+   *
+   * The win is ROUND TRIPS, not SQL: the original issues the hot, near and far
+   * band queries as three sequential awaits (measured 2026-09-19: the pool read
+   * took 352-457ms, ≈3 × the ~130ms Turso round trip), while this sends the same
+   * three statements as ONE batched request — the same shape the completion
+   * flush already uses. Rows read are unchanged, per-band LIMITs still apply,
+   * and result order is preserved because batch results come back in statement
+   * order (hot, then near, then far, exactly as `out.push` ordered them).
+   */
+  async getReevalPoolBatched(
+    opts: Parameters<Db["getReevalPool"]>[0],
+  ): Promise<TokenStats[]> {
+    const now = opts.now ?? Date.now();
+    const center = opts.windowEntryLaunchMs;
+    const spanLo = opts.minLaunchMs;
+    const spanHi = opts.maxLaunchMs;
+    const hotLo = Math.max(spanLo, center - POOL_HOT_BELOW_MS);
+    const hotHi = Math.min(spanHi, center + POOL_HOT_ABOVE_MS);
+    const hotLimit = Math.min(opts.limit, POOL_HOT_MAX);
+    const bands: Array<{
+      lo: number;
+      hi: number;
+      center: number;
+      limit: number;
+      orderBy: "entry" | "signal";
+    }> = [];
+    if (hotHi > hotLo) {
+      bands.push({ lo: hotLo, hi: hotHi, center, limit: hotLimit, orderBy: "entry" });
+    }
+    const rotLimit = Math.max(0, opts.limit - hotLimit);
+    const rotLo = spanLo; // oldest launch in the window
+    const rotHi = hotLo; // everything older than the hot zone
+    if (rotLimit > 0 && rotHi > rotLo) {
+      const nearLo = Math.max(rotLo, center - POOL_NEAR_WINDOW_MS);
+      const nearSlots = Math.max(1, Math.floor(opts.nearSlots ?? POOL_NEAR_SLOTS));
+      const farSlots = Math.max(1, Math.floor(opts.farSlots ?? POOL_FAR_SLOTS));
+      const nearLimit = Math.max(
+        0,
+        Math.min(rotLimit, Math.round(rotLimit * POOL_NEAR_LIMIT_SHARE)),
+      );
+      const farLimit = Math.max(0, rotLimit - nearLimit);
+      const slot = Math.floor(now / (opts.rotationPeriodMs ?? POOL_ROTATION_PERIOD_MS));
+      if (rotHi > nearLo && nearLimit > 0) {
+        const slotW = (rotHi - nearLo) / nearSlots;
+        const s = slot % nearSlots;
+        const lo = rotHi - (s + 1) * slotW;
+        const hi = rotHi - s * slotW;
+        bands.push({ lo, hi, center: (lo + hi) / 2, limit: nearLimit, orderBy: "signal" });
+      }
+      if (nearLo > rotLo && farLimit > 0) {
+        const slotW = (nearLo - rotLo) / farSlots;
+        const s = slot % farSlots;
+        const lo = nearLo - (s + 1) * slotW;
+        const hi = nearLo - s * slotW;
+        bands.push({ lo, hi, center: (lo + hi) / 2, limit: farLimit, orderBy: "signal" });
+      }
+    }
+    if (bands.length === 0) return [];
+    const seen = this.seenExclusion(opts.seenChatIds);
+    const statements = bands.map((b) => {
+      const clauses: string[] = [];
+      const args: Array<string | number> = [b.lo, b.hi, opts.sinceMs];
+      if (opts.minQualifyMcap !== undefined) {
+        clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed >= ?)`);
+        args.push(opts.minQualifyMcap);
+      }
+      if (opts.maxQualifyMcap !== undefined) {
+        clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed <= ?)`);
+        args.push(opts.maxQualifyMcap);
+      }
+      if (opts.minQualifyLiquidity !== undefined) {
+        clauses.push(
+          `(max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)`,
+        );
+        args.push(opts.minQualifyLiquidity);
+      }
+      args.push(...seen.args);
+      if (b.orderBy === "signal") {
+        args.push(b.limit);
+        return {
+          sql: `SELECT * FROM token_stats
+                WHERE launch_ms BETWEEN ? AND ?
+                  AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
+                  ${seen.clause}
+                ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC
+                LIMIT ?`,
+          args,
+        };
+      }
+      args.push(b.center, b.limit);
+      return {
+        sql: `SELECT * FROM token_stats
+              WHERE launch_ms BETWEEN ? AND ?
+                AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
+                ${seen.clause}
+              ORDER BY ABS(launch_ms - ?)
+              LIMIT ?`,
+        args,
+      };
+    });
+    const results = await this.get().batch(statements, "read");
+    const out: TokenStats[] = [];
+    for (const result of results) {
+      for (const row of result.rows) out.push(this.statsFromRow(row));
+    }
+    return out;
+  }
+
   /** Creates the libsql client once (lazy; no network until first call). */
   private connect(): Client {
     if (this.client) return this.client;

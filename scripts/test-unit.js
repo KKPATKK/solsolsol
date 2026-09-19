@@ -33,6 +33,7 @@ const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
 const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta } = require("../dist/deferrallog.js");
+const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
 let failed = 0;
@@ -280,6 +281,196 @@ async function main() {
   // came back at 413 of 490, i.e. only the far zone re-read the same
   // signal-ordered head every visit. 18-min sweeps give 12 far slots of
   // ~1.6h each; the near zone needs no extra slots because it already fits.
+  // The pool read is the one DB call whose failure used to be silent: the
+  // scanner races it against a cap and resolves [] on a loss, which is
+  // indistinguishable from "the window has no coins" and made the tick
+  // early-return and evaluate nothing (2026-09-19: 60-100% of ticks per 10 min
+  // while the profiles feed was also empty). These tests pin the replacement:
+  // a FAILED read re-serves the last good slice, a genuinely EMPTY read does
+  // not, and a failure before any good read still surfaces.
+  await test("PoolFallbackDb: a failed pool read re-sweeps the last good slice", async () => {
+    const t = tmpDb();
+    let fail = false;
+    // Delegates to the real local SQLite until `fail` flips, then rejects the
+    // way the DB layer's 1.2x hard wall does.
+    const flaky = {
+      execute: (a) =>
+        fail
+          ? Promise.reject(new Error("db execute hit the 1440ms hard wall"))
+          : t.client.execute(a),
+      batch: (a) =>
+        fail ? Promise.reject(new Error("db batch hit the hard wall")) : t.client.batch(a),
+      close: () => t.client.close(),
+    };
+    const db = new PoolFallbackDb("file:injected", undefined, flaky);
+    await db.init();
+    const now = Date.now();
+    const seed = async (token, ageMin, mcap, liq) => {
+      const launch = now - ageMin * 60_000;
+      await t.client.execute({
+        sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: [token, launch, 9000, ageMin, launch, mcap, liq],
+      });
+    };
+    // Inside the chat's 80-1560 min window and above every qualify floor.
+    await seed("INSIDE1", 100, 120_000, 40_000);
+    await seed("INSIDE2", 300, 150_000, 50_000);
+    // Aged out of the 30h re-eval span - must never appear either way.
+    await seed("TOOOLD", 40 * 60, 120_000, 40_000);
+    const opts = {
+      sinceMs: now - 30 * 3600_000,
+      minLaunchMs: now - (1560 + 180) * 60_000,
+      maxLaunchMs: now - (80 - 180) * 60_000,
+      windowEntryLaunchMs: now - 80 * 60_000,
+      limit: 1000,
+      nearSlots: 2,
+      farSlots: 12,
+      rotationPeriodMs: 90_000,
+      minQualifyMcap: 30_000,
+      maxQualifyMcap: 500_000,
+      minQualifyLiquidity: 5_000,
+      seenChatIds: ["chat-1"],
+    };
+    const first = await db.getReevalPool(opts);
+    assert.ok(first.length > 0, "the seeded in-window coins must be found");
+    assert.ok(
+      first.every((r) => r.token.startsWith("INSIDE")),
+      `only in-window coins are eligible, got ${first.map((r) => r.token)}`,
+    );
+    resetPoolFallbackStats();
+    assert.equal(poolFallbackStats().count, 0);
+
+    fail = true;
+    const second = await db.getReevalPool(opts);
+    assert.deepEqual(
+      second.map((r) => r.token),
+      first.map((r) => r.token),
+      "the fallback must serve the same slice, in the same order",
+    );
+    assert.equal(poolFallbackStats().count, 1);
+    assert.equal(poolFallbackStats().rows, first.length);
+    assert.ok(poolFallbackStats().at > 0);
+
+    // A read that comes back genuinely EMPTY is not masked by the fallback.
+    fail = false;
+    const empty = await db.getReevalPool({
+      ...opts,
+      minQualifyMcap: 900_000_000,
+      maxQualifyMcap: undefined,
+    });
+    assert.equal(empty.length, 0);
+    assert.equal(poolFallbackStats().count, 1, "an empty read must not count as a fallback");
+
+    // Failure with no good read yet (fresh isolate) must still surface.
+    const fresh = new PoolFallbackDb("file:injected", undefined, {
+      execute: () => Promise.reject(new Error("boom")),
+      batch: () => Promise.reject(new Error("boom")),
+      close: async () => {},
+    });
+    resetPoolFallbackStats();
+    await assert.rejects(() => fresh.getReevalPool(opts));
+    assert.equal(poolFallbackStats().count, 0);
+    await t.cleanup();
+  });
+
+  // The batched pool read is the QUERY-LAYER half: the same three bands in
+  // ONE request instead of three sequential awaits (the measured 352-457ms
+  // pool read ≈ 3 x the ~130ms Turso round trip). Because its band split is a
+  // copy of getReevalPool's (that region is outside the edit window), this
+  // test pins the two to the SAME tokens in the SAME order — drift in either
+  // copy fails here rather than silently dropping a band in production.
+  await test("getReevalPoolBatched: same bands, one round trip (drift guard)", async () => {
+    const t = tmpDb();
+    let executes = 0;
+    let batches = 0;
+    const counting = {
+      execute: (a) => {
+        executes++;
+        return t.client.execute(a);
+      },
+      batch: (a, m) => {
+        batches++;
+        return t.client.batch(a, m);
+      },
+      close: () => t.client.close(),
+    };
+    const db = new Db("file:injected", undefined, counting);
+    await db.init();
+    const now = Date.now();
+    const seed = async (token, ageMin) => {
+      const launch = now - ageMin * 60_000;
+      await t.client.execute({
+        sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: [token, launch, 10_000, ageMin, launch, 120_000, 40_000],
+      });
+    };
+    // Coins every 10 min across the whole window, NOT one per hand-guessed
+    // band: the rotation slot decides where the near/far bands fall, so the
+    // first version of this test placed its coins in empty bands and passed
+    // vacuously (both paths agreeing on nothing). A dense spread means a wrong
+    // boundary in either copy changes the returned set.
+    for (let age = 20; age <= 700; age += 10) {
+      await seed(`T${String(age).padStart(3, "0")}`, age);
+    }
+    // 40h old: outside the 30h span, must never appear.
+    await seed("AGEDOUT", 40 * 60);
+    const opts = {
+      sinceMs: now - 30 * 3600_000,
+      minLaunchMs: now - (1560 + 180) * 60_000,
+      maxLaunchMs: now - (80 - 180) * 60_000,
+      windowEntryLaunchMs: now - 80 * 60_000,
+      limit: 1000,
+      nearSlots: 2,
+      farSlots: 12,
+      // Huge period -> slot 0 for every call, so both methods see identical
+      // bands and the comparison cannot straddle a rotation boundary.
+      rotationPeriodMs: 1e12,
+      minQualifyMcap: 30_000,
+      maxQualifyMcap: 500_000,
+      minQualifyLiquidity: 5_000,
+      seenChatIds: ["chat-1"],
+      now,
+    };
+    executes = 0;
+    batches = 0;
+    const perBand = await db.getReevalPool(opts);
+    const perBandExecutes = executes;
+    assert.equal(batches, 0, "the per-band path must not use batch()");
+    assert.ok(perBandExecutes >= 3, `per-band should issue one read per band, saw ${perBandExecutes}`);
+    // Non-vacuous: every zone really contributed rows (at rotationPeriodMs 1e12
+    // the slot is 1, so the near band falls over ages 275-440 and the far band
+    // over 548-657), and the coin outside the 30h span is never evaluated.
+    const ages = perBand.map((r) => Number(r.token.slice(1)));
+    assert.ok(ages.some((a) => a <= 110), "the hot band contributed rows");
+    assert.ok(ages.some((a) => a > 110 && a <= 440), "the near band contributed rows");
+    assert.ok(ages.some((a) => a > 440), "the far band contributed rows");
+    assert.ok(
+      !perBand.some((r) => r.token === "AGEDOUT"),
+      "a coin outside the 30h span must never enter the pool",
+    );
+
+    executes = 0;
+    batches = 0;
+    const batched = await db.getReevalPoolBatched(opts);
+    assert.equal(batches, 1, "the batched read must be exactly ONE request");
+    assert.equal(executes, 0, "the batched read must not fall back to per-band execute() calls");
+    assert.deepEqual(
+      batched.map((r) => r.token),
+      perBand.map((r) => r.token),
+      "both paths must return the same coins in the same order",
+    );
+    // The qualify floor must bite in the batched SQL too (same filters).
+    const floored = await db.getReevalPoolBatched({
+      ...opts,
+      minQualifyMcap: 900_000_000,
+      maxQualifyMcap: undefined,
+    });
+    assert.equal(floored.length, 0, "a qualify floor above every coin must empty the batched pool");
+    await t.cleanup();
+  });
+
   // Axiom kill switch (AXIOM_ENABLED, default on). Off must mean the Worker
   // never builds the Axiom client: the session costs one /token-info call per
   // final candidate and fires a "session dead" admin alert once it expires,

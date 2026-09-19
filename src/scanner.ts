@@ -505,15 +505,18 @@ const FEED_DEADLINE_MS = 600;
  * lastSkip, so /health cannot say why (the only trace is profiles=0/pool=0,
  * which is what the 2026-09-19 06:14–06:57Z history shows for 60–100% of
  * ticks per 10 min: the pool sweep was effectively stopped for stretches).
- * 1400 is sized just ABOVE SCAN_DB_TIMEOUT_MS (1200), the leash every
- * tick-scoped round trip already carries: at 600 this constant, not the DB
- * layer, was the binding constraint, so a read the client would have
- * completed was thrown away and took the whole tick with it. The worst case
- * still fits the front window (FEED_DEADLINE_MS 600 + 1400 = 2000 <
- * FRONT_PHASE_WINDOW_MS 2600), so it cannot eat the 1600ms gate reserve the
- * way the retired 2200 did.
+ * 1600 is sized just ABOVE the fastest failure the DB layer can raise:
+ * SCAN_DB_TIMEOUT_MS (1200) is only the TRANSPORT signal, and
+ * wrapClientWithHardWall races every call against 1.2x it (= 1440ms) because
+ * the libsql client retries internally after an abort. Keeping this cap below
+ * that wall meant the scanner's silent `[]` could still win the race, which is
+ * the whole failure this raise exists to remove; above it, a failed read
+ * arrives as an ERROR and can be answered with the last good pool (see
+ * src/poolfallback.ts) instead of costing the tick. The worst case still fits
+ * the front window (FEED_DEADLINE_MS 600 + 1600 = 2200 < FRONT_PHASE_WINDOW_MS
+ * 2600), so it cannot eat the 1600ms gate reserve the way the retired 2200 did.
  */
-const POOL_FETCH_BUDGET_MS = 1_400;
+const POOL_FETCH_BUDGET_MS = 1_600;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the

@@ -3,6 +3,9 @@ import { BirdeyeClient } from "./birdeye";
 import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
 import { Db } from "./db";
+// Subclass with the last-good pool fallback: the method it wraps lives past
+// the file-sync window in src/db.ts, so the production path is adjusted here.
+import { PoolFallbackDb, poolFallbackStats } from "./poolfallback";
 import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
@@ -643,7 +646,7 @@ async function ensureInitialized(env: Env): Promise<void> {
     tradeConfigured = Boolean(config.trade.walletSecret);
     jupiterKeyed = Boolean(config.trade.jupiterApiKey);      if (config.tursoUrl) {
         try {
-          db = new Db(config.tursoUrl, config.tursoAuthToken);
+          db = new PoolFallbackDb(config.tursoUrl, config.tursoAuthToken);
           await db.init();
           dbReady = true;
           console.log("[worker] Turso ready");
@@ -1175,6 +1178,11 @@ async function runScan(
               lastScanOk && summary
                 ? summary.profiles === 0 && summary.pool === 0
                 : null,
+            // Last-good pool fallbacks in this isolate's lifetime
+            // (src/poolfallback.ts): a non-zero count means the re-eval pool
+            // read failed and the tick re-swept an older slice instead of
+            // evaluating nothing.
+            poolFallback: poolFallbackStats(),
             // The durable deferral counters as of the LAST confirmed write
             // (persistPushDeferralDelta runs after this flush, and the next
             // tick's `phase: scanning` heartbeat publishes the fresh copy).
