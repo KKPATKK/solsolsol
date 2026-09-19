@@ -164,6 +164,20 @@ export function parsePushDeferralSnapshot(
 }
 
 /**
+ * The snapshot an isolate mirrors for /health: the stored row when there is
+ * one, and an all-zero snapshot when there is not. Never null, because the
+ * reader has to be able to tell "no card has been deferred yet" (zeros, with
+ * `firstDeferredAt: null`) from "the counter channel is missing" — a bare
+ * null would read as the latter and hide the moment `deferredTotal` first
+ * moves off zero, which is the whole point of the row.
+ */
+export function loadPushDeferralSnapshot(
+  raw: string | null | undefined,
+): PushDeferralSnapshot {
+  return parsePushDeferralSnapshot(raw) ?? emptyPushDeferralSnapshot();
+}
+
+/**
  * The delta a completion flush should persist: this isolate's cumulative
  * totals minus the totals the last CONFIRMED write recorded. Null when there
  * is nothing new — which is also what keeps a rebuilt scanner, whose counters

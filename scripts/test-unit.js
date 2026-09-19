@@ -30,7 +30,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralDelta } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralDelta } = require("../dist/deferrallog.js");
 
 let passed = 0;
 let failed = 0;
@@ -164,6 +164,34 @@ async function main() {
     assert.equal(coerced.firstDeferredAt, 5);
     assert.equal(coerced.events.length, 1, "an event without a timestamp is dropped");
     assert.equal(coerced.events[0].deferred, 1);
+  });
+
+  await test("loadPushDeferralSnapshot: an unwritten row reads as zeros, not null", () => {
+    // The /health mirror must never be null: a reader has to tell "nothing
+    // deferred yet" from "the counter channel is missing", and the first rise
+    // must show up as 0 -> 1.
+    const cold = loadPushDeferralSnapshot(null);
+    assert.deepEqual(cold, {
+      deferredTotal: 0,
+      recoveredTotal: 0,
+      pending: 0,
+      firstDeferredAt: null,
+      lastDeferAt: null,
+      firstRecoveredAt: null,
+      lastRecoveredAt: null,
+      events: [],
+    });
+    // A corrupt row degrades the same way (recount from zero) instead of
+    // blanking the field on the heartbeat.
+    assert.equal(loadPushDeferralSnapshot("{oops").deferredTotal, 0);
+    // A real row passes through unchanged.
+    const stored = JSON.stringify(
+      nextPushDeferralSnapshot(null, { deferred: 2, recovered: 1, pending: 1 }, 5_000),
+    );
+    const loaded = loadPushDeferralSnapshot(stored);
+    assert.equal(loaded.deferredTotal, 2);
+    assert.equal(loaded.recoveredTotal, 1);
+    assert.equal(loaded.firstRecoveredAt, 5_000, "the milestone stamp survives the load");
   });
 
   // ---------- re-eval pool coverage (config slot counts) ----------

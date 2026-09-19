@@ -9,8 +9,8 @@ import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
 import {
   PUSH_DEFERRAL_STATE_KEY,
+  loadPushDeferralSnapshot,
   nextPushDeferralSnapshot,
-  parsePushDeferralSnapshot,
   pushDeferralDelta,
   type PushDeferralSnapshot,
 } from "./deferrallog";
@@ -530,10 +530,13 @@ async function ensureInitialized(env: Env): Promise<void> {
           if (storedAxiomToken) axiomConfigured = true;
           // Mirror the durable deferral counters (src/deferrallog.ts) so this
           // isolate's heartbeats carry the fleet-wide numbers even before it
-          // has any of its own — without this, /health would show `deferral:
-          // null` from a recycled isolate until it happened to defer a card.
+          // has any of its own. A row that does not exist yet loads as an
+          // all-zero snapshot (never null): /health then reads "nothing has
+          // been deferred yet" instead of something indistinguishable from a
+          // missing counter channel, which is what makes the first rise
+          // visible as 0 → 1 rather than null → object.
           try {
-            pushDeferralSnapshot = parsePushDeferralSnapshot(
+            pushDeferralSnapshot = loadPushDeferralSnapshot(
               await db?.getWorkerState(PUSH_DEFERRAL_STATE_KEY),
             );
           } catch {
@@ -809,10 +812,10 @@ async function runScan(
     dex429At,
     // Fleet-wide deferral counters (see persistPushDeferralDelta): the
     // in-memory summary below is only THIS isolate's, so /health gets the
-    // durable copy here — `recoveredTotal` rising and `firstRecoveredAt`
-    // being stamped ARE the "a deferred coin really is pushed back later"
-    // proof, and the event ring is its rate. Null until this isolate has
-    // read the row (see the init load in ensureInitialized).
+    // durable copy here — `deferredTotal`/`recoveredTotal` rising and
+    // `firstRecoveredAt` being stamped ARE the "a deferred coin really is
+    // pushed back later" proof, and the event ring is its rate (see the init
+    // load in ensureInitialized).
     deferral: pushDeferralSnapshot,
   });
   if (db) {
