@@ -11,6 +11,8 @@ import {
   PUSH_DEFERRAL_STATE_KEY,
   loadPushDeferralSnapshot,
   nextPushDeferralSnapshot,
+  parsePushDeferralSnapshot,
+  pushDeferralAlreadyApplied,
   pushDeferralDelta,
   type PushDeferralSnapshot,
 } from "./deferrallog";
@@ -150,8 +152,11 @@ let dex429At: number | null = null;
 // (summary.cardSendDeferredTotal / summary.deferRecovered) are per-isolate
 // and die with the isolate that produced them, which is why the fleet-wide
 // numbers live in Turso (worker_state `push_deferral`, see src/deferrallog.ts)
-// and are mirrored here so both heartbeat writes carry them for /health
-// without an extra read.
+// and are mirrored here so both heartbeat writes carry them for /health. The
+// mirror is re-read from the row once per tick (syncPushDeferralCounters),
+// because /health serves whichever isolate wrote the last heartbeat — a
+// boot-time-only copy would publish totals that another isolate has already
+// moved past.
 let pushDeferralSnapshot: PushDeferralSnapshot | null = null;
 /**
  * Cumulative scanner totals as of the last CONFIRMED deferral write. The
@@ -161,6 +166,14 @@ let pushDeferralSnapshot: PushDeferralSnapshot | null = null;
  * tick instead of dropping it, and a delta can never be counted twice.
  */
 let pushDeferralBaseline = { deferred: 0, recovered: 0 };
+/**
+ * How long the post-flush deferral sync may take before the tick moves on.
+ * Telemetry is never allowed to extend the invocation: the outer finally still
+ * has bookkeeping to run (the dead-tick streak, the safety-net lock release),
+ * and a sync this bounds away is simply re-offered next tick. Generous against
+ * the ~100-400ms a healthy read + write costs.
+ */
+const DEFERRAL_SYNC_BOUND_MS = 1_000;
 
 /**
  * Cross-isolate 429 bookkeeping: the scan that trips DexScreener's batched
@@ -180,24 +193,48 @@ async function recordDex429(at: number): Promise<void> {
 }
 
 /**
- * Persist the deferral delta this tick produced (see src/deferrallog.ts).
+ * Bring the durable deferral counters (src/deferrallog.ts) in step with this
+ * tick's summary, and refresh the copy the heartbeat publishes.
  *
  * Called AFTER the completion flush on purpose: the flush is the tick's last
  * must-land write, so telemetry that runs after it can only ever cost the
  * counters — never the heartbeat, the scan_history row or the lease release.
- * A tick that neither refused nor paid back a card (the common case) returns
- * on the delta check without touching Turso at all, and an ordinary minute
- * therefore costs zero extra round trips.
+ *
+ * The READ is unconditional, the WRITE is not. Reading only on ticks that
+ * deferred something would leave this isolate publishing its pre-write copy
+ * forever the moment ANOTHER isolate added to the row, and /health serves
+ * whichever heartbeat was written last — so the fleet totals would visibly go
+ * backwards, or the first make-up push would be hidden behind a stale null,
+ * on exactly the milestone the counters exist to prove.
  */
-async function persistPushDeferralDelta(summary: ScanSummary | null): Promise<void> {
+async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<void> {
+  if (!db) return;
   const totals = {
     deferred: summary?.cardSendDeferredTotal ?? 0,
     recovered: summary?.deferRecovered ?? 0,
   };
+  const raw = await db.getWorkerState(PUSH_DEFERRAL_STATE_KEY);
+  const durable = parsePushDeferralSnapshot(raw);
+  // The row is authoritative: mirror it even when this isolate has nothing of
+  // its own to add (that is the cross-isolate refresh).
+  const refreshMirror = (): void => {
+    if (durable) pushDeferralSnapshot = durable;
+  };
   const delta = pushDeferralDelta(pushDeferralBaseline, totals);
-  if (!delta || !db) return;
+  if (!delta) {
+    refreshMirror();
+    return;
+  }
+  if (pushDeferralAlreadyApplied(durable, SCAN_LOCK_OWNER, totals)) {
+    // A previous attempt of this very write committed while its response was
+    // lost (hard wall, invocation kill). The row already carries it — ACK
+    // rather than add it a second time.
+    pushDeferralBaseline = totals;
+    refreshMirror();
+    return;
+  }
   const next = nextPushDeferralSnapshot(
-    await db.getWorkerState(PUSH_DEFERRAL_STATE_KEY),
+    raw,
     {
       ...delta,
       // Backlog as this tick left it (a gauge): a deferral burst is readable
@@ -205,12 +242,14 @@ async function persistPushDeferralDelta(summary: ScanSummary | null): Promise<vo
       pending: summary?.deferPending ?? 0,
     },
     Date.now(),
+    { owner: SCAN_LOCK_OWNER, ...totals },
   );
   await db.setWorkerState(PUSH_DEFERRAL_STATE_KEY, JSON.stringify(next));
   pushDeferralSnapshot = next;
   // Baseline advances ONLY here. A write that threw (or was killed past the
   // invocation's wall clock) leaves it untouched, so the next tick re-offers
-  // the same delta under its own timestamp instead of losing the count.
+  // the same delta — and the applied marker above stops that re-offer from
+  // double-counting a write that did land.
   pushDeferralBaseline = totals;
   console.log(
     `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered (totals ${next.deferredTotal}/${next.recoveredTotal})`,
@@ -1097,16 +1136,29 @@ async function runScan(
         }
         }
       }
-      // Cross-isolate deferral counters, written only now that the completion
-      // flush has had its turn (see persistPushDeferralDelta). It is awaited
+      // Cross-isolate deferral counters, synced only now that the completion
+      // flush has had its turn (see syncPushDeferralCounters). It is awaited
       // so the isolate cannot be recycled mid-write, but everything it can
       // lose is its own telemetry: both Db calls carry the standard hard
-      // wall, and the delta is re-offered next tick if this one fails.
+      // wall, the delta is re-offered next tick if the write failed, and the
+      // row's applied marker keeps that re-offer from double-counting a
+      // write that actually landed.
       try {
-        await persistPushDeferralDelta(summary);
+        // Bounded like every other await on this tail (see
+        // DEFERRAL_SYNC_BOUND_MS): a hung Turso read must not walk the
+        // invocation past the wall clock and cost the outer finally its
+        // bookkeeping. A bounded-away sync is re-offered next tick, and its
+        // promise is left running (an idempotent write is welcome to land
+        // late — the next tick's read mirrors it).
+        await Promise.race([
+          syncPushDeferralCounters(summary),
+          new Promise((resolve) =>
+            setTimeout(resolve, Math.min(DEFERRAL_SYNC_BOUND_MS, remainingFlushMs())),
+          ),
+        ]);
       } catch (err) {
         console.error(
-          "[worker] deferral counter write failed:",
+          "[worker] deferral counter sync failed:",
           err instanceof Error ? err.message : err,
         );
       }

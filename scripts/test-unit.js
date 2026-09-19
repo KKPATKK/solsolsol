@@ -30,7 +30,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralDelta } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta } = require("../dist/deferrallog.js");
 
 let passed = 0;
 let failed = 0;
@@ -180,6 +180,7 @@ async function main() {
       firstRecoveredAt: null,
       lastRecoveredAt: null,
       events: [],
+      applied: null,
     });
     // A corrupt row degrades the same way (recount from zero) instead of
     // blanking the field on the heartbeat.
@@ -192,6 +193,81 @@ async function main() {
     assert.equal(loaded.deferredTotal, 2);
     assert.equal(loaded.recoveredTotal, 1);
     assert.equal(loaded.firstRecoveredAt, 5_000, "the milestone stamp survives the load");
+  });
+
+  await test("pushDeferralAlreadyApplied: only this isolate's own already-persisted totals are recognised", () => {
+    const row = nextPushDeferralSnapshot(
+      null,
+      { deferred: 2, recovered: 0, pending: 2 },
+      1_000,
+      { owner: "isoA", deferred: 2, recovered: 0 },
+    );
+    assert.equal(row.applied.owner, "isoA", "the folding isolate is recorded");
+    assert.equal(pushDeferralAlreadyApplied(row, "isoA", { deferred: 2, recovered: 0 }), true);
+    // Another isolate carrying coincidentally identical counters owns a
+    // DIFFERENT delta — its write must not be suppressed as a duplicate.
+    assert.equal(pushDeferralAlreadyApplied(row, "isoB", { deferred: 2, recovered: 0 }), false);
+    // Same isolate, more counters since -> genuinely new increments.
+    assert.equal(pushDeferralAlreadyApplied(row, "isoA", { deferred: 3, recovered: 0 }), false);
+    assert.equal(pushDeferralAlreadyApplied(row, "isoA", { deferred: 2, recovered: 1 }), false);
+    assert.equal(pushDeferralAlreadyApplied(null, "isoA", { deferred: 2, recovered: 0 }), false);
+  });
+
+  await test("a committed-but-response-lost write is ACKed, not added twice", () => {
+    const totals = { deferred: 2, recovered: 0 };
+    // Tick 1: the flush writes the delta, the row lands...
+    const rowAfterCommit = nextPushDeferralSnapshot(
+      null,
+      { ...totals, pending: 2 },
+      1_000,
+      { owner: "isoA", ...totals },
+    );
+    // ...but the caller never learns (hard wall / invocation kill), so its
+    // baseline stays put and it re-offers the same delta on tick 2.
+    const reoffered = pushDeferralDelta({ deferred: 0, recovered: 0 }, totals);
+    assert.deepEqual(reoffered, totals, "the delta really is re-offered");
+    // The applied marker is what stops the re-offer from inflating the totals:
+    // keyed on (isolate, totals), it recognises the earlier commit.
+    const raw = JSON.stringify(rowAfterCommit);
+    assert.equal(
+      pushDeferralAlreadyApplied(parsePushDeferralSnapshot(raw), "isoA", totals),
+      true,
+      "a blind re-offer would add these again",
+    );
+    const blind = nextPushDeferralSnapshot(raw, { ...totals, pending: 2 }, 2_000, {
+      owner: "isoA",
+      ...totals,
+    });
+    assert.equal(blind.deferredTotal, 4, "without the marker the row would double-count");
+  });
+
+  await test("an isolate with no events of its own still mirrors another isolate's row", () => {
+    // The cross-isolate staleness this guards against: /health serves whichever
+    // isolate wrote the last heartbeat, so a boot-time-only copy would publish
+    // zeros (and a null firstRecoveredAt) after another isolate had already
+    // recorded the very milestone the counters exist to prove.
+    const deferral = nextPushDeferralSnapshot(
+      null,
+      { deferred: 1, recovered: 0, pending: 1 },
+      1_000,
+      { owner: "isoB", deferred: 1, recovered: 0 },
+    );
+    // isoB's own later tick pays the deferred coin back — nothing to do with us.
+    const otherIsolate = JSON.stringify(
+      nextPushDeferralSnapshot(
+        JSON.stringify(deferral),
+        { deferred: 0, recovered: 1, pending: 0 },
+        2_000,
+        { owner: "isoB", deferred: 1, recovered: 1 },
+      ),
+    );
+    const mirrored = loadPushDeferralSnapshot(otherIsolate);
+    assert.equal(mirrored.deferredTotal, 1);
+    assert.equal(mirrored.recoveredTotal, 1);
+    assert.equal(mirrored.firstRecoveredAt, 2_000, "the milestone stamp is visible from any isolate");
+    // This isolate has nothing of its own -> no delta to write (a read-only
+    // refresh, no row mutation).
+    assert.equal(pushDeferralDelta({ deferred: 0, recovered: 0 }, { deferred: 0, recovered: 0 }), null);
   });
 
   // ---------- re-eval pool coverage (config slot counts) ----------

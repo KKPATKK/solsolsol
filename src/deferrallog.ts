@@ -22,11 +22,20 @@
  * critical path, so its writer can afford its own read + batch whenever it
  * likes, while a deferral is produced INSIDE the tick that is about to flush
  * — the tick whose tail is already racing Cloudflare's wall clock. So the
- * counters are written in that same invocation immediately AFTER the
+ * counters are read and written in that same invocation immediately AFTER the
  * completion flush has had its turn, as a read-modify-write on one
  * `worker_state` JSON row (the same shape as the `push_audit` delivery ring,
- * race tolerance included), and a tick with nothing new writes nothing: an
- * ordinary minute costs zero extra round trips.
+ * race tolerance included).
+ *
+ * The READ runs on every tick; the WRITE only on a tick that deferred a card
+ * or paid one back. The read is not optional housekeeping: the totals are
+ * published through the heartbeat, and the heartbeat is written by whichever
+ * isolate won that tick's lease — so an isolate that reads the row once at
+ * boot would keep publishing its pre-write copy after ANOTHER isolate had
+ * already added to it, and /health (which serves the last heartbeat written)
+ * would show the fleet totals going backwards, or hide the first make-up push
+ * behind a stale `null`. One small single-row read per tick, spent after the
+ * flush has landed, is the price of a copy that is never older than a tick.
  *
  * The stored shape is deliberately lossless for the two questions above:
  * monotonic totals (they survive the isolate that produced them), the FIRST
@@ -71,6 +80,18 @@ export interface PushDeferralSnapshot {
   lastRecoveredAt: number | null;
   /** Newest-last ring of recent events (see PUSH_DEFERRAL_RING_MAX). */
   events: PushDeferralEvent[];
+  /**
+   * Which isolate's totals were folded in last (`applied`), as the write's
+   * identity. The write is a read-modify-write from after the completion
+   * flush, so a first attempt can COMMIT and still look failed to its caller
+   * — the hard wall aborts the awaiting promise, the invocation is killed, or
+   * the response is lost — and a blind retry would then add the same delta
+   * twice. Recording the exact (isolate, totals) pair already in the row lets
+   * the next attempt recognise "this is already mine" and ACK instead of
+   * adding again. Keyed by owner because two isolates can legitimately carry
+   * the same counters (both fresh, both at 1) while owning different deltas.
+   */
+  applied: { owner: string; deferred: number; recovered: number } | null;
 }
 
 /** worker_state key holding the snapshot. */
@@ -100,6 +121,7 @@ function emptyPushDeferralSnapshot(): PushDeferralSnapshot {
     firstRecoveredAt: null,
     lastRecoveredAt: null,
     events: [],
+    applied: null,
   };
 }
 
@@ -135,6 +157,14 @@ export function parsePushDeferralSnapshot(
     return null;
   }
   const rec = parsed as Record<string, unknown>;
+  let applied: PushDeferralSnapshot["applied"] = null;
+  if (rec.applied && typeof rec.applied === "object") {
+    const a = rec.applied as Record<string, unknown>;
+    const owner = typeof a.owner === "string" ? a.owner : "";
+    if (owner.length > 0) {
+      applied = { owner, deferred: count(a.deferred), recovered: count(a.recovered) };
+    }
+  }
   const events: PushDeferralEvent[] = [];
   if (Array.isArray(rec.events)) {
     for (const e of rec.events) {
@@ -160,7 +190,28 @@ export function parsePushDeferralSnapshot(
     firstRecoveredAt: stamp(rec.firstRecoveredAt),
     lastRecoveredAt: stamp(rec.lastRecoveredAt),
     events,
+    applied,
   };
+}
+
+/**
+ * Whether this isolate's current totals are ALREADY folded into the stored
+ * row — i.e. an earlier attempt of this very write committed while its
+ * response was lost. The caller ACKs (advances its baseline and mirrors the
+ * row) instead of adding the delta a second time.
+ */
+export function pushDeferralAlreadyApplied(
+  snapshot: PushDeferralSnapshot | null,
+  owner: string,
+  totals: { deferred: number; recovered: number },
+): boolean {
+  const applied = snapshot?.applied;
+  if (!applied) return false;
+  return (
+    applied.owner === owner &&
+    applied.deferred === totals.deferred &&
+    applied.recovered === totals.recovered
+  );
 }
 
 /**
@@ -215,6 +266,12 @@ export function nextPushDeferralSnapshot(
   raw: string | null | undefined,
   delta: { deferred: number; recovered: number; pending: number },
   at: number,
+  /**
+   * The isolate + cumulative totals this delta came from (see `applied`).
+   * Optional so a projection can skip the dedupe marker; the production path
+   * always passes it.
+   */
+  appliedBy: { owner: string; deferred: number; recovered: number } | null = null,
 ): PushDeferralSnapshot {
   const prev = parsePushDeferralSnapshot(raw) ?? emptyPushDeferralSnapshot();
   const deferred = count(delta.deferred);
@@ -228,7 +285,9 @@ export function nextPushDeferralSnapshot(
     firstRecoveredAt: prev.firstRecoveredAt,
     lastRecoveredAt: prev.lastRecoveredAt,
     events: prev.events.slice(),
+    applied: prev.applied,
   };
+  if (appliedBy && (deferred > 0 || recovered > 0)) next.applied = appliedBy;
   if (deferred > 0) {
     if (next.firstDeferredAt === null) next.firstDeferredAt = at;
     next.lastDeferAt = at;
