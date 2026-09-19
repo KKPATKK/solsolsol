@@ -229,6 +229,28 @@ curl -s .../health | jq '.heartbeat.summary | {profiles, feedMakeup}'
 13:47:11  prof 23   raw 18 + make-up 5   failedTotal 仍然係 1（同一次故障唔會重複計）
 ```
 
+**最終版（deploy 13:49:39 之後，只封頂重試鏈）**：
+
+```text
+13:56:09  prof 5   feedsMs 320   failedTotal 1   lastFailedAt 13:56:08.122
+          emptyFeedTotal 0   feeds 全部 0   ← 重試鏈喺 320ms 退場，make-up 趕及喺 600ms race 之前交貨
+```
+
+同一個窗（13:49–13:57，7 個 tick）有以下結果，順便回答之前「`cand 1 / push 0`」個問題：
+
+```text
+13:52:10  prof 22  cand 0  pushed 0
+13:53:12  prof 22  cand 1  pushed 1   ← 卡喺 3438ms 入 claim（< 3550ms gate），send:telegram→track→autobuy→done
+13:54:10  prof 22  cand 0  pushed 0
+13:55:10  prof 22  cand 0  pushed 0
+13:56:09  prof  5  cand 0  pushed 0   ← make-up-only tick
+13:50:14  prof  0  ← 冷啟 isolate 第一個 tick（見「要老實講」第 2 點）
+13:51:13  prof  0  ← 同上，第二個 tick
+```
+
+`cardSendDeferred 0`、`cardSendDeferredTotal 0`、`deferredTotal` 冇升，`writeDrain` 喺 tick 之後
+落地（166ms），`pushedTotal 233 → 234`。
+
 - 主要量度點：**prof0 比率**（改動前 23%）同 `feedRequests / tick`
 
 **要老實講**：
