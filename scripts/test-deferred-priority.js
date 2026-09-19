@@ -195,12 +195,55 @@ async function feedTests() {
   assert.equal(bodyView.lastRawProfiles, 0);
   reg.recover("FEED_A");
 
-  // Note: a fetch that never answers at all (hanging upstream, no body) is
-  // still out of reach here — the scanner's own 600ms feed race discards it,
-  // make-up included. Bounding that would need the race's remaining budget at
-  // the call site (scanner.ts, past the file-sync window); what this change
-  // DOES guarantee is that the retry chain can no longer be the reason a tick
-  // ends up with nothing.
+  // A fetch that NEVER answers — the completely hung upstream (no 429, no 5xx,
+  // no body). The retry-chain fix alone could not reach this one: the call's
+  // abort floor was 1000ms, LONGER than the 600ms feed window the tick hands
+  // it, so the scanner's race kept its own `[]` and the make-up list — built
+  // after the fetch settles — went with it (`profiles 0`, no make-up). Now
+  // attempt 1 is clamped to the feed's own budget, so the call abandons the
+  // fetch itself, inside the window, and the make-up still rides the list.
+  resetFeedMakeup();
+  reg.recover("FEED_A");
+  reg.defer("FEED_A", 103);
+  // A hung fetch that settles only when its AbortSignal fires, which is what
+  // an unresponsive upstream looks like from inside the client.
+  globalThis.fetch = (_url, opts = {}) =>
+    new Promise((_resolve, reject) => {
+      const signal = opts.signal;
+      if (!signal) return; // no signal: hang forever, like the old bug
+      if (signal.aborted) return reject(new Error("The operation was aborted"));
+      signal.addEventListener("abort", () =>
+        reject(new Error("The operation was aborted")),
+      );
+    });
+  dex = freshDex();
+  // The ONLY pending work during this call is the client's own AbortSignal
+  // timer, and Node's timers from AbortSignal.timeout() are UNREF'd — so
+  // without something holding the event loop open the process would just exit
+  // (code 0, no output) instead of waiting for the abort. Every earlier case
+  // here answers immediately and never needs this; a hung upstream is the
+  // first case that only ever settles on a timer.
+  const keepAlive = setTimeout(() => {}, PROFILE_FEED_SELF_BUDGET_MS * 6);
+  const hungAt = Date.now();
+  const out6 = await dex.fetchLatestSolanaProfiles();
+  const hungElapsed = Date.now() - hungAt;
+  clearTimeout(keepAlive);
+  assert.deepEqual(
+    out6.map((p) => p.tokenAddress),
+    ["FEED_A"],
+    "a hung upstream still carries the make-up — the tick evaluates the coin instead of going dark",
+  );
+  assert.ok(
+    hungElapsed < PROFILE_FEED_SELF_BUDGET_MS * 2,
+    `the hang is abandoned inside the feed budget, not by the caller's race (took ${hungElapsed}ms)`,
+  );
+  const hungView = feedMakeupView();
+  assert.equal(hungView.failedTotal, 1, "a hang is a FAILED fetch");
+  assert.equal(hungView.emptyFeedTotal, 0, "and not an empty feed");
+  assert.equal(hungView.lastRawProfiles, 0, "rawProfiles reads 0 — the outage signal is intact");
+  assert.equal(hungView.lastInjected, 1, "the make-up is what filled the list");
+  assert.equal(hungView.feedRequests, 1);
+  reg.recover("FEED_A");
 }
 
 // ---------- the whole tick: the make-up coin is EVALUATED, not just listed ----

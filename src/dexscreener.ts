@@ -51,12 +51,29 @@ export interface PairInfo {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * How long the profiles feed's RETRY CHAIN may keep trying (2026-09-19).
+ * How long the profiles feed may keep trying (2026-09-19), attempt 1 included.
  *
- * This bounds attempts 2 and 3 only — the first attempt is untouched (the
- * scanner's own race is what limits it, see below), because a healthy response
- * is sometimes slower than this budget and truncating it would trade a real
- * feed for the make-up list.
+ * THE FIRST ATTEMPT IS BOUNDED NOW TOO. It used to be left to the scanner's
+ * own race — "a healthy response is sometimes slower than this budget, and
+ * truncating it would trade a real feed for the make-up list" — but the race
+ * keeps its own `[]` while the make-up list is built INSIDE this call, after
+ * the fetch settles, so any fetch the race discards takes the deferred
+ * backlog's only guaranteed lane with it. That is precisely what a completely
+ * hung upstream does (no 429, no 5xx — just no answer): the call's abort floor
+ * was 1000ms, LONGER than the 600ms window it had to fit inside, so the race
+ * always won and the tick went out with nothing. Live 2026-09-19: the 13:56
+ * tick was the retry-chain-expiry path (already rescued); the HANGING upstream
+ * was still the old behavior.
+ *
+ * 320 IS A MEASUREMENT, NOT A THEOREM — and it is now the number the whole
+ * call rests on: the call has to be DONE (make-up included) before the race
+ * fires, i.e. `budget < window remaining`. At 320 that holds because a normal
+ * tick reaches this call ~140ms into the 600ms window, leaving ~460ms. What it
+ * is NOT is a bound on the window: a tick whose front phases spend more than
+ * ~280ms before the feed leaves less than this budget, and on those ticks the
+ * race wins again. Closing that last case needs the caller's remaining window
+ * AT the call site (scanner.ts:1792, past this repo's ~55KB file-edit window)
+ * — the paste-ready wiring is in docs/push-baseline-ledger.md.
  *
  * Why the chain has to be bounded at all: the scanner races this one call
  * against the tick's feed window — 600ms from the tick's start
@@ -325,9 +342,11 @@ export class DexScreenerClient {
    * client errors (4xx) return null immediately — retrying a 404 for a
    * delisted token never helps, and the re-evaluation pool regularly
    * contains delisted coins, so this saves ~8s per failing batch.
-   * `deadline` (optional, ms epoch) bounds the whole attempt loop: once the
-   * budget is exhausted, in-flight requests abort quickly and the call
-   * returns null instead of throwing.
+   * `deadline` (optional, ms epoch) bounds the whole attempt loop: attempt 1's
+   * abort is clamped to the budget too (a bounded caller must not outlive the
+   * deadline it was handed), the backoff sleeps only as long as the budget
+   * allows, and once it is exhausted the call returns null instead of
+   * throwing.
    */
   private async getJson(path: string, deadline?: number): Promise<unknown> {
     let lastError: unknown;
@@ -339,8 +358,16 @@ export class DexScreenerClient {
         const res = await this.throttle.run(() =>
           fetch(`${BASE_URL}${path}`, {
             headers: { Accept: "application/json" },
+            // A BOUNDED caller gets its deadline enforced on every attempt,
+            // attempt 1 included. The old 1000ms floor was longer than the
+            // 600ms window the profiles feed is handed, so the feed outlived
+            // its caller's race and the race threw the make-up list away with
+            // the body (see PROFILE_FEED_SELF_BUDGET_MS). An unbounded caller
+            // keeps the full 15s.
             signal: AbortSignal.timeout(
-              Math.max(1_000, Math.min(15_000, remaining)),
+              deadline === undefined
+                ? 15_000
+                : Math.max(1, Math.min(15_000, remaining)),
             ),
           }),
         );
@@ -380,19 +407,21 @@ export class DexScreenerClient {
    * window even when the upstream is rate-limiting, and a fetch that fails
    * outright still returns the make-up list — the deferred coins are the whole
    * reason this list exists, and the ticks this used to skip were the ones
-   * that evaluated NOTHING (`profiles 0`, 23% of ticks).
+   * that evaluated NOTHING (`profiles 0`, 23% of ticks). That includes an
+   * upstream that never answers at all: the call abandons its own fetch
+   * inside the tick's window and still builds the make-up list, instead of
+   * letting the caller's race throw the list away with the body.
    */
   async fetchLatestSolanaProfiles(): Promise<TokenProfile[]> {
     let data: unknown = null;
     let failed = false;
+    // The deadline bounds the WHOLE call, attempt 1 included (see
+    // PROFILE_FEED_SELF_BUDGET_MS): a fetch this call abandons early still
+    // builds the make-up list, whereas one the scanner's race discards takes
+    // the make-up with it.
+    const deadline = Date.now() + PROFILE_FEED_SELF_BUDGET_MS;
     try {
-      // The deadline bounds the retry chain, not the answer (see
-      // PROFILE_FEED_SELF_BUDGET_MS): a call that must not be truncated waits
-      // on the scanner's own race instead.
-      data = await this.getJson(
-        "/token-profiles/latest/v1",
-        Date.now() + PROFILE_FEED_SELF_BUDGET_MS,
-      );
+      data = await this.getJson("/token-profiles/latest/v1", deadline);
     } catch (err) {
       failed = true;
       console.error(

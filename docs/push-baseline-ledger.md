@@ -318,10 +318,48 @@ row 保持舊行為（唔會靠估去 prune）。永久排除嘅代價同 mcap/�
 5. 另一個間接阻礙：`rejectBudgetBeforeEval = 50 − min(poolSlice, 50) = 0`（`scanner.ts:2276`）令
    feed／make-up 幣嘅拒絕理由完全冇名額睇到（所以 5 個 pending 幣從來冇出現喺 reject log）。
 
+## 完全 hang 嘅上游：make-up 一齊冇（2026-09-19 第五補）
+
+**症狀**：上游**完全 hang**（唔係 429、唔係 5xx，純粹唔覆）嗰陣，`profiles 0` 而且
+make-up 一樣冇 —— 即係本來要救嘅 deferred coin 冇被評估。今日 13:56 嗰個唔屬此類：
+佢行「重試鏈到期」路徑（已救回），hang 嘅仍然係舊行為。
+
+**根因**：兩個長度對唔上。scanner 只等 `FEED_DEADLINE_MS` = 600ms
+（`fetchFeedCapped` 用 `Promise.race`，輸咗就保留自己嘅 `[]`），而 `getJson` 嘅 abort
+下限係 `Math.max(1_000, …)` —— **1000ms > 600ms**。所以 attempt 1 永遠未 abort，
+race 先到；**而 make-up 係喺 `fetchLatestSolanaProfiles` 入面、fetch settle 之後才砌嘅**，
+所以 promise 被 race 丟棄 = make-up 一齊丟，`noteProfileFeed` 亦一次都冇叫過
+（`failedTotal` 因此唔會升）。
+
+**改咗乜**（全部喺 `dexscreener.ts`）：
+
+| 位置 | 變更 |
+|---|---|
+| `getJson` | abort 唔再用 1000ms 下限：有 deadline 就用 `clamp(remaining)`，冇 deadline 維持 15s |
+| `fetchLatestSolanaProfiles` | deadline 由「重試鏈」升級成「整個 call，attempt 1 在內」，所以 hang 會喺 budget 內自我放棄，make-up 照樣砌返 |
+
+**睇 live**：hang tick 嘅簽名 = `profiles` 5（= make-up）、`lastRawProfiles 0`、
+`failedTotal` ↑、`emptyFeedTotal` 唔動 —— 同 429 tick 一樣嘅形狀。
+
+**要老實講**：
+
+1. `PROFILE_FEED_SELF_BUDGET_MS = 320` **係量度導出，唔係定理**：佢成立係因為正常 tick
+   到 feed 前約 140ms（600 − 140 ≈ 460ms 剩）。真正約束係 `budget + make-up < 窗內剩餘`。
+2. 所以仲有一條窄缺口：front phases 若用多過 ~280ms 才到 feed，剩返嘅窗細過 320ms，
+   race 又會贏（make-up 再次冇）。補法要喺 call site 傳入剩餘窗，即 `scanner.ts:1792`
+   —— 喺檔案編輯窗口外，見下面「仍未落地」嘅可貼上 patch。
+3. 測試備註：hang case 係第一個「只會靠 timer settle」嘅 case，而
+   `AbortSignal.timeout()` 嘅 timer 係 unref'd，所以測試要自己 `setTimeout` 撐住
+   event loop，否則 process 直接 exit 0（無 output）睇落好似 hang。
+4. 呢個修復**唔會**令 `profiles 0` 消失：hang tick 照樣報 `profiles` = make-up 條數。
+   要分開「答空」同「唔答」仍然係睇 `rawProfiles` / `emptyFeedTotal` / `failedTotal`。
+
 ## 仍未落地（可選，非必需）
 
-本 repo 大檔嘅**多行**檔案編輯只能觸及大約頭 45–55KB（單行仍可），以下三個
-hunk 喺窗口外。但要講清楚：**三個都已經唔再係修正，只係補記錄**：
+本 repo 大檔嘅檔案編輯只能觸及大約頭 45–55KB，以下 hunk 喺窗口外。
+（2026-09-19 更正：「單行仍可」係**錯**嘅 —— 喺 `scanner.ts:1792`（~85KB）試過一條
+完全吻合嘅單行 patch，一樣 apply 唔到。所以窗口係按 byte offset 計，唔係按行數。）
+但要講清楚：**以下幾個都已經唔再係修正，只係補記錄**：
 
 - **第 3 個（Gecko 腿）嘅「值」已經 live 修正**：`geckoterminal.ts` 嘅相容欄位
   係 `fdvUsd: marketCapUsd ?? fdvOnlyUsd`，而 `scanner.ts:1496` 讀嘅正是
@@ -353,6 +391,18 @@ hunk 喺窗口外。但要講清楚：**三個都已經唔再係修正，只係�
    ```
    （`GeckoTokenSnapshot` 已經暴露 `marketCapUsd` / `fdvOnlyUsd` /
    `fdvUsedAsMcap`；價值語意已修正為「優先市場市值」，呢一步只係補標記。）
+4. **`scanner.ts:1792` 傳入 feed 剩餘窗**（收窄「完全 hang」窄缺口，見上一節）：
+
+   ```ts
+   // 1792 行（單行）
+   () => this.dex.fetchLatestSolanaProfiles(feedDeadline),
+   ```
+
+   配合 `dexscreener.ts` 嘅 `fetchLatestSolanaProfiles(windowDeadline?: number)`：
+   `deadline = Math.min(Date.now() + PROFILE_FEED_SELF_BUDGET_MS,
+   windowDeadline - 60)`（60ms 留返俾 make-up 跑，因為 make-up 係同步但 abort 嘅
+   rejection 要行幾個 await 才傳返到）。冇參數時行為同現狀一樣，所以
+   `scripts/test-filters.js` / `test-deferred-priority.js` 嘅無參數呼叫唔受影響。
 
 `PairInfo.fdvUsd` / `mcapFromFdv`（`dexscreener.ts`、`jupfeeds.ts`）已經就位，
 等上面第 3 步一貼就即刻有值。
