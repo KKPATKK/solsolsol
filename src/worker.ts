@@ -22,7 +22,7 @@ import {
 import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
-import { Scanner } from "./scanner";
+import { Scanner, deferredPushTokens } from "./scanner";
 import {
   PUSH_DEFERRAL_STATE_KEY,
   loadPushDeferralSnapshot,
@@ -319,7 +319,7 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
     },
     Date.now(),
     { owner: SCAN_LOCK_OWNER, ...totals },
-    scanner?.deferredTokens() ?? [],
+    deferredPushTokens(),
   );
   await db.setWorkerState(PUSH_DEFERRAL_STATE_KEY, JSON.stringify(next));
   pushDeferralSnapshot = next;

@@ -322,6 +322,11 @@ export function boundClaim(
  */
 const deferredPriorityTokens = new Set<string>();
 
+/** Pending deferred-card identities for the worker's post-flush persistence. */
+export function deferredPushTokens(): string[] {
+  return [...deferredPriorityTokens];
+}
+
 export class DeferredPushLedger {
   private readonly pending = new Map<string, number>();
   private recoveredCount = 0;
