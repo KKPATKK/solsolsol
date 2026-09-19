@@ -30,6 +30,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
+const { PUSH_DEFERRAL_RING_MAX, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralDelta } = require("../dist/deferrallog.js");
 
 let passed = 0;
 let failed = 0;
@@ -53,6 +54,118 @@ function tmpDb() {
 }
 
 async function main() {
+  // ---------- cross-isolate deferral counters (src/deferrallog.ts) ----------
+  //
+  // These are the durable half of the scanner's deferral bookkeeping: the
+  // counters the user watches on /health.heartbeat.deferral to prove that a
+  // card refused by a late tick really is pushed back later ("deferRecovered
+  // 第一次上升" / firstRecoveredAt) and to read the refusal RATE across
+  // isolates instead of only from whichever isolate answered /health.
+
+  await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {
+    // Nothing new since the last CONFIRMED write -> the flush writes nothing.
+    assert.equal(
+      pushDeferralDelta({ deferred: 3, recovered: 1 }, { deferred: 3, recovered: 1 }),
+      null,
+    );
+    // Refusals and make-ups in the same tick both count.
+    assert.deepEqual(
+      pushDeferralDelta({ deferred: 3, recovered: 1 }, { deferred: 5, recovered: 2 }),
+      { deferred: 2, recovered: 1 },
+    );
+    // The re-offer after a failed write is the SAME delta (the caller only
+    // advances its baseline once the write landed), so a lost write delays
+    // the count by a tick instead of dropping it.
+    assert.deepEqual(
+      pushDeferralDelta({ deferred: 3, recovered: 1 }, { deferred: 5, recovered: 2 }),
+      { deferred: 2, recovered: 1 },
+    );
+    // A wedged-isolate rebuild restarts the scanner's counters at zero; the
+    // delta floors to null rather than going negative (the worker also
+    // resets its baseline in the rebuild block).
+    assert.equal(pushDeferralDelta({ deferred: 5, recovered: 2 }, { deferred: 0, recovered: 0 }), null);
+    assert.equal(pushDeferralDelta({ deferred: 5, recovered: 2 }, { deferred: 1, recovered: 2 }), null);
+    assert.deepEqual(
+      pushDeferralDelta({ deferred: 5, recovered: 2 }, { deferred: 6, recovered: 2 }),
+      { deferred: 1, recovered: 0 },
+    );
+  });
+
+  await test("nextPushDeferralSnapshot: totals accumulate across ticks, first/last stamps are stable", () => {
+    const first = nextPushDeferralSnapshot(
+      null,
+      { deferred: 2, recovered: 0, pending: 2 },
+      1_000,
+    );
+    assert.equal(first.deferredTotal, 2);
+    assert.equal(first.recoveredTotal, 0);
+    assert.equal(first.pending, 2, "backlog gauge rides the event");
+    assert.equal(first.firstDeferredAt, 1_000);
+    assert.equal(first.lastDeferAt, 1_000);
+    assert.equal(first.firstRecoveredAt, null, "no make-up push yet");
+    assert.deepEqual(first.events, [{ at: 1_000, deferred: 2, recovered: 0, pending: 2 }]);
+    // Round-trips through the stored row: the next tick folds into it.
+    const second = nextPushDeferralSnapshot(
+      JSON.stringify(first),
+      { deferred: 0, recovered: 1, pending: 1 },
+      2_000,
+    );
+    assert.equal(second.deferredTotal, 2, "totals accumulate across ticks");
+    assert.equal(second.recoveredTotal, 1);
+    assert.equal(second.firstDeferredAt, 1_000, "the first deferral stamp never moves");
+    assert.equal(second.firstRecoveredAt, 2_000, "the first make-up push is stamped once");
+    assert.equal(second.lastRecoveredAt, 2_000);
+    assert.equal(second.lastDeferAt, 1_000, "a recovery-only tick does not move the deferral stamp");
+    assert.equal(second.events.length, 2);
+  });
+
+  await test("nextPushDeferralSnapshot: ring capped and TTL-pruned, totals survive both", () => {
+    const base = 1_700_000_000_000;
+    let raw = null;
+    for (let i = 0; i < PUSH_DEFERRAL_RING_MAX + 20; i++) {
+      raw = JSON.stringify(
+        nextPushDeferralSnapshot(raw, { deferred: 1, recovered: 0, pending: 1 }, base + i * 1_000),
+      );
+    }
+    let snap = parsePushDeferralSnapshot(raw);
+    assert.equal(snap.events.length, PUSH_DEFERRAL_RING_MAX, "ring capped at the keep size");
+    assert.equal(
+      snap.deferredTotal,
+      PUSH_DEFERRAL_RING_MAX + 20,
+      "totals are not capped by the ring",
+    );
+    // A week later the old events fall out of the rate window but the
+    // cumulative numbers (and the first/last stamps) stay.
+    const later = base + 400 * 24 * 3600_000;
+    snap = nextPushDeferralSnapshot(raw, { deferred: 1, recovered: 0, pending: 1 }, later);
+    assert.equal(snap.events.length, 1, "only the fresh event survives the TTL prune");
+    assert.equal(snap.deferredTotal, PUSH_DEFERRAL_RING_MAX + 21, "totals survive pruning");
+    assert.equal(snap.firstDeferredAt, base, "the first-ever stamp survives pruning");
+  });
+
+  await test("parsePushDeferralSnapshot: missing/corrupt rows degrade to null or zeros, never throw", () => {
+    assert.equal(parsePushDeferralSnapshot(null), null);
+    assert.equal(parsePushDeferralSnapshot(undefined), null, "a cold isolate has no row");
+    assert.equal(parsePushDeferralSnapshot(""), null);
+    assert.equal(parsePushDeferralSnapshot("{oops"), null);
+    assert.equal(parsePushDeferralSnapshot("[]"), null, "an array is not a snapshot");
+    const coerced = parsePushDeferralSnapshot(
+      JSON.stringify({
+        deferredTotal: "7",
+        recoveredTotal: -3,
+        pending: "2",
+        firstDeferredAt: "5",
+        events: [{ at: "5", deferred: 1 }, { nope: 1 }],
+      }),
+    );
+    assert.equal(coerced.deferredTotal, 7, "numeric strings coerce");
+    assert.equal(coerced.recoveredTotal, 0, "a negative count clamps to 0");
+    assert.equal(coerced.pending, 2);
+    assert.equal(coerced.firstDeferredAt, 5);
+    assert.equal(coerced.events.length, 1, "an event without a timestamp is dropped");
+    assert.equal(coerced.events[0].deferred, 1);
+  });
+
   // ---------- re-eval pool coverage (config slot counts) ----------
 
   // The 2026-09-15 coverage fix sizes the far zone so each of its

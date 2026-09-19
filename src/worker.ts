@@ -7,6 +7,13 @@ import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner } from "./scanner";
+import {
+  PUSH_DEFERRAL_STATE_KEY,
+  nextPushDeferralSnapshot,
+  parsePushDeferralSnapshot,
+  pushDeferralDelta,
+  type PushDeferralSnapshot,
+} from "./deferrallog";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
@@ -14,7 +21,7 @@ import { JupTokensClient } from "./jupfeeds";
 import { GmgnClient } from "./gmgn";
 import { AxiomClient, parseAxiomTokenInfo, type AxiomTokenInfo } from "./axiom";
 import { renderMessage } from "./render";
-import type { QualifyingCoin } from "./scanner";
+import type { QualifyingCoin, ScanSummary } from "./scanner";
 import { ArkhamClient } from "./arkham";
 import { CrimeWalletClient } from "./crimewallets";
 import { WalletAnalyzer } from "./walletanalysis";
@@ -139,6 +146,21 @@ let jupiterKeyed = false;
 // and mirrored here for the cheap /health read.
 let dex429Total = 0;
 let dex429At: number | null = null;
+// Cross-isolate deferral counters. The scanner's own totals
+// (summary.cardSendDeferredTotal / summary.deferRecovered) are per-isolate
+// and die with the isolate that produced them, which is why the fleet-wide
+// numbers live in Turso (worker_state `push_deferral`, see src/deferrallog.ts)
+// and are mirrored here so both heartbeat writes carry them for /health
+// without an extra read.
+let pushDeferralSnapshot: PushDeferralSnapshot | null = null;
+/**
+ * Cumulative scanner totals as of the last CONFIRMED deferral write. The
+ * delta between a live summary and this baseline is what gets persisted, and
+ * the baseline only advances once the write landed — so a write that failed
+ * (or was killed with the invocation) re-offers the same delta on the next
+ * tick instead of dropping it, and a delta can never be counted twice.
+ */
+let pushDeferralBaseline = { deferred: 0, recovered: 0 };
 
 /**
  * Cross-isolate 429 bookkeeping: the scan that trips DexScreener's batched
@@ -155,6 +177,44 @@ async function recordDex429(at: number): Promise<void> {
   } catch {
     // telemetry only — never fail a scan over a counter write
   }
+}
+
+/**
+ * Persist the deferral delta this tick produced (see src/deferrallog.ts).
+ *
+ * Called AFTER the completion flush on purpose: the flush is the tick's last
+ * must-land write, so telemetry that runs after it can only ever cost the
+ * counters — never the heartbeat, the scan_history row or the lease release.
+ * A tick that neither refused nor paid back a card (the common case) returns
+ * on the delta check without touching Turso at all, and an ordinary minute
+ * therefore costs zero extra round trips.
+ */
+async function persistPushDeferralDelta(summary: ScanSummary | null): Promise<void> {
+  const totals = {
+    deferred: summary?.cardSendDeferredTotal ?? 0,
+    recovered: summary?.deferRecovered ?? 0,
+  };
+  const delta = pushDeferralDelta(pushDeferralBaseline, totals);
+  if (!delta || !db) return;
+  const next = nextPushDeferralSnapshot(
+    await db.getWorkerState(PUSH_DEFERRAL_STATE_KEY),
+    {
+      ...delta,
+      // Backlog as this tick left it (a gauge): a deferral burst is readable
+      // next to the make-ups that later drain it.
+      pending: summary?.deferPending ?? 0,
+    },
+    Date.now(),
+  );
+  await db.setWorkerState(PUSH_DEFERRAL_STATE_KEY, JSON.stringify(next));
+  pushDeferralSnapshot = next;
+  // Baseline advances ONLY here. A write that threw (or was killed past the
+  // invocation's wall clock) leaves it untouched, so the next tick re-offers
+  // the same delta under its own timestamp instead of losing the count.
+  pushDeferralBaseline = totals;
+  console.log(
+    `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered (totals ${next.deferredTotal}/${next.recoveredTotal})`,
+  );
 }
 
 /**
@@ -468,6 +528,17 @@ async function ensureInitialized(env: Env): Promise<void> {
           // whenever a stored access token exists too.
           const storedAxiomToken = await db?.getWorkerState("axiom_access_token");
           if (storedAxiomToken) axiomConfigured = true;
+          // Mirror the durable deferral counters (src/deferrallog.ts) so this
+          // isolate's heartbeats carry the fleet-wide numbers even before it
+          // has any of its own — without this, /health would show `deferral:
+          // null` from a recycled isolate until it happened to defer a card.
+          try {
+            pushDeferralSnapshot = parsePushDeferralSnapshot(
+              await db?.getWorkerState(PUSH_DEFERRAL_STATE_KEY),
+            );
+          } catch {
+            // telemetry only — never fail init over a counter read
+          }
         } catch (err) {
           initError = err instanceof Error ? err.message : String(err);
           console.error("[worker] Turso init failed:", initError);
@@ -736,6 +807,13 @@ async function runScan(
     dex: dex?.getStats() ?? null,
     dex429Total,
     dex429At,
+    // Fleet-wide deferral counters (see persistPushDeferralDelta): the
+    // in-memory summary below is only THIS isolate's, so /health gets the
+    // durable copy here — `recoveredTotal` rising and `firstRecoveredAt`
+    // being stamped ARE the "a deferred coin really is pushed back later"
+    // proof, and the event ring is its rate. Null until this isolate has
+    // read the row (see the init load in ensureInitialized).
+    deferral: pushDeferralSnapshot,
   });
   if (db) {
     try {
@@ -913,6 +991,10 @@ async function runScan(
             ms: flushedMs,
             err: lastScanError,
             skip: scanner?.lastSkip ?? null,
+            // The durable deferral counters as of the LAST confirmed write
+            // (persistPushDeferralDelta runs after this flush, and the next
+            // tick's `phase: scanning` heartbeat publishes the fresh copy).
+            deferral: pushDeferralSnapshot,
             summary,
           }),
           {
@@ -1012,6 +1094,19 @@ async function runScan(
         }
         }
       }
+      // Cross-isolate deferral counters, written only now that the completion
+      // flush has had its turn (see persistPushDeferralDelta). It is awaited
+      // so the isolate cannot be recycled mid-write, but everything it can
+      // lose is its own telemetry: both Db calls carry the standard hard
+      // wall, and the delta is re-offered next tick if this one fails.
+      try {
+        await persistPushDeferralDelta(summary);
+      } catch (err) {
+        console.error(
+          "[worker] deferral counter write failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
     }
   } finally {
     // Streak bookkeeping AFTER the flush attempt. The old check re-read
@@ -1059,6 +1154,10 @@ async function runScan(
       deadTickStreak = 0;
       wedgedStateResets++;
       rebuilt = true;
+      // The rebuilt Scanner restarts its counters at zero, so a surviving
+      // baseline would make every later increment look "already written"
+      // (delta <= 0) and silently drop it.
+      pushDeferralBaseline = { deferred: 0, recovered: 0 };
     }
     // Only rebuild when the tick still has room: re-init costs DB round
     // trips, and spending them here would eat the very margin that lets the
