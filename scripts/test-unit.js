@@ -19,6 +19,8 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../d
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
+const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES } = require("../dist/pushledger.js");
+const { syncPushLedger } = require("../dist/worker.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -568,20 +570,276 @@ async function main() {
         },
       },
     };
-    assert.deepEqual(parseTokenSnapshot(real), {
-      priceUsd: 0.0001338104648,
-      fdvUsd: 133810.464817828,
-      reserveUsd: 15992.629169660797,
-    });
+    const snap = parseTokenSnapshot(real);
+    assert.equal(snap.priceUsd, 0.0001338104648);
+    assert.equal(snap.reserveUsd, 15992.629169660797);
+    // The Solana-memecoin shape: no circulating market cap, so the FDV stands
+    // in for the tracker's valuation AND says so (fdvUsedAsMcap) instead of
+    // being indistinguishable from a market cap.
+    assert.equal(snap.marketCapUsd, null);
+    assert.equal(snap.fdvOnlyUsd, 133810.464817828);
+    assert.equal(snap.fdvUsd, 133810.464817828);
+    assert.equal(snap.fdvUsedAsMcap, true);
     // market_cap_usd is the fallback when fdv is absent.
     const mc = { data: { attributes: { market_cap_usd: 5000, price_usd: "1" } } };
     assert.equal(parseTokenSnapshot(mc).fdvUsd, 5000);
+    assert.equal(parseTokenSnapshot(mc).fdvUsedAsMcap, false);
+    // Both present: the market cap is what the tracker uses, FDV stays its own
+    // quantity (the 2026-09-19 audit found a $1.59M FDV recorded as the push
+    // price of a coin whose market cap never passed ~$341K).
+    const both = {
+      data: { attributes: { price_usd: "1", market_cap_usd: 341_000, fdv_usd: 1_591_544 } },
+    };
+    const b = parseTokenSnapshot(both);
+    assert.equal(b.marketCapUsd, 341_000);
+    assert.equal(b.fdvOnlyUsd, 1_591_544);
+    assert.equal(b.fdvUsd, 341_000, "the tracker's valuation is the market cap when the API has one");
+    assert.equal(b.fdvUsedAsMcap, false);
     // Nothing usable → null, so callers treat it as "not found" and the
     // tracker counts a pair miss instead of evaluating on invented numbers.
     assert.equal(parseTokenSnapshot({ data: { attributes: { name: "x" } } }), null);
     assert.equal(parseTokenSnapshot(null), null);
     assert.equal(parseTokenSnapshot({ data: {} }), null);
     assert.equal(parseTokenSnapshot({ data: { attributes: { price_usd: "0" } } }), null);
+  });
+
+  await test("worker: syncPushLedger reconciles the audit ring + rows into the durable ledger", async () => {
+    // End-to-end against a real SQLite database, because the whole point is
+    // that this view outlives the mutable `push_watch` column: the audit ring
+    // carries the push-time value (last ~30 deliveries) and the row carries
+    // whatever a heal/resurrection wrote later.
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      await db.saveChatSettings({
+        chatId: "c", ...DEFAULT_SETTINGS,
+        minMarketCapUsd: 40_000, maxMarketCapUsd: 380_000, enabled: true,
+      });
+      // A clean push: the row and the audit entry agree.
+      await db.upsertPushWatch({
+        token: "PUSH1", chatId: "c", symbol: "PUSH1",
+        pushedAt: now - 60_000, mcapAtPush: 67_056, liquidityUsd: 50_000,
+      });
+      await db.recordPushDelivery({
+        chatId: "c", token: "PUSH1", symbol: "PUSH1",
+        messageId: 1, mcapAtPush: 67_056, kind: "initial",
+      });
+      // The polluted shape: pushed at $45K, healed hours later at $12K.
+      await db.upsertPushWatch({
+        token: "HEALED", chatId: "c", symbol: "HEALED",
+        pushedAt: now - 3_600_000, mcapAtPush: 12_000, liquidityUsd: 5_000,
+      });
+      await db.recordPushDelivery({
+        chatId: "c", token: "HEALED", symbol: "HEALED",
+        messageId: 2, mcapAtPush: 45_000, kind: "initial",
+      });
+      await syncPushLedger(now, db);
+      const stored = await db.getWorkerState("push_ledger");
+      const ledger = parsePushLedger(stored);
+      assert.equal(ledger.entries.length, 2);
+      const clean = ledger.entries.find((e) => e.token === "PUSH1");
+      assert.equal(clean.source, "initial-send");
+      assert.equal(clean.mcapAtPush, 67_056);
+      assert.equal(clean.bandMin, 40_000, "the band in force is stamped next to the push value");
+      assert.equal(clean.bandMax, 380_000);
+      const healed = ledger.entries.find((e) => e.token === "HEALED");
+      assert.equal(healed.mcapAtPush, 45_000, "the audit value survives as the push baseline");
+      assert.equal(healed.rowMcapAtPush, 12_000, "the rewritten baseline is recorded, not lost");
+      const stats = pushLedgerStats(ledger, now);
+      assert.equal(stats.entries, 2);
+      assert.equal(stats.rewrittenCount, 1);
+      assert.equal(stats.outOfBandCount, 0);
+      assert.deepEqual(stats.band, { min: 40_000, max: 380_000 });
+      // Idempotent: a second pass with nothing new must not rewrite the row.
+      await syncPushLedger(now + 1_000, db);
+      assert.equal(await db.getWorkerState("push_ledger"), stored);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  // ---------- push-baseline ledger (src/pushledger.ts) ----------
+
+  await test("pushLedger: the audit ring's push-time mcap is authoritative and carries the band", () => {
+    const now = 1_800_000_000_000;
+    const l1 = mergePushLedger(parsePushLedger(null), {
+      audit: [{ token: "A", at: now - 60_000, mcapAtPush: 67_056, kind: "initial" }],
+      rows: [{ token: "A", pushedAt: now - 60_000, mcapAtPush: 67_056 }],
+      band: { min: 60_000, max: 230_000 },
+      now,
+    });
+    assert.equal(l1.entries.length, 1);
+    assert.equal(l1.entries[0].source, "initial-send");
+    assert.equal(l1.entries[0].mcapAtPush, 67_056);
+    assert.equal(l1.entries[0].bandMin, 60_000);
+    assert.equal(l1.entries[0].bandMax, 230_000);
+    const stats = pushLedgerStats(l1, now);
+    assert.equal(stats.authoritative, 1);
+    assert.equal(stats.unbanded, 0);
+    assert.equal(stats.outOfBand.length, 0, "a push inside the band in force is never reported as out of band");
+    // Follow-up cards ride the same audit ring — they are not push baselines.
+    const l2 = mergePushLedger(l1, {
+      audit: [{ token: "ZZZ", at: now, mcapAtPush: 999_999, kind: "followup" }],
+      rows: [],
+      band: { min: 60_000, max: 230_000 },
+      now,
+    });
+    assert.equal(l2.entries.length, 1, "a followup audit entry must not create a push entry");
+  });
+
+  await test("pushLedger: a rewritten baseline (heal / resurrection) is flagged without losing the gate value", () => {
+    const now = 1_800_000_000_000;
+    const pushed = mergePushLedger(parsePushLedger(null), {
+      audit: [{ token: "TIL", at: now - 7_200_000, mcapAtPush: 341_000, kind: "initial" }],
+      rows: [],
+      band: { min: 60_000, max: 230_000 },
+      now,
+    });
+    // Hours later the row carries a different baseline — the live shape that
+    // produced this ledger ($12K baseline on a $45K push; an FDV-shaped $1.59M
+    // on a coin whose market cap never passed $341K).
+    const later = mergePushLedger(pushed, {
+      audit: [],
+      rows: [{ token: "TIL", pushedAt: now - 7_200_000, mcapAtPush: 1_591_544 }],
+      band: null,
+      now: now + 3_600_000,
+    });
+    const entry = later.entries[0];
+    assert.equal(entry.mcapAtPush, 341_000, "the value the gate saw is immutable once recorded");
+    assert.equal(entry.rowMcapAtPush, 1_591_544);
+    assert.ok(entry.baselineMovedAt > 0, "the divergence is stamped");
+    const stats = pushLedgerStats(later, now + 3_600_000);
+    assert.equal(stats.rewritten.length, 1);
+    assert.equal(stats.rewritten[0].rowMcapAtPush, 1_591_544);
+    // A row that agrees again (re-pushed) clears the stale flag.
+    const healed = mergePushLedger(later, {
+      audit: [],
+      rows: [{ token: "TIL", pushedAt: now - 7_200_000, mcapAtPush: 341_000 }],
+      band: null,
+      now: now + 3_700_000,
+    });
+    assert.equal(healed.entries[0].rowMcapAtPush, undefined);
+  });
+
+  await test("pushLedger: out-of-band is only claimed when the band in force is known", () => {
+    const now = 1_800_000_000_000;
+    // No band snapshot anywhere: unclassified, never guessed at.
+    const untagged = mergePushLedger(parsePushLedger(null), {
+      audit: [],
+      rows: [{ token: "B", pushedAt: now, mcapAtPush: 1_000 }],
+      band: null,
+      now,
+    });
+    assert.equal(pushLedgerStats(untagged, now).outOfBand.length, 0);
+    assert.equal(pushLedgerStats(untagged, now).unbanded, 1);
+    // The same token arrives in the audit ring with a band: classifiable, and
+    // the band snapshot is filled in on the provenance upgrade.
+    const tagged = mergePushLedger(untagged, {
+      audit: [{ token: "B", at: now, mcapAtPush: 1_000, kind: "initial" }],
+      rows: [],
+      band: { min: 60_000, max: 230_000 },
+      now: now + 1,
+    });
+    const stats = pushLedgerStats(tagged, now);
+    assert.equal(stats.unbanded, 0);
+    assert.equal(stats.outOfBand.length, 1);
+    assert.equal(stats.outOfBand[0].bandMin, 60_000);
+  });
+
+  await test("pushLedger: bounded retention and tolerant parse", () => {
+    const now = 1_800_000_000_000;
+    // Past the TTL: dropped (every tracking window is long over).
+    const stale = mergePushLedger(parsePushLedger(null), {
+      audit: [{ token: "OLD", at: now - 8 * 24 * 3_600_000, mcapAtPush: 100_000, kind: "initial" }],
+      rows: [],
+      band: null,
+      now,
+    });
+    assert.equal(stale.entries.length, 0);
+    // Ring cap: the newest PUSH_LEDGER_MAX_ENTRIES entries win.
+    const many = [];
+    for (let i = 0; i < 300; i++) {
+      many.push({ token: `T${i}`, at: now - i * 1_000, mcapAtPush: 100_000, kind: "initial" });
+    }
+    const capped = mergePushLedger(parsePushLedger(null), {
+      audit: many,
+      rows: [],
+      band: null,
+      now,
+    });
+    assert.equal(capped.entries.length, PUSH_LEDGER_MAX_ENTRIES);
+    assert.equal(capped.entries[0].token, "T0", "newest push first");
+    // Corrupt / legacy shapes degrade instead of throwing on the tick path.
+    assert.equal(parsePushLedger("not json").entries.length, 0);
+    assert.equal(parsePushLedger(null).entries.length, 0);
+    assert.equal(parsePushLedger('{"entries":[{"token":"X"}]}').entries.length, 0);
+    assert.equal(
+      parsePushLedger('{"entries":[{"token":"X","mcapAtPush":"100"}]}').entries[0].mcapAtPush,
+      100,
+    );
+  });
+
+  await test("PushWatcher self-heal: the ledger's push-time mcap is the baseline, not the coin's current value", async () => {
+    // 2026-09-19 shape: a coin pushed at $45K dumped to $12K and its row was
+    // lost (isolate died between the card send and the enrollment). The old
+    // heal seeded the CURRENT $12K, which is how rows ended up with a "push
+    // mcap" below the $40K floor and polluted every calibration reading.
+    const mint = "HEALEDMINT";
+    const pushedAt = Date.now() - 3_600_000;
+    const enrolled = [];
+    const pair = (token) => ({
+      chainId: "solana", url: "", pairAddress: `p-${token}`,
+      baseToken: { address: token, name: token, symbol: token },
+      priceUsd: "0.001", marketCap: 12_000,
+      volume: { h24: 1_000_000, h1: 20_000, m5: 1_000 },
+      priceChange: { m5: 1, h1: 5 },
+      txns: { m5Buys: 10, m5Sells: 8, h1Buys: 100, h1Sells: 80 },
+      liquidity: { usd: 50_000 }, pairCreatedAt: pushedAt,
+    });
+    const pairsFor = async (addrs) => new Map(addrs.map((a) => [a, pair(a)]));
+    const ledgerRow = JSON.stringify({
+      entries: [{
+        token: mint, pushedAt, mcapAtPush: 45_000,
+        bandMin: 40_000, bandMax: 380_000, bandAt: pushedAt,
+        source: "initial-send", firstSeenAt: pushedAt,
+      }],
+      updatedAt: Date.now(),
+    });
+    const fakeDb = (ledgerValue, tokens) => ({
+      listPushWatch: async () => [],
+      prunePushWatch: async () => 0,
+      findUntrackedPushes: async () => tokens.map((t) => ({ token: t, chatId: "c", pushedAt })),
+      markRecapClaimed: async () => false,
+      markRecapClaimedMany: async (list) => list.map(() => false),
+      getInitialPushAuditTokens: async () => new Set(tokens),
+      getWorkerState: async () => ledgerValue,
+      upsertPushWatchMany: async (rows) => { enrolled.push(...rows); },
+      claimPushWatch: async () => true,
+      reservePushWatchAlert: async () => true,
+      updatePushWatchCheck: async () => {},
+      deletePushWatch: async () => {},
+      setPushWatchHolders: async () => {},
+    });
+    const bot = { api: { sendMessage: async () => ({ message_id: 1 }) } };
+    const pw = new PushWatcher(
+      fakeDb(ledgerRow, [mint]), bot, null, loadConfig({}), pairsFor, null,
+    );
+    await pw.runTick();
+    assert.equal(enrolled.length, 1, "the missed push must be enrolled");
+    assert.equal(
+      enrolled[0].mcapAtPush,
+      45_000,
+      "baseline = the gate value recorded at push time, not the current $12K",
+    );
+    // A push older than the ledger keeps the documented fallback (current
+    // mcap), which is the one case that stays unbanded and excludable.
+    const pw2 = new PushWatcher(
+      fakeDb(null, ["NOENTRY"]), bot, null, loadConfig({}), pairsFor, null,
+    );
+    await pw2.runTick();
+    assert.equal(enrolled[1].mcapAtPush, 12_000, "no ledger entry → current value");
   });
 
   await test("Scanner: the tracker's pair lookup falls back to GeckoTerminal when DexScreener and Jupiter are empty", async () => {

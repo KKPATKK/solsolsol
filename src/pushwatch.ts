@@ -3,6 +3,11 @@ import type { Db } from "./db";
 import type { BirdeyeClient } from "./birdeye";
 import { fmtUsd } from "./format";
 import { tradeKeyboard } from "./bot";
+import {
+  PUSH_LEDGER_STATE_KEY,
+  findLedgerEntry,
+  parsePushLedger,
+} from "./pushledger";
 
 /**
  * Post-push tracker: every pushed coin is watched for a bounded window so
@@ -822,6 +827,12 @@ export class PushWatcher {
       mcapAtPush,
       liquidityUsd,
     });
+    // `mcapAtPush` here IS the gate value (the same frozen pair object the
+    // band tested), and it is the value the durable push-baseline ledger
+    // records as authoritative for this token (see src/pushledger.ts and the
+    // worker's syncPushLedger). Nothing extra is written on the push path:
+    // this runs inside the tick's card-send slice, where a round trip is
+    // budget the card itself may need.
   }
 
   /**
@@ -959,10 +970,12 @@ export class PushWatcher {
     if (past()) return deferred;
     // Heal missed enrollments: pushes recorded in seen_tokens but absent
     // from push_watch (an old pre-tracker isolate handled that scan, or the
-    // process died between the push and the upsert). Seeded with the CURRENT
-    // mcap as baseline — follow-ups measure from tracking start, not from
-    // the original push moment. Extra DexScreener call only when something
-    // is actually missing; a no-pair coin retries on the next tick.
+    // process died between the push and the upsert). Seeded with the TRUE
+    // push-time mcap from the durable ledger (src/pushledger.ts) when it has
+    // one, so a healed row stays comparable with the filter band; an unaudited
+    // push falls back to the current mcap and is the only case that measures
+    // "from tracking start". Extra DexScreener call only when something is
+    // actually missing; a no-pair coin retries on the next tick.
     try {
       trips += 1;
       const missing = await this.db.findUntrackedPushes(
@@ -976,6 +989,13 @@ export class PushWatcher {
         // coin). Both are one trip for the whole batch now, and the
         // enrollments land in a single batched INSERT at the end.
         const audited = await this.db.getInitialPushAuditTokens();
+        trips += 1;
+        // Durable push-baseline ledger (src/pushledger.ts): the true
+        // push-time mcap per token, copied out of the delivery audit ring and
+        // kept across deploys. ONE worker_state read covers the whole batch.
+        const ledger = parsePushLedger(
+          await this.db.getWorkerState(PUSH_LEDGER_STATE_KEY),
+        );
         trips += 1;
         const resendMode = await this.tradeMode();
         if (this.hasTrade()) trips += 1;
@@ -1070,12 +1090,20 @@ export class PushWatcher {
               );
             }
           }
+          // Baseline = the value the gate actually saw at push time whenever
+          // the ledger has it. Seeding the coin's CURRENT mcap (the old
+          // behaviour) is what put a $12K baseline on a $45K push and an
+          // FDV-shaped $1.59M on a coin whose market cap never passed $341K
+          // (2026-09-19 audit). Only a push older than the ledger falls back
+          // to the current value.
+          const known = findLedgerEntry(ledger, m.token);
+          const healedMcap = known?.mcapAtPush ?? pair.marketCap;
           enroll.push({
             token: m.token,
             chatId: m.chatId,
             symbol: pair.baseToken.symbol ?? null,
             pushedAt: m.pushedAt,
-            mcapAtPush: pair.marketCap,
+            mcapAtPush: healedMcap,
             liquidityUsd: pair.liquidity.usd ?? null,
           });
           if (resent) continue; // fresh card just went out — skip holder seed noise

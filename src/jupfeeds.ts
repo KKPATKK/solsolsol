@@ -146,7 +146,12 @@ export function jupToPairInfos(data: unknown): Map<string, PairInfo> {
         symbol: String(raw.symbol ?? ""),
       },
       priceUsd: String(n(raw.usdPrice)),
+      // `mcap` first; FDV only as an explicitly FLAGGED fallback, so a
+      // diluted valuation can never be recorded as a market cap by accident
+      // (see PairInfo.fdvUsd / mcapFromFdv).
       marketCap: n(raw.mcap) || n(raw.fdv),
+      fdvUsd: raw.fdv == null ? null : n(raw.fdv),
+      mcapFromFdv: n(raw.mcap) <= 0 && n(raw.fdv) > 0,
       volume: {
         h24: n(s24.buyVolume) + n(s24.sellVolume),
         h1: n(s1.buyVolume) + n(s1.sellVolume),

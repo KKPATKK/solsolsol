@@ -90,16 +90,32 @@ export function parseNewPools(json: unknown): NewPool[] {
  * memecoin, which left the tracker blind to its own coins for the duration.
  *
  * Field notes (verified against the live API on a tracked XCAT pool,
- * 2026-09-18): `fdv_usd` is the value that works for Solana memecoins because
- * `market_cap_usd` comes back null for them, and `total_reserve_in_usd` is the
- * reserve SUMMED over the token's pools (the closest analogue of DexScreener's
- * per-pool liquidity). The payload carries NO 5-minute volume/change and no
- * hourly txn counts, so those stay zero — see the call site for why that is
- * the safe direction.
+ * 2026-09-18): `market_cap_usd` comes back null for Solana memecoins, so
+ * `fdv_usd` is what callers can actually use, and `total_reserve_in_usd` is
+ * the reserve SUMMED over the token's pools (the closest analogue of
+ * DexScreener's per-pool liquidity). The two valuation fields are returned
+ * SEPARATELY (`marketCapUsd`, `fdvOnlyUsd`) with `fdvUsedAsMcap` marking the
+ * fallback: folding an FDV into a market cap silently is how an FDV value got
+ * recorded as a coin's push price (2026-09-19 audit). The payload carries NO
+ * 5-minute volume/change and no hourly txn counts, so those stay zero — see
+ * the call site for why that is the safe direction.
  */
 export interface GeckoTokenSnapshot {
   priceUsd: number | null;
+  /**
+   * The valuation the tracker uses when it needs a market cap:
+   * `market_cap_usd` when the API reports one, otherwise `fdv_usd` (the only
+   * figure Solana memecoins carry — see the field notes). This keeps the
+   * existing callers that read `fdvUsd` working unchanged; `fdvUsedAsMcap`
+   * says whether the number is really a diluted valuation.
+   */
   fdvUsd: number | null;
+  /** Circulating market cap only — null when the API omits it. */
+  marketCapUsd: number | null;
+  /** Raw fully-diluted valuation only — a DIFFERENT quantity. */
+  fdvOnlyUsd: number | null;
+  /** True when `fdvUsd` is an FDV standing in for a missing market cap. */
+  fdvUsedAsMcap: boolean;
   reserveUsd: number | null;
 }
 
@@ -118,10 +134,24 @@ export function parseTokenSnapshot(json: unknown): GeckoTokenSnapshot | null {
     return Number.isFinite(n) && n > 0 ? n : null;
   };
   const priceUsd = num(rec.price_usd);
-  const fdvUsd = num(rec.fdv_usd) ?? num(rec.market_cap_usd);
+  const marketCapUsd = num(rec.market_cap_usd);
+  const fdvOnlyUsd = num(rec.fdv_usd);
   const reserveUsd = num(rec.total_reserve_in_usd) ?? num(rec.reserve_in_usd);
-  if (priceUsd === null && fdvUsd === null && reserveUsd === null) return null;
-  return { priceUsd, fdvUsd, reserveUsd };
+  if (
+    priceUsd === null &&
+    marketCapUsd === null &&
+    fdvOnlyUsd === null &&
+    reserveUsd === null
+  )
+    return null;
+  return {
+    priceUsd,
+    fdvUsd: marketCapUsd ?? fdvOnlyUsd,
+    marketCapUsd,
+    fdvOnlyUsd,
+    fdvUsedAsMcap: marketCapUsd === null && fdvOnlyUsd !== null,
+    reserveUsd,
+  };
 }
 
 /**

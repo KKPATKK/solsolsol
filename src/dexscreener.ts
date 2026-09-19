@@ -18,7 +18,27 @@ export interface PairInfo {
   priceUsd: string;
   /** Price of 1 base token in native quote (e.g. SOL) — used for SOL/USD. */
   priceNative?: number;
+  /** Circulating market cap. Every gate and every recorded push baseline
+   * reads THIS field, so it must never be silently filled with an FDV. */
   marketCap: number;
+  /**
+   * Fully-diluted valuation when the source reports one, kept SEPARATE from
+   * `marketCap`. FDV counts supply that is not circulating (locked/vested),
+   * so it can be several times the market cap — folding the two together is
+   * how a $1.59M FDV got recorded as the push price of a coin whose market
+   * cap never passed ~$341K (2026-09-19 audit). `null`/absent = the source
+   * carries no FDV figure.
+   */
+  fdvUsd?: number | null;
+  /**
+   * True when `marketCap` had to be filled from an FDV because the source
+   * carried no circulating-market-cap figure (the Jupiter and GeckoTerminal
+   * legs report only FDV for most Solana memecoins). Gating still uses the
+   * value — the alternative is no data at all — but every recorded baseline
+   * carries this flag, so calibration can exclude FDV-derived rows instead
+   * of mistaking a valuation for a market cap.
+   */
+  mcapFromFdv?: boolean;
   volume: { h24: number; h1: number; m5: number };
   priceChange: { m5: number; h1: number };
   /** Transaction counts (DexScreener txns) — buy/sell pressure signal. */
@@ -426,6 +446,10 @@ export class DexScreenerClient {
             priceUsd: String(raw.priceUsd ?? "0"),
             priceNative: Number(raw.priceNative),
             marketCap: Number(raw.marketCap ?? 0),
+            // Reported FDV, stored as its own quantity. DexScreener omits
+            // `marketCap` for some pairs; that stays 0 (the gate rejects it)
+            // rather than quietly becoming an FDV.
+            fdvUsd: raw.fdv == null ? null : Number(raw.fdv),
             volume: {
               h24: Number(volume?.h24 ?? 0),
               h1: Number(volume?.h1 ?? 0),

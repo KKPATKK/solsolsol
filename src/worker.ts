@@ -16,6 +16,12 @@ import {
   pushDeferralDelta,
   type PushDeferralSnapshot,
 } from "./deferrallog";
+import {
+  PUSH_LEDGER_STATE_KEY,
+  mergePushLedger,
+  parsePushLedger,
+  pushLedgerStats,
+} from "./pushledger";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
@@ -175,6 +181,27 @@ let pushDeferralBaseline = { deferred: 0, recovered: 0 };
  */
 const DEFERRAL_SYNC_BOUND_MS = 1_000;
 
+// Durable push-baseline ledger (src/pushledger.ts). `push_watch.mcap_at_push`
+// is written by THREE code paths (the push itself, the self-heal enrollment
+// and the dead-resurrection reset) and only the first is the gate value —
+// which is how 7/39 rows ended up carrying a "push mcap" nowhere near any
+// filter band (2026-09-19 audit). The ledger keeps one immutable record per
+// pushed token (true push mcap + the band in force + whether a row's baseline
+// was later rewritten), so calibration stops depending on a mutable column.
+// Same shape as the deferral counters above: durable row = source of truth,
+// this module-local copy only feeds the heartbeat's cheap /health read.
+let pushLedgerMirror: ReturnType<typeof pushLedgerStats> | null = null;
+/**
+ * Minimum gap between reconciliations. Push volume is ~5/h and both sources
+ * (the audit ring holds 30 entries, rows live 26h) tolerate minutes of lag,
+ * while every pass costs a few Turso round trips — so this is throttled off
+ * the per-minute path instead of running every tick.
+ */
+const PUSH_LEDGER_SYNC_MIN_GAP_MS = 5 * 60_000;
+/** How long a reconciliation may take before the tick moves on (see below). */
+const PUSH_LEDGER_SYNC_BOUND_MS = 900;
+let pushLedgerSyncedAt = 0;
+
 /**
  * Cross-isolate 429 bookkeeping: the scan that trips DexScreener's batched
  * limit may run in any isolate, so the count lives in Turso while this
@@ -254,6 +281,62 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
   console.log(
     `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered (totals ${next.deferredTotal}/${next.recoveredTotal})`,
   );
+}
+
+/**
+ * Reconcile the durable push-baseline ledger (src/pushledger.ts) with the two
+ * sources it can read but never edit: the delivery audit ring (authoritative
+ * push-time mcap, last ~30 deliveries) and the live `push_watch` listing (the
+ * baseline each row carries NOW — a mismatch against the ledger is exactly how
+ * a heal/resurrection rewrite becomes visible). The band in force is stamped
+ * alongside, so "was this push inside the band?" stays answerable after the
+ * operator retunes the filter.
+ *
+ * The WRITE is skipped when nothing changed (the common case), so a steady
+ * tick costs three reads and no write. Called off the pre-race path under a
+ * throttle and a race bound: telemetry may never extend the invocation, and a
+ * pass that is bounded away is simply re-offered on the next tick it is due.
+ */
+export async function syncPushLedger(
+  now = Date.now(),
+  database: Db | null = db,
+): Promise<void> {
+  if (!database) return;
+  const raw = await database.getWorkerState(PUSH_LEDGER_STATE_KEY);
+  const [audit, rows, chats] = await Promise.all([
+    database.getPushAudit(),
+    database.listPushWatch(60),
+    database.listEnabledChats(),
+  ]);
+  // Widest band across enabled chats, matching how the scan's pool window is
+  // derived; null when nothing is enabled (then no band is stamped).
+  const band =
+    chats.length > 0
+      ? {
+          min: Math.min(...chats.map((c) => c.minMarketCapUsd)),
+          max: Math.max(...chats.map((c) => c.maxMarketCapUsd)),
+        }
+      : null;
+  const next = mergePushLedger(parsePushLedger(raw), {
+    audit: audit.map((a) => ({
+      token: a.token,
+      at: a.at,
+      mcapAtPush: a.mcapAtPush ?? null,
+      kind: (a as { kind?: string | null }).kind ?? null,
+    })),
+    rows: rows.map((r) => ({
+      token: r.token,
+      pushedAt: r.pushedAt,
+      mcapAtPush: r.mcapAtPush,
+    })),
+    band,
+    now,
+  });
+  const serialized = JSON.stringify(next);
+  if (serialized !== raw) {
+    await database.setWorkerState(PUSH_LEDGER_STATE_KEY, serialized);
+  }
+  pushLedgerMirror = pushLedgerStats(next, now);
 }
 
 /**
@@ -581,6 +664,17 @@ async function ensureInitialized(env: Env): Promise<void> {
           } catch {
             // telemetry only — never fail init over a counter read
           }
+          // Same for the push-baseline ledger (src/pushledger.ts): a freshly
+          // recycled isolate answers /health with the durable view instead of
+          // null until its first reconciliation comes due.
+          try {
+            pushLedgerMirror = pushLedgerStats(
+              parsePushLedger(await db?.getWorkerState(PUSH_LEDGER_STATE_KEY)),
+              Date.now(),
+            );
+          } catch {
+            // telemetry only — never fail init over a ledger read
+          }
         } catch (err) {
           initError = err instanceof Error ? err.message : String(err);
           console.error("[worker] Turso init failed:", initError);
@@ -852,10 +946,16 @@ async function runScan(
     // Fleet-wide deferral counters (see persistPushDeferralDelta): the
     // in-memory summary below is only THIS isolate's, so /health gets the
     // durable copy here — `deferredTotal`/`recoveredTotal` rising and
-    // `firstRecoveredAt` being stamped ARE the "a deferred coin really is
+    // `    firstRecoveredAt` being stamped ARE the "a deferred coin really is
     // pushed back later" proof, and the event ring is its rate (see the init
     // load in ensureInitialized).
     deferral: pushDeferralSnapshot,
+    // Push-baseline ledger view (src/pushledger.ts): the true push mcap per
+    // token, the band in force, which pushes landed outside it, and which
+    // rows' baselines were rewritten afterwards (heal / resurrection). The
+    // pre-race copy is the freshest one published every tick, so /health
+    // always carries it.
+    pushLedger: pushLedgerMirror,
   });
   if (db) {
     try {
@@ -911,6 +1011,27 @@ async function runScan(
     console.log(
       `[worker] backfilled dead tick at ${new Date(backfillEntry.at).toISOString()} (lived ${backfillEntry.ms}ms, flush lost)`,
     );
+  }
+  // Push-baseline ledger reconciliation (see syncPushLedger): run AFTER the
+  // claim/heartbeat (the tick's must-land write) and BEFORE the scan, so the
+  // tracker's self-heal reads this tick's fresh ledger without telemetry ever
+  // delaying the heartbeat. Throttled to one pass per 5 min and race-bounded:
+  // a pass that is bounded away is simply re-offered when it is due again.
+  if (db && startedAt - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS) {
+    try {
+      await Promise.race([
+        syncPushLedger(startedAt),
+        new Promise((resolve) => setTimeout(resolve, PUSH_LEDGER_SYNC_BOUND_MS)),
+      ]);
+    } catch (err) {
+      console.warn(
+        "[worker] push-ledger sync failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    // Stamped AFTER the attempt: a hard failure waits out a full gap instead
+    // of turning into a per-tick retry loop.
+    pushLedgerSyncedAt = Date.now();
   }
   // Wedged-isolate circuit breaker: track consecutive dead ticks. The
   // predecessor's death counts toward the streak (this isolate is the one
@@ -1037,6 +1158,7 @@ async function runScan(
             // (persistPushDeferralDelta runs after this flush, and the next
             // tick's `phase: scanning` heartbeat publishes the fresh copy).
             deferral: pushDeferralSnapshot,
+            pushLedger: pushLedgerMirror,
             summary,
           }),
           {
