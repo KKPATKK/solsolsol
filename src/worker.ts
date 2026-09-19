@@ -41,6 +41,9 @@ import {
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
+// Heal-path counters: module scope in the tracker, read here so /health can
+// answer "did the self-heal reuse the push-time baseline, and how often".
+import { pushWatchHealStats } from "./pushwatch";
 import { JupTokensClient } from "./jupfeeds";
 import { GmgnClient } from "./gmgn";
 import { AxiomClient, parseAxiomTokenInfo, type AxiomTokenInfo } from "./axiom";
@@ -206,7 +209,19 @@ const DEFERRAL_SYNC_BOUND_MS = 1_000;
 // was later rewritten), so calibration stops depending on a mutable column.
 // Same shape as the deferral counters above: durable row = source of truth,
 // this module-local copy only feeds the heartbeat's cheap /health read.
-let pushLedgerMirror: ReturnType<typeof pushLedgerStats> | null = null;
+type PushLedgerView = ReturnType<typeof pushLedgerStats> & {
+  /**
+   * Heal-path counters (src/pushwatch.ts). They ride the ledger view because
+   * the completion heartbeat serializes this mirror and nothing else this
+   * module owns, while the self-heal is exactly a push-baseline event: how many
+   * baselines were re-seeded from the ledger's push-time value rather than from
+   * the coin's current mcap. The pre-race heartbeat additionally carries a flat
+   * `heal` copy, so the numbers stay readable on a tick where the ledger view
+   * is unavailable.
+   */
+  heal?: ReturnType<typeof pushWatchHealStats>;
+};
+let pushLedgerMirror: PushLedgerView | null = null;
 /**
  * Minimum gap between reconciliations. Push volume is ~5/h and both sources
  * (the audit ring holds 30 entries, rows live 26h) tolerate minutes of lag,
@@ -364,7 +379,7 @@ export async function syncPushLedger(
   if (serialized !== raw) {
     await database.setWorkerState(PUSH_LEDGER_STATE_KEY, serialized);
   }
-  pushLedgerMirror = pushLedgerStats(next, now);
+  pushLedgerMirror = { ...pushLedgerStats(next, now), heal: pushWatchHealStats() };
 }
 
 /**
@@ -729,10 +744,13 @@ async function ensureInitialized(env: Env): Promise<void> {
           // recycled isolate answers /health with the durable view instead of
           // null until its first reconciliation comes due.
           try {
-            pushLedgerMirror = pushLedgerStats(
-              parsePushLedger(await db?.getWorkerState(PUSH_LEDGER_STATE_KEY)),
-              Date.now(),
-            );
+            pushLedgerMirror = {
+              ...pushLedgerStats(
+                parsePushLedger(await db?.getWorkerState(PUSH_LEDGER_STATE_KEY)),
+                Date.now(),
+              ),
+              heal: pushWatchHealStats(),
+            };
           } catch {
             // telemetry only — never fail init over a ledger read
           }
@@ -1022,6 +1040,12 @@ async function runScan(
     // Fleet-wide early-return counters (durable row): the isolate view above
     // answers why the tick being reported did nothing, this answers how often.
     skipCapture: skipCaptureMirror,
+    // Heal-path counters (src/pushwatch.ts). The self-heal's enrollment is the
+    // one place a push baseline could silently come from the coin's CURRENT
+    // mcap instead of the push-time value, so "how many heals, and how many of
+    // them found a ledger entry" is the runtime proof of that fix; each pass
+    // also leaves a durable audit entry (/debug/push-audit).
+    heal: pushWatchHealStats(),
     // DexScreener rate-limit watch for the 250ms dispatch spacing: the live
     // client stats (intervalMs / http429 / blockedForMs / cacheSize) plus the
     // fleet-wide 429-episode total mirrored in Turso by db.bumpDex429. Written

@@ -59,11 +59,34 @@ curl -s https://solana-meme-bot.cool1999k.workers.dev/health \
 調參只取 `authoritative` 且非 `unbanded` 嘅條數，就唔會再受 band 變更、
 heal、復活污染。
 
-## 仍未落地（編輯工具窗口限制）
+## 點證明 self-heal 用嘅係真推送值（2026-09-19 補）
 
-本 repo 大檔（`db.ts` 3022 行、`scanner.ts` 3812 行）嘅檔案編輯只能觸及大約
-頭 1000 行，以下三個 hunk 喺窗口外，要用 VS Code / 終端手動貼上（全部獨立、
-唔互相依賴）：
+呢一項以前**完全無法觀察**：heal 寫落嘅 row 同正常掛牌一模一樣，而修好之後
+佢亦唔會再產生帳本會 flag 嘅 divergence。所以而家有兩層證據：
+
+| 位置 | 睇乜 |
+|---|---|
+| `/health.heartbeat.heal` | `{enrolled, fromLedger, fromCurrentMcap, lastAt}`（isolate 累計；pre-race heartbeat） |
+| `/health.heartbeat.pushLedger.heal` | 同兩個數字，喺 **completion** heartbeat 亦帶（兩個 phase 都讀得到） |
+| `/debug/push-audit` | `kind: "heal-ledger"` = 補掛時用咗帳本嘅推送值；`kind: "heal-current"` = 帳本冇記錄，退回當前市值（唯一仍會 unbanded 嘅情況）。每次 heal **一個** entry（唔係每幣一個 —— audit ring 只有 30 格，而帳本要對住佢 reconcile） |
+
+副作用（要知）：`rewrittenCount` 而家主要代表**死而復生重置**，或者「早過帳本嘅幣」嘅 heal —— 因為 heal 已經改用推送值，唔再改寫 baseline。
+
+## 仍未落地（可選，非必需）
+
+本 repo 大檔嘅**多行**檔案編輯只能觸及大約頭 45–55KB（單行仍可），以下三個
+hunk 喺窗口外。但要講清楚：**三個都已經唔再係修正，只係補記錄**：
+
+- **第 3 個（Gecko 腿）嘅「值」已經 live 修正**：`geckoterminal.ts` 嘅相容欄位
+  係 `fdvUsd: marketCapUsd ?? fdvOnlyUsd`，而 `scanner.ts:1496` 讀嘅正是
+  `snap.fdvUsd` —— 即 tracker 條 Gecko 腿已經優先市場市值，FDV 只做 fallback，
+  `fdvUsedAsMcap` 標住 fallback 情況。剩低嘅只係把 `mcapFromFdv` 顯式傳入
+  `PairInfo`（令帳本可以標「呢個 baseline 其實係 FDV」），純標記。
+- **第 1、2 個已經被帳本取代**：`source` / band 印 / 推送值已經喺
+  `worker_state.push_ledger` 逐幣記錄，heal 亦已經讀佢。`push_watch` 加欄位只
+  對「早過帳本嘅幣」有幫助。
+
+原本嘅 patch 清單（留低備用）：
 
 1. **`push_watch` 欄位**（`db.ts`）：喺 `CREATE TABLE push_watch` 加
    `baseline_source TEXT, band_min REAL, band_max REAL, mcap_is_fdv INTEGER

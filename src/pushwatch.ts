@@ -189,6 +189,45 @@ const RISING_STAGES = [50, 100, 200, 400] as const;
  */
 const FIRST_CARD_RESEND_GRACE_MS = 15 * 60_000;
 /**
+ * Heal-path counters (module scope, same shape as src/poolfallback.ts's).
+ *
+ * The self-heal's claim — a healed row is seeded from the ledger's push-time
+ * value rather than the coin's CURRENT price — had no observable at all: the
+ * enrollment it writes looks exactly like a normal one, and after the
+ * 2026-09-19 fix it no longer produces the divergence the ledger would flag.
+ * So these counters record the event (how many heals, and how many took the
+ * ledger value vs the documented fallback), and each pass leaves ONE durable
+ * entry in the delivery audit ring naming the coin and the baseline it was
+ * seeded with (see the write after the enrollment batch).
+ */
+let healEnrolledTotal = 0;
+let healFromLedgerTotal = 0;
+let healFromCurrentMcapTotal = 0;
+let healLastAt: number | null = null;
+
+/** Read-only view for the heartbeat mirror (the worker reports it on /health). */
+export function pushWatchHealStats(): {
+  enrolled: number;
+  fromLedger: number;
+  fromCurrentMcap: number;
+  lastAt: number | null;
+} {
+  return {
+    enrolled: healEnrolledTotal,
+    fromLedger: healFromLedgerTotal,
+    fromCurrentMcap: healFromCurrentMcapTotal,
+    lastAt: healLastAt,
+  };
+}
+
+/** Test seam: the counters are module state, so tests need a reset. */
+export function resetPushWatchHealStats(): void {
+  healEnrolledTotal = 0;
+  healFromLedgerTotal = 0;
+  healFromCurrentMcapTotal = 0;
+  healLastAt = null;
+}
+/**
  * ⚡ Price/holder divergence (the JEFFERY shape): price ≥ +25% vs push while
  * the holder base shrank ≥10% vs its rolling baseline — the run is being
  * carried by fewer and fewer wallets, so pullbacks tend to be fast and
@@ -1007,6 +1046,19 @@ export class PushWatcher {
           mcapAtPush: number;
           liquidityUsd: number | null;
         }> = [];
+        /**
+         * First healed coin of this pass, for the ONE durable audit entry
+         * written after the batch lands (see below). Deliberately not one entry
+         * per coin: the audit ring is 30 slots and the ledger reconciles
+         * against it, so a burst of heals must not evict recent initial sends.
+         */
+        let healProof: {
+          token: string;
+          chatId: string;
+          symbol: string | null;
+          mcapAtPush: number;
+          fromLedger: boolean;
+        } | null = null;
         const missPairs = await this.pairsFor(
           missing.map((m) => m.token),
           now + TRACKER_PAIRS_BUDGET_MS,
@@ -1098,6 +1150,19 @@ export class PushWatcher {
           // to the current value.
           const known = findLedgerEntry(ledger, m.token);
           const healedMcap = known?.mcapAtPush ?? pair.marketCap;
+          healEnrolledTotal += 1;
+          healLastAt = Date.now();
+          if (known) healFromLedgerTotal += 1;
+          else healFromCurrentMcapTotal += 1;
+          if (healProof === null) {
+            healProof = {
+              token: m.token,
+              chatId: m.chatId,
+              symbol: pair.baseToken.symbol ?? null,
+              mcapAtPush: healedMcap,
+              fromLedger: known !== null,
+            };
+          }
           enroll.push({
             token: m.token,
             chatId: m.chatId,
@@ -1114,6 +1179,30 @@ export class PushWatcher {
         if (enroll.length > 0) {
           await this.db.upsertPushWatchMany(enroll);
           trips += 1;
+        }
+        // Durable trace of the heal path, written AFTER the enrollment landed.
+        // `kind` is never "initial", so the resend gate
+        // (getInitialPushAuditTokens) and the ledger merge (which accepts only
+        // "initial") both ignore it by construction, and the two kind values
+        // carry the provenance: "heal-ledger" = seeded from the push-time
+        // value, "heal-current" = the documented fallback for a push older than
+        // the ledger. /debug/push-audit is where a human confirms a healed row
+        // really does carry its push-time baseline.
+        if (healProof !== null) {
+          const proof = healProof;
+          try {
+            trips += 1;
+            await this.db.recordPushDelivery({
+              chatId: proof.chatId,
+              token: proof.token,
+              symbol: proof.symbol,
+              messageId: 0,
+              mcapAtPush: proof.mcapAtPush,
+              kind: proof.fromLedger ? "heal-ledger" : "heal-current",
+            });
+          } catch {
+            /* audit is best-effort */
+          }
         }
       }
     } catch {

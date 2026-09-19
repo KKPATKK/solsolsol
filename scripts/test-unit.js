@@ -870,6 +870,79 @@ async function main() {
     }
   });
 
+  await test("pushWatchHeal: a heal says which baseline it used — durably and on /health", async () => {
+    // The observable item 2 was missing. A heal's enrollment is invisible: the
+    // row it writes looks exactly like a normally enrolled push, and after the
+    // 2026-09-19 fix it no longer produces the divergence the ledger flags. So
+    // each pass leaves ONE "heal-ledger" / "heal-current" entry in the delivery
+    // audit ring (readable at /debug/push-audit) and the counters it reports on
+    // /health.heartbeat.heal say how the heals split between the ledger's
+    // push-time value and the documented fallback.
+    const {
+      PushWatcher: PW,
+      pushWatchHealStats: healStats,
+      resetPushWatchHealStats: resetHeal,
+    } = require("../dist/pushwatch.js");
+    resetHeal();
+    const mint = "HEALOBS";
+    const pushedAt = Date.now() - 3_600_000;
+    const enrolled = [];
+    const audits = [];
+    const pair = {
+      chainId: "solana", url: "", pairAddress: `p-${mint}`,
+      baseToken: { address: mint, name: mint, symbol: mint },
+      priceUsd: "0.001", marketCap: 12_000,
+      volume: { h24: 1_000_000, h1: 20_000, m5: 1_000 },
+      priceChange: { m5: 1, h1: 5 },
+      txns: { m5Buys: 10, m5Sells: 8, h1Buys: 100, h1Sells: 80 },
+      liquidity: { usd: 50_000 }, pairCreatedAt: pushedAt,
+    };
+    const pairsFor = async (addrs) => new Map(addrs.map((a) => [a, pair]));
+    const ledgerRow = JSON.stringify({
+      entries: [{
+        token: mint, pushedAt, mcapAtPush: 45_000,
+        bandMin: 60_000, bandMax: 230_000, bandAt: pushedAt,
+        source: "initial-send", firstSeenAt: pushedAt,
+      }],
+      updatedAt: Date.now(),
+    });
+    const mk = (ledgerValue, token) => new PW(
+      {
+        listPushWatch: async () => [],
+        prunePushWatch: async () => 0,
+        findUntrackedPushes: async () => [{ token, chatId: "c", pushedAt }],
+        markRecapClaimed: async () => false,
+        markRecapClaimedMany: async (list) => list.map(() => false),
+        getInitialPushAuditTokens: async () => new Set([token]),
+        getWorkerState: async () => ledgerValue,
+        upsertPushWatchMany: async (rows) => { enrolled.push(...rows); },
+        recordPushDelivery: async (entry) => { audits.push(entry); },
+        claimPushWatch: async () => true,
+        reservePushWatchAlert: async () => true,
+        updatePushWatchCheck: async () => {},
+        deletePushWatch: async () => {},
+        setPushWatchHolders: async () => {},
+      },
+      { api: { sendMessage: async () => ({ message_id: 1 }) } },
+      null, loadConfig({}), pairsFor, null,
+    );
+    await mk(ledgerRow, mint).runTick();
+    await mk(null, "HEALOBS2").runTick();
+    assert.equal(enrolled[0].mcapAtPush, 45_000, "ledger entry → push-time value");
+    assert.equal(enrolled[1].mcapAtPush, 12_000, "no ledger entry → current value");
+    assert.equal(audits.length, 2, "one entry per heal pass, not per coin");
+    assert.equal(audits[0].kind, "heal-ledger");
+    assert.equal(audits[0].token, mint);
+    assert.equal(audits[0].mcapAtPush, 45_000, "the entry names the baseline it seeded");
+    assert.equal(audits[1].kind, "heal-current");
+    const heal = healStats();
+    assert.equal(heal.enrolled, 2);
+    assert.equal(heal.fromLedger, 1);
+    assert.equal(heal.fromCurrentMcap, 1);
+    assert.ok(heal.lastAt > 0, "the heal is stamped");
+    resetHeal();
+  });
+
   // ---------- early-return capture (src/skipcapture.ts) ----------
   //
   // The scanner records why a tick returned early ("empty-feed-and-pool",
