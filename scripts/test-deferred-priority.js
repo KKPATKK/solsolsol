@@ -175,22 +175,32 @@ async function feedTests() {
   assert.equal(failView.lastRawProfiles, 0, "rawProfiles still reads 0 — the outage signal is intact");
   assert.equal(failView.lastInjected, 1, "the make-up is what filled the list");
 
-  // Hanging upstream: the race, not the HTTP client's patience, is what keeps
-  // the tick's feed window.
+  // A deterministic client error (404/HTML) is the same story.
   resetFeedMakeup();
-  globalThis.fetch = () => new Promise(() => {});
+  globalThis.fetch = async () =>
+    new Response("<html>nope</html>", {
+      status: 404,
+      headers: { "Content-Type": "text/html" },
+    });
   dex = freshDex();
-  const t1 = Date.now();
   const out5 = await dex.fetchLatestSolanaProfiles();
-  const hung = Date.now() - t1;
   assert.deepEqual(
     out5.map((p) => p.tokenAddress),
     ["FEED_A"],
-    "a hanging feed still carries the make-up",
+    "a 404 feed still carries the make-up",
   );
-  assert.ok(hung < PROFILE_FEED_SELF_BUDGET_MS * 3, `a hanging feed answers in ${hung}ms`);
-  assert.equal(feedMakeupView().failedTotal, 1, "and counts as a failed fetch");
+  const bodyView = feedMakeupView();
+  assert.equal(bodyView.failedTotal, 1, "a body that is not the profile array is a failed feed");
+  assert.equal(bodyView.emptyFeedTotal, 0);
+  assert.equal(bodyView.lastRawProfiles, 0);
   reg.recover("FEED_A");
+
+  // Note: a fetch that never answers at all (hanging upstream, no body) is
+  // still out of reach here — the scanner's own 600ms feed race discards it,
+  // make-up included. Bounding that would need the race's remaining budget at
+  // the call site (scanner.ts, past the file-sync window); what this change
+  // DOES guarantee is that the retry chain can no longer be the reason a tick
+  // ends up with nothing.
 }
 
 // ---------- the whole tick: the make-up coin is EVALUATED, not just listed ----

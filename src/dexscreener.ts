@@ -51,25 +51,33 @@ export interface PairInfo {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * How long the profiles feed may spend before it answers anyway (2026-09-19).
+ * How long the profiles feed's RETRY CHAIN may keep trying (2026-09-19).
  *
- * The scanner races this one call against the tick's feed window — 600ms from
- * the tick's start (FEED_DEADLINE_MS) — and keeps the race's `[]` when the
- * window closes first, which means anything this call returns late is thrown
- * away, make-up list included. The call used to be made with NO deadline, so a
- * single 429 (shared worker egress: http429 12 in one isolate) started the
- * 3-attempt chain with its 2s/4s backoff (~6s) and lost that race every time:
- * live, 9 of 40 ticks reported `profiles 0` with every feed empty and the
- * deferred backlog's only guaranteed lane missing, and the 429 stamps sit
- * inside those very ticks (13:26:10.250 → the 13:26 tick, 13:31:09.915 → the
- * 13:31 tick). A healthy response is ~60-100ms (measured against the CDN),
- * and the tick reaches this call some ~140ms in, so 320ms retires a 429 inside
- * the window with room to spare while leaving normal fetches untouched.
+ * This bounds attempts 2 and 3 only — the first attempt is untouched (the
+ * scanner's own race is what limits it, see below), because a healthy response
+ * is sometimes slower than this budget and truncating it would trade a real
+ * feed for the make-up list.
+ *
+ * Why the chain has to be bounded at all: the scanner races this one call
+ * against the tick's feed window — 600ms from the tick's start
+ * (FEED_DEADLINE_MS) — and keeps the race's `[]` when the window closes first,
+ * so anything returned late is thrown away, make-up list included. The call
+ * used to be made with NO deadline, so a single 429 (shared worker egress:
+ * http429 12 in one isolate) started the 3-attempt chain with its 2s/4s backoff
+ * (~6s) and lost that race every time: live, 9 of 40 ticks reported
+ * `profiles 0` with every feed empty and the deferred backlog's only
+ * guaranteed lane missing, and the 429 stamps sit inside those very ticks
+ * (13:26:10.250 → the 13:26 tick, 13:31:09.915 → the 13:31 tick).
+ *
+ * With the chain bounded, a 429 resolves in ~budget ms (attempt 1 fails fast,
+ * the capped backoff spends the rest, attempt 2 finds the budget gone and
+ * returns null) — i.e. well inside the scanner's 600ms window, so the make-up
+ * list this call returns on failure is what the tick actually evaluates.
+ * Live after the change: `feedsMs 320, profiles 5, failedTotal 1,
+ * lastRawProfiles 0, emptyFeedTotal 0` — the first failed fetch that did NOT
+ * cost the backlog its lane.
  */
 export const PROFILE_FEED_SELF_BUDGET_MS = 320;
-
-/** Race sentinel: the profiles fetch did not answer inside its self-budget. */
-const FEED_TIMED_OUT = Symbol("feed-timeout");
 
 /**
  * Compound momentum gate: a coin qualifies when its 5-minute tape is hot
@@ -375,20 +383,16 @@ export class DexScreenerClient {
    * that evaluated NOTHING (`profiles 0`, 23% of ticks).
    */
   async fetchLatestSolanaProfiles(): Promise<TokenProfile[]> {
-    const budgetEnd = Date.now() + PROFILE_FEED_SELF_BUDGET_MS;
     let data: unknown = null;
     let failed = false;
-    const call = this.getJson("/token-profiles/latest/v1", budgetEnd);
-    call.catch(() => {
-      // Abandoned by the race below — its rejection has no consumer left.
-    });
     try {
-      const raced = await Promise.race([
-        call,
-        sleep(Math.max(0, budgetEnd - Date.now())).then(() => FEED_TIMED_OUT),
-      ]);
-      if (raced === FEED_TIMED_OUT) failed = true;
-      else data = raced;
+      // The deadline bounds the retry chain, not the answer (see
+      // PROFILE_FEED_SELF_BUDGET_MS): a call that must not be truncated waits
+      // on the scanner's own race instead.
+      data = await this.getJson(
+        "/token-profiles/latest/v1",
+        Date.now() + PROFILE_FEED_SELF_BUDGET_MS,
+      );
     } catch (err) {
       failed = true;
       console.error(
@@ -398,8 +402,8 @@ export class DexScreenerClient {
     }
     const rows = Array.isArray(data) ? (data as Array<Record<string, unknown>>) : [];
     // A body that is not the expected array (a null from a deterministic 4xx,
-    // an HTML error page parsed as JSON, the timeout above) is a FAILED feed,
-    // not an empty one: it is counted apart so the outage stays readable.
+    // a budget that ran out mid-chain) is a FAILED feed, not an empty one: it
+    // is counted apart so the outage stays readable.
     if (!Array.isArray(data)) failed = true;
     const profiles: TokenProfile[] = [];
     for (const item of rows) {

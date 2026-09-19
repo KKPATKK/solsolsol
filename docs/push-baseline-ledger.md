@@ -198,10 +198,17 @@ prof0 呈 5 分鐘週期（13:01/13:06/13:11/13:16/13:21/13:26/13:31）。
 
 | 之前 | 現在 |
 |---|---|
-| profiles fetch 無 deadline，429 → ~6s 重試 | `PROFILE_FEED_SELF_BUDGET_MS = 320` 自我預算，＋全 call 用 `Promise.race` 硬保證喺窗內答覆 |
+| profiles fetch 無 deadline，429 → ~6s 重試 | `PROFILE_FEED_SELF_BUDGET_MS = 320`：**只封頂重試鏈**（attempt 2/3），first attempt 不變 |
 | retry backoff 固定 sleep 2s／4s | sleep 被 deadline 封頂（`Math.min(attempt * 2000, left)`）；無 deadline 嘅呼叫維持原狀 |
-| fetch 失敗 → `return []`（make-up 一齊冇） | fetch 失敗 → **照 append make-up**，延遲嘅 rejection 由 `.catch(() => {})` 吞掉 |
+| fetch 失敗 → `return []`（make-up 一齊冇） | fetch 失敗 → **照 append make-up** |
 | 故障只剩 `profiles: 0` | 新增 `failedTotal` / `lastFailedAt`：**「冇回應」同「回空」分開計** |
+
+為什麼只封頂重試鏈、而唔係整個 call 加 race（曾經咁做過，live 推翻）：改動後第一個 429 tick
+即時驗到 `profiles 5, feedsMs 320, failedTotal 1`，但同時見到 **`feedsMs 320` 意味著一個健康
+但慢嘅上游（320–600ms）會被自己嘅 race 截斷，拿真 feed（18 幣）換 5 個 make-up**。
+所以 race 拿掉，只保留「重試鏈唔可以喺窗內磨 6 秒」：正常快照一様等 scanner 嘅 600ms，
+而 429 因為 attempt 1 快速失敗 + backoff 被封頂，會喺 ~320ms 返回 null → 照帶 make-up 回來，
+**仍然贏 600ms race**。
 
 `noteProfileFeed(raw, injected, at, failed)`：`emptyFeedTotal` 只在**真係回空**（`!failed && raw === 0`）
 才加，`failedTotal` 只計失敗／超時。舊嘅 `profiles: 0` 訊號 = `rawProfiles 0` + 兩個 counter 之和，
@@ -214,19 +221,26 @@ curl -s .../health | jq '.heartbeat.summary | {profiles, feedMakeup}'
 # 429 tick 嘅預期簽名：profiles 5（= make-up），lastRawProfiles 0，failedTotal ↑，emptyFeedTotal 唔動
 ```
 
+**第一個 live 證據（deploy 13:41:45 之後）**：
+
+```text
+13:44:10  prof 24   raw 18 + make-up 5   feedRequests 2
+13:46:10  prof  5   raw  0 + make-up 5   failedTotal 1  lastFailedAt 13:46:07.910  ← 改動前呢個 tick 係 0
+13:47:11  prof 23   raw 18 + make-up 5   failedTotal 仍然係 1（同一次故障唔會重複計）
+```
+
 - 主要量度點：**prof0 比率**（改動前 23%）同 `feedRequests / tick`
-- 副作用要知：429 tick 嘅 scan_history row 由 `profiles 0` 變成 `profiles 5`，
-  而 `lastSkip = empty-feed-and-pool` 喺嗰啲 tick 唔會再出現（`feedProfiles` 唔再係空）
 
 **要老實講**：
 
-1. 320ms 係**啟發式**：tick 到 feed 之前嘅工作（`listEnabledChats`、crime refresh）實測約
-   140ms，健康回應實測 60–100ms；如果上游係「慢但唔係 429」，client 一様會 race 出去，
-   嗰個 tick 就只剩 make-up（真 feed 下一 tick 再嚟）。呢個係刻意的取捨：寧願保住
-   backlog 條 lane，唔好交白卷。
+1. 上游**完全冇回應**（hang、唔係 429）嘅 tick 仍然會兩者皆失：scanner 嘅 600ms race
+   會拿走 `[]`，make-up 一齊冇。要連呢個都救，就要喺呼叫點（`scanner.ts:1792`，编辑窗口外）
+   把剩餘 feed budget 傳入。今次修好嘅係「重試鏈自己喺窗內磨完 6 秒」呢個可量度嘅成因。
 2. 若 scanner 自己喺 `fetchFeedCapped` 之前就跳過（`remaining <= 250`），client 由頭到尾
-   冇被呼叫 —— 呢種 tick（cold start 最常見）仍然絕對冇 feed、冇 make-up，只有改用
-   scanner 內嘅 merge 點才救得到，而嗰個位置喺編輯窗口外。
+   冇被呼叫 —— 呢種 tick（cold start 最常見）仍然絕對冇 feed、冇 make-up。
+3. 320ms 係由量度導出（重試 × 2 ≤ 600ms window；tick 到 feed 之前約 140ms），不是定理。
+   副作用：429 tick 嘅 scan_history row 由 `profiles 0` 變成 `profiles 5`，
+   而 `lastSkip = empty-feed-and-pool` 喺嗰啲 tick 唔會再出現。
 
 ## 仍未落地（可選，非必需）
 
