@@ -354,6 +354,71 @@ race 先到；**而 make-up 係喺 `fetchLatestSolanaProfiles` 入面、fetch se
 4. 呢個修復**唔會**令 `profiles 0` 消失：hang tick 照樣報 `profiles` = make-up 條數。
    要分開「答空」同「唔答」仍然係睇 `rawProfiles` / `emptyFeedTotal` / `failedTotal`。
 
+## feed 被 `remaining <= 250` 提早跳過：make-up 一樣冇（2026-09-19 第六補）
+
+**症狀**：`prof=0`。兩個上游路徑（答空 / 唔答）現在都會注入 make-up，所以修復後
+`prof=0` 只剩兩個可能：
+
+- **(a)** feed 答空 **而且** 該 isolate 嘅 deferral registry 係空（剛 boot、durable snapshot 未載入）；
+- **(b)** feed 根本冇被叫過 —— `fetchFeedCapped` 嘅 `if (remaining <= 250) return empty;`。
+
+**實測 2026-09-19 15:07:12**：心跳（跨 isolate、Turso 持久）`deferral.pending = 5`
+（15:06:43–15:09:15 五次取樣都係 5），而該 tick `prof=0` **且** `pool=222`：
+
+- 若行 (a)，pending 5 → make-up 注入 → `prof` 應該係 5；
+- `pool=222 > 0` 證明掃描過到 feed 段之後（唔係 `shouldStopEarly` 提早 return）。
+
+→ 所以係 **(b)**：feed 窗口剩 ≤250ms，feed 從未被叫，make-up 也就冇了。
+
+**機制**：`feedDeadline = startedAt + FEED_DEADLINE_MS (600)`，即係由 tick 開始到 feed
+之間用多過 **350ms** 就會跳過。該段做嘅係 `listEnabledChats()`（DB）+ 
+`crimeWallets.refreshIfStale()`（TTL 6h，但**冷 isolate / 到期嗰次**會真拉一次
+~4.8K address 清單，上限 `CRIME_WALLETS_FETCH_TIMEOUT_MS` 預設 **8000ms**）。
+
+**量度**：120 tick 窗口（13:19–15:18）內 `prof=0` 有 **11 個（9%）**，另有 16 個係
+`prof=5`（make-up-only）——後者就係修復前本應係 `prof=0` 嘅 tick。
+
+**未解嘅觀察（重要）**：`prof=0` 有一串係**每 5 分鐘一次**：
+`13:21:10, 13:26:10, 13:31:10, 13:36:10, 13:41:10`（全部 :10），
+另外幾個緊貼 deploy（13:50+13:51 / 13:58 / 14:31 / 15:07）。
+後者可歸於冷 isolate 首次 crime 拉清單；但**前者 5 分鐘週期對唔上任何已知 TTL**
+（crime refresh 6h、gecko 429 backoff 5min 但嗰個係 feed 本身）。
+未 instrument 之前**唔應該猜**，所以本次冇改任何常數。
+
+**代價比 make-up 更大**：跳過係**整個 feed** 唔叫 —— 該 tick 唔止冇 make-up，連嗰分鐘嘅
+discovery（最多 100 個新 profile）都一齊冇，只剩 pool。
+
+**為乜今次改唔到**：兩個站點都喺編輯窗口外（實測 exact-match apply 全部唔中）：
+
+| 站點 | 位置 | 內容 |
+|---|---|---|
+| `fetchFeedCapped` 跳過 | `scanner.ts:1639`（~79.9KB） | `if (remaining <= 250) return empty;` |
+| 呼叫點 | `scanner.ts:1792`（~85KB） | `fetchFeedCapped(..., [], feedDeadline)` |
+
+**可貼上嘅 patch（一行修好三條路）**：唔需要改跳過行 —— 只要把 make-up 清單當
+`empty` 傳入，跳過同 race-timeout 兩條路就自動帶住 make-up（race-timeout 本來就會丟掉
+遲到嘅 body，所以只賺不賠）：
+
+```ts
+// scanner.ts:1792
+const profiles = await this.fetchFeedCapped(
+  () => this.dex.fetchLatestSolanaProfiles(feedDeadline),
+  missingDeferredTokens([]).map((tokenAddress) => ({ tokenAddress })),
+  feedDeadline,
+)
+```
+
+`missingDeferredTokens` 要加落 `scanner.ts` 頂部 `./deferredmakeup` 嘅 import（~1.5KB，窗口內）；
+但單獨加會變死 import，所以留返同呼叫點一齊改。
+（同下面第 4 項嘅 `windowDeadline` 係兩件獨立事，兩個可以一齊貼。）
+
+**另一條窗口內嘅槓桿（未採用）**：`FEED_DEADLINE_MS`（`scanner.ts:495`，~25KB，**可改**）
+600 → 900，跳過門檻由「pre-feed > 350ms」變「> 650ms」。
+成本：front window 未分配餘裕 400ms → 100ms（900 + 池 1600 = 2500 < 2600，仍然唔會食
+gate reserve），**而且**其他 feed 嘅 race 上限一齊由 600 → 900ms（慢嘅 gecko/jup 會多佔
+300ms，池評估相應少）。**未做**：上面嗰個 5 分鐘週期未解釋，冇量度「pre-feed > 350ms」
+嘅實際比率，唔想靠猜去緊一個保護 gate 嘅常數。
+
 ## 仍未落地（可選，非必需）
 
 本 repo 大檔嘅檔案編輯只能觸及大約頭 45–55KB，以下 hunk 喺窗口外。
