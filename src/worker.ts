@@ -25,6 +25,7 @@ import { RugcheckClient } from "./rugcheck";
 import { Scanner, deferredPushTokens } from "./scanner";
 import {
   PUSH_DEFERRAL_STATE_KEY,
+  heldBackCandidates,
   loadPushDeferralSnapshot,
   nextPushDeferralSnapshot,
   parsePushDeferralSnapshot,
@@ -189,8 +190,59 @@ let pushDeferralSnapshot: PushDeferralSnapshot | null = null;
  * the baseline only advances once the write landed — so a write that failed
  * (or was killed with the invocation) re-offers the same delta on the next
  * tick instead of dropping it, and a delta can never be counted twice.
+ *
+ * `stalled` is optional here on purpose: the dead-tick rebuild resets this
+ * cursor from a literal that predates the counter, and an absent field must
+ * read as zero rather than fail to compile. It costs nothing — the amount
+ * added for held-back coins comes from stalledUnflushed, not from this
+ * difference, and this field only rides along to keep the delta one shape.
  */
-let pushDeferralBaseline = { deferred: 0, recovered: 0 };
+let pushDeferralBaseline: { deferred: number; recovered: number; stalled?: number } = {
+  deferred: 0,
+  recovered: 0,
+  stalled: 0,
+};
+/**
+ * Candidate coins this isolate has watched a tick END with: qualifying coins
+ * in hand and no card delivered for them, minus the ones the tick REFUSED a
+ * claim slice (those are already counted in `deferred`, see
+ * cardSendDeferredTotal on the scanner).
+ *
+ * Worker-side, and derived from what the summary carries, because the shape
+ * it exists to expose has no counter of its own anywhere: the chain stage
+ * breaks out of the candidate loop on its own deadline (`chain deadline
+ * reached — deferring N candidate(s) to next tick`, scanner.ts) BEFORE the
+ * claim stage is ever reached, and logs it without recording it. Two live
+ * consequences, both fixed by turning the gap into a number: a deployment's
+ * `candidates 1, pushed 0` ticks could outnumber its recorded deferrals
+ * indefinitely (2026-09-19: 33 of 118 ticks against 5-6 deferrals/hour), and
+ * the rate could not be read from /health at all. See stalledTotal in
+ * src/deferrallog.ts for what this count can and cannot attribute — it is a
+ * lower bound on chain-stage deferrals, since a candidate skipped because
+ * every enabled chat already had the coin is counted in it too.
+ *
+ * Cumulative, and used for exactly two things: the log line and the applied
+ * marker that makes a lost write idempotent. The amount that actually gets
+ * ADDED to the durable row is stalledUnflushed below.
+ */
+let stalledCandidatesTotal = 0;
+/**
+ * Held-back coins counted since the last CONFIRMED deferral write — the
+ * pending DELTA for `stalledTotal`, deliberately kept apart from
+ * `pushDeferralBaseline`.
+ *
+ * `deferred`/`recovered` are cursor differences (isolate total − baseline),
+ * which is safe only because the dead-tick rebuild resets BOTH the Scanner
+ * that produces those totals and the baseline that follows them. This counter
+ * has no such pairing: it lives in worker module state, which the rebuild
+ * leaves alone (only the clients and the Scanner are replaced), while the
+ * rebuild's baseline literal carries no `stalled` field — so as a cursor
+ * difference it would read `stalled − 0` and re-offer every held-back coin
+ * counted since boot as fresh, once per rebuild. A pending delta has no such
+ * failure mode: it grows on every completed tick and is cleared in exactly
+ * one place, after a write that actually landed.
+ */
+let stalledUnflushed = 0;
 /**
  * How long the post-flush deferral sync may take before the tick moves on.
  * Telemetry is never allowed to extend the invocation: the outer finally still
@@ -282,9 +334,20 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
   // here rather than on the scan's pre-race path.
   await syncPostScanTelemetry();
   if (!db) return;
+  // Held-back candidates: the tick's own gap, counted once per completed
+  // summary (see heldBackCandidates — the derivation, and why it is a lower
+  // bound on chain-stage deferrals, live with it and its unit tests).
+  const heldBack = heldBackCandidates(summary);
+  if (heldBack > 0) {
+    stalledCandidatesTotal += heldBack;
+    // The pending delta too: this is the amount a landed write will add, and
+    // it survives a rebuild (see stalledUnflushed).
+    stalledUnflushed += heldBack;
+  }
   const totals = {
     deferred: summary?.cardSendDeferredTotal ?? 0,
     recovered: summary?.deferRecovered ?? 0,
+    stalled: stalledCandidatesTotal,
   };
   const raw = await db.getWorkerState(PUSH_DEFERRAL_STATE_KEY);
   const durable = parsePushDeferralSnapshot(raw);
@@ -296,8 +359,18 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
       scanner?.seedDeferredTokens(durable.pendingTokens);
     }
   };
-  const delta = pushDeferralDelta(pushDeferralBaseline, totals);
-  if (!delta) {
+  const cursorDelta = pushDeferralDelta(pushDeferralBaseline, totals);
+  // The held-back half rides its own pending delta (see stalledUnflushed), and
+  // that is what makes a chain-deferral-only tick persist at all: cursorDelta
+  // is null whenever the scanner's own counters did not move — exactly the
+  // shape this counter exists for. `totals.stalled` still travels with every
+  // write as the applied marker, but it is not the amount added.
+  const delta = {
+    deferred: cursorDelta?.deferred ?? 0,
+    recovered: cursorDelta?.recovered ?? 0,
+    stalled: stalledUnflushed,
+  };
+  if (delta.deferred <= 0 && delta.recovered <= 0 && delta.stalled <= 0) {
     refreshMirror();
     return;
   }
@@ -306,6 +379,7 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
     // lost (hard wall, invocation kill). The row already carries it — ACK
     // rather than add it a second time.
     pushDeferralBaseline = totals;
+    stalledUnflushed = 0;
     refreshMirror();
     return;
   }
@@ -328,8 +402,11 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
   // the same delta — and the applied marker above stops that re-offer from
   // double-counting a write that did land.
   pushDeferralBaseline = totals;
+  // The held-back delta clears here and nowhere else — one shared landing
+  // point with the cursor above, so a lost write re-offers both together.
+  stalledUnflushed = 0;
   console.log(
-    `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered (totals ${next.deferredTotal}/${next.recoveredTotal})`,
+    `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered / +${delta.stalled} held back (totals ${next.deferredTotal}/${next.recoveredTotal}/${next.stalledTotal})`,
   );
 }
 

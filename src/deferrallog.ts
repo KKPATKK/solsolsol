@@ -11,7 +11,13 @@
  *   1. "did a deferred card ever get pushed back on a later tick?"
  *      (deferRecovered rising — the live proof of the at-least-once promise);
  *   2. "how often does a tick actually refuse a card?" (a rate needs a
- *      counter that outlives the isolate that incremented it).
+ *      counter that outlives the isolate that incremented it);
+ *   3. "a tick found candidates and pushed none — was a card REFUSED, or did
+ *      the tick end with the coin still in hand?" Only the claim-stage
+ *      refusal had a counter (the scanner's cardSendDeferredTotal); a tick
+ *      whose chain hit its deadline broke out of the candidate loop before
+ *      the claim stage and left no trace anywhere, so the push gap could
+ *      outnumber every recorded deferral (see stalledTotal).
  *
  * Cloudflare recycles isolates within minutes, so the observation window was
  * a lottery: /health could only ever show the counters of whichever isolate
@@ -54,6 +60,12 @@ export interface PushDeferralEvent {
   deferred: number;
   /** Deferred coins that tick pushed back — the at-least-once proof. */
   recovered: number;
+  /**
+   * Candidates that tick held and delivered no card for WITHOUT refusing one a
+   * claim slice (`stalled`, see the snapshot's `stalledTotal`). The companion
+   * count for the shape `cardSendDeferred` cannot see.
+   */
+  stalled: number;
   /** Coins still waiting for a make-up push, as that tick left them (gauge). */
   pending: number;
 }
@@ -66,6 +78,34 @@ export interface PushDeferralSnapshot {
   recoveredTotal: number;
   /** Backlog the newest event left behind. */
   pending: number;
+  /**
+   * Candidate coins a tick ended WITHOUT delivering a card for and without
+   * refusing one a claim slice.
+   *
+   * The other half of the "candidates found, nothing pushed" gap. A tick can
+   * leave a qualifying coin in hand in two ways, and only the first had a
+   * counter: the claim stage refuses the card when no send slice is left
+   * (`deferred`, see cardSendDeadline), while the CHAIN stage breaks out of
+   * the candidate loop before it ever gets there (`chain deadline reached —
+   * deferring N candidate(s) to next tick`) and wrote nothing at all — so a
+   * quiet-market stretch of `candidates 1, pushed 0` ticks could outnumber the
+   * recorded deferrals indefinitely and read as if nothing was wrong (live
+   * 2026-09-19: 33 of 118 ticks, against 5-6 recorded deferrals per hour).
+   *
+   * Deliberately NOT attributed to the chain by name: the summary cannot
+   * separate a chain-deadline break from a candidate every enabled chat had
+   * already received (the chain's seen-check skips it with no counter) or a
+   * send that failed (recorded separately as a push failure). What it CAN say
+   * exactly is that a qualifying coin was in hand and no card went out — and
+   * with `deferred` beside it the gap stops being silent: the two counters
+   * together account for (candidates − pushed) of every tick that reached the
+   * push stage.
+   */
+  stalledTotal: number;
+  /** When the first held-back candidate was recorded (null until one happens). */
+  firstStallAt: number | null;
+  /** When the most recent one was recorded. */
+  lastStallAt: number | null;
   /**
    * Token identities still awaiting a make-up push. Bounded with the same
    * cap as the in-memory ledger so a recycled isolate can hydrate the actual
@@ -97,7 +137,12 @@ export interface PushDeferralSnapshot {
    * adding again. Keyed by owner because two isolates can legitimately carry
    * the same counters (both fresh, both at 1) while owning different deltas.
    */
-  applied: { owner: string; deferred: number; recovered: number } | null;
+  applied: {
+    owner: string;
+    deferred: number;
+    recovered: number;
+    stalled: number;
+  } | null;
 }
 
 /** worker_state key holding the snapshot. */
@@ -121,6 +166,9 @@ function emptyPushDeferralSnapshot(): PushDeferralSnapshot {
   return {
     deferredTotal: 0,
     recoveredTotal: 0,
+    stalledTotal: 0,
+    firstStallAt: null,
+    lastStallAt: null,
     pending: 0,
     pendingTokens: [],
     firstDeferredAt: null,
@@ -169,7 +217,15 @@ export function parsePushDeferralSnapshot(
     const a = rec.applied as Record<string, unknown>;
     const owner = typeof a.owner === "string" ? a.owner : "";
     if (owner.length > 0) {
-      applied = { owner, deferred: count(a.deferred), recovered: count(a.recovered) };
+      applied = {
+        owner,
+        deferred: count(a.deferred),
+        recovered: count(a.recovered),
+        // A row written before the stalled counter existed reads as 0 — which
+        // can only ever make a re-offered delta look un-applied once, never
+        // silently swallow one.
+        stalled: count(a.stalled),
+      };
     }
   }
   const pendingTokens = Array.isArray(rec.pendingTokens)
@@ -188,6 +244,7 @@ export function parsePushDeferralSnapshot(
         at,
         deferred: count(ev.deferred),
         recovered: count(ev.recovered),
+        stalled: count(ev.stalled),
         pending: count(ev.pending),
       });
     }
@@ -196,6 +253,9 @@ export function parsePushDeferralSnapshot(
   return {
     deferredTotal: count(rec.deferredTotal),
     recoveredTotal: count(rec.recoveredTotal),
+    stalledTotal: count(rec.stalledTotal),
+    firstStallAt: stamp(rec.firstStallAt),
+    lastStallAt: stamp(rec.lastStallAt),
     pending: count(rec.pending),
     pendingTokens,
     firstDeferredAt: stamp(rec.firstDeferredAt),
@@ -216,14 +276,15 @@ export function parsePushDeferralSnapshot(
 export function pushDeferralAlreadyApplied(
   snapshot: PushDeferralSnapshot | null,
   owner: string,
-  totals: { deferred: number; recovered: number },
+  totals: { deferred: number; recovered: number; stalled: number },
 ): boolean {
   const applied = snapshot?.applied;
   if (!applied) return false;
   return (
     applied.owner === owner &&
     applied.deferred === totals.deferred &&
-    applied.recovered === totals.recovered
+    applied.recovered === totals.recovered &&
+    applied.stalled === totals.stalled
   );
 }
 
@@ -257,10 +318,54 @@ export function pushDeferralDelta(
   baseline: { deferred: number; recovered: number },
   totals: { deferred: number; recovered: number },
 ): { deferred: number; recovered: number } | null {
-  const deferred = totals.deferred - baseline.deferred;
-  const recovered = totals.recovered - baseline.recovered;
+  const deferred = count(totals.deferred) - count(baseline.deferred);
+  const recovered = count(totals.recovered) - count(baseline.recovered);
   if (deferred <= 0 && recovered <= 0) return null;
   return { deferred: Math.max(0, deferred), recovered: Math.max(0, recovered) };
+}
+
+/**
+ * Qualifying coins a COMPLETED tick left in hand without delivering a card for
+ * them — the amount `stalledTotal` accumulates, derived from what a
+ * scan summary carries.
+ *
+ * WHY DERIVED rather than counted where it happens: the chain stage breaks out
+ * of the candidate loop on its own deadline (`chain deadline reached —
+ * deferring N candidate(s) to next tick`, src/scanner.ts) BEFORE the claim
+ * stage is ever reached, and that break records nothing anywhere — so a quiet
+ * stretch of `candidates 1, pushed 0` ticks could outnumber the recorded
+ * deferrals indefinitely while /health showed no sign of it (live 2026-09-19:
+ * 33 of 118 ticks against 5-6 deferrals/hour). The identity used here — coins
+ * in hand, no card out, MINUS the ones the tick explicitly refused a claim
+ * slice (those are already in `deferred`) — is exactly the remainder that had
+ * no home before.
+ *
+ * A LOWER BOUND on chain-stage deferrals, not an exact count: a candidate the
+ * chain did reach but skipped because every enabled chat already had the coin
+ * (the per-chat seen-check) was also "in hand, nothing delivered", and the
+ * summary cannot tell that case apart from a chain break. What it can say
+ * exactly is that the tick ended with a qualifying coin and no card for it.
+ *
+ * `pushPhase === "done"` is the completion test: a tick the worker's race cut
+ * short publishes its INFLIGHT summary with pushPhase still on the step it
+ * died in (send:claim, tracker, …), and a tick that never scanned has no
+ * summary at all — both are already reported by the dead-tick bookkeeping and
+ * must not be re-counted here; a completed tick's summary is stamped `done`
+ * with candidates and pushed final.
+ */
+export function heldBackCandidates(
+  summary: {
+    pushPhase?: string;
+    candidates?: number;
+    pushed?: number;
+    cardSendDeferred?: number;
+  } | null,
+): number {
+  if (!summary || summary.pushPhase !== "done") return 0;
+  return Math.max(
+    0,
+    count(summary.candidates) - count(summary.pushed) - count(summary.cardSendDeferred),
+  );
 }
 
 /**
@@ -277,22 +382,31 @@ export function pushDeferralDelta(
  */
 export function nextPushDeferralSnapshot(
   raw: string | null | undefined,
-  delta: { deferred: number; recovered: number; pending: number },
+  delta: { deferred: number; recovered: number; stalled: number; pending: number },
   at: number,
   /**
    * The isolate + cumulative totals this delta came from (see `applied`).
    * Optional so a projection can skip the dedupe marker; the production path
    * always passes it.
    */
-  appliedBy: { owner: string; deferred: number; recovered: number } | null = null,
+  appliedBy: {
+    owner: string;
+    deferred: number;
+    recovered: number;
+    stalled: number;
+  } | null = null,
   pendingTokens: string[] = [],
 ): PushDeferralSnapshot {
   const prev = parsePushDeferralSnapshot(raw) ?? emptyPushDeferralSnapshot();
   const deferred = count(delta.deferred);
   const recovered = count(delta.recovered);
+  const stalled = count(delta.stalled);
   const next: PushDeferralSnapshot = {
     deferredTotal: prev.deferredTotal + deferred,
     recoveredTotal: prev.recoveredTotal + recovered,
+    stalledTotal: prev.stalledTotal + stalled,
+    firstStallAt: prev.firstStallAt,
+    lastStallAt: prev.lastStallAt,
     pending: count(delta.pending),
     pendingTokens: pendingTokens.length > 0 ? [...new Set(pendingTokens)].slice(-500) : prev.pendingTokens,
     firstDeferredAt: prev.firstDeferredAt,
@@ -302,7 +416,9 @@ export function nextPushDeferralSnapshot(
     events: prev.events.slice(),
     applied: prev.applied,
   };
-  if (appliedBy && (deferred > 0 || recovered > 0)) next.applied = appliedBy;
+  if (appliedBy && (deferred > 0 || recovered > 0 || stalled > 0)) {
+    next.applied = appliedBy;
+  }
   if (deferred > 0) {
     if (next.firstDeferredAt === null) next.firstDeferredAt = at;
     next.lastDeferAt = at;
@@ -311,7 +427,11 @@ export function nextPushDeferralSnapshot(
     if (next.firstRecoveredAt === null) next.firstRecoveredAt = at;
     next.lastRecoveredAt = at;
   }
-  next.events.push({ at, deferred, recovered, pending: next.pending });
+  if (stalled > 0) {
+    if (next.firstStallAt === null) next.firstStallAt = at;
+    next.lastStallAt = at;
+  }
+  next.events.push({ at, deferred, recovered, stalled, pending: next.pending });
   const cutoff = at - PUSH_DEFERRAL_RING_TTL_MS;
   next.events = next.events
     .filter((e) => e.at >= cutoff)

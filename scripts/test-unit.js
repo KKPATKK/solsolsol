@@ -33,7 +33,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
@@ -72,7 +72,11 @@ async function main() {
       pushDeferralDelta({ deferred: 3, recovered: 1 }, { deferred: 3, recovered: 1 }),
       null,
     );
-    // Refusals and make-ups in the same tick both count.
+    // Refusals and make-ups in the same tick both count. Held-back candidates
+    // are NOT part of this cursor: their amount rides its own pending delta
+    // (the rebuild resets this cursor's location but not the counter — see
+    // stalledUnflushed in worker.ts), so a chain-deferral-only tick is folded
+    // in by nextPushDeferralSnapshot below rather than by this difference.
     assert.deepEqual(
       pushDeferralDelta({ deferred: 3, recovered: 1 }, { deferred: 5, recovered: 2 }),
       { deferred: 2, recovered: 1 },
@@ -95,6 +99,79 @@ async function main() {
     );
   });
 
+  await test("nextPushDeferralSnapshot: a chain-deferral-only tick is still persisted", () => {
+    // The live shape that used to leave no trace in the counters at all: a
+    // qualifying coin in hand, no refusal (so no `deferred`), no make-up —
+    // the chain simply ran out of tick. Nothing moved on the cursor, yet the
+    // row has to record it.
+    const row = nextPushDeferralSnapshot(
+      null,
+      { deferred: 0, recovered: 0, stalled: 2, pending: 2 },
+      1_000,
+      { owner: "isoA", deferred: 0, recovered: 0, stalled: 2 },
+    );
+    assert.equal(row.deferredTotal, 0, "not a claim-stage refusal");
+    assert.equal(row.recoveredTotal, 0);
+    assert.equal(row.stalledTotal, 2, "the held-back coins are accounted");
+    assert.equal(row.firstStallAt, 1_000, "and stamped, so the first rise is provable");
+    assert.equal(row.lastStallAt, 1_000);
+    assert.equal(row.firstDeferredAt, null, "a held-back coin is not a deferral stamp");
+    assert.equal(row.events[0].deferred, 0);
+    assert.equal(row.events[0].stalled, 2);
+    // A later tick that holds none back keeps the totals and leaves the stamp
+    // alone (only the events ring moves on).
+    const flat = nextPushDeferralSnapshot(
+      JSON.stringify(row),
+      { deferred: 0, recovered: 0, stalled: 0, pending: 0 },
+      2_000,
+      { owner: "isoA", deferred: 0, recovered: 0, stalled: 2 },
+    );
+    assert.equal(flat.stalledTotal, 2);
+    assert.equal(flat.lastStallAt, 1_000);
+    assert.equal(flat.firstStallAt, 1_000);
+  });
+
+  await test("heldBackCandidates: the chain-stage gap a completed tick left behind", () => {
+    // The shape that used to vanish: a coin in hand, no card out. The chain
+    // broke on its deadline BEFORE the claim stage, so nothing counted it.
+    assert.equal(
+      heldBackCandidates({ pushPhase: "done", candidates: 1, pushed: 0, cardSendDeferred: 0 }),
+      1,
+    );
+    // Every candidate delivered -> nothing held back.
+    assert.equal(
+      heldBackCandidates({ pushPhase: "done", candidates: 2, pushed: 2 }),
+      0,
+    );
+    // A claim REFUSAL already has its own counter, so it is not added again…
+    assert.equal(
+      heldBackCandidates({ pushPhase: "done", candidates: 1, pushed: 0, cardSendDeferred: 1 }),
+      0,
+      "a refused card is counted as deferred, never twice",
+    );
+    // …but a tick that refused one card AND held another back still reports
+    // the held-back one (the mixed case an all-or-nothing guard would drop).
+    assert.equal(
+      heldBackCandidates({ pushPhase: "done", candidates: 2, pushed: 0, cardSendDeferred: 1 }),
+      1,
+    );
+    assert.equal(
+      heldBackCandidates({ pushPhase: "done", candidates: 3, pushed: 1, cardSendDeferred: 1 }),
+      1,
+    );
+    // Only COMPLETED ticks qualify: a tick the race cut short publishes its
+    // inflight summary stamped with the step it died in, and a tick that never
+    // scanned has no summary — both are the dead-tick bookkeeping's business.
+    assert.equal(heldBackCandidates({ pushPhase: "send:claim", candidates: 1, pushed: 0 }), 0);
+    assert.equal(heldBackCandidates({ pushPhase: "tracker", candidates: 1, pushed: 0 }), 0);
+    assert.equal(heldBackCandidates({ candidates: 1, pushed: 0 }), 0, "no phase stamp, no claim");
+    assert.equal(heldBackCandidates(null), 0);
+    // Never negative: counters that disagree (a rebuilt scanner, a summary
+    // assembled from a stale copy) must read as "nothing held back".
+    assert.equal(heldBackCandidates({ pushPhase: "done", candidates: 1, pushed: 3 }), 0);
+    assert.equal(heldBackCandidates({ pushPhase: "done" }), 0);
+  });
+
   await test("nextPushDeferralSnapshot: totals accumulate across ticks, first/last stamps are stable", () => {
     const first = nextPushDeferralSnapshot(
       null,
@@ -107,15 +184,20 @@ async function main() {
     assert.equal(first.firstDeferredAt, 1_000);
     assert.equal(first.lastDeferAt, 1_000);
     assert.equal(first.firstRecoveredAt, null, "no make-up push yet");
-    assert.deepEqual(first.events, [{ at: 1_000, deferred: 2, recovered: 0, pending: 2 }]);
+    assert.deepEqual(first.events, [
+      { at: 1_000, deferred: 2, recovered: 0, stalled: 0, pending: 2 },
+    ]);
     // Round-trips through the stored row: the next tick folds into it.
     const second = nextPushDeferralSnapshot(
       JSON.stringify(first),
-      { deferred: 0, recovered: 1, pending: 1 },
+      { deferred: 0, recovered: 1, stalled: 1, pending: 1 },
       2_000,
     );
     assert.equal(second.deferredTotal, 2, "totals accumulate across ticks");
     assert.equal(second.recoveredTotal, 1);
+    assert.equal(second.stalledTotal, 1, "held-back coins accumulate too");
+    assert.equal(second.firstStallAt, 2_000, "the first held-back stamp is set once");
+    assert.equal(second.lastStallAt, 2_000);
     assert.equal(second.firstDeferredAt, 1_000, "the first deferral stamp never moves");
     assert.equal(second.firstRecoveredAt, 2_000, "the first make-up push is stamped once");
     assert.equal(second.lastRecoveredAt, 2_000);
@@ -178,6 +260,9 @@ async function main() {
     assert.deepEqual(cold, {
       deferredTotal: 0,
       recoveredTotal: 0,
+      stalledTotal: 0,
+      firstStallAt: null,
+      lastStallAt: null,
       pending: 0,
       pendingTokens: [],
       firstDeferredAt: null,
@@ -219,7 +304,10 @@ async function main() {
   });
 
   await test("a committed-but-response-lost write is ACKed, not added twice", () => {
-    const totals = { deferred: 2, recovered: 0 };
+    // The marker carries all three counters (the production caller always
+    // passes them); `stalled` is not part of the CURSOR, but it is part of the
+    // identity a re-offer is matched against.
+    const totals = { deferred: 2, recovered: 0, stalled: 0 };
     // Tick 1: the flush writes the delta, the row lands...
     const rowAfterCommit = nextPushDeferralSnapshot(
       null,
@@ -230,7 +318,7 @@ async function main() {
     // ...but the caller never learns (hard wall / invocation kill), so its
     // baseline stays put and it re-offers the same delta on tick 2.
     const reoffered = pushDeferralDelta({ deferred: 0, recovered: 0 }, totals);
-    assert.deepEqual(reoffered, totals, "the delta really is re-offered");
+    assert.deepEqual(reoffered, { deferred: 2, recovered: 0 }, "the delta really is re-offered");
     // The applied marker is what stops the re-offer from inflating the totals:
     // keyed on (isolate, totals), it recognises the earlier commit.
     const raw = JSON.stringify(rowAfterCommit);

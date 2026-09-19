@@ -72,6 +72,39 @@ heal、復活污染。
 
 副作用（要知）：`rewrittenCount` 而家主要代表**死而復生重置**，或者「早過帳本嘅幣」嘅 heal —— 因為 heal 已經改用推送值，唔再改寫 baseline。
 
+## 被扣住嘅候選：`stalledTotal`（2026-09-19 補）
+
+「有候選但冇推送」以前**有一半冇入帳**。一張卡被扣住有兩個位置：
+
+| 階段 | 之前有冇計 |
+|---|---|
+| **claim**：卡片臨送出但冇 send slice（`cardSendDeadline`） | ✅ `deferredTotal` |
+| **chain**：candidate 迴圈喺自己嘅 deadline break（`chain deadline reached — deferring N candidate(s)`），連 claim 都未到 | ❌ 只寫 log，冇任何 counter |
+
+所以 `candidates 1, pushed 0` 嘅 tick 可以長期多過 deferral 計數（live 2026-09-19：
+118 個 tick 中 33 個，而 deferral 只有 5–6/小時），而 /health 完全睇唔到。
+
+```bash
+curl -s https://solana-meme-bot.cool1999k.workers.dev/health \
+  | jq '.heartbeat.deferral | {stalledTotal, firstStallAt, lastStallAt, deferredTotal, recoveredTotal, pending}'
+```
+
+| 欄位 | 意思 |
+|---|---|
+| `stalledTotal` | **完成**嘅 tick 結束時「手上有合格幣、但一張卡都冇送出」嘅幣數（累計） |
+| `firstStallAt` / `lastStallAt` | 第一次 / 最近一次嘅時間戳 |
+| `events[].stalled` | 每個 tick 嘅數字，所以「有幾多個 tick 被扣住」可以由 ring 直接數 |
+
+點計：`max(0, candidates − pushed − cardSendDeferred)`，只計 `pushPhase === "done"`
+嘅 tick（被 race 砍斷嘅 tick 只會出 inflight summary，phase 停喺 `send:claim`／
+`tracker`，唔會入帳）。減 `cardSendDeferred` 係因為被拒嘅卡已經入 `deferredTotal`，
+而**減咗仍然要計**：同一 tick 可以既拒一張卡、又扣住另一張（全部扣就唔計嘅寫法會漏咗後者）。
+
+**限制（要知）**：呢個係 chain 階段 deferral 嘅**下界**。summary 分唔開「chain break」同
+「每個已開啟 chat 都已經收過呢個幣」（seen-check 直接 skip，冇 counter）；兩者都係
+「手上有幣、冇送卡」。所以讀嘅時候同 `deferredTotal` 一齊睇：兩者相加就係每次
+到咗 push 階段嘅 tick 嘅 `candidates − pushed`。
+
 ## 仍未落地（可選，非必需）
 
 本 repo 大檔嘅**多行**檔案編輯只能觸及大約頭 45–55KB（單行仍可），以下三個
