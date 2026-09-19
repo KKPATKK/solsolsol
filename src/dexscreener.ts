@@ -97,6 +97,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export const PROFILE_FEED_SELF_BUDGET_MS = 320;
 
 /**
+ * What a budgeted caller must have left before a retry is worth starting (see
+ * getJson): enough for one real attempt after the throttle gap is paid. Below
+ * this the retry can only convert budget into wall clock, and the caller's
+ * window is what the OTHER feeds need — measured 2026-09-19: a 429 that burned
+ * the profiles call's full 320ms left the tick's feed fan-out 226ms, under
+ * `fetchFeedCapped`'s 250ms floor, so Jupiter returned 0 for that minute.
+ */
+const RETRY_MIN_ATTEMPT_MS = 250;
+
+/**
  * How long the last non-empty profile list may be evaluated again when the
  * next fetch produces nothing usable (see shouldReuseProfileList).
  *
@@ -438,16 +448,31 @@ export class DexScreenerClient {
         return await res.json();
       } catch (err) {
         lastError = err;
-        // The backoff never outlives a budget: a bounded caller (the profiles
-        // feed, see PROFILE_FEED_SELF_BUDGET_MS) sleeps only as long as its
-        // deadline allows, so a 429 retires inside the tick's feed window
-        // instead of spending 2s + 4s on attempts nobody will read. An
-        // unbounded caller keeps the original 2s/4s spacing.
+        // A 429 is never retried by a BUDGETED caller (see below); an unbounded
+        // caller keeps its 2s/4s spacing, since it has no window to protect.
+        const rateLimited =
+          deadline !== undefined &&
+          /429/.test(err instanceof Error ? err.message : String(err));
         const left =
           deadline === undefined
             ? Number.POSITIVE_INFINITY
             : deadline - Date.now();
-        if (attempt < 3 && left > 0) await sleep(Math.min(attempt * 2000, left));
+        // A budgeted caller needs ROOM for the retry to be a retry rather than
+        // a way to spend the window. The throttle alone (dexRequestIntervalMs,
+        // 250-350ms) sits between two attempts, so an attempt started with less
+        // than that left cannot reach the network before its own abort fires:
+        // it just converts the caller's budget into wall clock. Measured
+        // 2026-09-19 18:11:11Z: the profiles call held the tick until +674ms
+        // (its 314ms sleep plus a throttle wait), the feed fan-out was
+        // dispatched with 226ms left, `fetchFeedCapped`'s 250ms floor
+        // short-circuited EVERY fan-out feed and Jupiter came back 0 for that
+        // minute (20 on the next tick). So when the headroom is gone, the call
+        // ENDS here instead of looping into an attempt nobody can win — and a
+        // 429 always ends it: note429 has just armed the 90s backoff, so no
+        // second request inside this window could succeed anyway.
+        const retryHeadroomMs = this.config.dexRequestIntervalMs + RETRY_MIN_ATTEMPT_MS;
+        if (attempt >= 3 || rateLimited || left < retryHeadroomMs) break;
+        await sleep(Math.min(attempt * 2000, left - retryHeadroomMs));
       }
     }
     throw lastError instanceof Error

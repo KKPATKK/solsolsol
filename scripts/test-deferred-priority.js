@@ -146,11 +146,14 @@ async function feedTests() {
   resetFeedMakeup();
   reg.recover("FEED_A");
   reg.defer("FEED_A", 102);
-  globalThis.fetch = async () =>
-    new Response("rate limited", {
+  let rateLimitCalls = 0;
+  globalThis.fetch = async () => {
+    rateLimitCalls += 1;
+    return new Response("rate limited", {
       status: 429,
       headers: { "Content-Type": "text/plain" },
     });
+  };
   dex = freshDex();
   const t0 = Date.now();
   const out4 = await dex.fetchLatestSolanaProfiles();
@@ -174,6 +177,38 @@ async function feedTests() {
   assert.equal(failView.lastFailedAt !== null, true, "the failure is stamped");
   assert.equal(failView.lastRawProfiles, 0, "rawProfiles still reads 0 — the outage signal is intact");
   assert.equal(failView.lastInjected, 1, "the make-up is what filled the list");
+  // ... and it gives the window BACK instead of burning it. The old chain slept
+  // `left` (314ms of a 320ms budget), waited out the 250ms throttle and then
+  // started an attempt whose own abort had already fired — measured live
+  // 2026-09-19 18:11:11Z: the profiles call held the tick until +674ms, the
+  // feed fan-out was dispatched with 226ms left, `fetchFeedCapped`'s 250ms
+  // floor short-circuited EVERY fan-out feed and Jupiter came back 0 for that
+  // minute. A budgeted caller never retries a 429 now (the client has just
+  // armed a 90s backoff, so no second attempt can win).
+  assert.ok(
+    elapsed < 150,
+    `a 429 answers immediately so the fan-out keeps its window (took ${elapsed}ms)`,
+  );
+  assert.equal(rateLimitCalls, 1, "no doomed second request is sent");
+
+  // A 5xx is NOT a 429 — it keeps its retry while the budget can hold one, so
+  // fail-fast does not quietly delete the retry path for transient outages.
+  // (The profiles budget cannot hold one: PROFILE_FEED_SELF_BUDGET_MS 320 is
+  // below the throttle gap + attempt floor, so a 5xx on the profiles call also
+  // fails fast — the pair path, with its 1000ms budget, is where the retry
+  // still fits.)
+  let serverErrorCalls = 0;
+  globalThis.fetch = async () => {
+    serverErrorCalls += 1;
+    return new Response("boom", { status: 500 });
+  };
+  dex = freshDex();
+  const emptyPairs = await dex.fetchPairsForTokens(["PAIRTOKEN"], Date.now() + 2_000);
+  assert.ok(
+    serverErrorCalls >= 2,
+    `a 5xx still retries when the budget can hold it (saw ${serverErrorCalls} request(s))`,
+  );
+  assert.equal(emptyPairs.size, 0, "a failing endpoint contributes no pair data");
 
   // A deterministic client error (404/HTML) is the same story.
   resetFeedMakeup();

@@ -601,3 +601,38 @@ tick 時發）。
 **驗收點**：deploy 後每個 5 分鐘 tick 應該見到 `profiles ≈ 24`（重用 20 ＋ make-up 4）而 `lastRawProfiles 仍 0`、`failedTotal` 仍然每 5 分鐘 +1 —— 即係「上游真係 429，但嗰分鐘唔再盲目」。
 
 **未處理（另計）**：429 本身仍然存在（~12 次/小時）；要壓落去就要降低請求頻率（例如隔一個 tick 抓一次）或者換源 —— 呢個係獨立決定，唔屬第八補。
+
+**Deploy 後首個 5 分鐘 tick（18:11:11，version `dd1c1ec4`）— 重用生效，但揭出第二個損失**：
+
+| tick | prof | feedReq | raw | fail | inj | jup | pool |
+|---|---|---|---|---|---|---|---|
+| **18:11:11（min%5==1）** | **26** | 4 | **0** | 1 | 16 | **0** | — |
+| 18:12:11（正常） | 26 | 5 | 22 | 1 | 20 | 20 | 272 |
+| 18:13:11（正常） | 26 | 6 | 22 | 1 | 24 | 20 | 340 |
+
+- `prof 26` ＝ **重用 22 ＋ make-up 4** ✓（同正常 tick 嘅組成一樣）→ 以前呢個 tick 只會評估 4 個 make-up 幣。
+- 但同一個 tick **`jup=0`**：profiles call 係 `await` 先嘅，燒盡 320ms budget 之後，fan-out 嘅其餘 feed 只剩 ~226ms，而 `fetchFeedCapped` 嘅 250ms 下限會令**每一個 fan-out feed 直接短路回空**（唔係 Jupiter 自己 throttle 嘅問題）→ 嗰分鐘整個 fan-out 都空。即係 5 分鐘週期嘅實際代價 ＝ profiles 22 幣（已由重用救回）＋ Jupiter 20 幣（未救）。
+- 下一補（第九補）就係修呢個 —— **唔需要改 `scanner.ts:1819`**（原本以為要，實際喺 client 層改得到）。
+
+### 第九補：令 429 快速讓路，唔再燒盡 feed 窗口
+
+**更正上面嘅推測**：唔係「Jupiter throttle 來不及」，而係 profiles call 返得太遲（+674ms）→ fan-out 只剩 226ms → **低過 `fetchFeedCapped` 嘅 250ms 下限**，所以每個 fan-out feed 連 HTTP 都唔發就回空。所以要修嘅係「profiles call 幾時放手」。
+
+**真正嘅燃燒路徑**（我初時估錯，用 stub 量清楚）：
+
+1. 第 1 次嘗試撞 429（~10ms 就到）→ `note429()` 記錄 + 武裝 90s backoff。
+2. 舊嘅 catch 分支 `await sleep(min(attempt*2000, left))` —— `left = 314ms` → **睡足 314ms**（把整個剩餘 budget 睡掉）。
+3. 第 2 次嘗試只等 throttle（**default 350ms**，prod 設 250ms）→ 但佢嘅 `AbortSignal` 死線早已經過 → **實際冇發過 request**，直接 abort throw。
+4. 總計 ≈ 674ms，全程冇第二个真 request。
+
+**改法（全部喺 `src/dexscreener.ts`，窗口內）**：
+
+- 新增 `RETRY_MIN_ATTEMPT_MS = 250`；`retryHeadroomMs = dexRequestIntervalMs + 250`。
+- 不滿 headroom **或**係 429（而 caller 有 deadline）→ `break`：**唔開始一定輸嘅第二次嘗試**，立即 throw 出去（`note429` 已經記錄嗰次 429）。
+- 5xx / 網路錯誤仍然保留重試（但同樣要夠 headroom）；unbounded caller（無 deadline）行為不變（2s/4s）。
+
+**本地量度**（同一個 429 stub，改前/改後）：429 `calls=1 took=+26ms`（改前 ~350ms）；500 `calls=1 took=+0ms`；404 `calls=1` ✓。
+
+**代價（講清楚）**：profiles call 嘅 320ms budget 細過 headroom 500ms，所以 5xx 都一樣 fail-fast、冇重試 —— 依賴嘅係（一）每 60s 都會再試、（二）失敗時有第八補嘅 last-good 重用。pair 路徑（1000ms budget）仍然有空間重試，所以冇刪走條路。
+
+**驗收點**：deploy 後嘅 5 分鐘 tick 應該 `jup ≈ 20`（原本 0）而 `profiles 仍 ≈ 26`（重用 20＋make-up）、`lastRawProfiles 仍 0`、`failedTotal` 仍然每 5 分鐘 +1。
