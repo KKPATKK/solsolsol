@@ -244,6 +244,93 @@ async function feedTests() {
   assert.equal(hungView.lastInjected, 1, "the make-up is what filled the list");
   assert.equal(hungView.feedRequests, 1);
   reg.recover("FEED_A");
+
+  // ---------- last-good reuse: a 429 stops costing the tick its coins ------ 
+  // Measured live 2026-09-19: DexScreener 429s this endpoint once per ~5 minutes
+  // on the shared egress (18/18 ticks at minute%5==1 read `lastRawProfiles 0`
+  // with `http429` +1 inside the tick), so one tick in five evaluated only the
+  // make-up list. More self-budget cannot help — a 429 answers in ~350ms — the
+  // scarce resource is the LIST, so the previous one is evaluated again.
+  const { shouldReuseProfileList, PROFILE_FEED_REUSE_MS } = require("../dist/dexscreener.js");
+  const refNow = 1_800_000_000_000;
+  assert.equal(
+    shouldReuseProfileList(0, true, refNow, refNow, PROFILE_FEED_REUSE_MS),
+    true,
+    "a failed fetch reuses a fresh list",
+  );
+  assert.equal(
+    shouldReuseProfileList(20, false, refNow, refNow, PROFILE_FEED_REUSE_MS),
+    false,
+    "a non-empty live fetch always wins",
+  );
+  assert.equal(
+    shouldReuseProfileList(0, false, refNow, refNow, PROFILE_FEED_REUSE_MS),
+    true,
+    "an empty answer reuses it too — evaluating nothing helps nobody",
+  );
+  assert.equal(
+    shouldReuseProfileList(0, true, refNow - PROFILE_FEED_REUSE_MS - 1, refNow, PROFILE_FEED_REUSE_MS),
+    false,
+    "a list older than the window is never resurrected — a dead feed must show up",
+  );
+  assert.equal(
+    shouldReuseProfileList(0, true, null, refNow, PROFILE_FEED_REUSE_MS),
+    false,
+    "nothing cached (fresh isolate), nothing to reuse",
+  );
+  assert.equal(
+    shouldReuseProfileList(0, false, refNow + 5_000, refNow, PROFILE_FEED_REUSE_MS),
+    false,
+    "a clock that moved backwards is not a fresh cache",
+  );
+
+  // The real client path: one successful tick, then the rate-limited one.
+  resetFeedMakeup();
+  reg.recover("FEED_A");
+  stub(feedBody);
+  dex = freshDex();
+  const live = await dex.fetchLatestSolanaProfiles();
+  assert.deepEqual(
+    live.map((p) => p.tokenAddress),
+    ["FEED_A"],
+    "the first fetch is the live list",
+  );
+  resetFeedMakeup();
+  globalThis.fetch = async () =>
+    new Response("rate limited", {
+      status: 429,
+      headers: { "Content-Type": "text/plain" },
+    });
+  const reused = await dex.fetchLatestSolanaProfiles();
+  assert.deepEqual(
+    reused.map((p) => p.tokenAddress),
+    ["FEED_A"],
+    "the rate-limited tick evaluates the last good list instead of nothing",
+  );
+  const reuseView = feedMakeupView();
+  assert.equal(reuseView.lastRawProfiles, 0, "the outage is STILL reported as 0 raw profiles");
+  assert.equal(reuseView.failedTotal, 1, "and still counted as a failed fetch");
+  assert.equal(reuseView.lastFailedAt !== null, true, "and still stamped");
+  assert.equal(
+    reuseView.injectedTotal,
+    0,
+    "nothing was deferred, so the reused list needs no make-up",
+  );
+  assert.equal(reuseView.feedRequests, 1, "one feed request per tick, however it resolves");
+
+  // A brand-new client has no cached list, so it degrades to the old behaviour
+  // (make-up only) rather than inventing one.
+  resetFeedMakeup();
+  reg.defer("FEED_A", 104);
+  dex = freshDex();
+  const cold = await dex.fetchLatestSolanaProfiles();
+  assert.deepEqual(
+    cold.map((p) => p.tokenAddress),
+    ["FEED_A"],
+    "a cold isolate still falls back to the make-up alone",
+  );
+  assert.equal(feedMakeupView().lastRawProfiles, 0);
+  reg.recover("FEED_A");
 }
 
 // ---------- the whole tick: the make-up coin is EVALUATED, not just listed ----

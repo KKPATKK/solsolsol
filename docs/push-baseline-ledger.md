@@ -573,3 +573,31 @@ flush），並抽成純函數 `deadTickRebuildDecision(prevRaw, now, staleMs)`�
 **驗收點**：`/health` 嘅 `outageAlertAt` 應該喺「有 tick 但零完成 ≥3 分鐘」時更新（舊行為下唔會動）；
 GitHub/Telegram 收到嗰句新訊息；`scan_history` 應該見到同期嘅 backfill 行（呢個 alert 只會在真係連續死
 tick 時發）。
+
+### 第八補：每 5 分鐘一次嘅 profiles 429（之前診斷錯咗）
+
+**量度（2026-09-19，兩個獨立樣本夾住 17:46:11 嗰個 tick）**：
+
+| tick | prof | feedRequests | lastRawProfiles | failedTotal | http429 | jup | feedsMs |
+|---|---|---|---|---|---|---|---|
+| 17:45:11（正常） | 24 | 20 | 20 | 4 | 4（last429At 17:41:08） | 20 | 714 |
+| **17:46:11（minute%5==1）** | **4** | 21 | **0** | **5** | **4→5（last429At 17:46:08.049）** | 20 | 758 |
+| 17:47:11（正常） | 24 | 22 | 20 | 5 | 5（blockedForMs 30428） | 20 | 758 |
+
+- 過去兩小時：**18/18** 個 `minute%5==1` 嘅 tick 都係 `prof=4`（＝只有 make-up），其餘 tick 全部 `prof>5`。
+- `failedAt 17:46:08.365` − tick 開始 `17:46:07.691` = **674ms** ＝ 前段 ~354ms ＋ `PROFILE_FEED_SELF_BUDGET_MS` 320ms。
+- `jup=20` 同一個 tick ✓ → **唔係** 窗口被搶、唔係 pool rotation 食預算。
+- **結論：係 HTTP 429**（`http429` 喺該 tick 內 +1，之後武裝 ~30s backoff），來自共享 CF egress；週期性最可能係該端點嘅 ~5 分鐘配額（我們 1 req/min 剛好踩到窗口邊界）。
+
+**我上次嘅建議係錯嘅**：叫「把 `PROFILE_FEED_SELF_BUDGET_MS` 320 → 700–900」冇用 —— 429 約 350ms 就返；而且 >546ms 會令呢個 call 超過 scanner 嘅 `feedDeadline`（`startedAt + 900`），種族會連 make-up 一齊丟（變返 `prof=0`，比現狀更差）。**改一個常數係解決唔到。**
+
+**改嘅係「嗰分鐘評估咗乜」**（`src/dexscreener.ts`，全部窗口內）：
+
+- 新增 `lastGoodProfiles`（記憶體）＋ `PROFILE_FEED_REUSE_MS = 10 分鐘` ＋ 純函數 `shouldReuseProfileList()`。
+- 非空且成功嘅 fetch 永遠贏；失敗（429/404/hang）或答空 → 重評估上一份好名單（10 分鐘內）。
+- **故障訊號保持誠實**：`noteProfileFeed()` 仍然收到 **fetch 到嘅長度**（429 時 = 0），所以 `lastRawProfiles` / `failedTotal` / `lastFailedAt` / `emptyFeedTotal` 照舊報上游實情；變嘅只係「呢個 tick 評估乜」。
+- 冷 isolate（無 cache）行為不變 → 退化成舊行為（只有 make-up）。
+
+**驗收點**：deploy 後每個 5 分鐘 tick 應該見到 `profiles ≈ 24`（重用 20 ＋ make-up 4）而 `lastRawProfiles 仍 0`、`failedTotal` 仍然每 5 分鐘 +1 —— 即係「上游真係 429，但嗰分鐘唔再盲目」。
+
+**未處理（另計）**：429 本身仍然存在（~12 次/小時）；要壓落去就要降低請求頻率（例如隔一個 tick 抓一次）或者換源 —— 呢個係獨立決定，唔屬第八補。

@@ -97,6 +97,56 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export const PROFILE_FEED_SELF_BUDGET_MS = 320;
 
 /**
+ * How long the last non-empty profile list may be evaluated again when the
+ * next fetch produces nothing usable (see shouldReuseProfileList).
+ *
+ * WHY (2026-09-19, measured live): /token-profiles/latest/v1 answers **429
+ * once per ~5 minutes** on the shared worker egress. Two independent samples of
+ * the tick at minute%5==1: `lastRawProfiles 0, failedTotal +1, http429 +1,
+ * last429At` inside that very tick, `blockedForMs` armed afterwards — and in
+ * the preceding two hours **18 of 18** such ticks matched while every other
+ * tick returned 20 raw profiles. The cost was one tick in five discovering
+ * nothing (`profiles 4` = the make-up list alone).
+ *
+ * Widening PROFILE_FEED_SELF_BUDGET_MS cannot fix this: a 429 answers in
+ * ~350ms, so more budget only buys more retry attempts against a door that is
+ * shut for ~30s. What is scarce is not time, it is the list — and the previous
+ * tick's list is a fine stand-in (the feed is a slowly rotating ~24-slot list,
+ * and its coins are what the pool re-evaluates anyway).
+ *
+ * The bound exists so a DEAD feed cannot be papered over forever: past it, the
+ * tick goes back to the make-up list alone. 10 minutes is deliberately longer
+ * than the 5-minute outage cycle it absorbs, and short enough that a permanent
+ * rate-limit shows up as `profiles` collapsing to the make-up size.
+ */
+export const PROFILE_FEED_REUSE_MS = 10 * 60_000;
+
+/**
+ * Should this tick evaluate the previous profile list instead of the one it
+ * just fetched? Pure and exported so the rule is unit-tested rather than only
+ * observed (scripts/test-deferred-priority.js).
+ *
+ * A non-empty fetch always wins — it is the fresh list. A failure (429, 404, a
+ * hung upstream abandoned at the budget) or an empty answer reuses the last
+ * good list, but only while it is younger than the window and only if one was
+ * ever fetched.
+ */
+export function shouldReuseProfileList(
+  fetched: number,
+  failed: boolean,
+  cachedAt: number | null,
+  now: number,
+  maxAgeMs: number,
+): boolean {
+  if (fetched > 0 && !failed) return false;
+  if (typeof cachedAt !== "number" || !Number.isFinite(cachedAt) || !(cachedAt > 0)) {
+    return false;
+  }
+  const age = now - cachedAt;
+  return age >= 0 && age <= maxAgeMs;
+}
+
+/**
  * Compound momentum gate: a coin qualifies when its 5-minute tape is hot
  * (fast pump in progress right now) OR its 1-hour tape is hot (pumped
  * within the last hour and possibly consolidating between spikes — the
@@ -277,6 +327,13 @@ export class DexScreenerClient {
   private http429Total = 0;
   /** Epoch of the most recent 429 response, or null if never. */
   private last429At: number | null = null;
+  /**
+   * The last profile fetch that returned coins, and when (see
+   * PROFILE_FEED_REUSE_MS): what a rate-limited tick evaluates instead of
+   * nothing. In-memory by design — the scanner hands this list to the tick, so
+   * a recycled isolate simply starts without it.
+   */
+  private lastGoodProfiles: { at: number; list: TokenProfile[] } | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -478,10 +535,31 @@ export class DexScreenerClient {
     // tick carrying make-up entries reads a few above the real feed size
     // (≤ DEFERRED_MAKEUP_MAX) — which is also the only observable that says
     // the make-up is pulling coins in BEFORE the first `deferRecovered` rise.
-    const makeup = missingDeferredTokens(feed.map((p) => p.tokenAddress));
-    noteProfileFeed(feed.length, makeup.length, Date.now(), failed);
-    if (makeup.length === 0) return feed;
-    return [...feed, ...makeup.map((tokenAddress) => ({ tokenAddress }))];
+    //
+    // Last-good reuse (2026-09-19, see PROFILE_FEED_REUSE_MS): a 429 (or a hung
+    // upstream, or an empty answer) used to leave the tick evaluating ONLY the
+    // make-up coins — one tick in five discovered nothing. Evaluating the
+    // previous list again recovers that minute's coins.
+    //
+    // THE OUTAGE SIGNAL STAYS THE FETCH'S, NOT THE EVALUATION'S: noteProfileFeed
+    // is still handed `feed.length` (0 on a 429), so lastRawProfiles /
+    // failedTotal / lastFailedAt / emptyFeedTotal keep reporting what the
+    // upstream did. Only what this tick EVALUATES changes — a masked feed stays
+    // impossible to miss in /health.summary.feedMakeup.
+    const now = Date.now();
+    const reuse = shouldReuseProfileList(
+      feed.length,
+      failed,
+      this.lastGoodProfiles?.at ?? null,
+      now,
+      PROFILE_FEED_REUSE_MS,
+    );
+    const evaluated = reuse && this.lastGoodProfiles ? this.lastGoodProfiles.list : feed;
+    if (!failed && feed.length > 0) this.lastGoodProfiles = { at: now, list: feed };
+    const makeup = missingDeferredTokens(evaluated.map((p) => p.tokenAddress));
+    noteProfileFeed(feed.length, makeup.length, now, failed);
+    if (makeup.length === 0) return evaluated;
+    return [...evaluated, ...makeup.map((tokenAddress) => ({ tokenAddress }))];
   }
 
   /**
