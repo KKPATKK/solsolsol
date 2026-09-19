@@ -13,11 +13,12 @@
  * WHY A RUNTIME SEAM
  * The worker constructs the scanner and calls it once per tick, and the
  * completion heartbeat publishes `scanner.lastSummary` verbatim. So the probe
- * wraps the two things the worker can reach — the tick entry (`runOnce`) and
- * the phase marker (`markPhase`) — keeps every stamp of the tick instead of
- * just the last, and attaches them to the summary the heartbeat already
- * carries. Nothing about the scanner's own behaviour changes: the wrapper calls
- * the original marker and the original tick in order, and only adds fields.
+ * wraps the things the worker can reach — the tick entry (`runOnce`), the phase
+ * marker (`markPhase`) and the DB handle (`db`) — keeps every stamp of the tick
+ * instead of just the last, and attaches its measurements to the summary the
+ * heartbeat already carries. Nothing about the scanner's own behaviour
+ * changes: the wrapper calls the original marker / method / tick in order, and
+ * only adds fields.
  *
  * WHAT IT PROVES (live use)
  *   - `summary.phases` = where the tick actually spent its budget, e.g.
@@ -29,6 +30,27 @@
  *     (`summary.modeRead`, `summary.feedMakeup`) without the heartbeat literal
  *     being editable — see jupiter.ts's prefetchMode and deferredmakeup.ts's
  *     feed view.
+ *
+ * WHY THE DB SEAM (2026-09-19, later)
+ * The front phase's cost is not the pair fetch: live after the 1250→1000ms cut
+ * the eval phase was STILL 2.0-3.7s, and the tick kept arriving at the claim
+ * (boundary 3550ms) just too late. The remaining steps between the pair fetch
+ * and the candidate chain are DB round trips the gates do not read:
+ * `recordTokenStatsMany` (registration) and `updateTokenMaxMcaps` (raise-only
+ * bookkeeping). Both are pure persistence for the tick — the scanner's own
+ * maps already hold the data the gates read, and its comment on the
+ * registration explicitly accepts a lost tick ("the feed re-registers the coin
+ * next tick"). So the probe TIMES them always, and can DEFER them: the scanner
+ * is handed an already-resolved promise, the real call is queued FIFO, and the
+ * worker drains the queue AFTER its completion flush (see the worker's
+ * `drainDeferredWrites` call), i.e. outside the scan race the claim gate
+ * measures.
+ *
+ * The read (`getTokenStatsMany`) is only TIMED, never deferred — the gates
+ * consume its result in the same tick. And the deferral is scoped to the TICK
+ * (`tickActive`): the same Db handle also serves callers outside a tick — the
+ * worker's own backfill endpoint awaits its seed before responding — and those
+ * keep their normal, immediate contract.
  */
 
 /** One phase stamp, tick-relative ms (see Scanner.markPhase). */
@@ -70,6 +92,17 @@ interface TickProbeTarget extends TickProbeSeam {
   lastSummary?: unknown;
 }
 
+/**
+ * The DB methods the probe may wrap. Loosely typed on purpose: the probe never
+ * inspects the arguments or the result, it only forwards them, so the real
+ * handle (with its own signatures) satisfies this structurally.
+ */
+export interface TickProbeDb {
+  getTokenStatsMany?: (...args: never[]) => Promise<unknown>;
+  recordTokenStatsMany?: (...args: never[]) => Promise<unknown>;
+  updateTokenMaxMcaps?: (...args: never[]) => Promise<unknown>;
+}
+
 /** Per-tick hooks for the caller (the worker owns what they attach). */
 export interface TickProbeHooks {
   /**
@@ -84,15 +117,135 @@ export interface TickProbeHooks {
    * reaches /health.
    */
   onTickEnd?: (summary: unknown) => void;
+  /**
+   * The scan's DB handle. Wrapped once per object (a rebuilt handle is a new
+   * object); see the header for what is measured and what may be deferred.
+   */
+  db?: TickProbeDb;
+  /**
+   * Move the two write round trips out of the tick (see the header). Default
+   * false: wrapped and timed, but still awaited in place. Turning it on
+   * requires the caller to drain (see drainDeferredWrites) — the worker does
+   * that after its completion flush.
+   */
+  deferWrites?: boolean;
+}
+
+/** One DB call the probe measured, cumulative per isolate. */
+export interface DbStepView {
+  calls: number;
+  ms: number;
+}
+
+/** What a (worker-side) drain did, or null before the first one. */
+export interface WriteDrainView {
+  /** Calls drained in the most recent drain. */
+  calls: number;
+  /** Wall-clock ms that drain took. */
+  ms: number;
+  /** Epoch of the last drain that actually ran (0 before the first one). */
+  at: number;
+  /** Deferred calls whose real write threw. */
+  failures: number;
+  /** Cumulative since the isolate booted, so the effect is readable either way. */
+  totals: { calls: number; ms: number; failures: number };
 }
 
 let view: TickProbeView | null = null;
 let tickStartedAt = 0;
 let stamps: TickPhaseStamp[] = [];
+/**
+ * Clock used by the DB seam and the drain. Production passes `Date.now` (see
+ * installTickProbe's `now`); tests inject their own, which is the only way the
+ * per-step ms can be asserted instead of merely observed.
+ */
+let dbClock: () => number = () => Date.now();
+
+/** Writes waiting for the drain, in call order. */
+let queue: Array<{ name: string; run: () => Promise<unknown> }> = [];
+/** Cumulative per-method timing for this isolate. */
+const steps = new Map<string, DbStepView>();
+let drain: WriteDrainView = {
+  calls: 0,
+  ms: 0,
+  at: 0,
+  failures: 0,
+  totals: { calls: 0, ms: 0, failures: 0 },
+};
+/** DB handles already wrapped (double wrapping would double every write). */
+const wrapped = new WeakSet<object>();
+/**
+ * True while a wrapped tick is running. Deferral is scoped to it so that the
+ * same Db handle's calls from OUTSIDE a tick (the worker's backfill endpoint)
+ * keep their normal contract — only the tick's own bookkeeping writes move.
+ */
+let tickActive = false;
 
 /** The tick that finished most recently, or null before the first one. */
 export function tickProbeView(): TickProbeView | null {
   return view ? { phases: view.phases.map((p) => ({ ...p })), tickMs: view.tickMs } : null;
+}
+
+/** Per-method DB timing since this isolate booted (see the header). */
+export function dbStepView(): Record<string, DbStepView> {
+  const out: Record<string, DbStepView> = {};
+  for (const [name, s] of steps) out[name] = { ...s };
+  return out;
+}
+
+/** The most recent drain plus its cumulative totals (see the header). */
+export function writeDrainView(): WriteDrainView {
+  return { ...drain, totals: { ...drain.totals } };
+}
+
+/** How many deferred writes are still waiting (0 = nothing queued). */
+export function deferredWriteCount(): number {
+  return queue.length;
+}
+
+/**
+ * Run every queued write, in call order, and report what it cost. Called by
+ * the worker AFTER its completion flush: the tick's own scan race is over, so
+ * this round trip can no longer delay a card's claim — it only costs the
+ * invocation's tail. Failures are counted and logged, never thrown: the
+ * scanner logs its own write failures, and a deferred write has nobody left
+ * to catch for it.
+ */
+export async function drainDeferredWrites(): Promise<WriteDrainView> {
+  const pending = queue;
+  queue = [];
+  if (pending.length === 0) {
+    // Nothing was queued: report the empty batch without erasing the last real
+    // drain's stamp, so a reader can tell "nothing to do" from "never drained".
+    drain = { ...drain, calls: 0, ms: 0, failures: 0 };
+    return writeDrainView();
+  }
+  const startedAt = dbClock();
+  let failures = 0;
+  for (const call of pending) {
+    try {
+      await call.run();
+    } catch (err) {
+      failures += 1;
+      console.error(
+        `[tickprobe] deferred ${call.name} failed:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  const ms = dbClock() - startedAt;
+  drain = {
+    calls: pending.length,
+    ms,
+    at: dbClock(),
+    failures,
+    totals: {
+      calls: drain.totals.calls + pending.length,
+      ms: drain.totals.ms + ms,
+      failures: drain.totals.failures + failures,
+    },
+  };
+  return writeDrainView();
 }
 
 /** Test seam: the probe is module state, like the scanner's own mirrors. */
@@ -100,6 +253,69 @@ export function resetTickProbe(): void {
   view = null;
   tickStartedAt = 0;
   stamps = [];
+  queue = [];
+  steps.clear();
+  dbClock = () => Date.now();
+  drain = { calls: 0, ms: 0, at: 0, failures: 0, totals: { calls: 0, ms: 0, failures: 0 } };
+}
+
+function noteStep(name: string, ms: number): void {
+  const seen = steps.get(name) ?? { calls: 0, ms: 0 };
+  steps.set(name, { calls: seen.calls + 1, ms: seen.ms + ms });
+}
+
+/**
+ * Wrap one DB method. A read is timed and still awaited by the scanner; a
+ * deferred write hands the scanner an already-resolved promise and queues the
+ * real call (see the header).
+ */
+function wrapDbMethod(
+  target: Record<string, unknown>,
+  name: string,
+  defer: boolean,
+): void {
+  const original = target[name];
+  if (typeof original !== "function") return;
+  const call = original as (...args: unknown[]) => Promise<unknown>;
+  target[name] = (...args: unknown[]): Promise<unknown> => {
+    if (!defer || !tickActive) {
+      const at = dbClock();
+      return call.apply(target, args).then(
+        (value) => {
+          noteStep(name, dbClock() - at);
+          return value;
+        },
+        (err: unknown) => {
+          noteStep(name, dbClock() - at);
+          throw err;
+        },
+      );
+    }
+    queue.push({
+      name,
+      run: async () => {
+        const at = dbClock();
+        try {
+          return await call.apply(target, args);
+        } finally {
+          noteStep(name, dbClock() - at);
+        }
+      },
+    });
+    return Promise.resolve();
+  };
+}
+
+/** Wrap the three DB methods the tick uses around its gates (see the header). */
+function wrapDb(db: TickProbeDb, deferWrites: boolean): void {
+  if (wrapped.has(db as object)) return;
+  wrapped.add(db as object);
+  const target = db as Record<string, unknown>;
+  // Reads keep their contract (the gates consume the result in this tick).
+  wrapDbMethod(target, "getTokenStatsMany", false);
+  // Writes: registration + raise-only bookkeeping, neither read by the gates.
+  wrapDbMethod(target, "recordTokenStatsMany", deferWrites);
+  wrapDbMethod(target, "updateTokenMaxMcaps", deferWrites);
 }
 
 /**
@@ -112,6 +328,10 @@ export function installTickProbe(
   hooks: TickProbeHooks = {},
   now: () => number = () => Date.now(),
 ): void {
+  if (hooks.db) {
+    dbClock = now;
+    wrapDb(hooks.db, hooks.deferWrites === true);
+  }
   const target = seam as TickProbeTarget;
   const marker =
     typeof target.markPhase === "function" ? target.markPhase.bind(target) : null;
@@ -130,6 +350,7 @@ export function installTickProbe(
     tickStartedAt = now();
     stamps = [];
     view = null;
+    tickActive = true;
     try {
       hooks.onTickStart?.();
     } catch {
@@ -138,6 +359,9 @@ export function installTickProbe(
     try {
       return await runOnce();
     } finally {
+      // Tick over: a straggler write from here on is awaited by its caller
+      // again (the queue keeps only what the tick itself queued).
+      tickActive = false;
       const captured = stamps;
       view = {
         phases: captured,

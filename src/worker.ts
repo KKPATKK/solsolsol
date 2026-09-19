@@ -24,7 +24,12 @@ import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner, deferredPushTokens } from "./scanner";
 import { feedMakeupView } from "./deferredmakeup";
-import { installTickProbe } from "./tickprobe";
+import {
+  installTickProbe,
+  dbStepView,
+  writeDrainView,
+  drainDeferredWrites,
+} from "./tickprobe";
 import {
   PUSH_DEFERRAL_STATE_KEY,
   heldBackCandidates,
@@ -1083,6 +1088,15 @@ async function ensureInitialized(env: Env): Promise<void> {
         //     start makes the chain's call a cache hit instead of a Turso
         //     round trip the tick cannot afford — with `modeRead` publishing
         //     reads/reuses/timeouts so the effect is visible, not assumed.
+        // The DB seam (src/tickprobe.ts): the gates' registration read is
+        // timed, and the tick's two WRITE round trips (registration insert +
+        // max-mcap UPDATE) are taken off the scan's CRITICAL PATH — they used
+        // to sit between the pair fetch and the candidate chain, the stretch
+        // that kept the card's claim arriving past the boundary (live:
+        // `cand>0 & pushed=0` on every candidate tick, front phases ending at
+        // 3.2-3.4s against a 3550ms claim gate). The scanner is handed resolved
+        // promises and the real calls are drained from onTickEnd below, i.e.
+        // after the chain and the tracker pass.
         installTickProbe(scanner, {
           onTickStart: () => trade?.prefetchMode(),
           onTickEnd: (summary) => {
@@ -1090,7 +1104,24 @@ async function ensureInitialized(env: Env): Promise<void> {
             if (!view) return;
             view.modeRead = trade?.modeStats() ?? null;
             view.feedMakeup = feedMakeupView();
+            view.dbSteps = dbStepView();
+            // Describes the drain that ran after the PREVIOUS tick: the
+            // summary is serialized before this tick's own drain starts.
+            view.writeDrain = writeDrainView();
+            // Fire the drain WITHOUT awaiting it: the tick's budget is done
+            // with these writes (that is the whole point of deferring them),
+            // so the invocation tail must not pay for them either. The queue
+            // is module state, so an isolate recycled before the drain lands
+            // simply hands the same calls to the next tick's drain -- in call
+            // order, which is the order the scanner wrote them in (the
+            // registration insert first, then the max-mcap UPDATE). Same
+            // pattern the deferral-counter sync already relies on ("its
+            // promise is left running -- an idempotent write is welcome to
+            // land late").
+            void drainDeferredWrites();
           },
+          db,
+          deferWrites: true,
         });
         // Hydrate durable deferred-card identities before the first scan in
         // this isolate; counters alone cannot guarantee a make-up push.

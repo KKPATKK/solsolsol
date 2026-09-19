@@ -182,15 +182,18 @@ const CANDIDATE_PUSH_RESERVE_MS = 900;
  * as a delivery failure — its claim is released and the coin stays in the
  * re-eval pool, so the next tick retries it.
  *
- * NOTE (2026-09-19): this floor (600) is UNDER the claim gate's requirement
- * (CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS = 650), so once the floor starts
- * binding at ~3600ms the gate refuses every claim and the last usable claim
- * start is 3550ms — the tick still holds 850ms of unused tail. Raising the
- * floor to 700 would move that boundary to 3750ms; it is left as it is because
- * the boundary is pinned by a unit test that lives past the file-sync window
- * (scripts/test-unit.js ~81k). The tail latency that made the claim arrive
- * late at all is removed instead — see the trade-mode prefetch in jupiter.ts
- * and the chain's per-phase capture in the worker.
+ * NOTE (2026-09-19, later): this floor (600) is UNDER the claim gate's
+ * requirement (CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS = 650), so once it
+ * starts binding the gate refuses every claim and the last usable claim start
+ * is 3550ms — the tick still holds 850ms of unused tail. Raising it above 650
+ * would hand that limit back to the thing sized for it (CARD_SEND_TAIL_MS =
+ * 4400, ~340ms inside the smallest race window observed) and move the boundary
+ * to 3750ms, but that boundary is pinned by a unit test that lives past the
+ * file-sync window (scripts/test-unit.js: `cardClaimDeadline(t0, t0 + 3_551)`
+ * must be null). The tail LATENCY that made the claim arrive late at all is
+ * removed instead — see the trade-mode prefetch in jupiter.ts, the chain's
+ * per-phase capture in the worker, and the DB write batch the tick probe takes
+ * out of the tick entirely (tickprobe.ts).
  */
 const CARD_SEND_FLOOR_MS = 600;
 /**
@@ -819,6 +822,26 @@ export interface ScanSummary {
   poolMs?: number;
   /** Wall-clock ms for matching + candidate gate evaluation. */
   evalMs?: number;
+  /**
+   * Per-DB-method timing the tick probe measured this isolate (calls + total
+   * ms; see tickprobe.ts). `getTokenStatsMany` is the registration read, which
+   * sits between the pair fetch and the gates; the two writes are the tick's
+   * post-gate persistence. Cumulative, so the averages are readable live.
+   */
+  dbSteps?: Record<string, { calls: number; ms: number }>;
+  /**
+   * The write batch the tick probe kept OFF the scan's critical path: how many
+   * calls waited, how long the worker's drain took, and the failures it saw
+   * (see tickprobe.ts). The scanner's own writes are no longer awaited inside
+   * the tick, so this is where their cost and their health are visible.
+   */
+  writeDrain?: {
+    calls: number;
+    ms: number;
+    at: number;
+    failures: number;
+    totals: { calls: number; ms: number; failures: number };
+  } | null;
   /**
    * Wall-clock ms the scan spent in tick-scoped Turso round trips (see
    * Db.enterScanMode / SCAN_DB_TIMEOUT_MS). The ladder's biggest UN-RACED

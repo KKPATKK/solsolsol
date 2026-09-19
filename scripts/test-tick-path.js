@@ -1,11 +1,13 @@
 /*
  * Push-path instrumentation tests (2026-09-19): the per-tick probe that records
- * every phase stamp of a scan, and the trade-mode read that used to sit
- * unbounded inside the card's claim slice.
+ * every phase stamp of a scan, the trade-mode read that used to sit unbounded
+ * inside the card's claim slice, and the DB seam that times the tick's round
+ * trips and takes its two writes off the scan's critical path.
  *
- * Both exist because a tick that ends `candidates 1, pushed 0` had no way to
- * say where its four seconds went, and because an unclamped Turso read on the
- * critical tail is what turned qualifying coins into deferred cards. Run by
+ * All three exist because a tick that ends `candidates 1, pushed 0` had no way
+ * to say where its four seconds went, and because the steps between the pair
+ * fetch and the gates — an unclamped Turso read, then two write round trips —
+ * are what turned qualifying coins into deferred cards. Run by
  * `npm run test:unit` (after the build), or on its own:
  *   node scripts/test-tick-path.js
  */
@@ -15,6 +17,10 @@ const {
   tickProbeView,
   resetTickProbe,
   TICK_PROBE_MAX_PHASES,
+  dbStepView,
+  writeDrainView,
+  drainDeferredWrites,
+  deferredWriteCount,
 } = require("../dist/tickprobe.js");
 const { TradeService } = require("../dist/jupiter.js");
 const { resetFeedMakeup, noteProfileFeed, feedMakeupView } = require("../dist/deferredmakeup.js");
@@ -202,7 +208,163 @@ installTickProbe(fakeScanner, {
   resetFeedMakeup();
   assert.equal(feedMakeupView().feedRequests, 0, "the test seam resets the view");
 
-  console.log("tick probe + mode read + feed view: pass");
+  // ---------- the DB seam: timed reads, deferred writes --------------------
+  resetTickProbe();
+  clock = 10_000;
+  const wire = [];
+  const seamDb = {
+    async getTokenStatsMany(rows) {
+      wire.push("read");
+      clock += 120;
+      return new Map(rows.map((r) => [r, {}]));
+    },
+    async recordTokenStatsMany(rows) {
+      wire.push("register");
+      clock += 200;
+      return undefined;
+    },
+    async updateTokenMaxMcaps(raises) {
+      wire.push("mcap");
+      clock += 300;
+      return undefined;
+    },
+  };
+  const observed = [];
+  const seams = {
+    lastSummary: {},
+    markPhase() {},
+    async runOnce() {
+      // The tick's own order, exactly as runOnce makes these calls: the read
+      // first (the gates consume its result), then the two bookkeeping writes.
+      const readBack = await seamDb.getTokenStatsMany(["a", "b"]);
+      observed.push(readBack instanceof Map);
+      await seamDb.recordTokenStatsMany(["x"]);
+      observed.push("register-returned");
+      await seamDb.updateTokenMaxMcaps(["y"]);
+      observed.push("mcap-returned");
+    },
+  };
+  installTickProbe(seams, { db: seamDb, deferWrites: true }, now);
+  await seams.runOnce();
+
+  // The gates' read keeps its contract — awaited, same result — and is timed,
+  // because the chain cannot start before it answers. The two WRITES hand the
+  // scanner an already-resolved promise, which is the whole point: they used
+  // to sit between the pair fetch and the candidate chain.
+  assert.deepEqual(
+    observed,
+    [true, "register-returned", "mcap-returned"],
+    "the tick's read answers and its writes return at once",
+  );
+  assert.deepEqual(wire, ["read"], "only the read hit the wire during the tick");
+  assert.deepEqual(
+    dbStepView().getTokenStatsMany,
+    { calls: 1, ms: 120 },
+    "the registration read's round trip is measured",
+  );
+  assert.equal(deferredWriteCount(), 2, "both tick writes wait for the drain");
+  assert.equal(
+    dbStepView().recordTokenStatsMany,
+    undefined,
+    "and are not timed until they really run",
+  );
+
+  // The drain runs them in CALL ORDER — the scanner writes registration before
+  // the max-mcap raises, and the bookkeeping must not reorder them.
+  const drained = await drainDeferredWrites();
+  assert.deepEqual(wire, ["read", "register", "mcap"], "the drain keeps call order");
+  assert.equal(drained.calls, 2, "the drain reports the batch size");
+  assert.equal(drained.ms, 500, "and what the batch cost");
+  assert.equal(drained.failures, 0, "nothing failed");
+  assert.deepEqual(drained.totals, { calls: 2, ms: 500, failures: 0 }, "with cumulative totals");
+  assert.deepEqual(
+    dbStepView().recordTokenStatsMany,
+    { calls: 1, ms: 200 },
+    "each write is timed where it actually runs",
+  );
+  assert.equal(deferredWriteCount(), 0, "the queue is emptied");
+
+  // An empty drain is a no-op that keeps the totals (the worker drains every
+  // tick, whether or not the tick queued anything).
+  const empty = await drainDeferredWrites();
+  assert.equal(empty.calls, 0);
+  assert.equal(empty.ms, 0);
+  assert.equal(empty.totals.calls, 2, "the cumulative totals survive an empty drain");
+  assert.equal(writeDrainView().at, drained.at, "and the last real drain is still described");
+
+  // A deferred write that throws is counted, never rethrown at the drain: the
+  // scanner already returned, so nobody is left to catch it.
+  clock = 20_000;
+  const angryDb = {
+    async updateTokenMaxMcaps() {
+      clock += 40;
+      throw new Error("turso 522");
+    },
+  };
+  const angryTick = {
+    lastSummary: {},
+    markPhase() {},
+    async runOnce() {
+      await angryDb.updateTokenMaxMcaps([1]);
+    },
+  };
+  installTickProbe(angryTick, { db: angryDb, deferWrites: true }, now);
+  await angryTick.runOnce();
+  const failed = await drainDeferredWrites();
+  assert.equal(failed.calls, 1);
+  assert.equal(failed.failures, 1, "a failed deferred write is counted");
+  assert.equal(failed.totals.failures, 1, "and rolled into the totals");
+
+  // A write error must still reach the scanner when the caller did NOT ask for
+  // the deferral (deferWrites is off by default).
+  const strictDb = {
+    async recordTokenStatsMany() {
+      throw new Error("turso 4xx");
+    },
+  };
+  installTickProbe(
+    { lastSummary: {}, markPhase() {}, async runOnce() {} },
+    { db: strictDb },
+    now,
+  );
+  const timedBefore = dbStepView().recordTokenStatsMany?.calls ?? 0;
+  await assert.rejects(() => strictDb.recordTokenStatsMany([]), /turso 4xx/);
+  assert.equal(deferredWriteCount(), 0, "an undeferred write is never queued");
+  assert.equal(
+    dbStepView().recordTokenStatsMany.calls,
+    timedBefore + 1,
+    "but it is timed (and its error reaches the scanner)",
+  );
+
+  // The deferral is scoped to the TICK: the same handle is also called from
+  // outside one (the worker's own backfill endpoint awaits its seed before
+  // responding), and that call keeps its immediate contract.
+  assert.deepEqual(wire, ["read", "register", "mcap"], "outside a tick nothing is queued");
+  const timedBeforeOutside = dbStepView().recordTokenStatsMany?.calls ?? 0;
+  await seamDb.recordTokenStatsMany(["outside"]);
+  assert.deepEqual(wire, ["read", "register", "mcap", "register"], "an outside write goes straight out");
+  assert.equal(deferredWriteCount(), 0, "and is not queued");
+  assert.equal(
+    dbStepView().recordTokenStatsMany.calls,
+    timedBeforeOutside + 1,
+    "it is timed where it runs",
+  );
+
+  // Wrapping is per DB object: the worker's dead-tick rebuild creates a new
+  // handle, and a re-install on one already wrapped would double every write.
+  const target = {
+    lastSummary: {},
+    markPhase() {},
+    async runOnce() {
+      await seamDb.recordTokenStatsMany(["z"]);
+    },
+  };
+  installTickProbe(target, { db: seamDb, deferWrites: true }, now);
+  await target.runOnce();
+  assert.equal(deferredWriteCount(), 1, "a second install does not wrap the handle twice");
+  await drainDeferredWrites();
+
+  console.log("tick probe + mode read + feed view + db seam: pass");
 })().catch((err) => {
   console.error("push-path instrumentation tests failed:", err);
   process.exit(1);

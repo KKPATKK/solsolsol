@@ -129,6 +129,47 @@ fail-safe 一樣，唔會用未證實嘅 mode）。成本：**跨 isolate** 嘅 
 （118 tick 中 7 個，其中 5 個喺 deploy 後 2 分鐘內）。現在**照注入**，訊號搬到
 `feedMakeup.lastRawProfiles`（0 = 一樣嘅意思）同 `emptyFeedTotal`（跨 tick 累計）。
 
+## 卡片點解送唔出：DB 寫入批次搬出 tick（2026-09-19 再補）
+
+**量到嘅事實**：pair budget 由 1250 → 1000ms 之後，`evalMs` 仍然 2.0–3.7s，
+`cand>0 & pushed=0` 照樣出現。即係前段貴嘅唔係 pair fetch，而係 pair fetch 同 gates
+之間其餘嘅 Turso round trip。
+
+**改咗乜**：tick probe 加咗一個 DB seam（`src/tickprobe.ts`）——
+
+| DB 動作 | 之前 | 現在 |
+|---|---|---|
+| `getTokenStatsMany`（gates 要讀） | tick 內 await | **照舊** await，只係計時 |
+| `recordTokenStatsMany`（登記） | 喺 pair fetch 之後、gates 之前 await | 交返已 resolve 嘅 promise，真呼叫入 FIFO queue |
+| `updateTokenMaxMcaps`（max mcap raise） | 同樣位置，順序喺登記之後 | 入同一條 queue（順序保留） |
+
+worker 喺 tick 完結時 `void drainDeferredWrites()`（**唔** await）——即係兩個寫入嘅
+round trip 完全離開 tick。Scanner 側冇改一行：佢嘅 in-memory map 照舊有數據，
+`dbDegraded: "stats-write"` 呢個訊號改由 drain 用 `writeDrain.failures` 報。
+
+**睇 live**：
+
+```bash
+curl -s .../health | jq '.heartbeat.summary | {dbSteps, writeDrain}'
+curl -s .../health | jq '.heartbeat.summary | {phases, candidates, pushed, cardSendDeferred}'
+```
+
+- `dbSteps.<method> = {calls, ms}`：累計每步真實成本（deferred 寫入係喺 drain 時量）
+- `writeDrain = {calls, ms, at, failures, totals}`：`ms` 係 drain 本身用幾耐，`at` 係最後
+  一次**真正** drain 嘅時間；空 drain 係 `calls: 0` 但保留 `at`（分得清「冇嘢做」同「從未 drain」）
+- 成功嘅簽名：`phases` 最後幾個 stamp 由 `deferred`／`send:claim` 變成有 `send:telegram`，
+  之後照有 `tracker`／`done`，而 `cardSendDeferredTotal` 停止上升
+
+**要老實講**：
+
+1. Claim 窗口**仍然係 3550ms**（`CARD_SEND_FLOOR_MS = 600` < 650 = claim + 最少 send）。
+   呢個 boundary 由 `scripts/test-unit.js` 一個 assertion 釘死（`cardClaimDeadline(t0, t0 + 3_551)`
+   必須係 null），而嗰個位置喺檔案編輯窗口外 —— 所以今次改嘅係**延遲**（把寫入搬走），
+   唔係放寬 boundary。
+2. Deferred 寫入係 fire-and-forget：isolate 若喺 drain 落地前被回收，同一批呼叫會留到
+   **下一個 tick** 嘅 drain（FIFO、順序保留、呼叫本身 idempotent）。代價係登記／
+   max mcap 可能遲一個 tick —— scanner 嘅 read guard 本來就接受「一個 tick 冇登記」。
+
 ## 仍未落地（可選，非必需）
 
 本 repo 大檔嘅**多行**檔案編輯只能觸及大約頭 45–55KB（單行仍可），以下三個
