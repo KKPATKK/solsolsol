@@ -20,6 +20,12 @@ import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
 import { PushWatcher } from "./pushwatch";
 import { FlurryAnalyzer, type FlurryOutcome, type FlurryReport } from "./flurry";
+import {
+  addDeferredToken,
+  deferredTokenList,
+  dropDeferredToken,
+  isDeferredToken,
+} from "./deferredmakeup";
 
 
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -319,31 +325,28 @@ export function boundClaim(
  * pruned it) must not grow the set forever, so the oldest entry is evicted at
  * the cap. Pure and exported so the accounting is unit-testable — its caller
  * sits inside runOnce, which has no offline qualifying-coin fixture.
+ *
+ * The state itself lives in deferredmakeup.ts, because the obligation is also
+ * read by the discovery feed (dexscreener.ts) — the one list a tick always
+ * evaluates — and that module cannot import this one. It is the same registry
+ * read twice, never a copy: the feed pulls in every pending token the pool's
+ * rotation missed, which is what makes the make-up send happen on the NEXT
+ * tick instead of whenever the coin's band comes around (see the module).
  */
-const deferredPriorityTokens = new Set<string>();
 
 /** Pending deferred-card identities for the worker's post-flush persistence. */
 export function deferredPushTokens(): string[] {
-  return [...deferredPriorityTokens];
+  return deferredTokenList();
 }
 
 export class DeferredPushLedger {
-  private readonly pending = new Map<string, number>();
   private recoveredCount = 0;
 
   constructor(private readonly maxEntries = 500) {}
 
   /** Record that `token` was refused a card (idempotent per token). */
   defer(token: string, at: number): void {
-    if (token.length === 0 || this.pending.has(token)) return;
-    this.pending.set(token, at);
-    deferredPriorityTokens.add(token);
-    while (this.pending.size > this.maxEntries) {
-      const oldest = this.pending.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      this.pending.delete(oldest);
-      deferredPriorityTokens.delete(oldest);
-    }
+    addDeferredToken(token, at, this.maxEntries);
   }
 
   /**
@@ -351,24 +354,24 @@ export class DeferredPushLedger {
    * (so this push IS the make-up send the deferral promised).
    */
   recover(token: string): boolean {
-    if (!this.pending.delete(token)) return false;
-    deferredPriorityTokens.delete(token);
+    if (!dropDeferredToken(token)) return false;
     this.recoveredCount += 1;
     return true;
   }
 
   /** Coins deferred and not yet pushed back (visibility into the backlog). */
   get pendingCount(): number {
-    return this.pending.size;
+    return deferredTokenList().length;
   }
 
   /**
    * Pending tokens in oldest-first order. This is exposed for diagnostics and
    * for the bounded priority path that keeps deferred tokens ahead of normal
-   * rotation when they are present in the pool slice.
+   * rotation when they are present in the pool slice (see slicePoolRotation)
+   * and for the feed make-up pass that pulls in the ones that are not.
    */
   pendingTokens(): string[] {
-    return [...this.pending.keys()];
+    return deferredTokenList();
   }
 
   /** Deferrals that were followed by a real push — the at-least-once proof. */
@@ -707,12 +710,13 @@ export function slicePoolRotation<T>(
 ): { slice: T[]; nextCursor: number } {
   // A deferred initial card is a make-up obligation. When its token is still
   // present in the normal pool, move it ahead of the rotating window so a
-  // busy pool cannot make it wait for another sweep. The scanner's explicit
-  // deferred-token lookup handles the stronger case where it fell out of the
-  // current query entirely.
+  // busy pool cannot make it wait for another sweep. The stronger case — the
+  // coin fell out of the query entirely, so this list never sees it — is
+  // handled by the feed make-up pass (see deferredmakeup.ts), which pulls it
+  // back through the one list the tick always evaluates.
   const priority = items.filter((item) => {
     const token = (item as { tokenAddress?: unknown }).tokenAddress;
-    return typeof token === "string" && deferredPriorityTokens.has(token);
+    return typeof token === "string" && isDeferredToken(token);
   });
   const ordinary = items.filter((item) => !priority.includes(item));
   const ordered = priority.length > 0 ? [...priority, ...ordinary] : items;

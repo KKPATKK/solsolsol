@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config";
+import { missingDeferredTokens } from "./deferredmakeup";
 
 const BASE_URL = "https://api.dexscreener.com";
 
@@ -343,7 +344,32 @@ export class DexScreenerClient {
           typeof item.openTimestamp === "number" ? item.openTimestamp : undefined,
       });
     }
-    return profiles.slice(0, this.config.scanProfileLimit);
+    const feed = profiles.slice(0, this.config.scanProfileLimit);
+    // Deferred make-up (see deferredmakeup.ts): the scanner's deferred cards
+    // ride THIS list back into the tick.
+    //
+    // Why here and not the re-eval pool: a deferral only leaves the coin in
+    // the pool, and the pool is a rotation — the coin comes around in 3 min
+    // (near zone) or 18 min (far), and if a band move or an mcap/liquidity
+    // prune skipped it, never. Live 2026-09-19: `deferredTotal 53,
+    // recoveredTotal 0` in 10.3h, i.e. not one make-up send was observable.
+    // The profiles feed is the one list a tick ALWAYS evaluates, and its coins
+    // lead the candidate order, so the deferred coin is re-checked on every
+    // tick until it either qualifies (and gets pushed) or stops qualifying.
+    //
+    // Appended PAST `scanProfileLimit`, so the feed's own coins keep their
+    // slots, and skipped outright on an empty feed: a 429-backoff tick must
+    // keep reading as an empty feed (the `empty-feed-and-pool` skip and the
+    // `profiles: 0` in /health) instead of being masked by make-up coins.
+    //
+    // Readability note: this list is what /health reports as `profiles`, so a
+    // tick carrying make-up entries reads a few above the real feed size
+    // (≤ DEFERRED_MAKEUP_MAX) — which is also the only observable that says
+    // the make-up is pulling coins in BEFORE the first `deferRecovered` rise.
+    if (feed.length === 0) return feed;
+    const makeup = missingDeferredTokens(feed.map((p) => p.tokenAddress));
+    if (makeup.length === 0) return feed;
+    return [...feed, ...makeup.map((tokenAddress) => ({ tokenAddress }))];
   }
 
   /**
