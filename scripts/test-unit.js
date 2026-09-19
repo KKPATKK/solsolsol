@@ -20,7 +20,8 @@ const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES } = require("../dist/pushledger.js");
-const { syncPushLedger } = require("../dist/worker.js");
+const { syncPushLedger, syncSkipCaptureState } = require("../dist/worker.js");
+const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -866,6 +867,142 @@ async function main() {
       assert.equal(await db.getWorkerState("push_ledger"), stored);
     } finally {
       await t.cleanup();
+    }
+  });
+
+  // ---------- early-return capture (src/skipcapture.ts) ----------
+  //
+  // The scanner records why a tick returned early ("empty-feed-and-pool",
+  // "no-chats-enabled", "previous-scan-still-running") and then nulls the field
+  // in the SAME tick, so every heartbeat and scan_history row read `skip: null`
+  // — including the ticks where the sweep had stopped evaluating anything.
+  // These tests pin the capture that makes the reason reach a reader.
+
+  await test("skipCapture: a reason survives the clear that used to erase it", () => {
+    resetSkipCapture();
+    const scanner = { lastSkip: null };
+    const now = 1_800_000_000_000;
+    installSkipCapture(scanner, () => now);
+    // The live sequence: a writer records the reason, then runOnce's finally
+    // nulls the field before the worker's completion flush can read it.
+    scanner.lastSkip = "empty-feed-and-pool";
+    assert.equal(skipCaptureSnapshot().reason, "empty-feed-and-pool");
+    assert.equal(skipCaptureSnapshot().at, now);
+    scanner.lastSkip = null;
+    assert.equal(scanner.lastSkip, null, "the field still behaves exactly as the scanner expects");
+    assert.equal(
+      skipCaptureSnapshot().reason,
+      "empty-feed-and-pool",
+      "the reason outlives the clear that made it unreadable",
+    );
+  });
+
+  await test("skipCapture: the nulling write is not counted as a skip", () => {
+    resetSkipCapture();
+    const scanner = { lastSkip: null };
+    installSkipCapture(scanner, () => 1);
+    assert.equal(skipCaptureSnapshot(), null, "nothing recorded yet");
+    scanner.lastSkip = "no-chats-enabled";
+    scanner.lastSkip = null;
+    scanner.lastSkip = "empty-feed-and-pool";
+    scanner.lastSkip = null;
+    const view = skipCaptureSnapshot();
+    assert.equal(view.total, 2, "only real reasons count");
+    assert.deepEqual(view.counts, { "no-chats-enabled": 1, "empty-feed-and-pool": 1 });
+  });
+
+  await test("skipCapture: the delta is re-offered until a write confirms it", () => {
+    resetSkipCapture();
+    const scanner = { lastSkip: null };
+    installSkipCapture(scanner, () => 42);
+    assert.equal(takeSkipCaptureDelta(), null, "nothing recorded, nothing to persist");
+    scanner.lastSkip = "no-chats-enabled";
+    scanner.lastSkip = "empty-feed-and-pool";
+    scanner.lastSkip = "empty-feed-and-pool";
+    const delta = takeSkipCaptureDelta();
+    assert.equal(delta.total, 3);
+    assert.deepEqual(delta.counts, { "no-chats-enabled": 1, "empty-feed-and-pool": 2 });
+    assert.equal(delta.reason, "empty-feed-and-pool");
+    assert.equal(delta.at, 42);
+    // A failed write must not lose the share it was carrying.
+    assert.equal(takeSkipCaptureDelta().total, 3);
+    markSkipCaptureSynced();
+    assert.equal(takeSkipCaptureDelta(), null, "and never twice after one that landed");
+    // A re-created scanner restarts the interval instead of going negative.
+    installSkipCapture(scanner, () => 43);
+    assert.equal(takeSkipCaptureDelta(), null);
+    scanner.lastSkip = "empty-feed-and-pool";
+    assert.equal(takeSkipCaptureDelta().total, 1);
+  });
+
+  await test("skipCapture: durable state merges, spans isolates, and parses garbage tolerantly", () => {
+    const now = 1_800_000_000_000;
+    const s1 = mergeSkipCaptureState(
+      emptySkipCaptureState(),
+      { total: 2, counts: { "empty-feed-and-pool": 2 }, reason: "empty-feed-and-pool", at: now - 1 },
+      now,
+    );
+    assert.equal(s1.total, 2);
+    assert.equal(s1.firstAt, now);
+    const s2 = mergeSkipCaptureState(
+      s1,
+      { total: 1, counts: { "no-chats-enabled": 1 }, reason: "no-chats-enabled", at: now + 60_000 },
+      now + 60_000,
+    );
+    assert.equal(s2.total, 3);
+    assert.equal(s2.firstAt, now, "firstAt is stamped once");
+    assert.equal(s2.lastAt, now + 60_000);
+    assert.equal(s2.counts["empty-feed-and-pool"], 2);
+    assert.equal(s2.lastReason, "no-chats-enabled");
+    assert.equal(s2.lastReasonAt, now + 60_000);
+    assert.deepEqual(parseSkipCaptureState(JSON.stringify(s2)), s2);
+    // Corrupt / legacy shapes degrade instead of throwing on the tick path.
+    assert.equal(parseSkipCaptureState("not json").total, 0);
+    assert.equal(parseSkipCaptureState(null).total, 0);
+    assert.deepEqual(parseSkipCaptureState('{"counts":{"x":-3,"y":"2"}}').counts, { y: 2 });
+    // Bounded key set: a stray dynamic reason cannot grow the row forever.
+    const wide = {};
+    for (let i = 0; i < SKIP_CAPTURE_MAX_REASONS + 4; i++) wide[`r${i}`] = i;
+    assert.equal(Object.keys(pruneSkipCounts(wide)).length, SKIP_CAPTURE_MAX_REASONS);
+  });
+
+  await test("worker: syncSkipCaptureState accumulates reasons across isolates", async () => {
+    const t = tmpDb();
+    const t0 = Date.now();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      resetSkipCapture();
+      // Isolate 1: the sweep returned early twice (the wiped observation
+      // window that made "how often does this happen" unanswerable).
+      const scanner = { lastSkip: null };
+      installSkipCapture(scanner, () => t0);
+      scanner.lastSkip = "empty-feed-and-pool";
+      scanner.lastSkip = "empty-feed-and-pool";
+      await syncSkipCaptureState(t0, db);
+      const first = parseSkipCaptureState(await db.getWorkerState("skip_capture"));
+      assert.equal(first.total, 2);
+      assert.equal(first.counts["empty-feed-and-pool"], 2);
+      assert.equal(first.firstAt, t0);
+      // A pass with nothing new must not rewrite the row.
+      const stored = await db.getWorkerState("skip_capture");
+      await syncSkipCaptureState(t0 + 1_000, db);
+      assert.equal(await db.getWorkerState("skip_capture"), stored);
+      // Isolate 2 (a fresh install is the recycle path): its share ADDS on top.
+      const scanner2 = { lastSkip: null };
+      installSkipCapture(scanner2, () => t0 + 120_000);
+      scanner2.lastSkip = "no-chats-enabled";
+      await syncSkipCaptureState(t0 + 120_000, db);
+      const second = parseSkipCaptureState(await db.getWorkerState("skip_capture"));
+      assert.equal(second.total, 3);
+      assert.equal(second.counts["empty-feed-and-pool"], 2, "the earlier isolate's share survives");
+      assert.equal(second.counts["no-chats-enabled"], 1);
+      assert.equal(second.firstAt, t0, "firstAt spans isolates");
+      assert.equal(second.lastAt, t0 + 120_000);
+      assert.equal(second.lastReason, "no-chats-enabled");
+    } finally {
+      await t.cleanup();
+      resetSkipCapture();
     }
   });
 

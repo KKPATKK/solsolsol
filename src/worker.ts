@@ -6,6 +6,19 @@ import { Db } from "./db";
 // Subclass with the last-good pool fallback: the method it wraps lives past
 // the file-sync window in src/db.ts, so the production path is adjusted here.
 import { PoolFallbackDb, poolFallbackStats } from "./poolfallback";
+// Early-return capture: the scanner nulls its own lastSkip in the same tick it
+// records a reason, so the reason is captured instead (see src/skipcapture.ts).
+import {
+  SKIP_CAPTURE_STATE_KEY,
+  emptySkipCaptureState,
+  installSkipCapture,
+  markSkipCaptureSynced,
+  mergeSkipCaptureState,
+  parseSkipCaptureState,
+  skipCaptureSnapshot,
+  takeSkipCaptureDelta,
+  type SkipCaptureState,
+} from "./skipcapture";
 import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
@@ -206,6 +219,18 @@ const PUSH_LEDGER_SYNC_BOUND_MS = 900;
 let pushLedgerSyncedAt = 0;
 
 /**
+ * Fleet-wide early-return counters (src/skipcapture.ts): the durable half of
+ * "the sweep returned without evaluating anything, because X". The isolate copy
+ * answers why the tick being reported did nothing; this one answers how often
+ * that happens, which one isolate's ~10-20 minute lifetime cannot.
+ */
+let skipCaptureMirror: SkipCaptureState = emptySkipCaptureState();
+/** Same throttle/bound rationale as the ledger sync: telemetry off the tick path. */
+const SKIP_CAPTURE_SYNC_MIN_GAP_MS = 5 * 60_000;
+const SKIP_CAPTURE_SYNC_BOUND_MS = 900;
+let skipCaptureSyncedAt = 0;
+
+/**
  * Cross-isolate 429 bookkeeping: the scan that trips DexScreener's batched
  * limit may run in any isolate, so the count lives in Turso while this
  * module-local mirror keeps /health from reading it twice per request. This
@@ -340,6 +365,37 @@ export async function syncPushLedger(
     await database.setWorkerState(PUSH_LEDGER_STATE_KEY, serialized);
   }
   pushLedgerMirror = pushLedgerStats(next, now);
+}
+
+/**
+ * Accumulate this isolate's early-return reasons (src/skipcapture.ts) into the
+ * durable row, so "how often does the sweep return without evaluating
+ * anything, and why" survives isolate recycling.
+ *
+ * Same shape as the deferral/ledger syncs: the READ is unconditional (a
+ * recycled isolate must republish the fleet total rather than its own zero) and
+ * the persist baseline advances only after a write that actually landed, so a
+ * failed write re-offers its delta instead of dropping it.
+ */
+export async function syncSkipCaptureState(
+  now = Date.now(),
+  database: Db | null = db,
+): Promise<void> {
+  if (!database) return;
+  const delta = takeSkipCaptureDelta();
+  const raw = await database.getWorkerState(SKIP_CAPTURE_STATE_KEY);
+  const durable = parseSkipCaptureState(raw);
+  if (!delta) {
+    skipCaptureMirror = durable;
+    return;
+  }
+  const next = mergeSkipCaptureState(durable, delta, now);
+  await database.setWorkerState(SKIP_CAPTURE_STATE_KEY, JSON.stringify(next));
+  skipCaptureMirror = next;
+  markSkipCaptureSynced();
+  console.log(
+    `[worker] skip capture persisted: +${delta.total} early return(s) (fleet total ${next.total}, last "${next.lastReason ?? "unknown"}")`,
+  );
 }
 
 /**
@@ -680,6 +736,16 @@ async function ensureInitialized(env: Env): Promise<void> {
           } catch {
             // telemetry only — never fail init over a ledger read
           }
+          // Same for the early-return counters (src/skipcapture.ts): a
+          // recycled isolate answers /health with the fleet totals instead of
+          // zeros until its own first sync comes due.
+          try {
+            skipCaptureMirror = parseSkipCaptureState(
+              await db?.getWorkerState(SKIP_CAPTURE_STATE_KEY),
+            );
+          } catch {
+            // telemetry only — never fail init over a counter read
+          }
         } catch (err) {
           initError = err instanceof Error ? err.message : String(err);
           console.error("[worker] Turso init failed:", initError);
@@ -862,6 +928,10 @@ async function ensureInitialized(env: Env): Promise<void> {
           // lineage (null when disabled). Last gate before each push.
           flurryAnalyzer ?? undefined,
         );
+        // Capture every early-return reason the scanner records: it sets
+        // lastSkip back to null in runOnce's finally within the same tick, so
+        // without this the reason never reaches a reader (src/skipcapture.ts).
+        installSkipCapture(scanner);
         scannerReady = true;
       }
     }
@@ -936,13 +1006,22 @@ async function runScan(
         pushed: null,
       }
     : null;
+  // Early-return reason view (src/skipcapture.ts). The scanner's own lastSkip
+  // is nulled in the same tick it is set, so these fields are how /health
+  // answers "why did the sweep evaluate nothing": `skipAt < at` means this tick
+  // ran a real scan and the reason predates it (the reason is never invented).
+  const startSkip = skipCaptureSnapshot();
   const heartbeatJson = JSON.stringify({
     at: startedAt,
     ok: true,
     phase: "scanning",
     ms: null,
     err: null,
-    skip: scanner?.lastSkip ?? null,
+    skip: startSkip?.reason ?? null,
+    skipAt: startSkip?.at ?? null,
+    // Fleet-wide early-return counters (durable row): the isolate view above
+    // answers why the tick being reported did nothing, this answers how often.
+    skipCapture: skipCaptureMirror,
     // DexScreener rate-limit watch for the 250ms dispatch spacing: the live
     // client stats (intervalMs / http429 / blockedForMs / cacheSize) plus the
     // fleet-wide 429-episode total mirrored in Turso by db.bumpDex429. Written
@@ -1043,6 +1122,25 @@ async function runScan(
     // Stamped AFTER the attempt: a hard failure waits out a full gap instead
     // of turning into a per-tick retry loop.
     pushLedgerSyncedAt = Date.now();
+  }
+  // Early-return counters (src/skipcapture.ts): same pre-race slot and same
+  // reasoning as the ledger sync above — the reasons are recorded during the
+  // scan phase, so a pass that reports the previous tick's share is fresh
+  // enough for a frequency counter, and telemetry never delays the heartbeat
+  // or the completion flush.
+  if (db && startedAt - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS) {
+    try {
+      await Promise.race([
+        syncSkipCaptureState(startedAt),
+        new Promise((resolve) => setTimeout(resolve, SKIP_CAPTURE_SYNC_BOUND_MS)),
+      ]);
+    } catch (err) {
+      console.warn(
+        "[worker] skip-capture sync failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    skipCaptureSyncedAt = Date.now();
   }
   // Wedged-isolate circuit breaker: track consecutive dead ticks. The
   // predecessor's death counts toward the streak (this isolate is the one
@@ -1155,6 +1253,10 @@ async function runScan(
       // into the closure below — copy them into consts first.
       const flushedAt: number = lastScanAt;
       const flushedMs: number = lastScanMs;
+      // Captured early-return reason for the tick this flush reports (see
+      // src/skipcapture.ts). Read ONCE, outside the closure, so `skip` and
+      // `skipAt` can never disagree about which early return they describe.
+      const skipView = skipCaptureSnapshot();
       const flushCompletion = () =>
         db?.persistScanCompletion(
           JSON.stringify({
@@ -1164,16 +1266,24 @@ async function runScan(
             count: scanCount,
             ms: flushedMs,
             err: lastScanError,
-            skip: scanner?.lastSkip ?? null,
+            // The scanner's own reason for returning early, captured because
+            // it nulls the field in this same tick (src/skipcapture.ts):
+            // `skipAt >= flushedAt` = the tick reported here returned early,
+            // `skipAt < flushedAt` = it ran a real scan and this is older.
+            skip: skipView?.reason ?? null,
+            skipAt: skipView?.at ?? null,
+            // Fleet-wide early-return counters (durable row).
+            skipCapture: skipCaptureMirror,
             // The idle-tick signature: green, but nothing was evaluated
             // because BOTH the profile feed and the re-eval pool read came
-            // back empty. Reported as a shape rather than a reason on
-            // purpose — the scanner's own lastSkip (empty-feed-and-pool,
-            // etc.) is reset to null in runOnce's finally before this flush
-            // reads it, so a cause here would be a guess, while the shape is
-            // what the operator actually needs to spot (2026-09-19: the pool
-            // read overran POOL_FETCH_BUDGET_MS on most ticks and the whole
-            // sweep silently stopped for 10-minute stretches).
+            // back empty. Kept ALONGSIDE `skip` because they answer different
+            // questions: `idle` is the shape (this tick evaluated nothing),
+            // while `skip` is the scanner's stated reason. An idle tick with
+            // `skip: null` is the one that matters most — the sweep died
+            // without stating a reason rather than being told to return
+            // (2026-09-19: the pool read overran POOL_FETCH_BUDGET_MS on most
+            // ticks and the whole sweep silently stopped for 10-minute
+            // stretches while every heartbeat read ok:true).
             idle:
               lastScanOk && summary
                 ? summary.profiles === 0 && summary.pool === 0
