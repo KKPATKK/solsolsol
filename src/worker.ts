@@ -954,6 +954,107 @@ export function deadTickRebuildDecision(
   return { rebuild: true, deadAt: dead.at };
 }
 
+/**
+ * Durable record behind the completion-based outage alert. Deliberately NOT
+ * scan_heartbeat: every tick's claim overwrites that row right AFTER the
+ * successor's recovery write, which is why heartbeat age can never grow past
+ * one cadence while ticks keep claiming — 2026-09-19 16:05-16:33Z ran 28
+ * minutes with ZERO completions, and the age-based checkOutageAndAlert stayed
+ * silent throughout because the claim refreshed `at` every 60s (the status page
+ * read green the whole way). Track completions instead.
+ *
+ * The row is {start: beginning of the current no-completion stretch, tickAt:
+ * wall clock of the death tick that last touched it}. `tickAt` IS the
+ * continuity test (wedgeChainEntry): a stored row is a continuation only when
+ * the dead predecessor started within tolerance of it, i.e. the row was written
+ * by the tick immediately before that predecessor. Rows left over from an
+ * outage that already ended fail the test and are replaced, so nothing has to
+ * clean up on healthy ticks — day-to-day this costs ZERO round trips and is
+ * paid only while ticks are dying.
+ */
+export const SCAN_WEDGE_STATE_KEY = "scan_wedge";
+
+/** Continuity slack for the row above: 2 cron cadences plus Turso jitter. */
+const WEDGE_CHAIN_TOLERANCE_MS = 3 * 60_000;
+
+function parseWedgeEntry(
+  raw: string | null | undefined,
+): { start: number; tickAt: number } | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as { start?: unknown; tickAt?: unknown } | null;
+    const start = Number(v?.start ?? 0);
+    const tickAt = Number(v?.tickAt ?? 0);
+    if (!Number.isFinite(start) || !Number.isFinite(tickAt)) return null;
+    if (!(start > 0) || !(tickAt > 0)) return null;
+    return { start, tickAt };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Advance (or restart) the durable no-completion stretch — pure and exported so
+ * the chain rule is unit-tested (scripts/test-tick-path.js) instead of only
+ * observed in production. `start` is preserved across ticks for as long as the
+ * deaths keep coming, which is what makes `now - start` the age of the last
+ * COMPLETION rather than the age of the last heartbeat.
+ */
+export function wedgeChainEntry(
+  raw: string | null | undefined,
+  deadAt: number,
+  now: number,
+  toleranceMs: number,
+): { start: number; tickAt: number } {
+  const stored = parseWedgeEntry(raw);
+  const continues =
+    stored !== null &&
+    stored.start <= deadAt &&
+    deadAt >= stored.tickAt - toleranceMs &&
+    deadAt <= stored.tickAt + toleranceMs;
+  return continues ? { start: stored.start, tickAt: now } : { start: deadAt, tickAt: now };
+}
+
+/**
+ * Both halves of the completion-based outage alert, in one place: keep the
+ * durable stretch current, then alert when it outlives OUTAGE_ALERT_GAP_MS.
+ * Only ever called from a death tick, so its round trips are paid exactly while
+ * scans are not landing. The cooldown row is the same one checkOutageAndAlert
+ * uses, so the two alerts can never double-post for one episode (that one still
+ * owns the separate "no tick claimed at all" case, where this path never runs).
+ */
+async function trackNoCompletionStretch(deadAt: number, now: number): Promise<void> {
+  const store = db;
+  if (!store) return;
+  const entry = wedgeChainEntry(
+    await store.getWorkerState(SCAN_WEDGE_STATE_KEY),
+    deadAt,
+    now,
+    WEDGE_CHAIN_TOLERANCE_MS,
+  );
+  await store.setWorkerState(SCAN_WEDGE_STATE_KEY, JSON.stringify(entry));
+  const silentMs = now - entry.start;
+  if (silentMs < OUTAGE_ALERT_GAP_MS || !bot) return;
+  const lastAlertRaw = await store.getWorkerState("outage_alert_at");
+  const lastAlertAt = lastAlertRaw ? Number(lastAlertRaw) : 0;
+  if (Number.isFinite(lastAlertAt) && now - lastAlertAt < OUTAGE_ALERT_COOLDOWN_MS) return;
+  const chats = await store.listEnabledChats();
+  if (chats.length === 0) return;
+  const minutes = Math.max(1, Math.round(silentMs / 60_000));
+  const text =
+    `⚠️ 扫描器已连续约 ${minutes} 分钟没有完成任何一次扫描` +
+    `（最早未完成的一轮开始于 ${new Date(entry.start).toISOString()}）\n` +
+    `状态页: https://solana-meme-bot.cool1999k.workers.dev/health`;
+  for (const chat of chats) {
+    try {
+      await bot.api.sendMessage(chat.chatId, text);
+    } catch (err) {
+      console.error("[worker] completion-outage alert failed:", err);
+    }
+  }
+  await store.setWorkerState("outage_alert_at", String(now));
+}
+
 async function ensureInitialized(env: Env): Promise<void> {
   // Dead-tick recovery (see DEAD_TICK_STREAK_RESET). The SUCCESSOR tick is the
   // only witness a killed tick can have, and this is the earliest hook every
@@ -981,7 +1082,8 @@ async function ensureInitialized(env: Env): Promise<void> {
           setTimeout(() => resolve(null), WEDGE_CHECK_BOUND_MS),
         ),
       ]);
-      const verdict = deadTickRebuildDecision(prevRaw, Date.now(), BACKFILL_STALE_MS);
+      const now = Date.now();
+      const verdict = deadTickRebuildDecision(prevRaw, now, BACKFILL_STALE_MS);
       if (verdict.rebuild) {
         console.error(
           `[worker] predecessor tick died before its completion flush (started ${new Date(
@@ -1024,6 +1126,14 @@ async function ensureInitialized(env: Env): Promise<void> {
           }),
         );
       }
+      // Outage tracking on COMPLETIONS, not on heartbeats — see
+      // trackNoCompletionStretch for why the age-based checkOutageAndAlert can
+      // never fire while ticks keep claiming, and why the successor tick is the
+      // only one that can keep the durable record. Dead-only: a heartbeat this
+      // tick can read as healthy means a completion landed, which is what ends
+      // the stretch (the row's own continuity test is what retires it).
+      const dead = prevRaw ? deadTickBackfillInfo(prevRaw, now, BACKFILL_STALE_MS) : null;
+      if (dead) await trackNoCompletionStretch(dead.at, now);
     } catch (err) {
       console.warn(
         "[worker] dead-tick recovery check failed — continuing:",

@@ -547,3 +547,29 @@ flush），並抽成純函數 `deadTickRebuildDecision(prevRaw, now, staleMs)`�
 
 **未動嘅舊機制**：`runScan` outer `finally` 嘅舊重建仍然存在（surviving tick 嘅第二道防線），
 連 `if (backfillEntry) deadTickStreak++` 一齊 —— 兩者位址喺窗口外改唔到，所以保留原狀。
+
+### 第七補：outage alert 由 heartbeat age 改綁「最後一次完成」
+
+**問題**：`checkOutageAndAlert` 用 `Date.now() - heartbeat.at` 判中斷。但 `scan_heartbeat` 每個 tick
+嘅 claim 都重寫，`at` 永遠新鮮（≈60s）→ **有 tick 但零完成** 嗰種中斷，age 永遠過唔到門檻，
+2026-09-19 16:05-16:33Z 嗰 28 分鐘係一路報綠（`outageAlertAt` 仍停在 2026-09-03）。
+
+**改法**：新增 durable row `scan_wedge`，由**後繼 tick**（唯一目擊者）維護，記
+`{start: 呢段「零完成」嘅起點, tickAt: 最後一次有人掂過呢行嘅 wall clock}`。`tickAt` 就係**連續性
+測試**：只有當「死咗嘅前任」嘅開始時間喺 `tickAt` 嘅容差內（即呢行係佢前一個 tick 寫嘅）才算同一段，
+否則重新起一段 —— 所以**舊事件嘅殘留行唔會令一次新死亡睇成好長嘅中斷**，而健康 tick 一次 round trip
+都唔使（清理係隱含嘅）。
+
+- 判定：`silentMs = now - start ≥ OUTAGE_ALERT_GAP_MS`（3 分鐘）→ 發 alert。
+- 只喺**死 tick** 才讀/寫（每次 1 read + 1 write；健康 tick = 0）→ 呢部分嘅日常成本係零。
+- 共用舊 alert 嘅 cooldown row `outage_alert_at`（30 分鐘）⇒ 兩條 alert 唔會為同一 episode 重複發。
+  舊 `checkOutageAndAlert` **冇改**（`worker.ts` 1927 行 = **91.6KB**，實測喺窗口外）：佢仲負責
+  「連 tick 都冇 claim」嗰種（我嗰條路喺嗰種情況永遠唔會跑）。
+- 訊息（同舊 alert 同風格）：`⚠️ 扫描器已连续约 N 分钟没有完成任何一次扫描（最早未完成的一轮开始于 <ISO>）`。
+
+**未落地（窗口外，已實測）**：`scan_wedge` 借落 claim heartbeat 就零額外 round trip，但嗰個寫入點喺
+~65KB。同理 `deadTickStreak` 嘅 publish 點。
+
+**驗收點**：`/health` 嘅 `outageAlertAt` 應該喺「有 tick 但零完成 ≥3 分鐘」時更新（舊行為下唔會動）；
+GitHub/Telegram 收到嗰句新訊息；`scan_history` 應該見到同期嘅 backfill 行（呢個 alert 只會在真係連續死
+tick 時發）。

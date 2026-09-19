@@ -430,6 +430,47 @@ installTickProbe(fakeScanner, {
     console.log("dead-tick recovery: pass");
   }
 
+  // ---------- completion-based outage alert (worker.ts wedgeChainEntry) ----------
+  // The age-based checkOutageAndAlert cannot see this outage at all: the claim
+  // heartbeat refreshes `at` every tick, so the reported age never passes one
+  // cadence and 28 minutes of zero completions read green (2026-09-19). Only a
+  // record of COMPLETIONS can grow, only the successor tick can keep it, and the
+  // continuation test is what lets one row survive the claim overwrite without
+  // any cleanup write on healthy ticks.
+  {
+    const { wedgeChainEntry, SCAN_WEDGE_STATE_KEY } = require("../dist/worker.js");
+    const now = 1_800_000_000_000;
+    const tol = 180_000;
+    const deadAt = now - 60_000; // the first tick that never flushed
+    assert.equal(SCAN_WEDGE_STATE_KEY, "scan_wedge");
+
+    // First death: nothing stored, so the stretch starts at the dead tick.
+    const first = wedgeChainEntry(null, deadAt, now, tol);
+    assert.deepEqual(first, { start: deadAt, tickAt: now });
+
+    // Next death tick one cadence later: the predecessor started ~one cadence
+    // after the row was written, so it IS the same stretch — `start` is kept and
+    // the reported age therefore grows.
+    const second = wedgeChainEntry(JSON.stringify(first), deadAt + 60_000, now + 60_000, tol);
+    assert.deepEqual(second, { start: deadAt, tickAt: now + 60_000 });
+    const third = wedgeChainEntry(JSON.stringify(second), deadAt + 120_000, now + 120_000, tol);
+    assert.equal(third.start, deadAt, "the stretch keeps its original start");
+    assert.equal(now + 180_000 - third.start, 240_000, "age measured from the last completion");
+
+    // A row left over from an outage that already ENDED must not make one fresh
+    // death look like a long outage: its tickAt is far from the dead tick.
+    const staleRow = JSON.stringify({ start: deadAt - 3_600_000, tickAt: now - 3_600_000 });
+    assert.equal(wedgeChainEntry(staleRow, now, now + 1_000, tol).start, now);
+    // A row whose start is LATER than the dead tick cannot describe it either.
+    assert.equal(wedgeChainEntry(JSON.stringify({ start: now, tickAt: now - 1_000 }), now - 60_000, now, tol).start, now - 60_000);
+    // Unparsable / shapeless / negative rows start a new stretch instead of
+    // throwing or inheriting nonsense.
+    for (const raw of [undefined, "", "not json", "{}", JSON.stringify({ start: -1, tickAt: 5 })]) {
+      assert.equal(wedgeChainEntry(raw, deadAt, now, tol).start, deadAt);
+    }
+    console.log("completion-based outage alert: pass");
+  }
+
   console.log("tick probe + mode read + feed view + db seam: pass");
 })().catch((err) => {
   console.error("push-path instrumentation tests failed:", err);
