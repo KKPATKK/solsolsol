@@ -179,6 +179,7 @@ async function main() {
       deferredTotal: 0,
       recoveredTotal: 0,
       pending: 0,
+      pendingTokens: [],
       firstDeferredAt: null,
       lastDeferAt: null,
       firstRecoveredAt: null,

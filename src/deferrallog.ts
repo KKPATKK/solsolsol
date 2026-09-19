@@ -66,6 +66,12 @@ export interface PushDeferralSnapshot {
   recoveredTotal: number;
   /** Backlog the newest event left behind. */
   pending: number;
+  /**
+   * Token identities still awaiting a make-up push. Bounded with the same
+   * cap as the in-memory ledger so a recycled isolate can hydrate the actual
+   * obligations, not just their aggregate count.
+   */
+  pendingTokens: string[];
   /** When the first deferral ever was recorded (null until one happens). */
   firstDeferredAt: number | null;
   /** When the most recent deferral was recorded. */
@@ -116,6 +122,7 @@ function emptyPushDeferralSnapshot(): PushDeferralSnapshot {
     deferredTotal: 0,
     recoveredTotal: 0,
     pending: 0,
+    pendingTokens: [],
     firstDeferredAt: null,
     lastDeferAt: null,
     firstRecoveredAt: null,
@@ -165,6 +172,11 @@ export function parsePushDeferralSnapshot(
       applied = { owner, deferred: count(a.deferred), recovered: count(a.recovered) };
     }
   }
+  const pendingTokens = Array.isArray(rec.pendingTokens)
+    ? rec.pendingTokens
+        .filter((token): token is string => typeof token === "string" && token.length > 0)
+        .slice(-500)
+    : [];
   const events: PushDeferralEvent[] = [];
   if (Array.isArray(rec.events)) {
     for (const e of rec.events) {
@@ -185,6 +197,7 @@ export function parsePushDeferralSnapshot(
     deferredTotal: count(rec.deferredTotal),
     recoveredTotal: count(rec.recoveredTotal),
     pending: count(rec.pending),
+    pendingTokens,
     firstDeferredAt: stamp(rec.firstDeferredAt),
     lastDeferAt: stamp(rec.lastDeferAt),
     firstRecoveredAt: stamp(rec.firstRecoveredAt),
@@ -272,6 +285,7 @@ export function nextPushDeferralSnapshot(
    * always passes it.
    */
   appliedBy: { owner: string; deferred: number; recovered: number } | null = null,
+  pendingTokens: string[] = [],
 ): PushDeferralSnapshot {
   const prev = parsePushDeferralSnapshot(raw) ?? emptyPushDeferralSnapshot();
   const deferred = count(delta.deferred);
@@ -280,6 +294,7 @@ export function nextPushDeferralSnapshot(
     deferredTotal: prev.deferredTotal + deferred,
     recoveredTotal: prev.recoveredTotal + recovered,
     pending: count(delta.pending),
+    pendingTokens: pendingTokens.length > 0 ? [...new Set(pendingTokens)].slice(-500) : prev.pendingTokens,
     firstDeferredAt: prev.firstDeferredAt,
     lastDeferAt: prev.lastDeferAt,
     firstRecoveredAt: prev.firstRecoveredAt,

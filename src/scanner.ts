@@ -1044,6 +1044,20 @@ function describePushError(err: unknown): PushErrorInfo {
 }
 
 export class Scanner {
+  /** Hydrate durable deferred-card obligations when an isolate is recycled. */
+  seedDeferredTokens(tokens: string[]): void {
+    for (const token of tokens.slice(-500)) {
+      if (typeof token === "string" && token.length > 0) {
+        this.deferredPushes.defer(token, Date.now());
+      }
+    }
+  }
+
+  /** Current deferred-card identities for the durable post-flush ledger. */
+  deferredTokens(): string[] {
+    return this.deferredPushes.pendingTokens();
+  }
+
   private running = false;
   /** When the current scan started — lets a stale lock be broken by age. */
   private runningSince = 0;

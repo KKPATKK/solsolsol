@@ -291,7 +291,10 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
   // The row is authoritative: mirror it even when this isolate has nothing of
   // its own to add (that is the cross-isolate refresh).
   const refreshMirror = (): void => {
-    if (durable) pushDeferralSnapshot = durable;
+    if (durable) {
+      pushDeferralSnapshot = durable;
+      scanner?.seedDeferredTokens(durable.pendingTokens);
+    }
   };
   const delta = pushDeferralDelta(pushDeferralBaseline, totals);
   if (!delta) {
@@ -316,6 +319,7 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
     },
     Date.now(),
     { owner: SCAN_LOCK_OWNER, ...totals },
+    scanner?.deferredTokens() ?? [],
   );
   await db.setWorkerState(PUSH_DEFERRAL_STATE_KEY, JSON.stringify(next));
   pushDeferralSnapshot = next;
@@ -983,6 +987,9 @@ async function ensureInitialized(env: Env): Promise<void> {
         // lastSkip back to null in runOnce's finally within the same tick, so
         // without this the reason never reaches a reader (src/skipcapture.ts).
         installSkipCapture(scanner);
+        // Hydrate durable deferred-card identities before the first scan in
+        // this isolate; counters alone cannot guarantee a make-up push.
+        scanner.seedDeferredTokens(pushDeferralSnapshot?.pendingTokens ?? []);
         scannerReady = true;
       }
     }
