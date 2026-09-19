@@ -700,8 +700,27 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * is now actually fetched instead of the last 20 being silently dropped past
  * the deadline. Same rule as above: this number moves only with the fetch
  * rate, and the pair cache keeps serving repeat coins for free on top.
+ *
+ * 2026-09-19: 130 → 90, sized by the PUSH PATH's deadline for the first time.
+ * Every other entry here traded breadth for finishing the tick at all; this one
+ * trades it for the CARD. The front phases (feeds ~460 + pool ~540 + pair fetch
+ * ~1250, then the gates over ~150 coins) were ending at 3.2-3.4s, and the
+ * candidate chain then needs ~250-600ms before it can take the claim — whose
+ * gate closes at 3550ms (see cardClaimDeadline / CARD_CLAIM_BUDGET_MS). Live
+ * over the two hours before this change: 45 of the last 111 ticks found a
+ * candidate and EVERY one of them failed to push (`cand>0 & pushed=0` = 45/45,
+ * cardSendDeferredTotal climbing ~20/hour), while the held-back counter stayed
+ * low — the chain was reaching the claim and arriving late. The slice and the
+ * pair budget are the two knobs that buy that time back, and they are one
+ * number in practice: 90 + the feed's ~24 = 114 addresses = 4 batches of 30 at
+ * the 250ms spacing, i.e. the pair fetch now finishes in ~1s instead of riding
+ * its 1250ms cap, and the gates run over ~40 fewer coins. Cost: the pool sweep
+ * stretches by ~1.4× (it is bounded by the rotation bands, not by this number —
+ * the hot zone is still evaluated every scan and a deferred coin still rides
+ * the feed). Raise it back only with a way to fetch more per second, and only
+ * after the delivery rate is healthy again.
  */
-const RE_EVAL_PER_TICK_MAX = 130;
+const RE_EVAL_PER_TICK_MAX = 90;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline

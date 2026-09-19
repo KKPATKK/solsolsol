@@ -158,8 +158,21 @@ class Throttle {
  * rising counter means the shared egress IP is being rate-limited again, and
  * the fix is to restore 350 (or higher) via DEX_REQUEST_INTERVAL_MS rather
  * than to touch this cap.
+ *
+ * 2026-09-19: 1250 → 1000, funding the CLAIM (paired with RE_EVAL_PER_TICK_MAX
+ * 130 → 90 in scanner.ts). This cap is the last front phase, and the coin it
+ * fetches still has to clear its gates, render and take the push claim before
+ * the claim gate closes at 3550ms (cardClaimDeadline). Live before the cut:
+ * every candidate the last two hours found was deferred — `cand>0 & pushed=0`
+ * was 45 of 45 ticks — with the front phases ending at 3.2–3.4s and the chain
+ * reaching the claim just past that boundary. 1000ms still dispatches 4 slots
+ * at the 250ms spacing = 120 addresses, and the slice was re-sized to match
+ * (90 + the feed's ~24 = 114), so the fetch finishes in ~1s instead of riding
+ * its cap and the gates gain the difference. Same rule as every entry above:
+ * skipped tokens keep their pool slot and are re-read on the next rotation
+ * slot — the cost is latency (and a ~1.4× longer sweep), never coverage.
  */
-const PAIRS_FETCH_BUDGET_MS = 1_250;
+const PAIRS_FETCH_BUDGET_MS = 1_000;
 /**
  * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
  * minute after minute), so re-fetching all ~550 addresses every tick burns
