@@ -484,3 +484,66 @@ pair fetch（自己嘅 `PAIRS_FETCH_BUDGET_MS` 冇 clamp 入 front window）同 
 
 `PairInfo.fdvUsd` / `mcapFromFdv`（`dexscreener.ts`、`jupfeeds.ts`）已經就位，
 等上面第 3 步一貼就即刻有值。
+
+---
+
+## 死 tick 唔會再卡 28 分鐘：breaker 移到「下一個 tick」（2026-09-19）
+
+**事故（已證實）**：`16:05:07Z → 16:33:07Z`（29 分鐘）`scan_history` **零真掃描**：
+23 行全部係 `previous tick died before its completion flush` 嘅 backfill 佔位
+（`profiles/pool/candidates/pushed = null`，`ms ≈ 60s` = 到下一 tick 為止嘅 liveness span），
+另有 6 分鐘（16:08/16:15/16:19/16:29/16:30/16:32）**連 row 都冇**。
+
+- `tickRing` 15:55–16:44 完整、無 >70s 斷層 → **cron 每分鐘都有 fire**（唔係交付停頓）。
+- backfill 行係「贏到 lease 嗰個 tick」騎住 claim batch 寫 → 每分鐘都有人成功 claim + 寫
+  heartbeat → **DB 寫得通**（唔係 Turso 硬故障；lock TTL 15s 亦排除餓死）。
+- claim 每分鐘重寫 `phase=scanning` heartbeat → cadence gate 繼續放行，而 outage alert 綁
+  heartbeat age → **一次都冇響**（`outageAlertAt` 仍係 2026-09-03）。即係 28 分鐘零掃描、
+  狀態頁照綠。
+
+**根因唔係觸發，而係「唔會自癒」**：breaker 嘅 streak 增量同重建都喺 `runScan` 嘅 outer
+`finally`（`worker.ts:1650` 起）。被 invocation wall clock 終止嘅 tick **唔會執行任何
+`finally`** → 死嘅 tick 永遠到唔到重建碼 → streak 一路升（1…23）而 `wedgedStateResets` 由頭
+到尾 0，只有 deploy 換 isolate 才斷。
+
+**修正**：重建移到**下一個 tick 最早嘅 hook** —— `ensureInitialized` 顶部（每個 scheduled / HTTP
+路徑喺掃描前必經），判定用返 backfill 同一把尺（stale `phase=scanning` heartbeat = 前任未
+flush），並抽成純函數 `deadTickRebuildDecision(prevRaw, now, staleMs)`（exported，單元測試喺
+`scripts/test-tick-path.js`）：
+
+- `rebuild: true` → 丟掉 module-scoped clients + scanner、`initPromise = null`，**同一個 tick 內**
+  inline 重建再照常掃描 → 唔蝕掃描分鐘。
+- 回復 tick 重寫 heartbeat，**保留死 tick 嘅 `at`**（寫 `now` 會令 cadence gate 跳過啱啱重建嘅
+  呢個 tick）+ 加 `rebuiltAt` 標記（`heartbeatRebuiltAt()` 讀返）。
+- 標記係防迴圈關鍵：回復 tick 自己嘅 heartbeat 都係 stale scanning，冇標記就會每 tick 重建成
+  永不掃描。
+- 讀取有界（`WEDGE_CHECK_BOUND_MS = 1500`，`Promise.race`）：慢 Turso 唔可以令呢個 check 變成
+  佢要修嘅嘢本身（超窗嘅 tick）；超時就今個 tick 唔做，下個再試。
+- 回復 tick 之後嘅 claim 一樣會 backfill 死 tick 嗰行 → 唔會喺 history 留洞。
+
+**代價（唔修飾）**：
+
+- 每 tick 多 **1 個單行 read**（live ~110ms；冷 isolate 首 tick 因為 `dbReady` gate 係 0）。
+  免費做法（streak counter 搭 claim heartbeat 傳）需要 claim/heartbeat 寫入點，嗰啲位喺本
+  repo 檔案編輯窗口外（`~60KB`，同今次逼住要搬位置嘅係同一個窗口）。
+- 回復門檻係「proven death 即重建」（唔再等連續 2 次）：代價係一次性 kill 之後多一個 re-init，
+  對比唔重建嘅代價（28 分鐘零掃描）低幾個數量級。`DEAD_TICK_STREAK_RESET = 2` 只留做
+  counter-based 路徑嘅既定門檻。
+
+**未解決（留低記錄）**：
+
+1. **觸發點未證實**（16:05 為何開始死）：信封算術好窄
+   （`scanRaceMs = max(2500, 9500 − 4500 − preRace)`，preRace 實測可到 1–4s，而 2500 下限會令
+   「budget − flush reserve」失效）→ preRace 一慢就過平台 kill。最一致嘅候選係 Turso latency
+   惡化（6 個「連 claim 都冇」嘅分鐘 = 死喺最早嘅 DB round trip）。CF logs 由呢邊觀察唔到
+   （`wrangler tail` 要 CF token 而且係長駐程序）。
+2. **`deadTickStreak` 仍然係 module-local**（無 publish 點）：`heartbeatDeadStreak` /
+   `nextDeadStreak` 已 export + 單元測試，等 claim heartbeat 寫入點可改時即接。
+3. **`wedgedStateResets` 係 per-isolate module state**：isolate 回收就清零，`/health` 只睇到
+   答你嗰個 isolate → 唔可以事後回溯。
+4. **並發競態（罕見）**：cron tick 同一個 HTTP 請求同時入 `ensureInitialized`，兩個都判定
+   rebuild；第二個會喺第一個之後再丟一次 scanner，令嗰個 tick 靜靜咁 `runScan` 早退。
+   下一個 tick 自動補回，唔會死循環。
+
+**未動嘅舊機制**：`runScan` outer `finally` 嘅舊重建仍然存在（surviving tick 嘅第二道防線），
+連 `if (backfillEntry) deadTickStreak++` 一齊 —— 兩者位址喺窗口外改唔到，所以保留原狀。

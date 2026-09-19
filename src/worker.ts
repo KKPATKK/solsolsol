@@ -830,29 +830,207 @@ let crossIsolateScanSkips = 0;
 /** How many times a dead predecessor tick's history row was backfilled. */
 let backfilledTicks = 0;
 /**
- * Consecutive dead ticks observed BY THIS ISOLATE (its own tick dying
- * without a flush, or backfilling a predecessor that died). One dead tick
- * is noise (a Turso spike, a wall-clock kill); a STREAK means this
- * isolate's module-scoped state is wedged — a hung upstream fetch or a
- * libsql connection stuck in an internal retry loop that never settles
- * (observed live 2026-09-08 12:26-12:59Z: 29 consecutive dead ticks while
- * healthy isolates kept landing OK rows — every tick routed to the
- * poisoned isolate died, recovery only came when Cloudflare recycled it).
- * When the streak reaches DEAD_TICK_STREAK_RESET, runScan drops the
- * module-scoped client instances (dex/helius/birdeye/…) and the scanner,
- * so the next tick's ensureInitialized rebuilds everything from scratch —
- * fresh fetch connections, fresh libsql client — instead of waiting for
- * an eviction that may not come for half an hour. The streak resets on
- * any flush that lands (the next tick's runScan sees its own completion
- * succeed and clears the counter).
+ * Consecutive dead ticks. One dead tick is noise (a Turso spike, a wall-clock
+ * kill); a STREAK means the module-scoped state (a hung upstream fetch, a
+ * libsql connection stuck in an internal retry loop) is wedged — 2026-09-08
+ * 12:26-12:59Z logged 29 consecutive dead ticks on a poisoned isolate while
+ * healthy isolates kept landing OK rows.
+ *
+ * WHAT CHANGED (2026-09-19 16:05-16:33Z live: 23 consecutive cron ticks and
+ * 28 minutes with ZERO scan rows). Cron fired every minute, every tick won
+ * the claim, wrote its phase=scanning heartbeat — and died before its
+ * completion flush, while the breaker never fired ONCE. The reason is
+ * structural: a tick killed by the invocation wall clock runs no `finally`,
+ * so both the counter increment and the rebuild that lived there were
+ * unreachable during exactly the failure they exist for. Only a redeploy
+ * ended it.
+ *
+ * The rebuild therefore moved to the SUCCESSOR tick, as early as this module
+ * can reach it: the top of ensureInitialized, which every scheduled and HTTP
+ * tick calls before it scans (see the dead-tick recovery block there). The
+ * witness is the same signal the history backfill uses — a stale
+ * phase=scanning heartbeat means the predecessor never flushed — and the
+ * recovering tick drops the module-scoped clients + scanner, rebuilds them
+ * inline and then scans the SAME tick, so recovery costs no scan minute.
+ *
+ * The recovery announces itself by rewriting the heartbeat with `rebuiltAt`
+ * while KEEPING the dead tick's `at` (writing `now` would make the cadence
+ * gate skip the very tick that just rebuilt the state). That marker is what
+ * stops one death from rebuilding on every later tick, so no durable counter
+ * is needed.
+ *
+ * Why the counter below has no publish site yet: the free way to carry it is
+ * the claim heartbeat the tick already writes, and that write sits past this
+ * repo's file-edit window (the same window that forced this rebuild to move).
+ * The helpers stay exported and unit-tested so the escalation rule is pinned
+ * the moment that write becomes editable; the shipped path uses the marker.
  */
 let deadTickStreak = 0;
 /** Streak length that triggers the module-state rebuild (2 dead ticks). */
-const DEAD_TICK_STREAK_RESET = 2;
-/** Set by runScan when it rebuilt the module state; surfaced via /health. */
+export const DEAD_TICK_STREAK_RESET = 2;
+/**
+ * Bound on the successor's dead-tick check (see the recovery block in
+ * ensureInitialized). It must stay far below the tick's front window: the
+ * check is a guard around the scan, never a second source of ticks that
+ * outlive it. A timed-out check does nothing this tick; the next one retries.
+ */
+const WEDGE_CHECK_BOUND_MS = 1_500;
+/** Set when the recovery rebuilt the module state; surfaced via /health. */
 let wedgedStateResets = 0;
 
+/**
+ * The streak the previous tick published (0 when the row is missing,
+ * unparsable, or carries no usable value). Exported for the offline tests:
+ * this drives the pre-scan rebuild, so a heartbeat written before the field
+ * existed must degrade to "no streak", never to a rebuild storm.
+ */
+export function heartbeatDeadStreak(raw: string | null | undefined): number {
+  if (!raw) return 0;
+  try {
+    const hb = JSON.parse(raw) as { deadStreak?: unknown } | null;
+    const n = Number(hb?.deadStreak ?? 0);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * The streak THIS tick publishes: the predecessor's value, +1 only when the
+ * predecessor is PROVEN dead. Pure + exported so the escalation rule is
+ * unit-tested instead of only observed in production.
+ */
+export function nextDeadStreak(prevStreak: number, predecessorDead: boolean): number {
+  const prev =
+    Number.isFinite(prevStreak) && prevStreak > 0 ? Math.floor(prevStreak) : 0;
+  return predecessorDead ? prev + 1 : prev;
+}
+
+/**
+ * `rebuiltAt` from a heartbeat row (null when absent or unparsable): the
+ * marker the recovery writes after it rebuilt the module state. It is what
+ * separates "this heartbeat is stale because the state behind it is fresh"
+ * from "this heartbeat is stale because the tick died" — without it, the
+ * recovery tick's own heartbeat would look like another death and every
+ * later tick would rebuild again. Exported for the offline tests.
+ */
+export function heartbeatRebuiltAt(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  try {
+    const hb = JSON.parse(raw) as { rebuiltAt?: unknown } | null;
+    const n = Number(hb?.rebuiltAt ?? 0);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The successor's rebuild verdict, as a pure function so the recovery rule is
+ * unit-tested instead of only observed in production (scripts/test-tick-path.js).
+ *
+ * Rebuild iff the predecessor is PROVEN dead — a phase=scanning heartbeat
+ * older than staleMs, the exact test the history backfill uses — and its
+ * heartbeat carries no `rebuiltAt` marker. The marker is what makes the
+ * recovery idempotent: without it, the recovering tick's own (scanning,
+ * stale) heartbeat would read as another death and every later tick would
+ * rebuild again, forever, while never scanning.
+ *
+ * Note the deliberate absence of a "2 consecutive deaths" threshold: the
+ * predecessor test already requires a proven non-flush, and the cost of a
+ * spurious rebuild (one re-init on the tick after a one-off kill) is orders
+ * of magnitude below the cost of NOT rebuilding (28 minutes of zero scans,
+ * 2026-09-19 16:05-16:33Z). DEAD_TICK_STREAK_RESET stays as the documented
+ * escalation threshold for the counter-based path above.
+ */
+export function deadTickRebuildDecision(
+  prevRaw: string | null | undefined,
+  now: number,
+  staleMs: number,
+): { rebuild: false } | { rebuild: true; deadAt: number } {
+  const dead = prevRaw ? deadTickBackfillInfo(prevRaw, now, staleMs) : null;
+  if (!dead) return { rebuild: false };
+  if (heartbeatRebuiltAt(prevRaw) !== null) return { rebuild: false };
+  return { rebuild: true, deadAt: dead.at };
+}
+
 async function ensureInitialized(env: Env): Promise<void> {
+  // Dead-tick recovery (see DEAD_TICK_STREAK_RESET). The SUCCESSOR tick is the
+  // only witness a killed tick can have, and this is the earliest hook every
+  // scheduled and HTTP path reaches before it scans. A predecessor that died
+  // before its completion flush leaves a stale phase=scanning heartbeat — the
+  // same test the history backfill uses proves it — so the recovering tick
+  // drops the module-scoped clients + scanner and rebuilds them here, then
+  // goes on to scan this same tick. No scan minute is lost.
+  //
+  // Why not in runScan's `finally`, where the breaker used to live: a tick
+  // killed by the invocation wall clock runs no `finally` at all, which is how
+  // 2026-09-19 16:05-16:33Z reached 23 consecutive dead ticks and 28 minutes of
+  // zero scan rows with the breaker never firing once.
+  //
+  // Cost, stated plainly: one single-row read per tick (~110ms live). The free
+  // alternative — carrying a streak counter in the claim heartbeat — needs the
+  // claim/heartbeat write sites, which sit past this repo's file-edit window.
+  // The read is bounded so that slow Turso can never turn this check into the
+  // very thing it exists to fix (a tick that outlives its window).
+  if (db && dbReady) {
+    try {
+      const prevRaw = await Promise.race([
+        db.getWorkerState("scan_heartbeat"),
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), WEDGE_CHECK_BOUND_MS),
+        ),
+      ]);
+      const verdict = deadTickRebuildDecision(prevRaw, Date.now(), BACKFILL_STALE_MS);
+      if (verdict.rebuild) {
+        console.error(
+          `[worker] predecessor tick died before its completion flush (started ${new Date(
+            verdict.deadAt,
+          ).toISOString()}) — rebuilding module state before this scan`,
+        );
+        dex = null;
+        helius = null;
+        birdeye = null;
+        gmgn = null;
+        axiom = null;
+        arkham = null;
+        crimeWallets = null;
+        walletAnalyzer = null;
+        flurryAnalyzer = null;
+        scanner = null;
+        scannerReady = false;
+        initPromise = null;
+        wedgedStateResets++;
+        // The rebuilt Scanner restarts its counters at zero, so a surviving
+        // baseline would make every later increment look "already written"
+        // (delta <= 0) and silently drop it.
+        pushDeferralBaseline = { deferred: 0, recovered: 0 };
+        // Announce the rebuild in the heartbeat, keeping the DEAD tick's `at`:
+        // `now` would make the cadence gate skip the tick that just rebuilt the
+        // state, and `rebuiltAt` is the marker that stops the same death from
+        // rebuilding again on every later tick. One extra round trip, paid only
+        // on a recovery tick.
+        //
+        // The claim this tick goes on to win still sees that same stale
+        // phase=scanning row, so runScan writes the dead tick's backfill row as
+        // usual — the recovery adds a rebuild, not a hole in scan_history.
+        await db.setWorkerState(
+          "scan_heartbeat",
+          JSON.stringify({
+            at: verdict.deadAt,
+            ok: true,
+            phase: "scanning",
+            rebuiltAt: Date.now(),
+          }),
+        );
+      }
+    } catch (err) {
+      console.warn(
+        "[worker] dead-tick recovery check failed — continuing:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
   const fp = tradeFingerprint(env);
   if (initPromise && fp !== lastTradeFp) {
     // Trade bindings changed since init (e.g. the wallet secret was added or
@@ -1247,6 +1425,12 @@ async function runScan(
   const dead = prevHeartbeatRaw
     ? deadTickBackfillInfo(prevHeartbeatRaw, Date.now(), BACKFILL_STALE_MS)
     : null;
+  // Durable dead-tick streak (see DEAD_TICK_STREAK_RESET): read from the
+  // heartbeat the previous tick left, escalated only when that tick is proven
+  // dead, and published below in this tick's own claim heartbeat — so the next
+  // tick inherits it even if THIS one is killed before its flush.
+  const prevDeadStreak = heartbeatDeadStreak(prevHeartbeatRaw);
+  const deadStreakNow = nextDeadStreak(prevDeadStreak, dead !== null);
   const backfillEntry = dead
     ? {
         at: dead.at,

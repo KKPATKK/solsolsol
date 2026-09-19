@@ -364,6 +364,72 @@ installTickProbe(fakeScanner, {
   assert.equal(deferredWriteCount(), 1, "a second install does not wrap the handle twice");
   await drainDeferredWrites();
 
+  // ---------- dead-tick recovery (worker.ts deadTickRebuildDecision) ----------
+  // The 2026-09-19 16:05-16:33Z incident: 23 consecutive cron ticks, each won
+  // the claim, wrote a phase=scanning heartbeat and died before its completion
+  // flush, while the breaker never fired — its increment and rebuild sat in a
+  // `finally` a killed invocation never runs. The recovery now runs on the
+  // SUCCESSOR tick, before it scans. These cases pin that rule.
+  {
+    const {
+      deadTickRebuildDecision,
+      heartbeatRebuiltAt,
+      heartbeatDeadStreak,
+      nextDeadStreak,
+    } = require("../dist/worker.js");
+    const now = 1_800_000_000_000;
+    const stale = 45_000;
+    const deadHb = JSON.stringify({ at: now - 60_000, ok: true, phase: "scanning" });
+
+    // A stale phase=scanning heartbeat with no marker: the predecessor never
+    // flushed, so the successor rebuilds the state BEFORE it scans.
+    assert.deepEqual(deadTickRebuildDecision(deadHb, now, stale), {
+      rebuild: true,
+      deadAt: now - 60_000,
+    });
+    // Marker present: the row is stale because the state behind it was ALREADY
+    // rebuilt. This is the case that stops one death from rebuilding forever
+    // (the recovering tick's own heartbeat is stale too, and it never flushes).
+    const marked = JSON.stringify({
+      at: now - 60_000,
+      phase: "scanning",
+      rebuiltAt: now - 59_500,
+    });
+    assert.deepEqual(deadTickRebuildDecision(marked, now, stale), { rebuild: false });
+    // A landed completion flush is proof of life, however old the row is.
+    assert.deepEqual(
+      deadTickRebuildDecision(JSON.stringify({ at: now - 600_000, phase: "done" }), now, stale),
+      { rebuild: false },
+    );
+    // A fresh scanning heartbeat is a tick that is still RUNNING, not a death:
+    // rebuilding here would tear down the state of a live scan.
+    assert.deepEqual(
+      deadTickRebuildDecision(JSON.stringify({ at: now - 5_000, phase: "scanning" }), now, stale),
+      { rebuild: false },
+    );
+    // Missing / unparsable / shapeless rows can never trigger a rebuild.
+    for (const raw of [null, undefined, "", "not json", "{}", JSON.stringify({ phase: "scanning" })]) {
+      assert.deepEqual(deadTickRebuildDecision(raw, now, stale), { rebuild: false });
+    }
+    assert.equal(heartbeatRebuiltAt(marked), now - 59_500);
+    assert.equal(heartbeatRebuiltAt(deadHb), null);
+    assert.equal(heartbeatRebuiltAt("not json"), null);
+    assert.equal(heartbeatRebuiltAt(JSON.stringify({ rebuiltAt: 0 })), null);
+
+    // The counter helper is pinned even though its publish site (the claim
+    // heartbeat) is outside the editable window: the escalation rule 0→1→2 on
+    // consecutive proven deaths is what DEAD_TICK_STREAK_RESET means.
+    assert.equal(heartbeatDeadStreak(deadHb), 0);
+    assert.equal(heartbeatDeadStreak(JSON.stringify({ deadStreak: 2 })), 2);
+    assert.equal(heartbeatDeadStreak(JSON.stringify({ deadStreak: -3 })), 0);
+    assert.equal(heartbeatDeadStreak("not json"), 0);
+    assert.equal(nextDeadStreak(0, true), 1);
+    assert.equal(nextDeadStreak(1, true), 2);
+    assert.equal(nextDeadStreak(2, false), 2);
+    assert.equal(nextDeadStreak(-5, true), 1);
+    console.log("dead-tick recovery: pass");
+  }
+
   console.log("tick probe + mode read + feed view + db seam: pass");
 })().catch((err) => {
   console.error("push-path instrumentation tests failed:", err);
