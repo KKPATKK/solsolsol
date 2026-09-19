@@ -489,8 +489,31 @@ const FEED_DEADLINE_MS = 600;
  * TTL-expiry tick or a slow Turso — and on those a fast, diagnosable miss
  * (slice deferred to the next rotation slot) beats a pool that spent the
  * candidate's gate window.
+ *
+ * 2026-09-19: 600 → 1400. The 600 ceiling rested on "most ticks are a cache
+ * hit, so the cap only bites on the TTL-expiry tick". Live numbers say the
+ * opposite: cron ticks land on freshly recycled isolates (the isolate that
+ * answered /health reported dex cacheSize 0, i.e. no warm state), so the 90s
+ * pool cache is COLD and the read genuinely happens nearly every tick.
+ * Measured over 12 real scans (/debug/tick + heartbeat summary): 178, 230,
+ * 352, 388, 442, 445, 448, 449, 457, 457, 544ms — the read sits at 59–91%
+ * of a 600ms cap, so any Turso wobble crosses it. When it does,
+ * fetchFeedCapped resolves the `[]` fallback; if the DexScreener profiles
+ * feed is ALSO empty (429-backoff ticks: http429 1 with blockedForMs ≈ 32s),
+ * the tick takes the `empty-feed-and-pool` early return and evaluates
+ * NOTHING while still reporting ok:true — and the finally below nulls
+ * lastSkip, so /health cannot say why (the only trace is profiles=0/pool=0,
+ * which is what the 2026-09-19 06:14–06:57Z history shows for 60–100% of
+ * ticks per 10 min: the pool sweep was effectively stopped for stretches).
+ * 1400 is sized just ABOVE SCAN_DB_TIMEOUT_MS (1200), the leash every
+ * tick-scoped round trip already carries: at 600 this constant, not the DB
+ * layer, was the binding constraint, so a read the client would have
+ * completed was thrown away and took the whole tick with it. The worst case
+ * still fits the front window (FEED_DEADLINE_MS 600 + 1400 = 2000 <
+ * FRONT_PHASE_WINDOW_MS 2600), so it cannot eat the 1600ms gate reserve the
+ * way the retired 2200 did.
  */
-const POOL_FETCH_BUDGET_MS = 600;
+const POOL_FETCH_BUDGET_MS = 1_400;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the

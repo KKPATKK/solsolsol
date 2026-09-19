@@ -1162,6 +1162,19 @@ async function runScan(
             ms: flushedMs,
             err: lastScanError,
             skip: scanner?.lastSkip ?? null,
+            // The idle-tick signature: green, but nothing was evaluated
+            // because BOTH the profile feed and the re-eval pool read came
+            // back empty. Reported as a shape rather than a reason on
+            // purpose — the scanner's own lastSkip (empty-feed-and-pool,
+            // etc.) is reset to null in runOnce's finally before this flush
+            // reads it, so a cause here would be a guess, while the shape is
+            // what the operator actually needs to spot (2026-09-19: the pool
+            // read overran POOL_FETCH_BUDGET_MS on most ticks and the whole
+            // sweep silently stopped for 10-minute stretches).
+            idle:
+              lastScanOk && summary
+                ? summary.profiles === 0 && summary.pool === 0
+                : null,
             // The durable deferral counters as of the LAST confirmed write
             // (persistPushDeferralDelta runs after this flush, and the next
             // tick's `phase: scanning` heartbeat publishes the fresh copy).
