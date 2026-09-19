@@ -280,6 +280,24 @@ async function main() {
   // came back at 413 of 490, i.e. only the far zone re-read the same
   // signal-ordered head every visit. 18-min sweeps give 12 far slots of
   // ~1.6h each; the near zone needs no extra slots because it already fits.
+  // Axiom kill switch (AXIOM_ENABLED, default on). Off must mean the Worker
+  // never builds the Axiom client: the session costs one /token-info call per
+  // final candidate and fires a "session dead" admin alert once it expires,
+  // and neither the trending switch nor the bot-users floor covers both.
+  await test("loadConfig: AXIOM_ENABLED=0 disables Axiom, default stays on", () => {
+    assert.equal(loadConfig({}).axiomEnabled, true);
+    assert.equal(loadConfig({ AXIOM_ENABLED: "1" }).axiomEnabled, true);
+    assert.equal(loadConfig({ AXIOM_ENABLED: "0" }).axiomEnabled, false);
+    // Switching off must not silently retune what comes back on revival:
+    // the bot-users floor and the feed size keep their documented defaults
+    // (wrangler.toml sets AXIOM_TRENDING_LIMIT=0 explicitly while disabled),
+    // and the Worker is still not allowed to be a refresher.
+    const off = loadConfig({ AXIOM_ENABLED: "0" });
+    assert.equal(off.axiomMinBotUsers, 90);
+    assert.equal(off.axiomTrendingLimit, 20);
+    assert.equal(off.axiomExternalRefresh, false);
+  });
+
   // If these numbers drift, the far zone silently starves again (its oldest
   // coins never read) — the bug this test prevents.
   await test("loadConfig: 3/18-min sweeps give a full-coverage far zone", () => {

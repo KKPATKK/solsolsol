@@ -17,16 +17,41 @@
 # lock inside scripts/axiom-refresh-action.py — concurrent triggers can
 # never double-rotate the session.
 #
+# FAILURE VISIBILITY (2026-09-19): this Action failed on every delivered run
+# from 2026-08-27 to 2026-09-19 and nobody noticed — schedule delivery had
+# decayed to ~4-5 runs/day, the cron-job.org channel had stopped on 08-28,
+# and GitHub's own failure e-mail was easy to miss. The steps below open ONE
+# tracking issue (deduped, at most one comment per 6h) and close it again on
+# the first success, with the HTTP status that says which remedy applies.
+#
 # Secrets required (repo → Settings → Secrets and variables → Actions):
 #   TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io
 #   TURSO_AUTH_TOKEN     Turso auth token
+#
+# STATUS 2026-09-19: DISABLED along with AXIOM_ENABLED=0 — the schedule below
+# is commented out and nothing here runs on its own. Everything in this file is
+# kept (script, status row, tracking issue) so reviving Axiom is a config flip,
+# not a rebuild.
+#
+# Verify the chain on demand after a re-login (rotates even a fresh token):
+#   gh workflow run axiom-refresh.yml -f force=true
 
 name: Axiom session refresher
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
+  # SCHEDULE DISABLED 2026-09-19: Axiom is switched off (AXIOM_ENABLED="0" in
+  # wrangler.toml), so there is no session to keep alive — and this job failed
+  # on every delivered run since 2026-08-27 (~4-5/day), which only added noise.
+  # workflow_dispatch is kept so the chain can be verified the moment Axiom is
+  # revived:  gh workflow run axiom-refresh.yml -f force=true
+  # schedule:
+  #   - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Refresh even if the access token is still fresh"
+        type: boolean
+        default: false
 
 concurrency:
   group: axiom-refresh
@@ -34,6 +59,7 @@ concurrency:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   refresh:
@@ -55,4 +81,54 @@ jobs:
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          FORCE_REFRESH: ${{ inputs.force && '1' || '0' }}
         run: python scripts/axiom-refresh-action.py
+
+      # One open issue per outage (not one per run). The status row written by
+      # the script carries the consecutive-failure count and the remedy hint.
+      - name: Report failure in a tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="Axiom session refresher failing"
+          {
+            echo "Axiom refresh run failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Status row (\`worker_state.axiom_refresh_status\`):"
+            echo
+            echo '```json'
+            cat .axiom-status.json 2>/dev/null || echo '{}'
+            echo '```'
+            echo
+            echo "**Why this matters:** the Cloudflare Worker cannot refresh Axiom itself — Bot Management answers HTTP 418 to its egress — so this Action is the only writer (see docs/axiom-refresher.md). While it fails, the session dies ~16 min after its access token expires: the trending source stops and the bot-users push gate pauses."
+            echo
+            echo "**Remedy:** \`401\` = the stored refresh token is dead, so only a browser re-login fixes it — log in on axiom.trade, copy the \`auth-access-token\` + \`auth-refresh-token\` cookies and open \`/debug/axiom-tokens?access=...&refresh=...\`; then verify with \`gh workflow run axiom-refresh.yml -f force=true\`. \`418\` = this runner's fingerprint was blocked, retry next slot."
+            echo
+            echo "**Also check the second trigger channel:** cron-job.org → the job calling this workflow's dispatch API (an all-401 History tab means the PAT expired). GitHub's \`schedule\` alone delivered only ~4-5 runs/day during this outage."
+          } > /tmp/axiom-issue.md
+          N="$(gh issue list --state open --search "in:title \"$TITLE\"" --json number -q '.[0].number // empty')"
+          if [ -z "$N" ]; then
+            gh issue create --title "$TITLE" --body-file /tmp/axiom-issue.md
+          else
+            LAST="$(gh issue view "$N" --json comments -q '.comments[-1].createdAt // empty')"
+            if [ -z "$LAST" ] || [ $(( $(date +%s) - $(date -d "$LAST" +%s) )) -gt 21600 ]; then
+              gh issue comment "$N" --body-file /tmp/axiom-issue.md
+            else
+              echo "tracking issue #$N already updated <6h ago — staying quiet"
+            fi
+          fi
+
+      - name: Close the tracking issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="Axiom session refresher failing"
+          N="$(gh issue list --state open --search "in:title \"$TITLE\"" --json number -q '.[0].number // empty')"
+          if [ -n "$N" ]; then
+            gh issue comment "$N" --body "✅ Refresher recovered (run $GITHUB_RUN_ID) — the Axiom session is renewing again."
+            gh issue close "$N"
+          fi

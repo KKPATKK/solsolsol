@@ -637,7 +637,9 @@ async function ensureInitialized(env: Env): Promise<void> {
     // Axiom is configured when there are login credentials OR already
     // persisted tokens (Google/SSO accounts have no password — they get
     // tokens via /debug/axiom-tokens, which is re-checked after DB init).
-    axiomConfigured = Boolean(config.axiomEmail && config.axiomPassword);
+    axiomConfigured = Boolean(
+      config.axiomEnabled && config.axiomEmail && config.axiomPassword,
+    );
     tradeConfigured = Boolean(config.trade.walletSecret);
     jupiterKeyed = Boolean(config.trade.jupiterApiKey);      if (config.tursoUrl) {
         try {
@@ -649,7 +651,7 @@ async function ensureInitialized(env: Env): Promise<void> {
           // persisted by /debug/axiom-tokens, so the feed is "configured"
           // whenever a stored access token exists too.
           const storedAxiomToken = await db?.getWorkerState("axiom_access_token");
-          if (storedAxiomToken) axiomConfigured = true;
+          if (storedAxiomToken && config.axiomEnabled) axiomConfigured = true;
           // Mirror the durable deferral counters (src/deferrallog.ts) so this
           // isolate's heartbeats carry the fleet-wide numbers even before it
           // has any of its own. A row that does not exist yet loads as an
@@ -719,11 +721,17 @@ async function ensureInitialized(env: Env): Promise<void> {
       // instead of a password; the client's login methods guard on that).
       // Decoupling from the trending switch keeps /debug/axiom-token-info
       // usable while the feed is off.
+      //
+      // AXIOM_ENABLED=0 short-circuits ALL of it: no client means no trending
+      // call, no per-candidate /token-info and no refresh attempt, so a dead
+      // session cannot keep spending API calls and firing admin alerts while
+      // it waits for a manual browser re-login (the state 2026-08-27 → 09-19).
       if (
-        config.axiomTrendingLimit > 0 ||
-        config.axiomMinBotUsers > 0 ||
-        axiomConfigured ||
-        Boolean(config.axiomEmail && config.axiomPassword)
+        config.axiomEnabled &&
+        (config.axiomTrendingLimit > 0 ||
+          config.axiomMinBotUsers > 0 ||
+          axiomConfigured ||
+          Boolean(config.axiomEmail && config.axiomPassword))
       ) {
         try {
           axiom = new AxiomClient(config);

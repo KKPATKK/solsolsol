@@ -8,3 +8,4 @@ dist/
 tsconfig.tsbuildinfo
 __pycache__/
 *.pyc
+.axiom-status.json

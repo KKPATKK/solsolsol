@@ -412,6 +412,17 @@ export interface AppConfig {
    */
   axiomExternalRefresh: boolean;
   /**
+   * Global Axiom kill switch (AXIOM_ENABLED, default on): 0 = the Worker never
+   * builds the Axiom client at all. That removes every Axiom call in one move:
+   * the trending feed, the per-candidate /token-info (which feeds BOTH the
+   * card summary line and the axiomMinBotUsers gate — the gate is therefore
+   * inert while this is off) and the session refresh/alert path. Cards fall
+   * back to the legacy lines, exactly as they already did while the session
+   * was down. Disabled 2026-09-19 after a session that could only be revived
+   * by hand. See docs/axiom-refresher.md.
+   */
+  axiomEnabled: boolean;
+  /**
    * Jupiter API base. Kept out of wrangler.toml [vars]: the Worker hit the
    * free tier's 64-variable cap (deploy ERROR 10055, 88 bound → 64 limit) and
    * this value had a code default anyway. The env override (if any) is honored
@@ -669,6 +680,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ? Math.max(0, Math.floor(Number(env.AXIOM_MIN_BOT_USERS ?? 90)))
       : 90,
     axiomExternalRefresh: (env.AXIOM_EXTERNAL_REFRESH ?? "0") === "1",
+    axiomEnabled: (env.AXIOM_ENABLED ?? "1") !== "0",
     birdeyeBackfillEnabled: (env.BIRDEYE_BACKFILL_ENABLED ?? "true") !== "false",
     birdeyeBackfillIntervalMs:
       Number.isFinite(Number(env.BIRDEYE_BACKFILL_INTERVAL_MIN ?? 360)) &&

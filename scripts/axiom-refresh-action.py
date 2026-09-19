@@ -19,6 +19,9 @@ Flow:
   4. POST /refresh-access-token through every shard until one answers 200
      (curl_cffi, impersonate="chrome").
   5. Write the rotated pair back to worker_state and release the lock.
+  6. Record the attempt (ok / http / consecutive failures) in
+     worker_state.axiom_refresh_status so a dead refresher is visible
+     without reading run logs — see record_status().
 
 Secrets expected (GitHub repo → Settings → Secrets → Actions):
   TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io
@@ -91,6 +94,7 @@ MASK = lambda t: f"{t[:12]}…{t[-6:]}" if t and len(t) > 24 else "<missing>"
 
 def die(msg: str) -> None:
     print(f"❌ {msg}")
+    record_status(ok=False, http=LAST_HTTP or None, error=msg)
     sys.exit(1)
 
 
@@ -142,6 +146,100 @@ def turso_execute(sql: str, args: list | None = None) -> int:
         or inner.get("rows_affected")
         or 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Durable refresher status (worker_state.axiom_refresh_status).
+#
+# Why: this Action failed on EVERY run from 2026-08-27 to 2026-09-19 (~23 days)
+# and nothing surfaced it. The Worker cannot refresh at all (Cloudflare Bot
+# Management answers 418 to its egress) and the cron-job.org dispatch channel
+# had stopped a day later, so the only symptom was cards quietly losing Axiom
+# enrichment. This row makes the refresher's own health inspectable: last
+# attempt, last success, consecutive failures, and the HTTP status that says
+# WHICH remedy applies (401 = the stored pair is dead, only a browser re-login
+# fixes it; 418 = this runner's fingerprint was blocked, retry next slot).
+# ---------------------------------------------------------------------------
+STATUS_KEY = "axiom_refresh_status"
+STATUS_FILE = ".axiom-status.json"
+
+# Set by refresh() so a failure can report the status the API actually gave.
+LAST_HTTP = 0
+
+
+def _hint(http: int | None) -> str:
+    if http == 401:
+        return (
+            "the stored refresh token was REJECTED (401) — the pair is dead; "
+            "re-login on axiom.trade in a browser and paste both cookies via "
+            "/debug/axiom-tokens?access=...&refresh=..."
+        )
+    if http == 418:
+        return "Cloudflare bot management blocked this runner's TLS fingerprint (418)"
+    if http and http >= 500:
+        return f"Axiom answered HTTP {http} — upstream incident, retry next slot"
+    return "see the run log"
+
+
+def _read_status() -> dict:
+    try:
+        raw = get_worker_state(STATUS_KEY)
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def record_status(
+    ok: bool,
+    http: int | None = None,
+    host: str | None = None,
+    error: str | None = None,
+    skipped: str | None = None,
+) -> None:
+    """Persist + print this run's outcome. NEVER raises: a telemetry write
+    must not turn a working refresh into a red run.
+
+    Upsert (not UPDATE): the first run has to create the row, and the CAS
+    lock row already proved plain UPDATE silently no-ops on a missing key.
+    """
+    now = int(time.time())
+    prev = _read_status()
+    if ok:
+        fails, first_fail = 0, None
+    else:
+        fails = int(prev.get("fails") or 0) + 1
+        first_fail = prev.get("firstFailAt") if fails > 1 else now
+    status = {
+        "at": now,
+        "ok": ok,
+        "event": os.environ.get("GITHUB_EVENT_NAME") or "local",
+        "runId": os.environ.get("GITHUB_RUN_ID") or None,
+        "http": http,
+        "host": host,
+        "skipped": skipped,
+        "error": error[:300] if error else None,
+        "hint": None if ok else _hint(http),
+        "fails": fails,
+        "firstFailAt": first_fail,
+        "lastOkAt": now if ok else prev.get("lastOkAt"),
+    }
+    try:
+        with open(STATUS_FILE, "w") as fh:
+            json.dump(status, fh)
+    except Exception:
+        pass
+    try:
+        turso_execute(
+            "INSERT INTO worker_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [
+                {"type": "text", "value": STATUS_KEY},
+                {"type": "text", "value": json.dumps(status, separators=(",", ":"))},
+            ],
+        )
+    except Exception as exc:
+        print(f"⚠️ status row not written: {str(exc)[:120]}")
+    print(f"📊 status: {json.dumps(status, separators=(',', ':'))}")
 
 
 def try_claim_lock(now_s: int) -> bool:
@@ -231,6 +329,7 @@ def extract_cookie(set_cookie_header: str | None, name: str) -> str | None:
 
 
 def refresh(refresh_token: str):
+    global LAST_HTTP
     last_status = 0
     for host in HOSTS:
         url = f"https://{host}{REFRESH_PATH}"
@@ -258,10 +357,11 @@ def refresh(refresh_token: str):
         except Exception as exc:
             print(f"  {host}: {exc.__class__.__name__}: {str(exc)[:120]}")
         time.sleep(0.3)
+    LAST_HTTP = last_status  # so record_status() can name the remedy
     raise RuntimeError(f"all {len(HOSTS)} hosts failed (last HTTP {last_status})")
 
 
-def main() -> None:
+def run() -> None:
     if not TURSO_URL or not TURSO_TOKEN:
         die("TURSO_DATABASE_URL / TURSO_AUTH_TOKEN secrets missing")
 
@@ -270,13 +370,20 @@ def main() -> None:
     if not access or not refresh_token:
         die("no tokens in worker_state — run /debug/axiom-tokens once first")
 
+    # FORCE_REFRESH=1 (workflow_dispatch input) rotates even a still-fresh
+    # token, so the whole chain can be verified on demand right after a
+    # browser re-login instead of waiting for the ~16 min expiry.
+    forced = (os.environ.get("FORCE_REFRESH") or "").strip().lower() in ("1", "true", "yes")
     exp = jwt_exp(access)
     now = int(time.time())
     if exp is None:
         print("⚠️ cannot parse exp from access JWT — forcing refresh")
+    elif forced:
+        print("🔁 FORCE_REFRESH=1 — refreshing despite a fresh access token")
     elif exp - now > REFRESH_MARGIN_SECONDS:
         mins = (exp - now) // 60
         print(f"✅ access token still valid ({mins} min left) — no refresh needed")
+        record_status(ok=True, skipped=f"fresh ({mins} min left)")
         return
 
     print(f"🔁 access token stale/expired ({MASK(access)}) — refreshing…")
@@ -284,6 +391,7 @@ def main() -> None:
     # Only ONE platform may rotate the pair — claim the cross-platform lock.
     if not try_claim_lock(now):
         print("🔒 another refresher holds the lock — skipping (it owns this rotation)")
+        record_status(ok=True, skipped="lock-held")
         return
     try:
         # Another scheduler may have refreshed between our first read and the
@@ -291,10 +399,15 @@ def main() -> None:
         access = get_worker_state("axiom_access_token") or access
         refresh_token = get_worker_state("axiom_refresh_token") or refresh_token
         re_exp = jwt_exp(access)
-        if re_exp is not None and re_exp - int(time.time()) > REFRESH_MARGIN_SECONDS:
+        if (
+            not forced
+            and re_exp is not None
+            and re_exp - int(time.time()) > REFRESH_MARGIN_SECONDS
+        ):
             print(
                 f"✅ re-checked after lock: already fresh ({(re_exp - int(time.time())) // 60} min left) — no rotation needed"
             )
+            record_status(ok=True, skipped="fresh-after-lock")
             return
 
         new_access, new_refresh, host = refresh(refresh_token)
@@ -306,8 +419,29 @@ def main() -> None:
             print("♻️ refresh token rotated — updated worker_state")
         mins = f"{(new_exp - now) // 60} min" if new_exp else "?"
         print(f"✅ refreshed via {host} — new access {MASK(new_access)} expires in {mins}")
+        record_status(ok=True, http=200, host=host)
     finally:
         release_lock()
+
+
+def main() -> None:
+    """Wrap run() so EVERY outcome lands in the durable status row.
+
+    Without this, a refresher that is failing looks exactly like a scheduler
+    that stopped delivering — which is how the 2026-08-27 → 09-19 outage
+    stayed invisible for ~23 days.
+    """
+    try:
+        run()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        record_status(
+            ok=False,
+            http=LAST_HTTP or None,
+            error=f"{exc.__class__.__name__}: {exc}",
+        )
+        raise
 
 
 if __name__ == "__main__":

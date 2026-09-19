@@ -203,8 +203,24 @@ BOT_ADMIN_IDS = "530602939"
 # (JWT exp). So the feed cannot self-renew from the worker and dies with
 # each token. /debug/axiom-tokens stores tokens, /debug/axiom-refresh
 # probes the blocked endpoint, /debug/axiom-trending probes the feed.
-# ENABLED 2026-08-25: session is auto-refreshed by the GitHub Action
-# (AXIOM_EXTERNAL_REFRESH=1), so the feed survives token expiry. Scanner
-# caches the feed for 3 min (AXIOM_TREND_CACHE_TTL_MS) — upstream sees at
-# most one call per 3 min, not one per 60s tick.
+# DISABLED 2026-09-19: 0 = no trending calls. The session needs a manual
+# browser re-login and can never self-renew from the Worker's egress (Bot
+# Management answers 418 to /refresh-access-token), so the integration was
+# switched off instead of chased. See AXIOM_ENABLED below.
 AXIOM_TRENDING_LIMIT = "0"
+# Global Axiom kill switch (default on). 0 = the Worker never builds the
+# Axiom client, which removes every Axiom call in one move: no trending feed,
+# no per-candidate /token-info (it feeds BOTH the card summary line and the
+# AXIOM_MIN_BOT_USERS gate, so the gate is inert while off), and no session
+# refresh or "session dead" admin alert. Cards fall back to the legacy format
+# — which is what they already showed while the session was down
+# (2026-08-27 → 09-19, Action failing on every delivered run).
+# To re-enable: follow docs/axiom-refresher.md, revive a trigger channel,
+# re-login in a browser, then set this back to "1".
+AXIOM_ENABLED = "0"
+# Single-writer rule (docs/axiom-refresher.md): Axiom rotates the refresh
+# token on EVERY successful call, so exactly one writer may refresh — the
+# GitHub Action (curl_cffi Chrome TLS), never the Worker. 0 because there is
+# no session to keep alive while AXIOM_ENABLED is 0 (the Action's schedule is
+# commented out for the same reason). Set BOTH back to "1" when reviving.
+AXIOM_EXTERNAL_REFRESH = "0"

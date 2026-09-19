@@ -1,5 +1,25 @@
 # Axiom Session Refresher — 雙觸發通道（GitHub schedule + cron-job.org dispatch）
 
+> ## ⛔ 狀態（2026-09-19）：Axiom 已停用
+>
+> `AXIOM_ENABLED="0"`（wrangler.toml）—— Worker 完全唔會建立 Axiom client：
+> 冇 trending、冇 per-candidate `/token-info`（卡片摘要行 + bot-users 閘門一齊停）、
+> 冇 refresh、冇「session 已死」警報；卡片照舊行 legacy 格式。
+> 本 workflow 嘅 `schedule` 亦已 comment 走（只剩 `workflow_dispatch`）。
+>
+> 點解停：session 一定要人手瀏覽器重登，而**兩個觸發通道都失效** ——
+> GitHub schedule 由 2026-09-18 起只投遞 9 個 run（~4.5/日，應該 144/日）、
+> cron-job.org dispatch 自 2026-08-28 15:20Z 起零 fire；Action 由 08-27 19:01Z
+> 起連續 401（stored refresh token 死透），而 Worker 側永遠 418
+> （Cloudflare Bot Management 擋 egress）。結論：冇可靠 10 分鐘觸發通道，
+> 貼新 cookie 只買到 ~16 分鐘。
+>
+> **恢復次序（重要）**：① 先搞好觸發通道（下面 ①/②）→ ② 瀏覽器重登、貼
+> cookie 落 `/debug/axiom-tokens?access=...&refresh=...` → ③ 驗證
+> `gh workflow run axiom-refresh.yml -f force=true`（綠 = 整條鏈通）→
+> ④ 最後才把 `AXIOM_ENABLED` 設返 `"1"`（同時 `AXIOM_EXTERNAL_REFRESH="1"`）
+> 重新 deploy。次序掉轉的話，開返功能只會即刻再死一次。
+
 > 背景（2026-08-26）：GitHub Actions 嘅 `schedule` 投遞係 best-effort 共享隊列，
 > 平台事故時成條隊停擺（當日 00:02–01:52Z 零投遞 ~110 分鐘 → session 死透、
 > Axiom 全端點回偽裝 502）。而 refresh 端點本身 418 所有非瀏覽器 TLS 指紋，
