@@ -23,6 +23,8 @@ import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner, deferredPushTokens } from "./scanner";
+import { feedMakeupView } from "./deferredmakeup";
+import { installTickProbe } from "./tickprobe";
 import {
   PUSH_DEFERRAL_STATE_KEY,
   heldBackCandidates,
@@ -1064,6 +1066,32 @@ async function ensureInitialized(env: Env): Promise<void> {
         // lastSkip back to null in runOnce's finally within the same tick, so
         // without this the reason never reaches a reader (src/skipcapture.ts).
         installSkipCapture(scanner);
+        // Tick probe (src/tickprobe.ts): keeps every phase stamp of the tick
+        // (the scanner keeps only the last one, and the completion path
+        // overwrites even that with `done`), and hangs the worker's own
+        // per-tick numbers off the summary the completion heartbeat already
+        // serializes — the only channel reachable from here.
+        //
+        // Two live problems it exists for:
+        //   - Where did the 4 seconds go on a `candidates 1, pushed 0` tick?
+        //     `summary.phases` answers it: the last stamp before the card is
+        //     refused is the chain step that ran out of clock, and its ms is
+        //     the distance to the claim window (cardClaimDeadline).
+        //   - The trade-mode read used to sit UNBOUNDED inside that window
+        //     (TradeService.effectiveMode is awaited in the chain right before
+        //     the card is rendered and claimed). Kicking it off at the tick's
+        //     start makes the chain's call a cache hit instead of a Turso
+        //     round trip the tick cannot afford — with `modeRead` publishing
+        //     reads/reuses/timeouts so the effect is visible, not assumed.
+        installTickProbe(scanner, {
+          onTickStart: () => trade?.prefetchMode(),
+          onTickEnd: (summary) => {
+            const view = summary as Record<string, unknown> | null;
+            if (!view) return;
+            view.modeRead = trade?.modeStats() ?? null;
+            view.feedMakeup = feedMakeupView();
+          },
+        });
         // Hydrate durable deferred-card identities before the first scan in
         // this isolate; counters alone cannot guarantee a make-up push.
         scanner.seedDeferredTokens(pushDeferralSnapshot?.pendingTokens ?? []);

@@ -11,8 +11,13 @@ const assert = require("node:assert/strict");
 const { DeferredPushLedger, deferredPushTokens, slicePoolRotation } = require("../dist/scanner.js");
 const { loadPushDeferralSnapshot, nextPushDeferralSnapshot } = require("../dist/deferrallog.js");
 const { DexScreenerClient } = require("../dist/dexscreener.js");
-const { isDeferredToken, missingDeferredTokens, DEFERRED_MAKEUP_MAX } =
-  require("../dist/deferredmakeup.js");
+const {
+  isDeferredToken,
+  missingDeferredTokens,
+  DEFERRED_MAKEUP_MAX,
+  feedMakeupView,
+  resetFeedMakeup,
+} = require("../dist/deferredmakeup.js");
 const { loadConfig } = require("../dist/config.js");
 
 // ---------- the pool's rotation priority (a deferred coin in the query) ----
@@ -99,11 +104,28 @@ async function feedTests() {
     "a coin the feed already carries is never pulled in twice",
   );
 
-  // An EMPTY feed stays empty: a 429-backoff tick must keep reading as an
-  // outage (the `empty-feed-and-pool` skip, `profiles: 0` in /health) instead
-  // of being masked by make-up coins.
+  // An EMPTY feed is no longer left alone (2026-09-19). The skip existed to
+  // keep `profiles: 0` readable as an outage, but the ticks it cost the
+  // backlog were exactly the ones a cold isolate serves (5 of the 7
+  // `profiles 0` ticks in one 118-tick window fell within two minutes of a
+  // deploy) — so the outage signal is now recorded per request instead:
+  // rawProfiles stays 0 and emptyFeedTotal counts it, while the deferred coin
+  // rides the list like on any other tick.
+  resetFeedMakeup();
   stub([]);
-  assert.deepEqual(await dex.fetchLatestSolanaProfiles(), [], "an empty feed is never masked");
+  const out3 = await dex.fetchLatestSolanaProfiles();
+  assert.deepEqual(
+    out3.map((p) => p.tokenAddress),
+    ["FEED_A"],
+    "an empty feed still carries the make-up",
+  );
+  const emptyView = feedMakeupView();
+  assert.equal(emptyView.lastRawProfiles, 0, "the RAW size is still 0 — that IS the outage signal");
+  assert.equal(emptyView.emptyFeedTotal, 1, "and it is counted fleet-wide");
+  assert.equal(emptyView.lastInjected, 1, "the make-up is what filled the list");
+  assert.equal(emptyView.injectedTotal, 1, "the injected count accumulates per request");
+  assert.equal(emptyView.feedRequests, 1);
+  assert.equal(emptyView.lastEmptyFeedAt !== null, true, "the empty feed is stamped");
   reg.recover("FEED_A");
 }
 
@@ -160,8 +182,12 @@ async function tickMakeupTest() {
       ["DEFERRED_COIN", "FEEDCOIN"],
       "the feed's own coin AND the deferred one reach the pair phase on this tick",
     );
-    // An empty feed stays empty — the make-up must not mask an outage (and the
-    // tick still takes its empty-feed-and-pool path when the pool is empty too).
+    // An empty feed is no longer left alone either: the deferred coin reaches
+    // the pair phase on those ticks too. That is the fix — the `profiles 0`
+    // ticks (429 backoff, a cold isolate's first fetch) were the ones whose
+    // make-up chance was being thrown away, and they are exactly the ticks
+    // where the backlog is most likely to sit. The outage stays visible in
+    // feedMakeupView(): rawProfiles 0 + emptyFeedTotal.
     stubFeed([]);
     asked = null;
     const scanner2 = new Scanner(
@@ -171,8 +197,8 @@ async function tickMakeupTest() {
     scanner2.seedDeferredTokens(["DEFERRED_COIN"]);
     await scanner2.runOnce();
     assert.ok(
-      !(asked ?? []).includes("DEFERRED_COIN"),
-      "a 429-backoff tick (empty feed) is left alone, not masked by make-up coins",
+      (asked ?? []).includes("DEFERRED_COIN"),
+      "an empty feed still pulls the deferred coin into the tick",
     );
   } finally {
     await client.close();

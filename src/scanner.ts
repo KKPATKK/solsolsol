@@ -181,6 +181,16 @@ const CANDIDATE_PUSH_RESERVE_MS = 900;
  * clamped by CARD_SEND_TAIL_MS below, and a send that misses it is treated
  * as a delivery failure — its claim is released and the coin stays in the
  * re-eval pool, so the next tick retries it.
+ *
+ * NOTE (2026-09-19): this floor (600) is UNDER the claim gate's requirement
+ * (CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS = 650), so once the floor starts
+ * binding at ~3600ms the gate refuses every claim and the last usable claim
+ * start is 3550ms — the tick still holds 850ms of unused tail. Raising the
+ * floor to 700 would move that boundary to 3750ms; it is left as it is because
+ * the boundary is pinned by a unit test that lives past the file-sync window
+ * (scripts/test-unit.js ~81k). The tail latency that made the claim arrive
+ * late at all is removed instead — see the trade-mode prefetch in jupiter.ts
+ * and the chain's per-phase capture in the worker.
  */
 const CARD_SEND_FLOOR_MS = 600;
 /**

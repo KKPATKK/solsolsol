@@ -105,6 +105,30 @@ curl -s https://solana-meme-bot.cool1999k.workers.dev/health \
 「手上有幣、冇送卡」。所以讀嘅時候同 `deferredTotal` 一齊睇：兩者相加就係每次
 到咗 push 階段嘅 tick 嘅 `candidates − pushed`。
 
+## 卡片點解送唔出：`summary.phases` / `modeRead` / `feedMakeup`（2026-09-19 補）
+
+`candidates 1, pushed 0` 以前**講唔出**時間去邊。scanner 每個階段都有 stamp，但
+只留**最後一個**（`pushPhase` / `pushPhaseMs`），而完成路徑會用 `done` 蓋咗它，
+所以一張被扣嘅卡同一張成功嘅卡由外面睇一模一樣。現在每 tick 喺
+`/health.heartbeat.summary` 帶三組：
+
+| 欄位 | 意思 |
+|---|---|
+| `phases[]` | **整條** tick 嘅階段時間線（最新 12 個，`{phase, ms}`）——被扣嘅卡最後一個 stamp 就係用完鐘嘅一步，`ms` 就係同 claim 窗口（3550ms）嘅距離 |
+| `modeRead` | trade-mode 讀取：`{reads, reuses, timeouts, lastReadMs, cachedAgeMs}`。`reuses` 上升 = 卡尾嗰個讀取已經唔收錢 |
+| `feedMakeup` | feed 真相：`{feedRequests, lastRawProfiles, emptyFeedTotal, lastEmptyFeedAt, injectedTotal, lastInjected}` |
+
+**改咗乜（第 1 點）**：`effectiveMode()` 以前喺 render／claim 之前**無界**讀 Turso，
+即係坐响嗰 400ms claim slice 中間。現在 worker 喺**tick 開始**就 prefetch（`onTickStart`），
+卡尾嗰個 call 係 cache hit；每個讀取亦硬性界限 250ms（超時就用 env mode —— 同原本嘅
+fail-safe 一樣，唔會用未證實嘅 mode）。成本：**跨 isolate** 嘅 `/setmode` 最多 15 秒生效
+（同一個 isolate 即時，`setModeOverride` 會寫穿 cache）。
+
+**改咗乜（第 2 點）**：`profiles 0` 嘅 tick 以前刻意**唔注入** make-up（為咗保留
+`profiles: 0` 呢個故障訊號），代價係冷啟動 isolate 嗰幾個 tick 冇補推機會
+（118 tick 中 7 個，其中 5 個喺 deploy 後 2 分鐘內）。現在**照注入**，訊號搬到
+`feedMakeup.lastRawProfiles`（0 = 一樣嘅意思）同 `emptyFeedTotal`（跨 tick 累計）。
+
 ## 仍未落地（可選，非必需）
 
 本 repo 大檔嘅**多行**檔案編輯只能觸及大約頭 45–55KB（單行仍可），以下三個

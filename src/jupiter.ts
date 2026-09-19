@@ -556,6 +556,37 @@ export class JupiterClient {
 }
 
 /**
+ * How long one trade-mode override read may be REUSED, and the hard cap on
+ * the read itself.
+ *
+ * WHY (live 2026-09-19): `effectiveMode()` is awaited in the candidate chain
+ * immediately before the card is rendered and claimed (src/scanner.ts), i.e.
+ * inside the ~400ms slice the tick reserves for pushing the card
+ * (CARD_CLAIM_BUDGET_MS). An unbounded Turso round trip there is what turns a
+ * qualifying coin into a DEFERRED card ("no slice left for the claim plus the
+ * send") instead of a delivery: 10 of 13 consecutive ticks ended
+ * `candidates 1, pushed 0` with `cardSendDeferredTotal` climbing once a
+ * minute, while the same public counters showed the chain REACHING the claim
+ * (the held-back counter stayed flat) — the tick was not short of candidates,
+ * it was short of clock. The read is moved off that tail by the prefetch
+ * below: the worker kicks it off at the tick's start, so the chain's call
+ * 3-4s later is a cache hit.
+ *
+ * What reuse costs: staleness. A `/setmode` flip made in ANOTHER isolate is
+ * honoured within this window; the isolate that handled the command updates
+ * its own copy immediately (setModeOverride). Fifteen seconds covers any tick
+ * (the scan deadline is 4.2s) plus the post-push tracker pass, and the mode is
+ * an operator gesture rather than a per-tick input.
+ */
+const MODE_OVERRIDE_TTL_MS = 15_000;
+/**
+ * Hard cap on one override read. Past it the read is treated as unanswered —
+ * the env mode answers instead, which is exactly the fail-safe the read had
+ * before (see effectiveMode): never act on a mode that could not be verified.
+ */
+const MODE_OVERRIDE_READ_BOUND_MS = 250;
+
+/**
  * High-level trade service shared by the scanner (auto mode), the bot
  * (manual-mode button + /trade status) and /debug/trade. Every money-moving
  * path funnels through executeBuy, the single place that records trade_log
@@ -568,28 +599,123 @@ export class TradeService {
     private readonly db: Db,
   ) {}
 
+  /** Last answered override read, reusable for MODE_OVERRIDE_TTL_MS. */
+  private modeOverride: { at: number; value: string | null } | null = null;
+  /** The read in flight, so a prefetch and a caller share one round trip. */
+  private modeReadInFlight: Promise<boolean> | null = null;
+  /** Observability (the same numbers the heartbeat publishes per tick). */
+  private modeReads = 0;
+  private modeReadReuses = 0;
+  private modeReadTimeouts = 0;
+  private lastModeReadMs = 0;
+
   /**
-   * Effective trade mode: the Telegram /setmode override (worker_state) when
-   * set, otherwise the env-config mode. Reads the DB each call so a live
-   * /setmode flip applies immediately; a DB read failure falls back to the
-   * env config (fail-safe: never trades on a mode we could not verify).
+   * Start the override read off the critical path: the worker calls this at the
+   * beginning of every scan tick, so the chain's late `effectiveMode()` — the
+   * one standing between a qualifying coin and its claim — is served from the
+   * cache. Cheap and idempotent: a fresh cache is a no-op, and a read already
+   * in flight is not duplicated.
    */
-  async effectiveMode(): Promise<TradeMode> {
-    let override: string | null = null;
-    try {
-      override = await this.db.getTradeModeOverride();
-    } catch (err) {
-      console.error(
-        "[trade] override read failed — using env mode:",
-        err instanceof Error ? err.message : err,
-      );
+  prefetchMode(): void {
+    if (this.modeOverride && Date.now() - this.modeOverride.at < MODE_OVERRIDE_TTL_MS) {
+      return;
     }
-    return resolveTradeMode(this.cfg.mode, override);
+    void this.readOverrideOnce();
   }
 
-  /** Persist (or clear, when null) the Telegram trade-mode override. */
+  /**
+   * One bounded override read. Resolves to whether it ANSWERED: a failure or a
+   * read past MODE_OVERRIDE_READ_BOUND_MS leaves the cache untouched and says
+   * so, so the caller can fall back to the env mode instead of inventing a
+   * value (or reusing one that may no longer be true).
+   */
+  private readOverrideOnce(): Promise<boolean> {
+    if (this.modeReadInFlight) return this.modeReadInFlight;
+    const startedAt = Date.now();
+    this.modeReads += 1;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cut = new Promise<{ cut: true }>((resolve) => {
+      timer = setTimeout(() => resolve({ cut: true }), MODE_OVERRIDE_READ_BOUND_MS);
+    });
+    const read: Promise<{ value: string | null } | { cut: true }> = this.db
+      .getTradeModeOverride()
+      .then(
+        (value) => ({ value }),
+        (err) => {
+          console.error(
+            "[trade] override read failed — using env mode:",
+            err instanceof Error ? err.message : err,
+          );
+          return { cut: true as const };
+        },
+      );
+    this.modeReadInFlight = Promise.race([read, cut])
+      .then((out) => {
+        this.lastModeReadMs = Date.now() - startedAt;
+        if ("cut" in out) {
+          this.modeReadTimeouts += 1;
+          return false;
+        }
+        this.modeOverride = { at: Date.now(), value: out.value };
+        return true;
+      })
+      .finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+        this.modeReadInFlight = null;
+      });
+    return this.modeReadInFlight;
+  }
+
+  /**
+   * Effective trade mode: the Telegram /setmode override (worker_state) when
+   * set, otherwise the env-config mode.
+   *
+   * The override is read at most once per MODE_OVERRIDE_TTL_MS window (the
+   * worker prefetches it at each tick's start) and each read is bounded — see
+   * the constants above for why the per-call DB read this replaced was itself
+   * the bug. A read that fails or overruns falls back to the env config
+   * (fail-safe: never act on a mode we could not verify).
+   */
+  async effectiveMode(): Promise<TradeMode> {
+    const cached = this.modeOverride;
+    if (cached && Date.now() - cached.at < MODE_OVERRIDE_TTL_MS) {
+      this.modeReadReuses += 1;
+      return resolveTradeMode(this.cfg.mode, cached.value);
+    }
+    const answered = await this.readOverrideOnce();
+    return resolveTradeMode(this.cfg.mode, answered ? (this.modeOverride?.value ?? null) : null);
+  }
+
+  /**
+   * The mode lookup's own telemetry, published per tick on the scan summary
+   * (see the worker's runOnce wrapper): `reuses` rising next to `reads` is the
+   * proof that the tail call stopped paying for a round trip.
+   */
+  modeStats(): {
+    reads: number;
+    reuses: number;
+    timeouts: number;
+    lastReadMs: number;
+    cachedAgeMs: number | null;
+  } {
+    return {
+      reads: this.modeReads,
+      reuses: this.modeReadReuses,
+      timeouts: this.modeReadTimeouts,
+      lastReadMs: this.lastModeReadMs,
+      cachedAgeMs: this.modeOverride ? Date.now() - this.modeOverride.at : null,
+    };
+  }
+
+  /**
+   * Persist (or clear, when null) the Telegram trade-mode override. The cache
+   * is written through so the isolate that handled the command applies it
+   * immediately instead of at the next prefetch (other isolates pick it up
+   * within MODE_OVERRIDE_TTL_MS).
+   */
   async setModeOverride(mode: TradeMode | null): Promise<void> {
     await this.db.setTradeModeOverride(mode);
+    this.modeOverride = { at: Date.now(), value: mode };
   }
 
   get mode(): TradeConfigSettings["mode"] {

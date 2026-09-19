@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config";
-import { missingDeferredTokens } from "./deferredmakeup";
+import { missingDeferredTokens, noteProfileFeed } from "./deferredmakeup";
 
 const BASE_URL = "https://api.dexscreener.com";
 
@@ -358,16 +358,25 @@ export class DexScreenerClient {
     // tick until it either qualifies (and gets pushed) or stops qualifying.
     //
     // Appended PAST `scanProfileLimit`, so the feed's own coins keep their
-    // slots, and skipped outright on an empty feed: a 429-backoff tick must
-    // keep reading as an empty feed (the `empty-feed-and-pool` skip and the
-    // `profiles: 0` in /health) instead of being masked by make-up coins.
+    // slots.
+    //
+    // NOT skipped on an empty feed any more (2026-09-19): that skip existed to
+    // keep `profiles: 0` readable as "the feed answered with nothing", and it
+    // cost the deferred backlog its make-up chance on exactly the ticks a cold
+    // isolate serves (5 of the 7 `profiles 0` ticks in a 118-tick window fell
+    // within two minutes of a deploy — the first fetch of a fresh isolate
+    // rides its whole budget and returns nothing). The signal moves instead of
+    // being preserved by omission: the raw size is recorded per request in
+    // deferredmakeup.ts (rawProfiles / emptyFeedTotal / lastEmptyFeedAt) and
+    // published every tick with the scan summary, so a masked feed is
+    // impossible to miss — while the deferred coin gets its chance here.
     //
     // Readability note: this list is what /health reports as `profiles`, so a
     // tick carrying make-up entries reads a few above the real feed size
     // (≤ DEFERRED_MAKEUP_MAX) — which is also the only observable that says
     // the make-up is pulling coins in BEFORE the first `deferRecovered` rise.
-    if (feed.length === 0) return feed;
     const makeup = missingDeferredTokens(feed.map((p) => p.tokenAddress));
+    noteProfileFeed(feed.length, makeup.length, Date.now());
     if (makeup.length === 0) return feed;
     return [...feed, ...makeup.map((tokenAddress) => ({ tokenAddress }))];
   }

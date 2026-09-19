@@ -93,6 +93,83 @@ export function deferredTokenList(): string[] {
  * whatever sweep would have come around. Pure, so the selection is testable
  * without the scan.
  */
+/**
+ * What the discovery feed has actually been returning, and what the make-up
+ * did with it — the signal that used to live in `profiles`, and the reason it
+ * had to move.
+ *
+ * `profiles` (the tick's profile-list length, published in /health and in the
+ * scan_history row) is the oldest health signal this bot has: 0 means the feed
+ * answered with nothing (a 429 backoff, a blocked endpoint, a cold isolate
+ * whose first fetch rode its whole budget). The make-up used to be SKIPPED
+ * outright whenever the raw feed was empty, purely to keep that `0` readable
+ * — which cost the deferred backlog its make-up chance on exactly the ticks a
+ * cold isolate serves (live 2026-09-19: 5 of the 7 `profiles 0` ticks in a
+ * 118-tick window fell within two minutes of a deploy).
+ *
+ * Now the make-up injects regardless, and the raw number is kept here: a
+ * `rawProfiles: 0` reading is what `profiles` used to say, `emptyFeedTotal`
+ * accumulates it fleet-wide (the durable counters answer "how often", which a
+ * single isolate's 10-20 minute lifetime cannot), and `injectedTotal` proves
+ * the make-up is what pulled the deferred coins back. Published per tick by
+ * the worker on the scan summary (see the runOnce wrapper in worker.ts).
+ */
+export interface FeedMakeupView {
+  /** Profile requests observed since this isolate booted. */
+  feedRequests: number;
+  /** Size of the LAST raw feed, before the make-up appended anything. */
+  lastRawProfiles: number;
+  /** Requests whose raw feed came back empty (`profiles` used to show this). */
+  emptyFeedTotal: number;
+  /** When the most recent empty feed was seen. */
+  lastEmptyFeedAt: number | null;
+  /** Deferred coins the make-up has appended, lifetime. */
+  injectedTotal: number;
+  /** Coins the LAST feed request appended (0 = nothing was pending). */
+  lastInjected: number;
+}
+
+let feedView: FeedMakeupView = {
+  feedRequests: 0,
+  lastRawProfiles: 0,
+  emptyFeedTotal: 0,
+  lastEmptyFeedAt: null,
+  injectedTotal: 0,
+  lastInjected: 0,
+};
+
+/**
+ * Record one profile fetch: `raw` is what the endpoint returned (before the
+ * make-up), `injected` how many deferred coins were appended to it.
+ */
+export function noteProfileFeed(raw: number, injected: number, at: number): void {
+  feedView = {
+    feedRequests: feedView.feedRequests + 1,
+    lastRawProfiles: raw,
+    emptyFeedTotal: feedView.emptyFeedTotal + (raw === 0 ? 1 : 0),
+    lastEmptyFeedAt: raw === 0 ? at : feedView.lastEmptyFeedAt,
+    injectedTotal: feedView.injectedTotal + injected,
+    lastInjected: injected,
+  };
+}
+
+/** This isolate's feed/make-up view (see noteProfileFeed). */
+export function feedMakeupView(): FeedMakeupView {
+  return { ...feedView };
+}
+
+/** Test seam: the view is module state, like the pending registry above. */
+export function resetFeedMakeup(): void {
+  feedView = {
+    feedRequests: 0,
+    lastRawProfiles: 0,
+    emptyFeedTotal: 0,
+    lastEmptyFeedAt: null,
+    injectedTotal: 0,
+    lastInjected: 0,
+  };
+}
+
 export function missingDeferredTokens(
   present: Iterable<string>,
   max = DEFERRED_MAKEUP_MAX,
