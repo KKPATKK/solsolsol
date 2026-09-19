@@ -491,8 +491,38 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  * the pool and is evaluated on a later sweep, and feed coins are
  * overwhelmingly the sub-$10K-liquidity dust the pool prunes anyway (see
  * the RE_EVAL_PER_TICK_MAX notes).
+ *
+ * 2026-09-19: 600 → 900. Live evidence says part of the remaining
+ * `profiles: 0` population is not "called and empty" but "never called":
+ * `fetchFeedCapped` returns `empty` WITHOUT dispatching when the remaining
+ * feed budget is under the 250ms make-up floor, so any tick whose pre-feed
+ * steps (listEnabledChats + the crime-wallet refresh + the DB work ahead of
+ * the feed) spend more than 350ms of the 600ms deadline loses the whole
+ * feed. The signature is unmistakable in the history: `profiles: 0` WITH a
+ * non-zero `pool` (so the scan continued past the feed phase) while the
+ * cross-isolate heartbeat reports `deferral.pending > 0` — a feed that was
+ * called would have injected the make-up lane on BOTH the failure and the
+ * empty answer and reported pending, not 0 (15:07:12Z: prof 0, pool 222,
+ * pending 5). Measured 11/120 ticks (9%) over 13:19–15:18Z, including a
+ * 5-minute-spaced run (13:21/13:26/13:31/13:36/13:41Z) that is NOT
+ * explained by the post-deploy cold isolates and is still unaccounted for.
+ *
+ * 900 moves the skip threshold to "pre-feed > 650ms", i.e. covers every
+ * pre-feed cost measured so far except the cold isolate's ~4.8K-address
+ * crime-list fetch (8s cap, first tick after a deploy). Accepted cost, and
+ * it is real: the front window's unallocated slack over the pool read drops
+ * 400 → 100ms (900 + POOL_FETCH_BUDGET_MS 1600 = 2500 < FRONT_PHASE_WINDOW_MS
+ * 2600), and EVERY feed in the concurrent fan-out now races up to 900ms
+ * instead of 600. On a bad tick that is 300ms less for the pair fetch (whose
+ * own PAIRS_FETCH_BUDGET_MS is NOT clamped to the front window) and for the
+ * candidate chain. The trade is deliberate: a feed coin discovered a tick
+ * later is not lost (it enters the re-eval pool), whereas a skipped feed
+ * loses that minute's discovery outright, and the make-up lane is skipped
+ * with it. The actual fix for the skip path is passing the make-up list as
+ * `empty` at the profiles call site (the call site sits past this tool's
+ * edit window; the patch is recorded in docs/push-baseline-ledger.md).
  */
-const FEED_DEADLINE_MS = 600;
+const FEED_DEADLINE_MS = 900;
 /**
  * Wall-clock cap for the re-eval pool DB read and the token_stats prune
  * (both race against this deadline; see the call sites). Evidence
@@ -548,7 +578,7 @@ const FEED_DEADLINE_MS = 600;
  * the whole failure this raise exists to remove; above it, a failed read
  * arrives as an ERROR and can be answered with the last good pool (see
  * src/poolfallback.ts) instead of costing the tick. The worst case still fits
- * the front window (FEED_DEADLINE_MS 600 + 1600 = 2200 < FRONT_PHASE_WINDOW_MS
+ * the front window (FEED_DEADLINE_MS 900 + 1600 = 2500 < FRONT_PHASE_WINDOW_MS
  * 2600), so it cannot eat the 1600ms gate reserve the way the retired 2200 did.
  */
 const POOL_FETCH_BUDGET_MS = 1_600;

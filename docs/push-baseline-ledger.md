@@ -412,12 +412,25 @@ const profiles = await this.fetchFeedCapped(
 但單獨加會變死 import，所以留返同呼叫點一齊改。
 （同下面第 4 項嘅 `windowDeadline` 係兩件獨立事，兩個可以一齊貼。）
 
-**另一條窗口內嘅槓桿（未採用）**：`FEED_DEADLINE_MS`（`scanner.ts:495`，~25KB，**可改**）
-600 → 900，跳過門檻由「pre-feed > 350ms」變「> 650ms」。
-成本：front window 未分配餘裕 400ms → 100ms（900 + 池 1600 = 2500 < 2600，仍然唔會食
-gate reserve），**而且**其他 feed 嘅 race 上限一齊由 600 → 900ms（慢嘅 gecko/jup 會多佔
-300ms，池評估相應少）。**未做**：上面嗰個 5 分鐘週期未解釋，冇量度「pre-feed > 350ms」
-嘅實際比率，唔想靠猜去緊一個保護 gate 嘅常數。
+**已採用（2026-09-19）**：`FEED_DEADLINE_MS` 600 → 900（`scanner.ts`，~25KB，窗口內）。
+跳過門檻由「pre-feed > 350ms」變「> 650ms」，即除咗冷啟動 isolate 嗰次 ~4.8K 清單
+fetch（8s 上限）之外，實測到嘅 pre-feed 成本全部覆蓋。
+成本（真實、唔修飾）：front window 未分配餘裕 400ms → 100ms（900 + 池 1600 = 2500 < 2600，
+仍然唔會食 gate reserve），**而且**其他 feed 嘅 race 上限一齊由 600 → 900ms；壞 tick 上
+pair fetch（自己嘅 `PAIRS_FETCH_BUDGET_MS` 冇 clamp 入 front window）同 candidate chain 各少 300ms。
+
+**要分清楚換咗啲乜**：feed 係「遲一 tick 亦唔會失」嘅一相（feed coin 會入 pool 等下個 sweep），
+而跳過係**直接冇咗嗰分鐘嘅 discovery，連 make-up lane 一齊冇** —— 所以用 300ms 尾延遲
+買返成分鐘覆蓋率係賺。**但唔係免費**：壞 tick 上池評估/閘門少 300ms，即係候選送出嘅
+餘裕收窄，所以要一齊盯 `cand>0 && push=0` 嘅比率有冇變差。
+
+**量度點（deploy 後）**：
+- 主：`scan-history` 嘅 `prof=0` 比率（改前 13:19–15:18Z 係 11/120 = 9%）。預期跌。
+- 交叉核對（唔可以單睇 `profiles`）：`rawProfiles` / `emptyFeedTotal` / `failedTotal`
+  三者 —— 跳過係唯一「三者都 0 而 prof=0」嘅路徑。
+- 反效果訊號：`cand>0 && push=0` 比率同上唔好升；`deferral.pending` 唔好長期積。
+- 仍然未解釋：13:21/13:26/13:31/13:36/13:41Z 嗰串**每 5 分鐘一次**嘅 `prof=0`
+  （全部 :10）對唔上任何已知 TTL（crime 6h），未 instrument 到就唔當佢係同一成因。
 
 ## 仍未落地（可選，非必需）
 
