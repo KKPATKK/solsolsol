@@ -105,6 +105,22 @@ let scanner: Scanner | null = null;
 let bot: Bot | null = null;
 let webhook: ((req: Request) => Promise<Response>) | null = null;
 let dex: DexScreenerClient | null = null;
+
+/**
+ * Liquidity the scan ACTUALLY observed this tick, token → usd (2026-09-19).
+ *
+ * Filled by the pair-fetch wrapper installed in init() and flushed after the
+ * tick (see flushObservedLiquidity): it is the raw material for the pool's
+ * dead-pool prune (db.ts DEAD_LIQUIDITY_USD). The pool used to pre-filter on
+ * `max_liquidity_observed`, a lifetime high-water, so a coin that had a pool
+ * and LOST it stayed in the sweep forever — live 2026-09-19: 48 of 49 logged
+ * rejects were liquidity failures (~72% of them liquidity 0/null) while a coin
+ * like `wildebeest` read $0 against a $242K peak. Only readings the scan itself
+ * produced go in here: no liquidity field (`null`) leaves the column as it was,
+ * so a coin nobody has measured keeps the old behavior instead of being pruned
+ * on a guess.
+ */
+let observedLiquidity = new Map<string, number>();
 let helius: HeliusClient | null = null;
 let birdeye: BirdeyeClient | null = null;
 let gmgn: GmgnClient | null = null;
@@ -318,6 +334,35 @@ async function recordDex429(at: number): Promise<void> {
     await db?.bumpDex429(at);
   } catch {
     // telemetry only — never fail a scan over a counter write
+  }
+}
+
+/**
+ * Persist the tick's observed liquidity (see observedLiquidity) so the pool's
+ * dead-pool prune can read how much of a pool is left instead of how much it
+ * ever had (db.ts DEAD_LIQUIDITY_USD).
+ *
+ * Called AFTER the tick and behind the deferred-write drain, never inside it:
+ * the drain carries the tick's own persistence, and both are fire-and-forget so
+ * neither can delay a card's claim or the completion flush. The map is cleared
+ * BEFORE the write on purpose — a failed round trip costs one tick of freshness
+ * on a signal that is recomputed on every sweep, and re-sending a stale batch
+ * later would report liquidity from a tick that is already over.
+ */
+async function flushObservedLiquidity(): Promise<void> {
+  if (!db || observedLiquidity.size === 0) return;
+  const rows = [...observedLiquidity].map(([token, liquidityUsd]) => ({
+    token,
+    liquidityUsd,
+  }));
+  observedLiquidity = new Map();
+  try {
+    await db.recordObservedLiquidity(rows);
+  } catch (err) {
+    console.warn(
+      "[worker] observed-liquidity write failed:",
+      err instanceof Error ? err.message : err,
+    );
   }
 }
 
@@ -898,6 +943,20 @@ async function ensureInitialized(env: Env): Promise<void> {
         void recordDex429(at);
       },
     });
+    // Record what each pair fetch ACTUALLY returned (see observedLiquidity):
+    // the scanner keeps only in-memory state, so the worker — which owns the
+    // end-of-tick write — has to see the map as it goes by. Cheap: one Map
+    // insert per coin per tick, no extra request.
+    const fetchPairs = dex.fetchPairsForTokens.bind(dex);
+    dex.fetchPairsForTokens = async (addresses, deadline) => {
+      const pairs = await fetchPairs(addresses, deadline);
+      for (const [token, pair] of pairs) {
+        const liq = pair.liquidity?.usd;
+        if (typeof liq === "number" && Number.isFinite(liq))
+          observedLiquidity.set(token, liq);
+      }
+      return pairs;
+    };
 
     if (config.telegramBotToken) {
       birdeye = null;
@@ -1118,7 +1177,7 @@ async function ensureInitialized(env: Env): Promise<void> {
             // pattern the deferral-counter sync already relies on ("its
             // promise is left running -- an idempotent write is welcome to
             // land late").
-            void drainDeferredWrites();
+            void drainDeferredWrites().then(() => flushObservedLiquidity());
           },
           db,
           deferWrites: true,

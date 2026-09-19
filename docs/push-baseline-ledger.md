@@ -264,6 +264,60 @@ curl -s .../health | jq '.heartbeat.summary | {profiles, feedMakeup}'
    副作用：429 tick 嘅 scan_history row 由 `profiles 0` 變成 `profiles 5`，
    而 `lastSkip = empty-feed-and-pool` 喺嗰啲 tick 唔會再出現。
 
+## 追蹤池長期 0 候選：死池 prune（2026-09-19 第四補）
+
+**症狀**：pool 240–336、`candidates` 長期 0。**唔係 age 窗口**：
+
+```text
+reject log 49 筆 → 48 筆係流動性（其中大部分 `流动性 —` = 0/null）
+fails: other 72（流動性 + 市值/流動性比）| mcap 8 | chg 4 | age 1
+agedEval 4     ← 每 tick ~91 個被評估的幣之中，只有 4 個行到動能閘
+```
+
+**根因**：pool 嘅流動性 pre-filter 讀 `max_liquidity_observed` —— 一個只升唔跌嘅
+終身高位（`updateTokenMaxMcaps` raise-only），所以「曾經有池、之後抽乾」嘅幣永遠
+通過 prune。實測（DexScreener 現值 vs scanner 記錄）：
+
+| symbol | scanner 峰值 liq | 現時 liq |
+|---|---|---|
+| `wildebeest` | 242,572 | **0** |
+| `CASH` | 43,735 | 2,323 |
+| `upcoin` | 25,953 | 3,586 |
+
+（11 個樣本中 3 個；同 reject log 嘅 ~98% 對得上。）順帶排除嘅假設：
+`fetchPairsForTokens` 嘅「first pair wins」唔係問題 —— DexScreener 本身按深度排序，
+11 個幣每一個嘅 first pair 都係最深池、冇 null。
+
+**改咗乜**：
+
+| 位置 | 變更 |
+|---|---|
+| `db.ts` | 新欄位 `token_stats.last_liquidity_usd`（`addColumnIfMissing`，idempotent） |
+| `db.ts` | `DEAD_POOL_CLAUSE` = `(last_liquidity_usd IS NULL OR last_liquidity_usd >= 1000)`，加入 `getReevalPoolBatched` |
+| `db.ts` | 新 method `recordObservedLiquidity(rows)`：每 120 幣一個 `UPDATE … CASE`（一次 round trip） |
+| `worker.ts` | 包住 `dex.fetchPairsForTokens` 收集本 tick 真實觀察到嘅流動性，tick 後（喺 deferred-write drain 之後）fire-and-forget 寫入 |
+
+`1000` 係「池已經冇了」嘅門檻（0 或幾百美元），**刻意遠低於**聊天閘嘅 $10K：目的係
+踢走「冇池」嘅屍體，唔係代替閘去篩「池細但仲有」嘅幣。NULL 仍然放行 —— 從來未量度過嘅
+row 保持舊行為（唔會靠估去 prune）。永久排除嘅代價同 mcap/峰值流動性 prune 一樣（紀錄在案）。
+
+**睇 live**：`pool` 數字應該首次持續跌（屍體出 pool）；`agedEval` 相對升；reject log 裡
+`流动性 —` 佔比跌；1–2 個 tick 之後 DexScreener 嘅 last reading 就會寫入。
+
+**要老實講**：
+
+1. 每 tick 多一次寫入（~115 行、1 個 statement），喺 tick 之後 fire-and-forget，唔喺 critical path。
+2. 如果 isolate 喺 tick 同 drain 之間死，嗰批 reading 會留到下一個成功 tick 才寫（值會舊 ≤2 min）。
+3. 永久排除嘅風險：一個被 prune 嘅幣唔會再被 pool 評估（自然也就唔會更新 reading），但
+   **feed 仍然可以把它帶回來** —— 任何重新有熱度嘅幣都會出現喺 trending/discovery feed，
+   而 feed 路徑唔經 pool query，所以「復活」唔會被永久封死。
+4. `queryReevalBand`（per-band fallback，`db.ts:2338`）未加 clause —— 佢喺檔案編輯窗口外。
+   生產路徑係 `getReevalPoolBatched`（`poolfallback.ts` 先試佢），所以只有「batched 讀失敗」
+   嘅 tick 會暫時放行屍體。可貼上嘅 patch：把 `const clauses: string[] = [];`（`queryReevalBand` 內）
+   改成 `const clauses: string[] = [DEAD_POOL_CLAUSE];`。
+5. 另一個間接阻礙：`rejectBudgetBeforeEval = 50 − min(poolSlice, 50) = 0`（`scanner.ts:2276`）令
+   feed／make-up 幣嘅拒絕理由完全冇名額睇到（所以 5 個 pending 幣從來冇出現喺 reject log）。
+
 ## 仍未落地（可選，非必需）
 
 本 repo 大檔嘅**多行**檔案編輯只能觸及大約頭 45–55KB（單行仍可），以下三個

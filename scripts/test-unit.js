@@ -561,6 +561,83 @@ async function main() {
     await t.cleanup();
   });
 
+  // The dead-pool prune (2026-09-19). The pool's liquidity filter used to read
+  // `max_liquidity_observed`, a lifetime high-water, so a coin that HAD a pool
+  // and lost it stayed in the sweep forever: live, 48 of 49 logged rejects were
+  // liquidity failures (~72% of them liquidity 0/null), `agedEval 4` of ~91
+  // evaluated coins, and `wildebeest` read $0 against a $242K lifetime peak.
+  // The prune now reads the LAST liquidity the scan measured — and a row nobody
+  // has measured since the column existed keeps the old behavior (NULL passes),
+  // so this cannot prune a coin on a guess.
+  await test("pool: a drained pool is pruned on its recent reading, an unmeasured one is not", async () => {
+    const t = tmpDb();
+    const db = new Db("file:injected", undefined, t.client);
+    await db.init();
+    const now = Date.now();
+    const seed = async (token, ageMin, maxLiq, lastLiq) => {
+      const launch = now - ageMin * 60_000;
+      await t.client.execute({
+        sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed, last_liquidity_usd)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [token, launch, 10_000, ageMin, launch, 120_000, maxLiq, lastLiq],
+      });
+    };
+    // Same peak for every coin, so ONLY the recent reading decides — and the
+    // peak is far above the caller's own liquidity floor, i.e. the old filter
+    // would have admitted all four.
+    // All four sit in the same band (the hot zone around the window entry) so
+    // the rotation cannot be what hides one of them.
+    await seed("ALIVE1", 100, 250_000, 25_000);
+    await seed("DEAD0", 102, 250_000, 0);
+    await seed("DEAD400", 104, 250_000, 400);
+    await seed("UNMEASURED", 106, 250_000, null);
+    const opts = {
+      sinceMs: now - 30 * 3600_000,
+      minLaunchMs: now - (1560 + 180) * 60_000,
+      maxLaunchMs: now - (80 - 180) * 60_000,
+      windowEntryLaunchMs: now - 80 * 60_000,
+      limit: 1000,
+      nearSlots: 2,
+      farSlots: 12,
+      rotationPeriodMs: 1e12,
+      minQualifyMcap: 30_000,
+      maxQualifyMcap: 500_000,
+      minQualifyLiquidity: 5_000,
+      seenChatIds: ["chat-1"],
+      now,
+    };
+    const tokens = (await db.getReevalPoolBatched(opts)).map((r) => r.token);
+    assert.ok(tokens.includes("ALIVE1"), "a live pool stays in the sweep");
+    assert.ok(
+      tokens.includes("UNMEASURED"),
+      "a coin with no recent reading keeps the old high-water-only behavior",
+    );
+    assert.ok(
+      !tokens.includes("DEAD0"),
+      "a drained pool ($0) leaves the sweep instead of being re-checked every rotation",
+    );
+    assert.ok(!tokens.includes("DEAD400"), "dust below the dead-pool floor is pruned too");
+
+    // The write that feeds the prune: one call, one statement, per-coin values.
+    const updated = await db.recordObservedLiquidity([
+      { token: "ALIVE1", liquidityUsd: 0 },
+      { token: "UNMEASURED", liquidityUsd: 12_000 },
+    ]);
+    assert.equal(updated, 2, "both coins are written");
+    const after = (await db.getReevalPoolBatched(opts)).map((r) => r.token);
+    assert.ok(
+      !after.includes("ALIVE1"),
+      "the coin whose pool just drained is pruned on the very next read",
+    );
+    assert.ok(after.includes("UNMEASURED"), "a measured, live pool stays");
+    assert.equal(
+      await db.recordObservedLiquidity([]),
+      0,
+      "an empty batch is a no-op (no round trip on a tick that fetched nothing)",
+    );
+    await t.cleanup();
+  });
+
   // Axiom kill switch (AXIOM_ENABLED, default on). Off must mean the Worker
   // never builds the Axiom client: the session costs one /token-info call per
   // final candidate and fires a "session dead" admin alert once it expires,

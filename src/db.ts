@@ -169,6 +169,41 @@ const POOL_NEAR_LIMIT_SHARE = 0.7;
  */
 const POOL_ROTATION_PERIOD_MS = 300_000;
 
+/**
+ * Liquidity below which a pool counts as dead for the re-eval pool query
+ * (2026-09-19).
+ *
+ * WHY A RECENCY PRUNE WAS NEEDED: the pool's liquidity filter read
+ * `max_liquidity_observed`, a lifetime high-water that only ever rises, so a
+ * coin that HAD a pool and lost it passed the prune forever — it was swept,
+ * pair-fetched and rejected at the gate on every rotation while live coins
+ * shared the slice with it. Live 2026-09-19: the reject log was ~98% liquidity
+ * failures (48 of 49, 48 of 50), ~72% of them `流动性 —` (liquidity 0/null),
+ * `fails.other 72` against `mcap 8 / chg 4 / age 1`, `agedEval 4` of ~91
+ * evaluated coins — and DexScreener showed exactly the escape: `wildebeest`
+ * peaked at $242,572 liquidity and now reads 0, `CASH` 43,735 → 2,323,
+ * `upcoin` 25,953 → 3,586 (3 of 11 sampled coins), all still passing the 6K
+ * prune built on their own high-water.
+ *
+ * WHY THIS THRESHOLD: the floor is deliberately far below the narrowest chat
+ * gate ($10K) — the point is to drop pools that are GONE (0, or a few hundred
+ * dollars of dust), not to second-guess coins that still hold a real LP and
+ * could grow into the gate. A coin whose recent reading is only recorded ONCE
+ * and is below this floor is excluded until its discovery feed finds it again
+ * (the same permanent-exclusion trade-off the mcap and peak-liquidity prunes
+ * already make). NULL still passes: a row nobody has measured since this column
+ * existed keeps the old, high-water-only behavior.
+ */
+const DEAD_LIQUIDITY_USD = 1_000;
+
+/**
+ * The pool pre-filter that a recent reading drives (see DEAD_LIQUIDITY_USD).
+ * Constant-only, so it needs no bound argument in either query builder — and
+ * both MUST carry it, or the batched path would re-admit the corpses the
+ * per-band path drops (the same drift the pair of builders is tested for).
+ */
+const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR last_liquidity_usd >= ${DEAD_LIQUIDITY_USD})`;
+
 /** Opening stats captured the first time the scanner ever saw a token. */
 export interface TokenStats {
   token: string;
@@ -394,7 +429,7 @@ export class Db {
     if (bands.length === 0) return [];
     const seen = this.seenExclusion(opts.seenChatIds);
     const statements = bands.map((b) => {
-      const clauses: string[] = [];
+      const clauses: string[] = [DEAD_POOL_CLAUSE];
       const args: Array<string | number> = [b.lo, b.hi, opts.sinceMs];
       if (opts.minQualifyMcap !== undefined) {
         clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed >= ?)`);
@@ -904,6 +939,12 @@ export class Db {
     // huge max_mcap_observed would otherwise rank them FIRST in every band).
     // Unconditional because addColumnIfMissing is idempotent.
     await this.addColumnIfMissing("token_stats", "max_liquidity_observed", "REAL");
+    // Recent-liquidity tracking (2026-09-19): how much liquidity each coin
+    // ACTUALLY had the last time the scan looked at it (see
+    // DEAD_LIQUIDITY_USD). The high-water above cannot answer "is this pool
+    // still there?" — this column can, and it is what the pool's dead-pool
+    // prune reads. Unconditional because addColumnIfMissing is idempotent.
+    await this.addColumnIfMissing("token_stats", "last_liquidity_usd", "REAL");
     // Feed attribution: which discovery feed first registered each coin
     // (per-feed quality stats). Unconditional — idempotent.
     await this.addColumnIfMissing("token_stats", "discovered_via", "TEXT");
@@ -969,6 +1010,47 @@ export class Db {
         "write",
       );
     }
+  }
+
+  /**
+   * Record how much liquidity each evaluated coin ACTUALLY had on this tick
+   * (2026-09-19) — the recency signal the pool's dead-pool prune reads (see
+   * DEAD_LIQUIDITY_USD).
+   *
+   * WHY IT IS A SEPARATE WRITE and not part of updateTokenMaxMcaps: that
+   * method is a RAISE-ONLY high-water update, and it only receives coins whose
+   * mcap or liquidity hit a new high. A pool that drains writes nothing — the
+   * corpse keeps its peak forever, which is exactly the escape this column
+   * closes. The caller (worker.ts) collects the pair map the scan actually
+   * used and sends EVERY coin with a finite reading, so the column tracks the
+   * present instead of the best day.
+   *
+   * One CASE statement per chunk of coins, in ONE round trip: the scan
+   * evaluates ~90 pool coins + ~25 feed coins per tick, and the caller fires
+   * this AFTER the tick (it can never delay a card's claim). Same
+   * fire-and-forget contract as the deferred-write drain: a lost isolate
+   * simply re-observes on the next tick.
+   */
+  async recordObservedLiquidity(
+    rows: Array<{ token: string; liquidityUsd: number }>,
+    chunk = 120,
+  ): Promise<number> {
+    if (rows.length === 0) return 0;
+    let updated = 0;
+    for (let i = 0; i < rows.length; i += chunk) {
+      const slice = rows.slice(i, i + chunk);
+      const cases = slice.map(() => "WHEN ? THEN ?").join(" ");
+      const args: Array<string | number> = [];
+      for (const r of slice) args.push(r.token, r.liquidityUsd);
+      for (const r of slice) args.push(r.token);
+      const res = await this.get().execute({
+        sql: `UPDATE token_stats SET last_liquidity_usd = CASE token ${cases} END
+              WHERE token IN (${slice.map(() => "?").join(",")})`,
+        args,
+      });
+      updated += Number(res.rowsAffected ?? 0);
+    }
+    return updated;
   }
 
   /**
