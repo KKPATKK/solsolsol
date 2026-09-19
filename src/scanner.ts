@@ -320,6 +320,8 @@ export function boundClaim(
  * the cap. Pure and exported so the accounting is unit-testable — its caller
  * sits inside runOnce, which has no offline qualifying-coin fixture.
  */
+const deferredPriorityTokens = new Set<string>();
+
 export class DeferredPushLedger {
   private readonly pending = new Map<string, number>();
   private recoveredCount = 0;
@@ -330,10 +332,12 @@ export class DeferredPushLedger {
   defer(token: string, at: number): void {
     if (token.length === 0 || this.pending.has(token)) return;
     this.pending.set(token, at);
+    deferredPriorityTokens.add(token);
     while (this.pending.size > this.maxEntries) {
       const oldest = this.pending.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       this.pending.delete(oldest);
+      deferredPriorityTokens.delete(oldest);
     }
   }
 
@@ -343,6 +347,7 @@ export class DeferredPushLedger {
    */
   recover(token: string): boolean {
     if (!this.pending.delete(token)) return false;
+    deferredPriorityTokens.delete(token);
     this.recoveredCount += 1;
     return true;
   }
@@ -350,6 +355,15 @@ export class DeferredPushLedger {
   /** Coins deferred and not yet pushed back (visibility into the backlog). */
   get pendingCount(): number {
     return this.pending.size;
+  }
+
+  /**
+   * Pending tokens in oldest-first order. This is exposed for diagnostics and
+   * for the bounded priority path that keeps deferred tokens ahead of normal
+   * rotation when they are present in the pool slice.
+   */
+  pendingTokens(): string[] {
+    return [...this.pending.keys()];
   }
 
   /** Deferrals that were followed by a real push — the at-least-once proof. */
@@ -686,13 +700,24 @@ export function slicePoolRotation<T>(
   cursor: number,
   maxPerTick: number,
 ): { slice: T[]; nextCursor: number } {
-  if (items.length <= maxPerTick) return { slice: items, nextCursor: 0 };
-  const start = cursor % items.length;
+  // A deferred initial card is a make-up obligation. When its token is still
+  // present in the normal pool, move it ahead of the rotating window so a
+  // busy pool cannot make it wait for another sweep. The scanner's explicit
+  // deferred-token lookup handles the stronger case where it fell out of the
+  // current query entirely.
+  const priority = items.filter((item) => {
+    const token = (item as { tokenAddress?: unknown }).tokenAddress;
+    return typeof token === "string" && deferredPriorityTokens.has(token);
+  });
+  const ordinary = items.filter((item) => !priority.includes(item));
+  const ordered = priority.length > 0 ? [...priority, ...ordinary] : items;
+  if (ordered.length <= maxPerTick) return { slice: ordered, nextCursor: 0 };
+  const start = cursor % ordered.length;
   const end = start + maxPerTick;
-  if (end <= items.length) {
-    return { slice: items.slice(start, end), nextCursor: end % items.length };
+  if (end <= ordered.length) {
+    return { slice: ordered.slice(start, end), nextCursor: end % ordered.length };
   }
-  return { slice: items.slice(start), nextCursor: 0 };
+  return { slice: ordered.slice(start), nextCursor: 0 };
 }
 
 /** One qualifying coin, prepared for a specific chat. */

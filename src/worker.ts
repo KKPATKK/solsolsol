@@ -278,6 +278,9 @@ async function recordDex429(at: number): Promise<void> {
  * on exactly the milestone the counters exist to prove.
  */
 async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<void> {
+  // Called after the completion flush; keep the expensive telemetry reads
+  // here rather than on the scan's pre-race path.
+  await syncPostScanTelemetry();
   if (!db) return;
   const totals = {
     deferred: summary?.cardSendDeferredTotal ?? 0,
@@ -411,6 +414,36 @@ export async function syncSkipCaptureState(
   console.log(
     `[worker] skip capture persisted: +${delta.total} early return(s) (fleet total ${next.total}, last "${next.lastReason ?? "unknown"}")`,
   );
+}
+
+/**
+ * Persist non-critical telemetry after the scan completion batch. Keeping
+ * these reads off the pre-race path protects the candidate send window.
+ */
+async function syncPostScanTelemetry(now = Date.now()): Promise<void> {
+  if (!db) return;
+  if (now - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS) {
+    try {
+      await Promise.race([
+        syncPushLedger(now),
+        new Promise((resolve) => setTimeout(resolve, PUSH_LEDGER_SYNC_BOUND_MS)),
+      ]);
+    } catch (err) {
+      console.warn("[worker] post-scan push-ledger sync failed:", err);
+    }
+    pushLedgerSyncedAt = Date.now();
+  }
+  if (now - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS) {
+    try {
+      await Promise.race([
+        syncSkipCaptureState(now),
+        new Promise((resolve) => setTimeout(resolve, SKIP_CAPTURE_SYNC_BOUND_MS)),
+      ]);
+    } catch (err) {
+      console.warn("[worker] post-scan skip-capture sync failed:", err);
+    }
+    skipCaptureSyncedAt = Date.now();
+  }
 }
 
 /**
@@ -1126,46 +1159,10 @@ async function runScan(
       `[worker] backfilled dead tick at ${new Date(backfillEntry.at).toISOString()} (lived ${backfillEntry.ms}ms, flush lost)`,
     );
   }
-  // Push-baseline ledger reconciliation (see syncPushLedger): run AFTER the
-  // claim/heartbeat (the tick's must-land write) and BEFORE the scan, so the
-  // tracker's self-heal reads this tick's fresh ledger without telemetry ever
-  // delaying the heartbeat. Throttled to one pass per 5 min and race-bounded:
-  // a pass that is bounded away is simply re-offered when it is due again.
-  if (db && startedAt - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS) {
-    try {
-      await Promise.race([
-        syncPushLedger(startedAt),
-        new Promise((resolve) => setTimeout(resolve, PUSH_LEDGER_SYNC_BOUND_MS)),
-      ]);
-    } catch (err) {
-      console.warn(
-        "[worker] push-ledger sync failed:",
-        err instanceof Error ? err.message : err,
-      );
-    }
-    // Stamped AFTER the attempt: a hard failure waits out a full gap instead
-    // of turning into a per-tick retry loop.
-    pushLedgerSyncedAt = Date.now();
-  }
-  // Early-return counters (src/skipcapture.ts): same pre-race slot and same
-  // reasoning as the ledger sync above — the reasons are recorded during the
-  // scan phase, so a pass that reports the previous tick's share is fresh
-  // enough for a frequency counter, and telemetry never delays the heartbeat
-  // or the completion flush.
-  if (db && startedAt - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS) {
-    try {
-      await Promise.race([
-        syncSkipCaptureState(startedAt),
-        new Promise((resolve) => setTimeout(resolve, SKIP_CAPTURE_SYNC_BOUND_MS)),
-      ]);
-    } catch (err) {
-      console.warn(
-        "[worker] skip-capture sync failed:",
-        err instanceof Error ? err.message : err,
-      );
-    }
-    skipCaptureSyncedAt = Date.now();
-  }
+  // Non-critical telemetry is deliberately not on the pre-race path. The
+  // claim/heartbeat is the only must-land write before scanning; ledger and
+  // skip-capture reconciliation run after the completion flush below, so a
+  // slow Turso read cannot steal the deferred-card/gate window.
   // Wedged-isolate circuit breaker: track consecutive dead ticks. The
   // predecessor's death counts toward the streak (this isolate is the one
   // that keeps seeing deaths — if the deaths are its own doing, the streak
