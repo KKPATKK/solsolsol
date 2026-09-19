@@ -104,6 +104,85 @@ async function feedTests() {
   // of being masked by make-up coins.
   stub([]);
   assert.deepEqual(await dex.fetchLatestSolanaProfiles(), [], "an empty feed is never masked");
+  reg.recover("FEED_A");
+}
+
+// ---------- the whole tick: the make-up coin is EVALUATED, not just listed ----
+// The feed test above proves the profiles list carries the deferred coin. This
+// one proves the tick then acts on it: the coin reaches the pair phase (and
+// therefore the gates and the candidate chain) on that same tick, without
+// waiting for its pool rotation band.
+async function tickMakeupTest() {
+  const { Db } = require("../dist/db.js");
+  const { Scanner } = require("../dist/scanner.js");
+  const { createClient } = require("@libsql/client");
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const p = path.join(os.tmpdir(), `defer-makeup-${process.pid}-${Date.now()}.db`);
+  const client = createClient({ url: `file:${p}` });
+  const stubFeed = (body) => {
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+  };
+  try {
+    const db = new Db(p, undefined, client);
+    await db.init();
+    const cfg = loadConfig({});
+    await db.saveChatSettings({
+      chatId: "chat-on",
+      minLiquidityUsd: 0, minVolume24hUsd: 0, minMarketCapUsd: 0,
+      maxMarketCapUsd: 10_000_000, minAgeMinutes: 0, maxAgeMinutes: 100_000,
+      min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+      enabled: true,
+    });
+    const dex = new DexScreenerClient(cfg);
+    let asked = null;
+    dex.fetchPairsForTokens = async (addrs) => {
+      asked = addrs.slice();
+      return new Map();
+    };
+    const scanner = new Scanner(
+      db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+      null, null, null, null, null, null, null,
+    );
+    // A coin deferred on an earlier tick, hydrated exactly as the worker does
+    // it from the durable snapshot.
+    scanner.seedDeferredTokens(["DEFERRED_COIN"]);
+    stubFeed([{ chainId: "solana", tokenAddress: "FEEDCOIN", symbol: "F" }]);
+    await scanner.runOnce();
+    assert.ok(asked, "the tick reached its pair phase");
+    assert.deepEqual(
+      [...asked].sort(),
+      ["DEFERRED_COIN", "FEEDCOIN"],
+      "the feed's own coin AND the deferred one reach the pair phase on this tick",
+    );
+    // An empty feed stays empty — the make-up must not mask an outage (and the
+    // tick still takes its empty-feed-and-pool path when the pool is empty too).
+    stubFeed([]);
+    asked = null;
+    const scanner2 = new Scanner(
+      db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+      null, null, null, null, null, null, null,
+    );
+    scanner2.seedDeferredTokens(["DEFERRED_COIN"]);
+    await scanner2.runOnce();
+    assert.ok(
+      !(asked ?? []).includes("DEFERRED_COIN"),
+      "a 429-backoff tick (empty feed) is left alone, not masked by make-up coins",
+    );
+  } finally {
+    await client.close();
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      /* best-effort */
+    }
+    reg.recover("DEFERRED_COIN");
+  }
 }
 
 // ---------- the durable snapshot the worker writes after the flush ----------
@@ -118,6 +197,7 @@ const reloaded = loadPushDeferralSnapshot(JSON.stringify(durable));
 assert.deepEqual(reloaded.pendingTokens, ["DURABLE_TOKEN"]);
 
 feedTests()
+  .then(tickMakeupTest)
   .then(() => {
     // Cleanup: the registry is module state; leave nothing behind for the
     // next suite that loads this build.
