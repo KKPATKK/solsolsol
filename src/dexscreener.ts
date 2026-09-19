@@ -51,6 +51,27 @@ export interface PairInfo {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * How long the profiles feed may spend before it answers anyway (2026-09-19).
+ *
+ * The scanner races this one call against the tick's feed window — 600ms from
+ * the tick's start (FEED_DEADLINE_MS) — and keeps the race's `[]` when the
+ * window closes first, which means anything this call returns late is thrown
+ * away, make-up list included. The call used to be made with NO deadline, so a
+ * single 429 (shared worker egress: http429 12 in one isolate) started the
+ * 3-attempt chain with its 2s/4s backoff (~6s) and lost that race every time:
+ * live, 9 of 40 ticks reported `profiles 0` with every feed empty and the
+ * deferred backlog's only guaranteed lane missing, and the 429 stamps sit
+ * inside those very ticks (13:26:10.250 → the 13:26 tick, 13:31:09.915 → the
+ * 13:31 tick). A healthy response is ~60-100ms (measured against the CDN),
+ * and the tick reaches this call some ~140ms in, so 320ms retires a 429 inside
+ * the window with room to spare while leaving normal fetches untouched.
+ */
+export const PROFILE_FEED_SELF_BUDGET_MS = 320;
+
+/** Race sentinel: the profiles fetch did not answer inside its self-budget. */
+const FEED_TIMED_OUT = Symbol("feed-timeout");
+
+/**
  * Compound momentum gate: a coin qualifies when its 5-minute tape is hot
  * (fast pump in progress right now) OR its 1-hour tape is hot (pumped
  * within the last hour and possibly consolidating between spikes — the
@@ -325,9 +346,16 @@ export class DexScreenerClient {
         return await res.json();
       } catch (err) {
         lastError = err;
-        if (attempt < 3 && Date.now() < (deadline ?? Number.POSITIVE_INFINITY)) {
-          await sleep(attempt * 2000);
-        }
+        // The backoff never outlives a budget: a bounded caller (the profiles
+        // feed, see PROFILE_FEED_SELF_BUDGET_MS) sleeps only as long as its
+        // deadline allows, so a 429 retires inside the tick's feed window
+        // instead of spending 2s + 4s on attempts nobody will read. An
+        // unbounded caller keeps the original 2s/4s spacing.
+        const left =
+          deadline === undefined
+            ? Number.POSITIVE_INFINITY
+            : deadline - Date.now();
+        if (attempt < 3 && left > 0) await sleep(Math.min(attempt * 2000, left));
       }
     }
     throw lastError instanceof Error
@@ -338,14 +366,43 @@ export class DexScreenerClient {
   /**
    * Newest token profiles first. Returns only Solana profiles so the scanner
    * never inspects other chains.
+   *
+   * Self-budgeted and failure-tolerant (2026-09-19, see
+   * PROFILE_FEED_SELF_BUDGET_MS): the call answers inside the tick's feed
+   * window even when the upstream is rate-limiting, and a fetch that fails
+   * outright still returns the make-up list — the deferred coins are the whole
+   * reason this list exists, and the ticks this used to skip were the ones
+   * that evaluated NOTHING (`profiles 0`, 23% of ticks).
    */
   async fetchLatestSolanaProfiles(): Promise<TokenProfile[]> {
-    const data = (await this.getJson("/token-profiles/latest/v1")) as Array<
-      Record<string, unknown>
-    >;
-    if (!Array.isArray(data)) return [];
+    const budgetEnd = Date.now() + PROFILE_FEED_SELF_BUDGET_MS;
+    let data: unknown = null;
+    let failed = false;
+    const call = this.getJson("/token-profiles/latest/v1", budgetEnd);
+    call.catch(() => {
+      // Abandoned by the race below — its rejection has no consumer left.
+    });
+    try {
+      const raced = await Promise.race([
+        call,
+        sleep(Math.max(0, budgetEnd - Date.now())).then(() => FEED_TIMED_OUT),
+      ]);
+      if (raced === FEED_TIMED_OUT) failed = true;
+      else data = raced;
+    } catch (err) {
+      failed = true;
+      console.error(
+        "[dex] profiles feed failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    const rows = Array.isArray(data) ? (data as Array<Record<string, unknown>>) : [];
+    // A body that is not the expected array (a null from a deterministic 4xx,
+    // an HTML error page parsed as JSON, the timeout above) is a FAILED feed,
+    // not an empty one: it is counted apart so the outage stays readable.
+    if (!Array.isArray(data)) failed = true;
     const profiles: TokenProfile[] = [];
-    for (const item of data) {
+    for (const item of rows) {
       if (item.chainId !== "solana") continue;
       const tokenAddress = String(item.tokenAddress ?? "");
       if (!tokenAddress) continue;
@@ -389,7 +446,7 @@ export class DexScreenerClient {
     // (≤ DEFERRED_MAKEUP_MAX) — which is also the only observable that says
     // the make-up is pulling coins in BEFORE the first `deferRecovered` rise.
     const makeup = missingDeferredTokens(feed.map((p) => p.tokenAddress));
-    noteProfileFeed(feed.length, makeup.length, Date.now());
+    noteProfileFeed(feed.length, makeup.length, Date.now(), failed);
     if (makeup.length === 0) return feed;
     return [...feed, ...makeup.map((tokenAddress) => ({ tokenAddress }))];
   }

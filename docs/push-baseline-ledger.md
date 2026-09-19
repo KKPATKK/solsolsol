@@ -116,7 +116,7 @@ curl -s https://solana-meme-bot.cool1999k.workers.dev/health \
 |---|---|
 | `phases[]` | **整條** tick 嘅階段時間線（最新 12 個，`{phase, ms}`）——被扣嘅卡最後一個 stamp 就係用完鐘嘅一步，`ms` 就係同 claim 窗口（3550ms）嘅距離 |
 | `modeRead` | trade-mode 讀取：`{reads, reuses, timeouts, lastReadMs, cachedAgeMs}`。`reuses` 上升 = 卡尾嗰個讀取已經唔收錢 |
-| `feedMakeup` | feed 真相：`{feedRequests, lastRawProfiles, emptyFeedTotal, lastEmptyFeedAt, injectedTotal, lastInjected}` |
+| `feedMakeup` | feed 真相：`{feedRequests, lastRawProfiles, emptyFeedTotal, lastEmptyFeedAt, failedTotal, lastFailedAt, injectedTotal, lastInjected}`（`failedTotal` = fetch 冇回應／超時，見下文第三補） |
 
 **改咗乜（第 1 點）**：`effectiveMode()` 以前喺 render／claim 之前**無界**讀 Turso，
 即係坐响嗰 400ms claim slice 中間。現在 worker 喺**tick 開始**就 prefetch（`onTickStart`），
@@ -128,6 +128,11 @@ fail-safe 一樣，唔會用未證實嘅 mode）。成本：**跨 isolate** 嘅 
 `profiles: 0` 呢個故障訊號），代價係冷啟動 isolate 嗰幾個 tick 冇補推機會
 （118 tick 中 7 個，其中 5 個喺 deploy 後 2 分鐘內）。現在**照注入**，訊號搬到
 `feedMakeup.lastRawProfiles`（0 = 一樣嘅意思）同 `emptyFeedTotal`（跨 tick 累計）。
+
+> **⚠️ 更正（2026-09-19，同日稍後）**：上面「冷啟動、feed 回空」嘅因果**估錯**。
+> Live 追查發現嗰啲 `profiles 0` tick 係 **429 → fetch 根本冇回應**，注入點（喺
+> dex fetch 成功路徑內）被完全繞過 —— `emptyFeedTotal` 一直係 0 就係證據。
+> 詳見下節；`061f4f6` 呢個修正本身冇錯（空 feed 亦應該注入），但佢解唔到 prof0。
 
 ## 卡片點解送唔出：DB 寫入批次搬出 tick（2026-09-19 再補）
 
@@ -169,6 +174,59 @@ curl -s .../health | jq '.heartbeat.summary | {phases, candidates, pushed, cardS
 2. Deferred 寫入係 fire-and-forget：isolate 若喺 drain 落地前被回收，同一批呼叫會留到
    **下一個 tick** 嘅 drain（FIFO、順序保留、呼叫本身 idempotent）。代價係登記／
    max mcap 可能遲一個 tick —— scanner 嘅 read guard 本來就接受「一個 tick 冇登記」。
+
+## 卡片點解送唔出：feed lane 嘅自我預算（2026-09-19 第三補）
+
+**量到嘅事實**：deploy 之後 40 個 tick 之中 **9 個（23%）`profiles 0`**，而且嗰啲 tick
+係**全部 feed 都 0**（`pump/geo/geoTrend/jup/gmgn/axiom` 全 0），`feedRequests` 冇升，
+`emptyFeedTotal` 保持 0 —— 即係 `noteProfileFeed()` 由頭到尾冇被叫過。
+
+**根因**：`fetchLatestSolanaProfiles()` 嗰個 `getJson("/token-profiles/latest/v1")`
+**冇傳 deadline**，所以一食 429（共用 egress：單一 isolate `http429 12`）就係 3 次嘗試
+連 2s+4s backoff ≈ 6s；而 scanner 嗰邊 `fetchFeedCapped` 600ms 就 race 出 `[]`
+（`scanner.ts:1633-1643`）→ 遲到嘅結果（連 make-up）**一律丟掉**。時間戳直接對得上：
+
+```text
+dex.http429 last429At 13:26:10.250   ← 同一分鐘嘅 tick 13:26 就係 prof0
+              last429At 13:31:09.915   ← 13:31 亦係 prof0
+```
+
+gecko／jup 各自有 5 分鐘 backoff，所以嗰啲 tick 係「所有 feed 一齊 0」，亦解釋咗
+prof0 呈 5 分鐘週期（13:01/13:06/13:11/13:16/13:21/13:26/13:31）。
+
+**改咗乜**（全部喺 `src/dexscreener.ts`，因為 scanner 嗰個呼叫點喺編輯窗口外）：
+
+| 之前 | 現在 |
+|---|---|
+| profiles fetch 無 deadline，429 → ~6s 重試 | `PROFILE_FEED_SELF_BUDGET_MS = 320` 自我預算，＋全 call 用 `Promise.race` 硬保證喺窗內答覆 |
+| retry backoff 固定 sleep 2s／4s | sleep 被 deadline 封頂（`Math.min(attempt * 2000, left)`）；無 deadline 嘅呼叫維持原狀 |
+| fetch 失敗 → `return []`（make-up 一齊冇） | fetch 失敗 → **照 append make-up**，延遲嘅 rejection 由 `.catch(() => {})` 吞掉 |
+| 故障只剩 `profiles: 0` | 新增 `failedTotal` / `lastFailedAt`：**「冇回應」同「回空」分開計** |
+
+`noteProfileFeed(raw, injected, at, failed)`：`emptyFeedTotal` 只在**真係回空**（`!failed && raw === 0`）
+才加，`failedTotal` 只計失敗／超時。舊嘅 `profiles: 0` 訊號 = `rawProfiles 0` + 兩個 counter 之和，
+所以故障一樣讀得到，但 backlog 唔再陪葬。
+
+**睇 live**：
+
+```bash
+curl -s .../health | jq '.heartbeat.summary | {profiles, feedMakeup}'
+# 429 tick 嘅預期簽名：profiles 5（= make-up），lastRawProfiles 0，failedTotal ↑，emptyFeedTotal 唔動
+```
+
+- 主要量度點：**prof0 比率**（改動前 23%）同 `feedRequests / tick`
+- 副作用要知：429 tick 嘅 scan_history row 由 `profiles 0` 變成 `profiles 5`，
+  而 `lastSkip = empty-feed-and-pool` 喺嗰啲 tick 唔會再出現（`feedProfiles` 唔再係空）
+
+**要老實講**：
+
+1. 320ms 係**啟發式**：tick 到 feed 之前嘅工作（`listEnabledChats`、crime refresh）實測約
+   140ms，健康回應實測 60–100ms；如果上游係「慢但唔係 429」，client 一様會 race 出去，
+   嗰個 tick 就只剩 make-up（真 feed 下一 tick 再嚟）。呢個係刻意的取捨：寧願保住
+   backlog 條 lane，唔好交白卷。
+2. 若 scanner 自己喺 `fetchFeedCapped` 之前就跳過（`remaining <= 250`），client 由頭到尾
+   冇被呼叫 —— 呢種 tick（cold start 最常見）仍然絕對冇 feed、冇 make-up，只有改用
+   scanner 內嘅 merge 點才救得到，而嗰個位置喺編輯窗口外。
 
 ## 仍未落地（可選，非必需）
 

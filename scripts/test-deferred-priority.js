@@ -10,7 +10,10 @@
 const assert = require("node:assert/strict");
 const { DeferredPushLedger, deferredPushTokens, slicePoolRotation } = require("../dist/scanner.js");
 const { loadPushDeferralSnapshot, nextPushDeferralSnapshot } = require("../dist/deferrallog.js");
-const { DexScreenerClient } = require("../dist/dexscreener.js");
+const {
+  DexScreenerClient,
+  PROFILE_FEED_SELF_BUDGET_MS,
+} = require("../dist/dexscreener.js");
 const {
   isDeferredToken,
   missingDeferredTokens,
@@ -83,9 +86,14 @@ const stub = (body) => {
 };
 
 async function feedTests() {
-  const dex = new DexScreenerClient(loadConfig({}));
+  // A fresh client per case: the profiles call is self-budgeted (it must answer
+  // inside the tick's 600ms feed window), and the throttle's 250ms spacing
+  // between two calls of the SAME client would eat that budget in a way the
+  // scan never sees — the feed call is the first DexScreener request of a tick.
+  const freshDex = () => new DexScreenerClient(loadConfig({}));
   reg.defer("PAID_LATE", 100);
   stub(feedBody);
+  let dex = freshDex();
   const out = await dex.fetchLatestSolanaProfiles();
   assert.deepEqual(
     out.map((p) => p.tokenAddress),
@@ -97,6 +105,7 @@ async function feedTests() {
   // A coin the feed already returned is not duplicated.
   reg.recover("PAID_LATE");
   reg.defer("FEED_A", 101);
+  dex = freshDex();
   const out2 = await dex.fetchLatestSolanaProfiles();
   assert.deepEqual(
     out2.map((p) => p.tokenAddress),
@@ -113,6 +122,7 @@ async function feedTests() {
   // rides the list like on any other tick.
   resetFeedMakeup();
   stub([]);
+  dex = freshDex();
   const out3 = await dex.fetchLatestSolanaProfiles();
   assert.deepEqual(
     out3.map((p) => p.tokenAddress),
@@ -126,6 +136,60 @@ async function feedTests() {
   assert.equal(emptyView.injectedTotal, 1, "the injected count accumulates per request");
   assert.equal(emptyView.feedRequests, 1);
   assert.equal(emptyView.lastEmptyFeedAt !== null, true, "the empty feed is stamped");
+
+  // A FAILED fetch is a different outage from a feed that answers with
+  // nothing, and it is the one that used to cost the backlog its lane. The
+  // profiles call was made with no deadline, so a 429 spent ~6s in a 3-attempt
+  // retry chain and the scanner's 600ms feed race threw the result away —
+  // make-up list included. Live 2026-09-19: 9 of 40 ticks went `profiles 0`
+  // with every feed empty, and the 429 stamps sit inside those very ticks.
+  resetFeedMakeup();
+  reg.recover("FEED_A");
+  reg.defer("FEED_A", 102);
+  globalThis.fetch = async () =>
+    new Response("rate limited", {
+      status: 429,
+      headers: { "Content-Type": "text/plain" },
+    });
+  dex = freshDex();
+  const t0 = Date.now();
+  const out4 = await dex.fetchLatestSolanaProfiles();
+  const elapsed = Date.now() - t0;
+  assert.deepEqual(
+    out4.map((p) => p.tokenAddress),
+    ["FEED_A"],
+    "a rate-limited feed still carries the make-up — the coin is evaluated instead of skipped",
+  );
+  assert.ok(
+    elapsed < PROFILE_FEED_SELF_BUDGET_MS * 3,
+    `the call answers inside its own budget (took ${elapsed}ms) — no 6s retry chain`,
+  );
+  const failView = feedMakeupView();
+  assert.equal(failView.failedTotal, 1, "the outage is counted as a FAILED fetch");
+  assert.equal(
+    failView.emptyFeedTotal,
+    0,
+    "and NOT as an empty feed — 'never answered' and 'answered with nothing' are different outages",
+  );
+  assert.equal(failView.lastFailedAt !== null, true, "the failure is stamped");
+  assert.equal(failView.lastRawProfiles, 0, "rawProfiles still reads 0 — the outage signal is intact");
+  assert.equal(failView.lastInjected, 1, "the make-up is what filled the list");
+
+  // Hanging upstream: the race, not the HTTP client's patience, is what keeps
+  // the tick's feed window.
+  resetFeedMakeup();
+  globalThis.fetch = () => new Promise(() => {});
+  dex = freshDex();
+  const t1 = Date.now();
+  const out5 = await dex.fetchLatestSolanaProfiles();
+  const hung = Date.now() - t1;
+  assert.deepEqual(
+    out5.map((p) => p.tokenAddress),
+    ["FEED_A"],
+    "a hanging feed still carries the make-up",
+  );
+  assert.ok(hung < PROFILE_FEED_SELF_BUDGET_MS * 3, `a hanging feed answers in ${hung}ms`);
+  assert.equal(feedMakeupView().failedTotal, 1, "and counts as a failed fetch");
   reg.recover("FEED_A");
 }
 
@@ -199,6 +263,22 @@ async function tickMakeupTest() {
     assert.ok(
       (asked ?? []).includes("DEFERRED_COIN"),
       "an empty feed still pulls the deferred coin into the tick",
+    );
+    // And the live case (23% of ticks): the feed never answers at all. The
+    // deferred coin is still in the evaluated set, so the make-up lane is no
+    // longer lost exactly when the tick is otherwise blind.
+    globalThis.fetch = async () =>
+      new Response("rate limited", { status: 429, headers: { "Content-Type": "text/plain" } });
+    asked = null;
+    const scanner3 = new Scanner(
+      db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+      null, null, null, null, null, null, null,
+    );
+    scanner3.seedDeferredTokens(["DEFERRED_COIN"]);
+    await scanner3.runOnce();
+    assert.ok(
+      (asked ?? []).includes("DEFERRED_COIN"),
+      "a rate-limited feed still pulls the deferred coin into the tick",
     );
   } finally {
     await client.close();

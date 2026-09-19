@@ -113,16 +113,39 @@ export function deferredTokenList(): string[] {
  * single isolate's 10-20 minute lifetime cannot), and `injectedTotal` proves
  * the make-up is what pulled the deferred coins back. Published per tick by
  * the worker on the scan summary (see the runOnce wrapper in worker.ts).
+ *
+ * THE FAILED FETCH IS ITS OWN COUNTER (2026-09-19): the ticks that actually go
+ * dark are not the ones the feed answers with nothing — they are the ones the
+ * fetch never answers at all. Live: `profiles 0` on 9 of 40 ticks (23%), every
+ * feed empty on those ticks, and `noteProfileFeed` never called once — the
+ * profiles call had no deadline, so a single 429 started a ~6s retry chain
+ * that the scanner's 600ms feed race discarded, make-up list included. The
+ * 429 timestamps sit inside those very ticks (13:26:10.250 → the 13:26 tick,
+ * 13:31:09.915 → the 13:31 tick). A request that fails or times out is
+ * therefore counted as `failedTotal` (with `lastFailedAt`), NOT as an empty
+ * feed: "answered with nothing" and "never answered" are different outages,
+ * and only the second one used to cost the backlog its lane. The old
+ * `profiles: 0` reading is their sum, readable as `rawProfiles 0` plus the two
+ * counters.
  */
 export interface FeedMakeupView {
   /** Profile requests observed since this isolate booted. */
   feedRequests: number;
   /** Size of the LAST raw feed, before the make-up appended anything. */
   lastRawProfiles: number;
-  /** Requests whose raw feed came back empty (`profiles` used to show this). */
+  /** Requests whose raw feed ANSWERED empty (`profiles` used to show this). */
   emptyFeedTotal: number;
   /** When the most recent empty feed was seen. */
   lastEmptyFeedAt: number | null;
+  /**
+   * Requests whose fetch FAILED or timed out (no answer at all). Counted
+   * apart from `emptyFeedTotal` because it is the outage the make-up now
+   * survives: the deferred coins below were evaluated on a tick whose feed
+   * never arrived.
+   */
+  failedTotal: number;
+  /** When the most recent failed fetch was seen. */
+  lastFailedAt: number | null;
   /** Deferred coins the make-up has appended, lifetime. */
   injectedTotal: number;
   /** Coins the LAST feed request appended (0 = nothing was pending). */
@@ -134,20 +157,31 @@ let feedView: FeedMakeupView = {
   lastRawProfiles: 0,
   emptyFeedTotal: 0,
   lastEmptyFeedAt: null,
+  failedTotal: 0,
+  lastFailedAt: null,
   injectedTotal: 0,
   lastInjected: 0,
 };
 
 /**
  * Record one profile fetch: `raw` is what the endpoint returned (before the
- * make-up), `injected` how many deferred coins were appended to it.
+ * make-up), `injected` how many deferred coins were appended to it, and
+ * `failed` whether the fetch never answered (see FeedMakeupView).
  */
-export function noteProfileFeed(raw: number, injected: number, at: number): void {
+export function noteProfileFeed(
+  raw: number,
+  injected: number,
+  at: number,
+  failed = false,
+): void {
+  const answeredEmpty = !failed && raw === 0;
   feedView = {
     feedRequests: feedView.feedRequests + 1,
     lastRawProfiles: raw,
-    emptyFeedTotal: feedView.emptyFeedTotal + (raw === 0 ? 1 : 0),
-    lastEmptyFeedAt: raw === 0 ? at : feedView.lastEmptyFeedAt,
+    emptyFeedTotal: feedView.emptyFeedTotal + (answeredEmpty ? 1 : 0),
+    lastEmptyFeedAt: answeredEmpty ? at : feedView.lastEmptyFeedAt,
+    failedTotal: feedView.failedTotal + (failed ? 1 : 0),
+    lastFailedAt: failed ? at : feedView.lastFailedAt,
     injectedTotal: feedView.injectedTotal + injected,
     lastInjected: injected,
   };
@@ -165,6 +199,8 @@ export function resetFeedMakeup(): void {
     lastRawProfiles: 0,
     emptyFeedTotal: 0,
     lastEmptyFeedAt: null,
+    failedTotal: 0,
+    lastFailedAt: null,
     injectedTotal: 0,
     lastInjected: 0,
   };
