@@ -988,8 +988,21 @@ export interface ScanSummary {
   rejects: RejectionEntry[];
 }
 
-/** Cap on per-coin rejection entries kept in the scan summary/heartbeat. */
-const REJECT_LOG_MAX = 50;
+/**
+ * Cap on per-coin rejection entries kept in the scan summary/heartbeat. It is
+ * purely a LOG budget: every coin counted here was already rejected by a gate
+ * above, so this changes what /health can explain, never what the scan
+ * evaluates — the feed/pool split at the call site only decides WHICH
+ * rejections occupy the slots.
+ *
+ * 2026-09-20: 50 → 20. Measured: 50 entries serialize to 5.0KB, 40% of the
+ * 12.4KB completion batch the tick writes twice (claim + flush). The flush has
+ * a fixed ~4.5s window inside a tick the cron invocation kills at ~9.6s, so
+ * BYTES are the one thing still buyable there, and 20 entries keep the
+ * dominant reasons visible (the feed's sub-$10K dust + the pool's gate
+ * failures) at ~2KB.
+ */
+const REJECT_LOG_MAX = 20;
 
 /**
  * Market-cap-to-liquidity sanity gate (Nudaeng lesson, 2026-08-22: pushed at

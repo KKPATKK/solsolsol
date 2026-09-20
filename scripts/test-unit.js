@@ -229,6 +229,31 @@ async function main() {
     assert.equal(snap.firstDeferredAt, base, "the first-ever stamp survives pruning");
   });
 
+  await test("push deferral snapshot: the serialized row stays a small write", () => {
+    // Both heartbeats carry this snapshot (claim + completion), and the
+    // completion batch has a fixed ~4.5s window inside a tick the cron
+    // invocation kills at ~9.6s. Bytes are the one thing buyable there, so a
+    // ring raise must not silently eat the flush — 2026-09-20: 60 → 12
+    // events, 4.3KB → ~1.1KB of the 12.4KB batch.
+    const base = 1_700_000_000_000;
+    let raw = null;
+    for (let i = 0; i < PUSH_DEFERRAL_RING_MAX + 5; i++) {
+      raw = JSON.stringify(
+        nextPushDeferralSnapshot(raw, { deferred: 1, recovered: 0, stalled: 0, pending: 2 }, base + i * 1_000),
+      );
+    }
+    const snap = nextPushDeferralSnapshot(
+      raw,
+      { deferred: 0, recovered: 0, stalled: 0, pending: 2 },
+      base + 90_000,
+      null,
+      ["3n2NJk8vg25at8jvaAzUfEnGZyXqazSqa5U6xyPfCW56", "9UfySjMsSz4tyQR9X2SCgPaWagQL5eYPpw9y9Nr2STNK"],
+    );
+    const bytes = Buffer.byteLength(JSON.stringify(snap));
+    assert.equal(snap.events.length, PUSH_DEFERRAL_RING_MAX, "a full ring is what gets measured");
+    assert.ok(bytes < 1_500, `deferral snapshot stays a small write (${bytes}B)`);
+  });
+
   await test("parsePushDeferralSnapshot: missing/corrupt rows degrade to null or zeros, never throw", () => {
     assert.equal(parsePushDeferralSnapshot(null), null);
     assert.equal(parsePushDeferralSnapshot(undefined), null, "a cold isolate has no row");

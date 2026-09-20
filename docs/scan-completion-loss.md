@@ -61,16 +61,50 @@ token_stats bookkeeping（`updateTokenMaxMcaps`／`recordTokenStatsMany`）一�
 - 順手修一個細 bug：announce write 一 throw 會跳過 alert（同一個 `try`）；現在 alert
   獨立、唔會被前一步拖累。
 
+## 已做（窗口內）：縮細每次寫入
+
+| 旋鈕 | 位置 | 改動 | 量到 |
+|---|---|---|---|
+| `PUSH_DEFERRAL_RING_MAX` | `deferrallog.ts`（全檔可改） | 60 → **12** events | snapshot 4709B → **1253B**（−3456B）|
+| `REJECT_LOG_MAX` | `scanner.ts:992`（53KB，可改） | 50 → **20** entries | 5401B → **2161B**（−3240B）|
+| | | **completion heartbeat 合計** | 12369B → **≈5673B（−54%）** |
+
+兩者都只係**紀錄／rate window**，唔影響掃描行為：`rejects` 只係已經被閘門拒收嘅幣嘅日誌
+（`addReject` 同 `reject()` 只 push，唔會改變資格判定；`REJECT_LOG_MAX` 亦係 feed/pool
+分配 slots 嘅唯一預算，所以結構不變）；deferral ring 只係 cadence 讀數，`totals`／
+`pendingTokens`／首末時間戳照舊保留（`pendingTokens` **冇**收縮 —— 佢係功能狀態，唔係遙測）。
+
+`test-unit.js` 新增一條 pin：「the serialized row stays a small write」—— 直接量全滿 ring
+嘅 JSON 字節並上界，令將來加 ring 唔會靜靜食返 flush 嘅窗。
+
+## 唔做 `DB_REQUEST_TIMEOUT_MS`：算術唔支持
+
+原本嘅想法係「令吊死嘅第一次 flush 喺 reserve 內 abort，重試先有機會落地」。查完常數後
+唔成立：
+
+- `FLUSH_ATTEMPT_BOUND_MS = 1200`（唔係 2500）→ 第一次嘗試只等 **1.2s** 就轉為**並行**重試；
+- 重試嘅等待窗係 `remainingFlushMs()` ＝ `4500 − 1200` ≈ **3300ms**，同 transport timeout **無關**；
+- `DB_REQUEST_TIMEOUT_MS = 6000`（硬牆 7.2s）→ 就算降到 3s（硬牆 3.6s）仍然 > 3300ms，對
+  flush 嘅窗**零影響**，只會令其他熱路徑（command handler、`/debug`、deferred drain）更早
+  放棄 → 多一個失敗源。
+
+**而 reserve 亦冇得加大**：`scanRaceMs = max(2500, BUDGET − RESERVE − preRace)`，所以 flush 嘅
+窗永遠係 `[BUDGET−RESERVE, BUDGET]`，固定結束喺 **t≈9.5s**；加大 RESERVE 只係由掃描度搶時間。
+檔案自己記載嘅實測：**cron invocation kill 就喺 ~9.6s 之後**（2026-09-15 用 12s budget 時每一
+tick 都死，而成功嘅 tick 喺 8.7–9.6s flush）。即係 9.5s 已經貼住 kill，冇得延後 →
+**字節係唯一仲買得返嘅嘢**。
+
 ## 未做
 
 - completion flush 本身（窗口外）。
-- `summary.rejects` / `deferral` payload 縮細（`scanner.ts:3494` ＝ 163KB、summary 組裝
-  喺 84KB）。呢兩個佔咗每次 flush 寫入嘅 ~75%。
-- `DB_REQUEST_TIMEOUT_MS`（`db.ts` 頭部，**可改**，但會一併影響所有熱路徑，未動）。
+- `pendingTokens` 上限 500：功能狀態（真正等住推送嘅幣），唔可以截；500 個 base58 地址會令
+  snapshot 爆到 ~22KB，但實測 pending 只有 4–6 個 → 冇動，只記錄。
 
 ## 驗收點（deploy 後）
 
 - 主：`scan-history` 嘅**連續** dead 行長度上限（改前 5–13 連）→ 應縮到 1–2。
+- 次：`/health` 嘅 `heartbeat` 大小（`JSON.stringify(heartbeat).length`）應由 ~12.4KB 跌到 ~5.7KB；
+  `deferral.events.length` ≤ 12；`summary.rejects.length` ≤ 20。
 - 輔：`outageAlertAt` 更新頻率；warm isolate `/health` 嘅 `wedgedStateResets`。
 - **唔可以**再用 dead 行判斷「有冇掃描」——要交叉核對 `/debug/pushes` 嘅時間戳。
 - 量度注意：**任何 HTTP 路由都會行 `maybeRunScanIfStale`**，所以 curl `/health`（或

@@ -149,10 +149,18 @@ export interface PushDeferralSnapshot {
 export const PUSH_DEFERRAL_STATE_KEY = "push_deferral";
 /**
  * Events kept in the ring. Deferrals are rare by design (a late tick refusing
- * a card), so 60 entries is days-to-weeks of cadence at any plausible rate
- * while keeping the JSON that every /health response carries small.
+ * a card), so a dozen entries is still days of cadence at any plausible rate,
+ * and the ring is ONLY the rate window: `deferredTotal`/`recoveredTotal`/
+ * `stalledTotal`, `pending`/`pendingTokens` and the first/last stamps all
+ * survive pruning (see nextPushDeferralSnapshot).
+ *
+ * 2026-09-20: 60 → 12. Measured: the snapshot serializes to 4.3KB at the 60
+ * cap — 35% of the 12.4KB completion batch the tick writes twice (claim +
+ * flush). That batch has a fixed ~4.5s window inside a tick the cron
+ * invocation kills at ~9.6s, so bytes are the one thing still buyable there,
+ * and a 60-event ring was never read for anything but cadence.
  */
-export const PUSH_DEFERRAL_RING_MAX = 60;
+export const PUSH_DEFERRAL_RING_MAX = 12;
 /**
  * Events older than this are dropped from the ring even when it is not full —
  * a burst month ago must not be reported as if it were current cadence. The
