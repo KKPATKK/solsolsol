@@ -532,6 +532,19 @@ async function main() {
     assert.equal(loaded.deferredTotal, 2);
     assert.equal(loaded.recoveredTotal, 1);
     assert.equal(loaded.firstRecoveredAt, 5_000, "the milestone stamp survives the load");
+    // A row whose gauge disagrees with its own list is mirrored CONSISTENTLY:
+    // the mirror derives the gauge, so a row written by an older build (which
+    // published the caller's scan-time count) cannot keep republishing the
+    // disagreement on every delta-less tick. Live 2026-09-20 02:44Z: that pair
+    // was still being served minutes after the write-side fix deployed.
+    const legacyRow = JSON.stringify({
+      deferredTotal: 90,
+      pending: 7,
+      pendingTokens: ["AAA", "BBB", "CCC", "DDD", "EEE"],
+      events: [],
+    });
+    assert.equal(loadPushDeferralSnapshot(legacyRow).pending, 5, "the gauge follows the list");
+    assert.equal(loadPushDeferralSnapshot(legacyRow).pendingTokens.length, 5);
   });
 
   await test("pushDeferralAlreadyApplied: only this isolate's own already-persisted totals are recognised", () => {

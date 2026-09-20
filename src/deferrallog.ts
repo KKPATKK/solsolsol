@@ -313,11 +313,23 @@ export function pushDeferralAlreadyApplied(
  * `firstDeferredAt: null`) from "the counter channel is missing" — a bare
  * null would read as the latter and hide the moment `deferredTotal` first
  * moves off zero, which is the whole point of the row.
+ *
+ * The mirrored gauge is DERIVED from the list, for the same reason the write
+ * derives it (see nextPushDeferralSnapshot): a row written by a build that
+ * still published the caller's scan-time count can carry `pending: 7` beside
+ * five tokens, and this function is the only thing that turns such a row into
+ * a heartbeat — the mirror would then republish the disagreement on every
+ * tick that has no delta of its own to write, i.e. indefinitely. Live
+ * 2026-09-20 02:44Z: exactly that pair was still being served two minutes
+ * after the write-side fix deployed, because the last write predated it.
+ * The stored field is left as it is (this is a read), so nothing else
+ * depends on the mirrored number being the stored one.
  */
 export function loadPushDeferralSnapshot(
   raw: string | null | undefined,
 ): PushDeferralSnapshot {
-  return parsePushDeferralSnapshot(raw) ?? emptyPushDeferralSnapshot();
+  const parsed = parsePushDeferralSnapshot(raw) ?? emptyPushDeferralSnapshot();
+  return { ...parsed, pending: parsed.pendingTokens.length };
 }
 
 /**
