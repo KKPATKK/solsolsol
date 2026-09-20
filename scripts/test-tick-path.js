@@ -430,6 +430,55 @@ installTickProbe(fakeScanner, {
     console.log("dead-tick recovery: pass");
   }
 
+  // ---------- bounded recovery awaits (worker.ts recoveryAwait) ----------
+  // The recovery runs BEFORE the scan, on the ticks that are already in
+  // trouble — so every round trip it makes is bounded. A hung write there used
+  // to inherit the full 6s transport / 7.2s hard-wall ladder and grow the front
+  // phase past Cloudflare's invocation kill, killing the recovering tick too:
+  // that is how one lost completion became a chain of them.
+  {
+    const { recoveryAwait, RECOVERY_DB_BOUND_MS } = require("../dist/worker.js");
+
+    // A settled promise passes its value through untouched.
+    assert.equal(await recoveryAwait(Promise.resolve(42), 50, "unit"), 42);
+
+    // A promise that never settles — the hung libsql write shape — answers null
+    // on the bound instead of spending the tick on it, and is left running
+    // (every write on the recovery path is idempotent, so a late commit is
+    // harmless and the next tick re-offers it).
+    const t0 = Date.now();
+    let settledLate = false;
+    const hung = new Promise((resolve) =>
+      setTimeout(() => {
+        settledLate = true;
+        resolve("late");
+      }, 400),
+    );
+    assert.equal(await recoveryAwait(hung, 60, "unit"), null);
+    const waited = Date.now() - t0;
+    assert.ok(waited >= 40, `waited at least the bound (waited ${waited}ms)`);
+    assert.ok(waited < 350, `released the tick on the bound (waited ${waited}ms)`);
+    assert.equal(settledLate, false, "the abandoned promise is left running");
+
+    // A rejection is the same answer as a timeout: the recovery is best-effort
+    // bookkeeping and must never fail the tick doing the recovering (the
+    // caller's own catch would otherwise abort the steps after it, e.g. the
+    // alert after a failed announce write).
+    assert.equal(await recoveryAwait(Promise.reject(new Error("boom")), 50, "unit"), null);
+    assert.equal(
+      await recoveryAwait(Promise.reject(new Error("boom")), 50, "unit").then(() => "continued"),
+      "continued",
+      "a failed recovery step does not throw into the caller",
+    );
+
+    // The bound itself stays a fraction of the tick: the read plus two writes
+    // must not be able to grow the front phase into the invocation's kill
+    // window (the regression this replaced could reach ~22s).
+    assert.ok(RECOVERY_DB_BOUND_MS > 0 && RECOVERY_DB_BOUND_MS <= 1_200);
+    assert.ok(1_500 + 2 * RECOVERY_DB_BOUND_MS < 5_000);
+    console.log("bounded recovery awaits: pass");
+  }
+
   // ---------- completion-based outage alert (worker.ts wedgeChainEntry) ----------
   // The age-based checkOutageAndAlert cannot see this outage at all: the claim
   // heartbeat refreshes `at` every tick, so the reported age never passes one

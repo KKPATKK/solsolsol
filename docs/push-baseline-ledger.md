@@ -636,3 +636,17 @@ tick 時發）。
 **代價（講清楚）**：profiles call 嘅 320ms budget 細過 headroom 500ms，所以 5xx 都一樣 fail-fast、冇重試 —— 依賴嘅係（一）每 60s 都會再試、（二）失敗時有第八補嘅 last-good 重用。pair 路徑（1000ms budget）仍然有空間重試，所以冇刪走條路。
 
 **驗收點**：deploy 後嘅 5 分鐘 tick 應該 `jup ≈ 20`（原本 0）而 `profiles 仍 ≈ 26`（重用 20＋make-up）、`lastRawProfiles 仍 0`、`failedTotal` 仍然每 5 分鐘 +1。
+
+**Deploy 後量到（version `170f9838`，warm isolate）**：
+
+| tick | prof | feedReq | raw | fail | lastFailAt | jup | feedsMs |
+|---|---|---|---|---|---|---|---|
+| 18:30:11（正常） | 21 | 4 | 17 | 0 | — | 20 | 767 |
+| **18:31:11（min%5==1）** | **21** | 5 | **0** | **1** | 18:31:07.783 | **20** ✓ | 767 |
+| 舊行為 18:11:11（比較） | 26 | 4 | 0 | 1 | 18:11:08 | **0** ✗ | 768 |
+
+- 429 仍然存在（`raw 0`、`failedTotal +1`、時間戳落喺該 tick 內）—— 訊號冇被遮蔽 ✓
+- **`jup` 由 0 變返 20** ✓ 即 fan-out 不再短路；tick 長度（`ms 4224`）同正常一樣。
+- `prof 21` ＝ 重用 17 ＋ make-up 4 ✓
+
+**今次 verfiy 嘅教訓（也記下）**：deploy 後第一個 5 分鐘 tick（18:26:13）**驗不到** —— 佢係冷 isolate，行嘅係模式 A（`feedReq 0 / feedsMs 0 / prof 0`，前段 cold crime 抓食死窗口），要等 warm isolate 嘅 18:31 才有結論。兩種 5 分鐘病徵唔可以混為一談。

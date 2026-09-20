@@ -875,6 +875,52 @@ export const DEAD_TICK_STREAK_RESET = 2;
  * outlive it. A timed-out check does nothing this tick; the next one retries.
  */
 const WEDGE_CHECK_BOUND_MS = 1_500;
+/**
+ * Bound on EACH database await the recovery itself performs (the heartbeat
+ * announce and the no-completion alert). The recovery runs BEFORE the scan on
+ * exactly the ticks that are already in trouble, and its round trips used to
+ * inherit the full DB_REQUEST_TIMEOUT_MS ladder (6s transport, 7.2s hard
+ * wall): the read + two writes could grow the front phase to ~22s, past
+ * Cloudflare's invocation kill, so the tick doing the recovering died too and
+ * the stretch just continued. 800ms is ~6x the live Turso round trip (~130ms),
+ * and caps the whole recovery at WEDGE_CHECK_BOUND_MS + 2x this — a fraction
+ * of the tick budget, spent before the scan rather than inside it. A
+ * bounded-away write is left running (every write on this path is idempotent)
+ * and re-offered by the next tick.
+ */
+export const RECOVERY_DB_BOUND_MS = 800;
+/**
+ * Await `work` for at most `ms`, treating a timeout and a rejection as the
+ * same "did not settle" answer. Recovery bookkeeping must never be able to
+ * fail — or delay — the tick that is doing the recovering, so this returns
+ * null instead of throwing (the caller's own try/catch would otherwise abort
+ * the rest of the recovery, e.g. the alert after a failed announce write).
+ * Exported for the offline tests.
+ */
+export async function recoveryAwait<T>(
+  work: Promise<T>,
+  ms: number,
+  what: string,
+): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const raced = await Promise.race([
+      work,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), ms);
+      }),
+    ]);
+    return raced as T | null;
+  } catch (err) {
+    console.warn(
+      `[worker] dead-tick recovery ${what} failed — continuing:`,
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 /** Set when the recovery rebuilt the module state; surfaced via /health. */
 let wedgedStateResets = 0;
 
@@ -1116,14 +1162,20 @@ async function ensureInitialized(env: Env): Promise<void> {
         // The claim this tick goes on to win still sees that same stale
         // phase=scanning row, so runScan writes the dead tick's backfill row as
         // usual — the recovery adds a rebuild, not a hole in scan_history.
-        await db.setWorkerState(
-          "scan_heartbeat",
-          JSON.stringify({
-            at: verdict.deadAt,
-            ok: true,
-            phase: "scanning",
-            rebuiltAt: Date.now(),
-          }),
+        // Bounded: the announce is a nicety (it stops one death from
+        // rebuilding on every later tick) and must not become the next death.
+        await recoveryAwait(
+          db.setWorkerState(
+            "scan_heartbeat",
+            JSON.stringify({
+              at: verdict.deadAt,
+              ok: true,
+              phase: "scanning",
+              rebuiltAt: Date.now(),
+            }),
+          ),
+          RECOVERY_DB_BOUND_MS,
+          "heartbeat announce",
         );
       }
       // Outage tracking on COMPLETIONS, not on heartbeats — see
@@ -1133,7 +1185,19 @@ async function ensureInitialized(env: Env): Promise<void> {
       // tick can read as healthy means a completion landed, which is what ends
       // the stretch (the row's own continuity test is what retires it).
       const dead = prevRaw ? deadTickBackfillInfo(prevRaw, now, BACKFILL_STALE_MS) : null;
-      if (dead) await trackNoCompletionStretch(dead.at, now);
+      if (dead) {
+        // Bounded for the same reason as the announce write: the alert is the
+        // LAST thing this tick needs, and a hung wedge read/write here would
+        // spend the successor's front window on bookkeeping — the
+        // amplification that turned one lost completion into the 2026-09-19
+        // chains of 5+ dead ticks. The stretch stays open, so a bounded-away
+        // alert is late, never lost.
+        await recoveryAwait(
+          trackNoCompletionStretch(dead.at, now),
+          RECOVERY_DB_BOUND_MS,
+          "no-completion alert",
+        );
+      }
     } catch (err) {
       console.warn(
         "[worker] dead-tick recovery check failed — continuing:",
