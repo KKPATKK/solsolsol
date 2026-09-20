@@ -22,7 +22,7 @@ const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../d
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -95,6 +95,43 @@ async function main() {
     // Witness for why the value was lowered: the pre-2026-09-20 setting fails
     // the first assertion, i.e. every stalled flush was unrecoverable.
     assert.ok(6_000 * 1.2 > retryWindowMs, "the old 6s default should violate the window");
+  });
+
+  // ---------- card send room (src/scanner.ts) ----------
+  //
+  // The same arithmetic one layer down, and the fix for the duplicate cards
+  // reported live on 2026-09-20. A card's Telegram send only duplicates when it
+  // is CUT: Telegram accepts the card, the awaited race expires first, `sendTo`
+  // throws `cardSendTimeout`, its catch releases the claim, and the next tick
+  // sees the coin as unseen and pushes the same card again. What decides that
+  // is the slice the send gets, and the tick's shape makes it exactly
+  // `CANDIDATE_PUSH_RESERVE_MS - overhead`: the chain ends at
+  // `SCAN_TICK_DEADLINE_MS - reserve`, the send starts `overhead` later
+  // (render + trade-mode read + claim round trip), and its deadline is the
+  // tick's own internal deadline while the chain runs to its own. Live
+  // 2026-09-20: `wallets@2800 flurry@3300 render@3300 send@3542`, i.e. a 658ms
+  // slice against measured round trips of 0.62s and 1.23s (/debug/test-push).
+  // This case pins the floor so a future retune of the reserve cannot silently
+  // put the send back under a real round trip.
+  await test("card send room: the push reserve covers a measured Telegram round trip", () => {
+    const CARD_SEND_OVERHEAD_MS = 250; // render + claim RTT (live 3300 → 3542)
+    const roomMs = CANDIDATE_PUSH_RESERVE_MS - CARD_SEND_OVERHEAD_MS;
+    assert.ok(
+      roomMs >= 1_200,
+      `send room ${roomMs}ms must cover the slowest measured round trip (1230ms)`,
+    );
+    // The reserve is taken from the chain, so it must still leave one: the
+    // candidate chain and its gates share `SCAN_TICK_DEADLINE_MS - reserve`.
+    assert.ok(
+      SCAN_TICK_DEADLINE_MS - CANDIDATE_PUSH_RESERVE_MS >= 600,
+      "the reserve must leave the candidate chain a usable window",
+    );
+    // Witness for why the value moved: the pre-2026-09-20 setting left the send
+    // under the measured round trip, i.e. the cut was structural, not unlucky.
+    assert.ok(
+      900 - CARD_SEND_OVERHEAD_MS < 1_200,
+      "the old 900ms reserve should fail the room check",
+    );
   });
 
   // The runtime half of the same change: a request that never settles must be

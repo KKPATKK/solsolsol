@@ -427,3 +427,96 @@ if (raced.status === "abandoned") {
 - 反面驗收（防漏推）：模擬一個 request reject 嘅 send → 仍然要 `unclaimTokenPush` + 下 tick 補推；
   只有 `abandoned` 才保留 claim，而且 2 個 tick 內證唔到 delivery 就必須放返出去。
   heal gate 嘅反面驗收：**ring 完全冇 entry 嘅 token 必須照樣補發**（單元測試 `deliveredCardTokens` 覆蓋）。
+
+## 2026-09-20（今次）：量清編輯窗口，然後用窗口內唯一嘅旋鈕去減 (A)
+
+### 先講窗口（今次實測，之前只係估）
+
+用 `.syncprobe.ts`（worker.ts 嘅暫存副本）逐個偏移試 apply，得到：
+
+| 檔案 | 行 | byte offset | 結果 |
+|---|---|---|---|
+| `.syncprobe.ts`（= `worker.ts`） | 700 | 32,050 | ✅ apply |
+| 同上 | 1000 | 48,479 | ✅ |
+| 同上 | 1088 | 52,649 | ✅ |
+| 同上 | 1190 | 57,259 | ✅ |
+| 同上 | 1241（`COMPLETION_ALERT_GAP_MS`） | 59,404 | ❌ not found |
+| 同上 | 1300 | 62,009 | ❌ |
+| 同上 | 1400 | 66,907 | ❌ |
+| `scripts/test-unit.js` | 2018 | 97,884 | ❌ |
+| 同上（cardSendDeadline 斷言） | 2090–2129 | 100.5K | ❌ |
+| `src/scanner.ts` | 172（常數區） | 9,889 | ✅ |
+
+即係：**窗口大約係每個檔案嘅頭 1,200 行**（唔係固定 byte 數，亦唔係「某 % 數」——
+59.4K 唔過、62K 唔過，而 57.2K 過）。今日所有改動都落喺窗內。
+
+**推論**：`scanner.ts` 只可改頭 ~1200 行（send 喺 ~3020 行 ⇒ 唔得）；`worker.ts` 只可改頭 ~1200 行
+（race 信封喺 ~1980 行 ⇒ 唔得）；`db.ts` 只可改頭 ~1200 行（`claimTokenPush` 喺 ~1957 行 ⇒ 唔得）。
+
+### 今次落地：`CANDIDATE_PUSH_RESERVE_MS` 900 → **1500**（窗口內，`scanner.ts` ~172 行）
+
+**為何可以繞過「send floor 改唔到」嘅死結**：send 實際分到嘅 slice 唔係由 `CARD_SEND_FLOOR_MS`
+單獨決定，而係
+
+```
+send deadline = max(now + FLOOR, SCAN_TICK_DEADLINE_MS)  （再由 CARD_SEND_TAIL_MS 封頂）
+send 起點     = chainDeadline + overhead
+             = (SCAN_TICK_DEADLINE_MS − CANDIDATE_PUSH_RESERVE_MS) + ~242ms
+⇒ slice = SCAN_TICK_DEADLINE_MS − chainDeadline − overhead
+         = CANDIDATE_PUSH_RESERVE_MS − overhead      （只要 reserve − overhead > FLOOR）
+```
+
+所以 `reserve` 就係「room ≈ R − 220」模型裏面嗰個 R，而它**唔受任何測試釘住**
+（`cardSendDeadline`/`cardClaimDeadline` 嘅斷言只依賴 `(t0, now)` 同 FLOOR/MIN/BUDGET，
+reserve 唔喺裏面）。今日實測：
+
+| | 改前 | 改後 |
+|---|---|---|
+| `chainDeadline` | 3300ms | **2700ms** |
+| send 起點（live `render@3300 → send@3542` 嘅 242ms overhead） | 3542ms | ~2942ms |
+| send slice | **658ms** | **~1258ms** |
+| Telegram 實測 round trip（`/debug/test-push`） | 0.62s / 1.23s | 兩者都裝得落 ✅ |
+| 處理候選嘅鏈窗口 | 1.2s | 600ms |
+| gate 窗口（= `CANDIDATE_GATE_TAIL_MS`） | 500ms | 500ms（**刻意不動**） |
+
+**點解可以減 (A)**：slice 由 658ms（細過 1.23s 樣本、亦細過常見 ~1s）升到 ~1258ms
+（≥ 最慢樣本）⇒ send 嘅 await 通常喺 deadline 前 settle ⇒ `sent !== null` ⇒ claim 保留 +
+delivery audit 落地 ⇒ **下一 tick 冇「未推」狀態可以再推**。裝唔落嘅 tick 會 `cardSendDeadline`
+返 null ⇒ **defer**（零寫入、零 claim、保留 make-up 優先），即係 400ms 由「重複風險」換成「延遲」。
+
+**代價（老實列，全部 fail-open 且心跳可量）**
+
+1. **卡片裝飾行**：decor batch 係喺 ~2378ms dispatch、用 `enrichDeadline = chainDeadline − 500` 封頂，
+   所以它嘅 grace 由「2800 − 2378 = 422ms」跌到「2200 − 2378 < 0」。Birdeye 持有人/Pro、GMGN、
+   Arkham（本來已停用）、Jupiter 有機度 會照舊 render 成「—」。呢啲 client 逐 mint 有 cache，
+   所以暖 cache / 重掃嘅幣照樣有數據。
+2. **慢 gate 走查**：wallets / Flurry 一條 cold walk 喺 500ms 窗都已經行唔完（live `wallets`
+   2800→3300 直接燒到 chain deadline），而家更早被切 ⇒ 呢啲判斷更少（fail-open：唔會漏推，
+   但少判）。local/cached 嘅判斷（crime creator、top10 band、已 cache 嘅 Flurry/wallet verdict）
+   照樣落地。
+3. **晚開始嘅鏈**：front phase 用盡 `FRONT_PHASE_WINDOW_MS`（2600ms）嘅 tick，鏈一開波就撞
+   `Date.now() > chainDeadline` guard ⇒ 該候選 defer 去下一 tick（latency，唔會失去硬幣）。
+4. **trailing tracker + summary 早 ~500ms 完**，所以**反而**退返時間俾 worker 嘅 completion flush
+   （即上面嗰條失 flush 線嘅同一種 slack）。
+
+**如果要反悔**：只需改一個常數（`CANDIDATE_PUSH_RESERVE_MS`）。`cardSend.cut`（心跳）會量到
+剩返幾多 cut，`/health.deferral.pending` 會量到多咗幾多 defer。
+
+### 新單元測試（`scripts/test-unit.js` 頭部，窗口內）
+
+`card send room: the push reserve covers a measured Telegram round trip` —— 釘住
+`CANDIDATE_PUSH_RESERVE_MS − 250 ≥ 1200`（最慢實測 round trip）、
+`SCAN_TICK_DEADLINE_MS − reserve ≥ 600`（鏈仍然要有窗口）、同埋
+「舊值 900 應該唔合格」嘅見證斷言。兩個常數已 `export`（`scanner.ts`）。
+`test:unit` = **211 passed, 0 failed**；`test-deferred-priority` / `test-tick-path` 全 pass。
+
+### 仍然要人手貼（窗口外，patch 已備）
+
+1. **race 信封嘅 floor clamp**（`worker.ts` ~1980 行）：依然係正確性修正，位置/內容同上面一節
+   一樣。今次改動令 scan 早 ~500ms 完，flush 多咗 slack，但 envelope 本身嘅不變式仍然係錯嘅。
+2. **(A) 嘅根治：三態 send**（`scanner.ts` sendTo ~3020 行）：本節嘅 reserve 改動只係令 cut 變罕見，
+   唔係令 cut 無害。要真正封死：「abandoned 唔 unclaim + 背景寫 delivery + 2 個 tick 內證唔到才釋放」
+   （patch 一樣喺上面「(A) cut → unclaim → re-eval 重推」一節）。
+3. **`CARD_SEND_FLOOR_MS` 600→900 / `CARD_SEND_MIN_MS` 250→700**：仍然**做唔到**，因為
+   `scripts/test-unit.js` 2090–2129 嘅四條斷言（4150/4151、3550/3551）喺窗口外，改咗會 CI 紅。
+   reserve=1500 已經買到同一個效果，所以呢個配對而家係「可選加強」，唔再係必須。

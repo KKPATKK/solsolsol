@@ -124,7 +124,7 @@ const SCAN_TIMEOUT_MS = 25_000;
  * CANDIDATE_PUSH_RESERVE_MS / bestEffort), so the coin that cleared its
  * gates always reaches the send.
  */
-const SCAN_TICK_DEADLINE_MS = 4_200;
+export const SCAN_TICK_DEADLINE_MS = 4_200;
 /**
  * Wall-clock slice of the tick RESERVED for the gate/push phase — the ONLY
  * phase that can actually push a coin. The three front phases (discovery
@@ -168,8 +168,59 @@ const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
  * by the chain itself. Whatever has not answered by the deadline now degrades
  * to the same "未分析 / —" the card renders on an upstream failure, and the
  * coin — already through every real gate — still gets pushed.
+ *
+ * 2026-09-20 (900 → 1500): the reserve was short by the one measurement that
+ * decides this number — what a Telegram sendMessage round trip costs from this
+ * Worker. Live /debug/test-push timings: 0.62s and 1.23s (the /health baseline
+ * in the same window was 1.12-1.21s, so most of it is isolate start plus
+ * Telegram itself); the doc's "room ≈ R − 220" model (send deadline 4200 −
+ * chain end 3300 − the fixed ~242ms of render + claim + trade-mode read) gave
+ * the send 658ms of that. A card whose send ran longer was CUT at the
+ * deadline, and a cut send is the duplicate generator: Telegram may already
+ * have accepted the card, `sendTo` throws `cardSendTimeout`, its catch
+ * releases the claim, the next tick sees the coin as unseen and pushes the
+ * SAME card again. Measured live 2026-09-20 10:48-11:08 HKT: GROYPER and
+ * PONDER each arrived 4-5 times, on ticks whose phases were exactly this
+ * shape — `wallets@2800 flurry@3300 render@3300 send@3542`.
+ *
+ * At 1500 the chain ends at 2700ms, so the send slice becomes
+ * `chain 2700 + 242 overhead` → send start ~2942 against a 4200 deadline,
+ * i.e. ~1258ms — at or above the slowest measured round trip. The await then
+ * normally completes INSIDE the slice, `sent` is non-null, the claim is kept
+ * and the delivery audit is written: the one outcome that cannot duplicate.
+ * A tick that still cannot afford the slice DEFERS instead (cardClaimDeadline
+ * / cardSendDeadline return null, nothing is written, no claim is taken, the
+ * coin keeps its make-up priority in the re-eval pool), so this trades
+ * duplicates for push LATENCY, never for a lost push — and a duplicate card
+ * is worse than a late one, because the second card reads as a fresh
+ * opportunity the operator may act on twice.
+ *
+ * What it costs, honestly (all fail-open, all measured by the heartbeat):
+ *  - the whole post-discovery chain gets 600ms instead of 1.2s, so the
+ *    CARD-ONLY decor batch (Birdeye holder/pro-trader, GMGN, Arkham, Jupiter
+ *    organic) mostly misses its deadline and renders as "—", and the slow
+ *    gate walks (wallet analysis, Flurry) lose the tail they were already
+ *    spending without finishing (the live stamp above shows the wallet walk
+ *    burning 2800→3300 straight to its deadline). Those clients cache per
+ *    mint, so a warm/cached judgment still lands and a re-sweep still
+ *    decorates. CANDIDATE_GATE_TAIL_MS is deliberately NOT retuned: the gate
+ *    window is `chainDeadline − enrichDeadline` = the tail, so leaving it at
+ *    500 keeps the gates' window SHAPE identical while the numbers above
+ *    shift earlier.
+ *  - a chain that STARTS late (front phases riding their FRONT_PHASE_WINDOW_MS
+ *    cap) can now reach the loop's `Date.now() > chainDeadline` guard before it
+ *    processes a candidate, which defers that candidate to the next tick. Same
+ *    trade every budget cut here has always made: the coin keeps its re-eval
+ *    slot and its deferral make-up priority, so it costs a minute of latency,
+ *    never coverage.
+ *  - the trailing tracker + summary also finish earlier, which hands the
+ *    difference back to the worker's completion flush — the same slack the
+ *    dead-tick work in docs/scan-completion-loss.md is trying to buy.
+ * If card decoration ever matters more than a duplicate, this is the single
+ * constant to lower again; `cardSend.cut` (heartbeat) counts the cuts it
+ * removes and `/health.deferral.pending` counts the deferrals it adds.
  */
-const CANDIDATE_PUSH_RESERVE_MS = 900;
+export const CANDIDATE_PUSH_RESERVE_MS = 1_500;
 /**
  * Preferred slice for the initial-card Telegram send (see the send in
  * sendTo). The send is the LAST step of the push path and the only one that
@@ -187,21 +238,29 @@ const CANDIDATE_PUSH_RESERVE_MS = 900;
  * holding ~850ms of unused tail while late sends were started with whatever
  * crumbs were left.
  *
- * 2026-09-20 (duplicate cards, GROYPER/PONDER x5 in one afternoon): this value
- * is the one that should move next, and it is NOT moved yet on purpose — the
- * boundaries it produces are pinned by unit tests that live in
- * scripts/test-unit.js past the file-sync window, so raising it here would
- * turn CI red with no way to update them. The measurement is done and recorded
- * in docs/scan-completion-loss.md: the tick spends every deadline it is given
- * (`wallets@2800` = its enrich deadline, `flurry@3300` = the chain deadline,
- * `render@3300`, `send@3542`), so a card's send is started 658ms before the
- * 4200ms deadline while a Telegram sendMessage round trip from this Worker
- * measures 0.6-1.2s — the await is cut, the claim is released, and the next
- * tick pushes the same card again. Raising this to ~900 (with
- * CARD_SEND_MIN_MS to ~700, so a claimed card always has 400 + 700 = 1100ms)
- * is the paired change; a tick that cannot afford it then DEFERS the card
- * instead of cutting it. `cardSendCuts` in the heartbeat (src/tickprobe.ts)
- * counts how often this happens, so the effect is measurable either way.
+ * 2026-09-20 (duplicate cards, GROYPER/PONDER x5 in one afternoon): the tick
+ * spends every deadline it is given (`wallets@2800` = its enrich deadline,
+ * `flurry@3300` = the chain deadline, `render@3300`, `send@3542`), so a card's
+ * send was started 658ms before the 4200ms deadline while a Telegram
+ * sendMessage round trip from this Worker measures 0.6-1.2s — the await was
+ * cut, the claim released, and the next tick pushed the same card again.
+ *
+ * Raising THIS value (to ~900, with CARD_SEND_MIN_MS to ~700 so a claimed card
+ * always has 400 + 700 = 1100ms) is the direct fix and is still NOT possible
+ * from here: the boundaries it produces are pinned by assertions in
+ * scripts/test-unit.js (cardSendDeadline at 4150/4151ms, cardClaimDeadline at
+ * 3550/3551ms, both derived from this value and CARD_SEND_MIN_MS), and those
+ * assertions sit at byte ~100K of that file, past the file-sync window (this
+ * session measured the window: edits land up to ~line 1190 of a file and fail
+ * past ~1240). Raising the floor would turn CI red with no way to update them.
+ *
+ * So the same outcome was bought from CANDIDATE_PUSH_RESERVE_MS instead (see
+ * there: 900 → 1500), which moves the chain deadline instead of the send
+ * floor: the send now STARTS ~2942ms with ~1258ms of slice, so it finishes
+ * inside its deadline and the claim is never released for a delivered card.
+ * This constant keeps its old meaning (the least slice a send may be given);
+ * `cardSend.cut` in the heartbeat (src/tickprobe.ts) counts any that are still
+ * cut, so the effect stays measurable.
  */
 const CARD_SEND_FLOOR_MS = 600;
 /**
@@ -230,10 +289,13 @@ const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
  * 2026-09-20: this is the other half of the pair described at
  * CARD_SEND_FLOOR_MS above — the raise to ~700 (which also raises the CLAIM
  * gate to CARD_CLAIM_BUDGET_MS + this, so a claimed card always has 1100ms for
- * its claim plus its send) is ready but cannot land from here: the boundary it
- * produces at 3550/3551ms is asserted in scripts/test-unit.js, which is past
- * the file-sync window. Until it lands, the cut is counted instead
- * (`cardSendCuts`), and the coin keeps the duplicate-prone behaviour.
+ * its claim plus its send) is blocked for the same reason and in the same
+ * place: `cardSendDeadline(t0, t0 + 4150) === t0 + 4400` and
+ * `cardClaimDeadline(t0, t0 + 3551) === null` in scripts/test-unit.js pin this
+ * value's effect, and those assertions are past the file-sync window. The
+ * duplicate fix therefore landed one level up, in CANDIDATE_PUSH_RESERVE_MS
+ * (900 → 1500), which gives the send the room this constant exists to protect
+ * without moving the pinned boundaries.
  */
 const CARD_SEND_MIN_MS = 250;
 
