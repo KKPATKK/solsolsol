@@ -97,6 +97,41 @@ async function main() {
     assert.ok(6_000 * 1.2 > retryWindowMs, "the old 6s default should violate the window");
   });
 
+  // The runtime half of the same change: a request that never settles must be
+  // walled off early enough for the flush's racing retry to still land. Bounded
+  // against the OLD wall (6s transport x 1.2 = 7.2s) rather than a tight
+  // tolerance, so this pins the regression without going flaky on a slow CI
+  // box: a healthy machine measures ~3.0s (2.5s x 1.2).
+  await test("a never-settling DB call is walled off inside the flush retry window", async () => {
+    const never = () => new Promise(() => {});
+    const hangingClient = {
+      execute(stmt) {
+        if (stmt.args && stmt.args[0] === "anything") return never();
+        return Promise.resolve({ rows: [], rowsAffected: 0 });
+      },
+      async batch(stmts) {
+        return stmts.map(() => ({ rows: [], rowsAffected: 1 }));
+      },
+    };
+    const db = new Db("libsql://unused", undefined, hangingClient);
+    await db.init();
+    const t0 = Date.now();
+    await assert.rejects(
+      db.getWorkerState("anything"),
+      /hard wall|never settled/i,
+      "a hanging execute must reject via the wall, not hang",
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(
+      elapsed >= DB_REQUEST_TIMEOUT_MS,
+      `call settled in ${elapsed}ms — earlier than the ${DB_REQUEST_TIMEOUT_MS}ms transport timeout`,
+    );
+    assert.ok(
+      elapsed < 6_000,
+      `call settled in ${elapsed}ms — the old 6s wall (7200ms) would leave no retry window`,
+    );
+  });
+
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {
     // Nothing new since the last CONFIRMED write -> the flush writes nothing.
     assert.equal(
