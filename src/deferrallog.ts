@@ -371,6 +371,65 @@ export function pushDeferralDelta(
  * must not be re-counted here; a completed tick's summary is stamped `done`
  * with candidates and pushed final.
  */
+/**
+ * Delivery kinds that prove a coin's card was ACCEPTED BY TELEGRAM.
+ *
+ * `initial` is written by the scanner only after the send returned a
+ * message_id, and `resend` by the tracker's heal re-send under the same
+ * condition — both are therefore hard evidence that a card for that token
+ * reached the chat. `followup` and `heal-current` are NOT: they are about the
+ * tracker's own rows and a healed baseline, so they say nothing about whether
+ * the deferred INITIAL card was ever delivered. Keeping the list this narrow is
+ * what makes the guard below safe — it may only ever forget an obligation a
+ * delivery already discharged, never one the user is still owed.
+ */
+const DELIVERED_CARD_KINDS: ReadonlySet<string> = new Set(["initial", "resend"]);
+
+/**
+ * Deferred obligations the delivery audit ring proves were ALREADY DELIVERED
+ * (2026-09-20 duplicate fix).
+ *
+ * The shape it fixes: the durable pending list and the push itself are written
+ * by the SAME completion flush. When that flush is lost (the dead-tick shape
+ * this ledger documents), the push landed but the removal did not, so the coin
+ * stays "owed" and the next tick's make-up pass pushes the same card a second
+ * time — live 2026-09-20 00:47Z: GROYPER got its card, then a second one two
+ * minutes later, and the audit ring carries `initial` entries for 4 of the 8
+ * tokens still listed as pending.
+ *
+ * So: a pending token with a delivered-card audit entry is no longer owed, and
+ * forgetting it can only REMOVE a duplicate — a token whose card never reached
+ * the chat has no such entry and stays pending, exactly as it must. Coverage is
+ * the audit ring's (~30 deliveries, ~6h), which is many times the window a
+ * duplicate appears in (the next tick, seconds to a minute later).
+ *
+ * Pure and exported: the wiring is a durable read plus a registry drop, both of
+ * which live in code the offline harness cannot drive (worker + scanner), so
+ * the RULE is what the unit tests pin.
+ */
+export function deliveredDeferredTokens(
+  pending: readonly string[],
+  audit: ReadonlyArray<{ token?: string | null; kind?: string | null }>,
+): string[] {
+  if (pending.length === 0 || audit.length === 0) return [];
+  const delivered = new Set<string>();
+  for (const entry of audit) {
+    const token = entry?.token;
+    if (typeof token !== "string" || token.length === 0) continue;
+    if (typeof entry.kind !== "string" || !DELIVERED_CARD_KINDS.has(entry.kind)) continue;
+    delivered.add(token);
+  }
+  if (delivered.size === 0) return [];
+  const stale: string[] = [];
+  const seen = new Set<string>();
+  for (const token of pending) {
+    if (typeof token !== "string" || !delivered.has(token) || seen.has(token)) continue;
+    seen.add(token);
+    stale.push(token);
+  }
+  return stale;
+}
+
 export function heldBackCandidates(
   summary: {
     pushPhase?: string;

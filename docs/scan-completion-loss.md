@@ -191,6 +191,46 @@ alert 一齊放寬）。改為新增獨立常數：
 - `pendingTokens` 上限 500：功能狀態（真正等住推送嘅幣），唔可以截；500 個 base58 地址會令
   snapshot 爆到 ~22KB，但實測 pending 只有 4–6 個 → 冇動，只記錄。
 
+## 已做（窗口內）：補推重複嘅修正（live 2026-09-20 00:47Z GROYPER，+2 分鐘再收一次）
+
+**機制**：`push_deferral` 嘅 pending 列表同推送**係同一個 completion flush 寫嘅**。flush 一失手，
+卡片已經送出但「仲欠佢一張」嘅記錄冇清 → 下一 tick 嘅 make-up pass 再送同一張卡 → 用戶收到重複。
+即係呢個重複係上面「失 completion」嘅**下游**後果，唔係獨立問題。
+
+**Live 證據**（deploy 前嘅 `/health` × `/debug/push-audit` 交叉核對）：
+
+| | |
+|---|---|
+| `deferral.pendingTokens` | 8 個 |
+| 其中 audit ring 已經有交付記錄（`initial`/`resend`） | **4 個**：`DFQHUegJ…pump`、`BmnGRH8N…SdpHk`、`6dWoxftz…9Eba`、`9gaMApmv…UW2Y` |
+
+即係嗰 4 個幣「卡片已經送到」，但當時仍然排住隊等補推 → 全部都有機會再送一次。
+
+**規則**（純函數 `deliveredDeferredTokens`，`deferrallog.ts`，窗口內）：
+只有 audit ring 嘅 **`initial`**（scanner 送卡成功、Telegram 回咗 `message_id` 之後才寫）同
+**`resend`**（tracker 嘅 heal 重送，同樣條件）可以證明「已送」。`followup` 同 `heal-current` **唔算**
+—— 佢哋講嘅係 tracker 自己嘅行同 baseline，證明唔到嗰張 initial 卡到底送咗未。
+
+**接線**（`worker.ts`，窗口內）：`syncPushDeferralCounters` 喺 **seed 之前即時讀一次** audit ring
+（**唔用** 5 分鐘 throttle 嗰個 mirror —— 重複就係喺下一 tick 出現，正好落喺 throttle 嘅盲區），
+把已送嘅 pending token 由 registry（`forgetDeferredTokens`）、鏡像同持久行**一齊**刪；
+而「持久行要寫」嘅條件放寬為 `stale.length > 0` 都要寫（否則行留住舊 token，recycle 後又 seed 返）。
+讀 audit 失敗 = 當「證唔到」→ pending 完全不動。
+
+**為何唔會漏推**：
+- `initial`/`resend` entry 只會在 send **成功之後**（Telegram 回 `message_id`）寫；冇 entry 即證唔到 → 一律保留 → 照舊補推。
+- deferral 本身就係「唔寫任何嘢、幣留喺 pool」（見 `DeferredPushLedger` 嘅註釋），所以 forget 只係取消**強制補推優先**，幣仍然可以經正常 rotation 再考。
+- 讀取失敗一律 fail-open（保留 pending）。
+
+**已知限制（老實講）**：
+1. 覆蓋範圍係 audit ring（~30 條交付 ≈ 6 小時）；但重複係喺下一 tick（秒至分鐘）出現，所以窗足夠。
+2. 若 tick 喺「send 成功」同「寫 audit」之間被殺，就冇任何記錄可證 → 呢種重複**唔可以**靠推斷消除（推斷就等於有機會漏推）。寧可有重複，唔可以漏。
+3. 多 chat：卡片送到 chat A 就會令該 token 被 forget，即使 chat B 後來才啟用。
+4. 冷 isolate 首次 seed 喺 `worker.ts` ~74KB（窗口外）讀持久行；持久行會由窗口內嘅寫入收緊，所以最多一個 tick 後收斂。
+
+**驗收點**：`/health` 嘅 `deferral.pendingTokens` 唔應該再包含 audit ring 已有 `initial` 嘅 token；
+console 會出現 `[worker] forgot N deferred obligation(s) already delivered — …`；同一個 token 唔應該再收兩張卡。
+
 ## 驗收點（deploy 後）
 
 - 主：`scan-history` 嘅**連續** dead 行長度上限（改前 5–13 連）→ 應縮到 1–2。

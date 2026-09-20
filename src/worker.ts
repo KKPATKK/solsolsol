@@ -22,7 +22,7 @@ import {
 import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
-import { Scanner, deferredPushTokens } from "./scanner";
+import { Scanner, deferredPushTokens, forgetDeferredTokens } from "./scanner";
 import { feedMakeupView } from "./deferredmakeup";
 import {
   installTickProbe,
@@ -35,6 +35,7 @@ import {
   heldBackCandidates,
   loadPushDeferralSnapshot,
   nextPushDeferralSnapshot,
+  deliveredDeferredTokens,
   parsePushDeferralSnapshot,
   pushDeferralAlreadyApplied,
   pushDeferralDelta,
@@ -367,6 +368,45 @@ async function flushObservedLiquidity(): Promise<void> {
 }
 
 /**
+ * Forget deferred obligations the delivery audit ring already discharged (the
+ * rule is deliveredDeferredTokens; the duplicate it fixes is 2026-09-20 00:47Z
+ * GROYPER — a card, then the same card again two minutes later).
+ *
+ * Two deliberate choices:
+ *  - FRESH read, not the module mirror: the duplicate lands on the very next
+ *    tick, which is inside the push-ledger sync's 5-minute throttle, so a
+ *    reused copy would be exactly the copy that cannot see the push yet. This
+ *    runs after the completion flush, where one extra round trip cannot cost a
+ *    card or the flush window.
+ *  - Best-effort: a failed read returns "nothing proved delivered", i.e. the
+ *    pending list is left exactly as it was. The cost of that is the duplicate
+ *    we already had, never a forgotten obligation.
+ */
+async function dropDeliveredPendings(
+  database: Db,
+  pending: readonly string[],
+): Promise<string[]> {
+  if (pending.length === 0) return [];
+  let audit: Awaited<ReturnType<Db["getPushAudit"]>>;
+  try {
+    audit = await database.getPushAudit();
+  } catch (err) {
+    console.warn(
+      "[worker] delivery-audit read failed (deferral duplicate guard skipped):",
+      err instanceof Error ? err.message : err,
+    );
+    return [];
+  }
+  const stale = deliveredDeferredTokens(pending, audit);
+  if (stale.length === 0) return [];
+  const forgotten = forgetDeferredTokens(stale);
+  console.log(
+    `[worker] forgot ${forgotten} deferred obligation(s) already delivered — a lost completion write had left them owed (duplicate guard)`,
+  );
+  return stale;
+}
+
+/**
  * Bring the durable deferral counters (src/deferrallog.ts) in step with this
  * tick's summary, and refresh the copy the heartbeat publishes.
  *
@@ -403,12 +443,25 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
   };
   const raw = await db.getWorkerState(PUSH_DEFERRAL_STATE_KEY);
   const durable = parsePushDeferralSnapshot(raw);
+  // Duplicate guard: a delivered coin must not stay "owed". The push and the
+  // pending-list write ride the same completion flush, so a lost flush leaves
+  // it pending and the make-up pass pushes the card again (see
+  // dropDeliveredPendings). Seeding happens AFTER the drop, so neither the
+  // registry nor the published gauge can resurrect it.
+  const stale = await dropDeliveredPendings(db, durable?.pendingTokens ?? []);
+  const owedPending = durable
+    ? durable.pendingTokens.filter((token) => !stale.includes(token))
+    : [];
   // The row is authoritative: mirror it even when this isolate has nothing of
   // its own to add (that is the cross-isolate refresh).
   const refreshMirror = (): void => {
     if (durable) {
-      pushDeferralSnapshot = durable;
-      scanner?.seedDeferredTokens(durable.pendingTokens);
+      pushDeferralSnapshot = {
+        ...durable,
+        pending: owedPending.length,
+        pendingTokens: owedPending,
+      };
+      scanner?.seedDeferredTokens(owedPending);
     }
   };
   const cursorDelta = pushDeferralDelta(pushDeferralBaseline, totals);
@@ -422,11 +475,19 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
     recovered: cursorDelta?.recovered ?? 0,
     stalled: stalledUnflushed,
   };
-  if (delta.deferred <= 0 && delta.recovered <= 0 && delta.stalled <= 0) {
+  // `stale.length > 0` keeps the write path open for a drop-only tick: the
+  // durable row has to lose those tokens too, or a recycled isolate re-seeds
+  // them from storage (see the seed call site) and pushes the same card again.
+  if (
+    delta.deferred <= 0 &&
+    delta.recovered <= 0 &&
+    delta.stalled <= 0 &&
+    stale.length === 0
+  ) {
     refreshMirror();
     return;
   }
-  if (pushDeferralAlreadyApplied(durable, SCAN_LOCK_OWNER, totals)) {
+  if (stale.length === 0 && pushDeferralAlreadyApplied(durable, SCAN_LOCK_OWNER, totals)) {
     // A previous attempt of this very write committed while its response was
     // lost (hard wall, invocation kill). The row already carries it — ACK
     // rather than add it a second time.

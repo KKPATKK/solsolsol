@@ -33,7 +33,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
@@ -130,6 +130,39 @@ async function main() {
       elapsed < 6_000,
       `call settled in ${elapsed}ms — the old 6s wall (7200ms) would leave no retry window`,
     );
+  });
+
+  // ---------- deferral duplicate guard (src/deferrallog.ts) ----------
+  //
+  // The pending list and the push itself are written by the SAME completion
+  // flush, so a lost flush leaves a delivered coin still "owed" and the next
+  // tick's make-up pass pushes the same card again (live 2026-09-20 00:47Z
+  // GROYPER, +2 min; the audit ring carried `initial` for 4 of the 8 tokens
+  // still listed as pending). The rule may only ever forget what a delivery
+  // ALREADY discharged — the user's hard requirement is that a real miss is
+  // never dropped, so the kind whitelist is the safety property under test.
+  await test("deliveredDeferredTokens: only audit-proven deliveries are forgotten, never an owed coin", () => {
+    const pending = ["AAA", "BBB", "CCC", "DDD", "EEE"];
+    const audit = [
+      { token: "AAA", kind: "initial" },
+      { token: "BBB", kind: "resend" },
+      { token: "CCC", kind: "followup" },
+      { token: "DDD", kind: "heal-current" },
+      { token: "EEE", kind: null },
+    ];
+    assert.deepEqual(deliveredDeferredTokens(pending, audit), ["AAA", "BBB"]);
+    // No audit entry at all for an owed coin -> it stays owed (the never-miss half).
+    assert.deepEqual(deliveredDeferredTokens(["ZZZ"], audit), []);
+    assert.deepEqual(deliveredDeferredTokens(pending, []), []);
+    assert.deepEqual(deliveredDeferredTokens([], audit), []);
+    // Duplicates in the pending list are dropped once, order preserved.
+    assert.deepEqual(deliveredDeferredTokens(["BBB", "AAA", "BBB"], audit), ["BBB", "AAA"]);
+    // Malformed survey rows must never throw — the guard is best-effort.
+    assert.deepEqual(
+      deliveredDeferredTokens(["AAA", "", null, undefined], [{ token: "AAA", kind: "initial" }]),
+      ["AAA"],
+    );
+    assert.deepEqual(deliveredDeferredTokens(["AAA"], [{ kind: "initial" }, { token: "", kind: "initial" }]), []);
   });
 
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {

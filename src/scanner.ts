@@ -352,6 +352,29 @@ export function deferredPushTokens(): string[] {
   return deferredTokenList();
 }
 
+/**
+ * Forget deferred-card obligations that were ALREADY DELIVERED (2026-09-20
+ * duplicate fix; the rule lives in deferrallog.deliveredDeferredTokens).
+ *
+ * Why the drop has to exist next to the seed: seeding only ever ADDS to the
+ * shared registry, so a token that was pushed by a tick whose completion write
+ * never landed would be re-seeded from the durable pending list on every later
+ * tick and pushed again — the duplicate card the user sees. Dropping it here is
+ * safe by construction: the caller passes only tokens the delivery audit ring
+ * proves Telegram accepted, and the coin keeps its place in the re-eval pool
+ * either way (a deferral is deliberately invisible in storage), so a coin the
+ * user is genuinely still owed is never forgotten — it just loses its forced
+ * make-up priority, which is exactly right.
+ */
+export function forgetDeferredTokens(tokens: readonly string[]): number {
+  let forgotten = 0;
+  for (const token of tokens) {
+    if (typeof token !== "string" || token.length === 0) continue;
+    if (dropDeferredToken(token)) forgotten += 1;
+  }
+  return forgotten;
+}
+
 export class DeferredPushLedger {
   private recoveredCount = 0;
 
