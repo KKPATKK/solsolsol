@@ -1,0 +1,19 @@
+--- a/docs/push-baseline-ledger.md
++++ b/docs/push-baseline-ledger.md
+@@ -652,3 +652,16 @@
+ - `prof 21` ＝ 重用 17 ＋ make-up 4 ✓
+ 
+ **今次 verfiy 嘅教訓（也記下）**：deploy 後第一個 5 分鐘 tick（18:26:13）**驗不到** —— 佢係冷 isolate，行嘅係模式 A（`feedReq 0 / feedsMs 0 / prof 0`，前段 cold crime 抓食死窗口），要等 warm isolate 嘅 18:31 才有結論。兩種 5 分鐘病徵唔可以混為一談。
++
++---
++
++## 第十補：跨源流動性 —— 一張假 💧 卡（見 `docs/liquidity-provenance.md`）
++
++2026-09-20 20:16 HKT 嘅「💧 流動性枯竭 Lobby | LP 僅剩 $7.95K（< $10K）… 停止追蹤」係**假警報**：
++該池當時 DexScreener 讀 17.5K（用戶睇 ~21K）。tracker 兩條流動性規則（$10K 絕對地板、45% 驟降比）
++係用 DexScreener 嘅 `liquidity.usd` 校準，但 pair 可以來自 Jupiter／Gecko 腿，而嗰兩把尺對同一個池
++只有大約一半（實測 14 行入面 **10 行**嘅 `lastLiquidity` = Jupiter 值，0.46–0.58× DS，誤差 ≤ 2%）。
++
++修正：`pushwatch.ts` 新增 `comparableLiquidity()`（非 DexScreener 來源一律當「資料不明，唔判斷」）
++＋ 三條腿各自標 `PairInfo.feedSource`；深層 hunk 以 `docs/patches/liq-source-guard.patch` 落地。
++量度表、代價同驗收點全部喺 `docs/liquidity-provenance.md`。

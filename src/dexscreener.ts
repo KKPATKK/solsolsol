@@ -46,6 +46,22 @@ export interface PairInfo {
   txns: { m5Buys: number; m5Sells: number; h1Buys: number; h1Sells: number };
   liquidity: { usd: number | null };
   pairCreatedAt: number;
+  /**
+   * Which upstream produced this row. The three legs feeding the scanner do
+   * NOT share a liquidity metric, and the difference is a factor of ~2 — not
+   * noise: DexScreener's `liquidity.usd` is the pool's total USD reserve,
+   * while Jupiter's per-token `liquidity` is roughly HALF of it for the very
+   * same pool (measured 2026-09-20 over the tracker's rotation: 10 of 14
+   * recently-checked rows carried a Jupiter reading at 0.46–0.58× the
+   * DexScreener value, e.g. Lobby 7950 vs 17446, SI 13305 vs 26568, DONATED
+   * 29327 vs 55212 — while `stored/Jupiter` was 0.98–1.02 on every one).
+   *
+   * Any rule that judges an ABSOLUTE USD level (or compares two readings)
+   * must therefore only mix like with like — see comparableLiquidity in
+   * pushwatch.ts, which is what turned this into a false 💧 流動性枯竭 card.
+   * Absent (legacy fixtures, synthetic pairs) = treated as DexScreener.
+   */
+  feedSource?: "dexscreener" | "jupiter" | "gecko";
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -711,10 +727,13 @@ export class DexScreenerClient {
               // rug rule must see it, not mistake it for "unknown" (null).
               usd:
                 (raw.liquidity as { usd?: number } | undefined)?.usd ===
-                  undefined
+                undefined
                   ? null
                   : Number((raw.liquidity as { usd?: number }).usd),
             },
+            // The metric every USD-level rule is calibrated on (see the
+            // feedSource note on PairInfo).
+            feedSource: "dexscreener",
             pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
           });
           this.pairCache.set(baseToken.address, {

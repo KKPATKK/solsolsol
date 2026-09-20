@@ -165,6 +165,11 @@ export function jupToPairInfos(data: unknown): Map<string, PairInfo> {
         h1Sells: n(s1.numSells),
       },
       liquidity: { usd: raw.liquidity === undefined ? null : n(raw.liquidity) },
+      // Jupiter's `liquidity` is its own metric — measured at ~half of
+      // DexScreener's pool reserve for the same pool (2026-09-20, see the
+      // feedSource note on PairInfo), so a pair built here must never be
+      // judged by a DexScreener-calibrated USD level.
+      feedSource: "jupiter",
       pairCreatedAt: toMs(raw.createdAt) ?? 0,
     });
   }

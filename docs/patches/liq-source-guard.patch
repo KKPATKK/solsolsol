@@ -1,0 +1,54 @@
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -1308,7 +1308,7 @@
+             symbol: pair.baseToken.symbol ?? null,
+             pushedAt: m.pushedAt,
+             mcapAtPush: healedMcap,
+-            liquidityUsd: pair.liquidity.usd ?? null,
++            liquidityUsd: comparableLiquidity(pair),
+           });
+           if (resent) continue; // fresh card just went out — skip holder seed noise
+         }
+@@ -1480,7 +1480,10 @@
+         now,
+         {
+           mcap: pair.marketCap,
+-          liquidity: pair.liquidity.usd,
++          // Comparable-only: a Jupiter/Gecko-sourced number is ~half of
++          // DexScreener's for the same pool (see comparableLiquidity) and
++          // must not be judged against the $10K floor.
++          liquidity: comparableLiquidity(pair),
+           chg5m: pair.priceChange.m5,
+           vol5m: pair.volume.m5,
+           buysH1: pair.txns.h1Buys,
+@@ -1551,7 +1554,7 @@
+         trips += 1;
+         await this.db.updatePushWatchCheck(row.token, {
+           peakMcap: evalResult.peakMcap,
+-          lastLiquidity: pair.liquidity.usd,
++          lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
+           lastVol5m: pair.volume.m5,
+           followupsSent: evalResult.followupsSent - evalResult.alerts.length,
+           lastState: row.lastState ?? null,
+@@ -1655,7 +1658,7 @@
+       const holdAnnouncements = undelivered > undeliveredBefore;
+       await this.db.updatePushWatchCheck(row.token, {
+         peakMcap: evalResult.peakMcap,
+-        lastLiquidity: pair.liquidity.usd,
++        lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
+         lastVol5m: pair.volume.m5,
+         // A backfill pass delivers nothing: the counters and the alert clock
+         // stay where they were, while the PERSISTENT state markers land —
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -1743,6 +1743,10 @@
+           priceChange: { m5: 0, h1: 0 },
+           txns: { m5Buys: 0, m5Sells: 0, h1Buys: 0, h1Sells: 0 },
+           liquidity: { usd: snap.reserveUsd },
++          // GeckoTerminal reserve is a THIRD liquidity metric (it sums only
++          // the pools it indexes, so it under-reports next to DexScreener too):
++          // never let a DexScreener-calibrated USD level judge it.
++          feedSource: "gecko",
+           pairCreatedAt: 0,
+         });
+       }

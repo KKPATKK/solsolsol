@@ -324,6 +324,44 @@ const LIQ_CRASH_MIN_LAST_USD = 5_000;
  */
 export const LIQ_FLOOR_USD = 10_000;
 /**
+ * The only liquidity reading a USD-level rule may judge: DexScreener's.
+ *
+ * This floor (and LIQ_CRASH_RATIO below, and the row's stored baseline) is
+ * calibrated on DexScreener's `liquidity.usd` — the POOL's total USD
+ * reserve. The tracker is fed by three legs (DexScreener → Jupiter →
+ * GeckoTerminal) and the other two report a DIFFERENT metric of the same
+ * pool, roughly half of it. Measured 2026-09-20 over the rotation: 10 of 14
+ * recently-checked rows carried a reading at 0.46–0.58× the DexScreener
+ * value (Lobby 7950 vs 17446, SI 13305 vs 26568, DONATED 29327 vs 55212)
+ * while matching Jupiter's own `liquidity` to within 2%.
+ *
+ * The mismatch is not cosmetic: the floor is an ABSOLUTE $10K test, so a
+ * healthy $17–21K pool read through the Jupiter leg looks drained. That is
+ * exactly what fired the 💧 流動性枯竭 … 停止追蹤 card on a live Lobby
+ * (2026-09-20 20:16 HKT) and marked it terminal. LIQ_CRASH_RATIO compares
+ * two readings, so mixing legs fabricates drops that never happened too.
+ *
+ * Same discipline as the push gates' "missing data never judges": a reading
+ * from any other leg counts as UNKNOWN for liquidity rules, and the row
+ * keeps its last comparable baseline instead of overwriting it with a
+ * number that cannot be compared to it. The next DexScreener-sourced check
+ * of that row judges normally (the rotation re-checks every row within
+ * minutes), so a real drain is still caught — just never on evidence that
+ * is off by a factor of two.
+ *
+ * `feedSource` absent (legacy rows, test fixtures, synthetic pairs) =
+ * DexScreener.
+ */
+export function comparableLiquidity(pair: {
+  liquidity: { usd: number | null };
+  feedSource?: "dexscreener" | "jupiter" | "gecko";
+}): number | null {
+  if (pair.feedSource !== undefined && pair.feedSource !== "dexscreener") {
+    return null;
+  }
+  return pair.liquidity.usd;
+}
+/**
  * Volume ignition: a tracked coin whose 5m volume jumps from dormant
  * (< DORMANT) to >= VOL is often the first breath of a new leg (the CONK
  * pattern: 75 min of quiet consolidation, then a volume spike minutes
@@ -1270,7 +1308,7 @@ export class PushWatcher {
             symbol: pair.baseToken.symbol ?? null,
             pushedAt: m.pushedAt,
             mcapAtPush: healedMcap,
-            liquidityUsd: pair.liquidity.usd ?? null,
+            liquidityUsd: comparableLiquidity(pair),
           });
           if (resent) continue; // fresh card just went out — skip holder seed noise
         }
@@ -1442,7 +1480,10 @@ export class PushWatcher {
         now,
         {
           mcap: pair.marketCap,
-          liquidity: pair.liquidity.usd,
+          // Comparable-only: a Jupiter/Gecko-sourced number is ~half of
+          // DexScreener's for the same pool (see comparableLiquidity) and
+          // must not be judged against the $10K floor.
+          liquidity: comparableLiquidity(pair),
           chg5m: pair.priceChange.m5,
           vol5m: pair.volume.m5,
           buysH1: pair.txns.h1Buys,
@@ -1513,7 +1554,7 @@ export class PushWatcher {
         trips += 1;
         await this.db.updatePushWatchCheck(row.token, {
           peakMcap: evalResult.peakMcap,
-          lastLiquidity: pair.liquidity.usd,
+          lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
           lastVol5m: pair.volume.m5,
           followupsSent: evalResult.followupsSent - evalResult.alerts.length,
           lastState: row.lastState ?? null,
@@ -1617,7 +1658,7 @@ export class PushWatcher {
       const holdAnnouncements = undelivered > undeliveredBefore;
       await this.db.updatePushWatchCheck(row.token, {
         peakMcap: evalResult.peakMcap,
-        lastLiquidity: pair.liquidity.usd,
+        lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
         lastVol5m: pair.volume.m5,
         // A backfill pass delivers nothing: the counters and the alert clock
         // stay where they were, while the PERSISTENT state markers land —

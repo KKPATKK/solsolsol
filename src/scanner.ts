@@ -1743,6 +1743,10 @@ export class Scanner {
           priceChange: { m5: 0, h1: 0 },
           txns: { m5Buys: 0, m5Sells: 0, h1Buys: 0, h1Sells: 0 },
           liquidity: { usd: snap.reserveUsd },
+          // GeckoTerminal reserve is a THIRD liquidity metric (it sums only
+          // the pools it indexes, so it under-reports next to DexScreener too):
+          // never let a DexScreener-calibrated USD level judge it.
+          feedSource: "gecko",
           pairCreatedAt: 0,
         });
       }

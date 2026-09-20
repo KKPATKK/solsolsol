@@ -18,7 +18,7 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, GECKO_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
@@ -563,6 +563,136 @@ async function main() {
       "the fire-and-forget drain must be replaced, not kept alongside the held one",
     );
     console.log("  ℹ writeDrain waitUntil patch present - the cron drain is held");
+  });
+
+  // ---------- liquidity provenance: the false 💧 rug on a live pool ----------
+  //
+  // Measured 2026-09-20 20:16 HKT: a "💧 流動性枯竭 Lobby | LP 僅剩 $7.95K …
+  // 停止追蹤" card went out while the pool actually held $17.5–21K. The reading
+  // behind it (7950.39) was Jupiter's `liquidity` — a DIFFERENT metric that
+  // runs at ~half of DexScreener's pool reserve for the very same pool (10 of
+  // 14 recently-checked rows: 0.46–0.58×, within 2% of Jupiter's own number).
+  // The tracker is fed by whichever leg answers, so a healthy pool was judged
+  // against a $10K floor calibrated on the other metric — and both liquidity
+  // rules (absolute floor AND the 45% crash ratio) are wrong across a leg
+  // boundary, since one compares two readings that are not the same quantity.
+
+  await test("comparableLiquidity: only DexScreener's metric may face a USD-level rule", () => {
+    assert.equal(
+      comparableLiquidity({ liquidity: { usd: 17_446 }, feedSource: "dexscreener" }),
+      17_446,
+    );
+    assert.equal(
+      comparableLiquidity({ liquidity: { usd: 7_950.39 }, feedSource: "jupiter" }),
+      null,
+      "Jupiter's ~half metric is UNKNOWN for a USD-level rule, not a drained pool",
+    );
+    assert.equal(comparableLiquidity({ liquidity: { usd: 10_640 }, feedSource: "gecko" }), null);
+    assert.equal(
+      comparableLiquidity({ liquidity: { usd: 21_000 } }),
+      21_000,
+      "untagged (fixtures, synthetic pairs, legacy rows) = DexScreener",
+    );
+    assert.equal(
+      comparableLiquidity({ liquidity: { usd: null }, feedSource: "dexscreener" }),
+      null,
+      "a genuinely missing reading stays missing",
+    );
+  });
+
+  await test("push-watch: a Jupiter-sourced reading can neither rug nor crash a live coin", () => {
+    const row = (over = {}) => ({
+      token: "EGTFrUPym8JnEMAddZjuhBkcSGEGTM75qymxUZgTpump", chatId: "c", symbol: "Lobby",
+      pushedAt: 0, mcapAtPush: 100_000, peakMcap: 100_000, lastLiquidity: 19_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const cfg = { cooldownMs: 30 * 60_000 };
+    // Flat mcap so no mcap-derived rule can fire: only liquidity can decide.
+    const base = { mcap: 100_000, chg5m: 0, buysH1: 0, sellsH1: 0 };
+    const jupiterPair = { liquidity: { usd: 7_950.39 }, feedSource: "jupiter" };
+
+    // What the tracker USED to hand the rules: the raw cross-source number.
+    // Both halves of the bug, exactly as they fired live.
+    const rawFloor = evaluateWatch(row({ lastLiquidity: 19_288 }), 1000, { ...base, liquidity: 7_950.39 }, cfg);
+    assert.equal(rawFloor.alerts[0].kind, "liquidity");
+    assert.match(rawFloor.alerts[0].text, /流動性枯竭 Lobby/);
+    assert.equal(rawFloor.stopTracking, true, "the card claimed 停止追蹤");
+    // Above the floor — so the crash ratio is the rule that judges — a leg
+    // switch still fabricates a drop (stored 26K DexScreener → 11K Jupiter).
+    // (The crash rule sits inside the cooldown block, hence the old lastAlertAt.)
+    const rawCrash = evaluateWatch(
+      row({ lastLiquidity: 26_000, lastAlertAt: -3_600_000 }),
+      1000,
+      { ...base, liquidity: 11_000 },
+      cfg,
+    );
+    assert.equal(rawCrash.alerts[0].kind, "liquidity");
+    assert.match(rawCrash.alerts[0].text, /流動性驟降 Lobby/, "a -58% 'crash' that never happened");
+    // Guarded, the same pair yields no reading at all — so the ratio never runs.
+    const guardedCrash = evaluateWatch(
+      row({ lastLiquidity: 26_000, lastAlertAt: -3_600_000 }),
+      1000,
+      { ...base, liquidity: comparableLiquidity({ liquidity: { usd: 11_000 }, feedSource: "jupiter" }) },
+      cfg,
+    );
+    assert.deepEqual(guardedCrash.alerts, []);
+
+    // What it hands them now: the guarded reading (null = unknown) → no rule
+    // judges, so no card and no terminal state.
+    const out = evaluateWatch(row(), 1000, { ...base, liquidity: comparableLiquidity(jupiterPair) }, cfg);
+    assert.deepEqual(out.alerts, []);
+    assert.equal(out.stopTracking, false);
+    assert.notEqual(out.lastState, "rug");
+
+    // The rule itself is untouched: the SAME low number from the calibrated
+    // leg still rugs (a real drain must never be missed).
+    const dsPair = { liquidity: { usd: 7_950.39 }, feedSource: "dexscreener" };
+    const real = evaluateWatch(row(), 1000, { ...base, liquidity: comparableLiquidity(dsPair) }, cfg);
+    assert.equal(real.alerts[0].kind, "liquidity");
+    assert.equal(real.stopTracking, true);
+  });
+
+  await test("out-of-window patch: liquidity provenance is guarded (docs/patches/liq-source-guard.patch)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const applied = {
+      "guard (comparableLiquidity)": pushwatchSrc.includes("exportfunctioncomparableLiquidity"),
+      "live reading guarded": pushwatchSrc.includes("liquidity:comparableLiquidity(pair),"),
+      "both baselines keep the comparable value":
+        pushwatchSrc.includes("lastLiquidity:comparableLiquidity(pair)??row.lastLiquidity,"),
+      "heal seed guarded": pushwatchSrc.includes("liquidityUsd:comparableLiquidity(pair),"),
+      "no raw cross-source baseline left":
+        !pushwatchSrc.includes("lastLiquidity:pair.liquidity.usd,") &&
+        !pushwatchSrc.includes("liquidityUsd:pair.liquidity.usd"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ liquidity provenance guard missing - apply docs/patches/liq-source-guard.patch",
+      );
+      return;
+    }
+    const missing = Object.entries(applied)
+      .filter(([, v]) => !v)
+      .map(([k]) => k);
+    assert.equal(
+      missing.length,
+      0,
+      `partial application is unsafe - missing: ${missing.join(", ")} (see docs/patches/liq-source-guard.patch)`,
+    );
+    // Every leg must declare its metric, or an untagged pair reads as
+    // DexScreener and the guard above is bypassed from the producer side.
+    assert.equal(read("src/dexscreener.ts").includes('feedSource:"dexscreener"'), true);
+    assert.equal(read("src/jupfeeds.ts").includes('feedSource:"jupiter"'), true);
+    assert.equal(read("src/scanner.ts").includes('feedSource:"gecko"'), true);
+    console.log("  ℹ liquidity provenance guarded - USD-level rules see one metric only");
   });
 
   // ---------- GeckoTerminal 429: the cache is the fix, the backoff the net ---
