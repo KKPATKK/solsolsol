@@ -1062,8 +1062,51 @@ export function wedgeChainEntry(
 }
 
 /**
+ * How long a stretch of LOST COMPLETIONS has to run before it is worth a
+ * Telegram page — deliberately NOT OUTAGE_ALERT_GAP_MS, because the two alerts
+ * measure different things and only one of them is usually an outage.
+ *
+ * Measured 2026-09-20: ~44% of ticks lost their completion write while the
+ * scanner itself was fine — of the recent pushes that fell inside the
+ * scan-history ring, ALL 8 came from ticks the record calls dead
+ * (docs/scan-completion-loss.md). A 3-minute threshold therefore paged on
+ * telemetry loss alone, several times an hour. The age-based
+ * checkOutageAndAlert keeps its 3 minutes and still owns the genuinely bad
+ * shape (no tick claiming at all), which this path can never see: by
+ * construction a death tick DID claim.
+ *
+ * 10 minutes is past every lost-flush stretch measured (the longest run of
+ * dead rows observed is 13) while still catching a real wedge — the 2026-09-19
+ * 16:05-16:33Z incident ran 28 minutes.
+ */
+export const COMPLETION_ALERT_GAP_MS = 10 * 60_000;
+
+/**
+ * The page decision, pure and exported so the rule is unit-tested rather than
+ * only observed live (scripts/test-tick-path.js). `alerting` is false for the
+ * two cases that must stay quiet: too short a stretch, and a cooldown that has
+ * not elapsed. A zero/absent `lastAlertAt` is "never alerted", not "alerted at
+ * the epoch" — the pre-existing intent the raw comparison got from `> 0`
+ * checks elsewhere in this file.
+ */
+export function shouldAlertNoCompletion(
+  silentMs: number,
+  lastAlertAt: number,
+  now: number,
+  gapMs: number = COMPLETION_ALERT_GAP_MS,
+  cooldownMs: number = OUTAGE_ALERT_COOLDOWN_MS,
+): { alerting: boolean; minutes: number } {
+  const minutes = Math.max(1, Math.round(silentMs / 60_000));
+  if (silentMs < gapMs) return { alerting: false, minutes };
+  if (Number.isFinite(lastAlertAt) && lastAlertAt > 0 && now - lastAlertAt < cooldownMs) {
+    return { alerting: false, minutes };
+  }
+  return { alerting: true, minutes };
+}
+
+/**
  * Both halves of the completion-based outage alert, in one place: keep the
- * durable stretch current, then alert when it outlives OUTAGE_ALERT_GAP_MS.
+ * durable stretch current, then alert when it outlives COMPLETION_ALERT_GAP_MS.
  * Only ever called from a death tick, so its round trips are paid exactly while
  * scans are not landing. The cooldown row is the same one checkOutageAndAlert
  * uses, so the two alerts can never double-post for one episode (that one still
@@ -1080,16 +1123,24 @@ async function trackNoCompletionStretch(deadAt: number, now: number): Promise<vo
   );
   await store.setWorkerState(SCAN_WEDGE_STATE_KEY, JSON.stringify(entry));
   const silentMs = now - entry.start;
-  if (silentMs < OUTAGE_ALERT_GAP_MS || !bot) return;
+  // Cheap gate first: a stretch this short can never page, so no cooldown read.
+  if (!bot || silentMs < COMPLETION_ALERT_GAP_MS) return;
   const lastAlertRaw = await store.getWorkerState("outage_alert_at");
-  const lastAlertAt = lastAlertRaw ? Number(lastAlertRaw) : 0;
-  if (Number.isFinite(lastAlertAt) && now - lastAlertAt < OUTAGE_ALERT_COOLDOWN_MS) return;
+  const verdict = shouldAlertNoCompletion(
+    silentMs,
+    lastAlertRaw ? Number(lastAlertRaw) : 0,
+    now,
+  );
+  if (!verdict.alerting) return;
   const chats = await store.listEnabledChats();
   if (chats.length === 0) return;
-  const minutes = Math.max(1, Math.round(silentMs / 60_000));
+  // Says what it measures: the tick DID claim (that is how this path is
+  // reached at all), so the scan was almost certainly running — what is lost is
+  // the completion WRITE. Announcing that distinction is the difference
+  // between an operator checking the cards and one chasing a phantom outage.
   const text =
-    `⚠️ 扫描器已连续约 ${minutes} 分钟没有完成任何一次扫描` +
-    `（最早未完成的一轮开始于 ${new Date(entry.start).toISOString()}）\n` +
+    `⚠️ 扫描器已连续约 ${verdict.minutes} 分钟没有任何一次扫描完成落地` +
+    `（扫描本身可能仍在运行，丢失的是完成写入；最早未完成的一轮开始于 ${new Date(entry.start).toISOString()}）\n` +
     `状态页: https://solana-meme-bot.cool1999k.workers.dev/health`;
   for (const chat of chats) {
     try {

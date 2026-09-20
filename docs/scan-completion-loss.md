@@ -99,9 +99,72 @@ totals 不動）→ 唔再靠「下次 deferral」才生效。
 tick 都死，而成功嘅 tick 喺 8.7–9.6s flush）。即係 9.5s 已經貼住 kill，冇得延後 →
 **字節係唯一仲買得返嘅嘢**。
 
+## 編輯窗口：2026-09-20 再驗證過，係真嘅（唔係字串打錯）
+
+同一個 session、同一個工具，做過對照：
+
+| 位置 | 動作 | 結果 |
+|---|---|---|
+| `worker.ts` ~27KB（`OUTAGE_ALERT_GAP_MS`） | 讀 | ✅ |
+| `worker.ts` ~50KB（`trackNoCompletionStretch` 一帶） | **改** | ✅ apply |
+| `worker.ts` ~77KB（`runScan` 嘅 claim 路徑） | **改**（exact-match） | ❌ `old string not found` |
+| `scanner.ts` ~53KB（`REJECT_LOG_MAX`） | 改 | ✅ apply |
+
+50KB 過、77KB 唔過，所以係**硬邊界**，唔係我打錯字。即係 `persistScanCompletion`（~88KB）、
+race 信封（~81KB）、claim（~77KB）、`/health`（~113KB）全部改唔到。
+
+## 窗口外嘅正確修正（等窗口開／人手貼）
+
+**問題**：`scanRaceMs = Math.max(2_500, SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRace)`
+嘅 `Math.max(2_500, …)` **違反佢上面自己寫嘅不變式**：「the flush ALWAYS starts inside the same
+wall-clock window no matter how slow the pre-race phase was」。
+
+算術：race 完結時間 = `preRace + max(2500, 9500 − 4500 − preRace)`。preRace 0.3s → 5.0s（flush 窗
+4.5s，正常）；preRace 5s → 7.5s（窗 2.0s）；**preRace 7s → 9.5s（窗 0）**。而 dead 連鎖嘅後繼
+tick 正正係要 rebuild ＋ re-init（可能連 cold crime 清單 ~4.8K 一齊重抓）→ 前段變長 → 更容易再死。
+
+**修正**（`src/worker.ts` ~1706，窗口外）：
+
+```ts
+      // Never overshoot the tick budget: a front phase slow enough to eat the
+      // scan window must cost a scan, not the completion flush. The floor was
+      // there so a slow pre-race still got SOME scan; it does that by breaking
+      // the very invariant this calculation exists to hold.
+      const scanRaceMs = Math.max(
+        0,
+        Math.min(
+          5_000,
+          SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - (Date.now() - startedAt),
+        ),
+      );
+```
+
+效果：前段慢嘅 tick 照樣寫一行 completion（`ok:false`，reason 顯示 race window 0–2500ms），
+**一定落地**；代價係該 tick 唔掃描 —— 而文件自己講過「a completed 6s scan every minute beats
+a dead 12s tick that evaluates nothing」。
+
+## 已做（窗口內）：completion alert 重新校準
+
+`OUTAGE_ALERT_GAP_MS`（3 分鐘）**兩條 alert 共用**，所以唔可以改佢（會連「完全冇 claim」嘅舊
+alert 一齊放寬）。改為新增獨立常數：
+
+| | 舊 | 新 |
+|---|---|---|
+| completion alert 門檻 | 3 分鐘（共用） | **`COMPLETION_ALERT_GAP_MS` = 10 分鐘** |
+| age-based alert（`checkOutageAndAlert`） | 3 分鐘 | 3 分鐘（**不變**，佢先係真正「完全冇 claim」嗰條）|
+| cooldown | 30 分鐘 | 30 分鐘（共用同一行 `outage_alert_at`，唔會重複發）|
+| 訊息 | 「…沒有完成任何一次掃描」 | 「…沒有任何一次掃描**完成落地**（掃描本身可能仍在運行，丢失的是完成写入…）」|
+
+理由（有數）：呢條 alert **只喺有 claim 死 tick 時才觸發**，即係掃描幾乎肯定有跑（8/8 推送證據）；
+而 44% 嘅 tick 失 flush → 3 分鐘門檻等於每幾十分鐘就叫一次假警報。10 分鐘過咗所有量度到嘅
+失 flush 連鎖（最長 13 連），但仍然捉得到真 wedged（16:05–16:33Z 那次係 28 分鐘）。
+
+同時把決策抽成純函數 `shouldAlertNoCompletion(silentMs, lastAlertAt, now, gap, cooldown)` 並加
+9 條斷言 —— 「發送半邊」之前零自動化覆蓋（上一輪我自己指出嘅缺口）。
+
 ## 未做
 
-- completion flush 本身（窗口外）。
+- completion flush 本身（窗口外，需要上面那段 patch）。
 - `pendingTokens` 上限 500：功能狀態（真正等住推送嘅幣），唔可以截；500 個 base58 地址會令
   snapshot 爆到 ~22KB，但實測 pending 只有 4–6 個 → 冇動，只記錄。
 

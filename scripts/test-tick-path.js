@@ -517,6 +517,38 @@ installTickProbe(fakeScanner, {
     for (const raw of [undefined, "", "not json", "{}", JSON.stringify({ start: -1, tickAt: 5 })]) {
       assert.equal(wedgeChainEntry(raw, deadAt, now, tol).start, deadAt);
     }
+    // The page threshold is separate from the age-based alert's, because the
+    // two measure different things: this path is only reachable when a tick
+    // DID claim, so a lost completion write is not an outage on its own
+    // (2026-09-20: all 8 recent pushes inside the scan-history ring came from
+    // ticks the record calls dead).
+    const { shouldAlertNoCompletion, COMPLETION_ALERT_GAP_MS } = require("../dist/worker.js");
+    const cooldown = 30 * 60_000;
+    const gap = COMPLETION_ALERT_GAP_MS;
+    // The case that used to page every few hours: a 3-5 minute lost-flush run.
+    for (const mins of [1, 3, 5]) {
+      assert.equal(
+        shouldAlertNoCompletion(mins * 60_000, 0, now).alerting,
+        false,
+        `${mins} minutes of lost completions stays quiet`,
+      );
+    }
+    assert.equal(gap, 10 * 60_000, "the completion page needs 10 minutes, not 3");
+    assert.ok(gap > 3 * 60_000, "and it must stay above the age-based alert's 3");
+    // A stretch past the threshold pages once, with a rounded minute count.
+    const fire = shouldAlertNoCompletion(11 * 60_000, 0, now);
+    assert.deepEqual(fire, { alerting: true, minutes: 11 });
+    assert.equal(shouldAlertNoCompletion(gap, 0, now).alerting, true, "the threshold itself pages");
+    // ... and the shared cooldown still suppresses a repeat for 30 minutes.
+    assert.equal(shouldAlertNoCompletion(11 * 60_000, now - 5 * 60_000, now).alerting, false);
+    assert.equal(shouldAlertNoCompletion(11 * 60_000, now - cooldown + 1, now).alerting, false);
+    assert.equal(shouldAlertNoCompletion(11 * 60_000, now - cooldown, now).alerting, true);
+    // A never-alerted row (0) or an unreadable one (NaN) must not be read as
+    // "alerted just now" — the cooldown only ever suppresses a real stamp.
+    assert.equal(shouldAlertNoCompletion(20 * 60_000, 0, now).alerting, true);
+    assert.equal(shouldAlertNoCompletion(20 * 60_000, Number.NaN, now).alerting, true);
+    assert.equal(shouldAlertNoCompletion(90_000, 0, now).minutes, 2, "minutes are rounded up from 1");
+    assert.equal(shouldAlertNoCompletion(0, 0, now).minutes, 1, "a sub-minute stretch still reads 1");
     console.log("completion-based outage alert: pass");
   }
 
