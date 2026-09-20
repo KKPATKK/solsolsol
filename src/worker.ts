@@ -382,12 +382,14 @@ async function flushObservedLiquidity(): Promise<void> {
  *  - Best-effort: a failed read returns "nothing proved delivered", i.e. the
  *    pending list is left exactly as it was. The cost of that is the duplicate
  *    we already had, never a forgotten obligation.
- *  - TWO proof sources, because the ring alone is too short-lived: the audit
+ *  - THREE proof sources, because the ring alone is too short-lived: the audit
  *    ring holds ~30 deliveries of ALL kinds (initial, resend, follow-up, heal),
  *    and live 2026-09-20 it rolled two of the four stale tokens out of its
- *    window inside 13 minutes. The durable push ledger carries the same
- *    `initial` provenance for 7 days / 240 pushes, so both are read (in
- *    parallel, one round trip each) and treated as one proof set.
+ *    window inside 13 minutes. The durable push ledger carries `initial`
+ *    provenance for 7 days / 240 pushes, and `push_watch` rows (written right
+ *    after a successful push) cover the `resend`-only deliveries the ledger by
+ *    design does not record. All three are read in parallel and folded into one
+ *    proof set; only the kind whitelist in deliveredDeferredTokens decides.
  */
 async function dropDeliveredPendings(
   database: Db,
@@ -396,10 +398,12 @@ async function dropDeliveredPendings(
   if (pending.length === 0) return [];
   let audit: Awaited<ReturnType<Db["getPushAudit"]>>;
   let ledgerRaw: string | null;
+  let watchRows: Awaited<ReturnType<Db["listPushWatch"]>>;
   try {
-    [audit, ledgerRaw] = await Promise.all([
+    [audit, ledgerRaw, watchRows] = await Promise.all([
       database.getPushAudit(),
       database.getWorkerState(PUSH_LEDGER_STATE_KEY),
+      database.listPushWatch(60),
     ]);
   } catch (err) {
     console.warn(
@@ -408,16 +412,17 @@ async function dropDeliveredPendings(
     );
     return [];
   }
-  // The ledger's `initial-send` entries are the same proof class as the ring's
-  // `initial` kind (both come from the audit write that follows an accepted
-  // send), so they are folded into the same rule — only the KIND whitelist
-  // decides, and `watch-row` provenance never reaches it.
+  // Each source is labelled with the kind the rule expects: the ledger's
+  // `initial-send` entries ARE audit `initial` provenance (that is the merge's
+  // only accepted source), and a watch row is its own `pushed-row` proof (see
+  // DELIVERED_CARD_KINDS — a row exists only for a token a push delivered).
   const proof = [
     ...audit,
     ...ledgerDeliveredTokens(parsePushLedger(ledgerRaw)).map((token) => ({
       token,
       kind: "initial" as const,
     })),
+    ...watchRows.map((row) => ({ token: row.token, kind: "pushed-row" as const })),
   ];
   const stale = deliveredDeferredTokens(pending, proof);
   if (stale.length === 0) return [];

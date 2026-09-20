@@ -237,6 +237,13 @@ alert 一齊放寬）。改為新增獨立常數：
 `watch-row` provenance 刻意唔算（有 row 唔等於送過卡）。
 02:05:42Z 複測：pending 8 → **6**，overlap **0**。
 
+**第二輪 live 驗證（deploy 8e67fd33，02:12:01Z）—— 又一個缺口**：pending 7、ring overlap **0** ✓，
+但 `DFQHUegJW…PUMPCAT`、`BmnGRH8N1…` 仍在 pending。原因量到：佢哋嘅交付記錄係 **`resend`**，而
+ledger 只收 `initial` 一種 provenance（push-time mcap 嘅用途決定嘅），ring 又已經捲走。
+所以加第三個**持久**來源：**`push_watch` 嘅 rows**（`PushWatcher.onPush` 係「成功推送之後」才寫，
+只被 defer 嘅幣永遠冇 row）→ 合成 kind **`pushed-row`**（`DELIVERED_CARD_KINDS` 白名單加入）。
+三個來源並行讀、合成同一個 proof set，依然係「證唔到就保留」。
+
 **驗收點**：`/health` 嘅 `deferral.pendingTokens` 唔應該再包含 audit ring 或 ledger 已有 `initial` 嘅 token；
 console 會出現 `[worker] forgot N deferred obligation(s) already delivered — …`；同一個 token 唔應該再收兩張卡。
 

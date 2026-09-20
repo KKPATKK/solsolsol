@@ -197,6 +197,21 @@ async function main() {
     );
   });
 
+  // The third proof source: a `push_watch` row is written by onPush right
+  // after a successful push, so it proves delivery durably for a coin whose
+  // only delivery record was a `resend` (which the ledger does not keep). A
+  // follow-up or a healed baseline still proves nothing about the initial card.
+  await test("deliveredDeferredTokens: a durable pushed-row counts, a follow-up still never does", () => {
+    assert.deepEqual(
+      deliveredDeferredTokens(["AAA", "BBB", "CCC"], [
+        { token: "AAA", kind: "pushed-row" },
+        { token: "BBB", kind: "followup" },
+        { token: "CCC", kind: "heal-current" },
+      ]),
+      ["AAA"],
+    );
+  });
+
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {
     // Nothing new since the last CONFIRMED write -> the flush writes nothing.
     assert.equal(

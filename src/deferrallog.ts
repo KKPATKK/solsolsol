@@ -375,15 +375,26 @@ export function pushDeferralDelta(
  * Delivery kinds that prove a coin's card was ACCEPTED BY TELEGRAM.
  *
  * `initial` is written by the scanner only after the send returned a
- * message_id, and `resend` by the tracker's heal re-send under the same
- * condition — both are therefore hard evidence that a card for that token
- * reached the chat. `followup` and `heal-current` are NOT: they are about the
+ * message_id, `resend` by the tracker's heal re-send under the same condition,
+ * and `pushed-row` is synthesized from a `push_watch` row (written right after
+ * a successful push) — all three are therefore hard evidence that a card for
+ * that token reached the chat. `followup` and `heal-current` are NOT: they are about the
  * tracker's own rows and a healed baseline, so they say nothing about whether
  * the deferred INITIAL card was ever delivered. Keeping the list this narrow is
  * what makes the guard below safe — it may only ever forget an obligation a
  * delivery already discharged, never one the user is still owed.
  */
-const DELIVERED_CARD_KINDS: ReadonlySet<string> = new Set(["initial", "resend"]);
+const DELIVERED_CARD_KINDS: ReadonlySet<string> = new Set([
+  "initial",
+  "resend",
+  // Synthesized by the worker from the `push_watch` listing: PushWatcher.onPush
+  // writes a row right AFTER a successful push, so a row is proof a card for
+  // that token was delivered, and one is never written for a coin that was only
+  // deferred. This is the durable half a `resend`-only delivery would otherwise
+  // lose: the audit ring rolls such an entry out of its window within minutes,
+  // and the push ledger records `initial` provenance only.
+  "pushed-row",
+]);
 
 /**
  * Deferred obligations the delivery audit ring proves were ALREADY DELIVERED
