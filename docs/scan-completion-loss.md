@@ -82,22 +82,32 @@ token_stats bookkeeping（`updateTokenMaxMcaps`／`recordTokenStatsMany`）一�
 嘅 60 條 ring 會繼續映落每一次 heartbeat。已修：**讀側都套同一個 cap**（保留最新 N 條，
 totals 不動）→ 唔再靠「下次 deferral」才生效。
 
-## 唔做 `DB_REQUEST_TIMEOUT_MS`：算術唔支持
+## 做咗（窗口內）：令 flush 嘅並行 retry 真正有機會落地
 
-原本嘅想法係「令吊死嘅第一次 flush 喺 reserve 內 abort，重試先有機會落地」。查完常數後
-唔成立：
+**先更正上面一段（原本寫「唔做」）**：結論錯，因為模型錯。我當時以為 completion flush 嘅寫入
+行**scan 嗰條 1.2s 短索**，所以用「3s → 硬牆 3.6s > 3300ms」推出「降 timeout 零影響」。今次讀
+`scanner.ts:3187` 確認實情係相反：
 
-- `FLUSH_ATTEMPT_BOUND_MS = 1200`（唔係 2500）→ 第一次嘗試只等 **1.2s** 就轉為**並行**重試；
-- 重試嘅等待窗係 `remainingFlushMs()` ＝ `4500 − 1200` ≈ **3300ms**，同 transport timeout **無關**；
-- `DB_REQUEST_TIMEOUT_MS = 6000`（硬牆 7.2s）→ 就算降到 3s（硬牆 3.6s）仍然 > 3300ms，對
-  flush 嘅窗**零影響**，只會令其他熱路徑（command handler、`/debug`、deferred drain）更早
-  放棄 → 多一個失敗源。
+- `exitScanMode()` 喺 `runOnce()` 嘅 `finally` 執行 ⇒ tick 嘅 completion flush 係喺 **scan mode
+  之外**寫入 ⇒ 佢行嘅係 `DB_REQUEST_TIMEOUT_MS`（原本 6s → **硬牆 7.2s**）；
+- flush 自己嘅時間表：第一次嘗試最多等到 `FLUSH_ATTEMPT_BOUND_MS = 1200`，然後**並行**重試嘅窗
+  係 `SCAN_FLUSH_RESERVE_MS − 1200 = 3300ms`；
+- 請求只會喺**硬牆**（`1.2 × timeout`）之後 reject。7.2s > 3300ms ⇒ 吊死嘅寫入**連失敗都嚟唔切**，
+  即係重試係喺度 race 一個唔可能 settle 嘅 promise ⇒ **tick 必死**：掃描跑咗、卡推咗、row 冇落地。
 
-**而 reserve 亦冇得加大**：`scanRaceMs = max(2500, BUDGET − RESERVE − preRace)`，所以 flush 嘅
-窗永遠係 `[BUDGET−RESERVE, BUDGET]`，固定結束喺 **t≈9.5s**；加大 RESERVE 只係由掃描度搶時間。
-檔案自己記載嘅實測：**cron invocation kill 就喺 ~9.6s 之後**（2026-09-15 用 12s budget 時每一
-tick 都死，而成功嘅 tick 喺 8.7–9.6s flush）。即係 9.5s 已經貼住 kill，冇得延後 →
-**字節係唯一仲買得返嘅嘢**。
+而 `worker.ts:2017` 嘅註釋其實一直寫住呢個約束（"the hard-wall error arrives only after
+DB_REQUEST_TIMEOUT_MS\*1.2, which alone can outlive the flush window"）—— 只係冇任何嘢強制執行。
+
+**改動**（`src/db.ts` 頭 ~2KB，窗口內）：`DB_REQUEST_TIMEOUT_MS` 6000 → **2500**（硬牆 3.0s < 3300ms）。
+即係吊死嘅 flush 寫入而家會**失敗**，而 idempotent 嘅 batch 仲有第二次機會真正落地。2500 仍然係
+健康 round trip（100–300ms）嘅 ~8x、實測最慢健康查詢（poolMs 145–600ms）嘅 ~4x，所以健康路徑
+唔會被打斷。同時 `export` 佢（連 `SCAN_FLUSH_RESERVE_MS`、`FLUSH_ATTEMPT_BOUND_MS`），令
+`scripts/test-unit.js` 可以釘住呢條算術（新增 case：hard wall 必須 fit 落 retry window，並且舊嘅 6s
+值必須係唔合格嘅 —— 即係呢個回歸唔會再靜靜發生）。
+
+**reserve 冇得加大**：`scanRaceMs = max(2500, BUDGET − RESERVE − preRace)`，flush 嘅窗固定結束喺
+**t≈9.5s**，而 cron invocation kill 喺 ~9.6s（2026-09-15 用 12s budget 時每 tick 都死，成功嘅 tick 喺
+8.7–9.6s flush）。即係 9.5s 已經貼住 kill，冇得延後 → **每次請求嘅上界同字節**係唯一仲買得返嘅嘢。
 
 ## 編輯窗口：2026-09-20 再驗證過，係真嘅（唔係字串打錯）
 
@@ -112,6 +122,12 @@ tick 都死，而成功嘅 tick 喺 8.7–9.6s flush）。即係 9.5s 已經貼�
 
 50KB 過、77KB 唔過，所以係**硬邊界**，唔係我打錯字。即係 `persistScanCompletion`（~88KB）、
 race 信封（~81KB）、claim（~77KB）、`/health`（~113KB）全部改唔到。
+
+2026-09-20 再量精確 byte offset（改動前嘅檔）：`async function runScan` = **75,225**、race 信封 =
+**86,354**、`persistScanCompletion` = 90,259、`flushDeadline` = 93,246、retry 區 = 95,378 / 96,063 ——
+全部喺窗口外。同一時間**in** 嘅係：`DB_REQUEST_TIMEOUT_MS`（db.ts, ~1KB）、`SCAN_FLUSH_RESERVE_MS`
+= 34,494、`FLUSH_ATTEMPT_BOUND_MS` = 35,118、`WEDGE_CHECK_BOUND_MS` = 42,690、recovery 一帶 ≈ 56–59K。
+今次所有改動都落喺 in 嗰邊。
 
 ## 窗口外嘅正確修正（等窗口開／人手貼）
 
@@ -143,6 +159,11 @@ tick 正正係要 rebuild ＋ re-init（可能連 cold crime 清單 ~4.8K 一齊
 **一定落地**；代價係該 tick 唔掃描 —— 而文件自己講過「a completed 6s scan every minute beats
 a dead 12s tick that evaluates nothing」。
 
+**但呢段唔係今次失 flush 嘅主因**（唔好當佢係）：live row 顯示 claim 喺 cron 之後 0.2–1.2s 就落
+（即 preRace 細），floor 要 `preRace > 2500` 才會生效；而推送證據顯示掃描係跑完嘅（push 喺 claim
++3~4s）。即係「44% tick 冇 row」嘅收窄係由上面嗰個**硬牆**造成，唔係 floor。呢段 patch 仍然係
+要落地嘅**正確性修正**（等窗口開／人手貼），但唔應該當佢係減失 flush 嘅一步。
+
 ## 已做（窗口內）：completion alert 重新校準
 
 `OUTAGE_ALERT_GAP_MS`（3 分鐘）**兩條 alert 共用**，所以唔可以改佢（會連「完全冇 claim」嘅舊
@@ -164,13 +185,18 @@ alert 一齊放寬）。改為新增獨立常數：
 
 ## 未做
 
-- completion flush 本身（窗口外，需要上面那段 patch）。
+- race 信封嘅 floor clamp（窗口外，patch 已寫喺上面 —— 係正確性修正，唔係今次減失 flush 嘅主刀）。
+- flush 仍然會失手：今次改嘅係「吊死嘅寫入而家喺 reserve 內失敗，令重試有機會落地」，唔係令 Turso
+  唔會吊死。要真正封死，仍然係上面嗰段信封／claim 嘅窗口外工作。
 - `pendingTokens` 上限 500：功能狀態（真正等住推送嘅幣），唔可以截；500 個 base58 地址會令
   snapshot 爆到 ~22KB，但實測 pending 只有 4–6 個 → 冇動，只記錄。
 
 ## 驗收點（deploy 後）
 
 - 主：`scan-history` 嘅**連續** dead 行長度上限（改前 5–13 連）→ 應縮到 1–2。
+- 主（今次新增嘅 timeout 改動）：60 行窗口嘅 dead 比例（改前 ~44%）應該下降；如果 Turso 吊死，
+  console 會見到 `completion write hung — firing racing retry` 之後**同一 tick 仍然寫到行**
+  （改前係一定冇）。55 分鐘級嘅樣本太細 → 唔應該用 15 行就下結論。
 - 次：`/health` 嘅 `heartbeat` 大小（`JSON.stringify(heartbeat).length`）應由 ~12.4KB 跌到 ~5.7KB；
   `deferral.events.length` ≤ 12；`summary.rejects.length` ≤ 20。
 - 輔：`outageAlertAt` 更新頻率；warm isolate `/health` 嘅 `wedgedStateResets`。

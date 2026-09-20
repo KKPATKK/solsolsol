@@ -9,7 +9,7 @@ const { createClient } = require("@libsql/client");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { Db, DEFAULT_SETTINGS } = require("../dist/db.js");
+const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS } = require("../dist/db.js");
 const { parseFilterArgs, tradeKeyboard } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
@@ -20,7 +20,7 @@ const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES } = require("../dist/pushledger.js");
-const { syncPushLedger, syncSkipCaptureState } = require("../dist/worker.js");
+const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
@@ -65,6 +65,37 @@ async function main() {
   // card refused by a late tick really is pushed back later ("deferRecovered
   // 第一次上升" / firstRecoveredAt) and to read the refusal RATE across
   // isolates instead of only from whichever isolate answered /health.
+
+  // ---------- flush reserve vs DB transport timeout (src/db.ts + src/worker.ts) ----------
+  //
+  // Constants-only, placed first because it guards a TUNING relationship the
+  // rest of the tick depends on. The completion flush is the tick's last chance
+  // to land its row, and it is the one step that runs OUTSIDE scan mode — so its
+  // writes are leashed by DB_REQUEST_TIMEOUT_MS, not by SCAN_DB_TIMEOUT_MS. The
+  // flush gives its first attempt FLUSH_ATTEMPT_BOUND_MS, then starts a
+  // concurrent retry that races whatever is left of SCAN_FLUSH_RESERVE_MS. A
+  // request only rejects after the transport hard wall (1.2x the timeout), so a
+  // timeout longer than that remaining window means a stalled flush cannot even
+  // FAIL in time — the retry races a promise that cannot settle and the tick is
+  // dead by construction (the scan ran, the cards went out, the row is lost).
+  // Those two numbers sat in exactly that state until 2026-09-20: 6000ms gave a
+  // 7.2s hard wall against a 3.3s window. This case keeps it visible.
+  await test("flush retry can land: the DB hard wall fits inside the reserve left after the first attempt", () => {
+    const retryWindowMs = SCAN_FLUSH_RESERVE_MS - FLUSH_ATTEMPT_BOUND_MS;
+    assert.ok(
+      DB_REQUEST_TIMEOUT_MS * 1.2 <= retryWindowMs,
+      `hard wall ${DB_REQUEST_TIMEOUT_MS * 1.2}ms must fit the ${retryWindowMs}ms retry window`,
+    );
+    // One whole request must fit the window, else the retry is a no-op even when
+    // the database is merely slow rather than hung.
+    assert.ok(retryWindowMs >= DB_REQUEST_TIMEOUT_MS);
+    // ...and the timeout must stay generous for healthy round trips (live
+    // 100-300ms, slowest healthy query measured ~600ms).
+    assert.ok(DB_REQUEST_TIMEOUT_MS >= 1_500, "too tight for a healthy Turso round trip");
+    // Witness for why the value was lowered: the pre-2026-09-20 setting fails
+    // the first assertion, i.e. every stalled flush was unrecoverable.
+    assert.ok(6_000 * 1.2 > retryWindowMs, "the old 6s default should violate the window");
+  });
 
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {
     // Nothing new since the last CONFIRMED write -> the flush writes nothing.

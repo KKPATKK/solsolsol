@@ -726,7 +726,12 @@ const SCAN_TICK_BUDGET_MS = 9_500;
  * defers its work to the re-eval pool exactly as every other budget cut
  * has (latency, never coverage).
  */
-const SCAN_FLUSH_RESERVE_MS = 4_500;
+// Exported so scripts/test-unit.js can pin the flush arithmetic below against
+// DB_REQUEST_TIMEOUT_MS: the reserve minus the first-attempt bound is the
+// window the racing retry races IN, and a transport hard wall (1.2x the
+// request timeout) longer than that window turns every stalled flush into a
+// dead tick, however much reserve is budgeted.
+export const SCAN_FLUSH_RESERVE_MS = 4_500;
 /**
  * How long the flush waits for its FIRST completion-write attempt before
  * firing the concurrent retry. The batch is idempotent (it clears its own
@@ -737,7 +742,7 @@ const SCAN_FLUSH_RESERVE_MS = 4_500;
  * hung write was a guaranteed dead tick. 1.2s fires the retry while there
  * is still room for a settled second attempt to land.
  */
-const FLUSH_ATTEMPT_BOUND_MS = 1_200;
+export const FLUSH_ATTEMPT_BOUND_MS = 1_200;
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -879,8 +884,9 @@ const WEDGE_CHECK_BOUND_MS = 1_500;
  * Bound on EACH database await the recovery itself performs (the heartbeat
  * announce and the no-completion alert). The recovery runs BEFORE the scan on
  * exactly the ticks that are already in trouble, and its round trips used to
- * inherit the full DB_REQUEST_TIMEOUT_MS ladder (6s transport, 7.2s hard
- * wall): the read + two writes could grow the front phase to ~22s, past
+ * inherit the full DB_REQUEST_TIMEOUT_MS ladder (then 6s transport, 7.2s hard
+ * wall — 2.5s/3.0s since 2026-09-20, see db.ts): the read + two writes could
+ * grow the front phase to ~22s, past
  * Cloudflare's invocation kill, so the tick doing the recovering died too and
  * the stretch just continued. 800ms is ~6x the live Turso round trip (~130ms),
  * and caps the whole recovery at WEDGE_CHECK_BOUND_MS + 2x this — a fraction

@@ -24,10 +24,30 @@ import { createClient, type Client } from "@libsql/client/web";
  * froze in phase=scanning, and the next tick backfilled a dead tick. At
  * 6s the abort fires at t≈19s (inside the window), the flush lands by
  * ~19-21s, and the flush's 2.5s racing retry fits too. One lever, three
- * failure shapes fixed. Restore to 15000 only after a stretch with zero
- * dead ticks AND Turso p99 round trips comfortably under 2s.
+ * failure shapes fixed.
+ *
+ * 2026-09-20: 6000 → 2500. The completion flush runs AFTER the scanner's
+ * exitScanMode(), i.e. its writes are NOT on the 1.2s scan leash but on this
+ * timeout, and its whole wall-clock budget is SCAN_FLUSH_RESERVE_MS (4.5s) of
+ * which the first attempt occupies FLUSH_ATTEMPT_BOUND_MS (1.2s) before the
+ * racing retry starts. The worker's own retry comment states the constraint —
+ * "the hard-wall error arrives only after DB_REQUEST_TIMEOUT_MS*1.2, which
+ * alone can outlive the flush window" — but nothing enforced it: at 6s the
+ * hard wall is 7.2s, so a stalled flush write could not even FAIL inside the
+ * 3.3s the retry races in, which makes a stalled flush a dead tick by
+ * construction (the scanner's work, its pushes, all lost from scan_history).
+ * 2500 puts the hard wall at 3.0s, inside that 3.3s, so the stalled request
+ * now rejects while there is still reserve for the idempotent batch's second
+ * attempt to land. 2500 is ~8x the healthy round trip (100-300ms) and ~4x the
+ * slowest healthy scan query measured in production (poolMs 145-600ms), so
+ * nothing healthy is cut short; the conversion is "guaranteed dead tick" →
+ * "retried flush". Pinned by the "flush retry can land" case in
+ * scripts/test-unit.js, which fails if either constant drifts out of range.
+ *
+ * Restore upward (15000 was the pre-2026-09-12 value) only after a stretch
+ * with zero dead ticks AND Turso p99 round trips comfortably under 2s.
  */
-const DB_REQUEST_TIMEOUT_MS = 6_000;
+export const DB_REQUEST_TIMEOUT_MS = 2_500;
 /**
  * Tick-scoped cap for the round trips the SCAN makes (see
  * Db.enterScanMode). DB_REQUEST_TIMEOUT_MS is sized for the completion flush
