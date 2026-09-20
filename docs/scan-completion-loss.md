@@ -72,10 +72,15 @@ token_stats bookkeeping（`updateTokenMaxMcaps`／`recordTokenStatsMany`）一�
 兩者都只係**紀錄／rate window**，唔影響掃描行為：`rejects` 只係已經被閘門拒收嘅幣嘅日誌
 （`addReject` 同 `reject()` 只 push，唔會改變資格判定；`REJECT_LOG_MAX` 亦係 feed/pool
 分配 slots 嘅唯一預算，所以結構不變）；deferral ring 只係 cadence 讀數，`totals`／
-`pendingTokens`／首末時間戳照舊保留（`pendingTokens` **冇**收縮 —— 佢係功能狀態，唔係遙測）。
+`pendingTokens`／首末時間戳照舊保留（`pendingTokens` **冇**收縮 —— 佢係功能狀態，唔係遙測）。`test-unit.js` 新增兩條 pin：「the serialized row stays a small write」（量全滿 ring 嘅 JSON
+字節並上界）同「an oversized ring is trimmed on READ, newest kept」。
 
-`test-unit.js` 新增一條 pin：「the serialized row stays a small write」—— 直接量全滿 ring
-嘅 JSON 字節並上界，令將來加 ring 唔會靜靜食返 flush 嘅窗。
+**Deploy 後實測（`91bfb89b`，00:18–00:19Z）發現一個缺口**：`summary.rejects` 即刻由 50 → 20
+條、4957B → 1961B（有效），但 `deferral.events` **仍然係 60 條 / 4958B**。原因：deferral row
+只喺**真正有 deferral/recovery/stall 發生**時才重寫，而 deferrals 本身少（設計如此）→
+`parsePushDeferralSnapshot`（`loadPushDeferralSnapshot` 嘅唯一讀者）冇套 cap，所以舊 row
+嘅 60 條 ring 會繼續映落每一次 heartbeat。已修：**讀側都套同一個 cap**（保留最新 N 條，
+totals 不動）→ 唔再靠「下次 deferral」才生效。
 
 ## 唔做 `DB_REQUEST_TIMEOUT_MS`：算術唔支持
 

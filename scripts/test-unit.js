@@ -277,6 +277,33 @@ async function main() {
     assert.equal(coerced.events[0].deferred, 1);
   });
 
+  await test("parsePushDeferralSnapshot: an oversized ring is trimmed on READ, newest kept", () => {
+    // The row is only rewritten when a deferral happens, so a row written
+    // before the cap was lowered would otherwise keep its full ring in every
+    // heartbeat the isolate mirrors (measured live after the 60 → 12 cut).
+    const over = PUSH_DEFERRAL_RING_MAX + 30;
+    const snap = parsePushDeferralSnapshot(
+      JSON.stringify({
+        deferredTotal: over,
+        pending: 2,
+        events: Array.from({ length: over }, (_, i) => ({
+          at: 1_700_000_000_000 + i * 1_000,
+          deferred: 1,
+          recovered: 0,
+          stalled: 0,
+          pending: 2,
+        })),
+      }),
+    );
+    assert.equal(snap.events.length, PUSH_DEFERRAL_RING_MAX, "the reader enforces the same cap");
+    assert.equal(
+      snap.events[snap.events.length - 1].at,
+      1_700_000_000_000 + (over - 1) * 1_000,
+      "the newest events are the ones kept",
+    );
+    assert.equal(snap.deferredTotal, over, "the totals are never touched by the trim");
+  });
+
   await test("loadPushDeferralSnapshot: an unwritten row reads as zeros, not null", () => {
     // The /health mirror must never be null: a reader has to tell "nothing
     // deferred yet" from "the counter channel is missing", and the first rise

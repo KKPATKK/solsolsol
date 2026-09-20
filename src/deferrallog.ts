@@ -257,6 +257,16 @@ export function parsePushDeferralSnapshot(
       });
     }
     events.sort((a, b) => a.at - b.at);
+    // The same cap the WRITER applies, enforced on the read side too. The row
+    // only gets rewritten when a deferral/recovery/stall happens, and deferrals
+    // are rare by design — so a row written before the cap was lowered (or by
+    // an older build) would otherwise keep its full ring in every heartbeat
+    // this isolate mirrors. Measured exactly that on the first ticks after the
+    // 60 → 12 cut: `deferral.events.length` stayed 60 (4.9KB of the payload)
+    // until the next deferral happened to rewrite the row.
+    if (events.length > PUSH_DEFERRAL_RING_MAX) {
+      events.splice(0, events.length - PUSH_DEFERRAL_RING_MAX);
+    }
   }
   return {
     deferredTotal: count(rec.deferredTotal),
