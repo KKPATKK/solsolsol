@@ -10,7 +10,11 @@ import {
 } from "./pushledger";
 // The self-heal's resend gate asks the same question the deferral guard does
 // ("was a card for this token delivered?"), so it asks it with the same rule.
-import { deliveredCardTokens } from "./deferrallog";
+import {
+  deliveredCardTokens,
+  parseUnconfirmedCardSends,
+  UNCONFIRMED_CARD_STATE_KEY,
+} from "./deferrallog";
 
 /**
  * Post-push tracker: every pushed coin is watched for a bounded window so
@@ -207,22 +211,52 @@ const FIRST_CARD_RESEND_GRACE_MS = 15 * 60_000;
  * degrades to the initial-only set — the pre-widen behaviour, never a crash and
  * never a dropped resend.
  */
-async function readDeliveredTokens(
-  database: Db,
-): Promise<{ tokens: Set<string>; trips: number }> {
+async function readDeliveredTokens(database: Db): Promise<{
+  tokens: Set<string>;
+  unconfirmed: Set<string>;
+  trips: number;
+}> {
   const initial = await database.getInitialPushAuditTokens();
+  let trips = 1;
+  // Unconfirmed sends (deferrallog.UNCONFIRMED_CARD_STATE_KEY, the third state
+  // of the send): a card whose send was ABANDONED — the race stopped waiting
+  // while the request was still in flight, so it may already be in the chat and
+  // it wrote no audit entry. That is proof of NOTHING, so it must NOT join
+  // `tokens` (which is what licenses forgetting an obligation); it is its own
+  // set and its only job is to hold the 補發 back while the record is pending
+  // (see the gate below), because the record's own settle — the background
+  // audit write, or the worker's reconcile — decides which it was.
+  //
+  // Fail-open both ways: an unreadable row (the heal tests' Db doubles
+  // implement only the initial reader) reads as "none", which is exactly the
+  // pre-three-state behaviour — the 補發 goes out when it used to.
+  let unconfirmed = new Set<string>();
+  const stateRead = (database as Partial<Pick<Db, "getWorkerState">>).getWorkerState;
+  if (typeof stateRead === "function") {
+    try {
+      unconfirmed = new Set(
+        parseUnconfirmedCardSends(
+          await stateRead.call(database, UNCONFIRMED_CARD_STATE_KEY),
+        ).map((r) => r.token),
+      );
+    } catch {
+      unconfirmed = new Set();
+    }
+    trips += 1;
+  }
   const read = (
     database as Partial<Pick<Db, "getPushAudit">>
   ).getPushAudit;
-  if (typeof read !== "function") return { tokens: initial, trips: 1 };
+  if (typeof read !== "function") return { tokens: initial, unconfirmed, trips };
   try {
     const ring = await read.call(database);
     return {
       tokens: new Set([...initial, ...deliveredCardTokens(ring)]),
-      trips: 2,
+      unconfirmed,
+      trips: trips + 1,
     };
   } catch {
-    return { tokens: initial, trips: 1 };
+    return { tokens: initial, unconfirmed, trips };
   }
 }
 
@@ -1078,6 +1112,16 @@ export class PushWatcher {
         // all is still re-sent on this pass — the never-miss half.
         const proof = await readDeliveredTokens(this.db);
         const delivered = proof.tokens;
+        // A card send that was ABANDONED (three-state send) is not proof of
+        // delivery — but it is not a licence to send the 補發 either: the card
+        // may already be in the chat, and this pass is the very duplicate loop
+        // (five PONDER cards in eleven minutes) this gate exists to close. The
+        // unconfirmed record settles within ~1s (the background audit write)
+        // or, at the latest, two tick cadences later in the worker's reconcile
+        // — which releases the claim when nothing proved delivery, so the coin
+        // is re-pushed by a normal scan instead. Nothing is silenced for good:
+        // a token with no entry anywhere still gets its 補發 on this pass.
+        const unconfirmed = proof.unconfirmed;
         trips += proof.trips;
         // Durable push-baseline ledger (src/pushledger.ts): the true
         // push-time mcap per token, copied out of the delivery audit ring and
@@ -1131,7 +1175,7 @@ export class PushWatcher {
           // dropped by this gate.
           const recentClaim = now - m.pushedAt <= FIRST_CARD_RESEND_GRACE_MS;
           let resent = false;
-          if (recentClaim && !delivered.has(m.token)) {
+          if (recentClaim && !delivered.has(m.token) && !unconfirmed.has(m.token)) {
             try {
               const usd = (n: number | null | undefined) =>
                 n == null || !Number.isFinite(n)

@@ -185,6 +185,9 @@ alert 一齊放寬）。改為新增獨立常數：
 
 ## 未做
 
+> **2026-09-20：以下三項已經整理成逐字可貼（verbatim verified）嘅 patch，見文末
+> 「可直接貼上嘅窗口外 patch」——三態 send 嘅規則／讀側已經落地並有單元測試，剩返嘅只係搬線。**
+
 - race 信封嘅 floor clamp（窗口外，patch 已寫喺上面 —— 係正確性修正，唔係今次減失 flush 嘅主刀）。
 - flush 仍然會失手：今次改嘅係「吊死嘅寫入而家喺 reserve 內失敗，令重試有機會落地」，唔係令 Turso
   唔會吊死。要真正封死，仍然係上面嗰段信封／claim 嘅窗口外工作。
@@ -520,3 +523,577 @@ delivery audit 落地 ⇒ **下一 tick 冇「未推」狀態可以再推**。�
 3. **`CARD_SEND_FLOOR_MS` 600→900 / `CARD_SEND_MIN_MS` 250→700**：仍然**做唔到**，因為
    `scripts/test-unit.js` 2090–2129 嘅四條斷言（4150/4151、3550/3551）喺窗口外，改咗會 CI 紅。
    reserve=1500 已經買到同一個效果，所以呢個配對而家係「可選加強」，唔再係必須。
+
+---
+
+# 可直接貼上嘅窗口外 patch（2026-09-20 整理）
+
+## 先講已經喺窗口內落地嘅部分（唔需要貼）
+
+三態 send 嘅**規則**同**讀側尊重**已經寫入 repo 並有單元測試釘住，所以下面每塊 patch 只剩
+「搬線」嘅部分，冇未測試嘅邏輯：
+
+| 位置 | 內容 | 測試 |
+|---|---|---|
+| `src/deferrallog.ts` | `UNCONFIRMED_CARD_STATE_KEY` / `UNCONFIRMED_CARD_MAX`(12) / `UNCONFIRMED_CARD_GRACE_MS`(120s)、`parse/add/remove/serialize UnconfirmedCardSend…`、`settleUnconfirmedCardSends`、`cardSendDisposition` | `cardSendDisposition: abandoned keeps the claim…`、`unconfirmed ledger: one record per coin, capped, and removable`、`settleUnconfirmedCardSends: proof keeps the claim, silence releases it after the grace`（`test:unit` = 214 passed / 0 failed） |
+| `src/pushwatch.ts` | heal gate 多一個條件：`recentClaim && !delivered.has(token) && !unconfirmed.has(token)`；`readDeliveredTokens` 多回一個 `unconfirmed` 集合（讀唔到 = 空集 = 舊行為） | 規則本體（`cardSendDisposition` / `settle…`）已釘；gate 係 fail-open 讀側 |
+
+**為何要 pushwatch 呢一步**：冇佢，abandoned 嘅卡（可能已經送到、但冇 audit entry）會被 self-heal
+判成「首卡未送達」→ 即刻送一張「📤 補發推送」= 用戶投訴嘅重複。有佢之後，補發由
+「unconfirmed 記錄」接住，而該記錄最遲兩個 tick 由 worker reconcile 放返 claim，硬幣照樣經正常
+掃描再推 —— 延遲幾分鐘，唔會漏。
+
+---
+
+## Patch 1／4：race 信封嘅 floor clamp（`src/worker.ts`，~1977–1983 行）
+
+**OLD**
+
+```ts
+      // phase was. The constant's floor still applies to ticks with a fast
+      // pre-race (the common case).
+      // The race ends EARLY, leaving SCAN_FLUSH_RESERVE_MS for the
+      // completion flush below: the tick envelope is then
+      // preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS no matter how slow
+      // the pre-race phase was, so there is always time left to land the
+      // flush before Cloudflare kills the invocation.
+      const scanRaceMs = Math.max(
+        2_500,
+        SCAN_TICK_BUDGET_MS -
+          SCAN_FLUSH_RESERVE_MS -
+          (Date.now() - startedAt),
+      );
+```
+
+**NEW**
+
+```ts
+      // phase was.
+      // The race ends EARLY, leaving SCAN_FLUSH_RESERVE_MS for the
+      // completion flush below: the tick envelope is then
+      // preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS no matter how slow
+      // the pre-race phase was, so there is always time left to land the
+      // flush before Cloudflare kills the invocation.
+      //
+      // 2026-09-20 (correctness): the 2_500ms FLOOR broke that invariant —
+      // preRace 7s → envelope 9.5s → flush window 0, i.e. the slow-pre-race
+      // tick this calculation exists to protect was exactly the tick it
+      // killed. A recovering successor is a slow-pre-race tick by
+      // construction (rebuild + re-init, sometimes a cold crime-list fetch),
+      // which is how one death became a 5-13 tick chain (the backfill rows
+      // all report 54-77s spans). A tick that cannot afford a scan now spends
+      // its envelope on the COMPLETION instead: `scanRaceMs === 0` fires the
+      // timeout branch at once, `scanner.abort()` stops the scan at its next
+      // phase boundary, and the row that lands says so. "A completed 6s scan
+      // every minute beats a dead 12s tick that evaluates nothing" — and a
+      // completed 0s scan (deferred candidate, re-offered next tick) beats
+      // both.
+      const scanRaceMs = Math.max(
+        0,
+        Math.min(
+          5_000,
+          SCAN_TICK_BUDGET_MS -
+            SCAN_FLUSH_RESERVE_MS -
+            (Date.now() - startedAt),
+        ),
+      );
+```
+
+唔需要改其他嘢：race 之後嘅 `lastScanOk = !timedOut`、`lastScanError`（用 `scanRaceMs` 砌訊息）同
+`finally` 嘅 completion flush 全部照舊，所以 `scanRaceMs === 0` 係一條「已落地嘅 timeout 行」，
+唔係死 tick。`Math.min(5_000, …)` 係善意上界（現值 9_500−4_500 正好 5_000），防止將來調 budget 時
+race 反過來變成無上限。
+
+---
+
+## Patch 2／4：三態 send（`src/scanner.ts`，`sendTo` 內 ~3086–3140 行）
+
+### 2a. 檔案頂 import（窗口內，可即刻做）
+
+`src/scanner.ts` 現時冇 import `deferrallog`，加：
+
+```ts
+import {
+  cardSendDisposition,
+  addUnconfirmedCardSend,
+  removeUnconfirmedCardSend,
+  UNCONFIRMED_CARD_STATE_KEY,
+} from "./deferrallog";
+```
+
+### 2b. send 段整段換（**OLD → NEW**）
+
+**OLD**
+
+```ts
+          try {
+            // Bounded by the card-send tail (see CARD_SEND_TAIL_MS): a
+            // null here means the send missed its slice, and the
+            // caller's failure path releases the claim so the coin is
+            // retried.
+            this.markPhase(diag, "send:telegram", startedAt);
+            const sent = await this.bestEffort(
+              () =>
+                this.bot.api.sendMessage(c.chatId, message, {
+                  reply_markup: {
+                    inline_keyboard: tradeKeyboard(
+                      tokenAddress,
+                      this.trade ? this.trade.buySizeLabel : "",
+                      tradeMode,
+                      { modeSwitch: Boolean(this.trade), unwatch: true },
+                    ),
+                  },
+                }),
+              sendDeadline,
+              null,
+            );
+            if (sent === null) {
+              const cut = new Error(
+                `initial-card send exceeded its deadline (card may not have been delivered)`,
+              ) as Error & { cardSendTimeout?: boolean };
+              // Tagged so the delivery retry below does NOT sleep 1200ms and
+              // re-send inside a tick that has already run out of room.
+              cut.cardSendTimeout = true;
+              throw cut;
+            }
+            // Delivery audit: Telegram returned a message_id, so the card
+            // left us and was accepted. Recording it lets a later "never
+            // got the first card" report be answered with hard evidence.
+            try {
+              await this.db.recordPushDelivery({
+                chatId: c.chatId,
+                token: c.profile.tokenAddress,
+                symbol: c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
+                messageId: Number(
+                  (sent as { message_id?: unknown }).message_id ?? 0,
+                ),
+                mcapAtPush: c.pair.marketCap,
+                kind: "initial",
+              });
+            } catch {
+              /* audit is best-effort */
+            }
+          } catch (err) {
+```
+
+**NEW**
+
+```ts
+          try {
+            // THREE-STATE send (2026-09-20 — docs/scan-completion-loss.md §
+            // "(A) cut → unclaim → re-eval 重推"). The two-state version read
+            // every non-delivery as a failure: bestEffort() returns `null`
+            // BOTH when Telegram rejected the card AND when the tick merely
+            // stopped waiting for a request that is still in flight. The
+            // second case then released the claim (unclaim → the re-eval pool
+            // sends the same coin again) while the first card was already on
+            // its way — the operator's repeat cards (PONDER 5× in 11 minutes.
+            //
+            // The promise is started ONCE, here, so the background chain
+            // below watches the very request the race gave up on.
+            this.markPhase(diag, "send:telegram", startedAt);
+            const inFlight = this.bot.api.sendMessage(c.chatId, message, {
+              reply_markup: {
+                inline_keyboard: tradeKeyboard(
+                  tokenAddress,
+                  this.trade ? this.trade.buySizeLabel : "",
+                  tradeMode,
+                  { modeSwitch: Boolean(this.trade), unwatch: true },
+                ),
+              },
+            });
+            // `settled` never rejects: a rejection is a FACT ("Telegram said
+            // no") while the timeout is the ABSENCE of one, and not conflating
+            // the two is the entire fix.
+            const settled = inFlight.then(
+              (m) => ({ status: "sent" as const, message: m }),
+              () => ({ status: "failed" as const }),
+            );
+            let cutTimer: ReturnType<typeof setTimeout> | null = null;
+            const abandoned = new Promise<{ status: "abandoned" }>((resolve) => {
+              cutTimer = setTimeout(
+                () => resolve({ status: "abandoned" }),
+                Math.max(0, sendDeadline - Date.now()),
+              );
+            });
+            const raced = await Promise.race([settled, abandoned]);
+            // Cleared either way: a pending timer would hold the isolate (and
+            // the abandoned scan's promise) open past this tick.
+            if (cutTimer !== null) clearTimeout(cutTimer);
+            // The never-miss rule as one tested function (deferrallog):
+            //   sent      → audit it (hard proof of delivery)
+            //   failed    → release the claim + surface the failure (catch
+            //               below, unchanged — a rejected card was NOT sent)
+            //   abandoned → keep the claim, record it durably, watch it to a
+            //               conclusion in the background
+            const plan = cardSendDisposition(raced.status);
+            if (plan.throwFailure) {
+              throw new Error(
+                `initial-card send failed (Telegram did not accept it — the card was NOT delivered)`,
+              );
+            }
+            const symbol = c.profile.symbol ?? c.pair.baseToken.symbol ?? null;
+            const auditDelivery = async (messageId: number): Promise<void> => {
+              try {
+                await this.db.recordPushDelivery({
+                  chatId: c.chatId,
+                  token: c.profile.tokenAddress,
+                  symbol,
+                  messageId,
+                  mcapAtPush: c.pair.marketCap,
+                  kind: "initial",
+                });
+              } catch {
+                /* audit is best-effort */
+              }
+            };
+            if (plan.audit && raced.status === "sent") {
+              // Delivery audit: Telegram returned a message_id, so the card
+              // left us and was accepted. Recording it lets a later "never
+              // got the first card" report be answered with hard evidence.
+              await auditDelivery(Number(raced.message.message_id ?? 0));
+            }
+            if (plan.recordUnconfirmed) {
+              // ABANDONED: the request is still in flight, so the card may
+              // already be in the chat. KEEP the claim — it is the only thing
+              // stopping the re-eval pool from sending a second card — and
+              // record the send durably so the worker's reconcile
+              // (reconcileUnconfirmedCardSends) can release it if nothing
+              // ever proves delivery. The audit ring gets NOTHING here: an
+              // entry means Telegram ACCEPTED a card.
+              const recordUnconfirmedSend = async (): Promise<void> => {
+                try {
+                  const prev = await this.db.getWorkerState(
+                    UNCONFIRMED_CARD_STATE_KEY,
+                  );
+                  await this.db.setWorkerState(
+                    UNCONFIRMED_CARD_STATE_KEY,
+                    addUnconfirmedCardSend(prev, {
+                      chatId: c.chatId,
+                      token: c.profile.tokenAddress,
+                      at: Date.now(),
+                      symbol,
+                    }),
+                  );
+                } catch (err) {
+                  // The record is what later RELEASES the claim, so losing it
+                  // can only cost a duplicate, never a card: the claim stays,
+                  // and a coin whose card never arrived is still re-sent by
+                  // the tracker's self-heal (which allows a 補發 whenever
+                  // there is neither proof nor an unconfirmed record).
+                  console.warn(
+                    "[scanner] unconfirmed card-send record write failed (claim kept):",
+                    err instanceof Error ? err.message : err,
+                  );
+                }
+              };
+              const clearUnconfirmedSend = async (): Promise<void> => {
+                try {
+                  const prev = await this.db.getWorkerState(
+                    UNCONFIRMED_CARD_STATE_KEY,
+                  );
+                  await this.db.setWorkerState(
+                    UNCONFIRMED_CARD_STATE_KEY,
+                    removeUnconfirmedCardSend(prev, c.chatId, c.profile.tokenAddress),
+                  );
+                } catch {
+                  /* the worker's reconcile drops it on proof */
+                }
+              };
+              await recordUnconfirmedSend();
+              // Settle in the background: the tick is over either way. A late
+              // success AUDITS the card (nothing re-pushes the coin, and the
+              // tracking this call starts is the follow-up it was owed); a
+              // late rejection RELEASES the claim (the never-miss half); an
+              // isolate that dies before either is the reconcile's job.
+              void settled
+                .then(async (r) => {
+                  if (r.status === "sent") {
+                    await auditDelivery(Number(r.message.message_id ?? 0));
+                    try {
+                      await this.pushWatcher?.onPush(
+                        c.chatId,
+                        c.profile.tokenAddress,
+                        symbol,
+                        c.pair.marketCap,
+                        c.pair.liquidity.usd,
+                      );
+                    } catch {
+                      /* tracking is optional */
+                    }
+                  } else {
+                    try {
+                      await this.db.unclaimTokenPush(
+                        c.chatId,
+                        c.profile.tokenAddress,
+                      );
+                    } catch {
+                      /* best-effort — the reconcile retries the release */
+                    }
+                  }
+                  await clearUnconfirmedSend();
+                })
+                .catch(() => {
+                  /* the reconcile settles whatever this isolate cannot */
+                });
+              return;
+            }
+          } catch (err) {
+```
+
+**行為對照（為何唔會漏、為何少重複）**
+
+| Telegram 事實 | 舊行為 | 新行為 |
+|---|---|---|
+| 接受（返 message_id） | audit `initial`，claim 保留 | 一樣 |
+| 明確拒絕（4xx/網絡錯） | throw → unclaim → 下 tick 補推 | 一樣（`plan.releaseClaim` 由原本嘅 catch 執行） |
+| deadline 前冇答案 | throw → unclaim → **即刻重推（重複）** | **唔 unclaim**、寫 durable 記錄、背景跟到有答案；證實失敗先放 claim |
+
+---
+
+## Patch 3／4：worker 側 reconcile（`src/worker.ts`）—— 三態 send 嘅**必需**配套
+
+冇呢塊，`abandoned` 嘅 claim 就永遠留住：卡片真係送唔到嘅話，硬幣就一直「已推」→ **漏推**。
+所以要貼。兩處改動：import 同 `dropDeliveredPendings` 後面加一個函數 + 一行呼叫。
+
+### 3a. import（`src/worker.ts` 頂 `./deferrallog` 嘅 import block）
+
+```ts
+import {
+  PUSH_DEFERRAL_STATE_KEY,
+  heldBackCandidates,
+  loadPushDeferralSnapshot,
+  nextPushDeferralSnapshot,
+  deliveredDeferredTokens,
+  duplicateInitialTokens,
+  parsePushDeferralSnapshot,
+  pushDeferralAlreadyApplied,
+  pushDeferralDelta,
+  // 三態 send（2026-09-20）：abandoned 嘅卡由下面 reconcileUnconfirmedCardSends 收尾。
+  deliveredCardTokens,
+  parseUnconfirmedCardSends,
+  serializeUnconfirmedCardSends,
+  settleUnconfirmedCardSends,
+  UNCONFIRMED_CARD_STATE_KEY,
+  UNCONFIRMED_CARD_GRACE_MS,
+  type PushDeferralSnapshot,
+} from "./deferrallog";
+```
+
+### 3b. 新函數（貼喺 `dropDeliveredPendings` 同 `syncPushDeferralCounters` 之間）
+
+```ts
+/**
+ * Settle the durable "unconfirmed card send" records — the third state of the
+ * send (see deferrallog.UNCONFIRMED_CARD_STATE_KEY).
+ *
+ * A card send that was ABANDONED (the tick stopped waiting while the request
+ * was still in flight) keeps its seen_tokens claim so nothing re-pushes it, and
+ * records itself durably. That record has exactly two endings, and this decides
+ * both:
+ *
+ *   * the audit ring proves a card for that token was delivered → drop the
+ *     record, the claim stands (the card arrived; re-pushing it IS the
+ *     duplicate the operator reported);
+ *   * two tick cadences pass with no proof anywhere → release the claim, so a
+ *     later scan re-pushes the coin (never miss; at most one duplicate, two
+ *     minutes late).
+ *
+ * The fast path is the scanner's own background settle, which lands within a
+ * second of the send. This runs for records the scanner could not settle, i.e.
+ * exactly the case where the sending isolate died before it could.
+ *
+ * ORDERING IS LOAD-BEARING: the SHRUNK row is persisted BEFORE any claim is
+ * released, and nothing is released when that write fails. A record that
+ * outlived its own release would release again on the next tick, and if the
+ * coin had been re-pushed and re-claimed in between, that second release would
+ * delete the NEW claim and put a third card in flight.
+ */
+async function reconcileUnconfirmedCardSends(): Promise<void> {
+  if (!db) return;
+  let raw: string | null;
+  try {
+    raw = await db.getWorkerState(UNCONFIRMED_CARD_STATE_KEY);
+  } catch (err) {
+    // Unreadable row: nothing is settled this tick. The record is durable, so
+    // waiting is free; guessing costs a card.
+    console.warn(
+      "[worker] unconfirmed card-send read failed (nothing settled):",
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+  const records = parseUnconfirmedCardSends(raw);
+  // The common tick: no record at all, one read, nothing else.
+  if (records.length === 0) return;
+  let proven: Set<string>;
+  try {
+    // ONE read of the ring the deferral guard already reads. A failed read
+    // must NOT be taken as "nothing was delivered" — that would release
+    // claims on a guess.
+    proven = new Set(deliveredCardTokens(await db.getPushAudit()));
+  } catch (err) {
+    console.warn(
+      "[worker] unconfirmed card-send proof read failed (nothing released):",
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+  const settled = settleUnconfirmedCardSends(
+    records,
+    Date.now(),
+    UNCONFIRMED_CARD_GRACE_MS,
+    proven,
+  );
+  if (settled.confirmed.length === 0 && settled.release.length === 0) return;
+  try {
+    await db.setWorkerState(
+      UNCONFIRMED_CARD_STATE_KEY,
+      serializeUnconfirmedCardSends(settled.kept),
+    );
+  } catch (err) {
+    console.warn(
+      "[worker] unconfirmed card-send shrink write failed (nothing released):",
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+  if (settled.confirmed.length > 0) {
+    console.log(
+      `[worker] ${settled.confirmed.length} unconfirmed card send(s) proved delivered — claim kept, nothing re-pushed`,
+    );
+  }
+  for (const r of settled.release) {
+    try {
+      await db.unclaimTokenPush(r.chatId, r.token);
+      console.log(
+        `[worker] unconfirmed card send for ${r.symbol ?? r.token} proved undelivered — claim released, a later scan re-pushes it`,
+      );
+    } catch (err) {
+      console.warn(
+        "[worker] unconfirmed card-send claim release failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+}
+```
+
+### 3c. 一行呼叫（`syncPushDeferralCounters`，喺 `dropDeliveredPendings` 之後）
+
+**OLD**
+
+```ts
+  const stale = await dropDeliveredPendings(db, durable?.pendingTokens ?? []);
+  const owedPending = durable
+```
+
+**NEW**
+
+```ts
+  const stale = await dropDeliveredPendings(db, durable?.pendingTokens ?? []);
+  // 三態 send 嘅配套：收尾 abandoned 嘅卡（見 reconcileUnconfirmedCardSends）。
+  // 同 duplicate guard 並排，因為兩者答同一條問題 ——「呢隻幣仲欠唔欠一張卡」。
+  // 冇記錄嘅 tick 只係一個 read；有記錄先會寫 / unclaim。
+  await reconcileUnconfirmedCardSends();
+  const owedPending = durable
+```
+
+---
+
+## Patch 4／4（**可選加強**）：send slice 下限 600→900、claim 下限 250→700
+
+reserve=1500 已經買到同一個效果，所以呢塊唔貼都可以。要貼就**兩邊一齊貼**，否則 CI 紅。
+
+### 4a. `src/scanner.ts`（窗口內，兩行）
+
+```ts
+const CARD_SEND_FLOOR_MS = 600;   →  const CARD_SEND_FLOOR_MS = 900;
+const CARD_SEND_MIN_MS = 250;     →  const CARD_SEND_MIN_MS = 700;
+```
+
+### 4b. `scripts/test-unit.js` 四條斷言（~2250–2290 行）
+
+實測（今次真係改咗常數再 build 去量）：`cardSendDeadline` 邊界由 **4150/4151** 移到
+**3700/3701**，`cardClaimDeadline` 邊界由 **3550/3551** 移到 **3100/3101**。
+
+**OLD**
+
+```js
+    // Late but still usable: clamped by the tail, not by `now + floor`.
+    assert.equal(cardSendDeadline(t0, t0 + 4_000), t0 + 4_400);
+```
+
+**NEW**
+
+```js
+    // Late but still usable: clamped by the tail, not by `now + floor`.
+    assert.equal(cardSendDeadline(t0, t0 + 3_600), t0 + 4_400);
+    // No sub-700ms slice is ever handed out any more: a send starting at
+    // 4_000ms (the shape that used to get 400ms and get cut mid-flight) is
+    // now refused outright — deferred, not half-sent.
+    assert.equal(cardSendDeadline(t0, t0 + 4_000), null);
+```
+
+**OLD**
+
+```js
+    // Boundary: exactly the minimum slice is still attempted, one ms more is
+    // not (the card is deferred, not dropped).
+    assert.equal(cardSendDeadline(t0, t0 + 4_150), t0 + 4_400);
+    assert.equal(cardSendDeadline(t0, t0 + 4_151), null);
+```
+
+**NEW**
+
+```js
+    // Boundary: exactly the minimum slice (700ms) is still attempted, one ms
+    // more is not (the card is deferred, not dropped).
+    assert.equal(cardSendDeadline(t0, t0 + 3_700), t0 + 4_400);
+    assert.equal(cardSendDeadline(t0, t0 + 3_701), null);
+```
+
+**OLD**
+
+```js
+    // Late but affordable: 700ms of tail still covers 400 (claim) + 250
+    // (least send).
+    assert.equal(cardClaimDeadline(t0, t0 + 3_500), t0 + 3_900);
+    // Boundary: exactly 650ms of tail, one ms less is refused.
+    assert.equal(cardClaimDeadline(t0, t0 + 3_550), t0 + 3_950);
+    assert.equal(cardClaimDeadline(t0, t0 + 3_551), null);
+```
+
+**NEW**
+
+```js
+    // Late but affordable: the claim runs while 400 (claim) + 700 (least send)
+    // are still available before the 4.2s internal deadline.
+    assert.equal(cardClaimDeadline(t0, t0 + 3_000), t0 + 3_400);
+    // Boundary: exactly 1100ms of room, one ms less is refused. NB the tail
+    // clamp is what moves this from 3550 to 3100 — past it the send's own
+    // floor (900) can no longer cover the 700 minimum.
+    assert.equal(cardClaimDeadline(t0, t0 + 3_100), t0 + 3_500);
+    assert.equal(cardClaimDeadline(t0, t0 + 3_101), null);
+```
+
+唔變嘅斷言（保留）：`+2_000`/`+3_000` → `t0 + 4_200`；`+4_309` → `null`；`+9_000` → `null`；
+`cardClaimDeadline` 嘅 `+2_000` → `t0 + 2_400`、`+3_792`/`+4_200`/`+9_000` → `null`。
+
+順手要更新（純註釋，唔會令 CI 紅）：`src/scanner.ts` ~237–300 行嘅 `CARD_SEND_FLOOR_MS` /
+`CARD_SEND_MIN_MS` 註釋仍然寫住「4150/4151、3550/3551」同「raising THIS value (to ~900…)」——
+改完之後應改成 3700/3701、3100/3101（或者索性刪走舊邊界嗰兩句）。
+
+---
+
+## 貼完之後嘅驗收點
+
+1. `bun convex`／`npm run test:unit`：214 passed（三態規則已釘）＋ 四條新邊界斷言（只有貼咗 Patch 4 才需要）。
+2. `npx tsc --noEmit` 過（Patch 2 嘅 `plan` / `raced` 收窄係嚴格模式友善；`settled` 永遠唔 reject）。
+3. Live：同一個 token 喺 `/debug/push-audit` **只應有 1 條 `initial`**；`seen_tokens` 唔應該再因為
+   send timeout 而被刪（`/debug/chats` 唔應該再出現 `initial-card send exceeded its deadline` 配住下一 tick 重推）。
+4. 反面（防漏推）：`pushwatch` 嘅自我修復仍然要為「完全冇 entry 而且冇 unconfirmed 記錄」嘅 token 補發；
+   reconcile 之後 `unconfirmed_card_sends` 行應該返 `[]`，而 release 過嘅幣要喺下一個 scan 真係再推。
+5. 觀察 `console.warn`：`unconfirmed card-send record write failed` / `proof read failed` / `shrink write failed`
+   —— 三者任何一個都代表「寧可重複，唔會漏」，但值得跟。
+

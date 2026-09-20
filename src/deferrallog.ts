@@ -528,6 +528,250 @@ export function duplicateInitialTokens(
   return out;
 }
 
+/**
+ * Durable ledger of card sends whose DELIVERY IS UNKNOWN — the third state of
+ * the three-state send (2026-09-20, see docs/scan-completion-loss.md § "(A) cut
+ * → unclaim → re-eval 重推").
+ *
+ * WHY (the duplicate it removes): the send was two-state —
+ * `bestEffort(send, deadline, null)` returned either Telegram's message or
+ * `null`, and `null` was read as "not delivered". It is not: the race stops
+ * WAITING, never the request. So a card that was already on its way to Telegram
+ * was treated as failed, the `seen_tokens` claim was deleted, and the next
+ * tick's re-eval pool pushed the same coin again — the operator's "推送之後又
+ * 收到同一隻幣" report (live 2026-09-20 10:48–11:08 HKT, PONDER five times).
+ *
+ * With a third state, an abandoned send KEEPS its claim — the claim is the only
+ * thing that stops the re-push — and records itself here. This ledger settles
+ * that record in exactly one of two directions:
+ *
+ *   * PROVEN delivered (a DELIVERED_CARD_KINDS proof exists in the audit ring,
+ *     which is what the worker's reconcile reads) → drop the record, keep the
+ *     claim. The card reached the chat, so the coin must NOT be pushed again.
+ *   * PROVEN undelivered (grace elapsed, no proof anywhere) → RELEASE the claim
+ *     so a later scan re-pushes the coin. At most one duplicate, two minutes
+ *     late. Fail-open on purpose: "一定不能漏推" is the hard rule, and the two
+ *     costs are not symmetric (a missing card is a lost trade, a duplicate is
+ *     noise).
+ *
+ * The record is DURABLE because the isolate that started the send is exactly
+ * what may not survive to settle it — an abandoned send means the tick ran out
+ * of room, which is one step from the wall-clock kill the sibling docs in
+ * docs/scan-completion-loss.md describe.
+ *
+ * Pure and exported: the durable read/write and the unclaim live in worker code
+ * the offline harness cannot drive, so the RULES are what the tests pin.
+ */
+export const UNCONFIRMED_CARD_STATE_KEY = "unconfirmed_card_sends";
+
+/**
+ * Ring cap. A cut is rare once the reserve gives the send a real slice, so more
+ * than a couple of records at once means something else is wrong; 12 keeps the
+ * row a sub-2KB write on a tick tail that is racing the wall clock.
+ */
+export const UNCONFIRMED_CARD_MAX = 12;
+
+/**
+ * How long a record may stay unconfirmed before its claim is released. Two cron
+ * cadences: a send that is going to settle at all does so in about a second
+ * (the background chain writes its own `initial` audit entry), so a record that
+ * is still unproven after two minutes means the sending isolate died between
+ * the send and the audit — the card may or may not have arrived, and re-pushing
+ * is the never-miss choice.
+ */
+export const UNCONFIRMED_CARD_GRACE_MS = 120_000;
+
+/** One abandoned send awaiting proof, keyed by (chatId, token). */
+export interface UnconfirmedCardSend {
+  chatId: string;
+  token: string;
+  /** ms epoch the abandoned send started — the grace clock. */
+  at: number;
+  symbol: string | null;
+}
+
+function unconfirmedRecord(v: unknown): UnconfirmedCardSend | null {
+  if (!v || typeof v !== "object") return null;
+  const o = v as Record<string, unknown>;
+  const chatId = typeof o.chatId === "string" ? o.chatId : "";
+  const token = typeof o.token === "string" ? o.token : "";
+  const at = stamp(o.at) ?? 0;
+  if (chatId.length === 0 || token.length === 0 || at <= 0) return null;
+  const symbol = typeof o.symbol === "string" && o.symbol.length > 0 ? o.symbol : null;
+  return { chatId, token, at, symbol };
+}
+
+/**
+ * Read side, tolerant like every other row in this module: garbage, a missing
+ * row or a round-tripped value degrades to "nothing unconfirmed", which is the
+ * pre-three-state behaviour. Newest kept when the ring overflowed.
+ */
+export function parseUnconfirmedCardSends(
+  raw: string | null | undefined,
+): UnconfirmedCardSend[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const out: UnconfirmedCardSend[] = [];
+    const seen = new Set<string>();
+    for (const item of parsed) {
+      const entry = unconfirmedRecord(item);
+      if (!entry) continue;
+      const key = `${entry.chatId}:${entry.token}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(entry);
+    }
+    return out.slice(-UNCONFIRMED_CARD_MAX);
+  } catch {
+    return [];
+  }
+}
+
+/** Serialize the ring, capped — the only writer shape the row accepts. */
+export function serializeUnconfirmedCardSends(
+  list: readonly UnconfirmedCardSend[],
+  max: number = UNCONFIRMED_CARD_MAX,
+): string {
+  return JSON.stringify(list.slice(-Math.max(1, max)));
+}
+
+/**
+ * Add (or refresh) one record. Re-recording the same (chatId, token) keeps ONE
+ * entry with the NEWER timestamp, so a coin abandoned twice cannot leave two
+ * records that would release the same claim twice.
+ */
+export function addUnconfirmedCardSend(
+  raw: string | null | undefined,
+  entry: { chatId: string; token: string; at: number; symbol?: string | null },
+  max: number = UNCONFIRMED_CARD_MAX,
+): string {
+  const next = parseUnconfirmedCardSends(raw).filter(
+    (e) => !(e.chatId === entry.chatId && e.token === entry.token),
+  );
+  next.push({
+    chatId: entry.chatId,
+    token: entry.token,
+    at: entry.at,
+    symbol: entry.symbol ?? null,
+  });
+  return serializeUnconfirmedCardSends(next, max);
+}
+
+/**
+ * Drop the record for one (chatId, token) — the background chain's own settle:
+ * a send that is CONFIRMED (audit written) or CONFIRMED failed (record cleared
+ * and the claim released right there) must not be settled a second time by the
+ * worker's reconcile.
+ */
+export function removeUnconfirmedCardSend(
+  raw: string | null | undefined,
+  chatId: string,
+  token: string,
+): string {
+  return serializeUnconfirmedCardSends(
+    parseUnconfirmedCardSends(raw).filter(
+      (e) => !(e.chatId === chatId && e.token === token),
+    ),
+  );
+}
+
+/**
+ * Split the ring into what the caller must do next. Pure: the caller owns the
+ * durable write and the unclaim, this owns the RULE.
+ *
+ * Order matters to the caller: persist `kept` BEFORE unclaiming anything. A
+ * record that survives a crash after the claim was released would release the
+ * claim a second time — and if the coin had been re-pushed and re-claimed in
+ * between, that second release would delete a NEW claim and put a third card in
+ * flight. Writing the shrink first makes the release at-most-once.
+ */
+export function settleUnconfirmedCardSends(
+  records: readonly UnconfirmedCardSend[],
+  now: number,
+  graceMs: number,
+  proven: ReadonlySet<string>,
+): {
+  confirmed: UnconfirmedCardSend[];
+  release: UnconfirmedCardSend[];
+  kept: UnconfirmedCardSend[];
+} {
+  const confirmed: UnconfirmedCardSend[] = [];
+  const release: UnconfirmedCardSend[] = [];
+  const kept: UnconfirmedCardSend[] = [];
+  for (const r of records) {
+    if (proven.has(r.token)) {
+      confirmed.push(r);
+      continue;
+    }
+    if (now - r.at >= graceMs) {
+      release.push(r);
+      continue;
+    }
+    kept.push(r);
+  }
+  return { confirmed, release, kept };
+}
+
+/** The three outcomes of one card send (see the ledger above). */
+export type CardSendOutcome = "sent" | "failed" | "abandoned";
+
+/** What the send path must do for one outcome. */
+export interface CardSendDisposition {
+  /** Write the delivery audit — hard proof Telegram accepted the card. */
+  audit: boolean;
+  /** Delete the seen_tokens claim so a later scan re-pushes the coin. */
+  releaseClaim: boolean;
+  /** Keep the claim and settle the in-flight request in the background. */
+  watchInBackground: boolean;
+  /** Write the durable unconfirmed record the reconcile settles. */
+  recordUnconfirmed: boolean;
+  /** Surface a delivery failure to the caller (its retry / failure record). */
+  throwFailure: boolean;
+}
+
+/**
+ * The never-miss rule, as one pure function: Telegram ACCEPTED the card (audit
+ * it), Telegram REJECTED it (release the claim, surface the failure, the coin is
+ * re-pushed by a later tick), or we STOPPED WAITING (keep the claim, record it,
+ * watch it to a conclusion in the background).
+ *
+ * `abandoned` deliberately neither audits (nothing was confirmed) nor releases
+ * (the card may already be in the chat, and releasing is what re-pushes it).
+ * That asymmetry is the whole fix: the old two-state send mapped "abandoned"
+ * onto "failed", which is the duplicate generator the operator reported.
+ */
+export function cardSendDisposition(outcome: CardSendOutcome): CardSendDisposition {
+  switch (outcome) {
+    case "sent":
+      return {
+        audit: true,
+        releaseClaim: false,
+        watchInBackground: false,
+        recordUnconfirmed: false,
+        throwFailure: false,
+      };
+    case "failed":
+      return {
+        audit: false,
+        releaseClaim: true,
+        watchInBackground: false,
+        recordUnconfirmed: false,
+        throwFailure: true,
+      };
+    case "abandoned":
+    default:
+      return {
+        audit: false,
+        releaseClaim: false,
+        watchInBackground: true,
+        recordUnconfirmed: true,
+        throwFailure: false,
+      };
+  }
+}
+
 export function heldBackCandidates(
   summary: {
     pushPhase?: string;

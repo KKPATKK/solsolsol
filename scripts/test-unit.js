@@ -33,7 +33,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, duplicateInitialTokens } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
@@ -319,6 +319,129 @@ async function main() {
     }
     assert.deepEqual(deliveredCardTokens([]), []);
     assert.deepEqual(deliveredCardTokens([{ kind: "initial" }, { token: "", kind: "resend" }, null]), []);
+  });
+
+  // ---------- three-state card send: the unconfirmed-delivery ledger ----------
+  //
+  // The duplicate this closes: `bestEffort(send, deadline, null)` reported
+  // "abandoned" as "failed", so the send path deleted the seen_tokens claim and
+  // the next tick's re-eval pool pushed the same card again (live 2026-09-20:
+  // PONDER five times in eleven minutes). These are the exact rules the pasted
+  // send path runs; they are pinned offline because the send itself sits inside
+  // runOnce, past the file-sync window, with no fixture to drive it.
+
+  await test("cardSendDisposition: abandoned keeps the claim, only a rejection releases it", () => {
+    assert.deepEqual(cardSendDisposition("sent"), {
+      audit: true,
+      releaseClaim: false,
+      watchInBackground: false,
+      recordUnconfirmed: false,
+      throwFailure: false,
+    });
+    assert.deepEqual(cardSendDisposition("failed"), {
+      audit: false,
+      releaseClaim: true,
+      watchInBackground: false,
+      recordUnconfirmed: false,
+      throwFailure: true,
+    });
+    assert.deepEqual(cardSendDisposition("abandoned"), {
+      audit: false,
+      releaseClaim: false,
+      watchInBackground: true,
+      recordUnconfirmed: true,
+      throwFailure: false,
+    });
+    // The never-miss invariants, stated as invariants so a later edit has to
+    // argue with them: a card is never both audited and released, and the
+    // ambiguous outcome never releases (that release IS the duplicate).
+    for (const outcome of ["sent", "failed", "abandoned"]) {
+      const d = cardSendDisposition(outcome);
+      assert.equal(d.audit && d.releaseClaim, false, `${outcome}: never audit AND release`);
+    }
+    assert.equal(
+      cardSendDisposition("abandoned").releaseClaim,
+      false,
+      "abandoned must keep the claim — releasing it is what re-pushes the card",
+    );
+    assert.equal(
+      cardSendDisposition("abandoned").throwFailure,
+      false,
+      "abandoned is not a failure: the caller must not run its failure/retry path",
+    );
+  });
+
+  await test("unconfirmed ledger: one record per coin, capped, and removable", () => {
+    const at = 1_000_000;
+    let raw = addUnconfirmedCardSend(null, { chatId: "c1", token: "AAA", at, symbol: "AAA" });
+    assert.deepEqual(parseUnconfirmedCardSends(raw), [
+      { chatId: "c1", token: "AAA", at, symbol: "AAA" },
+    ]);
+    // The same coin abandoned twice keeps ONE record with the NEWER stamp: two
+    // records would release the same claim twice, and the second release could
+    // delete a claim taken by a later, legitimately re-pushed card.
+    raw = addUnconfirmedCardSend(raw, { chatId: "c1", token: "AAA", at: at + 5_000, symbol: "AAA" });
+    assert.equal(parseUnconfirmedCardSends(raw).length, 1);
+    assert.equal(parseUnconfirmedCardSends(raw)[0].at, at + 5_000);
+    // Per chat: the same token in another chat is its own obligation.
+    raw = addUnconfirmedCardSend(raw, { chatId: "c2", token: "AAA", at });
+    assert.equal(parseUnconfirmedCardSends(raw).length, 2);
+    assert.deepEqual(parseUnconfirmedCardSends(removeUnconfirmedCardSend(raw, "c1", "AAA")), [
+      { chatId: "c2", token: "AAA", at, symbol: null },
+    ]);
+    // Ring cap: newest kept, and the row stays a small write.
+    let ring = null;
+    for (let i = 0; i < UNCONFIRMED_CARD_MAX + 5; i++) {
+      ring = addUnconfirmedCardSend(ring, { chatId: "c1", token: `T${i}`, at: at + i });
+    }
+    const list = parseUnconfirmedCardSends(ring);
+    assert.equal(list.length, UNCONFIRMED_CARD_MAX);
+    assert.equal(list[list.length - 1].token, `T${UNCONFIRMED_CARD_MAX + 4}`);
+    assert.equal(serializeUnconfirmedCardSends(list), JSON.stringify(list));
+    // Garbage never throws and never invents a record.
+    assert.deepEqual(parseUnconfirmedCardSends("{not json"), []);
+    assert.deepEqual(
+      parseUnconfirmedCardSends('[{"token":"X"},null,{"chatId":"c","token":"Y","at":1}]'),
+      [{ chatId: "c", token: "Y", at: 1, symbol: null }],
+    );
+  });
+
+  await test("settleUnconfirmedCardSends: proof keeps the claim, silence releases it after the grace", () => {
+    const at = 1_000_000;
+    const records = [
+      { chatId: "c1", token: "DELIVERED", at, symbol: null },
+      { chatId: "c1", token: "LOST", at, symbol: null },
+      { chatId: "c1", token: "FRESH", at: at + 119_000, symbol: null },
+    ];
+    const settled = settleUnconfirmedCardSends(
+      records,
+      at + 120_000,
+      UNCONFIRMED_CARD_GRACE_MS,
+      new Set(["DELIVERED"]),
+    );
+    // Proof: the card reached the chat → keep the claim, drop the record.
+    assert.deepEqual(settled.confirmed.map((r) => r.token), ["DELIVERED"]);
+    // Grace elapsed with no proof anywhere → release (the never-miss side).
+    assert.deepEqual(settled.release.map((r) => r.token), ["LOST"]);
+    // Still inside the grace → wait. Releasing early would re-push a card the
+    // in-flight request is about to deliver.
+    assert.deepEqual(settled.kept.map((r) => r.token), ["FRESH"]);
+    // The grace boundary itself releases; one ms less does not.
+    const one = [{ chatId: "c", token: "T", at, symbol: null }];
+    assert.equal(
+      settleUnconfirmedCardSends(one, at + UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_CARD_GRACE_MS, new Set()).release.length,
+      1,
+    );
+    assert.equal(
+      settleUnconfirmedCardSends(one, at + UNCONFIRMED_CARD_GRACE_MS - 1, UNCONFIRMED_CARD_GRACE_MS, new Set()).release.length,
+      0,
+    );
+    // The reconcile's common case: no record at all (nothing to read, nothing done).
+    assert.deepEqual(settleUnconfirmedCardSends([], at, UNCONFIRMED_CARD_GRACE_MS, new Set()), {
+      confirmed: [],
+      release: [],
+      kept: [],
+    });
   });
 
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {
