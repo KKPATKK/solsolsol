@@ -601,6 +601,8 @@ tick 時發）。
 **驗收點**：deploy 後每個 5 分鐘 tick 應該見到 `profiles ≈ 24`（重用 20 ＋ make-up 4）而 `lastRawProfiles 仍 0`、`failedTotal` 仍然每 5 分鐘 +1 —— 即係「上游真係 429，但嗰分鐘唔再盲目」。
 
 **未處理（另計）**：429 本身仍然存在（~12 次/小時）；要壓落去就要降低請求頻率（例如隔一個 tick 抓一次）或者換源 —— 呢個係獨立決定，唔屬第八補。
+（呢個係 DexScreener profiles 嘅 429；**GeckoTerminal 自身嘅 429 係另一條線，而且係持續性嘅** —— 見
+`docs/gecko-429.md`。）
 
 **Deploy 後首個 5 分鐘 tick（18:11:11，version `dd1c1ec4`）— 重用生效，但揭出第二個損失**：
 

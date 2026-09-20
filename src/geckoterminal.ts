@@ -2,14 +2,46 @@ import type { AppConfig } from "./config";
 
 const BASE_URL = "https://api.geckoterminal.com/api/v2";
 /**
- * Back off ALL GeckoTerminal calls for this long after one 429. Measured
- * 2026-08-16: the API rate-limits Cloudflare Worker egress (shared IP pool)
- * with a sustained 429 on trending_pools, which also started starving
+ * Back off ALL GeckoTerminal calls for this long after the FIRST 429 in a row.
+ * Measured 2026-08-16: the API rate-limits Cloudflare Worker egress (shared IP
+ * pool) with a sustained 429 on trending_pools, which also started starving
  * new_pools. Without backoff the scanner would hit the 429 wall every
  * round; with it, one 429 pauses the feed for 5 min and it self-recovers.
  * Matches the discovery gap the re-eval pool + Birdeye backfill cover.
+ *
+ * This is the BASE of an escalation, not a flat window (see geckoBackoffMs):
+ * re-measured 2026-09-20, the worker's egress was 429ed on EVERY attempt —
+ * /debug/gecko-trending returned 429 three times out of three, and every tick's
+ * summary reported `geo 0 / geoTrend 0` — so a feed that comes back at the
+ * 5-minute mark and takes the same 429 is just paying a request per window for
+ * nothing. The window now doubles per consecutive 429 (5 → 10 → 20 → 40 → 60
+ * min cap) and resets on the first success, so the cost of a poisoned egress
+ * decays to one probe an hour instead of twelve while staying self-healing.
  */
-const GECKO_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+export const GECKO_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+/** Ceiling the doubling stops at (1 h). */
+export const GECKO_BACKOFF_MAX_MS = 60 * 60_000;
+/** Absolute ceiling, so an upstream Retry-After cannot park the feed for days. */
+export const GECKO_BACKOFF_HARD_MAX_MS = 6 * 60 * 60_000;
+/** ±10% spread, so N isolates do not all re-probe in the same second. */
+export const GECKO_BACKOFF_JITTER = 0.1;
+/**
+ * Edge-cache TTL for GeckoTerminal subrequests, in seconds (see requestInit).
+ *
+ * WHY THE CACHE IS THE REAL FIX: the 429 is app-level rate limiting on
+ * GeckoTerminal's side (`{"status":"429","title":"Rate Limited"}`) keyed on the
+ * caller's IP, and Cloudflare Worker egress is a small shared pool — so the
+ * quota is spent by other Workers before this one asks. Measured the same
+ * minute from a normal host: `new_pools` and `trending_pools` both answered 200
+ * with `cf-cache-status: HIT` (the public API serves `cache-control:
+ * max-age=30, s-maxage=60` and Cloudflare caches it). A Worker subrequest does
+ * NOT use that cache unless asked to, which is why every gecko call here was
+ * billed to the shared IP; with cacheEverything the colo cache answers instead
+ * and the origin limiter is never reached. 60s is the upstream's own s-maxage:
+ * discovery only needs a coin's pool_created_at (it is evaluated when it ages
+ * into the 80m–26h window), so a minute of staleness costs nothing.
+ */
+export const GECKO_CACHE_TTL_S = 60;
 
 export interface NewPool {
   tokenAddress: string;
@@ -20,6 +52,106 @@ export interface NewPool {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Cloudflare-only fetch options — absent from the standard RequestInit (this
+ * repo compiles without workers-types), which is why they are declared here and
+ * cast in requestInit. Ignored by any other runtime (the bot's Node entry
+ * simply drops unknown init keys).
+ */
+interface CloudflareFetchInit extends RequestInit {
+  cf?: {
+    cacheEverything?: boolean;
+    cacheTtl?: number;
+    cacheTtlByStatus?: Record<string, number>;
+  };
+}
+
+/**
+ * Parse a `Retry-After` header into ms from `nowMs`. Accepts both documented
+ * forms (delay-seconds and an HTTP-date) and returns null when the header is
+ * missing, malformed, or already in the past — the caller then falls back to
+ * its own escalated window. Pure, so the rule is unit-tested directly.
+ */
+export function parseRetryAfterMs(
+  header: string | null,
+  nowMs: number,
+): number | null {
+  if (header === null) return null;
+  const raw = header.trim();
+  if (raw.length === 0) return null;
+  if (/^\d+(\.\d+)?$/.test(raw)) {
+    const secs = Number(raw);
+    return Number.isFinite(secs) && secs > 0 ? Math.round(secs * 1000) : null;
+  }
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return null;
+  const delta = at - nowMs;
+  return delta > 0 ? delta : null;
+}
+
+/**
+ * How long to pause the feed after a 429 (pure — the escalation is asserted in
+ * scripts/test-unit.js instead of being inferred from a live 429).
+ *
+ * `consecutive429` is 1 for the first 429, so the first window is still
+ * GECKO_RATE_LIMIT_BACKOFF_MS (5 min — the behaviour the existing unit test and
+ * the docs pin), and every further 429 in the same streak doubles it up to
+ * GECKO_BACKOFF_MAX_MS. A Retry-After the API explicitly asked for wins, up to
+ * the 6h hard ceiling. Jitter spreads the fleet's next probe.
+ */
+export function geckoBackoffMs(
+  consecutive429: number,
+  retryAfterMs: number | null = null,
+  random: () => number = Math.random,
+): number {
+  const step = Math.max(1, Math.floor(consecutive429));
+  // 2**8 caps the shift; the min() below caps the value anyway.
+  const doubled = GECKO_RATE_LIMIT_BACKOFF_MS * 2 ** Math.min(step - 1, 8);
+  const base = Math.min(
+    GECKO_BACKOFF_MAX_MS,
+    Math.max(GECKO_RATE_LIMIT_BACKOFF_MS, doubled),
+  );
+  const asked =
+    retryAfterMs !== null && Number.isFinite(retryAfterMs) && retryAfterMs > base
+      ? retryAfterMs
+      : base;
+  const capped = Math.min(GECKO_BACKOFF_HARD_MAX_MS, asked);
+  const jitter = 1 + (random() * 2 - 1) * GECKO_BACKOFF_JITTER;
+  return Math.round(capped * jitter);
+}
+
+/**
+ * Per-isolate GeckoTerminal feed state, published on the tick summary (see
+ * tickprobe) so `/health` can tell "the feed is empty" from "the feed is
+ * rate-limited" without a separate probe. Before this the only signal was
+ * `summary.geo: 0 / geoTrend: 0`, which looks the same whether the API is
+ * blocked, the shape changed, or the market is quiet.
+ */
+export interface GeckoFeedStats {
+  /** True once a client was built in this isolate (the worker always does). */
+  active: boolean;
+  /** HTTP requests actually issued (backed-off calls cost 0). */
+  requests: number;
+  /** Responses that parsed as OK. */
+  ok: number;
+  /** 429s seen since the isolate booted. */
+  http429: number;
+  /** 429s in the current streak — the escalation input (0 after a success). */
+  consecutive429: number;
+  /** Subrequests the edge cache answered (`cf-cache-status: HIT`). */
+  cacheHits: number;
+  /** Upstream status of the newest request (0 = none yet). */
+  lastStatus: number;
+  /** `cf-cache-status` of the newest request (null when the header is absent). */
+  lastCacheStatus: string | null;
+  last429At: number;
+  lastOkAt: number;
+  /** Window applied by the newest 429 (0 = not backing off). */
+  backoffMs: number;
+  /** Epoch the current backoff expires at (0 = not backing off). */
+  backoffUntil: number;
+}
 
 /** Spaces out HTTP requests so we stay well under GeckoTerminal's rate limit. */
 class Throttle {
@@ -155,6 +287,34 @@ export function parseTokenSnapshot(json: unknown): GeckoTokenSnapshot | null {
 }
 
 /**
+ * The isolate's client, for telemetry only (see geckoFeedStats). The worker
+ * builds exactly one per isolate, so a module-level handle is the cheapest
+ * channel that reachable code can publish from.
+ */
+let lastClient: GeckoTerminalClient | null = null;
+
+/** Feed state of this isolate's client, or an inactive zero record. */
+export function geckoFeedStats(): GeckoFeedStats {
+  if (lastClient === null) {
+    return {
+      active: false,
+      requests: 0,
+      ok: 0,
+      http429: 0,
+      consecutive429: 0,
+      cacheHits: 0,
+      lastStatus: 0,
+      lastCacheStatus: null,
+      last429At: 0,
+      lastOkAt: 0,
+      backoffMs: 0,
+      backoffUntil: 0,
+    };
+  }
+  return lastClient.stats();
+}
+
+/**
  * Free live discovery of brand-new Solana pools (every DEX, incl. pump.fun
  * graduates) — no API key, reachable from datacenter egress. Each page holds
  * ~20 pools created within the last few minutes. This is the zero-CU
@@ -167,34 +327,112 @@ export class GeckoTerminalClient {
   private readonly throttle: Throttle;
   /** Timestamp until which all calls are skipped (after a 429). */
   private rateLimitedUntil = 0;
+  /** Telemetry (see GeckoFeedStats) — never read by any decision. */
+  private requests = 0;
+  private ok = 0;
+  private http429 = 0;
+  private consecutive429 = 0;
+  private cacheHits = 0;
+  private lastStatus = 0;
+  private lastCacheStatus: string | null = null;
+  private last429At = 0;
+  private lastOkAt = 0;
+  private backoffMs = 0;
 
   constructor(config: AppConfig) {
     this.throttle = new Throttle(config.geckoterminalRequestIntervalMs);
+    // Publish this client's feed state (see geckoFeedStats).
+    lastClient = this;
   }
 
   private rateLimited(): boolean {
     return Date.now() < this.rateLimitedUntil;
   }
 
+  /** Feed state for /health (see GeckoFeedStats). */
+  stats(): GeckoFeedStats {
+    return {
+      active: true,
+      requests: this.requests,
+      ok: this.ok,
+      http429: this.http429,
+      consecutive429: this.consecutive429,
+      cacheHits: this.cacheHits,
+      lastStatus: this.lastStatus,
+      lastCacheStatus: this.lastCacheStatus,
+      last429At: this.last429At,
+      lastOkAt: this.lastOkAt,
+      backoffMs: this.backoffMs,
+      backoffUntil: this.rateLimitedUntil,
+    };
+  }
+
   /**
-   * Shared GET: throttle-spaced, 429-aware. Returns the parsed JSON on
-   * success, null on rate-limit (setting the backoff window) or any other
-   * failure — callers degrade to [] without throwing.
+   * Fetch init for every GeckoTerminal call: JSON, a 10s transport cap, and the
+   * Cloudflare edge cache (see GECKO_CACHE_TTL_S). `cacheTtlByStatus` keeps
+   * error responses — a 429 in particular — out of the cache, so a bad minute
+   * can never be served to the next tick as if it were a fresh feed.
+   */
+  private requestInit(): CloudflareFetchInit {
+    const init: CloudflareFetchInit = {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+      cf: {
+        cacheEverything: true,
+        cacheTtl: GECKO_CACHE_TTL_S,
+        cacheTtlByStatus: {
+          "200-299": GECKO_CACHE_TTL_S,
+          "300-399": 0,
+          "400-599": 0,
+        },
+      },
+    };
+    return init;
+  }
+
+  /**
+   * Shared GET: throttle-spaced, 429-aware, cache-friendly. Returns the parsed
+   * JSON on success, null on rate-limit (escalating the backoff window) or any
+   * other failure — callers degrade to [] without throwing.
    */
   private async get(path: string): Promise<unknown> {
     if (this.rateLimited()) return null;
     try {
       const res = await this.throttle.run(() =>
-        fetch(`${BASE_URL}${path}`, {
-          headers: { Accept: "application/json" },
-          signal: AbortSignal.timeout(10_000),
-        }),
+        fetch(`${BASE_URL}${path}`, this.requestInit()),
       );
+      this.requests += 1;
+      this.lastStatus = res.status;
+      const cacheStatus = res.headers.get("cf-cache-status");
+      this.lastCacheStatus = cacheStatus;
+      if (cacheStatus !== null && /^(HIT|REVALIDATED)$/i.test(cacheStatus)) {
+        this.cacheHits += 1;
+      }
       if (res.status === 429) {
-        this.rateLimitedUntil = Date.now() + GECKO_RATE_LIMIT_BACKOFF_MS;
+        const now = Date.now();
+        this.http429 += 1;
+        this.consecutive429 += 1;
+        this.last429At = now;
+        const asked = parseRetryAfterMs(res.headers.get("retry-after"), now);
+        this.backoffMs = geckoBackoffMs(this.consecutive429, asked);
+        this.rateLimitedUntil = now + this.backoffMs;
+        console.warn(
+          `[gecko] 429 #${this.consecutive429} on ${path} — pausing the feed ${Math.round(
+            this.backoffMs / 1000,
+          )}s${asked !== null ? ` (retry-after ${Math.round(asked / 1000)}s)` : ""}`,
+        );
         return null;
       }
       if (!res.ok) return null;
+      if (this.consecutive429 > 0) {
+        console.log(
+          `[gecko] feed recovered after ${this.consecutive429} consecutive 429(s)`,
+        );
+        this.consecutive429 = 0;
+        this.backoffMs = 0;
+      }
+      this.ok += 1;
+      this.lastOkAt = Date.now();
       return res.json();
     } catch {
       return null;

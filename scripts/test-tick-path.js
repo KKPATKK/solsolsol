@@ -20,6 +20,7 @@ const {
   dbStepView,
   writeDrainView,
   drainDeferredWrites,
+  DEFERRED_WRITE_MAX_ATTEMPTS,
   deferredWriteCount,
   classifyCardSend,
   cardSendView,
@@ -93,6 +94,15 @@ installTickProbe(fakeScanner, {
     "the stamps are attached to the summary the heartbeat publishes",
   );
   assert.equal(fakeScanner.lastSummary.pushPhase, "done", "the scanner's own marker is untouched");
+  // The GeckoTerminal feed state rides the same summary: `geo: 0` cannot say
+  // whether the feed was rate-limited or the market was quiet, and the worker's
+  // telemetry block is past the file-sync window (see geckoFeedStats).
+  assert.equal(
+    fakeScanner.lastSummary.gecko?.active,
+    false,
+    "no client in this process, so the record is present and inactive",
+  );
+  assert.equal(typeof fakeScanner.lastSummary.gecko.http429, "number");
 
   // A long tick keeps the NEWEST stamps: the interesting ticks are the ones
   // that walk many phases and still end without a push, and the last step
@@ -297,27 +307,75 @@ installTickProbe(fakeScanner, {
   assert.equal(writeDrainView().at, drained.at, "and the last real drain is still described");
 
   // A deferred write that throws is counted, never rethrown at the drain: the
-  // scanner already returned, so nobody is left to catch it.
+  // scanner already returned, so nobody is left to catch it — but it must NOT
+  // be dropped. Live 2026-09-19: `writeDrain: 4 calls / 4 failures` (100%),
+  // because an un-awaited drain is cancelled when the invocation returns and
+  // its writes reject; the old code only counted them, so the token_stats
+  // bookkeeping never landed at all. The entry now stays queued (FIFO, in
+  // place) and the NEXT drain retries it — one tick of latency instead of a
+  // permanent data gap.
   clock = 20_000;
-  const angryDb = {
+  let flakyAttempts = 0;
+  const flakyDb = {
     async updateTokenMaxMcaps() {
+      flakyAttempts += 1;
       clock += 40;
-      throw new Error("turso 522");
+      // Fails exactly once, the way a cancelled invocation's write does.
+      if (flakyAttempts === 1) throw new Error("turso 522");
     },
   };
-  const angryTick = {
+  const flakyTick = {
     lastSummary: {},
     markPhase() {},
     async runOnce() {
-      await angryDb.updateTokenMaxMcaps([1]);
+      await flakyDb.updateTokenMaxMcaps([1]);
     },
   };
-  installTickProbe(angryTick, { db: angryDb, deferWrites: true }, now);
-  await angryTick.runOnce();
+  installTickProbe(flakyTick, { db: flakyDb, deferWrites: true }, now);
+  await flakyTick.runOnce();
   const failed = await drainDeferredWrites();
-  assert.equal(failed.calls, 1);
+  assert.equal(failed.calls, 1, "the failed write is attempted once per drain");
   assert.equal(failed.failures, 1, "a failed deferred write is counted");
   assert.equal(failed.totals.failures, 1, "and rolled into the totals");
+  assert.equal(failed.pending, 1, "and it stays queued instead of being dropped");
+  assert.equal(deferredWriteCount(), 1, "the queue still holds it");
+  // The retry lands on the next drain, without the tick that queued it.
+  const retried = await drainDeferredWrites();
+  assert.equal(retried.calls, 1, "the next drain retries the same call");
+  assert.equal(retried.failures, 0, "and this time it lands");
+  assert.equal(flakyAttempts, 2, "the real write ran a second time");
+  assert.equal(retried.pending, 0, "the queue drains clean");
+
+  // Bounded: a write that keeps failing is retried DEFERRED_WRITE_MAX_ATTEMPTS
+  // times and then dropped, so a database that is down for hours cannot grow
+  // the in-memory queue without limit.
+  clock = 30_000;
+  let deadAttempts = 0;
+  const deadDb = {
+    async recordTokenStatsMany() {
+      deadAttempts += 1;
+      clock += 10;
+      throw new Error("turso down");
+    },
+  };
+  const deadTick = {
+    lastSummary: {},
+    markPhase() {},
+    async runOnce() {
+      await deadDb.recordTokenStatsMany([1]);
+    },
+  };
+  installTickProbe(deadTick, { db: deadDb, deferWrites: true }, now);
+  await deadTick.runOnce();
+  for (let attempt = 1; attempt < DEFERRED_WRITE_MAX_ATTEMPTS; attempt += 1) {
+    const tryView = await drainDeferredWrites();
+    assert.equal(tryView.failures, 1, `attempt ${attempt} fails again`);
+    assert.equal(tryView.pending, 1, `attempt ${attempt} keeps the entry queued`);
+  }
+  const gaveUp = await drainDeferredWrites();
+  assert.equal(gaveUp.pending, 0, "the cap drops it rather than queueing forever");
+  assert.equal(gaveUp.failures, 1, "the last failure is still counted");
+  assert.equal(deadAttempts, DEFERRED_WRITE_MAX_ATTEMPTS, "exactly the capped attempts");
 
   // A write error must still reach the scanner when the caller did NOT ask for
   // the deferral (deferWrites is off by default).

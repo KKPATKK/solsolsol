@@ -47,6 +47,84 @@ completion flush 係 `worker.ts:1837+` 嘅一個 **12.4KB batch**（`heartbeat` 
 token_stats bookkeeping（`updateTokenMaxMcaps`／`recordTokenStatsMany`）一路冇落地。
 唔影響推送，但係數據缺損。
 
+> **2026-09-20 已修（窗口內）**：根因唔係寫入本身，而係 drain **唔被 await**（見下節
+> 「writeDrain 100% 失敗」）。`src/tickprobe.ts` 嘅 queue 而家改成**原地**走：一個 deferred write
+> 只會喺**真正落地之後**才離開 queue，失敗就留住（FIFO），由**下一個 tick 嘅 drain**再試，上限
+> `DEFERRED_WRITE_MAX_ATTEMPTS = 3` 次之後才丟（idempotent 寫入，所以重試安全）。
+> 即係嗰 4/4 由「永久數據缺損」變成「遲一個 tick 落地」；`writeDrain.pending` 會顯示仲等緊嘅數量。
+> 仲有一塊**窗口外**嘅根治（cron invocation 冇 waitUntil）——可直接貼嘅 diff 就喺下面一節。
+
+### writeDrain 100% 失敗：根因同根治（窗口外 patch）
+
+**根因（代碼路徑）**：tick 完結時 worker 係 `void drainDeferredWrites()` —— **唔 await**。
+`fetch` 嘅 promise 只要 handler 一 return 就會被取消，所以嗰批 token_stats 寫入 reject
+（transport abort 或者 `wrapClientWithHardWall` 嘅 3.0s 硬牆），而舊 code 只係**計數**。
+Cron 路徑最明顯：`scheduled(_event, env)` **冇第三個參數**，即係連 `ctx.waitUntil` 都冇，
+所以個 invocation 一完就殺 —— 嗰個 isolate 之後自己睇就係 `calls 4 / failures 4`。
+（HTTP 路徑唔同：`maybeRunScanIfStale` 已經入咗 `ctx.waitUntil`，所以佢嘅 drain 通常落得到 ——
+即係同一個 isolate 睇 `/health` 會見到 `failures 0`，令人以為已經好返。）
+
+**已落地嘅一半（窗口內，`src/tickprobe.ts`）**：queue 改成**原地**走，entry 只喺落地之後
+才 shift；失敗就留住由下一個 drain 再試（`DEFERRED_WRITE_MAX_ATTEMPTS = 3`，之後才丟）。
+即係「invocation 被殺 → 永久冇落 row」變成「下一個 tick 落返」。驗收：`writeDrain.failures`
+升嘅同時 `writeDrain.pending` 會係 1，而下一分鐘嗰個 tick 嘅 drain 會清返 0；
+`dbSteps.recordTokenStatsMany.calls` 應該跟住真寫入升（唔再係「有 calls 冇 row」）。
+
+**仲要人手貼嘅一半（窗口外）**：令 cron 嘅 invocation 自己保命。三塊，必須一齊貼
+（只貼 B 會攞唔到 `tickWaitUntil`）。
+
+**Patch A —— module state（`worker.ts`，`interface ExecutionContextLike` 之後）**
+
+```ts
+/** Minimal ExecutionContext shape — avoids pulling in workers-types. */
+interface ExecutionContextLike {
+  waitUntil(promise: Promise<unknown>): void;
+}
++
++/**
++ * The invocation's waitUntil, when the handler driving the tick has one. The
++ * HTTP fallback always has (`maybeRunScanIfStale` is itself a waitUntil);
++ * `scheduled` gets one only from its third argument, which is why the cron
++ * path needs Patch C. The tick's deferred token_stats writes are fired WITHOUT
++ * being awaited, and an un-awaited promise is cancelled the moment the handler
++ * returns — measured 2026-09-19 as `writeDrain` 4 calls / 4 failures (100%),
++ * i.e. the bookkeeping never landed. Holding the drain promise here keeps the
++ * isolate alive for it WITHOUT adding its cost to the tick itself.
++ */
++let tickWaitUntil: ((promise: Promise<unknown>) => void) | null = null;
+```
+
+**Patch B —— 個 drain 呼叫（`worker.ts` ~1741）**
+
+```ts
+-            void drainDeferredWrites().then(() => flushObservedLiquidity());
++            const drained = drainDeferredWrites().then(() => flushObservedLiquidity());
++            if (tickWaitUntil) tickWaitUntil(drained);
++            else void drained;
+```
+
+**Patch C —— cron handler（`worker.ts` ~3941）**
+
+```ts
+-  async scheduled(_event: ScheduledEventLike, env: Env): Promise<void> {
+-    scheduledTicks++;
++  async scheduled(
++    _event: ScheduledEventLike,
++    env: Env,
++    ctx: ExecutionContextLike,
++  ): Promise<void> {
++    // Keep the invocation open for the tick's deferred writes (see
++    // tickWaitUntil): a fire-and-forget drain is cancelled when the handler
++    // returns, which is the 100%-failure shape measured above.
++    tickWaitUntil = (promise) => ctx.waitUntil(promise);
++    scheduledTicks++;
+```
+
+**驗收點（貼完 + deploy）**：一個**只由 cron 驅動**嘅 isolate 應該見到
+`writeDrain.failures` 唔再等於 `calls`；`writeDrain.pending` 應該幾乎永遠係 0（貼完之後
+write 唔再被殺，所以連 retry 都唔需要）。相反若果 `pending` 經常係 1–2，即係寫入真係慢
+（Turso）而唔係 invocation 被殺 —— 兩種情況喺同一個 view 分得開。
+
 ## 今次改嘅（窗口內，`src/worker.ts`）
 
 **後繼 recovery 嘅每個 DB await 都上界。**

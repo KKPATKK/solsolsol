@@ -1,3 +1,5 @@
+import { geckoFeedStats } from "./geckoterminal";
+
 /*
  * Per-tick probe for the scan (2026-09-19).
  *
@@ -51,6 +53,15 @@
  * (`tickActive`): the same Db handle also serves callers outside a tick — the
  * worker's own backfill endpoint awaits its seed before responding — and those
  * keep their normal, immediate contract.
+ *
+ * 2026-09-20: a deferred write that FAILED used to be counted and dropped
+ * (live measurement: `writeDrain` 4 calls / 4 failures = 100%, because an
+ * un-awaited drain is cancelled when the invocation returns and its writes
+ * reject). The queue now owns the retry — an entry leaves it only once it has
+ * landed — so a cancelled drain costs one tick of latency instead of a
+ * permanent gap in token_stats (see drainDeferredWrites). The same tick also
+ * publishes the GeckoTerminal feed's state onto the summary, since `geo: 0`
+ * could not say whether the feed was rate-limited (see geckoFeedStats).
  */
 
 /** One phase stamp, tick-relative ms (see Scanner.markPhase). */
@@ -147,9 +158,24 @@ export interface WriteDrainView {
   at: number;
   /** Deferred calls whose real write threw. */
   failures: number;
+  /**
+   * Calls still waiting after this drain (0 = the queue is empty). A failed
+   * write is NOT dropped: it stays at the head of the queue and is retried by
+   * the next drain, so `failures > 0` with `pending > 0` reads as "the last
+   * tick's batch did not land yet", not "lost".
+   */
+  pending: number;
   /** Cumulative since the isolate booted, so the effect is readable either way. */
   totals: { calls: number; ms: number; failures: number };
 }
+
+/**
+ * How many times one deferred write may fail before it is dropped. The calls
+ * are idempotent (INSERT OR IGNORE / raise-only UPDATE), so retrying is free of
+ * consequence; the bound exists so a database that is down for hours cannot
+ * grow the in-memory queue without limit.
+ */
+export const DEFERRED_WRITE_MAX_ATTEMPTS = 3;
 
 /**
  * What the tick did with the card its chain reached — the counter this whole
@@ -206,8 +232,21 @@ let cardSend: CardSendView = {
  */
 let dbClock: () => number = () => Date.now();
 
+/**
+ * One deferred write waiting for the drain. `attempts` counts FAILED runs: an
+ * entry leaves the queue when it lands, or after DEFERRED_WRITE_MAX_ATTEMPTS
+ * (see drainDeferredWrites for why the queue, not the batch, owns the state).
+ */
+interface DeferredCall {
+  name: string;
+  run: () => Promise<unknown>;
+  attempts: number;
+}
+
 /** Writes waiting for the drain, in call order. */
-let queue: Array<{ name: string; run: () => Promise<unknown> }> = [];
+let queue: DeferredCall[] = [];
+/** One drain at a time — the queue is walked in place (see drainDeferredWrites). */
+let draining = false;
 /** Cumulative per-method timing for this isolate. */
 const steps = new Map<string, DbStepView>();
 let drain: WriteDrainView = {
@@ -215,6 +254,7 @@ let drain: WriteDrainView = {
   ms: 0,
   at: 0,
   failures: 0,
+  pending: 0,
   totals: { calls: 0, ms: 0, failures: 0 },
 };
 /** DB handles already wrapped (double wrapping would double every write). */
@@ -332,35 +372,73 @@ export function deferredWriteCount(): number {
  * to catch for it.
  */
 export async function drainDeferredWrites(): Promise<WriteDrainView> {
-  const pending = queue;
-  queue = [];
-  if (pending.length === 0) {
-    // Nothing was queued: report the empty batch without erasing the last real
-    // drain's stamp, so a reader can tell "nothing to do" from "never drained".
-    drain = { ...drain, calls: 0, ms: 0, failures: 0 };
-    return writeDrainView();
-  }
+  // One drain at a time. The queue is now edited IN PLACE (see below) rather
+  // than swapped out, so a second caller — a slow drain that overlaps the next
+  // tick's — must not walk the same entries; it gets the current view instead.
+  if (draining) return writeDrainView();
+  draining = true;
   const startedAt = dbClock();
+  let calls = 0;
   let failures = 0;
-  for (const call of pending) {
-    try {
-      await call.run();
-    } catch (err) {
-      failures += 1;
-      console.error(
-        `[tickprobe] deferred ${call.name} failed:`,
-        err instanceof Error ? err.message : err,
-      );
+  try {
+    if (queue.length === 0) {
+      // Nothing was queued: report the empty batch without erasing the last
+      // real drain's stamp, so a reader can tell "nothing to do" from "never
+      // drained".
+      drain = { ...drain, calls: 0, ms: 0, failures: 0, pending: 0 };
+      return writeDrainView();
     }
+    // Call order matters (the scanner registers a coin before it raises its max
+    // mcap), and an entry leaves the queue only once it has LANDED. That makes
+    // a drain cut short by the invocation's end hand the rest of the batch —
+    // including the call that was in flight — to the next tick's drain.
+    //
+    // WHY (measured 2026-09-19): the drain is fired WITHOUT being awaited, and
+    // a fire-and-forget promise is cancelled when the invocation returns, so
+    // its writes rejected at the transport or hard-wall timeout and the old code
+    // merely COUNTED them — `writeDrain: 4 calls / 4 failures` (100%), i.e.
+    // the token_stats bookkeeping never landed at all. Retrying the failed
+    // entry on the next drain turns that permanent data gap into one tick of
+    // latency (writeDrain.pending keeps it visible while it waits).
+    while (queue.length > 0) {
+      const call = queue[0];
+      calls += 1;
+      try {
+        await call.run();
+        queue.shift();
+      } catch (err) {
+        failures += 1;
+        call.attempts += 1;
+        const message = err instanceof Error ? err.message : err;
+        if (call.attempts >= DEFERRED_WRITE_MAX_ATTEMPTS) {
+          queue.shift();
+          console.error(
+            `[tickprobe] deferred ${call.name} failed ${call.attempts}x — dropping it:`,
+            message,
+          );
+        } else {
+          console.error(
+            `[tickprobe] deferred ${call.name} failed (attempt ${call.attempts}/${DEFERRED_WRITE_MAX_ATTEMPTS}) — kept for the next drain:`,
+            message,
+          );
+        }
+        // Stop the batch here: the database is what just failed, so another
+        // round trip would only burn what is left of this invocation.
+        break;
+      }
+    }
+  } finally {
+    draining = false;
   }
   const ms = dbClock() - startedAt;
   drain = {
-    calls: pending.length,
+    calls,
     ms,
     at: dbClock(),
     failures,
+    pending: queue.length,
     totals: {
-      calls: drain.totals.calls + pending.length,
+      calls: drain.totals.calls + calls,
       ms: drain.totals.ms + ms,
       failures: drain.totals.failures + failures,
     },
@@ -376,7 +454,15 @@ export function resetTickProbe(): void {
   queue = [];
   steps.clear();
   dbClock = () => Date.now();
-  drain = { calls: 0, ms: 0, at: 0, failures: 0, totals: { calls: 0, ms: 0, failures: 0 } };
+  draining = false;
+  drain = {
+    calls: 0,
+    ms: 0,
+    at: 0,
+    failures: 0,
+    pending: 0,
+    totals: { calls: 0, ms: 0, failures: 0 },
+  };
   cardSend = { sent: 0, cut: 0, deferred: 0, lastCutAt: 0, lastCutMs: 0 };
 }
 
@@ -414,6 +500,7 @@ function wrapDbMethod(
     }
     queue.push({
       name,
+      attempts: 0,
       run: async () => {
         const at = dbClock();
         try {
@@ -510,6 +597,14 @@ export function installTickProbe(
         // already serializes.
         summary.cardSend = cardSendView();
         summary.deliveryDuplicates = deliveryDuplicatesView();
+        // GeckoTerminal's feed state (src/geckoterminal.ts). The summary's own
+        // `geo` / `geoTrend` counts say the feed returned nothing; this says
+        // WHY — a 429 streak, the backoff window it armed, and whether the
+        // Cloudflare edge cache is answering instead of the rate-limited
+        // origin. Needed because the 2026-09-20 measurement (worker egress
+        // 429ed on every attempt, `geo 0 / geoTrend 0` on every tick) was
+        // otherwise indistinguishable from a quiet market.
+        summary.gecko = geckoFeedStats();
       }
       try {
         hooks.onTickEnd?.(target.lastSummary);

@@ -15,7 +15,7 @@ const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("..
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
-const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../dist/geckoterminal.js");
+const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, GECKO_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
@@ -442,6 +442,183 @@ async function main() {
       release: [],
       kept: [],
     });
+  });
+
+  // ---------- hand-paste drift guard (out-of-window patches) ----------
+  //
+  // Three of the four fixes in docs/scan-completion-loss.md § "可直接貼上嘅窗口外
+  // patch" sit past the file-sync window, so a human copies them in by hand.
+  // The dangerous state is a PARTIAL paste: the three-state send without the
+  // worker-side reconcile leaves an abandoned card's claim held forever (a coin
+  // whose card truly failed is then never pushed again — the one thing the
+  // operator forbids), and the race clamp on its own changes nothing while
+  // still costing scans. So: either the behavioural patches are all in the
+  // source, or none are. Anything in between fails HERE, with a message that
+  // names what is missing, instead of silently shipping a half-applied fix.
+
+  await test("out-of-window patches: pasted all together, or not at all", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const scannerSrc = read("src/scanner.ts");
+    const workerSrc = read("src/worker.ts");
+    const pushwatchSrc = read("src/pushwatch.ts");
+
+    const applied = {
+      "patch 1 (race floor clamp)": workerSrc.includes("constscanRaceMs=Math.max(0,Math.min("),
+      "patch 2 (three-state send)": scannerSrc.includes("cardSendDisposition(raced.status)"),
+      "patch 3 (reconcile function)": workerSrc.includes(
+        "asyncfunctionreconcileUnconfirmedCardSends",
+      ),
+      "patch 3 (reconcile called)": workerSrc.includes("awaitreconcileUnconfirmedCardSends("),
+      "patch 3 (reconcile imports)":
+        workerSrc.includes("parseUnconfirmedCardSends") &&
+        workerSrc.includes("UNCONFIRMED_CARD_GRACE_MS"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      // The documented pre-paste state: nothing landed, so there is no drift
+      // to guard and nothing to fail. (Everything below is about a HALF-paste.)
+      console.log(
+        "  ℹ out-of-window behavioural patches not pasted yet — see docs/scan-completion-loss.md",
+      );
+      return;
+    }
+    const missing = Object.entries(applied)
+      .filter(([, v]) => !v)
+      .map(([k]) => k);
+    assert.equal(
+      missing.length,
+      0,
+      `partial paste is unsafe — missing: ${missing.join(", ")} (see docs/scan-completion-loss.md)`,
+    );
+    // All in: the two-state send must be GONE (keeping it would leave two send
+    // paths and the old cut→unclaim→re-push generator intact), and the heal
+    // gate must honour the record or a delivered-but-abandoned card gets a
+    // make-up card mailed on top of it.
+    assert.equal(
+      scannerSrc.includes("cut.cardSendTimeout=true"),
+      false,
+      "the two-state cut path must be replaced, not kept alongside the new one",
+    );
+    assert.equal(
+      pushwatchSrc.includes("unconfirmed.has(m.token)"),
+      true,
+      "the heal gate must honour the unconfirmed-card record",
+    );
+    console.log("  ℹ out-of-window behavioural patches all present — three-state send is live in source");
+  });
+
+  // ---------- GeckoTerminal 429: the cache is the fix, the backoff the net ---
+  //
+  // Measured 2026-09-20: the worker's egress was 429ed on every attempt (three
+  // probes, `{"status":"429","title":"Rate Limited"}`) while the same public
+  // URLs answered 200 with `cf-cache-status: HIT` from a normal host. The limiter
+  // is per-IP and Cloudflare Worker egress is a shared pool, so the fix is to
+  // let the colo cache answer the subrequest; the escalating backoff is the
+  // fallback for when it cannot.
+
+  await test("GeckoTerminalClient: every call asks for the Cloudflare edge cache", async () => {
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, init) => {
+      seen.push({ url: String(url), cf: init && init.cf });
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "cf-cache-status": "HIT" },
+      });
+    };
+    try {
+      const client = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+      await client.fetchNewPools(1);
+      assert.equal(seen.length, 1, "one call, one request");
+      assert.equal(seen[0].cf?.cacheEverything, true, "the subrequest must join the edge cache");
+      assert.equal(seen[0].cf?.cacheTtl, GECKO_CACHE_TTL_S, "for the upstream's own s-maxage window");
+      assert.equal(
+        seen[0].cf?.cacheTtlByStatus?.["400-599"],
+        0,
+        "an error response (a 429!) must never be cached",
+      );
+      assert.ok(
+        GECKO_CACHE_TTL_S >= 30 && GECKO_CACHE_TTL_S <= 300,
+        "the TTL stays in the upstream's freshness band",
+      );
+      const stats = client.stats();
+      assert.equal(stats.active, true);
+      assert.equal(stats.requests, 1);
+      assert.equal(stats.ok, 1, "a cached 200 counts as an OK response");
+      assert.equal(stats.cacheHits, 1, "and the HIT is counted (this is how the fix is verified live)");
+      assert.equal(geckoFeedStats().cacheHits, 1, "the isolate publishes this client's state");
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("GeckoTerminalClient: consecutive 429s escalate the pause; a success resets it", async () => {
+    const origFetch = global.fetch;
+    let mode = "429";
+    global.fetch = async () =>
+      mode === "429"
+        ? new Response(JSON.stringify({ status: { error_code: 429 } }), { status: 429 })
+        : new Response(JSON.stringify({ data: [] }), { status: 200 });
+    try {
+      const client = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+      const t0 = Date.now();
+      await client.fetchNewPools(1);
+      const first = client.stats();
+      assert.equal(first.http429, 1);
+      assert.equal(first.consecutive429, 1, "the streak is what drives the escalation");
+      assert.ok(
+        first.backoffUntil - t0 >= GECKO_RATE_LIMIT_BACKOFF_MS * 0.85,
+        `the first window is still the 5-minute base (got ${first.backoffUntil - t0}ms)`,
+      );
+      // Backed off: neither endpoint may spend a request.
+      await client.fetchTrendingPools(20);
+      assert.equal(client.stats().requests, 1, "a backed-off call must not spend a request");
+      // Expire the window and 429 again: the next window is longer.
+      client.rateLimitedUntil = Date.now() - 1;
+      await client.fetchNewPools(1);
+      const second = client.stats();
+      assert.equal(second.consecutive429, 2);
+      assert.ok(second.backoffMs > first.backoffMs, "the second 429 doubles the pause");
+      assert.ok(
+        second.backoffMs <= GECKO_BACKOFF_MAX_MS * 1.1 + 1,
+        "and never past the configured ceiling",
+      );
+      // A success clears the streak, so a later 429 starts from the base again.
+      client.rateLimitedUntil = Date.now() - 1;
+      mode = "200";
+      await client.fetchNewPools(1);
+      const healed = client.stats();
+      assert.equal(healed.consecutive429, 0);
+      assert.equal(healed.backoffMs, 0, "the escalation is retired on recovery");
+      assert.ok(healed.lastOkAt > 0);
+      assert.equal(healed.ok, 1);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("geckoBackoffMs / parseRetryAfterMs: Retry-After wins, capped", () => {
+    const flat = () => 0.5; // deterministic: no jitter
+    assert.equal(geckoBackoffMs(1, null, flat), GECKO_RATE_LIMIT_BACKOFF_MS);
+    assert.equal(geckoBackoffMs(2, null, flat), GECKO_RATE_LIMIT_BACKOFF_MS * 2);
+    assert.equal(geckoBackoffMs(9, null, flat), GECKO_BACKOFF_MAX_MS, "the doubling stops at the ceiling");
+    // An explicit Retry-After wins when it is LONGER, but cannot park the feed
+    // past the hard cap; when it is shorter, the escalation still applies (a
+    // 429 is a 429 whatever the header says).
+    assert.equal(geckoBackoffMs(1, 20 * 60_000, flat), 20 * 60_000);
+    assert.equal(geckoBackoffMs(1, 24 * 3600_000, flat), GECKO_BACKOFF_HARD_MAX_MS);
+    assert.equal(geckoBackoffMs(3, 1000, flat), GECKO_RATE_LIMIT_BACKOFF_MS * 4);
+    const now = Date.UTC(2026, 8, 20, 7, 0, 0);
+    assert.equal(parseRetryAfterMs("120", now), 120_000, "delay-seconds form");
+    assert.equal(parseRetryAfterMs(new Date(now + 90_000).toUTCString(), now), 90_000, "HTTP-date form");
+    assert.equal(parseRetryAfterMs("garbage", now), null);
+    assert.equal(parseRetryAfterMs(null, now), null);
+    assert.equal(parseRetryAfterMs("0", now), null, "an already-expired answer is not a window");
   });
 
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {
