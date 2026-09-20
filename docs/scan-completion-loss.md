@@ -270,6 +270,12 @@ console 會出現 `[worker] forgot N deferred obligation(s) already delivered �
 而 gauge 就跟着「保留落嚟嗰個列表」嘅長度 → 不變式 `pending === pendingTokens.length`
 喺兩個分支都成立。
 
+**讀側亦要推導（deploy 後即刻量到嘅缺口）**：第一版只改寫入路徑，02:41:37Z deploy，02:44:50Z 讀
+`/health` 仍然係 **7 vs 5** —— 因為對上一次寫入（02:23:49Z）早於修正，而**冇 delta 嘅 tick
+只會照抄行嘅值**（`loadPushDeferralSnapshot` = init 時嘅鏡像），即係舊行會一直服務落去。
+所以鏡像亦改為**由列表推導 gauge**（`loadPushDeferralSnapshot`，同一個不變式）：舊行一經讀出就
+唔可能再發布一個同自己列表唔一致嘅 backlog。事件 ring 亦係同一個數。
+
 **驗收點**：任何讀數都應該 `deferral.pending === deferral.pendingTokens.length`；出現過刪除嘅 tick 之後
 （console 有 `[worker] forgot N …`）唔應該再見到 7 vs 5 嗰種組合。
 
