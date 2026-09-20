@@ -449,9 +449,19 @@ async function dropDeliveredPendings(
  * on exactly the milestone the counters exist to prove.
  */
 async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<void> {
-  // Called after the completion flush; keep the expensive telemetry reads
-  // here rather than on the scan's pre-race path.
-  await syncPostScanTelemetry();
+  // Called after the completion flush; keep the expensive telemetry reads here
+  // rather than on the scan's pre-race path.
+  //
+  // ORDER MATTERS, and the duplicate guard is why. This function is raced on
+  // the tick's tail with `min(DEFERRAL_SYNC_BOUND_MS, remainingFlushMs())`, and
+  // syncPostScanTelemetry's throttled ledger sync is itself bounded at 900ms —
+  // so when the duplicate guard sat AFTER it, a tick where that throttle fired
+  // never reached the guard at all: live 2026-09-20 the two delivered-but-owed
+  // tokens `DFQHUegJW…` / `BmnGRH8N1…` stayed pending across two deploys and
+  // four minutes of ticks even though the rule matches them (verified by replaying
+  // the live pending list against the live watch rows offline). The guard now
+  // runs FIRST (one parallel round trip), applies its in-memory effect
+  // immediately, and persists the shrink before the telemetry that starved it.
   if (!db) return;
   // Held-back candidates: the tick's own gap, counted once per completed
   // summary (see heldBackCandidates — the derivation, and why it is a lower
@@ -491,6 +501,33 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
       scanner?.seedDeferredTokens(owedPending);
     }
   };
+  // Apply it NOW rather than waiting for the delta path below: the seed and the
+  // published list must reflect the drop even on a tick whose write never lands
+  // (that in-memory half is what actually stops the duplicate push — the write
+  // only stops a later RECYCLE from re-seeding it).
+  refreshMirror();
+  if (stale.length > 0) {
+    // Persist the shrunken pending list before any other round trip on this
+    // tail. Zero deltas on purpose: this write carries the drop, not counters,
+    // and the normal delta path below may still follow with its own.
+    try {
+      const shrunk = nextPushDeferralSnapshot(
+        raw,
+        { deferred: 0, recovered: 0, stalled: 0, pending: owedPending.length },
+        Date.now(),
+        { owner: SCAN_LOCK_OWNER, ...totals },
+        owedPending,
+      );
+      await db.setWorkerState(PUSH_DEFERRAL_STATE_KEY, JSON.stringify(shrunk));
+      pushDeferralSnapshot = shrunk;
+    } catch (err) {
+      console.warn(
+        "[worker] deferral shrink write failed (next tick re-offers it):",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  await syncPostScanTelemetry();
   const cursorDelta = pushDeferralDelta(pushDeferralBaseline, totals);
   // The held-back half rides its own pending delta (see stalledUnflushed), and
   // that is what makes a chain-deferral-only tick persist at all: cursorDelta
