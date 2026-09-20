@@ -488,6 +488,41 @@ export function deliveredCardTokens(
 }
 
 /**
+ * Tokens the audit ring proves a TRACKER card (a follow-up alert) reached the
+ * chat.
+ *
+ * This is the proof half of the tracker's own three-state send (see
+ * cardSendDisposition and src/pushwatch.ts): a 💧 drain card cut by the send
+ * deadline keeps its row's terminal transition and leaves an unconfirmed
+ * record, and the settle needs to know whether the card got there before it
+ * decides to re-announce it. The `followup` kind is written by the tracker
+ * itself, right after Telegram returned a message_id, so an entry is hard
+ * proof for exactly the card this question is about — which is why the
+ * initial-card proof (deliveredCardTokens) cannot be reused: it answers a
+ * different question ("was a FIRST card delivered?") over a DIFFERENT kind
+ * whitelist, and a tracker follow-up is deliberately not one of those.
+ *
+ * Pure and exported: the read that feeds it is a durable round trip, so the
+ * RULE is what the unit tests pin.
+ */
+export function deliveredFollowupTokens(
+  audit: ReadonlyArray<{ token?: string | null; kind?: string | null }>,
+): string[] {
+  if (audit.length === 0) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of audit) {
+    const token = entry?.token;
+    if (typeof token !== "string" || token.length === 0) continue;
+    if (entry.kind !== "followup") continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+  }
+  return out;
+}
+
+/**
  * Tokens the delivery audit shows Telegram accepted as a FRESH card more than
  * once — the duplicate the operator reports by hand (2026-09-20: "PONDER
  * 10:48, then 10:57, 11:01, 11:03, 11:08" HKT).
@@ -563,6 +598,26 @@ export function duplicateInitialTokens(
  * the offline harness cannot drive, so the RULES are what the tests pin.
  */
 export const UNCONFIRMED_CARD_STATE_KEY = "unconfirmed_card_sends";
+
+/**
+ * The TRACKER's own unconfirmed ring: the same three-state discipline (see
+ * UNCONFIRMED_CARD_STATE_KEY), a different claim to settle.
+ *
+ * The initial card's `abandoned` disposition KEEPS the seen_tokens claim and,
+ * unproven after the grace, RELEASES it so a later scan re-pushes the coin. The
+ * tracker's terminal card (the 💧 drain alert, the only one that stops
+ * tracking) has a different claim — the row's own (last_state, last_alert_at) —
+ * so its release is a RE-ARM: back to ACTIVE with the alert clock cleared, and
+ * the next check re-announces the card instead of a scan re-pushing a coin that
+ * is already in the chat.
+ *
+ * Two different rows, two different settles, so they must not share a ring: the
+ * worker's reconcile may only ever touch the first, the tracker's own pass only
+ * ever touches this one, and neither can silently cancel the other's pending
+ * decision (a settle that swallowed the other side's record would strand a coin
+ * as pushed-with-no-card).
+ */
+export const UNCONFIRMED_TERMINAL_STATE_KEY = "unconfirmed_terminal_cards";
 
 /**
  * Ring cap. A cut is rare once the reserve gives the send a real slice, so more

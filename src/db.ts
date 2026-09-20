@@ -2050,6 +2050,8 @@ export class Db {
       symbol: string | null;
       messageId: number;
       mcapAtPush?: number;
+      /** "initial" (scanner) | "followup" (tracker) | … — see deferrallog. */
+      kind?: string;
       at: number;
     }>
   > {
@@ -2797,6 +2799,36 @@ export class Db {
     const res = await this.get().execute({
       sql: "UPDATE push_watch SET last_state = ? WHERE token = ?",
       args: [state, token],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
+  /**
+   * Re-arm a row whose TERMINAL card (the 💧 drain card — the only alert that
+   * stops tracking) was never PROVEN delivered.
+   *
+   * The tracker now treats a cut terminal send the way the initial-card path
+   * does (deferrallog.cardSendDisposition("abandoned")): it stops waiting on a
+   * request that may already be in the chat, KEEPS the terminal transition (a
+   * card that says 停止追蹤 must not leave the row ACTIVE with its cooldown
+   * unarmed — live 2026-09-20: Lobby's 💧 card arrived while the row stayed
+   * live and re-alertable), and records the unknown delivery durably. This is
+   * the other half of that rule: once the record ages out of its grace with no
+   * audit proof, the card may have been lost, so the row goes back to ACTIVE
+   * with its alert clock cleared and `last_checked` zeroed — the very next pass
+   * re-evaluates it (front of the rotation) and re-announces the same card.
+   * Deferring the re-announce instead of rolling back immediately is the whole
+   * point: the immediate version re-sent cards that were already in flight.
+   *
+   * Guarded on `last_state = 'rug'`, so it can never resurrect a row the user
+   * silenced (🔕 unwatched) or one a concurrent isolate already tombstoned
+   * (expired) — those are terminal for another reason and must stay quiet.
+   * Returns false when no such row matched (pruned, or it moved on).
+   */
+  async rearmPushWatchAlert(token: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: "UPDATE push_watch SET last_state = NULL, last_alert_at = 0, last_checked = 0\n            WHERE token = ?\n              AND last_state = 'rug'",
+      args: [token],
     });
     return Number(res.rowsAffected ?? 0) > 0;
   }

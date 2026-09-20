@@ -104,17 +104,35 @@ tracker 只將 `comparableLiquidity(pair)` 交畀規則（非 DexScreener → `n
 （~1,746 行）超出平台檔案編輯窗口，所以以真 unified diff 落地：
 `docs/patches/liq-source-guard.patch`（`git apply`，已 apply 且 `git apply --check` 通過）。
 
+**後續（2026-09-20，同一修正嘅第二半 —— 推播閘門）**：`scanner.ts` `matchCoins` 都係食緊跨源數字，
+`const liquidityUsd = pair.liquidity.usd ?? 0` 直接餵 `minLiquidityUsd` 同 `mcapLiqRatioMax`，
+即係 Jupiter 腿 tick 嚴格一倍。兩條規則而家讀 `gateLiquidityUsd(pair)`：
+
+- 可比腿（DexScreener／未標記）→ 照舊判斷：**真正嘅 0 同「可比腿冇讀數」都仍然當 $0 池深**，
+  乾池唔會因此放過。
+- 唔可比腿（Jupiter／Gecko）→ `null` = **唔判斷**（fail-open，同其他閘門「missing data never judges」
+  一致）。幣留喺 re-eval pool，下一個 DexScreener 腿嘅 tick 照常判 → 代價係「遲一個 tick」，唔係誤判。
+
+「兩條腿唔可比」同「可比腿冇讀數」嘅分別用新導出嘅 `liquidityIsComparable(pair)` 判
+（`comparableLiquidity` 亦都改用佢），唔會喺兩處各自重寫一次規則。
+
+同樣超出窗口，落地為 `docs/patches/liq-gate-source-guard.patch`（`git apply`，已 apply）。
+
 ---
 
 ## 4. 驗收
 
-- `npm run test:unit` → **222 passed / 0 failed**，新增三個測試：
+- `npm run test:unit` → **223 passed / 0 failed**，新增四個測試：
   - `comparableLiquidity: only DexScreener's metric may face a USD-level rule`
   - `push-watch: a Jupiter-sourced reading can neither rug nor crash a live coin`
     （釘死「原始數字 = 出卡」而「guard 後 = 無卡」；同一數字但 `feedSource: "dexscreener"` 仍然 rug，
     證明規則本身冇被削弱）
-  - `out-of-window patch: liquidity provenance is guarded`（5 個 pushwatch marker + 3 條腿嘅
-    `feedSource` 標記，半貼即紅 —— 同 `write-drain-waituntil.patch` 同一套 drift guard）
+  - `gateLiquidityUsd: the push gate's two USD rules judge one leg only`
+    （釘死「Jupiter 腿入唔到 floor／ratio」而「同一個數由 DexScreener 嚟就係真抽乾」——
+    同 tracker 測試同一套對照法）
+  - `out-of-window patch: liquidity provenance is guarded`（6 個 pushwatch marker + 3 條腿嘅
+    `feedSource` 標記 + 5 個 scanner 閘門 marker，半貼即紅 —— 同 `write-drain-waituntil.patch`
+    同一套 drift guard）
 - `npm run typecheck` ✅、`npm test`（整合掃描）✅。
 - deploy 後線上驗收：`/debug/push-watch` 嘅 `lastLiquidity` **唔應該再係 DexScreener 值嘅一半**；
   對照 `lite-api.jup.ag` 應該見到兩者分離（舊行會保留一半值直到下一個 DexScreener check 覆蓋佢）；
@@ -122,12 +140,60 @@ tracker 只將 `comparableLiquidity(pair)` 交畀規則（非 DexScreener → `n
 
 ---
 
-## 5. 仲有嘅事（未做，等指示）
+## 5. 仲有嘅事（三項都已修，2026-09-20）
 
-1. **推播閘門**（`scanner.ts` `liquidityUsd`）仍然食跨源數字 → `minLiquidityUsd` 同
-   `mcapLiqRatioMax` 喺 Jupiter 腿 tick 嚴格一倍（延遲風險，見第 2 節）。
-2. **該行嘅狀態被回滾**：Lobby 出卡後 DB 係 `lastState = null`、`lastAlertAt = 0`
-   （`/debug/push-audit` 亦**冇**該次 follow-up 記錄）＝ 送卡時 `bounded()` 超時，
-   走咗 rollback 路徑（at-least-once 設計：有機會重發），即係卡片聲稱「停止追蹤」但實際仲 active、
-   而且 cooldown 未武裝。呢個係另一個（既有）題目，唔係今次跨源 bug。
-3. **Gecko 腿**同理已標記為 `gecko`；如果將來想用佢判流動性，要先有 Gecko↔DexScreener 嘅校準。
+1. ~~**推播閘門**（`scanner.ts` `liquidityUsd`）仍然食跨源數字 → `minLiquidityUsd` 同
+   `mcapLiqRatioMax` 喺 Jupiter 腿 tick 嚴格一倍（延遲風險，見第 2 節）。~~
+   **✅ 已修（2026-09-20）**：兩條規則改讀 `gateLiquidityUsd(pair)`，唔可比腿 = 唔判斷；
+   見第 3 節後續同 `docs/patches/liq-gate-source-guard.patch`。
+2. ~~**`token_stats.max_liquidity_observed` 嘅寫入**（`raises`，~2,600 行）仍然係
+   `pair.liquidity?.usd ?? 0`~~ **✅ 已修（2026-09-20）**：同一個源、另一個閘門。
+   呢條欄餵 re-eval pool 嘅 `minQualifyLiquidity` prune（0.6× 最闊 chat 嘅 `minLiquidityUsd`，
+   DexScreener 校準）而且係 **raise-only**，所以 Jupiter 嘅半價讀數唔會被之後嘅可比讀數修正 ——
+   佢只會令該幣嘅 lifetime 高水位偏低，令一隻仍然活嘅幣被剔出 pool（**永久漏推**，
+   比閘門嘅「遲一個 tick」貴）。修法同閘門一致：
+   `const liquidity = liquidityIsComparable(pair) ? (pair.liquidity?.usd ?? 0) : undefined` ——
+   唔可比腿 ⇒ `liquidityUsd` 整個 omit（`updateTokenMaxMcaps` 對 `undefined` 會將條
+   liquidity CASE 完全略過），下一個 DexScreener 腿嘅 sweep 照樣記錄；可比腿嘅 0 仍然落地
+   （乾池嘅 $0 LP 本身就係訊號）。
+3. ~~**該行嘅狀態被回滾**~~ **✅ 已修（2026-09-20）**：Lobby 出卡後 DB 係 `lastState = null`、
+   `lastAlertAt = 0`（`/debug/push-audit` 亦**冇**該次 follow-up 記錄）＝ 送卡時 `bounded()`
+   超時，走咗 rollback 路徑，即係卡片聲稱「停止追蹤」但實際仲 active、cooldown 未武裝。
+   終態卡（💧 抽乾卡 —— `evaluateWatch` 只有呢個 branch 會 `stopTracking`，而且佢只回一張卡）
+   而家跟**首卡**嗰套 abandoned 政策（`cardSendDisposition`，同一個純函數）：
+   - **sent** → 照舊 audit + 計數。
+   - **failed**（Telegram 真係拒收，例如 400）→ 事實，唔係「未知」：照舊 rollback，下一 tick 重發。
+   - **abandoned**（超時，請求可能仲在途）→ **保留**終態轉換（`last_state = 'rug'` +
+     `last_alert_at` 武裝）＋ 用 call 自己嘅 ring 寫一條 durable 記錄
+     （`UNCONFIRMED_TERMINAL_STATE_KEY`，同首卡嘅 ring **分開**：兩者嘅「release」係兩件
+     唔同嘅事 —— 首卡係 unclaim seen_tokens 令 scan 重推，終態卡係 re-arm 該行令下一次 check
+     重發同一張卡）。該請求若然後來成功，背景鏈會補寫 `followup` audit 並清走記錄。
+   - pass 開頭 settle 一次（有記錄 pending 或者 isolate 第一次 pass 才讀，所以正常 tick 唔會
+     多一個 round trip）：有 audit 證明 → 掉記錄；過咗 `UNCONFIRMED_CARD_GRACE_MS`（120s）
+     仍未證實 → `rearmPushWatchAlert` 將該行（**只限** `last_state = 'rug'`）改回 ACTIVE、
+     清 `last_alert_at`、`last_checked = 0` → 下一次 check 重新推同一張卡。
+     即係「冇漏卡」，但延遲一個 grace 而唔係立即重發一張仲在途嘅卡（後者就係用戶見到嘅重複）。
+   順序上 re-arm 先、縮短 ring 後：萬一中途死，只會再 re-arm 一次已經 active 嘅行（被
+   `last_state = 'rug'` 守衛擋成 no-op），唔會反過來掉低一張從來冇證實嘅卡。
+   兩件都超出檔案編輯窗口，落地為 `docs/patches/terminal-send-and-liq-prune.patch`（`git apply`，已 apply）。
+4. **Gecko 腿**同理已標記為 `gecko`；如果將來想用佢判流動性，要先有 Gecko↔DexScreener 嘅校準。
+
+### 驗收（2026-09-20，第二輪）
+
+- `npm run test:unit` → **228 passed / 0 failed**，新增五個測試：
+  - `deliveredFollowupTokens: only the tracker's own follow-up entry proves a tracker card`
+    （同時釘死「首卡嘅證明唔可以借去問終態卡」，兩個 whitelist。）
+  - `PushWatcher: an ABANDONED terminal card KEEPS the transition and records the unknown delivery`
+    （釘死送卡超時**唔會** rollback：`lastState = 'rug'`、`lastAlertAt > 0`、`undelivered = 0`、
+    ring 有一條該幣記錄、note 有 `abandoned 1`。）
+  - `PushWatcher: a REJECTED terminal card still rolls back (a fact, not an absence)`
+    （拒絕 ≠ 未知：照樣 `undelivered 1`、`lastState = null`、ring 冇記錄。）
+  - `PushWatcher settle: an unproven terminal card re-arms the row after the grace (proof does not)`
+    （三態：(a) 過 grace 無證明 → re-arm ＋ 掉記錄 ＋ note `rearmed 1`；(b) 有 `followup` 證明 →
+    唔 re-arm；(c) 仍在 grace 內 → 兩樣都唔做。）
+  - `out-of-window patch: the terminal card's three-state send is all in`（半貼即紅嘅 drift guard，
+    連同上面 `liquidity provenance` 嗰條加咗 prune 寫入嘅兩個 marker。）
+- `npm run typecheck` ✅、`npm run build` ✅。
+- 線上驗收（deploy 後）：下次再見到 💧 卡而 `/debug/push-watch` 嘅 `lastState` 係空，即係呢個修
+  未生效；預期係卡片同 DB 一致（`rug` + cooldown 武裝），而且 **唔會**再出現「同一張停止追蹤卡
+  隔幾分鐘再出一次」。

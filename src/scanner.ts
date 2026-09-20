@@ -18,7 +18,7 @@ import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
 import type { JupTokensClient } from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
-import { PushWatcher } from "./pushwatch";
+import { PushWatcher, liquidityIsComparable } from "./pushwatch";
 import { FlurryAnalyzer, type FlurryOutcome, type FlurryReport } from "./flurry";
 import {
   addDeferredToken,
@@ -1148,6 +1148,32 @@ export function mcapRatioBlockReason(
   return ratio > ratioMax
     ? `市值/LP 比率 ${ratio.toFixed(1)}x > ${ratioMax}x（估值遠超池深：價格可操縱、難以出場）`
     : null;
+}
+/**
+ * The liquidity reading a USD-level rule HERE may judge, or null when the pair
+ * did not come from the leg those rules are calibrated on.
+ *
+ * `liquidity.usd` is DexScreener's POOL reserve, but a pair answered by the
+ * Jupiter or GeckoTerminal leg carries a different metric of the same pool —
+ * roughly half for Jupiter (measured 2026-09-20: 10 of 14 tracked rows matched
+ * Jupiter's own number to within 2% while sitting at 0.46–0.58x DexScreener's;
+ * see docs/liquidity-provenance.md). The push gate's floor and the mcap/LP
+ * ratio below are ABSOLUTE USD rules, so judging them with another leg's
+ * number makes this gate about twice as strict on that leg's tick and holds a
+ * healthy coin out of its age window.
+ *
+ * null = UNJUDGED, not $0: the same fail-open discipline every other gate
+ * uses for missing data. The coin keeps its place in the re-eval pool and the
+ * next DexScreener-served tick judges it normally, so the cost is a delayed
+ * push, never a wrong one. A COMPARABLE leg with no reading still counts as
+ * $0 depth — a drained pool reports 0 and must keep failing the floor.
+ */
+export function gateLiquidityUsd(pair: {
+  liquidity: { usd: number | null };
+  feedSource?: "dexscreener" | "jupiter" | "gecko";
+}): number | null {
+  if (!liquidityIsComparable(pair)) return null;
+  return pair.liquidity.usd ?? 0;
 }
 
 /**
@@ -2569,15 +2595,28 @@ export class Scanner {
           pair.marketCap <= 0
         )
           continue;
-        const liquidity = pair.liquidity?.usd ?? 0;
+        // Comparable-only (see gateLiquidityUsd): this column feeds the re-eval
+        // pool's `minQualifyLiquidity` prune (0.6 × the widest chat's floor,
+        // DexScreener-calibrated), and the raise is one-way — a Jupiter/Gecko
+        // reading is a different metric of the same pool (~half), so feeding it
+        // in can only leave the coin's high-water mark short of the truth and
+        // let a LIVE coin be pruned out of the pool: a permanent missed push,
+        // the one cost worse than the gate's one-tick delay. An unjudgeable leg
+        // therefore raises nothing, and the next DexScreener-served sweep of
+        // the same coin records it; a comparable leg's reading still lands,
+        // 0 included (a corpse's $0 LP is its identifying signal).
+        const liquidity: number | undefined = liquidityIsComparable(pair)
+          ? (pair.liquidity?.usd ?? 0)
+          : undefined;
         const mcapRaise =
           stats.maxMcapObserved === null ||
           stats.maxMcapObserved === undefined ||
           pair.marketCap > stats.maxMcapObserved;
         const liqRaise =
-          stats.maxLiquidityObserved === null ||
-          stats.maxLiquidityObserved === undefined ||
-          liquidity > stats.maxLiquidityObserved;
+          liquidity !== undefined &&
+          (stats.maxLiquidityObserved === null ||
+            stats.maxLiquidityObserved === undefined ||
+            liquidity > stats.maxLiquidityObserved);
         if (!mcapRaise && !liqRaise) continue;
         raises.push({
           token,
@@ -2586,8 +2625,9 @@ export class Scanner {
           mcapUsd: mcapRaise
             ? pair.marketCap
             : (stats.maxMcapObserved ?? 0),
-          // Always send a finite reading (0 included — a corpse's $0 LP is
-          // its identifying signal); callers without pair liquidity omit it.
+          // A finite reading (0 included) whenever the leg is comparable;
+          // omitted otherwise, so the liquidity CASE leaves the column alone —
+          // the same "missing data never judges" discipline as the gate.
           liquidityUsd: liquidity,
         });
       }
@@ -3980,7 +4020,10 @@ export class Scanner {
       if (!pair) continue;
       const stats = statsByToken.get(profile.tokenAddress);
       if (!stats) continue;
-      const liquidityUsd = pair.liquidity.usd ?? 0;
+      // Comparable-only (see gateLiquidityUsd): a Jupiter/Gecko pair's number
+      // is a different metric of the same pool, so it must not face these
+      // absolute USD rules. null = leave both unjudged for this tick.
+      const liquidityUsd = gateLiquidityUsd(pair);
       const volume24h = pair.volume.h24;
       const ageMs = Date.now() - pair.pairCreatedAt;
       // Log the coin's first failing gate for this chat (bounded — the feed
@@ -4008,7 +4051,7 @@ export class Scanner {
       };
 
       for (const chat of chats) {
-        if (liquidityUsd < chat.minLiquidityUsd) {
+        if (liquidityUsd !== null && liquidityUsd < chat.minLiquidityUsd) {
           fails.other++;
           reject(`流动性 ${fmtUsd(liquidityUsd)} < ${fmtUsd(chat.minLiquidityUsd)}`);
           continue;
@@ -4031,11 +4074,17 @@ export class Scanner {
         // Valuation vs pool depth sanity: a price that ran up far beyond its
         // pooled liquidity is manipulable and nearly un-exitable (see the
         // helper's calibration notes). Global knob, 0 = off.
-        const ratioReason = mcapRatioBlockReason(
-          pair.marketCap,
-          liquidityUsd,
-          this.config.mcapLiqRatioMax,
-        );
+        // null = the coin came from a leg this ratio cannot judge (see
+        // gateLiquidityUsd); stay fail-open rather than block a healthy coin
+        // on a number that is a different metric of the same pool.
+        const ratioReason =
+          liquidityUsd === null
+            ? null
+            : mcapRatioBlockReason(
+                pair.marketCap,
+                liquidityUsd,
+                this.config.mcapLiqRatioMax,
+              );
         if (ratioReason) {
           fails.other++;
           reject(ratioReason);

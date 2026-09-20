@@ -10,10 +10,21 @@ import {
 } from "./pushledger";
 // The self-heal's resend gate asks the same question the deferral guard does
 // ("was a card for this token delivered?"), so it asks it with the same rule.
+// The tracker's terminal card (2026-09-20) adds the other half of that rule:
+// the disposition itself, the durable ring an abandoned send leaves, and the
+// proof its settle reads back.
 import {
-  deliveredCardTokens,
-  parseUnconfirmedCardSends,
+  UNCONFIRMED_CARD_GRACE_MS,
   UNCONFIRMED_CARD_STATE_KEY,
+  UNCONFIRMED_TERMINAL_STATE_KEY,
+  addUnconfirmedCardSend,
+  cardSendDisposition,
+  deliveredCardTokens,
+  deliveredFollowupTokens,
+  parseUnconfirmedCardSends,
+  removeUnconfirmedCardSend,
+  serializeUnconfirmedCardSends,
+  settleUnconfirmedCardSends,
 } from "./deferrallog";
 
 /**
@@ -356,10 +367,27 @@ export function comparableLiquidity(pair: {
   liquidity: { usd: number | null };
   feedSource?: "dexscreener" | "jupiter" | "gecko";
 }): number | null {
-  if (pair.feedSource !== undefined && pair.feedSource !== "dexscreener") {
-    return null;
-  }
+  if (!liquidityIsComparable(pair)) return null;
   return pair.liquidity.usd;
+}
+
+/**
+ * Whether this pair's `liquidity` came from the one leg every USD-level rule
+ * is calibrated on (see comparableLiquidity).
+ *
+ * comparableLiquidity answers "what may a rule read?" (null = UNJUDGED). This
+ * answers the narrower question a consumer asks when it must tell "that leg is
+ * not comparable" from "that comparable leg has no reading": the push gate
+ * (scanner.ts gateLiquidityUsd) still counts a missing DexScreener reading as
+ * $0 depth — a drained pool reports 0 and must keep failing the floor — so it
+ * cannot collapse both cases onto null. One source of truth for the rule
+ * either way: untagged pairs (fixtures, synthetic, legacy rows) are
+ * DexScreener's.
+ */
+export function liquidityIsComparable(pair: {
+  feedSource?: "dexscreener" | "jupiter" | "gecko";
+}): boolean {
+  return pair.feedSource === undefined || pair.feedSource === "dexscreener";
 }
 /**
  * Volume ignition: a tracked coin whose 5m volume jumps from dormant
@@ -826,6 +854,20 @@ export function recapMessage(row: PushWatchRow): string {
 }
 
 /**
+ * One TERMINAL card send's outcome: Telegram ACCEPTED the card, Telegram
+ * REJECTED it, or we STOPPED WAITING while the request was still in flight.
+ * The third state is the whole point — the two-state send folded it into
+ * "failed" and rolled the row's announcement back, which is how a card that
+ * said 停止追蹤 left its row ACTIVE and re-announceable (live 2026-09-20,
+ * Lobby). The initial-card path made the same fix one commit earlier; see
+ * deferrallog.cardSendDisposition for the rule they share.
+ */
+type TerminalSendOutcome =
+  | { outcome: "sent"; message: unknown }
+  | { outcome: "failed" }
+  | { outcome: "abandoned" };
+
+/**
  * Service wrapper: owns the per-tick refresh loop and the Telegram delivery.
  * All network/db work is best-effort — a tracker failure must never affect
  * the scan or a push.
@@ -861,6 +903,23 @@ export class PushWatcher {
    * must not grow this forever; the oldest entry is evicted first.
    */
   private readonly pendingUndelivered = new Set<string>();
+  /**
+   * TERMINAL cards (the 💧 drain card) whose send was ABANDONED this isolate
+   * has seen: the race stopped waiting while the request was still in flight,
+   * so the card may or may not be in the chat. Cumulative for /health (the
+   * pass note carries the per-pass number) because this path deliberately does
+   * NOT roll back — the same "counted so it is observable instead of merely
+   * argued" discipline as undeliveredTotal.
+   */
+  private terminalAbandonedTotal = 0;
+  /**
+   * Unconfirmed terminal records THIS isolate wrote since its last successful
+   * settle read. The settle also probes ONCE per isolate (settleProbed) for a
+   * record an isolate that already died could not settle — the reason the ring
+   * is durable at all — so a pass with nothing pending costs no round trip.
+   */
+  private unconfirmedWrites = 0;
+  private settleProbed = false;
 
   /** Tokens the last pass put at the front of its rotation queue. */
   headTokens(): string[] {
@@ -1031,6 +1090,21 @@ export class PushWatcher {
     recoveredUndelivered: number;
     /** Tokens still waiting for their make-up send. */
     pendingUndelivered: number;
+    /**
+     * TERMINAL cards whose send was abandoned this pass. NOT part of
+     * `undelivered` — those are rolled back and re-announced, these keep their
+     * transition and leave a durable record for the settle instead. Optional:
+     * every pass that defers before the row loop attempts no card at all.
+     */
+    terminalAbandoned?: number;
+    /** Rows re-armed this pass because their 💧 card was never proven sent. */
+    rearmedCards?: number;
+    /**
+     * Terminal cards abandoned by this ISOLATE (the note's number is per pass,
+     * so this is the one that survives the next tick's note). Cumulative, the
+     * same shape as undeliveredTotal.
+     */
+    terminalAbandonedTotal?: number;
   }> {
     const cfg = this.config.pushWatch;
     const now = Date.now();
@@ -1117,6 +1191,18 @@ export class PushWatcher {
     // recap claims its row as it sends), so bailing here costs only latency —
     // the remaining stages run on the next tick with fresh rows.
     if (past()) return deferred;
+    // Settle abandoned TERMINAL cards before anything else in the pass: a 💧
+    // drain card whose send was abandoned KEEPS its row's terminal transition
+    // and leaves a durable record (see the alert loop). Proved delivered → the
+    // record is dropped; unproven after UNCONFIRMED_CARD_GRACE_MS → the row is
+    // re-armed and the card re-announced. That is the rollback the two-state
+    // send did IMMEDIATELY, now deferred until we actually know, so a card that
+    // was already in flight is not sent a second time.
+    // Early in the pass on purpose: the re-armed row has its last_checked
+    // zeroed, so it takes the front of the next rotation.
+    const settle = await this.settleUnconfirmedCards(now);
+    trips += settle.trips;
+    const rearmedCards = settle.rearmed;
     // Heal missed enrollments: pushes recorded in seen_tokens but absent
     // from push_watch (an old pre-tracker isolate handled that scan, or the
     // process died between the push and the upsert). Seeded with the TRUE
@@ -1437,6 +1523,13 @@ export class PushWatcher {
     let recoveredThisPass = 0;
     /** Rows refused because their cards did not fit the pass (no card lost). */
     let sendDeferred = 0;
+    /**
+     * TERMINAL cards whose send was abandoned this pass. NOT part of
+     * `undelivered`: those are rolled back and re-announced, these KEEP their
+     * transition (that is the fix) and are counted here so the two different
+     * promises stay distinguishable in /health.
+     */
+    let terminalAbandoned = 0;
     let firstRow = true;
     for (const row of head) {
       // Budget check BETWEEN rows: the claim and the alert reservation for a
@@ -1588,11 +1681,59 @@ export class PushWatcher {
           break;
         }
         try {
-          const sent = await this.bounded(
-            this.bot.api.sendMessage(row.chatId, a.text),
-            sendLeft,
-            null,
-          );
+          // The 💧 drain card is TERMINAL: evaluateWatch sets stopTracking on
+          // that branch alone, and that branch returns exactly this one alert
+          // (the "liq" crash card shares the kind but never stops tracking), so
+          // `terminalAlert` identifies it exactly. It takes the initial-card
+          // path's THREE-STATE send; every other alert keeps the two-state one,
+          // where a rollback is harmless — the same card is re-derived and
+          // re-sent on the next pass, which is the point of at-least-once.
+          const terminalAlert =
+            evalResult.stopTracking && a.kind === "liquidity";
+          let sent: { message_id?: unknown } | null = null;
+          if (terminalAlert) {
+            const outcome = await this.sendTerminalAlert(
+              row,
+              a.text,
+              sendLeft,
+              now,
+            );
+            if (outcome.outcome === "abandoned") {
+              // We stopped WAITING, which is not a failure: the card may
+              // already be in the chat. The initial card's rule applies
+              // verbatim (deferrallog.cardSendDisposition): KEEP the claim, so
+              // the terminal transition lands and the card's 停止追蹤 becomes
+              // TRUE. Rolling it back here was the live bug (2026-09-20,
+              // Lobby): the 💧 card arrived, the row stayed ACTIVE with its
+              // cooldown unarmed, and the same card could fire again — a card
+              // claiming tracking stopped while the DB said it had not. The
+              // unknown delivery is recorded durably instead (see the settle at
+              // the top of the pass): proved → nothing more; unproven after the
+              // grace → the row is re-armed and the card re-announced, so it is
+              // never simply lost.
+              console.error(
+                `[push-watch] terminal card send abandoned for ${row.symbol ?? row.token} — tracked state KEPT, delivery unconfirmed (recorded for the settle)`,
+              );
+              terminalAbandoned += 1;
+              break;
+            }
+            if (outcome.outcome === "failed") {
+              // Telegram REJECTED it: a FACT, not the absence of one. Fall
+              // through to the rollback below like any other undelivered card —
+              // nothing reached the chat, so the row keeps being watched and
+              // the 💧 card is re-announced next tick.
+              throw new Error(
+                `terminal-card send rejected for ${row.symbol ?? row.token}`,
+              );
+            }
+            sent = outcome.message as { message_id?: unknown };
+          } else {
+            sent = (await this.bounded(
+              this.bot.api.sendMessage(row.chatId, a.text),
+              sendLeft,
+              null,
+            )) as { message_id?: unknown } | null;
+          }
           if (sent === null) {
             // Timed out: the transition stays reserved for the rest of this
             // pass (a concurrent isolate must not re-send it), but the final
@@ -1739,7 +1880,9 @@ export class PushWatcher {
     // out of budget before the rest of the rotation (budget-cut), rows
     // whose first observation landed after a tracking gap (backfill), and
     // cards the pass could not deliver (undelivered — rolled back and
-    // re-announced next tick, never lost).
+    // re-announced next tick, never lost), terminal cards whose send was
+    // ABANDONED (kept and settled durably instead of rolled back), and rows
+    // re-armed because such a card was never proven delivered.
     // The note is ALWAYS present now: it ends with the pass's round-trip
     // count, the number this merge exists to keep down. (It used to be omitted
     // on a fully-clean pass, which is how a starved tracker looked healthy.)
@@ -1748,6 +1891,8 @@ export class PushWatcher {
       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
       `${undelivered > 0 ? ` undelivered ${undelivered}` : ""}` +
+      `${terminalAbandoned > 0 ? ` abandoned ${terminalAbandoned}` : ""}` +
+      `${rearmedCards > 0 ? ` rearmed ${rearmedCards}` : ""}` +
       `${recoveredThisPass > 0 ? ` recovered ${recoveredThisPass}` : ""}` +
       `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
 
@@ -1757,9 +1902,235 @@ export class PushWatcher {
       note,
       trips,
       undelivered,
+      terminalAbandoned,
+      terminalAbandonedTotal: this.terminalAbandonedTotal,
+      rearmedCards,
       undeliveredTotal: this.undeliveredTotal,
       recoveredUndelivered: this.recoveredUndeliveredTotal,
       pendingUndelivered: this.pendingUndelivered.size,
     };
+  }
+
+  /**
+   * Deliver ONE TERMINAL alert (the 💧 drain card) with the initial-card path's
+   * three-state outcome, and own what each state MEANS here.
+   *
+   * sent      → the caller audits it and counts it, unchanged.
+   * failed    → the caller throws: a rejection proves nothing reached the chat,
+   *             so the row is rolled back and the card re-announced.
+   * abandoned → we stopped waiting on a request that is still in flight. The
+   *             caller KEEPS the terminal transition and the unknown delivery is
+   *             recorded durably in the tracker's own ring
+   *             (UNCONFIRMED_TERMINAL_STATE_KEY) for the pass-level settle to
+   *             resolve: the chain below clears the record the moment the
+   *             request settles as DELIVERED, and the settle re-arms the row
+   *             (so the card is re-announced) when it never does.
+   *
+   * The promise is started ONCE, here, so the background chain above watches
+   * exactly the request the race gave up on.
+   */
+  private async sendTerminalAlert(
+    row: PushWatchRow,
+    text: string,
+    sendLeft: number,
+    now: number,
+  ): Promise<TerminalSendOutcome> {
+    const inFlight = this.bot.api.sendMessage(row.chatId, text);
+    // `settled` never rejects: a rejection is a FACT ("Telegram said no") while
+    // the timeout is the ABSENCE of one, and not conflating the two is the
+    // entire fix (see TerminalSendOutcome).
+    const settled: Promise<TerminalSendOutcome> = inFlight.then(
+      (message) => ({ outcome: "sent" as const, message }),
+      () => ({ outcome: "failed" as const }),
+    );
+    let cutTimer: ReturnType<typeof setTimeout> | undefined;
+    const abandoned = new Promise<TerminalSendOutcome>((resolve) => {
+      cutTimer = setTimeout(
+        () => resolve({ outcome: "abandoned" as const }),
+        Math.max(0, sendLeft),
+      );
+    });
+    const raced = await Promise.race([settled, abandoned]);
+    // Cleared either way: a pending timer would hold the isolate (and the
+    // promise the race gave up on) open past this tick.
+    if (cutTimer !== undefined) clearTimeout(cutTimer);
+    if (raced.outcome !== "abandoned") return raced;
+    // One source of truth for the policy itself, so the tracker and the
+    // initial-card send cannot drift apart on what "abandoned" means.
+    const plan = cardSendDisposition("abandoned");
+    this.terminalAbandonedTotal += 1;
+    if (plan.recordUnconfirmed) await this.recordAbandonedTerminalCard(row, now);
+    if (plan.watchInBackground) {
+      // The canary. A card that DOES arrive after the cut must clear its own
+      // record: the settle may never re-announce a card that is already in the
+      // chat, and the audit entry written here is hard proof Telegram accepted
+      // it. Errors are swallowed — this runs after the pass has moved on, the
+      // same contract as the initial card's background chain.
+      void settled.then(async (late) => {
+        if (late.outcome !== "sent") return; // a rejection leaves the record
+        try {
+          await this.db.recordPushDelivery({
+            chatId: row.chatId,
+            token: row.token,
+            symbol: row.symbol,
+            messageId: Number(
+              (late.message as { message_id?: unknown })?.message_id ?? 0,
+            ),
+            kind: "followup",
+          });
+        } catch {
+          /* audit is best-effort */
+        }
+        await this.clearAbandonedTerminalCard(row.chatId, row.token);
+      });
+    }
+    return raced;
+  }
+
+  /**
+   * Write (or refresh) one row's unconfirmed terminal-card record.
+   *
+   * Best-effort on purpose: the caller ALREADY kept the terminal transition
+   * (that is the fix), so a failed write costs only the deferred re-announce —
+   * the row stays rug, which is the correct state for a drained pool, and the
+   * 🏁 recap card reports the verdict when the window closes.
+   *
+   * Read through a seam rather than by adding a method to the Db interface: the
+   * Db doubles the tracker tests drive implement only the reader they need, so
+   * a double without the ring reader degrades to "nothing to settle", which is
+   * the pre-three-state behaviour and never a crash.
+   */
+  private async recordAbandonedTerminalCard(
+    row: PushWatchRow,
+    now: number,
+  ): Promise<void> {
+    const read = (this.db as Partial<Pick<Db, "getWorkerState">>).getWorkerState;
+    const write = (this.db as Partial<Pick<Db, "setWorkerState">>).setWorkerState;
+    if (typeof read !== "function" || typeof write !== "function") return;
+    try {
+      const raw = await read.call(this.db, UNCONFIRMED_TERMINAL_STATE_KEY);
+      await write.call(
+        this.db,
+        UNCONFIRMED_TERMINAL_STATE_KEY,
+        addUnconfirmedCardSend(raw, {
+          chatId: row.chatId,
+          token: row.token,
+          at: now,
+          symbol: row.symbol ?? null,
+        }),
+      );
+      // Arms the settle's cheap trigger: the next pass knows it has something
+      // to settle without reading the ring first.
+      this.unconfirmedWrites += 1;
+    } catch {
+      /* best-effort — the terminal transition is already kept */
+    }
+  }
+
+  /** Drop one row's record once a late send proved the card was delivered. */
+  private async clearAbandonedTerminalCard(
+    chatId: string,
+    token: string,
+  ): Promise<void> {
+    const read = (this.db as Partial<Pick<Db, "getWorkerState">>).getWorkerState;
+    const write = (this.db as Partial<Pick<Db, "setWorkerState">>).setWorkerState;
+    if (typeof read !== "function" || typeof write !== "function") return;
+    try {
+      const raw = await read.call(this.db, UNCONFIRMED_TERMINAL_STATE_KEY);
+      await write.call(
+        this.db,
+        UNCONFIRMED_TERMINAL_STATE_KEY,
+        removeUnconfirmedCardSend(raw, chatId, token),
+      );
+    } catch {
+      /* best-effort — the settle releases it after the grace instead */
+    }
+  }
+
+  /**
+   * Settle the tracker's unconfirmed terminal cards: a 💧 card abandoned by an
+   * EARLIER pass — or by an isolate that has since died, which is exactly why
+   * the ring is durable — is either proven delivered or, after the grace,
+   * re-armed so its row re-announces the card.
+   *
+   * The rule itself is deferrallog.settleUnconfirmedCardSends (proof keeps the
+   * claim, silence releases it after the grace). This owns the durable read,
+   * the proof read and the release.
+   *
+   * Order matters: the RE-ARM lands BEFORE the shrunken ring is persisted. The
+   * other way round, a crash in between would drop a record whose card was
+   * never proven — a lost card. This way a crash in between re-arms an
+   * already-active row, which rearmPushWatchAlert's `last_state = 'rug'` guard
+   * makes a no-op. (The initial-card ring documents the same ordering rule for
+   * its own release.)
+   */
+  private async settleUnconfirmedCards(
+    now: number,
+  ): Promise<{ rearmed: number; trips: number }> {
+    // One read while something is pending, plus ONE probe per isolate: a record
+    // left by an isolate that died between the send and its audit has no
+    // in-memory trace, and the durable ring exists for exactly that. After the
+    // first probe, a pass with nothing pending costs no round trip at all.
+    if (this.settleProbed && this.unconfirmedWrites === 0) {
+      return { rearmed: 0, trips: 0 };
+    }
+    const stateRead = (this.db as Partial<Pick<Db, "getWorkerState">>)
+      .getWorkerState;
+    if (typeof stateRead !== "function") return { rearmed: 0, trips: 0 };
+    let trips = 0;
+    let records: ReturnType<typeof parseUnconfirmedCardSends>;
+    try {
+      records = parseUnconfirmedCardSends(
+        await stateRead.call(this.db, UNCONFIRMED_TERMINAL_STATE_KEY),
+      );
+      trips += 1;
+    } catch {
+      // Unreadable: keep the probe armed so the next pass tries again — an
+      // unproven card may be waiting on this decision.
+      return { rearmed: 0, trips: 0 };
+    }
+    this.settleProbed = true;
+    if (records.length === 0) {
+      this.unconfirmedWrites = 0;
+      return { rearmed: 0, trips };
+    }
+    // Proof: the tracker's own `followup` audit entry, written only after
+    // Telegram returned a message_id for a card on this row.
+    let proven = new Set<string>();
+    const auditRead = (this.db as Partial<Pick<Db, "getPushAudit">>).getPushAudit;
+    if (typeof auditRead === "function") {
+      try {
+        proven = new Set(deliveredFollowupTokens(await auditRead.call(this.db)));
+        trips += 1;
+      } catch {
+        // Nothing readable = nothing proven, which only ever means the record
+        // waits out its grace (fail-open in the never-miss direction).
+      }
+    }
+    const { release, kept } = settleUnconfirmedCardSends(
+      records,
+      now,
+      UNCONFIRMED_CARD_GRACE_MS,
+      proven,
+    );
+    let rearmed = 0;
+    try {
+      for (const r of release) {
+        trips += 1;
+        if (await this.db.rearmPushWatchAlert(r.token)) rearmed += 1;
+      }
+      if (release.length > 0 || kept.length !== records.length) {
+        trips += 1;
+        await this.db.setWorkerState(
+          UNCONFIRMED_TERMINAL_STATE_KEY,
+          serializeUnconfirmedCardSends(kept),
+        );
+      }
+      this.unconfirmedWrites = 0;
+    } catch {
+      // Best-effort: the ring still holds the record, so the next pass tries
+      // again (and a second re-arm of an already-active row is a guarded no-op).
+    }
+    return { rearmed, trips };
   }
 }

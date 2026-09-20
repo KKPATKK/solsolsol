@@ -18,11 +18,11 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, GECKO_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -33,7 +33,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
@@ -444,6 +444,234 @@ async function main() {
     });
   });
 
+  await test("deliveredFollowupTokens: only the tracker's own follow-up entry proves a tracker card", () => {
+    assert.deepEqual(deliveredFollowupTokens([]), []);
+    const ring = [
+      { token: "A", kind: "initial" },
+      { token: "B", kind: "followup" },
+      { token: "B", kind: "followup" },
+      { token: "C", kind: "pushed-row" },
+      { token: "D" },
+      null,
+      { token: "", kind: "followup" },
+    ];
+    assert.deepEqual(deliveredFollowupTokens(ring), ["B"]);
+    // The initial-card proof is a DIFFERENT question over a different kind
+    // whitelist — reusing it here would re-announce (or hold back) the wrong
+    // cards in both directions.
+    assert.deepEqual(deliveredCardTokens(ring), ["A", "C"]);
+  });
+
+  // ---------- the tracker's terminal (💧 drain) card ----------
+  //
+  // The live bug these close (2026-09-20, Lobby): the 💧 流動性枯竭 …停止追蹤 card
+  // reached the chat, its send missed the tracker's slice, and the two-state path
+  // rolled the row's announcement back — so the card claimed tracking had stopped
+  // while the row stayed ACTIVE with its cooldown unarmed, free to fire the same
+  // card again. The terminal card now follows the initial card's abandoned
+  // policy: KEEP the transition, record the unknown delivery durably, and settle
+  // it — proved → nothing more; unproven after the grace → re-arm the row so the
+  // card is re-announced. The send loop sits past the file-sync window, so the
+  // pass is driven through its public seam here
+  // (docs/patches/terminal-send-and-liq-prune.patch).
+
+  const termRow = (over = {}) => ({
+    token: "LOBBY", chatId: "c", symbol: "LOBBY",
+    pushedAt: Date.now() - 30 * 60_000,
+    mcapAtPush: 100_000, peakMcap: 100_000, lastLiquidity: 50_000,
+    lastVol5m: 1_000, deadTroughMcap: null, holdersAtPush: null,
+    holdersLast: null, holdersCheckedAt: null, sellDomStreak: 0,
+    lastMcap: null, lastChecked: 0, lastAlertAt: 0,
+    followupsSent: 0, lastState: null, upStages: null,
+    ...over,
+  });
+  // Flat mcap and flat volume: the ONLY alert in play is the 💧 drain card, and
+  // that is the only one evaluateWatch marks terminal (stopTracking).
+  const termPair = (token, liquidityUsd) => ({
+    chainId: "solana", url: "", pairAddress: `p-${token}`,
+    baseToken: { address: token, name: token, symbol: token },
+    priceUsd: "0.001", marketCap: 100_000,
+    volume: { h24: 1_000_000, h1: 20_000, m5: 1_000 },
+    priceChange: { m5: 1, h1: 5 },
+    txns: { m5Buys: 10, m5Sells: 8, h1Buys: 100, h1Sells: 80 },
+    liquidity: { usd: liquidityUsd }, pairCreatedAt: Date.now() - 3 * 3_600_000,
+  });
+  const termDb = (rows, opts = {}) => {
+    const state = new Map(Object.entries(opts.state ?? {}));
+    const updated = [];
+    const rearmed = [];
+    return {
+      updated,
+      rearmed,
+      state,
+      listPushWatch: async () => rows,
+      prunePushWatch: async () => 0,
+      findUntrackedPushes: async () => [],
+      markRecapClaimed: async () => false,
+      markRecapClaimedMany: async (tokens) => tokens.map(() => false),
+      getInitialPushAuditTokens: async () => new Set(),
+      getPushAudit: async () => opts.audit ?? [],
+      upsertPushWatchMany: async () => {},
+      claimPushWatch: async () => true,
+      reservePushWatchAlert: async () => true,
+      updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
+      deletePushWatch: async () => {},
+      setPushWatchHolders: async () => {},
+      recordPushDelivery: async () => {},
+      getWorkerState: async (key) => state.get(key) ?? null,
+      setWorkerState: async (key, value) => { state.set(key, value); },
+      rearmPushWatchAlert: async (token) => { rearmed.push(token); return true; },
+    };
+  };
+  const termWatcher = (db, bot, liquidityUsd) =>
+    new PushWatcher(
+      db,
+      bot,
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, termPair(a, liquidityUsd)])),
+      null,
+    );
+
+  await test("PushWatcher: an ABANDONED terminal card KEEPS the transition and records the unknown delivery", async () => {
+    const db = termDb([termRow()]);
+    // Never answers: the send misses its slice, which is the ambiguous outcome.
+    const pw = termWatcher(db, { api: { sendMessage: () => new Promise(() => {}) } }, 2_000);
+    const out = await pw.runTick(Date.now() + 1_500);
+    assert.equal(out.terminalAbandoned, 1, "the pass reports the abandoned terminal card");
+    assert.equal(out.terminalAbandonedTotal, 1, "and the isolate total survives the next note");
+    assert.equal(out.undelivered, 0, "abandoned is not a failure — it must not roll back");
+    assert.equal(db.updated.length, 1);
+    const [, written] = db.updated[0];
+    // The card said 停止追蹤, so the DB has to agree: terminal + cooldown armed
+    // (the old rollback left last_state NULL and last_alert_at 0 — a card that
+    // contradicts the row it describes, and a card free to fire again).
+    assert.equal(written.lastState, "rug");
+    assert.ok(written.lastAlertAt > 0, "the terminal transition and its clock both land");
+    assert.equal(written.followupsSent, 1);
+    // Durable: the settle's input, keyed per coin, in the tracker's own ring.
+    const ring = parseUnconfirmedCardSends(db.state.get(UNCONFIRMED_TERMINAL_STATE_KEY));
+    assert.equal(ring.length, 1);
+    assert.equal(ring[0].token, "LOBBY");
+    assert.equal(ring[0].chatId, "c");
+    assert.match(String(out.note), /abandoned 1/);
+  });
+
+  await test("PushWatcher: a REJECTED terminal card still rolls back (a fact, not an absence)", async () => {
+    // Telegram answered "no": the card is provably not in the chat, so the row
+    // must keep being watched and the 💧 card must be re-announced next tick.
+    const db = termDb([termRow()]);
+    const bot = {
+      api: { sendMessage: async () => { throw new Error("400 Bad Request: chat not found"); } },
+    };
+    const pw = termWatcher(db, bot, 2_000);
+    const out = await pw.runTick(Date.now() + 1_500);
+    assert.equal(out.terminalAbandoned, 0, "a rejection is not an abandoned send");
+    assert.equal(out.undelivered, 1);
+    const [, written] = db.updated[0];
+    assert.equal(written.lastState, null, "nothing reached the chat → the row stays ACTIVE");
+    assert.equal(written.lastAlertAt, 0);
+    assert.equal(
+      db.state.get(UNCONFIRMED_TERMINAL_STATE_KEY),
+      undefined,
+      "nothing is unconfirmed — the rejection is a fact, and nothing waits on it",
+    );
+  });
+
+  await test("PushWatcher settle: an unproven terminal card re-arms the row after the grace (proof does not)", async () => {
+    const now = Date.now();
+    const record = (at) =>
+      serializeUnconfirmedCardSends([{ chatId: "c", token: "LOBBY", at, symbol: "LOBBY" }]);
+
+    // (a) Past the grace with no proof anywhere: the card may have been lost,
+    // so the row goes back to ACTIVE (front of the rotation) and the next
+    // check re-announces it — never-miss, one grace late instead of instantly
+    // into a duplicate.
+    const stale = termDb([termRow()], {
+      state: { [UNCONFIRMED_TERMINAL_STATE_KEY]: record(now - UNCONFIRMED_CARD_GRACE_MS - 5_000) },
+    });
+    const outA = await termWatcher(stale, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 50_000).runTick();
+    assert.deepEqual(stale.rearmed, ["LOBBY"], "the unproven card is re-announced via a re-arm");
+    assert.equal(outA.rearmedCards, 1);
+    assert.match(String(outA.note), /rearmed 1/);
+    assert.deepEqual(
+      parseUnconfirmedCardSends(stale.state.get(UNCONFIRMED_TERMINAL_STATE_KEY)),
+      [],
+      "and the settled record is dropped, so it can never release the claim twice",
+    );
+
+    // (b) Same record, but the audit ring proves Telegram accepted the card:
+    // the record is dropped and the row is left terminal — re-announcing here
+    // is exactly the duplicate this whole three-state send exists to stop.
+    const proven = termDb([termRow()], {
+      state: { [UNCONFIRMED_TERMINAL_STATE_KEY]: record(now - UNCONFIRMED_CARD_GRACE_MS - 5_000) },
+      audit: [{ chatId: "c", token: "LOBBY", kind: "followup", at: now - 6_000 }],
+    });
+    const outB = await termWatcher(proven, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 50_000).runTick();
+    assert.deepEqual(proven.rearmed, [], "a proven delivery must NOT be re-announced");
+    assert.equal(outB.rearmedCards, 0);
+    assert.deepEqual(parseUnconfirmedCardSends(proven.state.get(UNCONFIRMED_TERMINAL_STATE_KEY)), []);
+
+    // (c) Still inside the grace: an in-flight request may land at any moment,
+    // so nothing is released and nothing is re-sent yet.
+    const fresh = termDb([termRow()], {
+      state: { [UNCONFIRMED_TERMINAL_STATE_KEY]: record(now - 1_000) },
+    });
+    const outC = await termWatcher(fresh, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 50_000).runTick();
+    assert.deepEqual(fresh.rearmed, []);
+    assert.equal(outC.rearmedCards, 0);
+    assert.equal(
+      parseUnconfirmedCardSends(fresh.state.get(UNCONFIRMED_TERMINAL_STATE_KEY)).length,
+      1,
+      "the record waits out its grace",
+    );
+  });
+
+  await test("out-of-window patch: the terminal card's three-state send is all in (docs/patches/terminal-send-and-liq-prune.patch)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const dbSrc = read("src/db.ts");
+    const applied = {
+      "terminal alert identified": pushwatchSrc.includes(
+        'constterminalAlert=evalResult.stopTracking&&a.kind==="liquidity";',
+      ),
+      "three-state send": pushwatchSrc.includes("privateasyncsendTerminalAlert("),
+      "abandoned keeps the transition": pushwatchSrc.includes("terminalAbandoned+=1;"),
+      "abandoned is not counted as undelivered": !pushwatchSrc.includes(
+        "terminalAbandoned+=1;undelivered+=1;",
+      ),
+      "durable record written": pushwatchSrc.includes(
+        "awaitthis.recordAbandonedTerminalCard(row,now);",
+      ),
+      "settle runs in the pass": pushwatchSrc.includes(
+        "constsettle=awaitthis.settleUnconfirmedCards(now);",
+      ),
+      "re-arm exists (guarded on rug)":
+        dbSrc.includes("asyncrearmPushWatchAlert(token:string):Promise<boolean>{") &&
+        dbSrc.includes("ANDlast_state='rug'"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ terminal-card three-state send missing - apply docs/patches/terminal-send-and-liq-prune.patch",
+      );
+      return;
+    }
+    const missing = Object.entries(applied)
+      .filter(([, v]) => !v)
+      .map(([k]) => k);
+    assert.equal(
+      missing.length,
+      0,
+      `partial application is unsafe - missing: ${missing.join(", ")} (see docs/patches/terminal-send-and-liq-prune.patch)`,
+    );
+  });
+
   // ---------- hand-paste drift guard (out-of-window patches) ----------
   //
   // Three of the four fixes in docs/scan-completion-loss.md § "可直接貼上嘅窗口外
@@ -598,6 +826,47 @@ async function main() {
       null,
       "a genuinely missing reading stays missing",
     );
+    // The predicate a consumer needs to tell "that leg is not comparable"
+    // from "that comparable leg has no reading" — the push gate must NOT
+    // collapse the two onto null (a drained pool reports 0, and that $0 has
+    // to keep failing the floor).
+    assert.equal(liquidityIsComparable({ feedSource: "dexscreener" }), true);
+    assert.equal(liquidityIsComparable({ feedSource: "jupiter" }), false);
+    assert.equal(liquidityIsComparable({ feedSource: "gecko" }), false);
+    assert.equal(liquidityIsComparable({}), true, "untagged = DexScreener");
+  });
+
+  await test("gateLiquidityUsd: the push gate's two USD rules judge one leg only", () => {
+    // The floor and the mcap/LP ratio are calibrated on DexScreener's pool
+    // reserve (2026-09-20: Lobby 17,446 vs Jupiter 7,793 for the same pool).
+    assert.equal(
+      gateLiquidityUsd({ liquidity: { usd: 17_446 }, feedSource: "dexscreener" }),
+      17_446,
+    );
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: 21_000 } }), 21_000, "untagged = DexScreener");
+    // A drained pool reports 0, and a comparable leg with NO reading still
+    // counts as $0 depth: neither may be waved through the floor.
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: 0 }, feedSource: "dexscreener" }), 0);
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: null }, feedSource: "dexscreener" }), 0);
+    // Another leg's number is UNJUDGED, never $0: reading Jupiter's ~half
+    // metric as $0 depth is what made this gate twice as strict on its tick.
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: 7_950.39 }, feedSource: "jupiter" }), null);
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: 0 }, feedSource: "jupiter" }), null);
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: 10_640 }, feedSource: "gecko" }), null);
+    // So the two rules can only reject on the calibrated leg — the same number
+    // that is a false "drained" from Jupiter is a real drain from DexScreener.
+    const floor = 10_000;
+    const ratioMax = 10;
+    const jup = gateLiquidityUsd({ liquidity: { usd: 7_950.39 }, feedSource: "jupiter" });
+    const dex = gateLiquidityUsd({ liquidity: { usd: 7_950.39 }, feedSource: "dexscreener" });
+    assert.equal(jup === null, true, "the Jupiter leg cannot reach the floor to fail it");
+    assert.equal(dex !== null && dex < floor, true, "the DexScreener leg still fails it");
+    assert.equal(
+      jup === null ? null : mcapRatioBlockReason(150_000, jup, ratioMax),
+      null,
+      "and cannot fire the mcap/LP ratio either",
+    );
+    assert.match(mcapRatioBlockReason(150_000, dex, ratioMax), /18\.9x/);
   });
 
   await test("push-watch: a Jupiter-sourced reading can neither rug nor crash a live coin", () => {
@@ -668,6 +937,7 @@ async function main() {
       "both baselines keep the comparable value":
         pushwatchSrc.includes("lastLiquidity:comparableLiquidity(pair)??row.lastLiquidity,"),
       "heal seed guarded": pushwatchSrc.includes("liquidityUsd:comparableLiquidity(pair),"),
+      "comparable-leg predicate": pushwatchSrc.includes("exportfunctionliquidityIsComparable"),
       "no raw cross-source baseline left":
         !pushwatchSrc.includes("lastLiquidity:pair.liquidity.usd,") &&
         !pushwatchSrc.includes("liquidityUsd:pair.liquidity.usd"),
@@ -691,8 +961,57 @@ async function main() {
     // DexScreener and the guard above is bypassed from the producer side.
     assert.equal(read("src/dexscreener.ts").includes('feedSource:"dexscreener"'), true);
     assert.equal(read("src/jupfeeds.ts").includes('feedSource:"jupiter"'), true);
-    assert.equal(read("src/scanner.ts").includes('feedSource:"gecko"'), true);
-    console.log("  ℹ liquidity provenance guarded - USD-level rules see one metric only");
+    const scannerSrc = read("src/scanner.ts");
+    assert.equal(scannerSrc.includes('feedSource:"gecko"'), true);
+    // The PRUNE WRITE must judge the same way (docs/patches/
+    // terminal-send-and-liq-prune.patch): `token_stats.max_liquidity_observed`
+    // feeds the re-eval pool's minQualifyLiquidity prune and is raise-only, so
+    // a half-scale Jupiter reading can only leave a live coin short of its own
+    // high-water mark and have it pruned out of the pool — a PERMANENT missed
+    // push. Unjudgeable leg → no raise; the next DexScreener-served sweep
+    // records it (a comparable 0 still lands: a corpse's $0 LP is the signal).
+    assert.equal(
+      scannerSrc.includes("constliquidity:number|undefined=liquidityIsComparable(pair)"),
+      true,
+      "the max_liquidity_observed raise must read the comparable leg only",
+    );
+    assert.equal(
+      scannerSrc.includes("constliquidity=pair.liquidity?.usd??0;"),
+      false,
+      "the raw cross-source reading must be gone from the raise path",
+    );
+    // The PUSH GATE must judge the same way — the tracker half alone would
+    // leave `minLiquidityUsd`/`mcapLiqRatioMax` twice as strict on a Jupiter
+    // tick, holding a healthy coin out of its age window (docs/patches/
+    // liq-gate-source-guard.patch).
+    assert.equal(
+      scannerSrc.includes("exportfunctiongateLiquidityUsd(pair:{"),
+      true,
+      "gateLiquidityUsd must exist (see docs/patches/liq-gate-source-guard.patch)",
+    );
+    assert.equal(
+      scannerSrc.includes("constliquidityUsd=gateLiquidityUsd(pair);"),
+      true,
+      "the gate must read through the provenance guard",
+    );
+    assert.equal(
+      scannerSrc.includes("liquidityUsd!==null&&liquidityUsd<chat.minLiquidityUsd"),
+      true,
+      "the liquidity floor must not judge an unjudgeable leg",
+    );
+    assert.equal(
+      scannerSrc.includes("liquidityUsd===null?null:mcapRatioBlockReason("),
+      true,
+      "and neither may the mcap/LP ratio",
+    );
+    assert.equal(
+      scannerSrc.includes("constliquidityUsd=pair.liquidity.usd??0;"),
+      false,
+      "no raw cross-source reading may reach the gate",
+    );
+    console.log(
+      "  ℹ liquidity provenance guarded - the tracker rules AND the push gate see one metric only",
+    );
   });
 
   // ---------- GeckoTerminal 429: the cache is the fix, the backoff the net ---
