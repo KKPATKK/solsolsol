@@ -483,20 +483,51 @@ export function nextPushDeferralSnapshot(
     recovered: number;
     stalled: number;
   } | null = null,
-  pendingTokens: string[] = [],
+  /**
+   * The tokens this isolate holds as owed. Passing it makes the pending list
+   * AND — by construction — the gauge `pending` above come from the same
+   * array, so the two cannot drift apart (see the derivation below). Omit it
+   * only in a projection that genuinely has no list to offer; then the
+   * legacy `delta.pending` stands as the gauge.
+   */
+  pendingTokens?: readonly string[],
 ): PushDeferralSnapshot {
   const prev = parsePushDeferralSnapshot(raw) ?? emptyPushDeferralSnapshot();
   const deferred = count(delta.deferred);
   const recovered = count(delta.recovered);
   const stalled = count(delta.stalled);
+  // The backlog gauge and the token list are ONE fact: the gauge is the length
+  // of the list this very snapshot carries, so /health can never publish a
+  // backlog that disagrees with the tokens it is listing.
+  //
+  // That disagreement was live (2026-09-20): `pending` read 7 next to a
+  // 5-token list for a whole tick and on every heartbeat after it, because the
+  // gauge came from the caller's scan-time count (`summary.deferPending`, taken
+  // before the duplicate guard trimmed the list) while the list came from the
+  // post-guard registry. Deriving it here means the two can only ever be one
+  // number, whatever the caller's counters say.
+  //
+  // A list is OPTIONAL, and the two absences mean different things:
+  //   * no list at all (legacy callers, projections) → `delta.pending` stands
+  //     as the gauge, exactly as before;
+  //   * an empty list from a caller that DID read its store → nothing is owed.
+  //     It still does not wipe `pendingTokens`: an isolate whose scanner is not
+  //     ready yet holds no registry but must not erase obligations it simply
+  //     has not read. The gauge then follows the list that is kept, which keeps
+  //     the invariant (gauge === list length) true in every branch.
+  const hasList = pendingTokens !== undefined;
+  const catalogued =
+    hasList && pendingTokens.length > 0
+      ? [...new Set(pendingTokens)].slice(-500)
+      : prev.pendingTokens;
   const next: PushDeferralSnapshot = {
     deferredTotal: prev.deferredTotal + deferred,
     recoveredTotal: prev.recoveredTotal + recovered,
     stalledTotal: prev.stalledTotal + stalled,
     firstStallAt: prev.firstStallAt,
     lastStallAt: prev.lastStallAt,
-    pending: count(delta.pending),
-    pendingTokens: pendingTokens.length > 0 ? [...new Set(pendingTokens)].slice(-500) : prev.pendingTokens,
+    pending: hasList ? catalogued.length : count(delta.pending),
+    pendingTokens: catalogued,
     firstDeferredAt: prev.firstDeferredAt,
     lastDeferAt: prev.lastDeferAt,
     firstRecoveredAt: prev.firstRecoveredAt,

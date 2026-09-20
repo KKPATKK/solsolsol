@@ -564,8 +564,13 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
     raw,
     {
       ...delta,
-      // Backlog as this tick left it (a gauge): a deferral burst is readable
-      // next to the make-ups that later drain it.
+      // NOT the gauge any more: the snapshot derives `pending` from the list
+      // below (see nextPushDeferralSnapshot), because the two must be one
+      // fact. This value is the scanner's scan-time count (`deferPending`),
+      // taken before the duplicate guard trimmed the list, and publishing it
+      // is what made /health read "pending 7" next to a 5-token list on
+      // 2026-09-20. It still travels: it is the fallback gauge for a caller
+      // that passes no list at all.
       pending: summary?.deferPending ?? 0,
     },
     Date.now(),

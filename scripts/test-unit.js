@@ -351,6 +351,57 @@ async function main() {
     assert.equal(second.events.length, 2);
   });
 
+  await test("nextPushDeferralSnapshot: the gauge is the list's length, never the caller's counter", () => {
+    // The live shape (2026-09-20): /health published `deferral.pending: 7`
+    // next to a five-token list for a whole tick and on every heartbeat after
+    // it, because the gauge came from the scanner's scan-time count
+    // (`summary.deferPending`, taken BEFORE the duplicate guard trimmed the
+    // list) while the list came from the post-guard registry. A caller that
+    // hands over a list now gets that list's length as the gauge.
+    const held = ["AAA", "BBB", "CCC", "DDD", "EEE"];
+    const row = nextPushDeferralSnapshot(
+      null,
+      { deferred: 0, recovered: 0, stalled: 0, pending: 7 },
+      1_000,
+      null,
+      held,
+    );
+    assert.equal(row.pending, held.length, "the gauge is the list's length, not the caller's count");
+    assert.deepEqual(row.pendingTokens, held);
+    assert.equal(row.events[0].pending, held.length, "and the event carries the same number");
+    // Duplicates collapse first, so the gauge can never be inflated by one.
+    const dupes = nextPushDeferralSnapshot(
+      JSON.stringify(row),
+      { deferred: 0, recovered: 0, stalled: 0, pending: 5 },
+      2_000,
+      null,
+      ["AAA", "AAA", "BBB"],
+    );
+    assert.equal(dupes.pending, 2);
+    assert.deepEqual(dupes.pendingTokens, ["AAA", "BBB"]);
+    // An EMPTY list from a caller that read its store still never wipes it — a
+    // lost obligation is a missed card, an extra one is a duplicate, and only
+    // one of those is recoverable. The gauge follows the list that is KEPT, so
+    // the two stay one fact in this branch too.
+    const empty = nextPushDeferralSnapshot(
+      JSON.stringify(dupes),
+      { deferred: 0, recovered: 0, stalled: 0, pending: 4 },
+      3_000,
+      null,
+      [],
+    );
+    assert.deepEqual(empty.pendingTokens, ["AAA", "BBB"], "an empty list never wipes the store");
+    assert.equal(empty.pending, 2, "and the gauge still matches the list that was kept");
+    // No list at all keeps the legacy contract: the caller's count is the gauge.
+    const legacy = nextPushDeferralSnapshot(
+      JSON.stringify(empty),
+      { deferred: 0, recovered: 0, stalled: 0, pending: 3 },
+      4_000,
+    );
+    assert.equal(legacy.pending, 3, "no list → the caller's count stands");
+    assert.deepEqual(legacy.pendingTokens, ["AAA", "BBB"], "and the stored list is untouched");
+  });
+
   await test("nextPushDeferralSnapshot: ring capped and TTL-pruned, totals survive both", () => {
     const base = 1_700_000_000_000;
     let raw = null;

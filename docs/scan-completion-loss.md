@@ -247,6 +247,32 @@ ledger 只收 `initial` 一種 provenance（push-time mcap 嘅用途決定嘅）
 **驗收點**：`/health` 嘅 `deferral.pendingTokens` 唔應該再包含 audit ring 或 ledger 已有 `initial` 嘅 token；
 console 會出現 `[worker] forgot N deferred obligation(s) already delivered — …`；同一個 token 唔應該再收兩張卡。
 
+## 已做（窗口內）：令 gauge 同 pending 列表係「同一個事實」
+
+**病徵（live 2026-09-20 02:30Z）**：`/health` 嘅 `deferral.pending` 讀 **7**，但同一行嘅
+`pendingTokens` 只有 **5** 個，而且維持成個 tick（一直到下次寫入）。`pending` 就係運維／警報睇嘅 backlog。
+
+**成因**：兩個來源各自數一次。
+- `pending` 由 caller 帶入：`worker.ts` 傳 `summary.deferPending` —— 即 scanner **掃描當時**嘅
+  `deferredPushes.pendingCount`；
+- `pendingTokens` 由 registry 讀，而 duplicate guard 係喺**同一個 tick 嘅尾段**（掃描之後）才刪走已送嘅 token。
+
+所以「掃描時 7 → 尾段刪剩 5」嗰個 tick 寫落去嘅行就是 `pending: 7` ＋ 5 個 token，之後每次心跳照抄。
+
+**修法**：`nextPushDeferralSnapshot`（`deferrallog.ts`，窗口內）唔再收 caller 嘅數做 gauge ——
+**只要 caller 交咗列表，gauge 就係嗰個列表（去重、−500 截斷之後）嘅長度**，一個數只有一個來源，
+兩個欄位唔可能再分開。`delta.pending` 只喺 caller 完全冇列表（投影／legacy caller）時保留為 fallback。
+事件 ring 嘅 `pending` 亦用同一個數，所以連 ring 都唔會自相矛盾。
+
+**刻意保留嘅邊界**：caller 交**空**列表**唔會清空** `pendingTokens` —— 空列表可以係「真係冇欠」，
+亦可以係「呢個 isolate 未 seed registry（scanner 未 ready）」，而兩者要靠 caller 分；猜錯嘅代價唔對稱：
+**漏清 = 多一張重複卡；清錯 = 漏推一張卡**，所以一律保留（fail-open），
+而 gauge 就跟着「保留落嚟嗰個列表」嘅長度 → 不變式 `pending === pendingTokens.length`
+喺兩個分支都成立。
+
+**驗收點**：任何讀數都應該 `deferral.pending === deferral.pendingTokens.length`；出現過刪除嘅 tick 之後
+（console 有 `[worker] forgot N …`）唔應該再見到 7 vs 5 嗰種組合。
+
 ## 驗收點（deploy 後）
 
 - 主：`scan-history` 嘅**連續** dead 行長度上限（改前 5–13 連）→ 應縮到 1–2。
