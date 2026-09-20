@@ -193,6 +193,12 @@ alert 一齊放寬）。改為新增獨立常數：
 
 ## 已做（窗口內）：補推重複嘅修正（live 2026-09-20 00:47Z GROYPER，+2 分鐘再收一次）
 
+> **2026-09-20 更正（重要）**：本節嘅 *機制* 仍然成立（pending 寫入跟 completion flush 同生死），但
+> **GROYPER 00:49Z 那張重複卡唔係由呢條路徑產生**：audit ring 有一條 `resend GROYPER`（00:49:50Z，
+> id 2339），而 `resend` 只會由 **tracker self-heal 嘅「補發」** 寫 —— 即係用戶口中嘅「補推卡片」。
+> 真正嘅生成器係下面「重複推送卡片」一節嘅 **(B) self-heal 補發循環**（已修），呢節嘅 deferral 守衛
+> 係另一條獨立防線（live 驗證過：pending 由 7 降到 5，兩個已送幣被正確 forget）。
+
 **機制**：`push_deferral` 嘅 pending 列表同推送**係同一個 completion flush 寫嘅**。flush 一失手，
 卡片已經送出但「仲欠佢一張」嘅記錄冇清 → 下一 tick 嘅 make-up pass 再送同一張卡 → 用戶收到重複。
 即係呢個重複係上面「失 completion」嘅**下游**後果，唔係獨立問題。
@@ -279,6 +285,121 @@ console 會出現 `[worker] forgot N deferred obligation(s) already delivered �
 **驗收點**：任何讀數都應該 `deferral.pending === deferral.pendingTokens.length`；出現過刪除嘅 tick 之後
 （console 有 `[worker] forgot N …`）唔應該再見到 7 vs 5 嗰種組合。
 
+## 重複推送卡片（live 2026-09-20 10:48–11:08 HKT，GROYPER、PONDER 各重複 4–5 次）
+
+**唔關之前嘅 deferral 守衛事**：那個守衛管嘅係「pending／補推」清單（欠一張卡）。用戶回報嘅重複有**兩個獨立生成器**，兩個都不經過那份清單：
+
+| | 觸發 | 重複嘅卡從哪來 | 今日狀態 |
+|---|---|---|---|
+| **(A) cut → unclaim → re-eval 重推** | 卡片送到一半被 send deadline 切斷 | re-eval pool 下一個 tick 當佢「未推」再送 | **機制確認，修法在窗口外**（見下） |
+| **(B) tracker self-heal 嘅「補發」循環** | 幣喺 `seen_tokens`（已 claim）但冇 `push_watch` row，而且 audit ring 冇 `initial` entry | `pushwatch.ts` 嘅 self-heal 送「📤 補發推送」，**每個 pass 再送一次** | **已修（窗口內）** ✅ |
+
+(B) 才是用戶口中「その後收到 X 補推卡片」嘅那張：用戶 00:47Z GROYPER 收到推送，00:49Z 收到補推 — audit ring 正好有一條 `resend GROYPER`（00:49:50Z，id 2339）；同一形狀的 `resend` 還有 JEV（00:33）、STACK（01:02）、MEMEMAN（01:39）。
+
+### (B) self-heal 補發循環 —— 已修（窗口內）
+
+**代碼路徑**：`pushwatch.ts` 嘅 heal 段（`findUntrackedPushes` → 逐幣）；gate 原文：
+
+```ts
+const recentClaim = now - m.pushedAt <= FIRST_CARD_RESEND_GRACE_MS;   // 15 分鐘
+if (recentClaim && !audited.has(m.token)) {   // audited = getInitialPushAuditTokens()（只有 kind "initial"）
+  ... 送一張完整的首卡，然後寫 kind: "resend" 的 audit entry ...
+}
+```
+
+**為何會循環**：被 cut 嘅卡片**會送到，但一個 audit entry 都唔會寫**（cut 路徑只有 throw → unclaim）。所以：
+
+1. 第一次 heal pass：冇 `initial` → 覺得「首卡未送達」→ 送補發，並寫一條 `resend`；
+2. 下一次 pass：gate 只認 `initial`，**看不到自己剛寫嘅 `resend`** → 又送一張補發；
+3. 15 分鐘 grace 內每個 pass 重複 → 用戶在 11 分鐘內收到 4–5 張同一枚幣嘅卡（live PONDER 02:57/03:01/03:03/03:08Z，其中 03:01:11Z 嘅 `lastPushError` 正是 `cardSendTimeout`）。
+
+**修法（`src/pushwatch.ts` + `src/deferrallog.ts`，都是窗口內）**：gate 由「有冇 `initial`」改成「**有冇任何已送達嘅卡**」——即 `deferrallog.deliveredCardTokens(audit)`（kind ∈ `initial` / `resend` / `pushed-row`）：
+
+```ts
+const delivered = new Set(deliveredCardTokens(ring));   // ring = 同一條 push_audit row
+if (recentClaim && !delivered.has(m.token)) { ... 送補發 ... }
+```
+
+**為何仍然「一定唔會漏推」**（安全論證）：
+
+- 補發會寫自己嘅 `resend` entry，所以**每個 token 每個 ring 窗最多補發一次**；
+- **完全冇 entry** 嘅 token 照舊即時補發（never-miss 那半完全未動）；
+- ring 每個 kind 都只在 Telegram 回 `message_id` 之後才寫 → 有 entry = 用戶確實收過一張該幣嘅卡；
+- ring 讀失敗 → 退回舊嘅 initial-only 集合（fail toward the old behaviour，唔會多發）。
+
+**為何用 seam 讀**：heal 測試用嘅 Db double 只實作 `getInitialPushAuditTokens`，所以新 reader 用 `typeof` 檢查（缺就退回舊集合）——純規則本身有單元測試釘死。
+
+### (A) cut → unclaim → re-eval 重推 —— 機制確認，修法在窗口外
+
+**機制（代碼路徑，`scanner.ts` sendTo，行 ~3020，窗口外）**
+
+1. `claimTokenPush(chatId, token)` = `INSERT OR IGNORE INTO seen_tokens` → 搶到 claim 才會送（設計上「storage layer 令重複不可能」）。
+2. 送卡片係 `bestEffort(() => bot.api.sendMessage(...), sendDeadline, null)` = `Promise.race([send, timeout])`。**timeout 只係唔再等，send 本身繼續在飛** → Telegram 可能已經收下呢張卡。
+3. 但 `sent === null` 時代碼 **throw**（`cardSendTimeout`），catch 裡 **`unclaimTokenPush`** 把 claim `DELETE` 掉 → 個幣又變返「未推」。
+4. 下一 tick 嘅 re-eval pool 見佢未推 → 再送 → **第二張卡**。喺失手嘅 slice 修好之前，每個 tick 重複一次。
+
+**Live 證據**
+
+| 證據 | 讀數 |
+|---|---|
+| 該 chat 嘅 push 失敗記錄（`/debug/chats` → `lastPushError`） | `{"description":"initial-card send exceeded its deadline (card may not have been delivered)","token":"3QgAJyTGGKfp…"（PONDER）, "at": 03:01:11Z}` ← 正是用戶收到 11:01 HKT 嗰張卡 |
+| 該 tick 嘅 phase stamps（`/health` → `heartbeat.summary.phases`） | `flow@2102, rugcheck@2102, enrich-dispatch@2378, enrich-await@2378, wallets@2800（= enrich deadline）, flurry@3300（= chain deadline）, render@3300, send@3542, tracker@4131, done@4638`；`candidates 1, pushed 0, cardSendDeferred 1` |
+| 換算 | chain 用到 3300ms 為止（用盡每個 deadline）→ render/claim 190ms → **send 開 3542ms，距 4200ms deadline 只剩 658ms** |
+| claim 閘門邊界 | `CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS = 400 + 250 = 650`，最後可 claim 嘅起點 3550ms → **tick 就係壓在這條線上**，一係剛剛夠（送出去但被 cut），一係一時過就 defer |
+| Telegram 真實往返（`/debug/test-push`，5 次 curl 計時） | **0.62s / 1.23s**（`/health` 同期 baseline 1.12–1.21s，即大部分係 isolate 啟動，Telegram 自己約 0.5–1s）→ **658ms 嘅 slice 根本裝唔落** |
+| audit ring 嘅 message_id 缺口 | 最後一條有真 id 嘅 audit = **2361（02:37:09Z）**；之後我發測試訊息拿到 **2370/2371/2372/2373/2374** → **2362–2369 呢 8 條訊息完全冇 audit**（用戶回報嘅 4–5 張重複卡就落在這窗）。⚠️ 注意 ring 裏有 `messageId: 1` 嘅行（PONDER 兩條 `initial`、幾條 `followup`），即係 id 並不總是真實 id → 呢個缺口算術只適用於 id 落喺 23xx 嘅行 |
+
+**為何 deferred 守衛幫唔到**：`deferredDeferredTokens` 只管 `push_deferral.pendingTokens`（補推義務）；呢邊係 `seen_tokens` 被刪 → 推送閘門再開。守衛讀 proof 之後只會 forget pending，唔會（亦唔應該）擋一次合法 push。
+
+**真正嘅修法（窗口外，`scanner.ts` sendTo）**：把兩態改成**三態**，送嘅 promise 自己帶背景處理：
+
+```ts
+// 現在：const sent = await this.bestEffort(() => send, deadline, null);
+//       if (sent === null) throw cut;          // → catch 裡 unclaim → 重複
+const started = this.bot.api.sendMessage(chatId, message, opts);   // 立即開
+const raced = await Promise.race([
+  started.then((m) => ({ status: "sent", messageId: Number(m.message_id) }))
+         .catch(() => ({ status: "failed" })),
+  new Promise((r) => setTimeout(() => r({ status: "abandoned" }), Math.max(0, sendDeadline - Date.now()))),
+]);
+if (raced.status === "failed") throw new Error(...);            // 冇送到 → unclaim，等下 tick
+if (raced.status === "sent") { /* audit（今日本身有：kind "initial"）*/ }
+if (raced.status === "abandoned") {
+  // 唔 unclaim：卡片可能已送到，claim 留著 = 唯一阻止即刻重推嘅嘢。
+  // 先寫一筆持久「未確認」紀錄（worker_state ring：{chatId, token, at}），然後
+  void started.then(async (m) => {
+    await this.db.recordPushDelivery({ ...kind: "initial", messageId: Number(m.message_id) }); // 證明已送
+  }).catch(async () => {
+    await this.db.unclaimTokenPush(chatId, token);   // 真係失敗 → 放返出去，唔會漏
+  });
+}
+```
+
+**配套（worker 側，窗口內可寫）**：tick 尾（`syncPushDeferralCounters` 隔離區塊）對持久「未確認」紀錄做 reconcile：
+超過 2 個 tick（約 2 分鐘）而 audit/ledger/watch row **仍證唔到** delivery → 真正 `unclaimTokenPush`（放返出去，最壞情況=多一張重複，唔會漏）。
+即係：**freeze 天花板**由「即刻重複」變成「兩分鐘後最多重複一次」，而成功確認嘅個案完全唔會重複。
+
+**窗口內可以做嘅替代方案（有代價，未做，等決定）**
+
+1. **把 send 嘅 slice 補到約 1.1–1.3s**：`CARD_SEND_FLOOR_MS` 600→900、`CARD_SEND_MIN_MS` 250→700（claim 閘門 → 1100ms）。效果：`send@3542` 嗰種 tick 由「cut 但照送」變成**defer**（一個字都唔寫、零重複風險），真正送出去嘅卡都有 ≥1100ms。
+   障礙：所產生嘅邊界（`cardSendDeadline(t0,t0+4150)`、`cardClaimDeadline(t0,t0+3550/3551)`）**被 `scripts/test-unit.js` ~2018–2056 行嘅斷言釘死**，而該處在 file-sync 窗口外 → 改咗會 CI 紅。
+2. **把 chain 提前收工**：`CANDIDATE_PUSH_RESERVE_MS` 900→1300–1500（`chainDeadline` 3300→2900–2700）。效果：send 開 ~3200ms → slice ~1.0–1.25s。代價：`enrichDeadline` 由 2800 跌到 2400–2200，而 live enrich dispatch 喺 **2378ms** → 卡片會失去 Birdeye/Arkham/GMGN 那些裝飾行，wallet/Flurry 閘門嘅窗口亦相應縮短（fail-open，唔會漏推但少判）。
+3. **拉長 tail / `SCAN_TICK_DEADLINE_MS`**：**否決**。tail（4400）已經只離最小 race window（4742）340ms，再拉就會令 completion flush 又開始死（即之前那個病）。
+
+**已落地嘅改動（全部窗口內）**
+
+| 檔案 | 改動 | 作用 |
+|---|---|---|
+| `src/deferrallog.ts` | 新純函數 `deliveredCardTokens(audit)`；`deliveredDeferredTokens` 改用同一個 rule | 一個 rule 服侍兩個 call site（deferral 守衛 + heal gate） |
+| `src/deferrallog.ts` | 新純函數 `duplicateInitialTokens(audit)` | 由 ring 數「同一 token 有兩張 `initial`」= **可證實**嘅重複（見下方限制） |
+| `src/pushwatch.ts` | heal gate 改為 `deliveredCardTokens`；新增 `readDeliveredTokens(db)` seam | **修掉 (B) 循環**：每 token 每窗最多一張補發 |
+| `src/tickprobe.ts` | 新 `CardSendView`（`classifyCardSend` → cut / sent / deferred）＋ `DeliveryDuplicatesView`（`noteDuplicateCards` → `duplicates` / `tokens` / `at`） | 兩個計數器都掛上 `summary.cardSend` / `summary.deliveryDuplicates`，心跳會 serialize |
+| `src/worker.ts` | `dropDeliveredPendings` 改為**每個 tick 都讀一次 audit ring**（pending 空時只讀一條，唔再 3 條）並呼叫 `noteDuplicateCards` | 站內就有重複率，唔再靠用戶人手報告 |
+
+**計數器嘅已知限制（唔修飾）**：`duplicateInitialTokens` 只能捉到**兩張卡都有 audit entry** 嘅重複（即 (B) 類，或已 claim 成功嘅重複）；**(A) 類嘅主體係「cut 但送到」——一個 entry 都冇，因此在 ring 裏完全隱形**。所以 (A) 嘅唯一可量度訊號係 `cardSend.cut`（上游生成器）而非重複數本身；`deliveryDuplicates` 應該讀成「可證實嘅重複」下界。
+
+**`room ≈ R − 220` 模型（用 live tick 校準，供 (A) 調參用）**：`chainDeadline = SCAN_TICK_DEADLINE_MS − CANDIDATE_PUSH_RESERVE_MS`，而 live tick 顯示由 chain 收工到 `send:telegram` 之間固定花 ~220–250ms（render + claim round trip）。所以 send 實際可用時間 ≈ **R − 220ms**：R=900 → 680ms（實測 658ms ✓ 模型吻合），要 ~1.2s 就要 **R ≈ 1400**。
+
 ## 驗收點（deploy 後）
 
 - 主：`scan-history` 嘅**連續** dead 行長度上限（改前 5–13 連）→ 應縮到 1–2。
@@ -292,3 +413,17 @@ console 會出現 `[worker] forgot N deferred obligation(s) already delivered �
 - 量度注意：**任何 HTTP 路由都會行 `maybeRunScanIfStale`**，所以 curl `/health`（或
   UptimeRobot）本身會補跑掃描、令 cron 分鐘行消失（會見到 `scanCount 1` 嘅新 isolate）。
   睇 `tickRing` 才分得清 cron 有冇 fire。
+
+### 重複推送卡片那條線
+
+- 新指標：`/health` → `heartbeat.summary.cardSend = { cut, sent, deferred, lastCutAt, lastCutMs }`
+  同 `heartbeat.summary.deliveryDuplicates = { count, tokens, at }`。
+  基線：`cut` 應該幾乎每次卡被送都 +1（每次 `send@>3500ms` 嘅 tick），`sent` 只喺快 slice 出現。
+- **(B) 已修嘅驗收**：同一 token 喺 audit ring 唔應該再出現**多過一條** `resend`（改前可以 4–5 條）；
+  用戶唔應該再收到「📤 補發推送」。呢個係 deploy 後最快見到嘅成效（下一次有 cut 或漏 row 嘅幣就會觸發）。
+- **(A) 未修**：`cardSend.cut` 應該維持（上游生成器仍在）；`deliveryDuplicates.count` 唔會反映 (A)（見限制）。
+  (A) 嘅驗收要等窗口外嘅三態 send 落地：**同一 token 喺 `/debug/push-audit` 只應有 1 條 `initial`**、
+  `seen_tokens` 唔應該再因為 timeout 而被刪。
+- 反面驗收（防漏推）：模擬一個 request reject 嘅 send → 仍然要 `unclaimTokenPush` + 下 tick 補推；
+  只有 `abandoned` 才保留 claim，而且 2 個 tick 內證唔到 delivery 就必須放返出去。
+  heal gate 嘅反面驗收：**ring 完全冇 entry 嘅 token 必須照樣補發**（單元測試 `deliveredCardTokens` 覆蓋）。

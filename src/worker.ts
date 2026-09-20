@@ -29,6 +29,7 @@ import {
   dbStepView,
   writeDrainView,
   drainDeferredWrites,
+  noteDuplicateCards,
 } from "./tickprobe";
 import {
   PUSH_DEFERRAL_STATE_KEY,
@@ -36,6 +37,7 @@ import {
   loadPushDeferralSnapshot,
   nextPushDeferralSnapshot,
   deliveredDeferredTokens,
+  duplicateInitialTokens,
   parsePushDeferralSnapshot,
   pushDeferralAlreadyApplied,
   pushDeferralDelta,
@@ -395,16 +397,25 @@ async function dropDeliveredPendings(
   database: Db,
   pending: readonly string[],
 ): Promise<string[]> {
-  if (pending.length === 0) return [];
+  // The audit ring is read on EVERY tick, not only when something is pending:
+  // it is also where the duplicate count comes from (noteDuplicateCards), and
+  // without that number on the heartbeat neither the operator's report nor any
+  // fix can be measured. The two other proof sources (durable ledger, watch
+  // rows) are only fetched when they can actually be used, so a tick with
+  // nothing pending pays one read instead of three.
   let audit: Awaited<ReturnType<Db["getPushAudit"]>>;
-  let ledgerRaw: string | null;
-  let watchRows: Awaited<ReturnType<Db["listPushWatch"]>>;
+  let ledgerRaw: string | null = null;
+  let watchRows: Awaited<ReturnType<Db["listPushWatch"]>> = [];
   try {
-    [audit, ledgerRaw, watchRows] = await Promise.all([
-      database.getPushAudit(),
-      database.getWorkerState(PUSH_LEDGER_STATE_KEY),
-      database.listPushWatch(60),
-    ]);
+    if (pending.length === 0) {
+      audit = await database.getPushAudit();
+    } else {
+      [audit, ledgerRaw, watchRows] = await Promise.all([
+        database.getPushAudit(),
+        database.getWorkerState(PUSH_LEDGER_STATE_KEY),
+        database.listPushWatch(60),
+      ]);
+    }
   } catch (err) {
     console.warn(
       "[worker] delivery-proof read failed (deferral duplicate guard skipped):",
@@ -412,6 +423,17 @@ async function dropDeliveredPendings(
     );
     return [];
   }
+  // Duplicate telemetry rides the read that is already here. It is taken BEFORE
+  // the early return below, because a token pushed twice has nothing to do with
+  // whether anything is currently owed — and it only ever COUNTS: the one
+  // function allowed to drop an obligation is deliveredDeferredTokens, and only
+  // on hard proof of delivery.
+  try {
+    noteDuplicateCards(duplicateInitialTokens(audit));
+  } catch {
+    /* telemetry only */
+  }
+  if (pending.length === 0) return [];
   // Each source is labelled with the kind the rule expects: the ledger's
   // `initial-send` entries ARE audit `initial` provenance (that is the merge's
   // only accepted source), and a watch row is its own `pushed-row` proof (see

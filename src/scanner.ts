@@ -182,18 +182,26 @@ const CANDIDATE_PUSH_RESERVE_MS = 900;
  * as a delivery failure — its claim is released and the coin stays in the
  * re-eval pool, so the next tick retries it.
  *
- * NOTE (2026-09-19, later): this floor (600) is UNDER the claim gate's
- * requirement (CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS = 650), so once it
- * starts binding the gate refuses every claim and the last usable claim start
- * is 3550ms — the tick still holds 850ms of unused tail. Raising it above 650
- * would hand that limit back to the thing sized for it (CARD_SEND_TAIL_MS =
- * 4400, ~340ms inside the smallest race window observed) and move the boundary
- * to 3750ms, but that boundary is pinned by a unit test that lives past the
- * file-sync window (scripts/test-unit.js: `cardClaimDeadline(t0, t0 + 3_551)`
- * must be null). The tail LATENCY that made the claim arrive late at all is
- * removed instead — see the trade-mode prefetch in jupiter.ts, the chain's
- * per-phase capture in the worker, and the DB write batch the tick probe takes
- * out of the tick entirely (tickprobe.ts).
+ * NOTE (2026-09-19, later): the floor used to be UNDER the claim gate's
+ * requirement (CARD_CLAIM_BUDGET_MS + CARD_SEND_MIN_MS), which left the tick
+ * holding ~850ms of unused tail while late sends were started with whatever
+ * crumbs were left.
+ *
+ * 2026-09-20 (duplicate cards, GROYPER/PONDER x5 in one afternoon): this value
+ * is the one that should move next, and it is NOT moved yet on purpose — the
+ * boundaries it produces are pinned by unit tests that live in
+ * scripts/test-unit.js past the file-sync window, so raising it here would
+ * turn CI red with no way to update them. The measurement is done and recorded
+ * in docs/scan-completion-loss.md: the tick spends every deadline it is given
+ * (`wallets@2800` = its enrich deadline, `flurry@3300` = the chain deadline,
+ * `render@3300`, `send@3542`), so a card's send is started 658ms before the
+ * 4200ms deadline while a Telegram sendMessage round trip from this Worker
+ * measures 0.6-1.2s — the await is cut, the claim is released, and the next
+ * tick pushes the same card again. Raising this to ~900 (with
+ * CARD_SEND_MIN_MS to ~700, so a claimed card always has 400 + 700 = 1100ms)
+ * is the paired change; a tick that cannot afford it then DEFERS the card
+ * instead of cutting it. `cardSendCuts` in the heartbeat (src/tickprobe.ts)
+ * counts how often this happens, so the effect is measurable either way.
  */
 const CARD_SEND_FLOOR_MS = 600;
 /**
@@ -213,10 +221,19 @@ const CARD_SEND_FLOOR_MS = 600;
 const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
 /**
  * Least send slice worth starting. Below it the card is DEFERRED rather than
- * attempted: the claim and the delivery audit are written BEFORE the send
- * and are not retried, so a send that cannot finish loses the card, while a
- * deferral leaves the row completely untouched (the re-eval pool re-pushes
- * the coin next tick).
+ * attempted: a deferral writes NOTHING (no claim, no audit, no failure record)
+ * and the re-eval pool plus the deferred registry re-push the coin next tick,
+ * while a send that cannot finish is the duplicate generator — Telegram
+ * accepts the card, the await is cut, the claim is released, and the next tick
+ * sends the same card again.
+ *
+ * 2026-09-20: this is the other half of the pair described at
+ * CARD_SEND_FLOOR_MS above — the raise to ~700 (which also raises the CLAIM
+ * gate to CARD_CLAIM_BUDGET_MS + this, so a claimed card always has 1100ms for
+ * its claim plus its send) is ready but cannot land from here: the boundary it
+ * produces at 3550/3551ms is asserted in scripts/test-unit.js, which is past
+ * the file-sync window. Until it lands, the cut is counted instead
+ * (`cardSendCuts`), and the coin keeps the duplicate-prone behaviour.
  */
 const CARD_SEND_MIN_MS = 250;
 

@@ -435,13 +435,7 @@ export function deliveredDeferredTokens(
   audit: ReadonlyArray<{ token?: string | null; kind?: string | null }>,
 ): string[] {
   if (pending.length === 0 || audit.length === 0) return [];
-  const delivered = new Set<string>();
-  for (const entry of audit) {
-    const token = entry?.token;
-    if (typeof token !== "string" || token.length === 0) continue;
-    if (typeof entry.kind !== "string" || !DELIVERED_CARD_KINDS.has(entry.kind)) continue;
-    delivered.add(token);
-  }
+  const delivered = new Set(deliveredCardTokens(audit));
   if (delivered.size === 0) return [];
   const stale: string[] = [];
   const seen = new Set<string>();
@@ -451,6 +445,87 @@ export function deliveredDeferredTokens(
     stale.push(token);
   }
   return stale;
+}
+
+/**
+ * Tokens the audit ring proves had A CARD DELIVERED (any kind in
+ * DELIVERED_CARD_KINDS), in first-seen order.
+ *
+ * One rule, two callers: the deferral guard below asks it of the pending list,
+ * and the tracker's self-heal asks it of a claimed-but-untracked coin before
+ * re-sending a first card (src/pushwatch.ts). The heal's gate used to ask the
+ * narrower question — "was an INITIAL card delivered?" — and that is exactly
+ * how one duplicate became five: a card cut by the send deadline is delivered
+ * with NO audit entry at all, and the 補發 card it then sent writes the only
+ * entry the token ever gets, kind `resend`. Because that kind was invisible to
+ * the gate, the next heal pass still read "never delivered" and sent another
+ * 補發 — live 2026-09-20: the operator reports "a push, then a 補發 card", then
+ * four more of the same coin inside eleven minutes (PONDER, 10:48-11:08 HKT),
+ * and the ring shows the `resend` rows (GROYPER 00:49Z, JEV, STACK, MEMEMAN).
+ * Asking the wider question closes the loop after exactly ONE 補發 per token per
+ * ring window, and cannot hide anything: every kind here is written only after
+ * Telegram accepted a card, and a token with no entry at all still gets its
+ * 補發 on this pass exactly as before.
+ *
+ * Pure and exported: both callers are durable-read + network code the offline
+ * harness cannot drive, so the RULE is what the tests pin.
+ */
+export function deliveredCardTokens(
+  audit: ReadonlyArray<{ token?: string | null; kind?: string | null }>,
+): string[] {
+  if (audit.length === 0) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of audit) {
+    const token = entry?.token;
+    if (typeof token !== "string" || token.length === 0) continue;
+    if (typeof entry.kind !== "string" || !DELIVERED_CARD_KINDS.has(entry.kind)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+  }
+  return out;
+}
+
+/**
+ * Tokens the delivery audit shows Telegram accepted as a FRESH card more than
+ * once — the duplicate the operator reports by hand (2026-09-20: "PONDER
+ * 10:48, then 10:57, 11:01, 11:03, 11:08" HKT).
+ *
+ * Only `initial` counts. `resend`/`followup`/`heal-current` are the tracker
+ * repairing its own rows and are expected to repeat, and `pushed-row` is a
+ * synthesized proof with no kind of its own; a second `initial` for one token
+ * means the coin was pushed as a fresh discovery twice, which is exactly the
+ * duplicate the user sees. Nothing here is used to suppress anything — the one
+ * thing that may drop an obligation is deliveredDeferredTokens above, and only
+ * on hard proof — so this can never hide a card the user is still owed.
+ *
+ * The result is a WINDOW, not a lifetime total: the ring holds ~30 deliveries
+ * (~6h at the live push rate), so it decays on its own and answers "how many
+ * duplicates are visible right now?" — which is the acceptance measure for the
+ * scanner-side send fix (docs/scan-completion-loss.md) either way, and the way
+ * to tell that generator from the lost-completion-write one this file's guard
+ * already covers.
+ *
+ * Pure and exported: the read that feeds it happens in the worker's tick tail,
+ * which the offline harness cannot drive, so the RULE is what the tests pin.
+ */
+export function duplicateInitialTokens(
+  audit: ReadonlyArray<{ token?: string | null; kind?: string | null }>,
+): string[] {
+  if (audit.length === 0) return [];
+  const counts = new Map<string, number>();
+  for (const entry of audit) {
+    const token = entry?.token;
+    if (typeof token !== "string" || token.length === 0) continue;
+    if (entry.kind !== "initial") continue;
+    counts.set(token, (counts.get(token) ?? 0) + 1);
+  }
+  const out: string[] = [];
+  for (const [token, count] of counts) {
+    if (count > 1) out.push(token);
+  }
+  return out;
 }
 
 export function heldBackCandidates(

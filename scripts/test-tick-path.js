@@ -21,6 +21,10 @@ const {
   writeDrainView,
   drainDeferredWrites,
   deferredWriteCount,
+  classifyCardSend,
+  cardSendView,
+  noteDuplicateCards,
+  deliveryDuplicatesView,
 } = require("../dist/tickprobe.js");
 const { TradeService } = require("../dist/jupiter.js");
 const { resetFeedMakeup, noteProfileFeed, feedMakeupView } = require("../dist/deferredmakeup.js");
@@ -550,6 +554,127 @@ installTickProbe(fakeScanner, {
     assert.equal(shouldAlertNoCompletion(90_000, 0, now).minutes, 2, "minutes are rounded up from 1");
     assert.equal(shouldAlertNoCompletion(0, 0, now).minutes, 1, "a sub-minute stretch still reads 1");
     console.log("completion-based outage alert: pass");
+  }
+
+  // ---------- card-send outcome: cut vs delivered vs deferred ---------------
+  {
+    // The rule the duplicate-card investigation needed: the two stamps around
+    // the send (`send:telegram` before, `send:track` after) already say whether
+    // it RETURNED, which `pushed`/`cardSendDeferred` in the summary cannot. The
+    // three shapes below are the three real ones.
+    const pre = [{ phase: "render", ms: 3_300 }];
+    const claim = { phase: "send:claim", ms: 3_300 };
+    const telegram = { phase: "send:telegram", ms: 3_542 };
+    assert.equal(
+      classifyCardSend([...pre, claim, telegram, { phase: "send:track", ms: 4_131 }]),
+      "sent",
+      "a send that returned is delivered",
+    );
+    // The live shape that produced the duplicate cards (2026-09-20): the chain
+    // spent every deadline it was given and the send started at 3542ms of a
+    // 4200ms tick, so its 658ms slice cut the await while Telegram may already
+    // have accepted the card.
+    assert.equal(classifyCardSend([...pre, claim, telegram]), "cut");
+    // A claim opened and no send after it: the deferral path (or a claim
+    // another isolate won) — nothing was written, nothing can duplicate.
+    assert.equal(classifyCardSend([...pre, claim]), "deferred");
+    // Nothing card-shaped happened at all.
+    assert.equal(classifyCardSend(pre), null);
+    assert.equal(classifyCardSend([]), null);
+    // A cut AFTER a delivered card is still a cut: the consequence wins over
+    // the tick's other, successful send.
+    assert.equal(
+      classifyCardSend([
+        { phase: "send:telegram", ms: 2_500 },
+        { phase: "send:track", ms: 3_000 },
+        { phase: "send:telegram", ms: 3_600 },
+      ]),
+      "cut",
+    );
+
+    // The counters published on the summary the heartbeat serializes, so the
+    // cut RATE becomes a number the operator can watch going down after a fix.
+    resetTickProbe();
+    const cutScanner = {
+      lastSummary: { candidates: 1, pushed: 1 },
+      markPhase(diag, name) {
+        diag.pushPhase = name;
+      },
+      async runOnce() {
+        this.markPhase(this.lastSummary, "render");
+        clock = 7_250;
+        this.markPhase(this.lastSummary, "send:claim");
+        clock = 7_450;
+        this.markPhase(this.lastSummary, "send:telegram");
+      },
+    };
+    clock = 7_000;
+    installTickProbe(cutScanner, {}, now);
+    assert.deepEqual(cardSendView(), {
+      sent: 0,
+      cut: 0,
+      deferred: 0,
+      lastCutAt: 0,
+      lastCutMs: 0,
+    });
+    await cutScanner.runOnce();
+    const counted = cardSendView();
+    assert.equal(counted.cut, 1, "the abandoned send is counted");
+    assert.equal(counted.sent, 0, "and not mistaken for a delivery");
+    assert.equal(counted.deferred, 0, "nor for a deferral");
+    assert.equal(counted.lastCutAt, 7_450, "the cut's wall clock is recorded");
+    assert.equal(counted.lastCutMs, 450, "with the tick-relative stamp it happened at");
+    assert.equal(
+      cutScanner.lastSummary.cardSend.cut,
+      1,
+      "and it rides the summary the completion heartbeat serializes",
+    );
+    console.log("card-send outcome (cut / delivered / deferred): pass");
+  }
+
+  // ---------- the duplicate counter that rides the same heartbeat -----------
+  {
+    // The user's report ("PONDER five times between 10:48 and 11:08 HKT") had
+    // no number anywhere in /health, so neither the fix nor a regression could
+    // be seen. The worker's tail hands the audit-ring duplicates to the probe,
+    // and the summary the completion heartbeat serializes carries them from the
+    // NEXT tick on (the tail runs after this tick's stamps are published — one
+    // tick of lag, by construction, exactly like the deferral counters).
+    resetTickProbe();
+    assert.deepEqual(deliveryDuplicatesView(), { count: 0, tokens: [], at: 0 });
+    const probeScanner = {
+      lastSummary: { candidates: 1 },
+      markPhase(diag, name) {
+        diag.pushPhase = name;
+      },
+      async runOnce() {
+        this.markPhase(this.lastSummary, "render");
+      },
+    };
+    clock = 9_000;
+    installTickProbe(probeScanner, {}, now);
+    noteDuplicateCards(["AAAA", "BBBB", "CCCC", "DDDD"], 8_500);
+    const view = deliveryDuplicatesView();
+    assert.equal(view.count, 4, "every duplicate in the ring is counted");
+    assert.deepEqual(view.tokens, ["AAAA", "BBBB", "CCCC"], "the list is capped at three");
+    assert.equal(view.at, 8_500, "with the wall clock of the tail that saw them");
+    await probeScanner.runOnce();
+    assert.equal(
+      probeScanner.lastSummary.deliveryDuplicates.count,
+      4,
+      "and it rides the summary the completion heartbeat serializes",
+    );
+    // An empty ring CLEARS the count (it is a rolling window, not a total), and
+    // the stamp of the last sighting survives so the line stays answerable.
+    noteDuplicateCards([], 9_500);
+    const cleared = deliveryDuplicatesView();
+    assert.equal(cleared.count, 0, "no duplicates in the ring reads as zero");
+    assert.deepEqual(cleared.tokens, []);
+    assert.equal(cleared.at, 8_500, "the last sighting keeps its stamp");
+    // Malformed input must never throw in the tick tail.
+    noteDuplicateCards(["", null, undefined, "ZZZZ"]);
+    assert.equal(deliveryDuplicatesView().count, 1);
+    console.log("duplicate-card counter (audit ring → heartbeat): pass");
   }
 
   console.log("tick probe + mode read + feed view + db seam: pass");

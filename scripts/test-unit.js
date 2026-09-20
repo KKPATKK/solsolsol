@@ -33,7 +33,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, duplicateInitialTokens } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
@@ -210,6 +210,78 @@ async function main() {
       ]),
       ["AAA"],
     );
+  });
+
+  // The duplicate the operator reports by hand (2026-09-20: PONDER 10:48, then
+  // 10:57/11:01/11:03/11:08 HKT). Counted from the same ring, but nothing is
+  // ever dropped on it — it is the acceptance measure for the scanner-side send
+  // fix, so the rule has to distinguish a real duplicate (two `initial` cards)
+  // from the tracker's own repeats (resend / followup / heal-current).
+  await test("duplicateInitialTokens: two delivered initial cards, never the tracker's own repeats", () => {
+    const audit = [
+      { token: "AAA", kind: "initial" },
+      { token: "AAA", kind: "resend" },
+      { token: "AAA", kind: "followup" },
+      { token: "AAA", kind: "initial" },
+      { token: "BBB", kind: "initial" },
+      { token: "CCC", kind: "resend" },
+      { token: "CCC", kind: "heal-current" },
+      { token: "DDD", kind: "pushed-row" },
+      { token: "DDD", kind: "initial" },
+    ];
+    assert.deepEqual(duplicateInitialTokens(audit), ["AAA"]);
+    // One initial card is not a duplicate, however many resends followed it.
+    assert.deepEqual(duplicateInitialTokens([{ token: "AAA", kind: "initial" }, { token: "AAA", kind: "resend" }]), []);
+    // Three initial cards still report the token once.
+    assert.deepEqual(
+      duplicateInitialTokens([
+        { token: "AAA", kind: "initial" },
+        { token: "AAA", kind: "initial" },
+        { token: "AAA", kind: "initial" },
+      ]),
+      ["AAA"],
+    );
+    assert.deepEqual(duplicateInitialTokens([]), []);
+    // Malformed rows must never throw: this runs in the tick tail.
+    assert.deepEqual(
+      duplicateInitialTokens([{ kind: "initial" }, { token: "", kind: "initial" }, null, undefined]),
+      [],
+    );
+    // A duplicate whose first card has already rolled out of the ring cannot be
+    // seen — the count is a window, not a lifetime total (documented limit).
+    assert.deepEqual(duplicateInitialTokens([{ token: "ZZZ", kind: "initial" }]), []);
+  });
+
+  // The self-heal's resend gate (src/pushwatch.ts) asks the same question from
+  // the same rule. This is the one that turned THREE duplicates into five: a
+  // card cut by the send deadline is delivered with no audit entry, and the
+  // 補發 card writes the token's only entry, kind `resend` — which the old
+  // initial-only gate could not see, so every heal pass over the 15-minute
+  // grace sent another 補發. Bounded by the widen question: at most one per
+  // token, and never zero when there is no proof at all.
+  await test("deliveredCardTokens: any delivered card closes the heal-resend gate, and one pass writes the proof that closes it", () => {
+    const ringAfterCut = [{ token: "AAA", kind: "followup" }, { token: "BBB", kind: "initial" }];
+    assert.deepEqual(deliveredCardTokens(ringAfterCut), ["BBB"]);
+    // The 補發 this loop sends writes `resend`: the same token, one pass later,
+    // is now proof — so the gate is shut and the coin is only enrolled.
+    const afterResend = [...ringAfterCut, { token: "AAA", kind: "resend" }];
+    assert.deepEqual(deliveredCardTokens(afterResend), ["BBB", "AAA"]);
+    // A token with nothing in the ring stays re-sendable (never-miss half).
+    assert.equal(deliveredCardTokens(afterResend).includes("CCC"), false);
+    // `heal-ledger`/`heal-current` prove the tracker measured a push, not that
+    // a card was delivered, so they must not close the gate.
+    assert.deepEqual(
+      deliveredCardTokens([{ token: "DDD", kind: "heal-current" }, { token: "EEE", kind: "heal-ledger" }]),
+      [],
+    );
+    // The wider question is a superset of the old one on every ring.
+    for (const ring of [ringAfterCut, afterResend]) {
+      for (const token of deliveredDeferredTokens(ring.map((r) => r.token), ring)) {
+        assert.ok(deliveredCardTokens(ring).includes(token));
+      }
+    }
+    assert.deepEqual(deliveredCardTokens([]), []);
+    assert.deepEqual(deliveredCardTokens([{ kind: "initial" }, { token: "", kind: "resend" }, null]), []);
   });
 
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {

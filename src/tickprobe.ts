@@ -151,9 +151,54 @@ export interface WriteDrainView {
   totals: { calls: number; ms: number; failures: number };
 }
 
+/**
+ * What the tick did with the card its chain reached — the counter this whole
+ * duplicate-card investigation needed and did not have.
+ *
+ * The scanner stamps `send:telegram` immediately BEFORE the card send and
+ * `send:track` immediately after it returns (see the send in sendTo), so the
+ * two stamps together already answer "did this tick's card send finish?":
+ * the send is raced against its slice, so a `send:telegram` with no
+ * `send:track` after it means the await was abandoned — Telegram may still have
+ * ACCEPTED the card, the catch releases the claim, the coin is unseen again and
+ * the next tick pushes the same card. That is the duplicate the operator sees
+ * (live 2026-09-20: GROYPER x5 and PONDER x5 in one afternoon), and until it is
+ * fixed in the scanner's send (past the file-sync window) the least this probe
+ * can do is count it per tick, so the rate is a number instead of an anecdote
+ * and a fix can be shown to work.
+ */
+export interface CardSendView {
+  /** Ticks whose card send returned (the tick reached `send:track`). */
+  sent: number;
+  /**
+   * Ticks where a card send was abandoned at its deadline — the duplicate
+   * generator. An abandoned send may or may not have been delivered, which is
+   * exactly why its claim must not be released blindly.
+   */
+  cut: number;
+  /**
+   * Ticks that opened a card claim and never started a send: the deferral path
+   * (nothing written, the coin keeps its place in the pool and its make-up
+   * priority) or a claim another isolate won — cheap either way.
+   */
+  deferred: number;
+  /** Epoch of the most recent cut (0 = none since this isolate booted). */
+  lastCutAt: number;
+  /** Tick-relative ms of the phase stamp the last cut happened at. */
+  lastCutMs: number;
+}
+
 let view: TickProbeView | null = null;
 let tickStartedAt = 0;
 let stamps: TickPhaseStamp[] = [];
+/** Cumulative per isolate, like the DB step timings above. */
+let cardSend: CardSendView = {
+  sent: 0,
+  cut: 0,
+  deferred: 0,
+  lastCutAt: 0,
+  lastCutMs: 0,
+};
 /**
  * Clock used by the DB seam and the drain. Production passes `Date.now` (see
  * installTickProbe's `now`); tests inject their own, which is the only way the
@@ -184,6 +229,81 @@ let tickActive = false;
 /** The tick that finished most recently, or null before the first one. */
 export function tickProbeView(): TickProbeView | null {
   return view ? { phases: view.phases.map((p) => ({ ...p })), tickMs: view.tickMs } : null;
+}
+
+/** Card-send outcomes since this isolate booted (see CardSendView). */
+export function cardSendView(): CardSendView {
+  return { ...cardSend };
+}
+
+/**
+ * Classify one tick's card work from its phase stamps — pure, so the rule is
+ * unit-tested instead of inferred from a live tick (which is the only way to
+ * test it at all: the send itself lives inside runOnce, with no offline
+ * fixture, past the file-sync window).
+ *
+ * "cut" wins over "sent" when a telegram stamp is the newest send step: a tick
+ * that cut one card and delivered another reports the cut, because the cut is
+ * the outcome with a consequence. "deferred" is the trailing `send:claim` with
+ * no telegram stamp after it (the claim was opened and no send followed).
+ * Stamps are a bounded ring, so this is per-TICK, not per-card — enough for
+ * "is the cut rate going down?", and free by construction.
+ */
+export function classifyCardSend(
+  stampsIn: readonly TickPhaseStamp[],
+): "cut" | "sent" | "deferred" | null {
+  let claimIdx = -1;
+  let telegramIdx = -1;
+  let trackIdx = -1;
+  for (let i = 0; i < stampsIn.length; i += 1) {
+    const phase = stampsIn[i].phase;
+    if (phase === "send:claim") claimIdx = i;
+    else if (phase === "send:telegram") telegramIdx = i;
+    else if (phase === "send:track") trackIdx = i;
+  }
+  if (telegramIdx > trackIdx) return "cut";
+  if (trackIdx >= 0) return "sent";
+  if (claimIdx >= 0) return "deferred";
+  return null;
+}
+
+/**
+ * Cards the delivery audit shows went out TWICE (see
+ * deferrallog.duplicateInitialTokens, which is the rule — this is only the
+ * holder, because the worker's tick tail is where the ring is read and this
+ * file is where the summary is published).
+ *
+ * Without it the duplicate rate is an anecdote from the chat: the user reports
+ * "PONDER five times between 10:48 and 11:08" and nothing in /health moves.
+ * With it, any fix (the scanner-side three-state send in
+ * docs/scan-completion-loss.md, or the timing trade recorded there) has a
+ * before/after number, and the ring's own decay makes it a rolling window
+ * rather than a since-boot total.
+ */
+export interface DeliveryDuplicatesView {
+  /** How many distinct tokens currently show two delivered `initial` cards. */
+  count: number;
+  /** Up to three of them, for the log/health line. */
+  tokens: string[];
+  /** Epoch of the last tick that saw at least one (0 = none yet). */
+  at: number;
+}
+
+let duplicates: DeliveryDuplicatesView = { count: 0, tokens: [], at: 0 };
+
+/** Record this tail's view of the audit ring (an empty list CLEARS the count). */
+export function noteDuplicateCards(tokens: readonly string[], now = Date.now()): void {
+  const list = tokens.filter((token) => typeof token === "string" && token.length > 0);
+  duplicates = {
+    count: list.length,
+    tokens: list.slice(0, 3),
+    at: list.length > 0 ? now : duplicates.at,
+  };
+}
+
+/** Duplicates visible in the audit ring as of the last completed tail. */
+export function deliveryDuplicatesView(): DeliveryDuplicatesView {
+  return { ...duplicates, tokens: [...duplicates.tokens] };
 }
 
 /** Per-method DB timing since this isolate booted (see the header). */
@@ -257,6 +377,7 @@ export function resetTickProbe(): void {
   steps.clear();
   dbClock = () => Date.now();
   drain = { calls: 0, ms: 0, at: 0, failures: 0, totals: { calls: 0, ms: 0, failures: 0 } };
+  cardSend = { sent: 0, cut: 0, deferred: 0, lastCutAt: 0, lastCutMs: 0 };
 }
 
 function noteStep(name: string, ms: number): void {
@@ -367,8 +488,28 @@ export function installTickProbe(
         phases: captured,
         tickMs: captured.length > 0 ? captured[captured.length - 1].ms : now() - tickStartedAt,
       };
+      // Card outcome for THIS tick, folded into the cumulative counters. Read
+      // from the stamps rather than from the summary's counters because the
+      // stamps are what say whether the send RETURNED — `pushed` and
+      // `cardSendDeferred` cannot tell a delivered card from a cut one, which
+      // is the whole question here.
+      const outcome = classifyCardSend(captured);
+      if (outcome !== null) {
+        cardSend[outcome] += 1;
+        if (outcome === "cut") {
+          cardSend.lastCutAt = now();
+          cardSend.lastCutMs = captured.length > 0 ? captured[captured.length - 1].ms : 0;
+        }
+      }
       if (marker !== null && captured.length > 0 && target.lastSummary && typeof target.lastSummary === "object") {
-        (target.lastSummary as Record<string, unknown>).phases = captured;
+        const summary = target.lastSummary as Record<string, unknown>;
+        summary.phases = captured;
+        // Published here rather than by the worker's onTickEnd hook: this file
+        // is inside the file-sync window and worker.ts's telemetry block is
+        // not, and the summary is the channel the completion heartbeat
+        // already serializes.
+        summary.cardSend = cardSendView();
+        summary.deliveryDuplicates = deliveryDuplicatesView();
       }
       try {
         hooks.onTickEnd?.(target.lastSummary);

@@ -8,6 +8,9 @@ import {
   findLedgerEntry,
   parsePushLedger,
 } from "./pushledger";
+// The self-heal's resend gate asks the same question the deferral guard does
+// ("was a card for this token delivered?"), so it asks it with the same rule.
+import { deliveredCardTokens } from "./deferrallog";
 
 /**
  * Post-push tracker: every pushed coin is watched for a bounded window so
@@ -188,6 +191,41 @@ const RISING_STAGES = [50, 100, 200, 400] as const;
  * audit ring (delivered long ago) or are far past any recovery point.
  */
 const FIRST_CARD_RESEND_GRACE_MS = 15 * 60_000;
+/**
+ * Delivered-card proof for the resend gate: every token the audit ring shows a
+ * card was ACCEPTED for, whatever kind wrote it — see
+ * deferrallog.deliveredCardTokens for the rule and for why this one duplicate
+ * became five (a card cut by the send deadline is delivered with no audit
+ * entry, and the 補發 that followed wrote the token's only entry, kind
+ * `resend`, which the old initial-only gate could not see).
+ *
+ * Read through a seam rather than by adding a method to the Db interface: the
+ * Db doubles the heal tests drive implement the narrower initial-only reader,
+ * and both readers are the SAME `push_audit` worker_state row, so the wider one
+ * costs one extra trip per heal pass (only on a pass that found untracked
+ * pushes) and nothing at all on a normal tick. A seam without the ring reader
+ * degrades to the initial-only set — the pre-widen behaviour, never a crash and
+ * never a dropped resend.
+ */
+async function readDeliveredTokens(
+  database: Db,
+): Promise<{ tokens: Set<string>; trips: number }> {
+  const initial = await database.getInitialPushAuditTokens();
+  const read = (
+    database as Partial<Pick<Db, "getPushAudit">>
+  ).getPushAudit;
+  if (typeof read !== "function") return { tokens: initial, trips: 1 };
+  try {
+    const ring = await read.call(database);
+    return {
+      tokens: new Set([...initial, ...deliveredCardTokens(ring)]),
+      trips: 2,
+    };
+  } catch {
+    return { tokens: initial, trips: 1 };
+  }
+}
+
 /**
  * Heal-path counters (module scope, same shape as src/poolfallback.ts's).
  *
@@ -1027,8 +1065,20 @@ export class PushWatcher {
         // the trade mode is ONE setting (the re-send keyboard asked for it per
         // coin). Both are one trip for the whole batch now, and the
         // enrollments land in a single batched INSERT at the end.
-        const audited = await this.db.getInitialPushAuditTokens();
-        trips += 1;
+        // Delivered-card proof, NOT initial-card proof — the audit ring is ONE
+        // worker_state row, read once for the whole batch. The gate below asks
+        // "did the operator ever get a card for this coin?", and the 補發 card
+        // this very loop sends is proof of exactly that (kind `resend`). Asking
+        // only about `initial` left a token whose first card was cut by the send
+        // deadline looking "never delivered" — that card does leave the chat,
+        // but it writes no audit entry — so every later pass re-sent another
+        // 補發 and the operator got the same coin five times in eleven minutes
+        // (live 2026-09-20: PONDER 10:48-11:08 HKT; the ring shows the resend
+        // rows, GROYPER 00:49Z, JEV, STACK, MEMEMAN). A token with no entry at
+        // all is still re-sent on this pass — the never-miss half.
+        const proof = await readDeliveredTokens(this.db);
+        const delivered = proof.tokens;
+        trips += proof.trips;
         // Durable push-baseline ledger (src/pushledger.ts): the true
         // push-time mcap per token, copied out of the delivery audit ring and
         // kept across deploys. ONE worker_state read covers the whole batch.
@@ -1066,15 +1116,22 @@ export class PushWatcher {
         for (const m of missing) {
           const pair = missPairs.get(m.token);
           if (!pair) continue;
-          // A RECENTLY-claimed coin with no initial-card audit entry means
+          // A RECENTLY-claimed coin with no delivered-card audit entry means
           // the sending isolate died between claim and send (deploy
           // eviction — XST/GLITCH/Félicette/RING): the card never reached
           // Telegram, so re-send it instead of silently enrolling tracking
           // for a push nobody saw. Older unaudited pushes predate the audit
           // ring and were delivered normally — keep silent enrollment.
+          //
+          // "No delivered-card entry" rather than "no initial-card entry" is
+          // what bounds this to ONE 補發 per coin: the re-send below writes its
+          // own `resend` entry, so the next pass (and every pass for the rest
+          // of the 15-minute grace) sees proof and only enrolls. A coin with no
+          // entry at all is still re-sent — the card the user is owed is never
+          // dropped by this gate.
           const recentClaim = now - m.pushedAt <= FIRST_CARD_RESEND_GRACE_MS;
           let resent = false;
-          if (recentClaim && !audited.has(m.token)) {
+          if (recentClaim && !delivered.has(m.token)) {
             try {
               const usd = (n: number | null | undefined) =>
                 n == null || !Number.isFinite(n)
