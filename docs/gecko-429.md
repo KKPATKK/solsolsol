@@ -94,7 +94,41 @@ curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko}'
   `backoffUntil` 對得上，`geo` 仍然 0 —— 即係「真係 upstream 封 IP，但唔再盲目撞」；
 - **反面驗收**：`geo 0` 期間 `profiles`／`jup` 照樣有數（實測 28／20），卡片推送不受影響。
 
-## 單元測試（`test:unit` = 218 passed）
+## 部署後實測（`92cb2ea`，2026-09-20 10:08–10:15Z）
+
+```
+$ curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko}'
+geo 20   geoTrend 0
+gecko {requests 3, ok 1, http429 2, consecutive429 1, cacheHits 1,
+       lastStatus 429, lastCacheStatus "BYPASS", backoffMs 307956, backoffUntil +5min}
+
+$ curl -s .../debug/gecko-trending        # 裸 fetch，冇 cf options
+{"ok":false,"status":429,...}
+
+$ curl -s .../debug/feed-stats            # 累計（DB）
+gecko: coins 1575, pushed 21
+```
+
+讀法：
+
+1. **主刀有效**：同一個 isolate 嘅 3 個 request 有 1 個係 cache HIT（`cacheHits 1`），而 `geo`
+   由修前嘅「每 tick 都 0」變成 **20**（page 1 有 20 個 pool）—— 即係快取真係替 subrequest 擋咗
+   一次 origin 撞限流。
+2. **限流確實係 IP 級**：`/debug/gecko-trending` 呢條**冇帶 `cf` options 嘅裸探針**仍然 429，
+   同修前一樣 —— 所以今次唔係「upstream 忽然放行」，而係「同一條路，但改行快取就通」。
+3. **429 上嘅 `BYPASS` 係預期，唔係快取失效**：`cacheTtlByStatus["400-599"] = 0` 嘅目的就係要
+   429 **唔入 cache**，所以嗰個 response 直穿（`lastStatus 429` + `lastCacheStatus BYPASS` 同時出現
+   係一致嘅讀數，唔代表壞）。
+4. **`geoTrend 0` 仍然會出現**：`trending_pools` 嗰次係 MISS → 撞 429 → 即刻入 backoff，所以
+   trending 係整組最脆弱嗰條。但 gecko 只係 discovery／tracker 第三來源，DexScreener／Jupiter
+   fail-open 照樣跑（同一 tick `profiles`／`jup` 有數）→ **唔會因為 gecko 而漏推**。
+5. **推論（未單獨驗證）**：一個 cached 200 成功之後 `consecutive429` 會清零，所以 backoff
+   唔會一路升到 60 分鐘封頂 —— 呢個就係「修完之後 requests 唔會爆」嘅機制。
+6. **注意**：`/health` 嘅計數係**每個 isolate 自己**（module state），所以抽到一個冷 isolate
+   （`count 1`、`requests 0`）唔代表嗰分鐘冇 request，只係嗰個 isolate 未跑過 gecko。跨 isolate
+   只可以睇累計嘅 `/debug/feed-stats`。
+
+## 單元測試（`test:unit` = 219 passed）
 
 - `GeckoTerminalClient: every call asks for the Cloudflare edge cache`
   —— 釘住 `cacheEverything` / `cacheTtl` / `400-599: 0`，同 `cacheHits` 有計數；
@@ -102,6 +136,8 @@ curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko}'
   —— 第一次 5 分鐘、第二次更長、backoff 期間**零請求**、成功清零；
 - `geckoBackoffMs / parseRetryAfterMs: Retry-After wins, capped`
   —— 純規則：加倍、封頂、硬上限、秒數／HTTP-date 兩種 `Retry-After`。
+
+（新增嗰條 219 係 writeDrain 嘅窗口外 patch 防半貼 pin，見 `docs/scan-completion-loss.md`。）
 
 （原有嗰條 `GeckoTerminalClient backs off all calls for 5 min after a 429` 保持不變：
 今次改動令第一次 429 嘅行為同以前一致。）

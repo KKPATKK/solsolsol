@@ -1,0 +1,65 @@
+diff --git a/src/worker.ts b/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -100,7 +100,20 @@
+ /** Minimal ExecutionContext shape — avoids pulling in workers-types. */
+ interface ExecutionContextLike {
+   waitUntil(promise: Promise<unknown>): void;
+ }
+ 
++/**
++ * The invocation's waitUntil, when the handler driving the tick has one. The
++ * HTTP fallback always has (`maybeRunScanIfStale` is itself a waitUntil);
++ * `scheduled` gets one only from its third argument, which is why that
++ * argument has to be added. The tick's deferred token_stats writes are fired
++ * WITHOUT being awaited, and an un-awaited promise is cancelled the moment
++ * the handler returns — measured 2026-09-19 as `writeDrain` 4 calls / 4
++ * failures (100%), i.e. the bookkeeping never landed. Holding the drain
++ * promise here keeps the isolate alive for it WITHOUT adding its cost to the
++ * tick itself.
++ */
++let tickWaitUntil: ((promise: Promise<unknown>) => void) | null = null;
++
+ // --- Module-scoped state (warm-isolate lifetime) ---
+ let db: Db | null = null;
+@@ -1737,8 +1750,22 @@
+             // registration insert first, then the max-mcap UPDATE). Same
+             // pattern the deferral-counter sync already relies on ("its
+             // promise is left running -- an idempotent write is welcome to
+             // land late").
+-            void drainDeferredWrites().then(() => flushObservedLiquidity());
++            const drained = drainDeferredWrites().then(() => flushObservedLiquidity());
++            // Keep the isolate alive for it when the handler handed us a
++            // waitUntil (see tickWaitUntil): an un-awaited promise is
++            // cancelled the instant the handler returns, which is exactly
++            // why these writes never landed on the cron path.
++            if (tickWaitUntil) {
++              try {
++                tickWaitUntil(drained);
++              } catch {
++                // A stale context must never break the tick's tail.
++                void drained;
++              }
++            } else {
++              void drained;
++            }
+           },
+           db,
+           deferWrites: true,
+@@ -3939,6 +3966,14 @@
+   },
+ 
+-  async scheduled(_event: ScheduledEventLike, env: Env): Promise<void> {
+-    scheduledTicks++;
++  async scheduled(
++    _event: ScheduledEventLike,
++    env: Env,
++    ctx: ExecutionContextLike,
++  ): Promise<void> {
++    // Keep the invocation open for the tick's deferred writes (see
++    // tickWaitUntil): a fire-and-forget drain is cancelled when the handler
++    // returns — the 100%-failure shape measured above.
++    tickWaitUntil = (promise) => ctx.waitUntil(promise);
++    scheduledTicks++;
+     // Record the cron event BEFORE init, with a raw client: a slow/failed
+     // init (Turso degraded) otherwise kills the scheduled event inside the

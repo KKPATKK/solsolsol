@@ -70,10 +70,21 @@ Cron 路徑最明顯：`scheduled(_event, env)` **冇第三個參數**，即係�
 升嘅同時 `writeDrain.pending` 會係 1，而下一分鐘嗰個 tick 嘅 drain 會清返 0；
 `dbSteps.recordTokenStatsMany.calls` 應該跟住真寫入升（唔再係「有 calls 冇 row」）。
 
-**仲要人手貼嘅一半（窗口外）**：令 cron 嘅 invocation 自己保命。三塊，必須一齊貼
-（只貼 B 會攞唔到 `tickWaitUntil`）。
+**窗口外嘅一半（2026-09-20 已落地）**：令 cron 嘅 invocation 自己保命。三塊必須一齊。以前只可以
+人手貼（`worker.ts` 去到 ~1750／~3965 行已經超出檔案編輯窗口：同一個 `str_replace` 喺第 103 行成功，
+喺 1741／3941 行就算字串逐字一樣都唔會 match），而家係一個直接 apply 嘅 patch：
 
-**Patch A —— module state（`worker.ts`，`interface ExecutionContextLike` 之後）**
+```
+git apply docs/patches/write-drain-waituntil.patch   # git apply --check 驗過乾淨 apply
+```
+
+**2026-09-20 已經 apply 咗入 tree（三塊都喺 source）**，所以正常情況下唔使再做嘢；patch file 留低
+做審計／萬一 `worker.ts` 被重寫時嘅重播來源。改動係咪齊，睇個 pin 就知：
+`npm run test:unit | grep 'drain is held'`（A/B/C 三個 marker 要麼全中、要麼全冇，
+半貼會即刻紅）。下面三塊只係內容摘要。
+
+**Patch A —— module state（`worker.ts`，`interface ExecutionContextLike` 之後；下面係實際插入嘅內容，
+唯一來源仍然係 `docs/patches/write-drain-waituntil.patch`）**
 
 ```ts
 /** Minimal ExecutionContext shape — avoids pulling in workers-types. */
@@ -94,31 +105,18 @@ interface ExecutionContextLike {
 +let tickWaitUntil: ((promise: Promise<unknown>) => void) | null = null;
 ```
 
-**Patch B —— 個 drain 呼叫（`worker.ts` ~1741）**
+**Patch B —— 個 drain 呼叫（`worker.ts` ~1741）**：`void drainDeferredWrites().then(…)` 改成
+`const drained = drainDeferredWrites().then(…)` 再 `tickWaitUntil(drained)`；冇 ctx 就照舊
+fire-and-forget，外面嘅 `try/catch` 係防「一個已經完結嘅 invocation 嘅 stale context」拖垮 tick 尾巴
+（`onTickEnd` callback 一 throw 就會炸到 tick 收尾）。
 
-```ts
--            void drainDeferredWrites().then(() => flushObservedLiquidity());
-+            const drained = drainDeferredWrites().then(() => flushObservedLiquidity());
-+            if (tickWaitUntil) tickWaitUntil(drained);
-+            else void drained;
-```
+**Patch C —— cron handler（`worker.ts` ~3965）**：`scheduled(_event, env)` 收第三個參數
+`ctx: ExecutionContextLike`，入面第一句 `tickWaitUntil = (promise) => ctx.waitUntil(promise);`
+（呢個就係 cron 路徑由「冇 waitUntil」變成「有」嘅關鍵）。
 
-**Patch C —— cron handler（`worker.ts` ~3941）**
-
-```ts
--  async scheduled(_event: ScheduledEventLike, env: Env): Promise<void> {
--    scheduledTicks++;
-+  async scheduled(
-+    _event: ScheduledEventLike,
-+    env: Env,
-+    ctx: ExecutionContextLike,
-+  ): Promise<void> {
-+    // Keep the invocation open for the tick's deferred writes (see
-+    // tickWaitUntil): a fire-and-forget drain is cancelled when the handler
-+    // returns, which is the 100%-failure shape measured above.
-+    tickWaitUntil = (promise) => ctx.waitUntil(promise);
-+    scheduledTicks++;
-```
+**防半貼**：`scripts/test-unit.js` 嘅「out-of-window patch: the cron drain is held by waitUntil」
+檢查 A／B／C 三個 marker 要麼全中、要麼全冇（同上一組窗口外 patch 同一套規矩），並且確認
+`void drainDeferredWrites()` 已經消失。
 
 **驗收點（貼完 + deploy）**：一個**只由 cron 驅動**嘅 isolate 應該見到
 `writeDrain.failures` 唔再等於 `calls`；`writeDrain.pending` 應該幾乎永遠係 0（貼完之後

@@ -512,6 +512,59 @@ async function main() {
     console.log("  ℹ out-of-window behavioural patches all present — three-state send is live in source");
   });
 
+  // ---------- out-of-window drift guard: the cron drain hold ----------
+  //
+  // The writeDrain root fix is split. The queue itself (src/tickprobe.ts) is
+  // inside the edit window, but the three pieces that keep the invocation ALIVE
+  // for the drain sit ~1750 and ~3965 lines into src/worker.ts, past the
+  // file-sync window, so they shipped as docs/patches/write-drain-waituntil.patch
+  // (git apply) and are applied in the tree. The dangerous state is a PARTIAL
+  // application: with the hold in place
+  // but no waitUntil to hold it the drain is still cancelled on return
+  // (measured 2026-09-19: `writeDrain` 4 calls / 4 failures = the bookkeeping
+  // never landed), and the held promise without the queue change has nothing to
+  // retry. Either all three markers are in the source, or none are.
+
+  await test("out-of-window patch: the cron drain is held by waitUntil", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const workerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src/worker.ts"), "utf8"),
+    );
+    const applied = {
+      "patch A (tickWaitUntil state)": workerSrc.includes("lettickWaitUntil:"),
+      "patch B (drain held, not fire-and-forget)":
+        workerSrc.includes("constdrained=drainDeferredWrites()") &&
+        workerSrc.includes("tickWaitUntil(drained)"),
+      "patch C (scheduled takes ctx)":
+        workerSrc.includes("tickWaitUntil=(promise)=>ctx.waitUntil(promise)"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ writeDrain waitUntil patch missing - apply docs/patches/write-drain-waituntil.patch",
+      );
+      return;
+    }
+    const missing = Object.entries(applied)
+      .filter(([, v]) => !v)
+      .map(([k]) => k);
+    assert.equal(
+      missing.length,
+      0,
+      `partial application is unsafe - missing: ${missing.join(", ")} (see docs/patches/write-drain-waituntil.patch)`,
+    );
+    assert.equal(
+      workerSrc.includes("voiddrainDeferredWrites()"),
+      false,
+      "the fire-and-forget drain must be replaced, not kept alongside the held one",
+    );
+    console.log("  ℹ writeDrain waitUntil patch present - the cron drain is held");
+  });
+
   // ---------- GeckoTerminal 429: the cache is the fix, the backoff the net ---
   //
   // Measured 2026-09-20: the worker's egress was 429ed on every attempt (three
