@@ -117,6 +117,29 @@ export interface PushLedgerObservation {
   now: number;
 }
 
+/**
+ * Tokens whose INITIAL card the delivery audit recorded as accepted by Telegram
+ * (`source: "initial-send"`).
+ *
+ * `watch-row` provenance is deliberately EXCLUDED: a `push_watch` row existing
+ * only says the token is being tracked, not that a card was ever delivered — so
+ * treating it as proof would risk forgetting an obligation the user is still
+ * owed. This is the durable half of the worker's deferral duplicate guard: the
+ * audit RING holds ~30 deliveries of ALL kinds (initial, resend, follow-up,
+ * heal) and live 2026-09-20 it rolled two of four stale tokens out of its window
+ * within 13 minutes, while this ledger keeps the same `initial` provenance for
+ * 7 days / 240 pushes.
+ */
+export function ledgerDeliveredTokens(ledger: PushLedger): string[] {
+  const out: string[] = [];
+  for (const entry of ledger.entries) {
+    if (entry?.source === "initial-send" && typeof entry.token === "string" && entry.token.length > 0) {
+      out.push(entry.token);
+    }
+  }
+  return out;
+}
+
 export function emptyPushLedger(): PushLedger {
   return { entries: [], updatedAt: 0 };
 }

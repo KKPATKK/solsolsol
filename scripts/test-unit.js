@@ -19,7 +19,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient } = require("../d
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher } = require("../dist/pushwatch.js");
-const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES } = require("../dist/pushledger.js");
+const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger } = require("../dist/scanner.js");
@@ -163,6 +163,38 @@ async function main() {
       ["AAA"],
     );
     assert.deepEqual(deliveredDeferredTokens(["AAA"], [{ kind: "initial" }, { token: "", kind: "initial" }]), []);
+  });
+
+  // The durable half of that proof. The audit RING holds ~30 deliveries of ALL
+  // kinds and rolled two of four stale tokens out of its window within 13
+  // minutes on 2026-09-20, so the guard reads the push ledger too — where the
+  // same `initial` provenance lives for 7 days / 240 pushes. Only
+  // `initial-send` counts: a `watch-row` entry says the token is TRACKED, not
+  // that a card was delivered, and treating it as proof could forget an
+  // obligation the user is still owed.
+  await test("ledgerDeliveredTokens: only the audit's initial-send provenance counts, never a watch-row guess", () => {
+    const ledger = {
+      updatedAt: 0,
+      entries: [
+        { token: "AAA", source: "initial-send" },
+        { token: "BBB", source: "watch-row" },
+        { token: "CCC", source: "initial-send" },
+        { token: "", source: "initial-send" },
+        { source: "initial-send" },
+      ],
+    };
+    assert.deepEqual(ledgerDeliveredTokens(ledger), ["AAA", "CCC"]);
+    assert.deepEqual(ledgerDeliveredTokens({ entries: [], updatedAt: 0 }), []);
+    assert.deepEqual(
+      ledgerDeliveredTokens({ entries: [{ token: "X", source: "watch-row" }], updatedAt: 0 }),
+      [],
+    );
+    // The folded proof feeds the same kind whitelist, so a ledger token really
+    // does drop a delivered pending entry — and nothing else does.
+    assert.deepEqual(
+      deliveredDeferredTokens(["AAA", "ZZZ"], ledgerDeliveredTokens(ledger).map((token) => ({ token, kind: "initial" }))),
+      ["AAA"],
+    );
   });
 
   await test("pushDeferralDelta: only new increments are persisted; a rebuilt scanner never writes a negative", () => {

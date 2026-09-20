@@ -223,12 +223,21 @@ alert 一齊放寬）。改為新增獨立常數：
 - 讀取失敗一律 fail-open（保留 pending）。
 
 **已知限制（老實講）**：
-1. 覆蓋範圍係 audit ring（~30 條交付 ≈ 6 小時）；但重複係喺下一 tick（秒至分鐘）出現，所以窗足夠。
+1. 覆蓋範圍：最新係 **audit ring ＋ 持久 push ledger 兩邊一齊讀**（見下）。原本只用 ring，live 一量就發現唔夠。
 2. 若 tick 喺「send 成功」同「寫 audit」之間被殺，就冇任何記錄可證 → 呢種重複**唔可以**靠推斷消除（推斷就等於有機會漏推）。寧可有重複，唔可以漏。
 3. 多 chat：卡片送到 chat A 就會令該 token 被 forget，即使 chat B 後來才啟用。
 4. 冷 isolate 首次 seed 喺 `worker.ts` ~74KB（窗口外）讀持久行；持久行會由窗口內嘅寫入收緊，所以最多一個 tick 後收斂。
 
-**驗收點**：`/health` 嘅 `deferral.pendingTokens` 唔應該再包含 audit ring 已有 `initial` 嘅 token；
+**Live 量到嘅覆蓋缺口（deploy 後即刻發現，已修）**：首個 post-deploy 讀數
+（02:03:44Z）顯示 overlap 由 4 降至 **2**（`6dWoxftzRFH…STACK`、`9gaMApmv31…MEMEMAN` 被刪掉 ✓），
+但另一對（`DFQHUegJW…PUMPCAT`、`BmnGRH8N1…`）仍在 pending —— 因為 **audit ring 只有 30 條**
+（initial、resend、followup、heal 一齊塞），13 分鐘就將它們揷出窗。所以補上第二個證明來源：
+**持久 push ledger** 嘅 `source: "initial-send"` entries（同一個 `initial` 交付類別，TTL 7 日／240 條），
+經 `ledgerDeliveredTokens`（純函數，`pushledger.ts`）抽出，同 ring 合併成同一個 kind whitelist。
+`watch-row` provenance 刻意唔算（有 row 唔等於送過卡）。
+02:05:42Z 複測：pending 8 → **6**，overlap **0**。
+
+**驗收點**：`/health` 嘅 `deferral.pendingTokens` 唔應該再包含 audit ring 或 ledger 已有 `initial` 嘅 token；
 console 會出現 `[worker] forgot N deferred obligation(s) already delivered — …`；同一個 token 唔應該再收兩張卡。
 
 ## 驗收點（deploy 後）
