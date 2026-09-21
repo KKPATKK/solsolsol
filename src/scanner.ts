@@ -1983,75 +1983,6 @@ export class Scanner {
     ]);
   }
 
-  /**
-   * Start a discovery-feed call NOW and hand back a thunk that resolves to its
-   * result (see the tick-start block in runOnce). Every feed call used to be
-   * constructed at the fan-out, so the window it raced was only whatever the
-   * pre-feed steps left; starting it at tick start gives it the full
-   * FEED_DEADLINE_MS whatever those steps cost (2026-09-21, the same fix the
-   * profiles fetch got that day).
-   *
-   * The rejection handler is attached at creation, so a call whose job is
-   * abandoned — an early return below, or a feed race the deadline wins — can
-   * never surface as an unhandled rejection. `[]` is the same degradation
-   * every feed job already applies, and `label` keeps the console line the
-   * per-job catch used to print.
-   */
-  private startFeedCall<T>(
-    label: string,
-    start: () => Promise<T>,
-  ): () => Promise<T> {
-    const call = start().catch((err: unknown) => {
-      console.error(
-        `[scanner] ${label} discovery failed:`,
-        err instanceof Error ? err.message : err,
-      );
-      return [] as unknown as T;
-    });
-    return () => call;
-  }
-
-  /**
-   * GeckoTerminal new-pools pages → discovery profiles. Extracted from the
-   * fan-out so the call can be STARTED at tick start (see startFeedCall): the
-   * page loop is the reason this one cannot be a one-line thunk.
-   */
-  private async collectGeckoNewPools(): Promise<TokenProfile[]> {
-    const first = await this.gecko!.fetchNewPools(1);
-    const pools = [...first];
-    for (
-      let page = 2;
-      page <= this.config.geckoterminalPoolPages && first.length > 0;
-      page++
-    ) {
-      const got = await this.gecko!.fetchNewPools(page);
-      pools.push(...got);
-      if (got.length === 0) break;
-    }
-    return pools
-      .filter((p) => p.createdAtMs !== null)
-      .map((p) => ({
-        tokenAddress: p.tokenAddress,
-        openTimestamp: p.createdAtMs ?? undefined,
-      }));
-  }
-
-  /**
-   * GeckoTerminal trending-pools → discovery profiles (same extraction
-   * rationale as collectGeckoNewPools).
-   */
-  private async collectGeoTrendingPools(): Promise<TokenProfile[]> {
-    const trending = await this.gecko!.fetchTrendingPools(
-      this.config.geckoterminalTrendingLimit,
-    );
-    return trending
-      .filter((p) => p.createdAtMs !== null)
-      .map((p) => ({
-        tokenAddress: p.tokenAddress,
-        openTimestamp: p.createdAtMs ?? undefined,
-      }));
-  }
-
   /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
   async runOnce(): Promise<void> {
     if (this.running) {
@@ -2107,77 +2038,6 @@ export class Scanner {
         return { list: [] as TokenProfile[], settled: true };
       },
     );
-    // The OTHER discovery feeds get the same window, for the same reason (see
-    // FEED_DEADLINE_MS and startFeedCall). They were all DISPATCHED at the
-    // fan-out below, so the window they raced was only what the pre-feed steps
-    // left: measured live 2026-09-21, the enabled-chats read plus the isolate's
-    // crime-wallet load left under `fetchFeedCapped`'s 250ms dispatch floor on
-    // roughly a fifth of ticks, and those ticks logged `jup 0 / geo 0 /
-    // geoTrend 0` while the pool still evaluated 100+ coins. A skipped tick
-    // costs exactly the seconds-old launchpad window these feeds exist for
-    // (Jupiter `recent` is the pump.fun frontend-api replacement), and the
-    // window is the whole point of running a per-minute monitor.
-    //
-    // Each call is started here and only AWAITED at its job, with `inFlight`
-    // there so the dispatch floor cannot refuse a request that is already
-    // running. This makes the same trade the profiles call above already
-    // makes: a tick that returns early (no enabled chats, a tripped stop
-    // check) discards requests it used to skip — one request per feed, paid
-    // only on the ticks that do not push anything anyway, against losing the
-    // feed window on every slow tick.
-    const pumpCall =
-      this.pumpfun && this.config.pumpfunProfileLimit > 0
-        ? this.startFeedCall("pump.fun", () =>
-            this.pumpfun!.fetchNewestCoins(this.config.pumpfunProfileLimit),
-          )
-        : null;
-    const geckoPoolsCall = this.gecko
-      ? this.startFeedCall("geckoterminal", () => this.collectGeckoNewPools())
-      : null;
-    const geoTrendCall =
-      this.gecko && this.config.geckoterminalTrendingLimit > 0
-        ? this.startFeedCall("geckoterminal trending", () =>
-            this.collectGeoTrendingPools(),
-          )
-        : null;
-    const gmgnCall =
-      this.gmgn && this.config.gmgnTrendingLimit > 0
-        ? this.startFeedCall("gmgn trending", async () => {
-            const trending = await this.gmgn!.fetchTrending(
-              this.config.gmgnTrendingLimit,
-            );
-            return trending
-              .filter((t) => !t.isWashTrading)
-              .map((t) => ({
-                tokenAddress: t.address,
-                openTimestamp: t.createdAtMs ?? undefined,
-              }));
-          })
-        : null;
-    const axiomCall =
-      this.axiom && this.config.axiomTrendingLimit > 0
-        ? this.startFeedCall("axiom trending", async () => {
-            const trending = await this.fetchTrendingCached();
-            return trending
-              .filter((t) => t.createdAtMs !== null)
-              .map((t) => ({
-                tokenAddress: t.address,
-                openTimestamp: t.createdAtMs ?? undefined,
-              }));
-          })
-        : null;
-    const jupCall =
-      this.jupiter && this.config.jupiterRecentLimit > 0
-        ? this.startFeedCall("jupiter recent", () =>
-            this.jupiter!.fetchRecentTokens(this.config.jupiterRecentLimit),
-          )
-        : null;
-    const jupTrendCall =
-      this.jupiter && this.config.jupiterTrendLimit > 0
-        ? this.startFeedCall("jupiter trending", () =>
-            this.jupiter!.fetchTrendingTokens(this.config.jupiterTrendLimit),
-          )
-        : null;
     const diag: ScanSummary = {
       // Carried from the previous tick's tracker pass, which runs AFTER this
       // scan's flush (see runTrackerPass / worker.TRACKER_PASS_BUDGET_MS).
@@ -2322,9 +2182,14 @@ export class Scanner {
       // scan). Best-effort: any failure returns [] and the scan continues
       // on DexScreener alone (see /health summary.pump to verify liveness).
       let pumpProfiles: TokenProfile[] = [];
-      if (pumpCall) {
+      if (this.pumpfun && this.config.pumpfunProfileLimit > 0) {
         feedJobs.push(
-          this.fetchFeedCapped(pumpCall, [], feedDeadline, true)
+          this.fetchFeedCapped(
+            () =>
+              this.pumpfun!.fetchNewestCoins(this.config.pumpfunProfileLimit),
+            [],
+            feedDeadline,
+          )
             .then((p) => {
               pumpProfiles = p;
               diag.pump = p.length;
@@ -2348,9 +2213,30 @@ export class Scanner {
         await Promise.all(feedJobs);
         return;
       }
-      if (geckoPoolsCall) {
+      if (this.gecko) {
         feedJobs.push(
-          this.fetchFeedCapped(geckoPoolsCall, [], feedDeadline, true)
+          this.fetchFeedCapped(
+            async () => {
+              const pools = [];
+              for (
+                let page = 1;
+                page <= this.config.geckoterminalPoolPages;
+                page++
+              ) {
+                const got = await this.gecko!.fetchNewPools(page);
+                pools.push(...got);
+                if (got.length === 0) break;
+              }
+              return pools
+                .filter((p) => p.createdAtMs !== null)
+                .map((p) => ({
+                  tokenAddress: p.tokenAddress,
+                  openTimestamp: p.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
+          )
             .then((p) => {
               geckoProfiles = p;
               diag.geo = p.length;
@@ -2368,9 +2254,23 @@ export class Scanner {
       // egress with 429). Sized by GECKOTERMINAL_TRENDING_LIMIT (0 =
       // disabled); best-effort — failures return [] and the scan continues.
       let geoTrendProfiles: TokenProfile[] = [];
-      if (geoTrendCall) {
+      if (this.gecko && this.config.geckoterminalTrendingLimit > 0) {
         feedJobs.push(
-          this.fetchFeedCapped(geoTrendCall, [], feedDeadline, true)
+          this.fetchFeedCapped(
+            async () => {
+              const trending = await this.gecko!.fetchTrendingPools(
+                this.config.geckoterminalTrendingLimit,
+              );
+              return trending
+                .filter((p) => p.createdAtMs !== null)
+                .map((p) => ({
+                  tokenAddress: p.tokenAddress,
+                  openTimestamp: p.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
+          )
             .then((p) => {
               geoTrendProfiles = p;
               diag.geoTrend = p.length;
@@ -2388,9 +2288,23 @@ export class Scanner {
       // (best-effort — failures return [] and the scan continues). Sized by
       // GMGN_TRENDING_LIMIT (0 = disabled).
       let gmgnProfiles: TokenProfile[] = [];
-      if (gmgnCall) {
+      if (this.gmgn && this.config.gmgnTrendingLimit > 0) {
         feedJobs.push(
-          this.fetchFeedCapped(gmgnCall, [], feedDeadline, true)
+          this.fetchFeedCapped(
+            async () => {
+              const trending = await this.gmgn!.fetchTrending(
+                this.config.gmgnTrendingLimit,
+              );
+              return trending
+                .filter((t) => !t.isWashTrading)
+                .map((t) => ({
+                  tokenAddress: t.address,
+                  openTimestamp: t.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
+          )
             .then((p) => {
               gmgnProfiles = p;
               diag.gmgn = p.length;
@@ -2411,9 +2325,21 @@ export class Scanner {
       // (0 = disabled); best-effort — failures return [] and the scan
       // continues.
       let axiomProfiles: TokenProfile[] = [];
-      if (axiomCall) {
+      if (this.axiom && this.config.axiomTrendingLimit > 0) {
         feedJobs.push(
-          this.fetchFeedCapped(axiomCall, [], feedDeadline, true)
+          this.fetchFeedCapped(
+            async () => {
+              const trending = await this.fetchTrendingCached();
+              return trending
+                .filter((t) => t.createdAtMs !== null)
+                .map((t) => ({
+                  tokenAddress: t.address,
+                  openTimestamp: t.createdAtMs ?? undefined,
+                }));
+            },
+            [],
+            feedDeadline,
+          )
             .then((p) => {
               axiomProfiles = p;
               diag.axiom = p.length;
@@ -2433,9 +2359,14 @@ export class Scanner {
       // time. Sized by JUPITER_RECENT_LIMIT (0 = disabled); best-effort —
       // failures return [] and the scan continues.
       let jupProfiles: TokenProfile[] = [];
-      if (jupCall) {
+      if (this.jupiter && this.config.jupiterRecentLimit > 0) {
         feedJobs.push(
-          this.fetchFeedCapped(jupCall, [], feedDeadline, true)
+          this.fetchFeedCapped(
+            () =>
+              this.jupiter!.fetchRecentTokens(this.config.jupiterRecentLimit),
+            [],
+            feedDeadline,
+          )
             .then((p) => {
               jupProfiles = p;
               diag.jup = p.length;
@@ -2453,9 +2384,14 @@ export class Scanner {
       // resurging mints. Sized by JUPITER_TRENDING_LIMIT (0 = disabled);
       // best-effort — failures return [] and the scan continues.
       let jupTrendProfiles: TokenProfile[] = [];
-      if (jupTrendCall) {
+      if (this.jupiter && this.config.jupiterTrendLimit > 0) {
         feedJobs.push(
-          this.fetchFeedCapped(jupTrendCall, [], feedDeadline, true)
+          this.fetchFeedCapped(
+            () =>
+              this.jupiter!.fetchTrendingTokens(this.config.jupiterTrendLimit),
+            [],
+            feedDeadline,
+          )
             .then((p) => {
               jupTrendProfiles = p;
               diag.jupTrend = p.length;

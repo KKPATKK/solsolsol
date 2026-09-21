@@ -104,13 +104,35 @@ profiles 修好之後，逐個 feed 量度，發現**同一類問題還有四個
 
 | 位置 | 變更 |
 |---|---|
-| `scanner.ts` | pump / geo / geoTrend / gmgn / axiom / jup recent / jupTrend **全部改為 tick 開頭 dispatch**（`startFeedCall`），job 側只 await 並傳 `inFlight: true` —— 七個 feed 各自拿到由 tick 起計的 900ms 窗口，前段（enabled-chats 讀、crime hydrate）幾慢都偷不走 |
+| ~~`scanner.ts`~~ | ~~pump / geo / geoTrend / gmgn / axiom / jup recent / jupTrend 全部改為 tick 開頭 dispatch（`startFeedCall`）~~ —— **同日內已 revert**，見下面「為什麼 revert」 |
 | `jupfeeds.ts` | trending leg 由死掉的 `/trending/24h` 改指 `/toporganicscore/24h`（同日實測：top 20 裡 4 個落在年齡窗內：12.5h–24h、mcap 177K–4.0M、organic 75+） |
 | `tickprobe.ts` | `summary.gecko` 移出 `captured.length > 0` 的 guard —— 所有 `markPhase` 都在 per-candidate 鏈裡，所以「0 candidate」的 tick（多數 tick，而且正正就是 `geo 0` 的形狀）以前**乜都唔發佈**，解釋 `geo 0` 的數字剛好在需要時讀不到（live：8/8 次取樣都缺） |
 
-代價：冇 enabled chat 的 tick 現在也會發出這幾個請求（每個 feed 一次），與 profiles 當日已接受的同一個取捨。
+## 為什麼 revert 咗 scanner 那一半
+
+`4434fe6` 部署後即刻量到：
+
+| 窗口（同一份 scan-history） | 行數 | ok | `died before its completion flush` | race cut | ms median |
+|---|---|---|---|---|---|
+| 06:24–07:02（`d493dcb`，即改動前） | 48 | 44 | **0** | 4 | 2928 |
+| 07:02+（`4434fe6`，改動後） | 7 | 3 | **3** | 1 | 5000 |
+
+`died before its completion flush` 就是 `worker.ts` 描述的 **~9.6s cron kill** 那一類：tick 的 wall clock 超出殺點，
+完成寫入來不及落地（同一類在 2026-09-15/16 都以每分鐘一行連續出現過）。同一個 envelope 的註釋本身就寫住
+「Never widen this number to make room for a new tail stage」—— 9.5s 預算裡再塞七個 tick 開頭就飛出去的 feed，
+就是這個 envelope 最唔想見到的事：被跳過的 feed（約五分一 tick）現在一定跑，而且它們的 throttle sleep + JSON 解析
+同 eval 階段爭同一個 isolate，令本來 2.9s 的 tick 拉長到撞殺點。
+
+所以 scanner 那一半已 `git apply -R` 還原（`docs/patches/feed-early-dispatch-revert-scanner-test.patch`），
+保留兩個不會加 tick 負擔的：`jupfeeds.ts` 的 endpoint 修正（同一個請求，但終於有回報）
+同 `tickprobe.ts` 的 `summary.gecko`（只係 summary 多一個細 object）。
+
+要再試 feed-window 這個方向，正確做法係先分清「邊個 feed 值一個請求」——例如 pump.fun（530）同 gmgn（429）
+係死上游，每次請求都係純浪費，應該先把它們從 fan-out 拿掉，騰出的 budget 再餵給一個 feed，每次只加一個。
 
 ## 驗收（今次）
 
-- 單元測試 **243 passed / 0 failed**（新增 2 條：`JupTokensClient: the trending leg reads /toporganicscore/24h`、`Scanner: every discovery feed is dispatched at tick start, not at the fan-out`），`test-tick-path.js` 新增「0-candidate tick 仍要發佈 `summary.gecko`」斷言。
-- Live：同一輪 sweep 之後，`geo 0` 的 tick 上 `/health.heartbeat.summary.gecko` 應該有 `http429 / consecutive429 / backoffMs` 可以直接讀（唔再靠推論）。
+- 單元測試 **242 passed / 0 failed**（新增：`JupTokensClient: the trending leg reads /toporganicscore/24h`；`test-tick-path.js` 新增「0-candidate tick 仍要發佈 `summary.gecko`」斷言）。
+- Live（`4434fe6` 部署後，`/debug/tick`）：`prof 26 / settled true / jup 20 / **jupTrend 15** / gecko 有值` ——
+  死掉的 trending leg 終於有 15 個幣進來，而且 `summary.gecko` 在 0-candidate tick 上讀得到（之前 8/8 次取樣都缺）。
+- 跟進：revert 之後再量同一組窗口，確認 `died before its completion flush` 是否回到 0——未完成，見下一輪 push。
