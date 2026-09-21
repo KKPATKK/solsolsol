@@ -144,9 +144,10 @@ const SCAN_GATE_RESERVE_MS = 1_600;
 /**
  * Slice of the scan deadline kept free for FINISHING the tick: the summary
  * build plus the worker's completion flush must still land inside the race
- * window even when the post-push tracker pass uses its whole budget. The pass
- * runs LAST (after the candidate/push phase) and races this deadline, so a
- * busy tick defers part of its follow-up rotation instead of delaying a push.
+ * window. The post-push tracker pass is NOT part of the scan any more (see
+ * Scanner.runTrackerPass) — it runs in the worker's tail, after this flush —
+ * so what this reserve protects is the summary and the completion write
+ * itself, which is the one write a tick can never lose.
  */
 const SCAN_FINISH_RESERVE_MS = 600;
 /** The front phases' shared window (feeds + pool read + pair fetch). */
@@ -1682,6 +1683,53 @@ export class Scanner {
   private markPhase(diag: ScanSummary, name: string, startedAt: number): void {
     diag.pushPhase = name;
     diag.pushPhaseMs = Date.now() - startedAt;
+  }
+
+  /**
+   * ONE post-push tracker pass, run from the WORKER's tick tail rather than
+   * inside the scan (see worker.TRACKER_PASS_BUDGET_MS for why it moved).
+   *
+   * The pass advances the tracked-coin rotation least-recently-checked first,
+   * so calling it once per tick with a real allowance is the whole fix for a
+   * sweep that took hours: the scan's own leftover was 400-1200ms (one or two
+   * rows), while the tick leaves ~4s of its 9.5s budget unused once the
+   * completion flush has landed.
+   *
+   * Best-effort by construction: every stage inside the pass is bounded, the
+   * caller only has to bound the wall clock, and the note is published on the
+   * LAST summary — /health shows it on the next heartbeat, the same one-tick
+   * carry the deferral counters already use.
+   */
+  async runTrackerPass(deadlineMs: number): Promise<string | null> {
+    if (!this.pushWatcher) return null;
+    const startedAt = Date.now();
+    try {
+      const pw = await this.pushWatcher.runTick(deadlineMs);
+      const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
+      // Cumulative tracker telemetry (the pass note itself only reports the
+      // pass it happened in — /health shows the latest summary, so a loss
+      // vanished with the next tick).
+      this.pushWatchUndeliveredTotal = Number(
+        pw.undeliveredTotal ?? this.pushWatchUndeliveredTotal,
+      );
+      if (this.lastSummary) {
+        this.lastSummary.pushWatch = note;
+        this.lastSummary.pushWatchUndeliveredTotal =
+          this.pushWatchUndeliveredTotal;
+        this.lastSummary.pushWatchRecovered = Number(
+          pw.recoveredUndelivered ?? 0,
+        );
+        this.lastSummary.trackerMs = Date.now() - startedAt;
+      }
+      return note;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[scanner] push-watch tick failed:", msg);
+      if (this.lastSummary) {
+        this.lastSummary.pushWatch = `err:${msg.slice(0, 140)}`;
+      }
+      return null;
+    }
   }
 
   /**
@@ -3273,51 +3321,15 @@ export class Scanner {
       }
       diag.pushed = pushed;
       diag.evalMs = Date.now() - evalStart;
-      // Post-push tracker pass: one DexScreener batch + bounded Birdeye
-      // holder probes for the watched coins, then 🚀/⚠️/💀 follow-ups.
-      // Best-effort — a tracker failure never affects the scan.
-      //
-      // 2026-09-17 (priority order): this pass used to run right after the
-      // discovery feeds, i.e. IN FRONT OF the pool read, the pair fetch and
-      // the entire candidate chain. That was harmless only while the pass was
-      // starved into doing nothing; once its row allowance became real it
-      // cost 1.1-1.7s per tick and pushed the tick past its chain deadline
-      // (SCAN_TICK_DEADLINE_MS - CANDIDATE_PUSH_RESERVE_MS) before any
-      // candidate group could run: live quiet-market ticks with a qualifying
-      // coin showed `candidates: 1, pushed: 0` minute after minute with every
-      // `fails` counter at 0 — the coin was deferred, not rejected. Follow-up
-      // monitoring is hour-scale (every row is re-claimed on the next tick,
-      // nothing is lost), while a qualifying push is only actionable in the
-      // minutes after it qualifies, so the tracker now runs AFTER the push
-      // phase and spends whatever time is left.
-      //
-      // Its deadline also leaves SCAN_FINISH_RESERVE_MS for the summary build
-      // and the worker's completion flush, so the pass can never become the
-      // reason a tick dies before its flush.
-      this.markPhase(diag, "tracker", startedAt);
-      const trackerStart = Date.now();
-      if (this.pushWatcher) {
-        try {
-          const pw = await this.pushWatcher.runTick(
-            startedAt + SCAN_TICK_DEADLINE_MS - SCAN_FINISH_RESERVE_MS,
-          );
-          diag.pushWatch = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
-          // Cumulative tracker telemetry (the pass note above only ever
-          // reports the pass it happened in — /health shows the latest
-          // summary, so a loss vanished with the next tick).
-          this.pushWatchUndeliveredTotal = Number(
-            pw.undeliveredTotal ?? this.pushWatchUndeliveredTotal,
-          );
-          diag.pushWatchUndeliveredTotal = this.pushWatchUndeliveredTotal;
-          diag.pushWatchRecovered = Number(pw.recoveredUndelivered ?? 0);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error("[scanner] push-watch tick failed:", msg);
-          diag.pushWatch = `err:${msg.slice(0, 140)}`;
-        }
-      }
-      this.markPhase(diag, "done", startedAt);
-      diag.trackerMs = Date.now() - trackerStart;
+      // The post-push tracker pass USED to run here, last, on whatever the
+      // tick had left. It now runs in the worker's tick tail instead (see
+      // Scanner.runTrackerPass and worker.TRACKER_PASS_BUDGET_MS): the scan's
+      // own phases end at ~3.1s of a ~4.7s race window, so "whatever is left"
+      // measured 400-1200ms and the rotation stalled at one row per pass —
+      // and once the pass really used that allowance it also pushed the tick
+      // past its race window. What the pass still needs from the scan is
+      // already here: the pair phase above fetched this isolate's rotation
+      // head (see lastHeadTokens), so the pass's own batch is a cache hit.
       console.log(
         `[scanner] scan done in ${Date.now() - startedAt}ms: ${profiles.length} profiles, ${scannedProfiles.length}/${poolProfiles.length} pooled, ${candidates.length} candidates, ${pushed} pushed` +
           (this.birdeye ? "" : " (Birdeye not configured)"),

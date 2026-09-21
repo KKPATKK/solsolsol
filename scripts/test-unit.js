@@ -2217,6 +2217,41 @@ async function main() {
     }
   });
 
+  await test("Scanner.runTrackerPass: the tick tail's pass publishes its note on the last summary", async () => {
+    // The post-push pass is not part of the scan any more (it ran on the
+    // scan's leftover 400-1200ms, one or two rows a tick — live 2026-09-21
+    // `rows 0/29 budget-cut` pass after pass). It now runs from the worker's
+    // tick tail, AFTER the completion flush, with the slice the tick funded;
+    // the pass's note rides the next heartbeat's summary.
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const scanner = new Scanner(
+      {}, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    const handed = [];
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      runTick: async (deadlineMs) => {
+        handed.push(deadlineMs);
+        return {
+          checked: 4, alerted: 1, trips: 9,
+          note: "rows 4/29 pairs 6/6 miss 0 lost 0 trips 9",
+          undeliveredTotal: 2, recoveredUndelivered: 1,
+        };
+      },
+    };
+    scanner.lastSummary = {};
+    const deadline = Date.now() + 2_500;
+    const note = await scanner.runTrackerPass(deadline);
+    assert.equal(handed[0], deadline, "the pass is handed the slice the tick funded");
+    assert.match(String(note), /ok:4\/1/, "the note names the rows it checked and alerted");
+    assert.equal(scanner.lastSummary.pushWatch, note, "the note is published for /health");
+    assert.equal(scanner.lastSummary.pushWatchUndeliveredTotal, 2);
+    assert.equal(scanner.lastSummary.pushWatchRecovered, 1);
+    assert.equal(typeof scanner.lastSummary.trackerMs, "number");
+  });
+
   await test("parseTokenSnapshot: FDV and summed reserve are the usable numbers", () => {
     // Verified against the live API on a tracked XCAT pool (2026-09-18):
     // market_cap_usd comes back null for Solana memecoins, fdv_usd is the

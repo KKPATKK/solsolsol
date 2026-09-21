@@ -51,50 +51,34 @@ import {
  */
 
 /**
- * Wall-clock slice the post-push tracker pass may use INSIDE one scan tick.
- * The tracker is awaited by the scanner in its front-phase window (right
- * after the discovery feeds, before the re-eval pool read and the pair
- * fetch), so an unbounded pass starves everything behind it — 2026-09-12
- * live: trackerMs 4556 on a slow-Turso tick, after which that tick's pool
- * slice was never evaluated (timeout row, agedEval 0). Its alerts are
- * hour-scale follow-ups while the qualifying momentum windows are minutes
- * long, so a clamped remainder simply runs on the next tick (rows are
- * re-claimed then and nothing is lost — see the checks in runTick).
+ * Wall-clock slice ONE post-push tracker pass may use.
  *
- * 2026-09-17 (zero-row fix): 500 → 1000. At 500ms the pass had NO usable
- * row allowance at all: its mandatory stages (recap/prune, the self-heal
- * scan, one DexScreener batch for the watched tokens, then the row loop)
- * come to ~550–700ms on a healthy tick, so the loop hit its first budget
- * check already past the deadline, broke immediately, and returned
- * `checked:0, alerted:0` with no note — indistinguishable in /health from a
- * tick with nothing to watch. Live proof: 33 tracked rows, 28 of them
- * ACTIVE, `pushWatch: "ok:0/0"` on every tick, and not one row carrying a
- * tracker write (peak/lastMcap/lastVol5m all still at their insert values)
- * — post-push monitoring had stopped entirely while looking healthy. The
- * budget now covers the batch (TRACKER_PAIRS_BUDGET_MS) PLUS ≥400ms of row
- * work, and the loop never skips its first row, so progress per tick is
- * structurally guaranteed instead of depending on how fast DexScreener
- * answered. Sized as the tracker's SHARE of the scanner's front-phase
- * window (feed 600 + tracker 1000 + pool read 600 + pair fetch 1250 against
- * the 2600ms front window and the 4.2s internal deadline): the front phases
- * individually clamp to that window, so an oversubscribed worst case only
- * shortens the LATER phases — the gate/push reserve is untouched, and a
- * healthy tick (feeds ~450ms, tracker ~700ms, pool ~150ms) never comes
- * close.
+ * The pass IS the tracker's rotation mechanism: it walks the tracked rows
+ * least-recently-checked first, and each pass advances that queue by a head
+ * (TRACKER_PAIR_HEAD rows at best). Where its time comes FROM has moved twice,
+ * both times because measurement said so:
  *
- * 2026-09-17 (overrun fix): 1000 → 1600, and the front-window sizing above no
- * longer applies — the pass now runs LAST, against the scanner's finish
- * deadline (startedAt + SCAN_TICK_DEADLINE_MS - SCAN_FINISH_RESERVE_MS), so
- * its real allowance is whatever the tick has left. At 1000ms the ceiling was
- * binding on a healthy tick and the pass simply overran it: live
- * `trackerMs 1962` with `rows 2/24`, an alert card and a holder probe — the
- * pass needed ~1.9s of work while being allowed 1.0s, so every tick ended
- * past its budget and the run-time came out of the finish reserve. The
- * ceiling now matches one full row (see TRACKER_ROW_RESERVE_MS) plus a second
- * row's worth of slack, and the deadline still clamps it down whenever the
- * scan itself ran long.
+ *  - 2026-09-17: 500 → 1000 → 1600. The pass ran INSIDE the scan and its
+ *    mandatory stages (recap/prune, the self-heal read, one DexScreener
+ *    batch) cost ~550-700ms, so at 500ms the row loop broke before its first
+ *    row: 28 active rows went unrefreshed while /health read the healthy
+ *    `ok:0/0`. 1600 covered one full row plus a second row's slack, spent out
+ *    of whatever the scan tick had left.
+ *  - 2026-09-21: the pass MOVED OUT of the scan (see Scanner.runTrackerPass
+ *    and worker.TRACKER_PASS_BUDGET_MS) and this became its own ceiling. The
+ *    scan's phases end at ~3.1s of a ~4.7s race window, so "whatever the tick
+ *    has left" measured 400-1200ms — one or two rows per pass, i.e. a 29-row
+ *    rotation in tens of minutes however cheap a row got. The same tick leaves
+ *    ~4s of its budget unused behind the completion flush, so the pass is
+ *    funded from there now: after the flush, with this as its ceiling.
+ *
+ * 2500ms is the measured cost of a full head: ~400ms of setup (listing,
+ * recap/prune, terminal settle), ~600ms of pair batch (one DexScreener
+ * request, capped by TRACKER_PAIRS_BUDGET_MS), then ONE store round trip per
+ * silent row (~110-200ms each) plus any card sends — which are gated
+ * separately by TRACKER_SEND_MIN_MS, not by this number.
  */
-const TRACKER_TICK_BUDGET_MS = 1_600;
+const TRACKER_TICK_BUDGET_MS = 2_500;
 /**
 /**
  * Budget reserved BEFORE a row is claimed (see the row loop). A SILENT row —

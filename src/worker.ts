@@ -854,6 +854,31 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  */
 const SCAN_TICK_BUDGET_MS = 9_500;
 /**
+ * Wall-clock slice, taken at the END of a tick, for ONE post-push tracker
+ * pass (see Scanner.runTrackerPass and pushwatch.TRACKER_TICK_BUDGET_MS).
+ *
+ * The pass advances the tracked-coin rotation — least-recently-checked first,
+ * one head of six rows per pass — and it has no cadence of its own. It used to
+ * run INSIDE the scan, on whatever the scan's phases left: 400-1200ms of a
+ * ~4.7s race window, so one or two rows per tick and a 29-row sweep measured
+ * in tens of minutes (live 2026-09-21: `rows 0/29 ... budget-cut` and
+ * `pairs 0/6` tick after tick, with the head of the queue never moving).
+ *
+ * The tick's budget is 9.5s and the scan plus its completion flush settle at
+ * ~4s of it, so the pass is funded from that tail instead — and AFTER the
+ * flush, so a slow pass can never cost the tick its completion write, which is
+ * the one loss the whole dead-tick machinery exists to prevent. A pass that
+ * overruns its slice is clamped by the next tick's budget, not by the scan.
+ */
+const TRACKER_PASS_BUDGET_MS = 2_500;
+/**
+ * Tick tail kept clear after the tracker pass for the tick's own bookkeeping
+ * (streak counters, an isolate rebuild's re-init, the scan-lock safety
+ * release). The pass is clamped by what is left of this, so a long scan simply
+ * gets a shorter pass — never a tick that dies with its bookkeeping unwritten.
+ */
+const TRACKER_PASS_TAIL_MS = 1_000;
+/**
  * Wall-clock slice RESERVED at the end of every tick for the completion
  * flush (heartbeat + scan_history row + lock release) and the streak
  * bookkeeping behind it. The race now ends at
@@ -2244,6 +2269,26 @@ async function runScan(
           "[worker] deferral counter sync failed:",
           err instanceof Error ? err.message : err,
         );
+      }
+
+      // Post-push tracker pass — the tick's last work, funded by the budget
+      // the scan left over (see TRACKER_PASS_BUDGET_MS). It runs after the
+      // completion flush on purpose: the flush is the one write a tick cannot
+      // lose, and the pass bounds every stage of its own. Best-effort: its
+      // note rides the next heartbeat's summary.
+      const trackerBudgetMs = Math.min(
+        TRACKER_PASS_BUDGET_MS,
+        startedAt + SCAN_TICK_BUDGET_MS - TRACKER_PASS_TAIL_MS - Date.now(),
+      );
+      if (scanner && trackerBudgetMs > 0) {
+        try {
+          await scanner.runTrackerPass(Date.now() + trackerBudgetMs);
+        } catch (err) {
+          console.error(
+            "[worker] tracker pass failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
     }
   } finally {
