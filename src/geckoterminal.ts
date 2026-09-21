@@ -56,18 +56,38 @@ export const GECKO_CACHE_TTL_S = 60;
  * `ok2 429x2 cacheHits1 lastCacheStatus BYPASS`). The limiter is an IP quota,
  * so the only free lever left is asking a different host.
  *
- * VERIFIED SAME SHAPE (statically, from a clean host):
+ * SAME SHAPE, BUT KEYED ACCESS (clean-host measurements, 2026-09-21):
  * `/api/v3/onchain/networks/solana/new_pools` returns the identical
  * `{data:[{id:"solana_…", attributes:{pool_created_at, fdv_usd,
  * reserve_in_usd, transactions, volume_usd}, relationships.base_token}]}`
- * field set parseNewPools already reads, so the fallback needs no parser.
- * `trending_pools` is NOT eligible — keyless access to it on this host answers
- * 401 ("Requests without API key are not allowed for this endpoint"), which is
- * why the fallback is per-path instead of per-host.
+ * field set parseNewPools already reads, so the fallback needs no parser, and
+ * one 07:57Z fetch even answered 200 / 29,960 bytes / 20 pools.
+ *
+ * That 200 does NOT reproduce — re-measured 08:22Z, three ways:
+ *   no User-Agent          → 403 "Please add a descriptive User-Agent to your
+ *                            request" (which is what a Worker's fetch sends)
+ *   default/our User-Agent → 401 "Requests without API key are not allowed for
+ *                            this endpoint"
+ * so this host serves the fallback only WITH a key (see
+ * AppConfig.coingeckoApiKey). The eligibility stays per-path because
+ * `trending_pools` is key-gated on both hosts.
  */
 export const GECKO_ALT_BASE_URL = "https://api.coingecko.com/api/v3/onchain";
 /** Paths the alternate host serves without an API key (see GECKO_ALT_BASE_URL). */
 const ALT_ELIGIBLE_PREFIX = "/networks/solana/new_pools";
+/**
+ * Descriptive User-Agent both hosts require.
+ *
+ * Measured 2026-09-21 with `/debug/gecko-alt` (the probe the fallback needed):
+ * CoinGecko answers **403** with `"Please add a descriptive User-Agent to your
+ * request"` to a keyless subrequest that has none — which is exactly what a
+ * Worker's `fetch` sends by default (it is not curl). That single header is why
+ * the alternate host looked unreachable from the Worker's egress while a normal
+ * host got 200 from the same URL, so it is sent on BOTH hosts (they are both
+ * CoinGecko's) and in every call, snapshot lookups included.
+ */
+export const GECKO_USER_AGENT =
+  "solana-meme-bot/1.0 (+https://github.com/KKPATKK/solsolsol)";
 /** Header carrying a CoinGecko Demo-plan key (the free tier's keyed route). */
 export const COINGECKO_DEMO_HEADER = "x-cg-demo-api-key";
 /** Header carrying a CoinGecko Pro-plan key. */
@@ -75,12 +95,17 @@ export const COINGECKO_PRO_HEADER = "x-cg-pro-api-key";
 
 /**
  * Whether `path` may be asked on the alternate host while the primary is
- * paused (pure — unit-tested). KEYLESS only new_pools is public there;
- * `trending_pools` answers 401 without a key. WITH a CoinGecko key the
- * alternate is a full mirror of the primary, so every path qualifies — and
- * the key is also what makes a request count against the key's quota instead
- * of the shared egress IP, i.e. the durable escape from the 429 (see
- * AppConfig.coingeckoApiKey).
+ * paused (pure — unit-tested). WITH a CoinGecko key the alternate is a full
+ * mirror of the primary, so every path qualifies — and the key is also what
+ * makes a request count against the key's quota instead of the shared egress
+ * IP, i.e. the durable escape from the 429 (see AppConfig.coingeckoApiKey).
+ *
+ * KEYLESS (2026-09-21) the host answers 401 for *every* path, including
+ * new_pools — the one 200 it served at 07:57Z did not reproduce. The keyless
+ * branch is therefore kept NOT as a working fallback but as a bounded probe:
+ * the refusal pause (see armAltPause) holds it to one request per escalated
+ * window (5 → 60 min), so it costs ~nothing while self-healing the day the
+ * keyless allowance opens or a key is configured. `geo` stays 0 until then.
  */
 export function geckoAltEligible(path: string, keyed: boolean): boolean {
   return keyed || path.startsWith(ALT_ELIGIBLE_PREFIX);
@@ -460,15 +485,18 @@ export class GeckoTerminalClient {
   }
 
   /**
-   * Fetch init for every GeckoTerminal call: JSON, a 10s transport cap, and the
-   * Cloudflare edge cache (see GECKO_CACHE_TTL_S). `cacheTtlByStatus` keeps
-   * error responses — a 429 in particular — out of the cache, so a bad minute
-   * can never be served to the next tick as if it were a fresh feed.
+   * Fetch init for every GeckoTerminal call: JSON, a descriptive User-Agent
+   * (see GECKO_USER_AGENT — without it CoinGecko 403s the Worker's egress), a
+   * 10s transport cap, and the Cloudflare edge cache (see GECKO_CACHE_TTL_S).
+   * `cacheTtlByStatus` keeps error responses — a 429 in particular — out of the
+   * cache, so a bad minute can never be served to the next tick as if it were a
+   * fresh feed.
    */
   private requestInit(): CloudflareFetchInit {
     const init: CloudflareFetchInit = {
       headers: {
         Accept: "application/json",
+        "User-Agent": GECKO_USER_AGENT,
         ...(this.apiKey !== null ? { [this.apiKeyHeader]: this.apiKey } : {}),
       },
       signal: AbortSignal.timeout(10_000),

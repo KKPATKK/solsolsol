@@ -53,7 +53,7 @@ import {
 } from "./pushledger";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
-import { GeckoTerminalClient, GECKO_ALT_BASE_URL } from "./geckoterminal";
+import { GeckoTerminalClient, GECKO_ALT_BASE_URL, GECKO_USER_AGENT } from "./geckoterminal";
 // Heal-path counters: module scope in the tracker, read here so /health can
 // answer "did the self-heal reuse the push-time baseline, and how often".
 import {
@@ -3455,15 +3455,18 @@ export default {
     // Alternate-host probe (see GECKO_ALT_BASE_URL): the gecko fallback asks
     // CoinGecko's Onchain API when the primary is paused. Deployed 2026-09-21,
     // the worker's own egress got **403** there while a normal host gets 200 —
-    // so this fetches the same URL twice, with and without the client's
-    // Cloudflare cache options, and reports both: a WAF/bot block is told apart
-    // from a missing-key rule or from the cache options themselves.
+    // and the body said why: `Please add a descriptive User-Agent`. So this
+    // fetches the same URL three ways — with the client's UA, without it, and
+    // with it plus the Cloudflare cache options — which rules one variable out
+    // at a time instead of guessing.
     if (url.pathname === "/debug/gecko-alt") {
       const target = `${GECKO_ALT_BASE_URL}/networks/solana/new_pools?page=1`;
-      const probe = async (withCache: boolean) => {
+      const probe = async (withUa: boolean, withCache: boolean) => {
         try {
+          const headers: Record<string, string> = { Accept: "application/json" };
+          if (withUa) headers["User-Agent"] = GECKO_USER_AGENT;
           const init: Record<string, unknown> = {
-            headers: { Accept: "application/json" },
+            headers,
             signal: AbortSignal.timeout(10_000),
           };
           if (withCache) {
@@ -3495,8 +3498,12 @@ export default {
           return { error: err instanceof Error ? err.message : String(err) };
         }
       };
-      const [plain, cached] = await Promise.all([probe(false), probe(true)]);
-      return Response.json({ target, plain, cached });
+      const [ua, noUa, uaCached] = await Promise.all([
+        probe(true, false),
+        probe(false, false),
+        probe(true, true),
+      ]);
+      return Response.json({ target, userAgent: GECKO_USER_AGENT, ua, noUa, uaCached });
     }
 
     // Jupiter Token v2 feed probe — verifies the discovery client's two

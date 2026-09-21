@@ -93,8 +93,19 @@ export const GECKO_ALT_BASE_URL = "https://api.coingecko.com/api/v3/onchain";
 - 由乾淨主機實測（2026-09-21 07:57Z）：
   `GET /api/v3/onchain/networks/solana/new_pools?page=1` → **200 / 29,960 bytes**，
   `parseNewPools()` **20/20 全中**，全部有 `pool_created_at`（age 1 分鐘）⇒ **唔需要新 parser**。
-- 唔係全 host mirror：`trending_pools` 喺呢個 host **keyless 係 401**
-  （`Requests without API key are not allowed for this endpoint`），所以 fallback 係 **per-path**。
+- **但同一個 URL 半個鐘後唔再 200**（重新實測 08:22Z，三種打法）：
+
+| request | 結果 |
+|---|---|
+| 冇 `User-Agent`（＝ Worker `fetch` 嘅默認形態） | **403** `Please add a descriptive User-Agent to your request` |
+| 有 `User-Agent`（默認 curl 或我們嘅） | **401** `Requests without API key are not allowed for this endpoint` |
+
+  即係：**呢個 host 嘅 keyless 入場券已經冇了**（new_pools 同 trending 一樣要 key）。
+  同一個 host 由沙盒 IP 都係 401，所以唔係 Worker egress 問題，而係**帳號層面嘅規則**。
+- 結論：**fallback 只有在有 key 嘅情況下才真正服務得到**；keyless 下佢只係一條**有界探測**
+  （拒收 → `armAltPause` → 每 5→60 分鐘一次）——成本極低，而且將來若放寬或加 key 會自動回復。
+  主 host（`api.geckoterminal.com/api/v2`）反而係 **冇 UA 都 200**（實測），所以 429 純粹係 egress IP quota。
+- 唔係全 host mirror：`trending_pools` 喺呢個 host 一樣 key 閘住，所以 fallback 係 **per-path**。
 
 ### 規則（全部喺 `get()`）
 
@@ -170,11 +181,12 @@ geo 0  prof 28 | req 7  ok 0  429 2  cacheHits 0  lastStatus 429  backoffS 648
    成功即清零），成本由「每 tick 1 次」降到「每個窗口 1 次」，而萬一將來解封或加了 key 會自動回復。
    遙測加 `altFailures` / `altLastStatus`，所以「係唔係真係 403」一眼睇得到。
 
-**截至此刻嘅結論**：免費 alt host **由 Worker egress 用唔到**（403）。免費路徑就係原本嘅
-keyless 主 host ＋ 快取（同一批讀數裏面 `ok 0 429 2`，即係主 host 都仍然被封），
-而 gecko 貢獻 0 **唔影響其他 feed**：同一時間 `profiles 27–28`、`jup 20`、`jupTrend 15`。
-下一步只有三種：**帶 key**（`COINGECKO_API_KEY`，CoinGecko 對 keyed 流量用另一條路；未驗證）、
-**另一個 keyless 源**、或者**接受 gecko 降級**（re-eval pool ＋ Birdeye backfill 兜住）。
+**截至此刻嘅結論**：免費 alt host 唔服務（Worker egress **403**；沙盒係 **401**，即係要 key）。
+免費路徑就係原本嘅 keyless 主 host ＋ 快取，而主 host 同一批讀數係 `ok 0 429 2`（仍然被 egress IP quota 封），
+所以 `geo` **仍然係 0**，唔會回復 20。gecko 貢獻 0 **唔影響其他 feed**：同一時間
+`profiles 27–28`、`jup 20`、`jupTrend 15`，而且 `geo 0` 可由 re-eval pool ＋ Birdeye backfill 兜住。
+下一步只有三種：**帶 key**（`COINGECKO_API_KEY`）、**另一個 keyless 源**、
+或者**接受 gecko 降級**（rotation 與推送都唔受影响）。
 
 ## 部署後實測（`92cb2ea`，2026-09-20 10:08–10:15Z）
 

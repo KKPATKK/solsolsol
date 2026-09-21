@@ -1,0 +1,27 @@
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -1210,7 +1210,7 @@
+     const seen = [];
+     const origFetch = global.fetch;
+     global.fetch = async (url, init) => {
+-      seen.push({ url: String(url), cf: init && init.cf });
++      seen.push({ url: String(url), cf: init && init.cf, headers: (init && init.headers) || {} });
+       return new Response(JSON.stringify({ data: [] }), {
+         status: 200,
+         headers: { "Content-Type": "application/json", "cf-cache-status": "HIT" },
+@@ -1220,6 +1220,13 @@
+       const client = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+       await client.fetchNewPools(1);
+       assert.equal(seen.length, 1, "one call, one request");
++      // Measured 2026-09-21 with /debug/gecko-alt: CoinGecko answers 403
++      // ("Please add a descriptive User-Agent to your request") to a keyless
++      // subrequest that has none — which is exactly what a Worker's fetch
++      // sends. Without this header the alternate host is unusable from the
++      // Worker's own egress.
++      assert.ok(
++        String(seen[0].headers["User-Agent"] || "").startsWith("solana-meme-bot/"),
++        "every call must identify itself",
++      );
+       assert.equal(seen[0].cf?.cacheEverything, true, "the subrequest must join the edge cache");
+       assert.equal(seen[0].cf?.cacheTtl, GECKO_CACHE_TTL_S, "for the upstream's own s-maxage window");
+       assert.equal(
