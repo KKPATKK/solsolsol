@@ -2249,6 +2249,12 @@ async function main() {
     assert.equal(scanner.lastSummary.pushWatch, note, "the note is published for /health");
     assert.equal(scanner.lastSummary.pushWatchUndeliveredTotal, 2);
     assert.equal(scanner.lastSummary.pushWatchRecovered, 1);
+    // The note must ALSO survive into the NEXT scan's summary: each scan builds
+    // a fresh summary object, so mutating the finished one alone published
+    // nothing to /health (live: the pass's row writes landed while the summary
+    // stayed empty).
+    assert.equal(scanner.pushWatchNote, note, "the note is carried for the next summary");
+    assert.equal(scanner.pushWatchRecovered, 1);
     assert.equal(typeof scanner.lastSummary.trackerMs, "number");
   });
 

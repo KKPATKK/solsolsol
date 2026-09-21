@@ -1340,6 +1340,16 @@ export class Scanner {
   /** Cumulative tracker cards this isolate failed to deliver (from PushWatcher). */
   private pushWatchUndeliveredTotal = 0;
   /**
+   * The last tracker pass's note (see runTrackerPass), carried into the NEXT
+   * scan's summary: each scan builds a fresh summary object, and the pass runs
+   * after the flush, so mutating the finished one published nothing (the live
+   * symptom: a pass clearly ran — the row writes followed — while /health kept
+   * showing an empty pushWatch).
+   */
+  private pushWatchNote: string | null = null;
+  /** Cards the last pass recovered (its own counter, see runTrackerPass). */
+  private pushWatchRecovered = 0;
+  /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
    * without Cloudflare log access: "previous-scan-still-running",
@@ -1706,6 +1716,8 @@ export class Scanner {
     try {
       const pw = await this.pushWatcher.runTick(deadlineMs);
       const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
+      this.pushWatchNote = note;
+      this.pushWatchRecovered = Number(pw.recoveredUndelivered ?? 0);
       // Cumulative tracker telemetry (the pass note itself only reports the
       // pass it happened in — /health shows the latest summary, so a loss
       // vanished with the next tick).
@@ -1899,6 +1911,13 @@ export class Scanner {
     const frontDeadline = startedAt + FRONT_PHASE_WINDOW_MS;
     const feedDeadline = Math.min(startedAt + FEED_DEADLINE_MS, frontDeadline);
     const diag: ScanSummary = {
+      // Carried from the previous tick's tracker pass, which runs AFTER this
+      // scan's flush (see runTrackerPass / worker.TRACKER_PASS_BUDGET_MS).
+      // /health therefore reads the pass that produced the note one tick
+      // behind it — the same one-tick carry the deferral counters use.
+      pushWatch: this.pushWatchNote ?? undefined,
+      pushWatchUndeliveredTotal: this.pushWatchUndeliveredTotal,
+      pushWatchRecovered: this.pushWatchRecovered,
       profiles: 0,
       pump: 0,
       geo: 0,
