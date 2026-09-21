@@ -38,6 +38,8 @@ interface JupToken {
   symbol?: unknown;
   /** ISO timestamp of the token's creation (≈ launchpad birth time). */
   createdAt?: unknown;
+  /** Market cap in USD (only read on the trending leg — see its parser). */
+  mcap?: unknown;
 }
 
 /** Rolling-window stats block on a token entry (stats5m / stats1h / stats24h). */
@@ -85,13 +87,108 @@ export function parseJupTokens(data: unknown): TokenProfile[] {
 }
 
 /**
+ * The band a discovery feed's entries must sit inside to be worth a pair
+ * lookup — see parseJupTrendTokens for why the trending leg needs one.
+ */
+export interface TrendBand {
+  /** Youngest age (ms) a token may have and still be sampled. */
+  minAgeMs: number;
+  /** Oldest age (ms) — beyond this the qualifying window can never open. */
+  maxAgeMs: number;
+  minMcapUsd: number;
+  maxMcapUsd: number;
+}
+
+/**
+ * Build the trending leg's band from the enabled chats' qualifying windows,
+ * using the re-eval pool's own lenient margins (floor × 0.6, ceiling × 2,
+ * age ± margin): a coin slightly below the floor now can rise into it, and the
+ * pool would keep it for exactly that reason — so the discovery filter must
+ * not be tighter than the pool's own prune bounds.
+ */
+export function trendBandFromChats(
+  chats: Array<{
+    minAgeMinutes: number;
+    maxAgeMinutes: number;
+    minMarketCapUsd: number;
+    maxMarketCapUsd: number;
+  }>,
+  ageMarginMin: number,
+): TrendBand | null {
+  if (chats.length === 0) return null;
+  const margin = Math.max(0, ageMarginMin) * 60_000;
+  return {
+    minAgeMs: Math.max(0, Math.min(...chats.map((c) => c.minAgeMinutes)) * 60_000 - margin),
+    maxAgeMs: Math.max(...chats.map((c) => c.maxAgeMinutes)) * 60_000 + margin,
+    minMcapUsd: Math.min(...chats.map((c) => c.minMarketCapUsd)) * 0.6,
+    maxMcapUsd: Math.max(...chats.map((c) => c.maxMarketCapUsd)) * 2,
+  };
+}
+
+/**
+ * Trending-specific parser: the same mint/`createdAt` rules as
+ * parseJupTokens, plus the feed's own `mcap`, minus everything OUTSIDE the
+ * qualifying band.
+ *
+ * WHY THE BAND (measured 2026-09-21, from the Worker's egress).
+ * `/toporganicscore/24h` ranks by 24h organic score, so its HEAD is
+ * structurally the wrong population for a $60K–$230K / 80min–26h coin: of the
+ * first 15 entries, 13 were blue chips 300–20,000 hours old (SOL, USDC, USDT,
+ * JUP, WBTC, PUMP…) and the other two were 16h/$4.0M and 40h/$3.6M — i.e.
+ * ZERO passed the gates, which is exactly why the leg had registered 14 coins
+ * in its lifetime (`byFeed`) and pushed none of them. The band lives deeper:
+ * 8 of the top 100 sat inside 80min–26h AND $60K–$230K (Lobby 26h/$202K,
+ * TYLER 17.6h/$81K, INU 12h/$181K, PEEPEE 21.8h/$75K…), and 24 of 100 were
+ * inside the age window alone.
+ *
+ * The filter runs HERE, not downstream, because every profile the scanner
+ * accepts costs a DexScreener pair address in the front phase (see
+ * scanner.pairsForTracker): fetching 100 entries is one subrequest, but 85
+ * leftover blue chips would add ~3 pair batches to EVERY tick. Entries with no
+ * parseable `createdAt` or `mcap` are KEPT — absent evidence is not evidence
+ * against a coin, and the scanner's own gates remain the authority.
+ */
+export function parseJupTrendTokens(
+  data: unknown,
+  band: TrendBand | null,
+  now: number,
+): TokenProfile[] {
+  if (!Array.isArray(data)) return [];
+  const out: TokenProfile[] = [];
+  const seen = new Set<string>();
+  for (const raw of data) {
+    const t = (raw ?? {}) as JupToken;
+    const id = typeof t.id === "string" ? t.id : "";
+    if (!MINT_RE.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    const openTimestamp = toMs(t.createdAt);
+    if (band) {
+      if (openTimestamp !== undefined) {
+        const age = now - openTimestamp;
+        if (age < band.minAgeMs || age > band.maxAgeMs) continue;
+      }
+      const mcap = typeof t.mcap === "number" && Number.isFinite(t.mcap) ? t.mcap : undefined;
+      if (mcap !== undefined && (mcap < band.minMcapUsd || mcap > band.maxMcapUsd)) continue;
+    }
+    out.push({
+      tokenAddress: id,
+      name: typeof t.name === "string" ? t.name : undefined,
+      symbol: typeof t.symbol === "string" ? t.symbol : undefined,
+      openTimestamp,
+    });
+  }
+  return out;
+}
+
+/**
  * Jupiter Token API v2 DISCOVERY client (free lite-api, no key) — distinct
  * from src/jupiter.ts, which is the Jupiter Swap trading service:
  *   - fetchRecentTokens: seconds-old launchpad launches (pump.fun & co.) —
  *     the replacement for the blocked pump.fun frontend-api feed, with the
  *     same "enter the coin before DexScreener notices it" purpose.
  *   - fetchTrendingTokens: organic-score ranked coins (see the method: the
- *     /trending/24h endpoint it used to read went empty on 2026-09-21).
+ *     /trending/24h endpoint it used to read went empty on 2026-09-21), read
+ *     deep and filtered to the qualifying band — see parseJupTrendTokens.
  * Both degrade to [] on any failure; a rate limit sets a shared 5-minute
  * backoff so the scan never hammers a throttled upstream.
  */
@@ -306,10 +403,15 @@ export class JupTokensClient {
    * window are rejected by the age gate exactly as before — "mostly outside
    * the qualifying window" was already this feed's documented behaviour.
    */
-  async fetchTrendingTokens(limit: number): Promise<TokenProfile[]> {
+  async fetchTrendingTokens(
+    limit: number,
+    band: TrendBand | null = null,
+  ): Promise<TokenProfile[]> {
     const wanted = Math.max(1, Math.min(Math.floor(limit), 100));
-    return parseJupTokens(
+    return parseJupTrendTokens(
       await this.get(`/toporganicscore/24h?limit=${wanted}`),
+      band,
+      Date.now(),
     ).slice(0, wanted);
   }
 

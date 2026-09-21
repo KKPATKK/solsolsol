@@ -17,7 +17,7 @@ const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmoun
 const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
-const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
+const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard } = require("../dist/pushwatch.js");
@@ -4566,6 +4566,96 @@ async function main() {
     assert.equal(out[0].openTimestamp, Date.parse("2026-09-20T18:00:00.000Z"));
   });
 
+  await test("parseJupTrendTokens: the band keeps only coins that can still qualify", () => {
+    // Live population of /toporganicscore/24h (2026-09-21, worker egress): the
+    // head is blue chips 300–20,000h old, so 0 of the top 15 fitted a
+    // $60K–$230K / 80min–26h window while 8 of the top 100 did. The parser is
+    // where those 85 pointless profiles are dropped — before any of them can
+    // cost a DexScreener pair address in the front phase.
+    const band = {
+      minAgeMs: 80 * 60_000,
+      maxAgeMs: 1560 * 60_000,
+      minMcapUsd: 36_000,
+      maxMcapUsd: 460_000,
+    };
+    const now = Date.parse("2026-09-21T12:00:00Z");
+    const at = (hours) => new Date(now - hours * 3_600_000).toISOString();
+    // Base58-valid mints, so every case below is decided by the BAND and not
+    // by the mint regex silently dropping a symbol that has an O/I/l in it.
+    const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    const id = (seed) =>
+      Array.from(seed)
+        .map((ch) => (B58.includes(ch) ? ch : B58[ch.charCodeAt(0) % B58.length]))
+        .join("")
+        .padEnd(43, "1");
+    const out = parseJupTrendTokens(
+      [
+        { id: id("SOL"), symbol: "SOL", createdAt: at(20_113), mcap: 68_000_000_000 },
+        { id: id("Stamp"), symbol: "Stamp", createdAt: at(16.3), mcap: 4_019_595 },
+        { id: id("JEANP"), symbol: "JEANPHIL", createdAt: at(40.5), mcap: 3_608_100 },
+        { id: id("TYLER"), symbol: "TYLER", createdAt: at(17.6), mcap: 81_361 },
+        { id: id("young"), symbol: "Concho", createdAt: at(0.2), mcap: 96_485 },
+        { id: id("nostamp"), symbol: "NOAGE", mcap: 100_000 },
+        { id: id("nomcap"), symbol: "NOMCAP", createdAt: at(12) },
+      ],
+      band,
+      now,
+    );
+    assert.deepEqual(
+      out.map((p) => p.symbol),
+      ["TYLER", "NOAGE", "NOMCAP"],
+      "in-band kept; ancient, too-big and too-young dropped; missing fields kept",
+    );
+    assert.equal(out[0].openTimestamp, now - 17.6 * 3_600_000, "createdAt still maps to openTimestamp");
+    // No band = the old behaviour (the recent leg passes none, and a debug
+    // caller may want the raw page).
+    assert.equal(parseJupTrendTokens([{ id: id("SOL"), createdAt: at(20_113), mcap: 1 }], null, now).length, 1);
+    // Band + a payload shape that carries no createdAt at all: the age filter
+    // must not throw and must not invent a rejection.
+    assert.equal(parseJupTrendTokens([{ id: id("noage") }], band, now).length, 1);
+    assert.deepEqual(parseJupTrendTokens({ nope: true }, band, now), []);
+    assert.deepEqual(parseJupTrendTokens(null, band, now), []);
+  });
+
+  await test("trendBandFromChats: the band is the widest chat window with the pool's lenient margins", () => {
+    const band = trendBandFromChats(
+      [
+        { minAgeMinutes: 80, maxAgeMinutes: 1560, minMarketCapUsd: 60_000, maxMarketCapUsd: 230_000 },
+        { minAgeMinutes: 120, maxAgeMinutes: 1440, minMarketCapUsd: 40_000, maxMarketCapUsd: 380_000 },
+      ],
+      180,
+    );
+    assert.equal(band.minAgeMs, 0, "the age floor never goes negative (80min − 180min margin)");
+    assert.equal(band.maxAgeMs, (1560 + 180) * 60_000);
+    assert.equal(band.minMcapUsd, 24_000, "floor × 0.6 = the pool's own prune floor");
+    assert.equal(band.maxMcapUsd, 760_000, "ceiling × 2 = the pool's own prune ceiling");
+    assert.equal(trendBandFromChats([], 180), null, "no enabled chat → no band (and no filtering)");
+  });
+
+  await test("JupTokensClient: the trending leg applies its band to the page it fetched", async () => {
+    const urls = [];
+    const now = Date.now();
+    const fresh = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const ancient = "xyS4ySYhwk8LmUgHzDYKP9y4K7QvST5HoMV4iUepump";
+    const body = JSON.stringify([
+      { id: fresh, symbol: "INU", createdAt: new Date(now - 12 * 3_600_000).toISOString(), mcap: 181_000 },
+      { id: ancient, symbol: "SOL", createdAt: new Date(now - 20_113 * 3_600_000).toISOString(), mcap: 68e9 },
+    ]);
+    const client = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async (url) => {
+        urls.push(url);
+        return new Response(body, { status: 200 });
+      },
+    );
+    const band = { minAgeMs: 60 * 60_000, maxAgeMs: 26 * 3_600_000, minMcapUsd: 36_000, maxMcapUsd: 460_000 };
+    const out = await client.fetchTrendingTokens(100, band);
+    assert.ok(urls[0].includes("/toporganicscore/24h?limit=100"), `deep page requested (got ${urls[0]})`);
+    assert.deepEqual(out.map((p) => p.symbol), ["INU"], "the ancient head entry never reaches the pipeline");
+    const unfiltered = await client.fetchTrendingTokens(100);
+    assert.equal(unfiltered.length, 2, "no band = the raw page (the debug path)");
+  });
+
   await test("GmgnClient: one 429 pauses the client instead of retrying inside the tick", async () => {
     // GMGN's edge 429s a Worker's shared egress IP for the whole window (the
     // repo's own note on the gecko trending feed), and the client used to
@@ -8643,7 +8733,9 @@ async function main() {
       db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
       null, null, null, null,
       pump, gecko,
-      null, null, null, null,
+      // The Jupiter token client is opt-in per test: the launch-slot tests do
+      // not want the trending leg's behaviour in the way, the band test does.
+      opts.jupiter ?? null, null, null, null,
       null, null,
       null,
       meteora,
@@ -8732,6 +8824,53 @@ async function main() {
       await scanner.runOnce();
       assert.equal(calls.meteora, 0, "METEORA_FALLBACK_LIMIT=0 must mean no request at all");
       assert.equal(scanner.lastSummary.meteora, 0);
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: the trending leg reads a deep page and only the band reaches the pipeline", async () => {
+    // The wiring, end to end: config limit → client → band filter → `jupTrend`
+    // reading. Before this, the leg asked for the top 15 and passed NO band, so
+    // the blue-chip head of the ranking (SOL/USDC/…) became feed profiles and
+    // the leg contributed 14 coins in its lifetime — while still paying a pair
+    // address per profile in the front phase.
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const now = Date.now();
+      let seen = null;
+      const jupiter = {
+        fetchRecentTokens: async () => [],
+        fetchTrendingTokens: async (limit, band) => {
+          seen = { limit, band };
+          return parseJupTrendTokens(
+            [
+              { id: mint("TrendBlueChipN"), symbol: "SOL", createdAt: new Date(now - 20_113 * 3_600_000).toISOString(), mcap: 68e9 },
+              { id: mint("TrendInBandXN"), symbol: "INU", createdAt: new Date(now - 12 * 3_600_000).toISOString(), mcap: 181_512 },
+            ],
+            band,
+            now,
+          );
+        },
+        fetchTokenDataBatch: async () => new Map(),
+      };
+      const { scanner } = await chainScanner(
+        { JUPITER_TRENDING_LIMIT: "100" },
+        { t, geckoPools: () => [], pumpCoins: () => [], meteoraPools: () => [], jupiter },
+      );
+      await scanner.runOnce();
+      assert.deepEqual(
+        { limit: seen.limit, min: seen.band.minMcapUsd, max: seen.band.maxMcapUsd },
+        // chainScanner saves a maxMarketCapUsd of 10M and a minAgeMinutes of 0,
+        // so the band is the lenient expansion of exactly those numbers.
+        { limit: 100, min: 0, max: 20_000_000 },
+        "the leg must pass the config limit and the chats' band (not null)",
+      );
+      assert.equal(scanner.lastSummary.jupTrend, 1, "only the in-band entry reached the scan");
     } finally {
       globalThis.fetch = origFetch;
       await t.cleanup();

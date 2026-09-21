@@ -131,6 +131,15 @@ METEORA_FALLBACK_LIMIT = "20"
 # Coverage unchanged: the feed cap still bounds the phase, it just fits more
 # coins inside it before the cap trips.
 JUPITER_REQUEST_INTERVAL_MS = "500"
+# Jupiter Token v2 trending feed size per scan. 2026-09-21: 15 → 100. The page
+# is ranked by 24h organic score, so its HEAD is blue chips and blue chips never
+# qualify: measured with the live window ($60K–$230K / 80min–26h) exactly 0 of
+# the top 15 entries fitted, 8 of the top 100 did (Lobby 26h/$202K, TYLER
+# 17.6h/$81K, INU 12h/$181K…). The leg is one subrequest either way, and the
+# band filter runs at parse time, so the extra entries never reach the pair
+# phase (see jupfeeds.parseJupTrendTokens + docs/profiles-feed-zeros.md).
+# 0 = the leg is off entirely.
+JUPITER_TRENDING_LIMIT = "100"
 # DexScreener dispatch spacing, ms (code default 350). 2026-09-15: 350 → 250.
 # The pair phase is a fixed 1.5s window (PAIRS_FETCH_BUDGET_MS) and the shared
 # throttle spaces every request START, so the window held 5 dispatch slots at

@@ -16,7 +16,7 @@ import type { AxiomClient, AxiomTokenInfo, AxiomTrendingToken } from "./axiom";
 import { parseAxiomTokenInfo } from "./axiom";
 import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
 import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
-import type { JupTokensClient } from "./jupfeeds";
+import { trendBandFromChats, type JupTokensClient } from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
 import { PushWatcher, liquidityIsComparable } from "./pushwatch";
@@ -2471,10 +2471,22 @@ export class Scanner {
       // best-effort — failures return [] and the scan continues.
       let jupTrendProfiles: TokenProfile[] = [];
       if (this.jupiter && this.config.jupiterTrendLimit > 0) {
+        // The page is ranked by 24h organic score, so its HEAD is blue chips
+        // and the qualifying band only appears deep in it — measured
+        // 2026-09-21: 0 of the top 15 entries fitted an $60K–$230K / 80min–26h
+        // window, 8 of the top 100 did. Hence a deep fetch
+        // (JUPITER_TRENDING_LIMIT, default 100) plus a band filter at PARSE
+        // time: the leg's one subrequest stays one, and the untouched blue
+        // chips never reach the pair phase, which is where feed size actually
+        // costs (see jupfeeds.parseJupTrendTokens and pairsForTracker).
+        const trendBand = trendBandFromChats(chats, RE_EVAL_AGE_MARGIN_MIN);
         feedJobs.push(
           this.fetchFeedCapped(
             () =>
-              this.jupiter!.fetchTrendingTokens(this.config.jupiterTrendLimit),
+              this.jupiter!.fetchTrendingTokens(
+                this.config.jupiterTrendLimit,
+                trendBand,
+              ),
             [],
             feedDeadline,
           )

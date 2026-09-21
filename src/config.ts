@@ -356,9 +356,12 @@ export interface AppConfig {
   jupiterRecentLimit: number;
   /**
    * Jupiter Token v2 trending feed size per scan (JUPITER_TRENDING_LIMIT,
-   * default 15, max 100, 0 = disabled). Momentum-ranked coins over 24h —
-   * mostly older than the qualifying window, kept for early catch of
-   * resurging mints.
+   * default 100, max 100, 0 = disabled). 24h organic-score ranked coins — the
+   * HEAD of that ranking is blue chips (measured 2026-09-21: 0 of the top 15
+   * sat inside a $60K–$230K / 80min–26h window, 8 of the top 100 did), so the
+   * leg reads a deep page and keeps only the band (see
+   * jupfeeds.parseJupTrendTokens) — one subrequest either way, because the
+   * filter runs before the pair phase.
    */
   jupiterTrendLimit: number;
   /** Minimum spacing between Jupiter HTTP requests (rate limiting). */
@@ -653,9 +656,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     jupiterRecentLimit: Number.isFinite(Number(env.JUPITER_RECENT_LIMIT ?? 20))
       ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_RECENT_LIMIT ?? 20)), 100))
       : 20,
-    jupiterTrendLimit: Number.isFinite(Number(env.JUPITER_TRENDING_LIMIT ?? 15))
-      ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_TRENDING_LIMIT ?? 15)), 100))
-      : 15,
+    jupiterTrendLimit: Number.isFinite(Number(env.JUPITER_TRENDING_LIMIT ?? 100))
+      ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_TRENDING_LIMIT ?? 100)), 100))
+      : 100,
     jupiterRequestIntervalMs: Number.isFinite(
       Number(env.JUPITER_REQUEST_INTERVAL_MS ?? 1000),
     )

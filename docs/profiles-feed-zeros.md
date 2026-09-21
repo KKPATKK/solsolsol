@@ -155,3 +155,73 @@ backoff 期間所有 call（含 enrichment）零請求，恢復成功就自動�
 - Live（`4434fe6` 部署後，`/debug/tick`）：`prof 26 / settled true / jup 20 / **jupTrend 15** / gecko 有值` ——
   死掉的 trending leg 終於有 15 個幣進來，而且 `summary.gecko` 在 0-candidate tick 上讀得到（之前 8/8 次取樣都缺）。
 - 跟進：revert 之後再量同一組窗口，確認 `died before its completion flush` 是否回到 0——未完成，見下一輪 push。
+
+# 附：jupTrend 條腿貢獻近乎零（2026-09-21 追查）
+
+上一輪上面寫住「死掉的 trending leg 終於有 15 個幣進來」。跟進一查：**幣進得來，但一
+個都唔合格** —— `byFeed` 累計 `jupTrend coins 14 / pushed 0`，而每個 tick 仍然付一個
+subrequest。
+
+## 量度（`/toporganicscore/24h`，乾淨主機取樣）
+
+`createdAt` 換算年齡後，對住**線上實際**門檻（age 80min–1560min、mcap $60K–$230K）:
+
+| 取樣 | age 合格 | mcap 合格 | **兩者都合格** |
+|---|---|---|---|
+| `limit=15`（原設定） | 2 | 0 | **0** |
+| `limit=50` | 7 | 3 | 2 |
+| `limit=100` | 24 | 12 | 8 |
+
+頭 15 名（即原本 request 嘅全部）係：
+
+```
+SOL@20114h/$68061M  USDC@20114h/$7726M  CASH@9324h/$128M  ZEC@8294h/$154M
+USDT@20063h/$3839M  JEANPHIL@40h/$3.6M  STONK@1432h/$295M  Stamp@16h/$4.0M
+PUMP@10510h/$2092M  ZCAT@515h/$112M   GP@321h/$10M     JUP@20064h/$1019M
+```
+
+即係：24 小時 organic score 排名嘅**頭部結構上就唔係**目標幣 —— 藍籌（幾千至兩萬
+小時）＋已經沖上幾百萬嘅新熱幣。真係落喺 band 嘅（Lobby 26h/$202K、TYLER
+17.6h/$81K、INU 12h/$181K、PEEPEE 21.8h/$75K…）要**拉到第 50–100 名才出現**。
+
+## 成本模型（為何唔可以直接加大 limit）
+
+- **subrequest**：無論 limit 幾多都係 **1 個**（同一個 GET）。
+- **pair 地址**：feed 嘅每個 profile 都會入 `scannedProfiles` → `pairsForTracker`
+  每 tick 為佢拿一次 pair（30 個一批、3 並發）。limit 15 → 100 但唔過濾 =
+  **每 tick 多 ~85 個地址 ≈ 多 3 個 DexScreener batch**，而且全部係永遠唔可能合格嘅
+  藍籌。前段窗口（feeds + pool + pairs）正係 tick 最薄嘅一環。
+
+所以正確形狀唔係「加大 limit」，而係「**讀深頁，但喺 parse 階段就用 band 篩走**」。
+
+## 修法（`docs/patches/juptrend-deep-page-band.patch` + `juptrend-band-tests.patch`）
+
+- `jupfeeds.parseJupTrendTokens(data, band, now)`：同 `parseJupTokens` 一樣嘅 mint
+  驗證，另加 `mcap`，再按 band 篩 age 同 mcap；**冇 `createdAt` 或 `mcap` 嘅一律保留**
+  （缺席唔係反證，scanner 自己嘅 gate 才係權威）。
+- `trendBandFromChats(chats, margin)`：用**同 re-eval pool 一樣嘅寬鬆邊界**
+  （地板 ×0.6、天花板 ×2、age ±180min），所以唔會比 pool 自己嘅 prune 更緊。
+- `src/scanner.ts`：條腿改成傳 band（`JUPITER_TRENDING_LIMIT` 預設 15 → **100**）。
+
+淨效果：subrequest 一樣係 1 個，進入 pipeline 嘅 profile 由「15 個全部唔合格」變成
+「band 內 8–24 個」，pair 地址數量同改前相若。
+
+## 值唔值得保留？
+
+- **舊形狀（limit 15、無 band）**：明確唔值 —— 每個 tick 一個 subrequest 換 0 個合格幣，
+  終身 14 個註冊、0 個推播。
+- **新形狀**：仍然係一個**安全網**而唔係主力 feed。實測同一刻，8 個 band 內嘅幣有 **7 個
+  已經由 dex/jup 註冊過**（`discoveredVia`），只有 SCAT 一個係 DB 冇嘅 —— 即係條腿嘅邊際
+  產出係「**細幣細時冇被其他 feed 撈到、而家 1.3–26h 大**」這一窄條，而呢條 band 其他 feed
+  結構上撈唔到（dex/pump/jup 全部只帶秒/分鐘級新幣）。成本 1 個 subrequest ＋ 相若 pair
+  地址，所以保留係合理；如果只睇「pushed 0」想刪，亦係一個講得通嘅選擇（下面列了）。
+- **要刪的話**：`JUPITER_TRENDING_LIMIT=0`（已經有 0 = disabled 嘅閘），一行搞掂，唔需要
+  改 code。
+
+## 未觀察
+
+- 條腿嘅年齡分佈係喺**乾淨主機**量（內容唔會因 egress 而變；只有 429 會，而
+  `/debug/jupiter trending 5` 已證明 Worker egress 拿到貨）。deploy 之後嘅真實數字要睇
+  summary `jupTrend`（預期由 0 變 8–25）同 `byFeed.jupTrend`。
+- 8 個 band 內幣喺取樣嗰刻全部 5m 變動係負（−1% 至 −26%），所以佢們嘅價值係「入
+  re-eval pool 等下一次機會」，唔係即時推播 —— 呢點同 feed 原本嘅用途一致。
