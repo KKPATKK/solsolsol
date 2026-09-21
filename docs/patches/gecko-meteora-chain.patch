@@ -1,0 +1,197 @@
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -12,6 +12,7 @@
+ import type { GeckoTerminalClient } from "./geckoterminal";
++import type { MeteoraClient } from "./meteora";
+ import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
+ import type { AxiomClient, AxiomTokenInfo, AxiomTrendingToken } from "./axiom";
+ import { parseAxiomTokenInfo } from "./axiom";
+@@ -963,6 +964,14 @@
+   pumpFallback?: boolean;
++  /**
++   * Meteora Data API discovery feed size this scan (METEORA_FALLBACK_LIMIT,
++   * 0 when disabled/unconfigured). This layer only ever runs as the launch
++   * slot's LAST resort — gecko's new_pools AND pump.fun both delivered nothing
++   * — so a non-zero count is itself the proof that the two layers ahead of it
++   * failed (see src/meteora.ts).
++   */
++  meteora: number;
+   /** GeckoTerminal new-pools feed size this scan (0 when blocked/unconfigured). */
+   geo: number;
+@@ -1519,6 +1528,12 @@
+     private readonly flurry: FlurryAnalyzer | null = null,
++    /**
++     * Meteora Data API newest-pools discovery (null = disabled) — the launch
++     * slot's third and last keyless source, behind gecko's new_pools and
++     * pump.fun. Best-effort: failures degrade to the feeds ahead of it.
++     */
++    private readonly meteora: MeteoraClient | null = null,
+   ) {
+     this.pushWatcher = config.pushWatch.enabled
+@@ -2057,6 +2072,7 @@
+       profiles: 0,
+       pump: 0,
++      meteora: 0,
+       geo: 0,
+       geoTrend: 0,
+@@ -2185,45 +2201,18 @@
+-      // pump.fun discovery — the widest free source of brand-new coins
+-      // (DexScreener's profiles feed only returns ~24 Solana profiles per
+-      // scan). Best-effort: any failure returns [] and the scan continues
+-      // on DexScreener alone (see /health summary.pump to verify liveness).
+-      //
+-      // It ALSO fills gecko's slot (see pumpfunDiscoveryLimit): the two keyless
+-      // "brand-new coin" sources are gecko's new_pools and this launch feed, so
+-      // when THIS tick's gecko call delivers nothing the slot would otherwise
+-      // be empty. The decision rides the tick's own evidence — measured
+-      // 2026-09-21, gating it on the gecko client's PAUSE flag silently never
+-      // fired (`pump 0` while `geo 0`): that flag is per-isolate module state
+-      // and isolates churn every ~30s, so the isolate deciding had never made a
+-      // gecko call yet. Awaiting the gecko job costs only the failed tick, and
+-      // gecko's own failure path is a fast 429/refusal.
++      // The launch-slot fallback CHAIN (gecko → pump.fun → Meteora) is built
++      // after the gecko job BELOW, and that placement is load-bearing: each
++      // layer awaits the promise of the layer before it, and a layer placed
++      // above its producer reads `null` — an async IIFE runs synchronously up
++      // to its first await, so `if (geckoJob !== null) await geckoJob` in a
++      // block that precedes the gecko job is ALWAYS false. Measured 2026-09-21:
++      // that is how the previous "gecko fallback" silently became an always-on
++      // feed (`pump 20` + `pumpFallback true` on ticks where gecko was healthy
++      // too, and gecko's own `geo 0` never gated anything). geckoJob lives here
++      // only so the gecko block below can hand its promise over.
+       let geckoJob: Promise<void> | null = null;
+-      let pumpProfiles: TokenProfile[] = [];
+-      const pumpAlwaysLimit = this.config.pumpfunProfileLimit;
+-      const pumpFallbackLimit = this.config.pumpfunFallbackLimit;
+-      if (this.pumpfun && (pumpAlwaysLimit > 0 || pumpFallbackLimit > 0)) {
+-        feedJobs.push(
+-          (async () => {
+-            if (pumpAlwaysLimit <= 0) {
+-              if (geckoJob !== null) await geckoJob;
+-              if (diag.geo > 0) return; // gecko delivered — nothing to fill
+-              diag.pumpFallback = true;
+-            }
+-            pumpProfiles = await this.fetchFeedCapped(
+-              () =>
+-                this.pumpfun!.fetchNewestCoins(
+-                  pumpfunDiscoveryLimit(this.config, diag.geo > 0),
+-                ),
+-              [],
+-              feedDeadline,
+-            );
+-            diag.pump = pumpProfiles.length;
+-          })().catch((err: unknown) => {
+-            console.error(
+-              "[scanner] pump.fun discovery failed:",
+-              err instanceof Error ? err.message : err,
+-            );
+-          }),
+-        );
+-      }
+       // GeckoTerminal new-pools feed — the free (no-key) discovery source
+@@ -2276,6 +2275,78 @@
+         geckoJob = geckoPromise;
+         feedJobs.push(geckoPromise);
+       }
++      // LAUNCH-SLOT FALLBACK CHAIN: gecko's new_pools is the primary keyless
++      // launch feed, and a tick where it delivers nothing would leave the
++      // brand-new-coin slot empty — so two more keyless sources stand behind
++      // it, in measured order of freshness (both measured from the WORKER's own
++      // egress, the only placement that counts — see /debug/pool-source):
++      //
++      //   1. pump.fun v3 /coins      — newest coin ~2s old, one request
++      //   2. Meteora DAMM v2 /pools  — newest pool ~32s old, sorted server-side
++      //      by pool_created_at (see src/meteora.ts — Raydium and Orca cannot
++      //      answer "newest pools" at all: neither exposes a creation order)
++      //
++      // A layer awaits the one before it and returns the moment that layer
++      // delivered, so a healthy gecko tick pays NOTHING, a tick pump.fun fills
++      // never reaches Meteora, and only a tick where every layer ahead came
++      // back empty walks the whole chain. The wait sits INSIDE the feed window
++      // (fetchFeedCapped's floor): a layer that starts with no window left
++      // returns [] without dispatching, so a hung layer cannot drag the chain
++      // past the deadline.
++      let pumpProfiles: TokenProfile[] = [];
++      let pumpJob: Promise<void> | null = null;
++      const pumpAlwaysLimit = this.config.pumpfunProfileLimit;
++      const pumpFallbackLimit = this.config.pumpfunFallbackLimit;
++      if (this.pumpfun && (pumpAlwaysLimit > 0 || pumpFallbackLimit > 0)) {
++        const pumpPromise = (async () => {
++          if (pumpAlwaysLimit <= 0) {
++            if (geckoJob !== null) await geckoJob;
++            if (diag.geo > 0) return; // gecko delivered — nothing to fill
++            diag.pumpFallback = true;
++          }
++          pumpProfiles = await this.fetchFeedCapped(
++            () =>
++              this.pumpfun!.fetchNewestCoins(
++                pumpfunDiscoveryLimit(this.config, diag.geo > 0),
++              ),
++            [],
++            feedDeadline,
++          );
++          diag.pump = pumpProfiles.length;
++        })().catch((err: unknown) => {
++          console.error(
++            "[scanner] pump.fun discovery failed:",
++            err instanceof Error ? err.message : err,
++          );
++        });
++        pumpJob = pumpPromise;
++        feedJobs.push(pumpPromise);
++      }
++      // Meteora DAMM v2 — the chain's LAST resort (see src/meteora.ts). Reached
++      // only when gecko AND pump.fun both delivered nothing, which is exactly
++      // the case this layer exists for: pump.fun blocks datacenter IPs on and
++      // off, and an independent provider is what keeps the slot filled when it
++      // does. Sized by METEORA_FALLBACK_LIMIT (0 = off).
++      let meteoraProfiles: TokenProfile[] = [];
++      if (this.meteora && this.config.meteoraFallbackLimit > 0) {
++        feedJobs.push(
++          (async () => {
++            if (pumpJob !== null) await pumpJob;
++            if (diag.pump > 0) return; // pump.fun filled the slot
++            meteoraProfiles = await this.fetchFeedCapped(
++              () =>
++                this.meteora!.fetchNewestPools(this.config.meteoraFallbackLimit),
++              [],
++              feedDeadline,
++            );
++            diag.meteora = meteoraProfiles.length;
++          })().catch((err: unknown) => {
++            console.error(
++              "[scanner] meteora discovery failed:",
++              err instanceof Error ? err.message : err,
++            );
++          }),
++        );
++      }
+       // GeckoTerminal trending-pools — momentum feed (free, no key), the
+@@ -2463,6 +2534,7 @@
+       const geckoMints = new Set(geckoProfiles.map((p) => p.tokenAddress));
++      const meteoraMints = new Set(meteoraProfiles.map((p) => p.tokenAddress));
+       const geoTrendMints = new Set(geoTrendProfiles.map((p) => p.tokenAddress));
+       const gmgnMints = new Set(gmgnProfiles.map((p) => p.tokenAddress));
+@@ -2477,6 +2550,9 @@
+         ...jupTrendProfiles.map((p) => [p.tokenAddress, "jupTrend"] as const),
++        // Last-resort feed → last place in the attribution order: a mint both
++        // Meteora and an earlier feed carry is credited to the earlier one.
++        ...meteoraProfiles.map((p) => [p.tokenAddress, "meteora"] as const),
+       ]);
+       const feedProfiles: TokenProfile[] = [
+@@ -2531,6 +2607,18 @@
+             !jupMints.has(p.tokenAddress),
+         ),
++        ...meteoraProfiles.filter(
++          (p) =>
++            !dexMints.has(p.tokenAddress) &&
++            !pumpMints.has(p.tokenAddress) &&
++            !geckoMints.has(p.tokenAddress) &&
++            !geoTrendMints.has(p.tokenAddress) &&
++            !gmgnMints.has(p.tokenAddress) &&
++            !axiomMints.has(p.tokenAddress) &&
++            !jupMints.has(p.tokenAddress) &&
++            !jupTrendMints.has(p.tokenAddress),
++        ),
+       ];
+       const now = Date.now();

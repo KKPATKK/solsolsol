@@ -1,0 +1,14 @@
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -2316,6 +2316,10 @@
+           (async () => {
+             if (pumpJob !== null) await pumpJob;
+-            if (diag.pump > 0) return; // pump.fun filled the slot
++            // An EARLIER layer filling the slot stops the chain. Testing
++            // `diag.pump` alone is not enough: when gecko delivered, the pump
++            // layer returns from its skip branch WITHOUT setting `diag.pump`,
++            // so this layer would go to the network on a tick gecko covered.
++            if (diag.geo > 0 || diag.pump > 0) return;
+             meteoraProfiles = await this.fetchFeedCapped(
+               () =>
+                 this.meteora!.fetchNewestPools(this.config.meteoraFallbackLimit),

@@ -1,0 +1,259 @@
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -17,6 +17,7 @@
+ const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
++const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
+ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
+ const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
+@@ -8289,6 +8290,183 @@
+   // ---------- summary ----------
++
++  // ---------- launch-slot fallback chain (src/meteora.ts + src/scanner.ts) ----------
++  //
++  // GeckoTerminal's new_pools is the primary keyless launch feed. When it
++  // delivers nothing a tick would leave the brand-new-coin slot empty, so two
++  // more keyless sources stand behind it: pump.fun v3 (newest coin ~2s old) and
++  // Meteora's Data API (newest pool ~32s old, `sort_by=pool_created_at:desc`).
++  // All of those numbers came from `/debug/pool-source`, i.e. from the WORKER's
++  // own egress — the only placement that counts, because gecko's alternate host
++  // looked healthy from a clean host and answered 403/429 from there.
++
++  // Solana base58 mint (32-44 chars). Built from a readable prefix with the
++  // characters base58 EXCLUDES (0, O, I, l) mapped away, so a test mint is
++  // always parseable and a typo cannot turn a parser test into an "everything
++  // is junk" test.
++  const mint = (prefix) => {
++    const clean = prefix.replace(/[0OIl]/g, "x");
++    return `${clean}${"1".repeat(44 - clean.length)}`;
++  };
++  const WSOL_MINT = "So11111111111111111111111111111111111111112";
++  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
++
++  await test("Meteora: parseMeteoraPools keeps the non-quote side and drops unusable rows", async () => {
++    const created = Date.now() - 32_000;
++    const rows = [
++      // The ordinary launch row: quoted in SOL, so the OTHER side is the coin.
++      {
++        created_at: created,
++        launchpad: "met-dbc",
++        token_x: { address: WSOL_MINT, symbol: "SOL" },
++        token_y: { address: mint("9rZ5FDCR"), symbol: "RUM", name: "Rum" },
++      },
++      // Same mint again (a token can hold several pools) → deduped.
++      {
++        created_at: created,
++        token_x: { address: mint("9rZ5FDCR"), symbol: "RUM" },
++        token_y: { address: WSOL_MINT, symbol: "SOL" },
++      },
++      // Both sides are quote mints: no single launch token to register.
++      { created_at: created, token_x: { address: WSOL_MINT }, token_y: { address: USDC_MINT } },
++      // Neither side is a quote mint: cannot tell which side is the coin.
++      { created_at: created, token_x: { address: mint("3KxgYAhX") }, token_y: { address: mint("6rUZ4XtS") } },
++      // No creation time: the re-eval pool is keyed on it, so the row is junk.
++      { token_x: { address: WSOL_MINT }, token_y: { address: mint("SENDIT11") } },
++      { created_at: 0, token_x: { address: WSOL_MINT }, token_y: { address: mint("Pi11coin") } },
++    ];
++    const out = parseMeteoraPools({ data: rows });
++    assert.equal(out.length, 1, `exactly one usable row (got ${out.length})`);
++    assert.equal(out[0].tokenAddress, mint("9rZ5FDCR"));
++    assert.equal(out[0].symbol, "RUM");
++    assert.equal(out[0].name, "Rum");
++    assert.equal(out[0].openTimestamp, created, "created_at is milliseconds, passed through as-is");
++    // Shape failures are an empty feed, never a crash.
++    assert.deepEqual(parseMeteoraPools(null), []);
++    assert.deepEqual(parseMeteoraPools({ data: "nope" }), []);
++    assert.deepEqual(parseMeteoraPools({ data: [null, 7, "x"] }), []);
++  });
++
++  await test("MeteoraClient: asks for the newest page and treats a refusal as an empty feed", async () => {
++    const cfg = loadConfig({});
++    const client = new MeteoraClient(cfg);
++    const origFetch = globalThis.fetch;
++    const urls = [];
++    globalThis.fetch = async (url) => {
++      urls.push(String(url));
++      return new Response(
++        JSON.stringify({
++          data: [
++            {
++              created_at: Date.now() - 20_000,
++              token_x: { address: WSOL_MINT },
++              token_y: { address: mint("BITCAT11"), symbol: "BITCAT" },
++            },
++          ],
++        }),
++        { status: 200, headers: { "Content-Type": "application/json" } },
++      );
++    };
++    try {
++      const got = await client.fetchNewestPools(20);
++      assert.equal(got.length, 1);
++      assert.equal(got[0].tokenAddress, mint("BITCAT11"));
++      assert.ok(
++        urls[0].startsWith(`${METEORA_BASE_URL}/pools?`),
++        `the feed must come from the Data API host (got ${urls[0]})`,
++      );
++      assert.ok(
++        urls[0].includes("sort_by=pool_created_at:desc"),
++        "the ONLY thing that makes this source usable is the creation-time sort",
++      );
++      assert.ok(urls[0].includes("page_size=20"), `limit rides page_size (got ${urls[0]})`);
++      // A refused/blocked host is an empty feed and exactly ONE request: no
++      // retry ladder, because a rate-limited host will not answer inside the
++      // same tick any better on attempt three.
++      let calls = 0;
++      globalThis.fetch = async () => {
++        calls += 1;
++        return new Response("nope", { status: 429 });
++      };
++      assert.deepEqual(await client.fetchNewestPools(20), []);
++      assert.equal(calls, 1, "a refusal must not be retried inside the tick");
++    } finally {
++      globalThis.fetch = origFetch;
++    }
++  });
++
++  const chainScanner = async (cfgEnv, opts) => {
++    const { Scanner } = require("../dist/scanner.js");
++    const db = new Db(opts.t.p, undefined, opts.t.client);
++    await db.init();
++    // PUMPFUN_PROFILE_LIMIT=0 is what production runs (wrangler.toml): the
++    // launch feed is a FALLBACK, not an always-on feed. Left unset, the knob's
++    // code default (100) switches the pump layer to always-on mode, which skips
++    // gecko's verdict entirely — the exact behaviour these tests exist to pin.
++    const cfg = loadConfig({ PUMPFUN_PROFILE_LIMIT: "0", ...cfgEnv });
++    await db.saveChatSettings({
++      chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
++      minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
++      minAgeMinutes: 0, maxAgeMinutes: 100_000,
++      min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
++      enabled: true,
++    });
++    const dex = new DexScreenerClient(cfg);
++    dex.fetchLatestSolanaProfiles = async () => [];
++    dex.fetchPairsForTokens = async () => new Map();
++    const calls = { gecko: 0, pump: 0, meteora: 0 };
++    const gecko = {
++      fetchNewPools: async () => {
++        calls.gecko += 1;
++        return opts.geckoPools();
++      },
++      fetchTrendingPools: async () => [],
++      fetchTokenSnapshot: async () => null,
++    };
++    const pump = {
++      fetchNewestCoins: async () => {
++        calls.pump += 1;
++        return opts.pumpCoins();
++      },
++    };
++    const meteora = {
++      fetchNewestPools: async (limit) => {
++        calls.meteora += 1;
++        opts.meteoraLimitSeen = limit;
++        return opts.meteoraPools();
++      },
++    };
++    // (db, bot, dex, cfg, birdeye, rugcheck, helius, trade, pumpfun, gecko,
++    //  jupiter, gmgn, axiom, arkham, crimeWallets, walletAnalyzer, flurry,
++    //  meteora)
++    const scanner = new Scanner(
++      db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
++      null, null, null, null,
++      pump, gecko,
++      null, null, null, null,
++      null, null,
++      null,
++      meteora,
++    );
++    return { scanner, calls };
++  };
++
++  await test("Scanner: the launch-slot chain stops at the first layer that delivers", async () => {
++    const t = tmpDb();
++    const origFetch = globalThis.fetch;
++    globalThis.fetch = async () =>
++      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
++    try {
++      const { scanner, calls } = await chainScanner(
++        { PUMPFUN_FALLBACK_LIMIT: "20", METEORA_FALLBACK_LIMIT: "20" },
++        {
++          t,
++          geckoPools: () => [{ tokenAddress: mint("GECkxCxN"), createdAtMs: Date.now() - 60_000 }],
++          pumpCoins: () => [{ tokenAddress: mint("PUMPCxxN1") }],
++          meteoraPools: () => [{ tokenAddress: mint("METExRxxN"), openTimestamp: Date.now() - 60_000 }],
++        },
++      );
++      await scanner.runOnce();
++      assert.equal(calls.gecko, 1);
++      assert.equal(calls.pump, 0, "gecko delivered — pump.fun must not be paid for");
++      assert.equal(calls.meteora, 0, "gecko delivered — Meteora must not be paid for");
++      assert.equal(scanner.lastSummary.geo, 1);
++      assert.equal(scanner.lastSummary.pump, 0);
++      assert.equal(scanner.lastSummary.meteora, 0);
++      // The reading that used to lie: with the chain built above the gecko job,
++      // the pump layer read `geckoJob === null` and always ran + always claimed
++      // `pumpFallback`, even on ticks where gecko had delivered.
++      assert.notEqual(scanner.lastSummary.pumpFallback, true);
++    } finally {
++      globalThis.fetch = origFetch;
++      await t.cleanup();
++    }
++  });
++
++  await test("Scanner: a tick where gecko and pump.fun are both empty reaches Meteora", async () => {
++    const t = tmpDb();
++    const origFetch = globalThis.fetch;
++    globalThis.fetch = async () =>
++      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
++    try {
++      const opts = {
++        t,
++        geckoPools: () => [],
++        pumpCoins: () => [],
++        meteoraPools: () => [{ tokenAddress: mint("METExRxxN"), openTimestamp: Date.now() - 60_000 }],
++      };
++      const { scanner, calls } = await chainScanner(
++        { PUMPFUN_FALLBACK_LIMIT: "20", METEORA_FALLBACK_LIMIT: "20" },
++        opts,
++      );
++      await scanner.runOnce();
++      assert.equal(calls.gecko, 1);
++      assert.equal(calls.pump, 1, "gecko delivered nothing — pump.fun is the next layer");
++      assert.equal(calls.meteora, 1, "pump.fun delivered nothing — Meteora is the last resort");
++      assert.equal(opts.meteoraLimitSeen, 20);
++      assert.equal(scanner.lastSummary.geo, 0);
++      assert.equal(scanner.lastSummary.pump, 0);
++      assert.equal(scanner.lastSummary.pumpFallback, true);
++      assert.equal(scanner.lastSummary.meteora, 1);
++    } finally {
++      globalThis.fetch = origFetch;
++      await t.cleanup();
++    }
++  });
++
++  await test("Scanner: Meteora stays off the tick when its knob is 0", async () => {
++    const t = tmpDb();
++    const origFetch = globalThis.fetch;
++    globalThis.fetch = async () =>
++      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
++    try {
++      const { scanner, calls } = await chainScanner(
++        { PUMPFUN_FALLBACK_LIMIT: "20", METEORA_FALLBACK_LIMIT: "0" },
++        {
++          t,
++          geckoPools: () => [],
++          pumpCoins: () => [],
++          meteoraPools: () => [{ tokenAddress: mint("METExRxxN"), openTimestamp: Date.now() }],
++        },
++      );
++      await scanner.runOnce();
++      assert.equal(calls.meteora, 0, "METEORA_FALLBACK_LIMIT=0 must mean no request at all");
++      assert.equal(scanner.lastSummary.meteora, 0);
++    } finally {
++      globalThis.fetch = origFetch;
++      await t.cleanup();
++    }
++  });
+ 
+   console.log("\n===== UNIT TESTS =====");

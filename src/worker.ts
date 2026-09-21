@@ -53,6 +53,7 @@ import {
 } from "./pushledger";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
+import { MeteoraClient } from "./meteora";
 import { GeckoTerminalClient, GECKO_ALT_BASE_URL, GECKO_CACHE_TTL_S, GECKO_USER_AGENT } from "./geckoterminal";
 // Heal-path counters: module scope in the tracker, read here so /health can
 // answer "did the self-heal reuse the push-time baseline, and how often".
@@ -1770,6 +1771,10 @@ async function ensureInitialized(env: Env): Promise<void> {
           // Flurry launch forensics — deploy-slot bundle gate + funding
           // lineage (null when disabled). Last gate before each push.
           flurryAnalyzer ?? undefined,
+          // Meteora Data API newest-pools discovery — the launch slot's third
+          // and last keyless source (best-effort; reached only when gecko's
+          // new_pools AND pump.fun both came back empty — see src/meteora.ts).
+          new MeteoraClient(config),
         );
         // Capture every early-return reason the scanner records: it sets
         // lastSkip back to null in runOnce's finally within the same tick, so

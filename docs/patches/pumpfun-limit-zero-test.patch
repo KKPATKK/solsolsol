@@ -1,0 +1,28 @@
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -4403,6 +4403,24 @@
+     assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 100, pumpfunFallbackLimit: 40 }, true), 100);
+   });
+ 
++  await test("loadConfig: PUMPFUN_PROFILE_LIMIT=0 really does disable the always-on feed", () => {
++    // wrangler.toml documents `PUMPFUN_PROFILE_LIMIT = "0"` as "DISABLED", and
++    // pumpfun.ts says the same. The parser used to answer 100 for that 0 (a
++    // bare `> 0 ? clamp : 100`), so the "disabled" feed ran at full size — five
++    // paged requests inside the feed window — on every tick, and the gecko
++    // fallback branch never engaged. That is the state the launch-slot chain
++    // tests walked into (live `/debug/tick`: `pump 0`, no `pumpFallback`).
++    assert.equal(loadConfig({}).pumpfunProfileLimit, 100, "unset keeps the historic default");
++    assert.equal(
++      loadConfig({ PUMPFUN_PROFILE_LIMIT: "0" }).pumpfunProfileLimit,
++      0,
++      "an explicit 0 is OFF, exactly as wrangler.toml documents",
++    );
++    assert.equal(loadConfig({ PUMPFUN_PROFILE_LIMIT: "40" }).pumpfunProfileLimit, 40);
++    assert.equal(loadConfig({ PUMPFUN_PROFILE_LIMIT: "9000" }).pumpfunProfileLimit, 300, "clamped");
++    assert.equal(loadConfig({ PUMPFUN_PROFILE_LIMIT: "-5" }).pumpfunProfileLimit, 0, "below zero is OFF too");
++    assert.equal(loadConfig({ PUMPFUN_PROFILE_LIMIT: "nope" }).pumpfunProfileLimit, 0, "junk fails closed");
++  });
++
+   await test("PumpFunClient asks the v3 host with created_timestamp and identifies itself", async () => {
+     const calls = [];
+     const origFetch = global.fetch;

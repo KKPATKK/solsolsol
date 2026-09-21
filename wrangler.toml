@@ -85,9 +85,14 @@ REEVAL_POOL_CACHE_SECONDS = "90"
 # pump.fun discovery as an ALWAYS-ON feed: DISABLED (0) — the legacy host
 # (frontend-api.pump.fun) 530-blocks Worker egress (CF error 1016, origin DNS
 # gone since ~2026-08-20), so each tick only burned a doomed request. The v3
-# host is alive (measured 2026-09-21: HTTP 200, newest coins ~60s old at
+# host is alive (measured 2026-09-21: HTTP 200, newest coins ~2s old at
 # offset 0), so the feed is now wired as the GECKO FALLBACK below instead of
 # running every tick.
+#
+# NOTE (2026-09-21): this 0 did NOT disable anything until now — loadConfig's
+# `> 0 ? clamp : 100` turned it into 100, so the "disabled" feed ran at five
+# paged requests per tick and the fallback branch below never engaged (live
+# `/debug/tick` showed `pump 0` with no `pumpFallback`). 0 now means OFF.
 PUMPFUN_PROFILE_LIMIT = "0"
 # GECKO FALLBACK size: how many pump.fun newest coins to fetch while
 # GeckoTerminal's new_pools is PAUSED (429 or a hard refusal — its live state
@@ -96,11 +101,30 @@ PUMPFUN_PROFILE_LIMIT = "0"
 # healthy. See pumpfunDiscoveryLimit in src/pumpfun.ts.
 # ENABLED at 20 (the same batch size as the gecko feed it stands in for) after
 # `/debug/pool-source` proved the v3 host from the WORKER's own egress on
-# 2026-09-21: `pumpfun-v3 status 200 bytes 38959 count 20 newestAgeS 4` while
-# the legacy host answered 530/CF-1016 and Raydium/Orca/Meteora could not serve
-# a time-ordered pool list at all. 4 seconds old is fresher than gecko's
+# 2026-09-21: `pumpfun-v3 status 200 bytes 39112 count 20 newestAgeS 2` while
+# the legacy host answered 530/CF-1016. Seconds old is fresher than gecko's
 # new_pools ever was, and the cost is bounded to gecko's outage.
+#
+# CHAIN ORDER (src/scanner.ts): gecko new_pools → this feed → METEORA_FALLBACK_LIMIT
+# below. Each layer awaits the one before it, so this one is only paid for on a
+# tick where gecko delivered nothing, and the Meteora layer only on a tick where
+# BOTH of them did.
 PUMPFUN_FALLBACK_LIMIT = "20"
+# Meteora Data API newest-pools feed — the launch slot's LAST keyless source,
+# reached only when gecko's new_pools AND pump.fun both delivered nothing (0 =
+# off). ENABLED after `/debug/pool-source` proved it from the WORKER's own
+# egress on 2026-09-21: `meteora-damm-v2 status 200 count 10 newestAgeS 32`
+# with `sort_by=pool_created_at:desc` and both pool sides on every row.
+# A DIFFERENT provider, not a second URL for pump.fun — which is the point:
+# pump.fun blocks datacenter IPs on and off, and this keeps the slot filled when
+# it does. Earlier notes said "Meteora cannot serve a time-ordered pool list at
+# all"; that was measured against `dlmm-api.meteora.ag`, which now 404s every
+# path root-included. Meteora's current hosts (dlmm.datapi.meteora.ag /
+# damm-v2.datapi.meteora.ag) do sort by creation time. Raydium and Orca still
+# cannot — Raydium's `sortField` enum is liquidity/volume/fee/apr (and the
+# look-alike `poolSortField` is silently ignored), Orca's pools carry no
+# creation field. One request when reached. See src/meteora.ts.
+METEORA_FALLBACK_LIMIT = "20"
 # 2026-09-08: halved from 1000 — Jupiter-recent pacing (20 coins × interval)
 # was consuming ~5s of the 5.5s feed cap every tick, so feedsMs+evalMs+overhead
 # blew the 11s tick budget on ~2/3 of ticks (timeout rows in scan-history).

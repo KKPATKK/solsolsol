@@ -322,6 +322,15 @@ export interface AppConfig {
    */
   pumpfunFallbackLimit: number;
   /**
+   * Meteora Data API newest-pools count as the launch slot's LAST resort
+   * (METEORA_FALLBACK_LIMIT, default 0 = off, capped at 300). Reached only when
+   * gecko's new_pools AND pump.fun both delivered nothing on the same tick —
+   * an independent provider, so a pump.fun block (which comes and goes for
+   * datacenter IPs) cannot empty the slot on its own. One request when
+   * reached; nothing while the layers ahead of it deliver. See src/meteora.ts.
+   */
+  meteoraFallbackLimit: number;
+  /**
    * How many newest GeckoTerminal Solana pools to register per scan
    * (GECKOTERMINAL_POOL_PAGES, default 1, max 5 — each page ~20 pools). Free
    * discovery feed (no key) covering every Solana DEX incl. pump.fun
@@ -601,10 +610,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         ? Math.min(48, Math.max(2, Math.round(rawFarSweepMin / (poolCacheMs / 60_000))))
         : 6,
     reevalPoolCacheMs: poolCacheMs,
+    // 0 (and below) means OFF, which is what production sets: wrangler.toml's
+    // comment reads `PUMPFUN_PROFILE_LIMIT = "0"` → "DISABLED". The guard here
+    // used to be a bare `> 0 ? clamp : 100`, so an explicit 0 fell back to the
+    // code default and the "disabled" feed ran at 100 coins — five paged
+    // requests inside the feed window — on every tick. Found by the launch-slot
+    // chain tests (2026-09-21): it is also why the gecko-fallback branch never
+    // engaged in production (`pump 0`, no `pumpFallback`) and gecko's own
+    // verdict was unused. A junk value is treated as OFF too (fail-closed for
+    // cost); an UNSET variable keeps the historic 100 default.
     pumpfunProfileLimit:
-      Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
-        ? Math.min(Math.floor(rawPumpfunLimit), 300)
-        : 100,
+      env.PUMPFUN_PROFILE_LIMIT === undefined
+        ? 100
+        : Number.isFinite(rawPumpfunLimit) && rawPumpfunLimit > 0
+          ? Math.min(Math.floor(rawPumpfunLimit), 300)
+          : 0,
     pumpfunRequestIntervalMs: Number.isFinite(
       Number(env.PUMPFUN_REQUEST_INTERVAL_MS ?? 350),
     )
@@ -612,6 +632,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       : 350,
     pumpfunFallbackLimit: Number.isFinite(Number(env.PUMPFUN_FALLBACK_LIMIT ?? 0))
       ? Math.max(0, Math.min(Math.floor(Number(env.PUMPFUN_FALLBACK_LIMIT ?? 0)), 300))
+      : 0,
+    meteoraFallbackLimit: Number.isFinite(Number(env.METEORA_FALLBACK_LIMIT ?? 0))
+      ? Math.max(0, Math.min(Math.floor(Number(env.METEORA_FALLBACK_LIMIT ?? 0)), 300))
       : 0,
     geckoterminalPoolPages:
       Number.isFinite(rawGeoPages) && rawGeoPages > 0

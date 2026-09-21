@@ -263,6 +263,62 @@ Raydium 同 Orca 嘅排序選項係由**佢哋自己嘅規格**讀出來嘅（Ra
 **另一個 keyless 源**（Raydium／Orca／Meteora 嘅公開 pool API）、或者**接受降級**
 （re-eval pool ＋ Birdeye backfill 兜住，輪換與推送都唔受影响）。
 
+---
+
+## 第三個 keyless 源（真正嗰個）：Meteora Data API（2026-09-21 09:2xZ）
+
+### 一、先驗 Worker egress（`/debug/pool-source`，`128e434` 起）
+
+| 候選 | Worker egress 結果 | 判定 |
+|---|---|---|
+| `frontend-api-v3.pump.fun/coins` | 200，39,112 bytes，20 個，**newestAgeS 2** | ✅ 現役第一後備 |
+| `frontend-api.pump.fun`（舊 host） | 530 `error code: 1016` | ❌ 已死 |
+| `api.dexscreener.com/token-boosts/latest/v1` | 200，15 個 solana，**冇建立時間** | ⏸ 唔夠用 |
+| `api-v3.raydium.io/pools/info/list-v2` | 200 | ❌ **排序唔可以由建立時間** |
+| `api.orca.so/v2/solana/pools` | 200，172KB，50 個 | ❌ **payload 冇建立時間** |
+| `dlmm-api.meteora.ag`（舊 host） | **404，0 bytes（連 root 都 404）** | ❌ 唔存在（之前就係卡在這裏） |
+| **`damm-v2.datapi.meteora.ag/pools`** | **200，19,735 bytes，10 個，newestAgeS 32**，`newestMint 4uEsfHuhsHnf`，`newestLaunchpad met-dbc` | ✅ **用** |
+| `dlmm.datapi.meteora.ag/pools` | 200，19,342 bytes，10 個，newestAgeS 64，`newestTvl 2485` | ⏸ 姊妹端點，備用 |
+| `dbc.datapi.meteora.ag/pools` | 200，10 個，newestAgeS 509 | ⏸ 太慢、欄位唔齊 |
+
+（Raydium／Orca 今次係**重新量度**，唔係照抄上次：Raydium 嘅 `sortField` 係真參數——`time`／`openTime`／`bogus`
+全部回 500 `query sortField check error`，只有 liquidity/volume/fee/apr 合法；而上次以爲嘅 `poolSortField`
+係**被靜靜忽略**（`liquidity`／`time`／`bogus` 三個回傳**完全一樣** 20,465 bytes、同一排序）。
+Orca 嘅 pool object 完全冇 creation 欄位（只有 `updatedAt`／`updatedSlot`）。所以這兩家**任何價錢都做唔到「最新 pools」**。）
+
+### 二、接線：launch-slot chain（gecko → pump.fun → Meteora）
+
+- `src/meteora.ts`（新）：`GET /pools?page=1&page_size=N&sort_by=pool_created_at:desc`，
+  `parseMeteoraPools()` 由 *非 quote* 那一邊取 mint（WSOL／USDC／USDT 三個當 quote；兩邊都係 quote、
+  兩邊都唔係 quote、無 `created_at`、mint 唔似 base58 全部丟棄），`created_at` 係**毫秒**。
+- **一次請求、冇 retry ladder**：429／403／HTML／parse 失敗一律 `[]`。同一 tick 內重試唔會好，
+  而唔 await 嘅重試鏈會活過 feed 窗口、同 eval／push 爭 isolate（GMGN 嗰個 2s/4s 教訓）。
+- `src/scanner.ts`：三層改成**真 chain**（每層 await 上一層）。排列位置係關鍵 —— 舊碼把 pump 那層放在
+  gecko job **上面**，而 async IIFE 會同步跑到第一個 await，所以 `if (geckoJob !== null)` 永遠係 false：
+  即係「gecko fallback」實際上係**每個 tick 都跑**，而 `pumpFallback` 亦永遠為 true。而家 pump／Meteora
+  兩層都建在 gecko job **之後**，只有 gecko 交白卷才會輪到佢們，`diag.geo > 0 || diag.pump > 0` 就停鏈。
+- 成本：gecko 健康時 **零**；gecko 死而 pump.fun 有貨時零（Meteora 唔會出場）；三層全交白卷才 = 2 個請求/tick。
+  每次請求仍然在 `fetchFeedCapped` 的窗口內，冇窗口就唔 dispatch。
+
+### 三、順手修好嘅真 bug：`PUMPFUN_PROFILE_LIMIT="0"` 從來冇熄過
+
+`loadConfig` 嗰個 ternary 係 `raw > 0 ? clamp : 100`，所以 wrangler.toml 寫的 `"0"`（註解寫「DISABLED」）
+其實變成 **100** —— 即係 always-on feed 每個 tick 拉 5 頁（`limit=20` × 5）塞在 900ms 窗口內、被 cut，
+所以線上 `/debug/tick` 係 `pump 0` 兼且**冇 `pumpFallback`**（即係 fallback 分支根本冇行過、gecko 嘅判斷被浪費）。
+修法：`env` 未設 → 100（保留歷史默認），設 0／負數／垃圾 → **0（熄）**，正數 → clamp 到 300。
+新增測試釘死（`loadConfig: PUMPFUN_PROFILE_LIMIT=0 ...`）。
+
+### 四、驗收點（deploy 後）
+
+```
+/debug/tick → summary.pump == 20 兼 pumpFallback true（gecko 死 → 第一後備接手）
+            → summary.geo > 0 嘅 tick 必須 pump 0 / meteora 0（鏈停）
+            → pump.fun 都交白卷嘅 tick 才會見到 summary.meteora > 0
+```
+
+`summary.meteora` 只會在**最後一層**出現，所以「非零」本身就證明前兩層都失敗；而 `meteora 0` ＋
+`pumpFallback false/absent` ＋ `geo 0` 三者同時出現，就是「三層都死」的完整簽名。
+
 ## 部署後實測（`92cb2ea`，2026-09-20 10:08–10:15Z）
 
 ```

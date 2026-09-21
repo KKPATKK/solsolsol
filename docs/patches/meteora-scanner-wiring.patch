@@ -1,0 +1,9 @@
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -1773,2 +1773,6 @@
+           flurryAnalyzer ?? undefined,
++          // Meteora Data API newest-pools discovery — the launch slot's third
++          // and last keyless source (best-effort; reached only when gecko's
++          // new_pools AND pump.fun both came back empty — see src/meteora.ts).
++          new MeteoraClient(config),
+         );
