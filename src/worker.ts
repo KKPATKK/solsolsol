@@ -842,6 +842,17 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * the budget by only 100-300ms at 11.1-11.3s once GeckoTerminal recovered
  * and the pool grew to ~650 rows — the pool-eval phase was being aborted
  * ~0.1s before it would have finished). 12s starts the flush ~12.3s in,
+ * 2026-09-21 (9.5 → 12s): the envelope is raised to fund the post-push
+ * tracker pass, which now runs in the tick tail AFTER the completion flush
+ * (see TRACKER_PASS_BUDGET_MS). That ordering is what makes the raise safe: the
+ * 12s dead-tick era above was an envelope where a slow scan could push the
+ * FLUSH past the kill point, and the fix was SCAN_FLUSH_RESERVE_MS — which is
+ * unchanged and still taken out of the scan's race. Everything the tracker pass
+ * does happens after the completion write has already landed, so it can only
+ * ever lose its own work (one rotation pass, retried next tick), never a tick's
+ * completion. Measured before the raise: the pass reached the tail ~7.4s into
+ * the tick, leaving it 1150ms of the old budget — one row per pass against the
+ * 29 a sweep has to cover.
  * still ~8s clear of the ~20s kill window, and OK ticks measured 8.8-10.1s
  * all morning, so the 1s raise converts those marginal ticks to completions
  * without approaching the lethal mid-teens flush window.
@@ -852,7 +863,7 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
  */
-const SCAN_TICK_BUDGET_MS = 9_500;
+const SCAN_TICK_BUDGET_MS = 12_000;
 /**
  * Wall-clock slice, taken at the END of a tick, for ONE post-push tracker
  * pass (see Scanner.runTrackerPass and pushwatch.TRACKER_TICK_BUDGET_MS).
