@@ -20,6 +20,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterM
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
+const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
@@ -665,7 +666,11 @@ async function main() {
     lastVol5m: 1_000, deadTroughMcap: null, holdersAtPush: null,
     holdersLast: null, holdersCheckedAt: null, sellDomStreak: 0,
     lastMcap: null, lastChecked: 0, lastAlertAt: 0,
-    followupsSent: 0, lastState: null, upStages: null,
+    followupsSent: 0, lastState: null,
+    // ALREADY ARMED: this row has been seen below the floor once, so the drain
+    // rule is at its terminal step and the 💧 card is the alert in play. With a
+    // single reading it would only warn (see DRAIN_CONFIRM_MARK).
+    upStages: DRAIN_CONFIRM_MARK,
     ...over,
   });
   // Flat mcap and flat volume: the ONLY alert in play is the 💧 drain card, and
@@ -1070,8 +1075,20 @@ async function main() {
     // Both halves of the bug, exactly as they fired live.
     const rawFloor = evaluateWatch(row({ lastLiquidity: 19_288 }), 1000, { ...base, liquidity: 7_950.39 }, cfg);
     assert.equal(rawFloor.alerts[0].kind, "liquidity");
-    assert.match(rawFloor.alerts[0].text, /流動性枯竭 Lobby/);
-    assert.equal(rawFloor.stopTracking, true, "the card claimed 停止追蹤");
+    assert.match(rawFloor.alerts[0].text, /跌穿地板 Lobby/, "the raw leg reading still reaches the drain rule");
+    assert.equal(rawFloor.stopTracking, false, "but ONE reading no longer ends tracking");
+    assert.equal(rawFloor.announcedUpStages, DRAIN_CONFIRM_MARK, "it arms the confirmation instead");
+    // A SECOND reading off that same number still would have — which is what
+    // the guard below prevents by never handing the rule a number it cannot
+    // compare (the arm is where the old code got its confidence).
+    const rawFloor2 = evaluateWatch(
+      row({ lastLiquidity: 19_288, upStages: DRAIN_CONFIRM_MARK }),
+      2000,
+      { ...base, liquidity: 7_950.39 },
+      cfg,
+    );
+    assert.match(rawFloor2.alerts[0].text, /流動性枯竭 Lobby/);
+    assert.equal(rawFloor2.stopTracking, true);
     // Above the floor — so the crash ratio is the rule that judges — a leg
     // switch still fabricates a drop (stored 26K DexScreener → 11K Jupiter).
     // (The crash rule sits inside the cooldown block, hence the old lastAlertAt.)
@@ -1104,7 +1121,16 @@ async function main() {
     const dsPair = { liquidity: { usd: 7_950.39 }, feedSource: "dexscreener" };
     const real = evaluateWatch(row(), 1000, { ...base, liquidity: comparableLiquidity(dsPair) }, cfg);
     assert.equal(real.alerts[0].kind, "liquidity");
-    assert.equal(real.stopTracking, true);
+    assert.match(real.alerts[0].text, /跌穿地板 Lobby/, "the first calibrated reading warns");
+    assert.equal(real.stopTracking, false);
+    const real2 = evaluateWatch(
+      row({ upStages: String(real.announcedUpStages) }),
+      2000,
+      { ...base, liquidity: comparableLiquidity(dsPair) },
+      cfg,
+    );
+    assert.match(real2.alerts[0].text, /流動性枯竭 Lobby/);
+    assert.equal(real2.stopTracking, true, "and a genuinely drained pool still rugs on the second reading");
   });
 
   await test("out-of-window patch: liquidity provenance is guarded (docs/patches/liq-source-guard.patch)", () => {
@@ -5567,14 +5593,28 @@ async function main() {
     const r = evaluateWatch(row(), 1000, { mcap: 126_000, liquidity: 0, chg5m: 0, buysH1: 0, sellsH1: 0 }, cfg);
     assert.equal(r.alerts.length, 1);
     assert.equal(r.alerts[0].kind, "liquidity");
-    assert.match(r.alerts[0].text, /流動性枯竭 CatGPT/);
-    assert.equal(r.lastState, "rug");
-    assert.equal(r.stopTracking, true);
+    assert.match(r.alerts[0].text, /跌穿地板 CatGPT/);
+    assert.match(r.alerts[0].text, /下一次檢查仍低於地板就會停止追蹤/);
+    assert.equal(r.lastState, "up100", "a warning is not a state change");
+    assert.equal(r.stopTracking, false);
+    assert.equal(r.announcedUpStages, DRAIN_CONFIRM_MARK);
 
-    // Just below the floor with rising mcap — same outcome, no rising alert.
-    const r2 = evaluateWatch(row(), 1000, { mcap: 200_000, liquidity: 9_999, chg5m: 30, buysH1: 500, sellsH1: 10 }, cfg);
+    // The SAME row one reading later, still under the floor → terminal, with
+    // no rising card even though mcap shows +300% (that number is the zombie).
+    const r2 = evaluateWatch(row({ upStages: DRAIN_CONFIRM_MARK }), 2000, { mcap: 200_000, liquidity: 9_999, chg5m: 30, buysH1: 500, sellsH1: 10 }, cfg);
     assert.equal(r2.alerts[0].kind, "liquidity");
+    assert.match(r2.alerts[0].text, /流動性枯竭 CatGPT/);
+    assert.equal(r2.lastState, "rug");
     assert.equal(r2.stopTracking, true);
+    // The arm is the FIRST reading's business: a terminal tick that rewrote the
+    // column would be writing marks onto a row nothing will ever read again.
+    assert.equal(r2.announcedUpStages, undefined);
+
+    // Unarmed, that same just-below-floor reading only warns.
+    const warn = evaluateWatch(row(), 2000, { mcap: 200_000, liquidity: 9_999, chg5m: 30, buysH1: 500, sellsH1: 10 }, cfg);
+    assert.equal(warn.alerts.length, 1);
+    assert.match(warn.alerts[0].text, /跌穿地板 CatGPT/);
+    assert.equal(warn.stopTracking, false);
 
     // null liquidity (pair without an liq field) must NOT trigger the rule
     // (within cooldown so no other rule can fire either).
@@ -5587,7 +5627,146 @@ async function main() {
     assert.equal(hi.alerts.length, 0);
     const custom = evaluateWatch(row({ lastLiquidity: 40_000 }), 1000, { mcap: 90_000, liquidity: 19_000, chg5m: 2, buysH1: 30, sellsH1: 25 }, { cooldownMs: 0, liqFloorUsd: 20_000 });
     assert.equal(custom.alerts[0].kind, "liquidity");
-    assert.equal(custom.stopTracking, true);
+    assert.match(custom.alerts[0].text, /跌穿地板 CatGPT/);
+    assert.equal(custom.stopTracking, false);
+    const custom2 = evaluateWatch(row({ lastLiquidity: 40_000, upStages: DRAIN_CONFIRM_MARK }), 2000, { mcap: 90_000, liquidity: 19_000, chg5m: 2, buysH1: 30, sellsH1: 25 }, { cooldownMs: 0, liqFloorUsd: 20_000 });
+    assert.equal(custom2.stopTracking, true);
+  });
+
+  await test("evaluateWatch: the drain rule needs TWO readings, and a real reading above the floor disarms it", () => {
+    // The live shape this closes (ARGUS, 2026-09-21 10:05Z): a 💧 card reading
+    // `LP 僅剩 —（< $10K）` ended a row whose own stored measurement was
+    // $65,179.55 — and DexScreener answers `liquidity.usd: 0` (not a missing
+    // field) for a pool it has not (re)indexed. A 'rug' row is never
+    // re-evaluated and the re-arm path only ever covered an UNPROVEN CARD SEND,
+    // so one transient zero used to drop a live coin for good.
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "ARGUS", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 50_000, lastLiquidity: 65_179.55,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3_600_000, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+    const subFloor = { mcap: 49_500, liquidity: 0, chg5m: 0, buysH1: 0, sellsH1: 0 };
+
+    const first = evaluateWatch(row(), 1000, subFloor, cfg);
+    assert.equal(first.alerts.length, 1);
+    assert.equal(first.alerts[0].kind, "liquidity");
+    assert.match(first.alerts[0].text, /跌穿地板 ARGUS/);
+    assert.match(first.alerts[0].text, /下一次檢查仍低於地板就會停止追蹤/);
+    assert.equal(first.stopTracking, false, "one reading must not end tracking");
+    assert.equal(first.lastState, null, "and must not move the state machine");
+    assert.equal(first.announcedUpStages, DRAIN_CONFIRM_MARK, "the arm rides the persistent column");
+
+    const second = evaluateWatch(row({ upStages: DRAIN_CONFIRM_MARK }), 2000, subFloor, cfg);
+    assert.match(second.alerts[0].text, /流動性枯竭 ARGUS/);
+    assert.match(second.alerts[0].text, /連續 2 次檢查/);
+    assert.equal(second.lastState, "rug");
+    assert.equal(second.stopTracking, true);
+    assert.equal(second.announcedUpStages, undefined, "the terminal tick leaves the column alone");
+
+    // A comparable reading back above the floor disarms the count, so a later
+    // dip has to earn its own pair. (Stored 20K → live 21K, so the crash ratio
+    // has nothing to fire off either: only the disarm is in play.)
+    const recovered = evaluateWatch(
+      row({ upStages: DRAIN_CONFIRM_MARK, lastLiquidity: 20_000 }),
+      3000,
+      { ...subFloor, liquidity: 21_000 },
+      cfg,
+    );
+    assert.deepEqual(recovered.alerts, []);
+    assert.equal(recovered.announcedUpStages, "", "a real reading above the floor clears the arm");
+
+    // ...and a 🚀 stage write in the SAME tick must not re-add it: the stage
+    // writers share the set, so the two cannot fight over the column (a
+    // resurrected arm would make the NEXT dip single-reading again).
+    const recoveredRising = evaluateWatch(
+      row({ upStages: DRAIN_CONFIRM_MARK, lastLiquidity: 20_000 }),
+      3000,
+      { mcap: 200_000, liquidity: 30_000, chg5m: 5, buysH1: 40, sellsH1: 20 },
+      cfg,
+    );
+    assert.ok(recoveredRising.alerts.some((a) => a.kind === "rising"));
+    assert.ok(
+      !String(recoveredRising.announcedUpStages).includes(DRAIN_CONFIRM_MARK),
+      `the stage write must not resurrect the disarmed mark (got ${recoveredRising.announcedUpStages})`,
+    );
+    assert.ok(String(recoveredRising.announcedUpStages).includes("up200"));
+
+    // An UNKNOWN reading (another leg's metric → null) is no evidence either
+    // way: it must neither judge nor erase what the last real reading said.
+    const unknown = evaluateWatch(row({ upStages: DRAIN_CONFIRM_MARK }), 4000, { ...subFloor, liquidity: null }, cfg);
+    assert.deepEqual(unknown.alerts, []);
+    assert.equal(unknown.stopTracking, false);
+    assert.equal(unknown.announcedUpStages, undefined, "null must not touch the column");
+  });
+
+  await test("resumeTrackingKeyboard: the 💧 card carries its own way back", () => {
+    // The drain card is the only card that ENDS tracking, and its evidence is
+    // one provider's liquidity number — so the card itself has to offer the
+    // undo. The callback is `resume:<token>`, handled next to 🔕 in src/bot.ts
+    // through the guarded re-arm (Db.rearmPushWatchAlert).
+    const kb = resumeTrackingKeyboard("MINT111");
+    assert.equal(kb.inline_keyboard.length, 1);
+    const [btn] = kb.inline_keyboard[0];
+    assert.equal(btn.text, "🔁 恢復追蹤");
+    assert.equal(btn.callback_data, "resume:MINT111");
+  });
+
+  await test("Db.rearmPushWatchAlert: handing a row back also disarms the drain count", async () => {
+    // Every re-arm path (the 🔁 tap, the settle of an unproven terminal card,
+    // the /debug repair) returns the row with the verdict UNEARNED: inheriting
+    // the arm that terminated it would make the resumed row's very next
+    // sub-floor reading terminal again — a one-reading rug hiding behind a
+    // two-reading rule, with no ⚠️ warning card in between.
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({
+        chatId: "c", ...DEFAULT_SETTINGS,
+        minMarketCapUsd: 40_000, maxMarketCapUsd: 380_000, enabled: true,
+      });
+      const token = "RESUME1";
+      await db.upsertPushWatch({
+        token, chatId: "c", symbol: "RESUME1",
+        pushedAt: Date.now() - 3_600_000, mcapAtPush: 100_000, liquidityUsd: 4_000,
+      });
+      // The shape a drain leaves behind: terminal state + the armed mark, next
+      // to the marks other rules own (which have to survive the re-arm).
+      await db.updatePushWatchCheck(token, {
+        peakMcap: 100_000, lastLiquidity: 0, lastState: "rug",
+        upStages: `${DRAIN_CONFIRM_MARK},up50,w35`,
+      });
+      const before = (await db.listPushWatch(10)).find((r) => r.token === token);
+      assert.equal(before.lastState, "rug");
+
+      assert.equal(await db.rearmPushWatchAlert(token), true);
+      const after = (await db.listPushWatch(10)).find((r) => r.token === token);
+      assert.equal(after.lastState, null, "the row is ACTIVE again");
+      assert.equal(after.lastAlertAt, 0);
+      assert.equal(after.lastChecked, 0, "front of the rotation");
+      assert.equal(after.upStages, "up50,w35", "the arm is gone; the other marks are untouched");
+      assert.equal(await db.rearmPushWatchAlert(token), false, "and the rug guard still holds");
+
+      // A row whose ONLY mark was the arm ends with no marks at all, rather
+      // than an empty string the stage writers would have to special-case.
+      const solo = "RESUME2";
+      await db.upsertPushWatch({
+        token: solo, chatId: "c", symbol: "RESUME2",
+        pushedAt: Date.now() - 3_600_000, mcapAtPush: 100_000, liquidityUsd: 4_000,
+      });
+      await db.updatePushWatchCheck(solo, {
+        peakMcap: 100_000, lastLiquidity: 0, lastState: "rug",
+        upStages: DRAIN_CONFIRM_MARK,
+      });
+      assert.equal(await db.rearmPushWatchAlert(solo), true);
+      const soloRow = (await db.listPushWatch(10)).find((r) => r.token === solo);
+      assert.equal(soloRow.upStages, null, "a lone arm clears the column outright");
+    } finally {
+      await t.cleanup();
+    }
   });
 
   await test("evaluateWatch: volume ignition fires once from a dormant tape, never after rising stages", () => {

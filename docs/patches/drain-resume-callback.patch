@@ -1,0 +1,63 @@
+--- a/src/bot.ts
++++ b/src/bot.ts
+@@ -465,7 +465,8 @@ export function createBot(
+       (!data.startsWith("buy:") &&
+         !data.startsWith("sell:") &&
+         !data.startsWith("mode:") &&
+-        !data.startsWith("unwatch:"))
++        !data.startsWith("unwatch:") &&
++        !data.startsWith("resume:"))
+     )
+       return;
+ 
+@@ -514,6 +515,50 @@ export function createBot(
+       return;
+     }
+ 
++    // 🔁 resume: undo the 💧 drain card's terminal state. The row goes back to
++    // ACTIVE with its alert clock cleared and the drain rule's armed mark
++    // dropped (Db.rearmPushWatchAlert is guarded on `last_state = 'rug'`, so it
++    // can never resurrect a 🔕 tombstone or a window-expired row, and it strips
++    // the 'liq1' arm so the resumed row has to EARN the verdict again with two
++    // fresh readings), and the very next pass re-measures the pool. The rule is
++    // at-least-once by design: a pool that really is drained re-announces the
++    // ⚠️/💧 pair, which is the honest answer to "recheck it".
++    if (data.startsWith("resume:")) {
++      const token = data.slice("resume:".length);
++      if (adminIds.length === 0 || !isAdmin(ctx.from?.id, adminIds)) {
++        await ctx.answerCallbackQuery({ text: "你不是本 bot 的管理员，无法操作" });
++        return;
++      }
++      const chatDb = await getDb(ctx);
++      if (!chatDb) return;
++      // Update-then-report, same discipline as 🔕: the re-arm UPDATE only
++      // matches a 'rug' row, so the affected-row count separates "resumed"
++      // from "this coin was never in the drained state" instead of answering
++      // the same toast for both and making a no-op tap look like it worked.
++      let updated = false;
++      try {
++        updated = await chatDb.rearmPushWatchAlert(token);
++      } catch (err) {
++        console.error(
++          "[bot] resume state write failed:",
++          err instanceof Error ? err.message : err,
++        );
++        await ctx
++          .answerCallbackQuery({ text: "⚠️ 恢復追蹤失败，请稍后再试" })
++          .catch(() => {});
++        return;
++      }
++      // Clear the keyboard either way — the button has done its job, and a
++      // stale button would answer "already resumed" forever.
++      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
++      await ctx.answerCallbackQuery({
++        text: updated
++          ? "🔁 已恢復追蹤，下一個檢查會重新量度流動性"
++          : "ℹ️ 此幣不在「停止追蹤」狀態（可能已被清理或已恢復）",
++      });
++      return;
++    }
++
+     // ⚙️ mode switch: toggle (asks for confirmation) / apply / cancel. Global
+     // action — the token only exists to re-render the right card.
+     const modeCb = parseModeCallback(data);

@@ -1,0 +1,13 @@
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -2300,4 +2300,9 @@
+     now: number,
+   ): Promise<TerminalSendOutcome> {
+-    const inFlight = this.bot.api.sendMessage(row.chatId, text);
++    // The keyboard rides the terminal card only (see resumeTrackingKeyboard):
++    // every other follow-up card re-derives itself on the next pass, so the
++    // user has nothing to undo.
++    const inFlight = this.bot.api.sendMessage(row.chatId, text, {
++      reply_markup: resumeTrackingKeyboard(row.token),
++    });
+     // `settled` never rejects: a rejection is a FACT ("Telegram said no") while

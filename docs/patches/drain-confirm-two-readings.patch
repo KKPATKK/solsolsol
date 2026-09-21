@@ -1,0 +1,179 @@
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -394,8 +394,53 @@ const LIQ_CRASH_MIN_LAST_USD = 5_000;
+  * DexScreener keeps reporting "marketCap" from the last traded price even
+  * with zero liquidity, so every mcap-derived signal (rising stages, weak,
+  * dead) becomes noise — stop tracking instead of acting on fake numbers.
++ *
++ * ONE sub-floor reading no longer terminalizes: the rule requires TWO in a
++ * row (see DRAIN_CONFIRM_MARK), because the same reading that means "drained"
++ * is also what DexScreener answers for a pool it has not (re)indexed.
+  */
+ export const LIQ_FLOOR_USD = 10_000;
++/**
++ * The persistent mark that records "one sub-floor reading has been seen" — the
++ * first half of the drain rule's two-reading confirmation.
++ *
++ * WHY A READING IS NOT ENOUGH (2026-09-21). The rule used to terminalize on a
++ * single sub-floor reading, and DexScreener answers `liquidity.usd: 0` — not a
++ * missing field — for pools it has not (re)indexed. Because a 'rug' row is
++ * never re-evaluated and the re-arm path only covers an UNPROVEN CARD SEND
++ * (never a wrong reading), one transient zero permanently dropped a live coin.
++ * Live shape (ARGUS, 2026-09-21 10:05Z): the card read `LP 僅剩 —（< $10K）`
++ * while that row's own stored measurement was $65,179.55 — the audit flagged it
++ * as `measurement_above_floor`. (That particular pool WAS drained: DexScreener
++ * and GeckoTerminal both reported ~$0 reserves. So the card was right and its
++ * single reading was still the wrong way to establish it.)
++ *
++ * The mark rides the PERSISTENT up_stages column, because the tracker rotates
++ * rows across isolates and ticks — no per-process state can count two readings.
++ * A reading back above the floor DISARMS it, so an oscillating pool cannot
++ * accumulate its way to terminal, and the first sighting announces a ⚠️ card
++ * instead of the terminal one, so the 💧 card that follows is never a surprise.
++ */
++export const DRAIN_CONFIRM_MARK = "liq1";
++/**
++ * The 💧 card's keyboard — the one button that can undo a terminal row.
++ *
++ * The drain card is the only card that ENDS tracking, and its evidence is one
++ * provider's liquidity number, so the card now carries "🔁 恢復追蹤": the
++ * callback re-arms the row (Db.rearmPushWatchAlert, guarded on
++ * `last_state = 'rug'` so it can never resurrect a 🔕 tombstone or a
++ * window-expired row) and the next pass measures the pool again. At-least-once
++ * by design: a pool that really is drained re-announces the ⚠️/💧 pair, which
++ * is the honest outcome — the user gets to say "recheck it" without waiting
++ * out the 26h window or re-pushing the coin.
++ */
++export function resumeTrackingKeyboard(token: string): {
++  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
++} {
++  return {
++    inline_keyboard: [[{ text: "🔁 恢復追蹤", callback_data: `resume:${token}` }]],
++  };
++}
+ /**
+  * The only liquidity reading a USD-level rule may judge: DexScreener's.
+  *
+@@ -605,12 +650,47 @@ export function evaluateWatch(
+ 
+   // Liquidity drained outright (LP ≈ 0): the reported mcap is just the last
+   // traded price × supply and carries no information. Wins over every other
+-  // state so we never send 🚀 off a zombie number.
++  // state so we never send 🚀 off a zombie number — and it takes TWO sub-floor
++  // readings to terminalize (see DRAIN_CONFIRM_MARK), the first one warning.
+   const liqFloor = cfg.liqFloorUsd ?? LIQ_FLOOR_USD;
++  const marks = new Set<string>();
++  for (const m of (row.upStages ?? "").split(",")) if (m) marks.add(m);
++  // undefined = the mark set is unchanged, so the caller leaves the column as
++  // it is (the same contract the 🚀 stages use).
++  const marksChanged = (): string | undefined => {
++    const csv = [...marks].sort().join(",");
++    return csv === (row.upStages ?? "").split(",").sort().join(",")
++      ? undefined
++      : csv;
++  };
+   if (live.liquidity !== null && live.liquidity < liqFloor) {
++    if (!marks.has(DRAIN_CONFIRM_MARK)) {
++      // First sighting: warn and remember, but keep watching. The card says
++      // exactly what the next reading will decide, so the 💧 card that may
++      // follow is announced rather than a surprise.
++      marks.add(DRAIN_CONFIRM_MARK);
++      fire(
++        "liquidity",
++        `⚠️ 流動性跌穿地板 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}）— 已記錄第一次讀數，下一次檢查仍低於地板就會停止追蹤（市值數據隨 LP 失真）`,
++      );
++      return {
++        alerts,
++        peakMcap,
++        followupsSent,
++        lastState,
++        lastAlertAt,
++        stopTracking: false,
++        sellDomStreak: row.sellDomStreak ?? 0,
++        announcedUpStages: marksChanged(),
++      };
++    }
++    // Second consecutive sub-floor reading: terminal. The row's stored
++    // measurement already carries the first $0-ish reading, so a lost
++    // completion write can no longer leave the audit's
++    // `measurement_above_floor` contradiction behind.
+     fire(
+       "liquidity",
+-      `💧 流動性枯竭 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}），市值數據已失真（LP 被抽乾），停止追蹤`,
++      `💧 流動性枯竭 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}，連續 2 次檢查），市值數據已失真（LP 被抽乾），停止追蹤`,
+     );
+     return {
+       alerts,
+@@ -620,8 +700,18 @@ export function evaluateWatch(
+       lastAlertAt,
+       stopTracking: true,
+       sellDomStreak: row.sellDomStreak ?? 0,
++      announcedUpStages: marksChanged(),
+     };
+   }
++  // A real reading back above the floor disarms the count, so a LATER dip
++  // starts a new pair instead of inheriting this one's. Only a comparable
++  // reading may do it: an UNKNOWN one (null — another leg's metric) carries no
++  // evidence either way and must not erase what the last real reading said.
++  let drainDisarm: string | undefined;
++  if (live.liquidity !== null && marks.has(DRAIN_CONFIRM_MARK)) {
++    marks.delete(DRAIN_CONFIRM_MARK);
++    drainDisarm = marksChanged();
++  }
+ 
+   // Resurrection / silent-watch: once a coin is 💀 it is FULLY silent
+   // until it recovers to trough × 1.5 (then a fresh cycle starts). Without
+@@ -657,6 +747,7 @@ export function evaluateWatch(
+       stopTracking: false,
+       deadTroughMcap: trough,
+       sellDomStreak: row.sellDomStreak ?? 0,
++      announcedUpStages: drainDisarm,
+     };
+   }
+ 
+@@ -678,6 +769,7 @@ export function evaluateWatch(
+       stopTracking: false,
+       deadTroughMcap: live.mcap,
+       sellDomStreak: row.sellDomStreak ?? 0,
++      announcedUpStages: drainDisarm,
+     };
+   }
+ 
+@@ -728,8 +820,10 @@ export function evaluateWatch(
+     // with ⚠️/🔥 and gets wiped by them, which re-announced the same
+     // milestone (three 🚀 JEFFERY cards in one hour). The card also names
+     // the NEXT milestone so every card carries forward-looking info.
+-    const firedStages = new Set<string>();
+-    for (const s of (row.upStages ?? "").split(",")) if (s) firedStages.add(s);
++    // The SAME set the drain confirmation maintains above (it started as a
++    // copy of this column), so a disarm written by that rule is never re-added
++    // by a stage write here.
++    const firedStages = marks;
+     if (lastState?.startsWith("up")) firedStages.add(lastState);
+     const preFireStages = [...firedStages].sort().join(",");
+     for (let i = RISING_STAGES.length - 1; i >= 0; i--) {
+@@ -868,7 +962,9 @@ export function evaluateWatch(
+     stopTracking: false,
+     resetBaselineHolders,
+     sellDomStreak,
+-    announcedUpStages,
++    // A stage change owns the column when one happened; otherwise the drain
++    // rule's disarm is the only edit that has to land.
++    announcedUpStages: announcedUpStages ?? drainDisarm,
+   };
+ }
+ 
+@@ -2206,7 +2302,12 @@ export class PushWatcher {
+     sendLeft: number,
+     now: number,
+   ): Promise<TerminalSendOutcome> {
+-    const inFlight = this.bot.api.sendMessage(row.chatId, text);
++    // The keyboard rides the terminal card only (see resumeTrackingKeyboard):
++    // every other follow-up card re-derives itself on the next pass, so the
++    // user has nothing to undo.
++    const inFlight = this.bot.api.sendMessage(row.chatId, text, {
++      reply_markup: resumeTrackingKeyboard(row.token),
++    });
+     // `settled` never rejects: a rejection is a FACT ("Telegram said no") while
+     // the timeout is the ABSENCE of one, and not conflating the two is the
+     // entire fix (see TerminalSendOutcome).

@@ -286,3 +286,71 @@ miss 抵銷 —— 正正係呢份 doc 一路修嘅「冇卡喺 chat、行又靜
 - `npm run typecheck` ✅。
 - 呢個 fix 要 deploy 先喺線上生效；未 deploy 前再手動 repair 舊行，仍然有機會被第一次 miss 刪走
   （self-heal 會喺 lookback 內補返，但唔應該靠佢）。
+
+## 7. 收緊：兩次讀數才終止 ＋ 卡片自帶「🔁 恢復追蹤」（2026-09-21）
+
+第 6 節嘅普查揭到一件比行嘅簿記更根本嘅事：**呢條規則靠一次讀數就永久終止追蹤**，而「抽乾」同
+「DexScreener 未（重新）索引到呢個池」係同一個讀數（`liquidity.usd: 0`，唔係欄位缺失）。當日
+ARGUS 就係咁樣：
+
+| 證據 | 值 |
+|---|---|
+| 卡片 | `💧 流動性枯竭 ARGUS \| LP 僅剩 —（< $10K）… 停止追蹤`（`fmtUsd(0)` = `—`） |
+| 行本身嘅存量 `last_liquidity` | **$65,179.55** |
+| 審計 | `measurement_above_floor`（存量數值支撐唔到 `rug`） |
+| 事後查 DexScreener / GeckoTerminal | 兩個來源都係 ~$0 儲備 |
+
+即係：**呢張卡判得對，但用一次讀數去確立佢係錯嘅方法**。`rug` 行永遠唔會被再評估，而 re-arm 路徑
+（第 6 節）只覆蓋「送卡未證實送達」，唔覆蓋「讀數錯」—— 所以一次過渡性 0 就會永久丟一個活幣。
+
+### 規則：兩次連續讀數（`DRAIN_CONFIRM_MARK = "liq1"`）
+
+| 讀數 | 結果 |
+|---|---|
+| 第一次 low（`< liqFloor` 且可比腿） | `⚠️ 流動性跌穿地板…已記錄第一次讀數，下一次檢查仍低於地板就會停止追蹤`；`stopTracking: false`、`lastState` 不變、`up_stages` 加上 `liq1`（**武裝**） |
+| 第二次仍然 low（同一個武裝） | `💧 流動性枯竭 …（< …，連續 2 次檢查）… 停止追蹤`；`lastState: "rug"`、`stopTracking: true` |
+| 讀數返上地板（可比腿） | **解除武裝**（`liq1` 被刪，`up_stages` 其餘標記不動）→ 下一次跌穿要重新儲夠兩次 |
+| 讀數係 null（另一條腿） | 唔判、唔解除：`null` 唔係證據（見第 2 節嘅可比性規則） |
+
+武裝標記一定要**持久**（`up_stages` 欄），因為 tracker 每 pass 換 isolate、行亦輪換 —— 冇任何
+process 狀態數得到兩次讀數。寫入用同一個 `marks` set（🚀 里程碑、`w35/w45`、`div` 同一個欄），
+所以同一個 tick 嘅 🚀 寫入**唔會**把已解除嘅武裝加返（否則下一次跌穿又變返單讀數終止）。
+
+### 卡片自帶 undo：`🔁 恢復追蹤`
+
+💧 卡係唯一會終止追蹤嘅卡，證據又只係一個來源嘅一個數字，所以張卡自己帶返路：`resume:<token>`
+（同 🔕 一樣有 admin gate），經 `Db.rearmPushWatchAlert`（守 `last_state = 'rug'`，所以叫唔醒 🔕
+墳墓或者窗口已過嘅行）。
+
+順帶修好一個會令呢粒掣形同虛設嘅窿：**re-arm 本身亦會刪走 `liq1` 武裝**。否則恢復之後第一次
+sub-floor 讀數即刻又終止（`rug` 隱身喺一個「要兩次」嘅規則後面，中間連 ⚠️ 都冇）；同時佢只刪
+`liq1`，🚀 / `w35` / `div` 一律保留（CSV 手術用 `',' || up_stages || ','` 做 token-exact 比對，
+唔會剪到隔籬嘅標記）。呢個亦令上面句「真係抽乾就會重新出 ⚠️/💧 一對」成立。
+
+### 落地同驗證
+
+| 檔案 | 內容 |
+|---|---|
+| `src/pushwatch.ts` | `DRAIN_CONFIRM_MARK`、`resumeTrackingKeyboard`、`evaluateWatch` 兩次讀數 + 解除武裝（`docs/patches/drain-confirm-two-readings.patch`） |
+| `src/db.ts` | `rearmPushWatchAlert` 順手清 `liq1`（`docs/patches/drain-rearm-clear-mark.patch`） |
+| `src/bot.ts` | `resume:` callback（`docs/patches/drain-resume-callback.patch`） |
+| `scripts/test-unit.js` | 新測試 + 兩個舊測試改寫 + 終態卡 fixture 武裝（`docs/patches/drain-confirm-and-resume-tests.patch`、`drain-confirm-terminal-fixture.patch`） |
+
+- `npm run typecheck` ✅；`npm run test:unit` → **256 passed / 0 failed**（253 → 256：+3 條新測試；另 2 條舊測試改寫、1 個 fixture 修正）。
+- 新測試：`evaluateWatch: the drain rule needs TWO readings, and a real reading above the floor disarms it`、
+  `resumeTrackingKeyboard: the 💧 card carries its own way back`、
+  `Db.rearmPushWatchAlert: handing a row back also disarms the drain count`（真 DB：`liq1,up50,w35` → `up50,w35`；
+  單獨一個 `liq1` → `NULL`；第二次 re-arm 回 `false`）。
+- **過程中量到一個真嘅回歸**：終態卡三態測試（abandoned / rejected / settle）本來靠「第一次低讀數就終止」，
+  改規則之後一個都唔會 terminalize，`terminalAbandoned` 由 1 變 0。所以 fixture `termRow()` 改成預設已武裝
+  —— 呢個係測試覆蓋嘅修正，唔係把斷言調鬆。
+
+### 未做／未觀察（老實講）
+
+- 兩次讀數之間隔住一個輪換（每 pass 一行一次檢查），所以 ⚠️→💧 會有分鐘級延遲；如果一個 pass 被打斷
+  （race cut），pair 會隔得更開 —— 武裝本身冇時效，但窗口 prune（26 小時）會連行帶走。
+- ⚠️ 卡係一張 follow-up，會食一個 `followups_sent` 額度（同 💧 一樣）。
+- `liq1` 冇腿嘅概念，但唔需要：兩次讀數都必須係**可比腿**（DexScreener）嘅非 null 值，另一條腿一律
+  讀成 null，所以 pair 一定係同一把尺。
+- 線上驗收（要 deploy）：見到 `💧 …（< …，連續 2 次檢查）` 就係新規則生效；而 `⚠️ 流動性跌穿地板` 之後
+  行**冇**變 `rug`，係兩次讀數嘅設計，唔係漏判。

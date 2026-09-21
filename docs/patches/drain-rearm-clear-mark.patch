@@ -1,0 +1,23 @@
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -2889,11 +2889,22 @@
+    * Returns false when no such row matched (pruned, or it moved on).
++   *
++   * It also strips the drain rule's ARMED MARK ('liq1', see
++   * pushwatch.DRAIN_CONFIRM_MARK — that constant is where the token is
++   * defined, this SQL is the only place that removes it) while leaving every
++   * other persistent mark (🚀 stages, w35/w45, div) exactly as it was. The arm
++   * is what made the verdict TERMINAL, so a row handed back with it still set
++   * would end tracking again on its very next sub-floor reading — a
++   * one-reading rug hiding behind a two-reading rule, with no ⚠️ warning card
++   * in between. The CSV surgery is token-exact (',' + column + ',') so it can
++   * never clip a neighbouring mark.
+    */
+   async rearmPushWatchAlert(token: string): Promise<boolean> {
+     const res = await this.get().execute({
+-      sql: "UPDATE push_watch SET last_state = NULL, last_alert_at = 0, last_checked = 0\n            WHERE token = ?\n              AND last_state = 'rug'",
++      sql: `UPDATE push_watch SET last_state = NULL, last_alert_at = 0, last_checked = 0,\n              up_stages = NULLIF(TRIM(REPLACE(',' || COALESCE(up_stages, '') || ',', ',liq1,', ','), ','), '')\n            WHERE token = ?\n              AND last_state = 'rug'`,
+       args: [token],
+     });
+     return Number(res.rowsAffected ?? 0) > 0;
+   }

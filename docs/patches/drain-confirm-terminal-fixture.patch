@@ -1,0 +1,14 @@
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -668,7 +668,11 @@
+     lastVol5m: 1_000, deadTroughMcap: null, holdersAtPush: null,
+     holdersLast: null, holdersCheckedAt: null, sellDomStreak: 0,
+     lastMcap: null, lastChecked: 0, lastAlertAt: 0,
+-    followupsSent: 0, lastState: null, upStages: null,
++    followupsSent: 0, lastState: null,
++    // ALREADY ARMED: this row has been seen below the floor once, so the drain
++    // rule is at its terminal step and the 💧 card is the alert in play. With a
++    // single reading it would only warn (see DRAIN_CONFIRM_MARK).
++    upStages: DRAIN_CONFIRM_MARK,
+     ...over,
+   });
