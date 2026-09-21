@@ -94,11 +94,13 @@ PUMPFUN_PROFILE_LIMIT = "0"
 # since 2026-09-21, which leaves `geo 0` and the brand-new-coin slot empty).
 # It is a batch size, not a switch: 0 = off, and it costs nothing while gecko is
 # healthy. See pumpfunDiscoveryLimit in src/pumpfun.ts.
-# STILL 0: the v3 host answers from an ordinary host, but NOTHING is enabled
-# until `/debug/pool-source` proves it also answers from the WORKER's egress
-# (that is the placement that matters — gecko's alternate host looked reachable
-# and was 403/429 from here). Flip this to "40" once that probe is green.
-PUMPFUN_FALLBACK_LIMIT = "0"
+# ENABLED at 20 (the same batch size as the gecko feed it stands in for) after
+# `/debug/pool-source` proved the v3 host from the WORKER's own egress on
+# 2026-09-21: `pumpfun-v3 status 200 bytes 38959 count 20 newestAgeS 4` while
+# the legacy host answered 530/CF-1016 and Raydium/Orca/Meteora could not serve
+# a time-ordered pool list at all. 4 seconds old is fresher than gecko's
+# new_pools ever was, and the cost is bounded to gecko's outage.
+PUMPFUN_FALLBACK_LIMIT = "20"
 # 2026-09-08: halved from 1000 — Jupiter-recent pacing (20 coins × interval)
 # was consuming ~5s of the 5.5s feed cap every tick, so feedsMs+evalMs+overhead
 # blew the 11s tick budget on ~2/3 of ticks (timeout rows in scan-history).

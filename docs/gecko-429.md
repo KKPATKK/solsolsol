@@ -219,7 +219,44 @@ Worker 可以正常自行設 `User-Agent`。剩下嘅牆就係**keyless 額度**
   `altLastStatus 429`，之後 `altAtt` 唔再升）——**成本由舊寫法嘅每 tick 1 次降到每窗口 1 次**；
 - 「一個 tick 20、下一個 0」正是 60s TTL 嘅問題，所以 discovery 已改 **300s**（見上）。
 
-**結論**：免費路徑**仍然係降級狀態**（主 host 跟 alt 都被 keyless IP quota 封），
+## 第三個 keyless 源：pump.fun v3（`ca5c91c`／`wrangler.toml`，2026-09-21 08:54Z）
+
+### 先驗 Worker egress（`/debug/pool-source`）
+
+由 **Worker 自己嘅 egress** 打每一個候選源：
+
+| 候選 | 結果 | 判定 |
+|---|---|---|
+| `frontend-api-v3.pump.fun/coins?sort=created_timestamp` | **200**，38,959 bytes，20 個，**最新嗰個 4 秒前** | ✅ 用 |
+| `frontend-api.pump.fun`（舊 host） | **530** `error code: 1016`（origin DNS 冇了） | ❌ 難怪之前要熄 |
+| `api.dexscreener.com/token-boosts/latest/v1` | 200，15 個 solana（無建立時間） | ⏸ 後備 |
+| `api-v3.raydium.io/pools/info/list-v2` | 200，但 **`sortField` enum 只有 liquidity/volume/fee/apr** | ❌ 冇「最新」排序 |
+| `api.orca.so/v2/solana/pools` | 200，171KB，**`sortBy` enum 只有 volume/fee/rewards/yield/tvl**、payload 冇 `createdAt` | ❌ 同上 |
+| `dlmm-api.meteora.ag/...` | 404（由乾淨主機都係） | ❌ 唔存在 |
+
+Raydium 同 Orca 嘅排序選項係由**佢哋自己嘅規格**讀出來嘅（Raydium OpenAPI 嘅 `poolSortField` enum、Orca 嘅 400 錯誤列表），所以唔係「Worker 打唔到」而係**根本冇一個「最新 pools」入口**。
+
+### 接線方法
+
+- `src/pumpfun.ts`：BASE_URL 改去 v3，`sort=created` → **`sort=created_timestamp`**
+  （v3 嘅 400 自己列明合法值），加描述性 UA。
+- `pumpfunDiscoveryLimit()`：**只在 gecko `new_pools` 暫停時**才回一個 batch
+  （`PUMPFUN_FALLBACK_LIMIT=20`）——gecko 健康時係 0，所以 steady state 成本不變；
+  `summary.pumpFallback` 就係「呢批係唔係補位」嘅讀數。
+- 舊 host 已死，所以 v3 唔係「多一個 feed」，而係**同一條 feed 復活 + 只在 gecko 死時跑**。
+
+### 線上驗收
+
+```
+/debug/pool-source → pumpfun-v3 status 200 count 20 newestAgeS 4
+/health            → gecko geo 0（仍然被封）| pump 20 pumpFallback true | prof 22 jup 20 jupTrend 15
+```
+
+**結論（更新）**：gecko 仍然降級，但 brand-new-coin 槽位**已經有人補**，而且補得更早
+（pump.fun 嗰 20 個係**秒級**新幣，gecko 嘅 new_pools 係已建池、分鐘級）。
+完整推播覆蓋仍然靠 profiles ＋ jup；gecko 自己要靠 key 或等 egress quota 回復。
+
+**原本嘅結論**：免費路徑**仍然係降級狀態**（主 host 跟 alt 都被 keyless IP quota 封），
 但（a）403 呢個真 bug 修好了，（b）失敗成本有界，（c）一次成功而家覆蓋五個 tick。
 其他 feed 完全冇受影響：`profiles 23–24`、`jup 20`、`jupTrend 15`、tick 全 ok。
 要 gecko 完全穩定，只剩三條路：**帶 key**（`COINGECKO_API_KEY`，Demo 10K/月 ≈ 只夠 fallback 用）、
