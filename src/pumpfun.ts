@@ -1,12 +1,36 @@
 import type { AppConfig } from "./config";
 import type { TokenProfile } from "./dexscreener";
 
-const BASE_URL = "https://frontend-api.pump.fun";
+/**
+ * pump.fun's public launch API.
+ *
+ * WHY v3 (measured 2026-09-21): the legacy `frontend-api.pump.fun` this client
+ * used is DEAD — it answers **530 / Cloudflare error 1016** (origin DNS gone),
+ * which is why `PUMPFUN_PROFILE_LIMIT` was set to 0 and the whole feed sat
+ * disabled. The v3 host answers **200** with the same `/coins` shape (newest
+ * coins ~60s old at offset 0) and a slightly different sort parameter — its own
+ * 400 says: `Invalid sort value. Must be one of: created_timestamp, market_cap,
+ * ath_market_cap, reply_count, last_reply, last_trade_timestamp`, so the old
+ * `sort=created` is rejected and SORT_QUERY below is what works.
+ */
+const BASE_URL = "https://frontend-api-v3.pump.fun";
 /**
  * pump.fun's frontend API caps page size at 20 — requesting more returns
  * fewer. Paginate with `offset` to gather a full batch.
  */
 const PAGE_SIZE = 20;
+/**
+ * Newest-first ordering. `sort=created_timestamp` is v3's name for it (the
+ * legacy host took `sort=created`); see BASE_URL for the 400 that lists it.
+ */
+const SORT_QUERY = "sort=created_timestamp&order=DESC";
+/**
+ * Descriptive User-Agent. CoinGecko 403s a Worker subrequest without one (see
+ * GECKO_USER_AGENT in geckoterminal.ts); this host is measured separately and
+ * identifies itself for the same reason — an anonymous shared-egress request is
+ * the shape that gets blocked.
+ */
+const USER_AGENT = "solana-meme-bot/1.0 (+https://github.com/KKPATKK/solsolsol)";
 /** How many HTTP requests a single paginated feed may make at most. */
 const MAX_PAGES = 15;
 
@@ -73,6 +97,27 @@ export function parsePumpCoins(data: unknown): TokenProfile[] {
  * parse all degrade to [] and the scanner continues on DexScreener alone
  * (the pump counter on /health shows whether discovery is live).
  */
+/**
+ * How many pump.fun newest-coins this scan fetches (pure — unit-tested).
+ *
+ * TWO KNOBS, ONE FEED:
+ *  - `pumpfunProfileLimit` is the always-on feed. It is 0 in production: the
+ *    legacy host 530'd every Worker request, so the feed was switched off
+ *    rather than paying a doomed request per tick.
+ *  - `pumpfunFallbackLimit` is the GECKO FALLBACK size. GeckoTerminal's
+ *    new_pools feed is the other keyless "brand-new coin" source, and while it
+ *    is paused — a 429 or a refusal armed its backoff, the state that leaves
+ *    `geo 0` — pump.fun's launch feed takes over that slot. While gecko is
+ *    healthy this returns 0, so the steady state (and its cost) is unchanged.
+ */
+export function pumpfunDiscoveryLimit(
+  config: Pick<AppConfig, "pumpfunProfileLimit" | "pumpfunFallbackLimit">,
+  geckoPaused: boolean,
+): number {
+  if (config.pumpfunProfileLimit > 0) return config.pumpfunProfileLimit;
+  return geckoPaused ? config.pumpfunFallbackLimit : 0;
+}
+
 export class PumpFunClient {
   private readonly throttle: Throttle;
 
@@ -86,7 +131,7 @@ export class PumpFunClient {
       try {
         const res = await this.throttle.run(() =>
           fetch(`${BASE_URL}${path}`, {
-            headers: { Accept: "application/json" },
+            headers: { Accept: "application/json", "User-Agent": USER_AGENT },
             signal: AbortSignal.timeout(10_000),
           }),
         );
@@ -121,7 +166,7 @@ export class PumpFunClient {
     const seen = new Set<string>();
     for (let page = 0; page < MAX_PAGES && out.length < wanted; page++) {
       const data = await this.getJson(
-        `/coins?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}&sort=created&order=DESC`,
+        `/coins?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}&${SORT_QUERY}`,
       );
       if (!Array.isArray(data) || data.length === 0) break;
       let added = 0;
@@ -152,7 +197,7 @@ export class PumpFunClient {
     const seen = new Set<string>();
     for (let page = 0; page < maxPages; page++) {
       const data = await this.getJson(
-        `/coins?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}&sort=created&order=DESC`,
+        `/coins?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}&${SORT_QUERY}`,
       );
       if (!Array.isArray(data) || data.length === 0) break;
       let added = 0;

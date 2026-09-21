@@ -8,7 +8,7 @@ import { fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
 import type { TradeService } from "./jupiter";
-import type { PumpFunClient } from "./pumpfun";
+import { pumpfunDiscoveryLimit, type PumpFunClient } from "./pumpfun";
 import type { GeckoTerminalClient } from "./geckoterminal";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTokenInfo, AxiomTrendingToken } from "./axiom";
@@ -957,6 +957,13 @@ export interface ScanSummary {
   profiles: number;
   /** pump.fun discovery feed size this scan (0 when blocked/unconfigured). */
   pump: number;
+  /**
+   * True when that pump.fun batch came from the GECKO FALLBACK slot (gecko's
+   * new_pools was paused, so the launch feed filled it — see
+   * pumpfunDiscoveryLimit). Distinguishes "gecko is down and pump.fun is
+   * carrying the launch slot" from "pump.fun ran as its own always-on feed".
+   */
+  pumpFallback?: boolean;
   /** GeckoTerminal new-pools feed size this scan (0 when blocked/unconfigured). */
   geo: number;
   /** GeckoTerminal trending-pools feed size this scan (momentum, 0 when disabled). */
@@ -1949,6 +1956,17 @@ export class Scanner {
   }
 
   /**
+   * True while GECKO DISCOVERY IS PAUSED — a 429 (or a hard refusal) armed the
+   * client's backoff (see GeckoTerminalClient.stats / armAltPause). That is
+   * exactly the state that leaves `geo 0`, and the trigger for the pump.fun
+   * fallback that fills the launch slot (see pumpfunDiscoveryLimit).
+   */
+  private geckoDiscoveryPaused(): boolean {
+    const s = this.gecko?.stats();
+    return s !== undefined && s.backoffUntil > Date.now();
+  }
+
+  /**
    * Run one feed fetch capped by the feed deadline (see FEED_DEADLINE_MS).
    * Otherwise races the fetch against the remaining feed budget so a hanging
    * upstream call resolves empty at the deadline instead of starving the core
@@ -2181,12 +2199,21 @@ export class Scanner {
       // (DexScreener's profiles feed only returns ~24 Solana profiles per
       // scan). Best-effort: any failure returns [] and the scan continues
       // on DexScreener alone (see /health summary.pump to verify liveness).
+      //
+      // It ALSO fills gecko's slot while that feed is paused (see
+      // pumpfunDiscoveryLimit): the two keyless "brand-new coin" sources are
+      // gecko's new_pools and this launch feed, and while `geo 0` the slot is
+      // otherwise empty. Zero cost while gecko is healthy — measured
+      // 2026-09-21, gecko's new_pools is 429ed from the Worker's egress on
+      // every attempt while the launch feed answers 200.
+      const geckoPaused = this.geckoDiscoveryPaused();
+      const pumpLimit = pumpfunDiscoveryLimit(this.config, geckoPaused);
       let pumpProfiles: TokenProfile[] = [];
-      if (this.pumpfun && this.config.pumpfunProfileLimit > 0) {
+      if (this.pumpfun && pumpLimit > 0) {
+        diag.pumpFallback = geckoPaused && this.config.pumpfunProfileLimit === 0;
         feedJobs.push(
           this.fetchFeedCapped(
-            () =>
-              this.pumpfun!.fetchNewestCoins(this.config.pumpfunProfileLimit),
+            () => this.pumpfun!.fetchNewestCoins(pumpLimit),
             [],
             feedDeadline,
           )

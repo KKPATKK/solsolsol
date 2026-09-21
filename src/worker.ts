@@ -3506,6 +3506,96 @@ export default {
       return Response.json({ target, userAgent: GECKO_USER_AGENT, ua, noUa, uaCached });
     }
 
+    // Discovery-source probe: every candidate "new pools / new coins" feed is
+    // reachable from a normal host, but the WORKER'S OWN EGRESS is the only
+    // placement that counts — gecko's alternate host looked fine from a clean
+    // host and answered 403/429 from here (see docs/gecko-429.md). Each
+    // candidate is reported with its status, size, item count and, when the
+    // payload carries one, the age of its newest coin, so a source is picked on
+    // measurement instead of reputation.
+    //
+    // Raydium and Orca are included to show WHY they cannot serve this: neither
+    // exposes a creation-time order (their own specs list only liquidity /
+    // volume / fee / apr / tvl — Raydium's `/pools/info/list-v2?sortField=` and
+    // Orca's `?sortBy=` reject anything else), so there is no way to ask either
+    // one for "the newest pools". Meteora's public DLMM/DAMM hosts answer 404
+    // from a clean host, which is why it is only probed, never wired.
+    if (url.pathname === "/debug/pool-source") {
+      type ProbeReport = Record<string, unknown>;
+      const probe = async (
+        label: string,
+        target: string,
+        pick: (json: unknown) => ProbeReport,
+      ): Promise<ProbeReport> => {
+        try {
+          const res = await fetch(target, {
+            headers: { Accept: "application/json", "User-Agent": GECKO_USER_AGENT },
+            signal: AbortSignal.timeout(10_000),
+          });
+          const text = await res.text();
+          if (!res.ok) {
+            return { label, status: res.status, bytes: text.length, body: text.slice(0, 120) };
+          }
+          let parsed: unknown = null;
+          try {
+            parsed = JSON.parse(text);
+          } catch {
+            // non-JSON body (challenge page / HTML)
+            return { label, status: res.status, bytes: text.length, body: text.slice(0, 120) };
+          }
+          return { label, status: res.status, bytes: text.length, ...pick(parsed) };
+        } catch (err) {
+          return { label, error: err instanceof Error ? err.message : String(err) };
+        }
+      };
+      // pump.fun rows carry `created_timestamp` in ms → the age of the newest
+      // coin is the freshness proof for a launch feed.
+      const coins = (json: unknown): ProbeReport => {
+        const rows = Array.isArray(json) ? json : [];
+        const times = rows
+          .map((r) => Number((r as { created_timestamp?: number } | null)?.created_timestamp))
+          .filter((n) => Number.isFinite(n) && n > 0);
+        const newest = times.length > 0 ? Math.max(...times) : 0;
+        return {
+          count: rows.length,
+          newestAgeS: newest > 0 ? Math.round((Date.now() - newest) / 1000) : null,
+        };
+      };
+      // GeckoTerminal-shaped envelopes (`data: []`) and DexScreener arrays.
+      const envelope = (json: unknown): ProbeReport => {
+        const data = (json as { data?: unknown } | null)?.data;
+        return { count: Array.isArray(data) ? data.length : 0 };
+      };
+      const solanaBoosts = (json: unknown): ProbeReport => {
+        const rows = Array.isArray(json) ? json : [];
+        return {
+          count: rows.filter((r) => (r as { chainId?: string } | null)?.chainId === "solana")
+            .length,
+        };
+      };
+      const results = await Promise.all([
+        probe(
+          "pumpfun-v3",
+          "https://frontend-api-v3.pump.fun/coins?limit=20&offset=0&sort=created_timestamp&order=DESC",
+          coins,
+        ),
+        probe("pumpfun-legacy", "https://frontend-api.pump.fun/coins?limit=20&offset=0", coins),
+        probe(
+          "dexscreener-boosts",
+          "https://api.dexscreener.com/token-boosts/latest/v1",
+          solanaBoosts,
+        ),
+        probe(
+          "raydium-list-v2",
+          "https://api-v3.raydium.io/pools/info/list-v2?poolType=Standard&size=5&sortField=liquidity&sortType=desc",
+          envelope,
+        ),
+        probe("orca-pools", "https://api.orca.so/v2/solana/pools?limit=3", envelope),
+        probe("meteora-dlmm", "https://dlmm-api.meteora.ag/pair/all_by_groups?page=0&limit=5", envelope),
+      ]);
+      return Response.json({ ok: true, results });
+    }
+
     // Jupiter Token v2 feed probe — verifies the discovery client's two
     // endpoints from the worker's own egress (recent launchpad launches +
     // 24h trending). Pass ?raw=1 to include the first parsed profiles.

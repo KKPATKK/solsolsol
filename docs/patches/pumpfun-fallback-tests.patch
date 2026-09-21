@@ -1,0 +1,64 @@
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -17,3 +17,3 @@
+-const { parsePumpCoins } = require("../dist/pumpfun.js");
++const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
+ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
+ const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
+@@ -4386,6 +4386,66 @@
+     assert.deepEqual(parsePumpCoins({ not: "array" }), []);
+     assert.deepEqual(parsePumpCoins(null), []);
+   });
+ 
++  await test("pumpfunDiscoveryLimit: the launch feed only fills gecko's slot when gecko is paused", () => {
++    // Neither knob set → the feed never runs.
++    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 0 }, true), 0);
++    // A fallback size with gecko healthy → still nothing (steady state is
++    // unchanged; this is what makes it a fallback and not a second feed).
++    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 40 }, false), 0);
++    // Gecko paused (429/refusal) → the launch feed takes the slot.
++    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 40 }, true), 40);
++    // The always-on feed wins when it is configured.
++    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 100, pumpfunFallbackLimit: 40 }, false), 100);
++    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 100, pumpfunFallbackLimit: 40 }, true), 100);
++  });
++
++  await test("PumpFunClient asks the v3 host with created_timestamp and identifies itself", async () => {
++    const calls = [];
++    const origFetch = global.fetch;
++    global.fetch = async (url, init) => {
++      calls.push({ url: String(url), headers: (init && init.headers) || {} });
++      return new Response(
++        JSON.stringify([
++          { mint: "5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump", created_timestamp: Date.now() - 30_000 },
++        ]),
++        { status: 200, headers: { "Content-Type": "application/json" } },
++      );
++    };
++    try {
++      const client = new PumpFunClient({ pumpfunRequestIntervalMs: 0 });
++      const out = await client.fetchNewestCoins(5);
++      assert.equal(out.length, 1);
++      assert.equal(out[0].tokenAddress, "5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump");
++      // The legacy host answers 530/CF-1016 (origin DNS gone) — the feed moved.
++      assert.ok(
++        calls[0].url.startsWith("https://frontend-api-v3.pump.fun/coins?"),
++        `must ask the live v3 host (got ${calls[0].url})`,
++      );
++      // v3's own 400 lists the accepted sort values; `sort=created` (the legacy
++      // name) is rejected, `created_timestamp` is the newest-first one.
++      assert.ok(
++        calls[0].url.includes("sort=created_timestamp"),
++        "v3 sorts by created_timestamp, not the legacy `created`",
++      );
++      assert.ok(
++        String(calls[0].headers["User-Agent"] || "").startsWith("solana-meme-bot/"),
++        "an anonymous shared-egress request is the shape that gets blocked",
++      );
++    } finally {
++      global.fetch = origFetch;
++    }
++  });
++
+   await test("parseJupTokens maps mints + ISO createdAt, drops non-base58 and dupes", () => {
+     const good = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";

@@ -313,6 +313,15 @@ export interface AppConfig {
   /** Minimum spacing between pump.fun HTTP requests (rate limiting). */
   pumpfunRequestIntervalMs: number;
   /**
+   * pump.fun newest-coins count while GECKO DISCOVERY IS PAUSED
+   * (PUMPFUN_FALLBACK_LIMIT, default 0 = off, capped at 300). GeckoTerminal and
+   * pump.fun are the two keyless "brand-new coin" feeds; when gecko's new_pools
+   * is paused (429 / refusal — the state since 2026-09-21, where `geo 0` leaves
+   * the launch slot empty) this feed fills it. Zero while gecko is healthy, so
+   * the steady state and its cost do not change. See pumpfunDiscoveryLimit.
+   */
+  pumpfunFallbackLimit: number;
+  /**
    * How many newest GeckoTerminal Solana pools to register per scan
    * (GECKOTERMINAL_POOL_PAGES, default 1, max 5 — each page ~20 pools). Free
    * discovery feed (no key) covering every Solana DEX incl. pump.fun
@@ -601,6 +610,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     )
       ? Math.max(0, Number(env.PUMPFUN_REQUEST_INTERVAL_MS ?? 350))
       : 350,
+    pumpfunFallbackLimit: Number.isFinite(Number(env.PUMPFUN_FALLBACK_LIMIT ?? 0))
+      ? Math.max(0, Math.min(Math.floor(Number(env.PUMPFUN_FALLBACK_LIMIT ?? 0)), 300))
+      : 0,
     geckoterminalPoolPages:
       Number.isFinite(rawGeoPages) && rawGeoPages > 0
         ? Math.min(Math.floor(rawGeoPages), 2)
