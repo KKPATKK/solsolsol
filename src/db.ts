@@ -355,6 +355,33 @@ export function wrapClientWithHardWall<T extends object>(
  * pushed at most once per chat, while the same coin may still qualify for
  * different chats with different filters.
  */
+/**
+ * The columns a tracker check writes (see updatePushWatchCheck and
+ * claimPushWatchCheck below). ONE shape for both writers: a silent row and an
+ * alerting row must persist exactly the same fields, or a row's recorded state
+ * would depend on whether it happened to fire a card.
+ */
+interface PushWatchCheckValues {
+  peakMcap: number;
+  lastLiquidity: number | null;
+  lastVol5m?: number | null;
+  /** Dead-state low (lower low while silent-watching; null = keep). */
+  deadTroughMcap?: number | null;
+  followupsSent?: number;
+  lastState?: string | null;
+  lastAlertAt?: number;
+  /** Resurrection: reset the push-time mcap baseline to this value. */
+  mcapAtPush?: number;
+  /** 📈 alert fired: roll the holders baseline forward to this value. */
+  holdersAtPush?: number;
+  /** CSV of 🚀 stages already announced (undefined = keep; '' = clear). */
+  upStages?: string | null;
+  /** New 🧨 sell-pressure streak count (persisted as-is). */
+  sellDomStreak?: number;
+  /** Latest observed mcap (🏁 recap final value). */
+  lastMcap?: number;
+}
+
 export class Db {
   private client: Client | null = null;
   private readonly url: string;
@@ -2703,32 +2730,18 @@ export class Db {
   }
 
   /** Persist one tracker check (mcap/liquidity refresh + alert bookkeeping). */
-  async updatePushWatchCheck(
-    token: string,
-    v: {
-      peakMcap: number;
-      lastLiquidity: number | null;
-      lastVol5m?: number | null;
-      /** Dead-state low (lower low while silent-watching; null = keep). */
-      deadTroughMcap?: number | null;
-      followupsSent?: number;
-      lastState?: string | null;
-      lastAlertAt?: number;
-      /** Resurrection: reset the push-time mcap baseline to this value. */
-      mcapAtPush?: number;
-      /** 📈 alert fired: roll the holders baseline forward to this value. */
-      holdersAtPush?: number;
-      /** CSV of 🚀 stages already announced (undefined = keep; '' = clear). */
-      upStages?: string | null;
-      /** New 🧨 sell-pressure streak count (persisted as-is). */
-      sellDomStreak?: number;
-      /** Latest observed mcap (🏁 recap final value). */
-      lastMcap?: number;
-    },
-  ): Promise<void> {
-    await this.get().execute({
-      sql: `UPDATE push_watch SET
-              peak_mcap = ?, last_liquidity = ?, last_checked = ?,
+  /**
+   * The SET clause + bound values of a check write. ONE definition, shared by
+   * both writers below — one keyed by token, one keyed by token + the
+   * checked-at stamp the caller claimed — so their column lists cannot drift
+   * apart.
+   */
+  private pushWatchCheckSet(
+    v: PushWatchCheckValues,
+    checkedAt: number,
+  ): { sql: string; args: (string | number | null)[] } {
+    return {
+      sql: `peak_mcap = ?, last_liquidity = ?, last_checked = ?,
               followups_sent = ?, last_state = ?, last_alert_at = ?,
               last_vol_5m = COALESCE(?, last_vol_5m),
               dead_trough_mcap = COALESCE(?, dead_trough_mcap),
@@ -2736,12 +2749,11 @@ export class Db {
               holders_at_push = COALESCE(?, holders_at_push),
               sell_dom_streak = ?,
               up_stages = COALESCE(?, up_stages),
-              last_mcap = ?
-            WHERE token = ?`,
+              last_mcap = ?`,
       args: [
         v.peakMcap,
         v.lastLiquidity,
-        Date.now(),
+        checkedAt,
         v.followupsSent ?? 0,
         v.lastState ?? null,
         v.lastAlertAt ?? 0,
@@ -2752,9 +2764,51 @@ export class Db {
         v.sellDomStreak ?? 0,
         v.upStages ?? null,
         v.lastMcap ?? null,
-        token,
       ],
+    };
+  }
+
+  async updatePushWatchCheck(
+    token: string,
+    v: PushWatchCheckValues,
+  ): Promise<void> {
+    const set = this.pushWatchCheckSet(v, Date.now());
+    await this.get().execute({
+      sql: `UPDATE push_watch SET ${set.sql} WHERE token = ?`,
+      args: [...set.args, token],
     });
+  }
+
+  /**
+   * Claim AND record a row's check in ONE round trip — the SILENT half of the
+   * tracker's row loop (see PushWatcher.runTick).
+   *
+   * The loop spent two round trips on every row it merely observed: a
+   * claimPushWatch compare-and-swap on last_checked, then this check write.
+   * Only the ALERTING path needs them separated (the claim must land before a
+   * card is reserved and sent, and a lost race must skip the row entirely); a
+   * row with nothing to announce needs one writer, and carrying the same CAS
+   * in the WHERE clause gives exactly the same cross-isolate exclusion.
+   * Measured 2026-09-21: a Turso round trip costs ~110-200ms here and the
+   * pass's allowance is 1.2-1.6s, so halving the trips per observed row is
+   * what turns a 29-row rotation from tens of minutes into single digits.
+   *
+   * Returns false when another isolate claimed the row (or it vanished) —
+   * precisely when the two-step claim + write would have skipped it.
+   */
+  async claimPushWatchCheck(
+    token: string,
+    expectedLastChecked: number,
+    now: number,
+    v: PushWatchCheckValues,
+  ): Promise<boolean> {
+    const set = this.pushWatchCheckSet(v, now);
+    const res = await this.get().execute({
+      sql: `UPDATE push_watch SET ${set.sql}
+            WHERE token = ? AND last_checked = ?`,
+      args: [...set.args, token, expectedLastChecked],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
   }
 
   async setPushWatchHolders(token: string, holders: number, at: number): Promise<void> {

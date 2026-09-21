@@ -626,6 +626,7 @@ async function main() {
       getPushAudit: async () => opts.audit ?? [],
       upsertPushWatchMany: async () => {},
       claimPushWatch: async () => true,
+      claimPushWatchCheck: async (token, _expected, _now, v) => { updated.push([token, v]); return true; },
       reservePushWatchAlert: async () => true,
       updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
       deletePushWatch: async () => {},
@@ -2370,6 +2371,7 @@ async function main() {
         upsertPushWatchMany: async (rows) => { enrolled.push(...rows); },
         recordPushDelivery: async (entry) => { audits.push(entry); },
         claimPushWatch: async () => true,
+        claimPushWatchCheck: async () => true,
         reservePushWatchAlert: async () => true,
         updatePushWatchCheck: async () => {},
         deletePushWatch: async () => {},
@@ -2688,6 +2690,7 @@ async function main() {
       getWorkerState: async () => ledgerValue,
       upsertPushWatchMany: async (rows) => { enrolled.push(...rows); },
       claimPushWatch: async () => true,
+      claimPushWatchCheck: async () => true,
       reservePushWatchAlert: async () => true,
       updatePushWatchCheck: async () => {},
       deletePushWatch: async () => {},
@@ -4436,6 +4439,10 @@ async function main() {
     getInitialPushAuditTokens: async () => new Set(),
     upsertPushWatchMany: async () => {},
     claimPushWatch: async () => true,
+    // The silent row path claims AND writes in one round trip (see
+    // Db.claimPushWatchCheck); the fake records it exactly like the two-step
+    // write, so `updated` still names every row the pass observed.
+    claimPushWatchCheck: async (token, _expected, _now, v) => { updated.push([token, v]); return true; },
     reservePushWatchAlert: async () => true,
     updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
     deletePushWatch: async () => {},
@@ -4468,19 +4475,63 @@ async function main() {
     );
   });
 
-  await test("PushWatcher: tokens the pair batch did not return are reported, not silently skipped", async () => {
+  await test("PushWatcher: the pair batch's deadline is measured from the CALL, not the pass start", async () => {
+    // The setup stages (listing, recap/prune, terminal settle, self-heal) run
+    // BEFORE the batch and routinely cost 400-700ms. A deadline derived from
+    // the pass start was therefore already spent when the request was issued,
+    // and the DexScreener client's dispatch guard refuses to send it at all —
+    // answering an empty map. Live shape: `allow 1220 spend[setup 484 heal 171
+    // pairs 168] / pairs 0/6`, while the same six addresses asked directly came
+    // back 6/6 with live pools.
+    const rows = [watchRow("AAA")];
+    const updated = [];
+    const headroom = [];
+    const db = watchDb(rows, updated);
+    db.listPushWatch = async () => {
+      // 500ms of setup against the batch's 600ms budget: a deadline derived
+      // from the pass start leaves ~100ms here (and the real client refuses to
+      // dispatch at all), while a call-time one leaves the full 600ms.
+      await new Promise((r) => setTimeout(r, 500));
+      return rows;
+    };
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}),
+      async (addrs, deadlineMs) => {
+        headroom.push(deadlineMs - Date.now());
+        return new Map(addrs.map((a) => [a, watchPair(a)]));
+      },
+      null,
+    );
+    await pw.runTick();
+    assert.equal(headroom.length, 1);
+    assert.ok(
+      headroom[0] > 450,
+      `the batch needs its own budget after 500ms of setup, got ${headroom[0]}ms`,
+    );
+  });
+
+  await test("PushWatcher: a pair batch that resolved NOTHING is a failed fetch, not a screen of dead coins", async () => {
+    // Live 2026-09-21 02:18-02:23Z, with the pass's stage clock on:
+    // `pairs 0/6 miss 6` pass after pass while all six head tokens still had
+    // live pools. The batch's deadline had been spent by the pass's own setup
+    // (see the call-time test below), so the request never went out — and the
+    // loop then blamed every row nobody had asked about, arming the delete
+    // path's "unfindable for 2h" evidence against six live coins.
     const rows = [watchRow("AAA"), watchRow("BBB")];
     const updated = [];
+    const deleted = [];
+    const db = watchDb(rows, updated);
+    db.deletePushWatch = async (token) => { deleted.push(token); };
     const pw = new PushWatcher(
-      watchDb(rows, updated), watchBot, null, loadConfig({}),
+      db, watchBot, null, loadConfig({}),
       async () => new Map(), null,
     );
     const out = await pw.runTick();
     assert.equal(out.checked, 0);
-    assert.equal(updated.length, 0);
-    // The old code returned no note at all here — the silent-starve shape.
-    assert.match(String(out.note), /rows 0\/2/);
-    assert.match(String(out.note), /miss 2/);
+    assert.equal(updated.length, 0, "nothing is written off a request that never answered");
+    assert.match(String(out.note), /pairs-empty/);
+    assert.ok(!/miss [1-9]/.test(String(out.note)), `no row may be blamed: ${out.note}`);
+    assert.deepEqual(deleted, [], "a failed fetch may never arm a deletion");
   });
 
   await test("PushWatcher: a re-armed row is not deleted on its first pair miss", async () => {
@@ -4498,9 +4549,14 @@ async function main() {
     db.listPushWatch = async () => [
       watchRow("REARMED", { pushedAt: stalePush, lastChecked: 0, lastLiquidity: 9_000 }),
       watchRow("STALE", { pushedAt: stalePush, lastChecked: stalePush, lastLiquidity: 9_000 }),
+      // The batch must answer for SOMETHING: an empty one is now reported as
+      // `pairs-empty` and nothing at all is judged (see the test above).
+      watchRow("LIVE", { pushedAt: Date.now() - 40 * 60_000 }),
     ];
     const pw = new PushWatcher(
-      db, watchBot, null, loadConfig({}), async () => new Map(), null,
+      db, watchBot, null, loadConfig({}),
+      async () => new Map([["LIVE", watchPair("LIVE")]]),
+      null,
     );
     const out = await pw.runTick();
     assert.deepEqual(deleted, ["STALE"], "only a row with a check clock may be dropped");
@@ -4802,6 +4858,11 @@ async function main() {
       },
       findUntrackedPushes: async () => { calls.total += 1; return []; },
       claimPushWatch: async () => { calls.total += 1; return true; },
+      claimPushWatchCheck: async (token, _expected, _now, v) => {
+        calls.total += 1;
+        calls.updated.push([token, v]);
+        return true;
+      },
       reservePushWatchAlert: async () => { calls.total += 1; return true; },
       updatePushWatchCheck: async (token, v) => {
         calls.total += 1;
@@ -4846,6 +4907,7 @@ async function main() {
       markRecapClaimedMany: async (tokens) => { calls.total += 1; return tokens.map(() => true); },
       findUntrackedPushes: async () => { calls.total += 1; return []; },
       claimPushWatch: async () => { calls.total += 1; return true; },
+      claimPushWatchCheck: async () => { calls.total += 1; return true; },
       reservePushWatchAlert: async () => { calls.total += 1; return true; },
       updatePushWatchCheck: async () => { calls.total += 1; },
       deletePushWatch: async () => { calls.total += 1; },
@@ -4917,19 +4979,23 @@ async function main() {
     assert.ok(elapsed < 2_000, `the pass must return near the holder cap, took ${elapsed}ms`);
   });
 
-  await test("PushWatcher: a row is only started when its own cost still fits the pass", async () => {
-    // The loop used to ask only "am I past the deadline?", so it started a row
-    // it could not finish and the pass overran by a whole row.
-    // TRACKER_ROW_RESERVE_MS is checked before the claim: a row that cannot
-    // finish is left to the next tick, where it is re-claimed (nothing lost).
+  await test("PushWatcher: a silent row claims and writes in ONE round trip, and only when it fits", async () => {
+    // The loop spent TWO store round trips on every row it merely observed — a
+    // separate claim, then the check write — and reserved a flat 900ms before
+    // starting one, five times a silent row's true cost. Both are what capped
+    // the pass at a single row per tick (live `rows 1/29 ... budget-cut` on
+    // tick after tick) while ~90% of the rows a pass touches have nothing to
+    // announce.
     const rows = [watchRow("AAA"), watchRow("BBB")];
     const claims = [];
+    const writes = [];
     const updated = [];
     const db = {
       ...watchDb(rows, updated),
-      claimPushWatch: async (token) => {
-        claims.push(token);
-        await new Promise((r) => setTimeout(r, 700));
+      claimPushWatch: async (token) => { claims.push(token); return true; },
+      claimPushWatchCheck: async (token) => {
+        writes.push(token);
+        await new Promise((r) => setTimeout(r, 500));
         return true;
       },
     };
@@ -4938,12 +5004,16 @@ async function main() {
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
-    // 1500ms budget: row 1 burns ~700ms, leaving 800ms — under the 900ms row
-    // reserve, so row 2 must not start.
-    const out = await pw.runTick(Date.now() + 1_500);
-    assert.equal(out.checked, 1, "only the row whose cost fits is started");
-    assert.deepEqual(claims, ["AAA"], "the second row waits for the next tick");
-    assert.match(String(out.note), /budget-cut/);
+    // 1200ms budget, ~500ms per write: BOTH silent rows fit. The old shape
+    // reserved a flat 900ms per row and stopped after the first (700ms left <
+    // 900ms) — that cap, on ~90% silent rows, is what held the pass to one row
+    // per tick and the 29-row rotation to tens of minutes.
+    const out = await pw.runTick(Date.now() + 1_200);
+    assert.equal(out.checked, 2, "both silent rows fit: one write each");
+    assert.deepEqual(claims, [], "a silent row does not spend a separate claim");
+    assert.deepEqual(writes, ["AAA", "BBB"], "one write per row");
+    assert.equal(updated.length, 0, "the two-step writer is not used for a silent row");
+    assert.ok(!/budget-cut/.test(String(out.note)), `nothing may be cut: ${out.note}`);
   });
 
   await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {

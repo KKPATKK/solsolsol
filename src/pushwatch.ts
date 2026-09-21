@@ -96,16 +96,22 @@ import {
  */
 const TRACKER_TICK_BUDGET_MS = 1_600;
 /**
- * Budget reserved BEFORE a row is claimed (see the row loop). A row's work —
- * claim, card sends, delivery audit, final bookkeeping write — costs ~600-
- * 1000ms at healthy latencies, so a loop that only asks "am I past the
- * deadline?" happily starts a row it cannot finish and overruns the pass by a
- * whole row. The FIRST row of a pass is exempt (the progress floor that keeps
- * post-push monitoring alive — see the 2026-09-17 zero-row fix); its send
- * slice is clamped instead (TRACKER_SEND_FLOOR_MS), and the caps below are the
- * hard ceiling for every row after it.
+/**
+ * Budget reserved BEFORE a row is claimed (see the row loop). A SILENT row —
+ * nothing to announce, which is nearly every row on nearly every pass — costs
+ * ONE round trip now (the claim and the check write are the same UPDATE, see
+ * Db.claimPushWatchCheck), so ~300ms is the whole of what it needs to start
+ * and land. A row that WILL alert is not gated by this number: the send-slice
+ * check further down refuses it unless TRACKER_SEND_MIN_MS per card still
+ * fits, and that reservation is the one that actually has to be honoured.
+ *
+ * It used to be a flat 900ms for every row, because every row's work was
+ * claim + send + audit + write with nothing distinguishing the shapes. Applied
+ * to silent rows that was five times their true cost and it capped the pass at
+ * ONE row per tick: `rows 1/29 ... budget-cut` on every healthy tick, a 29-row
+ * rotation measured in tens of minutes (live 2026-09-21).
  */
-const TRACKER_ROW_RESERVE_MS = 900;
+const TRACKER_ROW_MIN_MS = 300;
 /**
  * Hard ceiling on the time ONE ROW may spend sending its cards. A row can
  * carry up to four 🚀 stage cards and the sends were awaited with NOTHING
@@ -1308,9 +1314,12 @@ export class PushWatcher {
           mcapAtPush: number;
           fromLedger: boolean;
         } | null = null;
+        // Call-time deadline, like the head batch above: this stage runs even
+        // LATER in the pass than that batch does, so a `now`-based cap here is
+        // always already spent.
         const missPairs = await this.pairsFor(
           missing.map((m) => m.token),
-          now + TRACKER_PAIRS_BUDGET_MS,
+          Date.now() + TRACKER_PAIRS_BUDGET_MS,
         );
         for (const m of missing) {
           const pair = missPairs.get(m.token);
@@ -1520,11 +1529,24 @@ export class PushWatcher {
     const tokens = head.map((r) => r.token);
     // Published for the scanner's next pair phase (see lastHeadTokens).
     this.lastHeadTokens = tokens;
+    // The batch's deadline is measured from the CALL, not from the pass start
+    // (`now`): the setup stages above (listing, recap/prune, terminal settle,
+    // self-heal) routinely cost 400-700ms, so a deadline derived from the pass
+    // start was already spent by the time this line ran — and the client's
+    // dispatch guard then refuses to issue the request at all, answering an
+    // EMPTY map. Live 2026-09-21 02:18-02:23Z, with the stage clock on:
+    // `allow 1220 spend[setup 484 heal 171 pairs 168] pairs 0/6`, while the
+    // same six addresses asked directly came back 6/6 with live pools. That is
+    // the rotation stall in one line: no pairs → every head row is blamed as a
+    // miss → zero rows evaluated, pass after pass, and the same head forever.
     const pairsStart = Date.now();
     const pairsTrips = trips;
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
     try {
-      pairs = await this.pairsFor(tokens, now + TRACKER_PAIRS_BUDGET_MS);
+      pairs = await this.pairsFor(
+        tokens,
+        Date.now() + TRACKER_PAIRS_BUDGET_MS,
+      );
     } catch (err) {
       // feed down — retry next tick; surface the reason via the heartbeat.
       spent.pairs.ms = Date.now() - pairsStart;
@@ -1543,6 +1565,29 @@ export class PushWatcher {
 
     spent.pairs.ms = Date.now() - pairsStart;
     spent.pairs.trips = trips - pairsTrips;
+
+    // A batch that resolved NOTHING while the head was non-empty is a FAILED
+    // FETCH — a DexScreener 429 backoff, or a deadline the caller had already
+    // spent (see above) — and NOT a screen of delisted coins. The row loop
+    // cannot tell the difference: every head row becomes a pair miss, and a
+    // miss is also the evidence the delete path uses ("unfindable for 2h"), so
+    // a stuck feed both stopped the rotation AND armed deletions against live
+    // rows (live 2026-09-21: `pairs 0/6 miss 6` on pass after pass while all
+    // six head tokens had live pools). Nothing is judged off a request that
+    // never answered: the empty batch is reported by name so a stuck feed is
+    // visible in /health, and every row is left exactly as it was.
+    if (tokens.length > 0 && pairs.size === 0) {
+      return {
+        checked: 0,
+        alerted: 0,
+        note: `pairs-empty ${stageNote()} trips ${trips}`,
+        trips,
+        undelivered: 0,
+        undeliveredTotal: this.undeliveredTotal,
+        recoveredUndelivered: this.recoveredUndeliveredTotal,
+        pendingUndelivered: this.pendingUndelivered.size,
+      };
+    }
 
     let checked = 0;
     let alerted = 0;
@@ -1583,7 +1628,7 @@ export class PushWatcher {
       // note while 28 active rows went unrefreshed (2026-09-17). One row per
       // tick is the floor that keeps the tracker moving no matter what
       // DexScreener or Turso are doing.
-      if (!firstRow && Date.now() + TRACKER_ROW_RESERVE_MS > deadline) {
+      if (!firstRow && Date.now() + TRACKER_ROW_MIN_MS > deadline) {
         budgetCut = true;
         break;
       }
@@ -1665,16 +1710,74 @@ export class PushWatcher {
           break;
         }
       }
-      // Cross-isolate claim: only one concurrent tick may alert this row.
-      // The loser's snapshot is stale — it would re-fire state-machine
-      // transitions (duplicate ⚠️/🚀 cards). Skip silently on lost race.
+      // The check write's columns, in ONE place: the silent path below binds
+      // them into its claim (one round trip), the alerting path writes them
+      // after its sends — with `hold` rolling the announcement columns back
+      // when a card did not go out (see the final write).
+      const checkFields = (hold: boolean) => ({
+        peakMcap: evalResult.peakMcap,
+        lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
+        lastVol5m: pair.volume.m5,
+        // A backfill pass delivers nothing: the counters and the alert clock
+        // stay where they were, while the PERSISTENT state markers land — that
+        // is what keeps every already-crossed 🚀/w35/dead transition from being
+        // re-announced, and what makes the next check report only genuinely
+        // new information.
+        followupsSent:
+          backfill || hold ? row.followupsSent : evalResult.followupsSent,
+        lastState: hold ? (row.lastState ?? null) : evalResult.lastState,
+        lastAlertAt:
+          backfill || hold ? row.lastAlertAt : evalResult.lastAlertAt,
+        mcapAtPush: hold ? row.mcapAtPush : evalResult.resetBaselineMcap,
+        // Roll the 📈 baseline forward — omitting this made every later holder
+        // check re-fire against the stale push-time baseline (BABYCATE
+        // 1,000 → 2,441 then 1,000 → 2,458).
+        holdersAtPush: hold
+          ? (row.holdersAtPush ?? undefined)
+          : evalResult.resetBaselineHolders,
+        upStages: hold ? row.upStages : evalResult.announcedUpStages,
+        deadTroughMcap: hold
+          ? (row.deadTroughMcap ?? null)
+          : (evalResult.deadTroughMcap ?? null),
+        sellDomStreak: hold ? row.sellDomStreak : evalResult.sellDomStreak,
+        lastMcap: pair.marketCap,
+      });
+
+      // SILENT ROW — nothing to announce (or a backfill, whose cards are
+      // deliberately suppressed): the claim and the check write are ONE round
+      // trip. The claim's compare-and-swap on last_checked is the same
+      // cross-isolate exclusion in one statement, and a lost race still skips
+      // the row entirely. This is the pass's throughput: ~90% of the rows a
+      // pass touches have nothing to say, and they used to cost two store
+      // round trips each out of an allowance that fits only a handful.
+      if (backfill || evalResult.alerts.length === 0) {
+        trips += 1;
+        if (
+          !(await this.db.claimPushWatchCheck(
+            row.token,
+            row.lastChecked,
+            now,
+            checkFields(false),
+          ))
+        ) {
+          claimLost += 1;
+          continue;
+        }
+        checked += 1;
+        if (backfill) backfilled += 1;
+        continue;
+      }
+
+      // ALERTING ROW — the reservation must land BEFORE the send, so the claim
+      // stays a round trip of its own. The loser's snapshot is stale: it would
+      // re-fire state-machine transitions (duplicate ⚠️/🚀 cards). Skip silently
+      // on a lost race.
       trips += 1;
       if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now))) {
         claimLost += 1;
         continue;
       }
       checked += 1;
-      if (backfill) backfilled += 1;
       // Authoritative duplicate guard: reserve the state transition
       // BEFORE delivering. The last_checked claim alone cannot stop an
       // isolate that reads between this isolate's claim and its final
@@ -1852,42 +1955,10 @@ export class PushWatcher {
       // liquidity, volume, last mcap) still advance — they describe the
       // coin, not the announcement.
       const holdAnnouncements = undelivered > undeliveredBefore;
-      await this.db.updatePushWatchCheck(row.token, {
-        peakMcap: evalResult.peakMcap,
-        lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
-        lastVol5m: pair.volume.m5,
-        // A backfill pass delivers nothing: the counters and the alert clock
-        // stay where they were, while the PERSISTENT state markers land —
-        // that is what keeps every already-crossed 🚀/w35/dead transition
-        // from being re-announced, and what makes the next check report only
-        // genuinely new information.
-        followupsSent:
-          backfill || holdAnnouncements
-            ? row.followupsSent
-            : evalResult.followupsSent,
-        lastState: holdAnnouncements
-          ? (row.lastState ?? null)
-          : evalResult.lastState,
-        lastAlertAt:
-          backfill || holdAnnouncements ? row.lastAlertAt : evalResult.lastAlertAt,
-        mcapAtPush: holdAnnouncements
-          ? row.mcapAtPush
-          : evalResult.resetBaselineMcap,
-        // Roll the 📈 baseline forward — omitting this made every later
-        // holder check re-fire against the stale push-time baseline
-        // (BABYCATE 1,000 → 2,441 then 1,000 → 2,458).
-        holdersAtPush: holdAnnouncements
-          ? (row.holdersAtPush ?? undefined)
-          : evalResult.resetBaselineHolders,
-        upStages: holdAnnouncements ? row.upStages : evalResult.announcedUpStages,
-        deadTroughMcap: holdAnnouncements
-          ? (row.deadTroughMcap ?? null)
-          : (evalResult.deadTroughMcap ?? null),
-        sellDomStreak: holdAnnouncements
-          ? row.sellDomStreak
-          : evalResult.sellDomStreak,
-        lastMcap: pair.marketCap,
-      });
+      await this.db.updatePushWatchCheck(
+        row.token,
+        checkFields(holdAnnouncements),
+      );
     }
     spent.rows.ms = Date.now() - rowsStart;
     spent.rows.trips = trips - rowsTrips;
