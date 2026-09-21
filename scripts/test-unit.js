@@ -15,7 +15,7 @@ const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("..
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
-const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
+const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
@@ -1236,6 +1236,19 @@ async function main() {
         0,
         "an error response (a 429!) must never be cached",
       );
+      // A success must cover SEVERAL ticks, not one: while the shared egress IP
+      // is over quota, only a rare 200 ever enters the cache, and a 60s TTL
+      // bought exactly one `geo 20` tick before the next one was 0 again (live
+      // 2026-09-21: `geo 20` → 0 one minute later, `ok 1 429 1 cacheHits 1`).
+      // A snapshot is the opposite case — fresh, money-adjacent data keeps the
+      // upstream's own s-maxage.
+      assert.ok(
+        GECKO_CACHE_TTL_S > GECKO_SNAPSHOT_CACHE_TTL_S,
+        "discovery pages are cached longer than snapshots",
+      );
+      assert.equal(geckoCacheTtlS("/networks/solana/new_pools?page=1"), GECKO_CACHE_TTL_S);
+      assert.equal(geckoCacheTtlS("/networks/solana/trending_pools?limit=20"), GECKO_CACHE_TTL_S);
+      assert.equal(geckoCacheTtlS("/networks/solana/tokens/abc"), GECKO_SNAPSHOT_CACHE_TTL_S);
       assert.ok(
         GECKO_CACHE_TTL_S >= 30 && GECKO_CACHE_TTL_S <= 300,
         "the TTL stays in the upstream's freshness band",

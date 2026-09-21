@@ -37,20 +37,28 @@ quota 早就畀其他 Worker 用光，同我們自己嘅頻率無關（我們只
 
 ```ts
 fetch(url, {
-  headers: { Accept: "application/json" },
+  headers: {
+    Accept: "application/json",
+    "User-Agent": GECKO_USER_AGENT,   // 冇佢 → 403（2026-09-21 實測）
+  },
   signal: AbortSignal.timeout(10_000),
   cf: {
     cacheEverything: true,          // Worker subrequest 默認唔用 cache
-    cacheTtl: GECKO_CACHE_TTL_S,    // 60s ＝ 上游自己嘅 s-maxage
-    cacheTtlByStatus: { "200-299": 60, "300-399": 0, "400-599": 0 },
+    cacheTtl: ttlS,                 // 分層：discovery 300s、snapshot 60s
+    cacheTtlByStatus: { "200-299": ttlS, "300-399": 0, "400-599": 0 },
   },
 });
 ```
 
 - Worker 嘅 subrequest **默認唔會**用 Cloudflare cache，所以過去每一次都係打去 origin
   （被共用 IP quota 擋）；`cacheEverything` 令佢加入邊緣快取 —— 命中就唔會再撞 rate limiter。
-- TTL 60s ＝ 上游自己嘅 `s-maxage`；discovery 只用 `pool_created_at`，而幣要 **80 分鐘之後**
-  才入合格窗口，所以遲一分鐘完全冇影響（tracker 嘅 snapshot 亦然）。
+- **TTL 分層**（`geckoCacheTtlS()`，2026-09-21 再改）：在同一個 egress IP 被 quota 封住嘅情況下，
+  快取裏面只會有「難得一次 200」放進去嘅 object —— 而 **429 一定唔入快取**，
+  所以 60s TTL 等於一次成功祇買到**一個 tick** 嘅 `geo 20`（實測：`geo 20` → 一分鐘後 0，
+  `ok 1 429 1 cacheHits 1`）。discovery 改 **300s**：一次成功覆蓋五個 tick，
+  而 discovery 本身冇損失（幣要 **80 分鐘之後** 才入合格窗口，註冊係 idempotent）。
+  **tracker 嘅 token snapshot 保持 60s**（上游自己嘅 `s-maxage`）—— 陳舊嘅流動性讀數係
+tracker 唯一唔應該照消化嘅東西，而嗰啲 call 係 per-coin，量少。
 - **429 明確唔准入 cache**（`400-599: 0`），唔會將一個壞分鐘當新 feed 派畀下一個 tick。
 
 ### 2. 升級式 backoff（安全網）
@@ -161,8 +169,9 @@ curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko}'
 - **反面驗收**：`geo 0` 期間 `profiles`／`jup` 照樣有數（實測 28／20），卡片推送不受影響。
 - **fallback**：`gecko.lastHost`／`altOk`／`altAttempts`／`altFailures`／`altLastStatus`。
   `altAttempts` 上升但 `altOk 0` ⇒ 睇 `altLastStatus` 分辨（**實測係 403，見下節**）。
-- **探針**：`/debug/gecko-alt` —— 同一個 URL 兩種打法（有／冇 `cf` 快取選項），
-  回 status、`cf-cache-status`、body 頭 200 字，用嚟分辨 WAF 擋、要 key、同快取選項本身。
+- **探針**：`/debug/gecko-alt` —— 同一個 URL 三種打法（有 UA／冇 UA／有 UA＋cf 快取選項），
+  回 status、`cf-cache-status`、body 頭 200 字，用嚟一次過分辨「WAF 擋」、「要 key」、
+  「UA」同「快取選項」四個可能。
 
 ## 部署後實測：alt host 由 Worker egress 係 **403**（`15982ea`，2026-09-21 08:08–08:15Z）
 
@@ -181,12 +190,41 @@ geo 0  prof 28 | req 7  ok 0  429 2  cacheHits 0  lastStatus 429  backoffS 648
    成功即清零），成本由「每 tick 1 次」降到「每個窗口 1 次」，而萬一將來解封或加了 key 會自動回復。
    遙測加 `altFailures` / `altLastStatus`，所以「係唔係真係 403」一眼睇得到。
 
-**截至此刻嘅結論**：免費 alt host 唔服務（Worker egress **403**；沙盒係 **401**，即係要 key）。
-免費路徑就係原本嘅 keyless 主 host ＋ 快取，而主 host 同一批讀數係 `ok 0 429 2`（仍然被 egress IP quota 封），
-所以 `geo` **仍然係 0**，唔會回復 20。gecko 貢獻 0 **唔影響其他 feed**：同一時間
-`profiles 27–28`、`jup 20`、`jupTrend 15`，而且 `geo 0` 可由 re-eval pool ＋ Birdeye backfill 兜住。
-下一步只有三種：**帶 key**（`COINGECKO_API_KEY`）、**另一個 keyless 源**、
-或者**接受 gecko 降級**（rotation 與推送都唔受影响）。
+## 部署後實測（`b52d4ce`，2026-09-21 08:23–08:29Z）
+
+### 1. 403 嘅真因：冇描述性 `User-Agent`（唔係 WAF、唔係快取選項）
+
+`/debug/gecko-alt` 喺 **Worker 自己嘅 egress** 打同一個 URL 三次：
+
+```
+userAgent: solana-meme-bot/1.0 (+https://github.com/KKPATKK/solsolsol)
+ua        → 429  You've exceeded the Rate Limit
+noUa      → 403  Please add a descriptive User-Agent to your request
+uaCached  → 429  （加 cf 快取選項結果一樣 ⇒ 快取選項無關）
+```
+
+⇒ **UA 真係必要**（沙盒冇 UA 都係一樣 403），而且 `cf` 選項被排除；
+Worker 可以正常自行設 `User-Agent`。剩下嘅牆就係**keyless 額度**（同主 host 一樣是 IP 層面）。
+
+### 2. `geo` 有回復，但會閃（5 分鐘 TTL 就係為此）
+
+```
+08:27:27 geo 20  jup 20 prof 23 | req 2 ok 1 429 1 cacheHits 1 host primary
+08:27:52 geo  0  jup 20 prof 23 | req 3 ok 1 429 1 cacheHits 1 host primary altAtt 1 altFail 1 altStatus 429
+08:28:18 geo  0  ...             | altAtt 1（**冇再升**）
+```
+
+- `geo 20` 係快取 HIT（`cacheHits 1`）——主 host 嘅 keyless 額度偶爾通到；
+- 下一個 tick 主 host 429 ⇒ 轉去 alt ⇒ alt 亦 429 ⇒ `armAltPause` 煞停（`altFailures 1`、
+  `altLastStatus 429`，之後 `altAtt` 唔再升）——**成本由舊寫法嘅每 tick 1 次降到每窗口 1 次**；
+- 「一個 tick 20、下一個 0」正是 60s TTL 嘅問題，所以 discovery 已改 **300s**（見上）。
+
+**結論**：免費路徑**仍然係降級狀態**（主 host 跟 alt 都被 keyless IP quota 封），
+但（a）403 呢個真 bug 修好了，（b）失敗成本有界，（c）一次成功而家覆蓋五個 tick。
+其他 feed 完全冇受影響：`profiles 23–24`、`jup 20`、`jupTrend 15`、tick 全 ok。
+要 gecko 完全穩定，只剩三條路：**帶 key**（`COINGECKO_API_KEY`，Demo 10K/月 ≈ 只夠 fallback 用）、
+**另一個 keyless 源**（Raydium／Orca／Meteora 嘅公開 pool API）、或者**接受降級**
+（re-eval pool ＋ Birdeye backfill 兜住，輪換與推送都唔受影响）。
 
 ## 部署後實測（`92cb2ea`，2026-09-20 10:08–10:15Z）
 

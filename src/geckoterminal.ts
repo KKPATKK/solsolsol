@@ -37,11 +37,27 @@ export const GECKO_BACKOFF_JITTER = 0.1;
  * max-age=30, s-maxage=60` and Cloudflare caches it). A Worker subrequest does
  * NOT use that cache unless asked to, which is why every gecko call here was
  * billed to the shared IP; with cacheEverything the colo cache answers instead
- * and the origin limiter is never reached. 60s is the upstream's own s-maxage:
- * discovery only needs a coin's pool_created_at (it is evaluated when it ages
- * into the 80m–26h window), so a minute of staleness costs nothing.
+ * and the origin limiter is never reached.
+ *
+ * WHY 300s AND NOT THE UPSTREAM'S s-maxage (re-measured 2026-09-21): while the
+ * shared egress IP is over quota, the cache only ever holds what a rare 200 put
+ * there — a MISS reaches the origin, the origin 429s, and a 429 is deliberately
+ * NOT cached (see requestInit), so with a 60s TTL a single success bought ONE
+ * tick of `geo 20` and the next tick was 0 again (live: `geo 20` → `geo 0` one
+ * minute later, `ok 1 429 1 cacheHits 1`). Five minutes of the same page covers
+ * five ticks per success, and discovery loses nothing by it: a coin is only
+ * judged when it ages into the 80m–26h window, and registration into the re-eval
+ * pool is idempotent. Snapshots keep the upstream's freshness instead — see
+ * geckoCacheTtlS.
  */
-export const GECKO_CACHE_TTL_S = 60;
+export const GECKO_CACHE_TTL_S = 300;
+/**
+ * Cache TTL for a token snapshot (see geckoCacheTtlS) — kept at the upstream's
+ * own s-maxage. A stale liquidity reading is the one thing the tracker must not
+ * act on, and those calls are per-coin (a handful a tick), so there is nothing
+ * to win by ageing them.
+ */
+export const GECKO_SNAPSHOT_CACHE_TTL_S = 60;
 /**
  * SECOND host for the one path both serve keyless (see get): the same
  * `new_pools` payload is published by CoinGecko's Onchain API, and it is a
@@ -109,6 +125,19 @@ export const COINGECKO_PRO_HEADER = "x-cg-pro-api-key";
  */
 export function geckoAltEligible(path: string, keyed: boolean): boolean {
   return keyed || path.startsWith(ALT_ELIGIBLE_PREFIX);
+}
+
+/**
+ * Cache TTL for a path (pure — unit-tested). The DISCOVERY feeds tolerate an
+ * aged page and need every HIT they can get while the origin rate-limits the
+ * shared egress IP (see GECKO_CACHE_TTL_S); a TOKEN SNAPSHOT is a fresh,
+ * money-adjacent reading for the post-push tracker, so it stays at the
+ * upstream's own s-maxage (see GECKO_SNAPSHOT_CACHE_TTL_S).
+ */
+export function geckoCacheTtlS(path: string): number {
+  return path.includes("/new_pools") || path.includes("/trending_pools")
+    ? GECKO_CACHE_TTL_S
+    : GECKO_SNAPSHOT_CACHE_TTL_S;
 }
 
 export interface NewPool {
@@ -492,7 +521,7 @@ export class GeckoTerminalClient {
    * cache, so a bad minute can never be served to the next tick as if it were a
    * fresh feed.
    */
-  private requestInit(): CloudflareFetchInit {
+  private requestInit(ttlS: number): CloudflareFetchInit {
     const init: CloudflareFetchInit = {
       headers: {
         Accept: "application/json",
@@ -502,9 +531,9 @@ export class GeckoTerminalClient {
       signal: AbortSignal.timeout(10_000),
       cf: {
         cacheEverything: true,
-        cacheTtl: GECKO_CACHE_TTL_S,
+        cacheTtl: ttlS,
         cacheTtlByStatus: {
-          "200-299": GECKO_CACHE_TTL_S,
+          "200-299": ttlS,
           "300-399": 0,
           "400-599": 0,
         },
@@ -550,9 +579,9 @@ export class GeckoTerminalClient {
         return null;
       }
       this.altAttempts += 1;
-      return this.attempt(GECKO_ALT_BASE_URL, path, true);
+      return this.attempt(GECKO_ALT_BASE_URL, path, true, geckoCacheTtlS(path));
     }
-    return this.attempt(BASE_URL, path, false);
+    return this.attempt(BASE_URL, path, false, geckoCacheTtlS(path));
   }
 
   /**
@@ -586,10 +615,11 @@ export class GeckoTerminalClient {
     baseUrl: string,
     path: string,
     alt: boolean,
+    ttlS: number,
   ): Promise<unknown> {
     try {
       const res = await this.throttle.run(() =>
-        fetch(`${baseUrl}${path}`, this.requestInit()),
+        fetch(`${baseUrl}${path}`, this.requestInit(ttlS)),
       );
       this.requests += 1;
       this.lastStatus = res.status;

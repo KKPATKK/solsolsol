@@ -53,7 +53,7 @@ import {
 } from "./pushledger";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
-import { GeckoTerminalClient, GECKO_ALT_BASE_URL, GECKO_USER_AGENT } from "./geckoterminal";
+import { GeckoTerminalClient, GECKO_ALT_BASE_URL, GECKO_CACHE_TTL_S, GECKO_USER_AGENT } from "./geckoterminal";
 // Heal-path counters: module scope in the tracker, read here so /health can
 // answer "did the self-heal reuse the push-time baseline, and how often".
 import {
@@ -3472,8 +3472,8 @@ export default {
           if (withCache) {
             init.cf = {
               cacheEverything: true,
-              cacheTtl: 60,
-              cacheTtlByStatus: { "200-299": 60, "300-399": 0, "400-599": 0 },
+              cacheTtl: GECKO_CACHE_TTL_S,
+              cacheTtlByStatus: { "200-299": GECKO_CACHE_TTL_S, "300-399": 0, "400-599": 0 },
             };
           }
           const res = await fetch(target, init as RequestInit);
