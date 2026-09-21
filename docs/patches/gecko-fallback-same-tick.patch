@@ -1,0 +1,116 @@
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -2199,30 +2199,46 @@
+       diag.profiles = profiles.length;
+       // pump.fun discovery — the widest free source of brand-new coins
+       // (DexScreener's profiles feed only returns ~24 Solana profiles per
+       // scan). Best-effort: any failure returns [] and the scan continues
+       // on DexScreener alone (see /health summary.pump to verify liveness).
+       //
+-      // It ALSO fills gecko's slot while that feed is paused (see
+-      // pumpfunDiscoveryLimit): the two keyless "brand-new coin" sources are
+-      // gecko's new_pools and this launch feed, and while `geo 0` the slot is
+-      // otherwise empty. Zero cost while gecko is healthy — measured
+-      // 2026-09-21, gecko's new_pools is 429ed from the Worker's egress on
+-      // every attempt while the launch feed answers 200.
+-      const geckoPaused = this.geckoDiscoveryPaused();
+-      const pumpLimit = pumpfunDiscoveryLimit(this.config, geckoPaused);
++      // It ALSO fills gecko's slot (see pumpfunDiscoveryLimit): the two keyless
++      // "brand-new coin" sources are gecko's new_pools and this launch feed, so
++      // when THIS tick's gecko call delivers nothing the slot would otherwise
++      // be empty. The decision rides the tick's own evidence — measured
++      // 2026-09-21, gating it on the gecko client's PAUSE flag silently never
++      // fired (`pump 0` while `geo 0`): that flag is per-isolate module state
++      // and isolates churn every ~30s, so the isolate deciding had never made a
++      // gecko call yet. Awaiting the gecko job costs only the failed tick, and
++      // gecko's own failure path is a fast 429/refusal.
++      let geckoJob: Promise<void> | null = null;
+       let pumpProfiles: TokenProfile[] = [];
+-      if (this.pumpfun && pumpLimit > 0) {
+-        diag.pumpFallback = geckoPaused && this.config.pumpfunProfileLimit === 0;
+-        feedJobs.push(
+-          this.fetchFeedCapped(
+-            () => this.pumpfun!.fetchNewestCoins(pumpLimit),
+-            [],
+-            feedDeadline,
+-          )
+-            .then((p) => {
+-              pumpProfiles = p;
+-              diag.pump = p.length;
+-            })
+-            .catch((err: unknown) => {
+-              console.error(
+-                "[scanner] pump.fun discovery failed:",
+-                err instanceof Error ? err.message : err,
+-              );
+-            }),
+-        );
++      const pumpAlwaysLimit = this.config.pumpfunProfileLimit;
++      const pumpFallbackLimit = this.config.pumpfunFallbackLimit;
++      if (this.pumpfun && (pumpAlwaysLimit > 0 || pumpFallbackLimit > 0)) {
++        feedJobs.push(
++          (async () => {
++            if (pumpAlwaysLimit <= 0) {
++              if (geckoJob !== null) await geckoJob;
++              if (diag.geo > 0) return; // gecko delivered — nothing to fill
++              diag.pumpFallback = true;
++            }
++            pumpProfiles = await this.fetchFeedCapped(
++              () =>
++                this.pumpfun!.fetchNewestCoins(
++                  pumpfunDiscoveryLimit(this.config, diag.geo > 0),
++                ),
++              [],
++              feedDeadline,
++            );
++            diag.pump = pumpProfiles.length;
++          })().catch((err: unknown) => {
++            console.error(
++              "[scanner] pump.fun discovery failed:",
++              err instanceof Error ? err.message : err,
++            );
++          }),
++        );
+       }
+@@ -2243,7 +2259,7 @@
+       }
+       if (this.gecko) {
+-        feedJobs.push(
+-          this.fetchFeedCapped(
++        const geckoPromise = this.fetchFeedCapped(
+             async () => {
+               const pools = [];
+               for (
+                 let page = 1;
+                 page <= this.config.geckoterminalPoolPages;
+                 page++
+               ) {
+                 const got = await this.gecko!.fetchNewPools(page);
+                 pools.push(...got);
+                 if (got.length === 0) break;
+               }
+               return pools
+                 .filter((p) => p.createdAtMs !== null)
+                 .map((p) => ({
+                   tokenAddress: p.tokenAddress,
+                   openTimestamp: p.createdAtMs ?? undefined,
+                 }));
+             },
+             [],
+             feedDeadline,
+           )
+             .then((p) => {
+               geckoProfiles = p;
+               diag.geo = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] geckoterminal discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+-            }),
+-        );
++            });
++        geckoJob = geckoPromise;
++        feedJobs.push(geckoPromise);
+       }

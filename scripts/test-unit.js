@@ -4388,14 +4388,15 @@ async function main() {
     assert.deepEqual(parsePumpCoins(null), []);
   });
 
-  await test("pumpfunDiscoveryLimit: the launch feed only fills gecko's slot when gecko is paused", () => {
+  await test("pumpfunDiscoveryLimit: the launch feed only fills a slot gecko left empty", () => {
     // Neither knob set → the feed never runs.
-    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 0 }, true), 0);
-    // A fallback size with gecko healthy → still nothing (steady state is
-    // unchanged; this is what makes it a fallback and not a second feed).
-    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 40 }, false), 0);
-    // Gecko paused (429/refusal) → the launch feed takes the slot.
-    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 40 }, true), 40);
+    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 0 }, false), 0);
+    // Gecko DELIVERED this tick → nothing runs (steady state unchanged; this is
+    // what makes it a fallback rather than a second feed).
+    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 40 }, true), 0);
+    // Gecko delivered nothing this tick (429 / refusal / a window cut by the
+    // feed deadline — all of which leave `geo 0`) → the launch feed fills it.
+    assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 0, pumpfunFallbackLimit: 40 }, false), 40);
     // The always-on feed wins when it is configured.
     assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 100, pumpfunFallbackLimit: 40 }, false), 100);
     assert.equal(pumpfunDiscoveryLimit({ pumpfunProfileLimit: 100, pumpfunFallbackLimit: 40 }, true), 100);

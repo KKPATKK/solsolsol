@@ -105,17 +105,25 @@ export function parsePumpCoins(data: unknown): TokenProfile[] {
  *    legacy host 530'd every Worker request, so the feed was switched off
  *    rather than paying a doomed request per tick.
  *  - `pumpfunFallbackLimit` is the GECKO FALLBACK size. GeckoTerminal's
- *    new_pools feed is the other keyless "brand-new coin" source, and while it
- *    is paused — a 429 or a refusal armed its backoff, the state that leaves
- *    `geo 0` — pump.fun's launch feed takes over that slot. While gecko is
- *    healthy this returns 0, so the steady state (and its cost) is unchanged.
+ *    new_pools feed is the other keyless "brand-new coin" source, and when it
+ *    delivers nothing on a tick — 429, refusal, or a window cut by the feed
+ *    deadline, all of which leave `geo 0` — pump.fun's launch feed takes that
+ *    slot. When gecko delivers this returns 0, so the steady state (and its
+ *    cost) is unchanged.
+ *
+ * `geckoDelivered` is THIS TICK's gecko result, not the client's pause flag.
+ * The pause flag was tried first and was silently useless: it is per-isolate
+ * module state, isolates churn every ~30s, and the isolate deciding had never
+ * made a gecko call yet — live proof `pump 0` while `geo 0` and gecko's own
+ * `backoffMs 659620` (2026-09-21). A tick's evidence is the only signal that
+ * exists in every isolate.
  */
 export function pumpfunDiscoveryLimit(
   config: Pick<AppConfig, "pumpfunProfileLimit" | "pumpfunFallbackLimit">,
-  geckoPaused: boolean,
+  geckoDelivered: boolean,
 ): number {
   if (config.pumpfunProfileLimit > 0) return config.pumpfunProfileLimit;
-  return geckoPaused ? config.pumpfunFallbackLimit : 0;
+  return geckoDelivered ? 0 : config.pumpfunFallbackLimit;
 }
 
 export class PumpFunClient {

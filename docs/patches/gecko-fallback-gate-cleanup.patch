@@ -1,0 +1,20 @@
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -1955,16 +1955,5 @@
+     return true;
+   }
+ 
+-  /**
+-   * True while GECKO DISCOVERY IS PAUSED — a 429 (or a hard refusal) armed the
+-   * client's backoff (see GeckoTerminalClient.stats / armAltPause). That is
+-   * exactly the state that leaves `geo 0`, and the trigger for the pump.fun
+-   * fallback that fills the launch slot (see pumpfunDiscoveryLimit).
+-   */
+-  private geckoDiscoveryPaused(): boolean {
+-    const s = this.gecko?.stats();
+-    return s !== undefined && s.backoffUntil > Date.now();
+-  }
+-
+   /**
+    * Run one feed fetch capped by the feed deadline (see FEED_DEADLINE_MS).
+    * Otherwise races the fetch against the remaining feed budget so a hanging
