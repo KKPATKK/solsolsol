@@ -1,0 +1,92 @@
+--- a/docs/scan-completion-loss.md
++++ b/docs/scan-completion-loss.md
+@@ -1175,0 +1176,118 @@
++
++---
++
++## 2026-09-21：量 `preRace` 花喺邊（`summary.preTick`）
++
++### 問題
++
++信封算術一直係 `scanRaceMs = max(2500, 9500 − 4500 − preRace)`，所以 `preRace` 係**唯一一條**
++「只要慢就即刻食掃描窗口」嘅數。但佢一直**冇讀數**：
++
++- `dbSteps`（tickprobe）量嘅係**掃描內**嘅 DB step（live：`getTokenStatsMany {calls 1, ms 113}`）；
++- `modeRead` 量嘅係**掃描內**嘅 trade-mode 讀（live：`{reads 1, lastReadMs 105, cachedAgeMs 2127}`）；
++- 兩者都喺 scan 開始之後，答唔到「掃描之前用咗幾多」。
++
++唯一嘅間接證據係**被切嗰行**：`err` 寫住窗口，所以 `preRace = 9500 − 4500 − 窗口`。
++（`docs/push-baseline-ledger.md` 嘅未解項 1 就係靠呢條式子推「preRace 實測 1–4s，候選係 Turso latency」。）
++
++### 量到嘅（live，`/debug/scan-history?limit=200`，120 行 ≈ 2 小時）
++
++| tick（Z） | 窗口 | 反推 preRace | 結果 |
++|---|---|---|---|
++| 10:01:06 | 4386ms | **614ms** | 被 race 切（唔係被 scan 自己嘅 4.2s deadline 切）|
++| 10:53:10 | 2500ms（**下限**） | **≥ 2500ms** | 被 race 切，而且該 tick 總共行咗 **11.5s**（連 flush 都過鐘）|
++
++同一窗口仲有 4 行 `previous tick died before its completion flush`（10:03、10:17、10:19、10:20Z）。
++老實講：嗰 4 行嘅 `ms`（62–101s）唔係掃描時長，而係**後繼 tick 同死 tick 嘅距離**，我只當佢哋係
++「同時段信封出事」嘅旁證，未歸因。
++
++### payload 半邊已經排除
++
++`heartbeatJson` 用嘅 mirror（`skipCapture` / `heal` / `dex` / `deferral` / `pushLedger`）本來係
++「CPU 貴」嘅嫌疑。實測（直接攞 live `/health` 嘅 heartbeat object，序列化後 4513 bytes）：
++
++```
++JSON.stringify(heartbeat) × 2000 → 25.1ms  ⇒ 0.013ms / 次
++```
++
++即係 payload 半邊**結構上唔可能**解釋 614ms，更加唔可能解釋 ≥2500ms。剩低嘅嫌疑人只有
++**claim 嗰個 round trip**（`claimScanLock`：heartbeat + lock INSERT，有 backfill 就多一行）
++—— 冷 isolate 嘅第一個請求（新連線/TLS）同 Turso 抖動都喺呢一步。呢個就係今次加讀數要分開嘅兩半。
++
++### 加咗嘅讀數
++
++`summary.preTick`（`/health`、`/debug/tick` 都有）：
++
++```json
++{
++  "at": 1758452345678,          // handler entry，對齊 heartbeat.at / scan_history.at
++  "steps": { "bump": 120, "init": 40, "gate": 260, "outage": 30, "json": 3, "claim": 611 },
++  "preStartMs": 450,           // handler entry → startedAt（食 wall clock，唔食掃描窗口）
++  "preRaceMs": 614,            // startedAt → race 開始（**呢個**才食掃描窗口）
++  "raceMs": 4386               // 實際派到嘅窗口
++}
++```
++
++- `bump` / `init` / `gate` / `outage` = handler 入面四個步驟（cron counter 寫、`ensureInitialized`、
++  cadence gate 讀、outage check），全部喺 `startedAt` 之前。`gate` 用 `finally` 包住，所以**被 skip 嘅 tick
++  一樣報數**（skip 嘅成因就係嗰個讀）。
++- `json` = payload 組裝 + 序列化（CPU，預期 ~0）；`claim` = claim round trip（DB）。兩者相加 ≈ `preRaceMs`。
++- 未量到嘅一律 `null`，**唔會**填 0（0 會讀成「好快」）。
++- 被 race 切嗰行嘅 `err` 亦開始自帶拆帳：
++  `scan exceeded its 4386ms race window (tick budget 9500ms, flush reserve 4500ms, preRace 614ms = json 3 + claim 611)`。
++
++### 點讀
++
++| 讀數 | 意思 |
++|---|---|
++| `preRaceMs` 400–700ms、`claim` ≈ 全部 | 正常：一個 Turso round trip 就係咁貴 |
++| `claim` 突然 1.5s+ | Turso 抖動／冷 isolate 首個請求 —— 該 tick 已經冇咗 1.5s 掃描 |
++| `raceMs == 2500`（下限） | 警號：`preRace ≥ 2500`，race 已經唔再由 `budget − reserve` 決定 |
++| `json` 佔比大 | 唔應該發生；發生即係 mirror 其中一個 getter 變成有 I/O |
++
++### 驗收點（deploy 後）
++
++1. `/debug/tick` 或 `/health`：`summary.preTick` 出現、`steps.json + steps.claim ≈ preRaceMs`。
++2. 下一次 race cut 嗰行 `err` 自帶 `preRace Xms = json Y + claim Z`；Y 應該係個位數 ms。
++3. `raceMs` 未再跌到 2500（跌到就係上面嗰個警號，唔好當「有下限所以冇事」）。
++
++### 未做（老實講）
++
++- **未修**：呢一步只係裝讀數。要唔要修（例如 claim 前預熱連線、或將 `bump`/`outage` 移出前置路徑）
++  應該等 live 拆帳出咗數先決定 —— `docs/push-baseline-ledger.md` 未解項 1 嘅「候選係 Turso latency」
++  而家有得證實或推翻。
++- 4 個 dead-tick backfill（10:03–10:20Z）未歸因；佢哋同 10:53 嗰個 11.5s tick 有冇共同前置，要等下一批讀數。
++- `bump` 用自己嘅 raw client（`new Db` + 一個 round trip，喺 init 之前），所以冷 isolate 嘅
++  `bump + init + claim` 係**三個**各自可能要開連線嘅步驟；呢點只有在 live 見到 `claim` 對唔上 round-trip
++  成本時才值得追。
++- `steps.json` 由 `heartbeatAt` 開始量，而 `heartbeatAt` 喺「fallback heartbeat read」之後：cron 同
++  HTTP fallback 都會傳入嗰個 read，所以只有 `/debug/tick` 嗰條路會多一個 read 而唔計入任何 step。

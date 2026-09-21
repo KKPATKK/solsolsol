@@ -1,0 +1,20 @@
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -988,7 +988,7 @@
+  * WHY. The race window is `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS -
+  * preRaceSpend`, so the scan's own 4.2s deadline only holds while the round
+  * trip in front of it is short: at ~600ms of preRace the granted window is
+- * 4.39s (live 09:59Z: `scan exceeded its 4386ms race window`), i.e. the scan
++ * 4.39s (live 10:01:06Z: `scan exceeded its 4386ms race window`), i.e. the scan
+  * was cut by the RACE rather than by its own deadline — and every millisecond
+  * of preRace is one taken from the gate/push phase, the only phase that can
+  * push a coin. On top of that sits a second, invisible slice: everything the
+@@ -1063,7 +1063,7 @@
+   steps: PreTickSteps;
+   /** Handler entry → `startedAt` (the envelope's origin). null = unmeasured. */
+   preStartMs: number | null;
+-  /** `startedAt` → race start: the claim round trip, taken out of the race. */
++  /** `startedAt` → race start: the slice taken out of the scan's window. */
+   preRaceMs: number | null;
+   /** The race window this tick was actually granted. */
+   raceMs: number | null;

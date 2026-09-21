@@ -23,6 +23,7 @@ const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquid
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
+const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
@@ -97,6 +98,85 @@ async function main() {
     // Witness for why the value was lowered: the pre-2026-09-20 setting fails
     // the first assertion, i.e. every stalled flush was unrecoverable.
     assert.ok(6_000 * 1.2 > retryWindowMs, "the old 6s default should violate the window");
+  });
+
+  // ---------- the pre-race slice of the tick envelope (src/worker.ts) ----------
+  //
+  // Same envelope, the OTHER side of the scan: everything the tick does before
+  // it starts scanning. The race window is
+  // `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRaceSpend`, so every
+  // millisecond of pre-race is a millisecond taken from the scan and, behind
+  // it, from the candidate chain — the only phase that can push a coin. Two
+  // live rows from 2026-09-21 pin the relationship, and until this change
+  // nothing published the pre-race split at all (`dbSteps` / `modeRead` both
+  // measure work INSIDE the scan).
+  await test("race window: the pre-race phase is paid for out of the scan's window, 1:1 until the floor", () => {
+    // A tick whose pre-race phase was free still only gets budget - reserve;
+    // the reserve is the flush's, never the scan's.
+    assert.equal(scanRaceWindowMs(0), SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS);
+    // Live witness 10:01:06Z — the completion row quotes
+    // "scan exceeded its 4386ms race window", which is exactly 614ms of
+    // pre-race taken off the unencumbered window.
+    assert.equal(scanRaceWindowMs(614), 4386);
+    assert.equal(SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 614, 4386);
+    // 1:1 in between, i.e. the pre-race phase cannot hide in a rounding step.
+    assert.equal(scanRaceWindowMs(1_000), SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 1_000);
+    // The floor: 10:53:10Z quotes "scan exceeded its 2500ms race window" (and
+    // that tick went on to run 11.5s, losing its flush) — everything from
+    // 2500ms of pre-race upward gets the same clamped window, which is why a
+    // floored tick is a signal rather than a graceful degradation.
+    assert.equal(scanRaceWindowMs(2_500), 2_500);
+    assert.equal(scanRaceWindowMs(9_000), 2_500);
+    // The scan's own deadline (SCAN_TICK_DEADLINE_MS) is what a healthy tick
+    // is actually bounded by, so the headroom between the two is the pre-race
+    // budget: 800ms today. Past that, the race — not the scan's deadline —
+    // decides where the sweep stops.
+    assert.equal(
+      SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - SCAN_TICK_DEADLINE_MS,
+      800,
+    );
+  });
+
+  await test("pre-tick split: handler steps are published, and anything unmeasured reads null (never 0)", () => {
+    // A handler that never called beginPreTick has no entry stamp: the split
+    // must say "not measured", because 0 would read as a perfectly fast tick.
+    const unmeasured = buildPreTickSplit({
+      entryAt: 0,
+      steps: PRE_TICK_ZERO_STEPS,
+      startedAt: 1_000,
+      raceAt: 1_000,
+      raceMs: 5_000,
+    });
+    assert.equal(unmeasured.at, 0);
+    assert.equal(unmeasured.preStartMs, null);
+    assert.equal(unmeasured.raceMs, 5_000);
+
+    const measured = buildPreTickSplit({
+      entryAt: 1_000_000,
+      steps: { bump: 120, init: 40, gate: 260, outage: 30, json: 70, claim: 544 },
+      startedAt: 1_000_450,
+      raceAt: 1_001_064,
+      raceMs: scanRaceWindowMs(614),
+    });
+    // Handler entry → startedAt (the envelope's origin, which does NOT shrink
+    // the race window: it eats the invocation's wall clock instead).
+    assert.equal(measured.preStartMs, 450);
+    // startedAt → race start: this is the slice that DOES shrink the window,
+    // and the two must agree with the window the scan was given.
+    assert.equal(measured.preRaceMs, 614);
+    assert.equal(scanRaceWindowMs(measured.preRaceMs), measured.raceMs);
+    // ...and that slice splits into its two accountable halves: the payload
+    // build (CPU) and the claim round trip (Turso). This is the pair the live
+    // reading has to attribute the loss to.
+    assert.equal(measured.steps.json + measured.steps.claim, measured.preRaceMs);
+    // The step split is copied, so a reader cannot mutate module state...
+    assert.notEqual(measured.steps, PRE_TICK_ZERO_STEPS);
+    assert.equal(measured.steps.bump, 120);
+    // ...and the view is a fresh copy too (preTickView is what /health and
+    // /debug/tick serialize).
+    const view = preTickView();
+    assert.notEqual(view, preTickView());
+    assert.equal(typeof view.steps.bump, "number");
   });
 
   // ---------- card send room (src/scanner.ts) ----------

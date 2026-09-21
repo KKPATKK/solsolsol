@@ -1,0 +1,50 @@
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -879,7 +879,7 @@
+  * room for a new tail stage — the tail IS what is left after the flush.
+  */
+-const SCAN_TICK_BUDGET_MS = 9_500;
++export const SCAN_TICK_BUDGET_MS = 9_500;
+ /**
+  * Wall-clock slice, taken at the END of a tick, for ONE post-push tracker
+  * pass (see Scanner.runTrackerPass and pushwatch.TRACKER_TICK_BUDGET_MS).
+@@ -1032,6 +1032,26 @@
+   };
+ }
+ 
++/**
++ * The race window a tick is actually granted, given how much of the budget
++ * its pre-race phase already spent. Exported so the tuning relationship below
++ * is pinned by a test rather than by this comment alone.
++ *
++ * `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS` is what a tick with a free
++ * pre-race phase gets; every further millisecond comes straight out of the
++ * scan, and behind the scan, out of the candidate chain — the only phase that
++ * can push a coin. The 2_500ms floor stops a very slow pre-race from erasing
++ * the scan entirely (a tick AT the floor is the alarm, not the fix: see
++ * PreTickView and the two live witnesses below).
++ */
++export function scanRaceWindowMs(preRaceSpendMs: number): number {
++  return Math.max(
++    2_500,
++    SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRaceSpendMs,
++  );
++}
++
+ /** Latest pre-scan split, module state like every other per-isolate counter. */
+ let preTick: PreTickView = {
+   at: 0,
+@@ -2188,12 +2208,7 @@
+       // preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS no matter how slow
+       // the pre-race phase was, so there is always time left to land the
+       // flush before Cloudflare kills the invocation.
+-      const scanRaceMs = Math.max(
+-        2_500,
+-        SCAN_TICK_BUDGET_MS -
+-          SCAN_FLUSH_RESERVE_MS -
+-          (Date.now() - startedAt),
+-      );
++      const scanRaceMs = scanRaceWindowMs(Date.now() - startedAt);
+       // Publish the split BEFORE the race runs: a tick the race cuts must
+       // still say how much of its window the pre-race phase took (see
+       // PreTickView — this is the number the race arithmetic uses).

@@ -1,0 +1,60 @@
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -1010,6 +1010,18 @@
+   gate: number;
+   /** checkOutageAndAlert (normally a cached read; an alert writes). */
+   outage: number;
++  /**
++   * Payload assembly: snapshot getters (skip capture, heal, dex stats,
++   * deferral, push-baseline ledger) plus the serialize, measured from
++   * `startedAt`. Pure CPU — a live 4.5KB heartbeat payload serializes in
++   * 0.013ms — so this half exists to be ruled OUT: if `preRaceMs` is large
++   * while this is ~0, the loss is the claim's, not the payload's.
++   */
++  json: number;
++  /**
++   * The claim round trip: the ONE must-land write before scanning (heartbeat +
++   * lock INSERT + any backfill row, batched). The other half of `preRaceMs`,
++   * and the half a slower Turso — or a cold isolate's first request — turns
++   * into lost race window.
++   */
++  claim: number;
+ }
+ 
+ /** The pre-scan split of one tick (published as `summary.preTick`). */
+@@ -1028,6 +1040,8 @@
+ export const PRE_TICK_ZERO_STEPS: PreTickSteps = {
+   bump: 0,
+   init: 0,
+   gate: 0,
+   outage: 0,
++  json: 0,
++  claim: 0,
+ };
+ 
+ /**
+@@ -2030,6 +2044,7 @@
+       // best-effort — a failed read just skips the backfill this tick
+     }
+   }
++  const heartbeatAt = Date.now();
+   // Backfill entry for a dead predecessor: written by the next tick that
+   // wins the lease, riding the claim batch (zero extra round trips). The
+   // row records that the tick started but never flushed, so scan_history
+@@ -2102,8 +2117,11 @@
+     pushLedger: pushLedgerMirror,
+   });
++  preTick.steps.json = Date.now() - heartbeatAt;
+   if (db) {
++    const claimAt = Date.now();
+     try {
+       scanLock = await db.claimScanLock(
+         SCAN_LOCK_OWNER,
+@@ -2113,6 +2131,7 @@
+         err instanceof Error ? err.message : err,
+       );
+     }
++    preTick.steps.claim = Date.now() - claimAt;
+   }
+   if (scanLock === null && !claimErrored) {
+     // Another isolate won the lease (its heartbeat write went out with the

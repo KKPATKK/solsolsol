@@ -876,7 +876,7 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * the tail that was already going unused. Never widen this number to make
  * room for a new tail stage — the tail IS what is left after the flush.
  */
-const SCAN_TICK_BUDGET_MS = 9_500;
+export const SCAN_TICK_BUDGET_MS = 9_500;
 /**
  * Wall-clock slice, taken at the END of a tick, for ONE post-push tracker
  * pass (see Scanner.runTrackerPass and pushwatch.TRACKER_TICK_BUDGET_MS).
@@ -980,6 +980,144 @@ export const SCAN_FLUSH_RESERVE_MS = 4_500;
  * is still room for a settled second attempt to land.
  */
 export const FLUSH_ATTEMPT_BOUND_MS = 1_200;
+/**
+ * Where a tick's PRE-SCAN time went — the slice of the envelope nothing
+ * published (2026-09-21).
+ *
+ * WHY. The race window is `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS -
+ * preRaceSpend`, so the scan's own 4.2s deadline only holds while the round
+ * trip in front of it is short: at ~600ms of preRace the granted window is
+ * 4.39s (live 10:01:06Z: `scan exceeded its 4386ms race window`), i.e. the scan
+ * was cut by the RACE rather than by its own deadline — and every millisecond
+ * of preRace is one taken from the gate/push phase, the only phase that can
+ * push a coin. On top of that sits a second, invisible slice: everything the
+ * handler does BEFORE `startedAt` — the cron counter write (its own short-lived
+ * Db client), `ensureInitialized` (schema DDL on a cold isolate), the
+ * cadence-gate heartbeat read and the outage check. The budget is measured
+ * from `startedAt`, so that slice does not shrink the race window; it eats the
+ * invocation's wall clock, which is exactly what the ~9.6s kill measures.
+ *
+ * `dbSteps` / `modeRead` (tickprobe) answer a DIFFERENT question — DB calls and
+ * the trade-mode prefetch INSIDE the scan — so the pre-scan slice had no
+ * reading at all. This is that reading.
+ */
+export interface PreTickSteps {
+  /** Cron counter write, before init (its own raw client + one round trip). */
+  bump: number;
+  /** ensureInitialized: db init + migrations (cold isolates pay the DDL). */
+  init: number;
+  /** Cadence-gate heartbeat read (doubles as backfill + outage input). */
+  gate: number;
+  /** checkOutageAndAlert (normally a cached read; an alert writes). */
+  outage: number;
+  /**
+   * Payload assembly: snapshot getters (skip capture, heal, dex stats,
+   * deferral, push-baseline ledger) plus the serialize, measured from
+   * `startedAt`. Pure CPU — a live 4.5KB heartbeat payload serializes in
+   * 0.013ms — so this half exists to be ruled OUT: if `preRaceMs` is large
+   * while this is ~0, the loss is the claim's, not the payload's.
+   */
+  json: number;
+  /**
+   * The claim round trip: the ONE must-land write before scanning (heartbeat +
+   * lock INSERT + any backfill row, batched). The other half of `preRaceMs`,
+   * and the half a slower Turso — or a cold isolate's first request — turns
+   * into lost race window.
+   */
+  claim: number;
+}
+
+/** The pre-scan split of one tick (published as `summary.preTick`). */
+export interface PreTickView {
+  /** Handler entry (epoch) — align with heartbeat.at / scan_history.at. */
+  at: number;
+  steps: PreTickSteps;
+  /** Handler entry → `startedAt` (the envelope's origin). null = unmeasured. */
+  preStartMs: number | null;
+  /** `startedAt` → race start: the slice taken out of the scan's window. */
+  preRaceMs: number | null;
+  /** The race window this tick was actually granted. */
+  raceMs: number | null;
+}
+
+export const PRE_TICK_ZERO_STEPS: PreTickSteps = {
+  bump: 0,
+  init: 0,
+  gate: 0,
+  outage: 0,
+  json: 0,
+  claim: 0,
+};
+
+/**
+ * Pure split of a tick's pre-scan envelope (exported for unit tests): the
+ * numbers the race arithmetic actually uses, with `null` for anything not
+ * measured rather than a fabricated 0.
+ */
+export function buildPreTickSplit(input: {
+  entryAt: number;
+  steps: PreTickSteps;
+  startedAt: number;
+  raceAt: number;
+  raceMs: number;
+}): PreTickView {
+  const { entryAt, steps, startedAt, raceAt, raceMs } = input;
+  return {
+    at: entryAt,
+    steps: { ...steps },
+    preStartMs: entryAt > 0 && startedAt >= entryAt ? startedAt - entryAt : null,
+    preRaceMs: raceAt >= startedAt ? raceAt - startedAt : 0,
+    raceMs,
+  };
+}
+
+/**
+ * The race window a tick is actually granted, given how much of the budget
+ * its pre-race phase already spent. Exported so the tuning relationship below
+ * is pinned by a test rather than by this comment alone.
+ *
+ * `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS` is what a tick with a free
+ * pre-race phase gets; every further millisecond comes straight out of the
+ * scan, and behind the scan, out of the candidate chain — the only phase that
+ * can push a coin. The 2_500ms floor stops a very slow pre-race from erasing
+ * the scan entirely (a tick AT the floor is the alarm, not the fix: see
+ * PreTickView and the two live witnesses below).
+ */
+export function scanRaceWindowMs(preRaceSpendMs: number): number {
+  return Math.max(
+    2_500,
+    SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRaceSpendMs,
+  );
+}
+
+/** Latest pre-scan split, module state like every other per-isolate counter. */
+let preTick: PreTickView = {
+  at: 0,
+  steps: { ...PRE_TICK_ZERO_STEPS },
+  preStartMs: null,
+  preRaceMs: null,
+  raceMs: null,
+};
+/** Handler entry of the tick in progress (0 = nothing recorded). */
+let preTickEntryAt = 0;
+
+/** Pre-scan split of the tick that finished most recently (see the header). */
+export function preTickView(): PreTickView {
+  return { ...preTick, steps: { ...preTick.steps } };
+}
+
+/** Start a fresh pre-scan split for a tick entering the handler. */
+function beginPreTick(entryAt: number): void {
+  preTickEntryAt = entryAt;
+  preTick = {
+    at: entryAt,
+    steps: { ...PRE_TICK_ZERO_STEPS },
+    preStartMs: null,
+    preRaceMs: null,
+    raceMs: null,
+  };
+}
+
 /**
  * Cross-isolate single-flight lease for one scan pass (see
  * Db.claimScanLock). The cadence gate is a read-then-act heartbeat check, so
@@ -1814,6 +1952,10 @@ async function ensureInitialized(env: Env): Promise<void> {
             view.modeRead = trade?.modeStats() ?? null;
             view.feedMakeup = feedMakeupView();
             view.dbSteps = dbStepView();
+            // Where the time BEFORE the scan went (handler steps + the claim
+            // round trip) — the reading `dbSteps` / `modeRead` cannot give,
+            // because both measure work INSIDE the scan (see PreTickView).
+            view.preTick = preTickView();
             // Describes the drain that ran after the PREVIOUS tick: the
             // summary is serialized before this tick's own drain starts.
             view.writeDrain = writeDrainView();
@@ -1903,6 +2045,7 @@ async function runScan(
       // best-effort — a failed read just skips the backfill this tick
     }
   }
+  const heartbeatAt = Date.now();
   // Backfill entry for a dead predecessor: written by the next tick that
   // wins the lease, riding the claim batch (zero extra round trips). The
   // row records that the tick started but never flushed, so scan_history
@@ -1976,7 +2119,9 @@ async function runScan(
     // always carries it.
     pushLedger: pushLedgerMirror,
   });
+  preTick.steps.json = Date.now() - heartbeatAt;
   if (db) {
+    const claimAt = Date.now();
     try {
       scanLock = await db.claimScanLock(
         SCAN_LOCK_OWNER,
@@ -1992,6 +2137,7 @@ async function runScan(
         err instanceof Error ? err.message : err,
       );
     }
+    preTick.steps.claim = Date.now() - claimAt;
   }
   if (scanLock === null && !claimErrored) {
     // Another isolate won the lease (its heartbeat write went out with the
@@ -2079,12 +2225,17 @@ async function runScan(
       // preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS no matter how slow
       // the pre-race phase was, so there is always time left to land the
       // flush before Cloudflare kills the invocation.
-      const scanRaceMs = Math.max(
-        2_500,
-        SCAN_TICK_BUDGET_MS -
-          SCAN_FLUSH_RESERVE_MS -
-          (Date.now() - startedAt),
-      );
+      const scanRaceMs = scanRaceWindowMs(Date.now() - startedAt);
+      // Publish the split BEFORE the race runs: a tick the race cuts must
+      // still say how much of its window the pre-race phase took (see
+      // PreTickView — this is the number the race arithmetic uses).
+      preTick = buildPreTickSplit({
+        entryAt: preTickEntryAt,
+        steps: preTick.steps,
+        startedAt,
+        raceAt: Date.now(),
+        raceMs: scanRaceMs,
+      });
       await Promise.race([
         scanner.runOnce(),
         new Promise<void>((resolve) => {
@@ -2106,8 +2257,13 @@ async function runScan(
       // Report the SCAN RACE window, not the whole tick budget: the race now
       // ends SCAN_FLUSH_RESERVE_MS early, so quoting the budget sent the
       // operator chasing a 9.5s timeout on ticks that were cut at ~6s.
+      // The pre-race split rides along because THIS row is the one a reader
+      // chases, and without it the lost window can only be reconstructed by
+      // subtraction (budget - reserve - window). Naming both halves also
+      // separates a CPU-heavy payload from a slow claim round trip, which
+      // have different fixes.
       lastScanError = timedOut
-        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms)`
+        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, preRace ${preTick.preRaceMs}ms = json ${preTick.steps.json} + claim ${preTick.steps.claim})`
         : null;
       if (timedOut) {
         console.error(`[worker] scan ran past its ${scanRaceMs}ms race window — completion written with timeout flag`);
@@ -2643,6 +2799,9 @@ async function analyzeMintFlow(mint: string): Promise<FlowCheckResult> {
 async function maybeRunScanIfStale(env?: Env): Promise<void> {
   if (!scanner) return;
   const now = Date.now();
+  // The HTTP fallback's own pre-scan slice: measured from here, because this
+  // is where a request's work before the scan starts (see PreTickView).
+  beginPreTick(now);
   if (now - lastScanTriggerAt < SCAN_TRIGGER_INTERVAL_MS) return;
   lastScanTriggerAt = now;
   // Dedupe against a healthy cron: skip when a scan already completed
@@ -4433,6 +4592,7 @@ export default {
     // Keep the invocation open for the tick's deferred writes (see
     // tickWaitUntil): a fire-and-forget drain is cancelled when the handler
     // returns — the 100%-failure shape measured above.
+    beginPreTick(Date.now());
     tickWaitUntil = (promise) => ctx.waitUntil(promise);
     scheduledTicks++;
     // Record the cron event BEFORE init, with a raw client: a slow/failed
@@ -4442,14 +4602,18 @@ export default {
     // post-init counter stayed null while HTTP-driven scans ran fine). This
     // is the cross-isolate proof that scheduled events arrive at all.
     try {
+      const bumpAt = Date.now();
       if (env.TURSO_DATABASE_URL && env.TURSO_AUTH_TOKEN) {
         const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
         await probe.bumpScheduledTick();
       }
+      preTick.steps.bump = Date.now() - bumpAt;
     } catch (err) {
       console.error("[worker] pre-init cron counter failed:", err);
     }
+    const initAt = Date.now();
     await ensureInitialized(env);
+    preTick.steps.init = Date.now() - initAt;
     if (!scanner) return;
     // Cadence gate: the cron trigger fires every minute; SCAN_INTERVAL_SECONDS
     // (default 60s) lets the operator slow the scan (e.g. 90s — every other
@@ -4468,6 +4632,7 @@ export default {
     // The heartbeat read doubles as the backfill input for runScan (a dead
     // predecessor's stale scanning heartbeat) and the outage check — pass
     // both down so the tick adds no extra round trips.
+    const gateAt = Date.now();
     let hbRaw: string | null = null;
     let hbAt: number | null = null;
     try {
@@ -4484,10 +4649,16 @@ export default {
       }
     } catch {
       // heartbeat unreadable — fail open and run the scan
+    } finally {
+      // Covers the `return` arm too: a SKIPPED tick still reports what its
+      // gate read cost, which is the tick shape a reader is chasing.
+      preTick.steps.gate = Date.now() - gateAt;
     }
     // Detect missed ticks (previous scan finished too long ago) and alert.
     try {
+      const outageAt = Date.now();
       await checkOutageAndAlert(hbAt);
+      preTick.steps.outage = Date.now() - outageAt;
     } catch (err) {
       console.error("[worker] outage check failed:", err);
     }

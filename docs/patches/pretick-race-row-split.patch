@@ -1,0 +1,18 @@
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -2255,8 +2255,14 @@
+       // Report the SCAN RACE window, not the whole tick budget: the race now
+       // ends SCAN_FLUSH_RESERVE_MS early, so quoting the budget sent the
+       // operator chasing a 9.5s timeout on ticks that were cut at ~6s.
++      // The pre-race split rides along because THIS row is the one a reader
++      // chases, and without it the lost window can only be reconstructed by
++      // subtraction (budget - reserve - window). Naming both halves also
++      // separates a CPU-heavy payload from a slow claim round trip, which
++      // have different fixes.
+       lastScanError = timedOut
+-        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms)`
++        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, preRace ${preTick.preRaceMs}ms = json ${preTick.steps.json} + claim ${preTick.steps.claim})`
+         : null;
+       if (timedOut) {
+         console.error(`[worker] scan ran past its ${scanRaceMs}ms race window — completion written with timeout flag`);
+       }
