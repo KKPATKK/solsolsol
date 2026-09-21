@@ -2276,8 +2276,38 @@ async function runScan(
         }
         }
       }
-      // Cross-isolate deferral counters, synced only now that the completion
-      // flush has had its turn (see syncPushDeferralCounters). It is awaited
+      // Post-push tracker pass — the tick's FIRST tail work, funded by the
+      // budget the scan left over (see TRACKER_PASS_BUDGET_MS). It runs after
+      // the completion flush on purpose (the flush is the one write a tick
+      // cannot lose, and the pass bounds every stage of its own) and BEFORE
+      // the deferral-counter sync, which is why it moved: the sync is bounded
+      // at DEFERRAL_SYNC_BOUND_MS (1s) and can spend up to that whole second
+      // starting late, and a pass that starts a second later is a pass that
+      // ends past the invocation's wall clock — measured live 2026-09-21
+      // 03:4xZ: with the sync in front, the pass completed on roughly half
+      // the ticks (the row writes proved the pass ran; no note was persisted,
+      // because the persist is its last step). Everything the sync can lose
+      // is its own telemetry and is re-offered next tick (see its comment
+      // below), while a pass that does not finish costs the rotation a whole
+      // tick. Best-effort either way: its note is persisted by the pass itself
+      // and carried in the next heartbeat's summary.
+      const trackerBudgetMs = Math.min(
+        TRACKER_PASS_BUDGET_MS,
+        startedAt + SCAN_TICK_BUDGET_MS - TRACKER_PASS_TAIL_MS - Date.now(),
+      );
+      if (scanner && trackerBudgetMs > 0) {
+        try {
+          await scanner.runTrackerPass(Date.now() + trackerBudgetMs);
+        } catch (err) {
+          console.error(
+            "[worker] tracker pass failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      // Cross-isolate deferral counters, synced only after the completion
+      // flush AND the tracker pass have had their turn (see
+      // syncPushDeferralCounters). It is awaited
       // so the isolate cannot be recycled mid-write, but everything it can
       // lose is its own telemetry: both Db calls carry the standard hard
       // wall, the delta is re-offered next tick if the write failed, and the
@@ -2293,7 +2323,19 @@ async function runScan(
         await Promise.race([
           syncPushDeferralCounters(summary),
           new Promise((resolve) =>
-            setTimeout(resolve, Math.min(DEFERRAL_SYNC_BOUND_MS, remainingFlushMs())),
+            setTimeout(
+              resolve,
+              Math.max(
+                250, // last-gasp floor: a write that lands late is idempotent
+                Math.min(
+                  DEFERRAL_SYNC_BOUND_MS,
+                  remainingFlushMs(),
+                  // The tracker pass ran first, so what is left for the sync
+                  // is the tick's tail, not the flush reserve.
+                  startedAt + SCAN_TICK_BUDGET_MS - TRACKER_PASS_TAIL_MS - Date.now(),
+                ),
+              ),
+            ),
           ),
         ]);
       } catch (err) {
@@ -2303,25 +2345,6 @@ async function runScan(
         );
       }
 
-      // Post-push tracker pass — the tick's last work, funded by the budget
-      // the scan left over (see TRACKER_PASS_BUDGET_MS). It runs after the
-      // completion flush on purpose: the flush is the one write a tick cannot
-      // lose, and the pass bounds every stage of its own. Best-effort: its
-      // note rides the next heartbeat's summary.
-      const trackerBudgetMs = Math.min(
-        TRACKER_PASS_BUDGET_MS,
-        startedAt + SCAN_TICK_BUDGET_MS - TRACKER_PASS_TAIL_MS - Date.now(),
-      );
-      if (scanner && trackerBudgetMs > 0) {
-        try {
-          await scanner.runTrackerPass(Date.now() + trackerBudgetMs);
-        } catch (err) {
-          console.error(
-            "[worker] tracker pass failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
-      }
     }
   } finally {
     // Streak bookkeeping AFTER the flush attempt. The old check re-read
