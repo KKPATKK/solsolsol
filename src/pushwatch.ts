@@ -1118,10 +1118,35 @@ export class PushWatcher {
     // Turso call below is a full request on a pass that only holds
     // TRACKER_TICK_BUDGET_MS, so this count is the tracker's real cost driver.
     let trips = 0;
+    // Per-stage clock for the pass, reported in the coverage note as
+    // `ms/trips`. The pass has no cadence of its own — it is handed whatever
+    // the scan tick has left — so `allow` plus this split is the only way to
+    // tell WHICH stage ate the budget. 2026-09-21: every tick reported
+    // `ok:0/0 deferred:tick-budget` while 30 rows aged out, and nothing in
+    // /health said whether the listing, the self-heal, the pair batch or the
+    // row loop was responsible (the note is per-pass and /health keeps only
+    // the latest summary, so a stage loss was invisible the moment the next
+    // tick overwrote it).
+    const spent = {
+      setup: { ms: 0, trips: 0 }, // listing + recap + prune + terminal settle
+      heal: { ms: 0, trips: 0 }, // untracked-push self-heal (reads + 補發)
+      pairs: { ms: 0, trips: 0 }, // the head pair batch (one request)
+      rows: { ms: 0, trips: 0 }, // the row loop: claim, reserve, send, write
+      holders: { ms: 0, trips: 0 }, // Birdeye holder probes (additive)
+    };
+    const stageNote = () =>
+      `allow ${budgetMs} spend[setup ${spent.setup.ms}/${spent.setup.trips}` +
+      ` heal ${spent.heal.ms}/${spent.heal.trips}` +
+      ` pairs ${spent.pairs.ms}/${spent.pairs.trips}` +
+      ` rows ${spent.rows.ms}/${spent.rows.trips}` +
+      ` holders ${spent.holders.ms}/${spent.holders.trips}]`;
     const deferred = {
       checked: 0,
       alerted: 0,
-      note: "deferred:tick-budget",
+      // Read at return time, so a deferral names the stage it stopped in.
+      get note() {
+        return `deferred:tick-budget ${stageNote()} trips ${trips}`;
+      },
       // Both deferral returns happen BEFORE the row loop, so no card was
       // even attempted — the per-pass count is 0 and the cumulative
       // totals are the isolate's running values.
@@ -1144,6 +1169,8 @@ export class PushWatcher {
     // recap/prune/heal and reused for the loop; the loop keeps only the rows
     // the prune would have kept, so a row that just got its 🏁 recap is still
     // never evaluated again.
+    const setupStart = Date.now();
+    const setupTrips = trips;
     let snapshot: PushWatchRow[] | null = null;
     try {
       snapshot = await this.db.listPushWatch(cfg.maxTracked);
@@ -1203,6 +1230,8 @@ export class PushWatcher {
     const settle = await this.settleUnconfirmedCards(now);
     trips += settle.trips;
     const rearmedCards = settle.rearmed;
+    spent.setup.ms = Date.now() - setupStart;
+    spent.setup.trips = trips - setupTrips;
     // Heal missed enrollments: pushes recorded in seen_tokens but absent
     // from push_watch (an old pre-tracker isolate handled that scan, or the
     // process died between the push and the upsert). Seeded with the TRUE
@@ -1211,6 +1240,8 @@ export class PushWatcher {
     // push falls back to the current mcap and is the only case that measures
     // "from tracking start". Extra DexScreener call only when something is
     // actually missing; a no-pair coin retries on the next tick.
+    const healStart = Date.now();
+    const healTrips = trips;
     try {
       trips += 1;
       const missing = await this.db.findUntrackedPushes(
@@ -1433,6 +1464,8 @@ export class PushWatcher {
     } catch {
       /* healing is best-effort */
     }
+    spent.heal.ms = Date.now() - healStart;
+    spent.heal.trips = trips - healTrips;
     if (past()) return deferred;
     // Reuse the snapshot (see the merge note at the top of the pass). Rows the
     // prune removed — everything past the window, i.e. exactly the ones the
@@ -1458,7 +1491,7 @@ export class PushWatcher {
       return {
         checked: 0,
         alerted: 0,
-        note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"} trips ${trips}`,
+        note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"} ${stageNote()} trips ${trips}`,
         trips,
         undelivered: 0,
         undeliveredTotal: this.undeliveredTotal,
@@ -1487,15 +1520,19 @@ export class PushWatcher {
     const tokens = head.map((r) => r.token);
     // Published for the scanner's next pair phase (see lastHeadTokens).
     this.lastHeadTokens = tokens;
+    const pairsStart = Date.now();
+    const pairsTrips = trips;
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
     try {
       pairs = await this.pairsFor(tokens, now + TRACKER_PAIRS_BUDGET_MS);
     } catch (err) {
       // feed down — retry next tick; surface the reason via the heartbeat.
+      spent.pairs.ms = Date.now() - pairsStart;
+      spent.pairs.trips = trips - pairsTrips;
       return {
         checked: 0,
         alerted: 0,
-        note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)} trips ${trips}`,
+        note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)} ${stageNote()} trips ${trips}`,
         trips,
         undelivered: 0,
         undeliveredTotal: this.undeliveredTotal,
@@ -1503,6 +1540,9 @@ export class PushWatcher {
         pendingUndelivered: this.pendingUndelivered.size,
       };
     }
+
+    spent.pairs.ms = Date.now() - pairsStart;
+    spent.pairs.trips = trips - pairsTrips;
 
     let checked = 0;
     let alerted = 0;
@@ -1531,6 +1571,8 @@ export class PushWatcher {
      */
     let terminalAbandoned = 0;
     let firstRow = true;
+    const rowsStart = Date.now();
+    const rowsTrips = trips;
     for (const row of head) {
       // Budget check BETWEEN rows: the claim and the alert reservation for a
       // row both happen after this point, so leaving a row to the next tick
@@ -1847,8 +1889,12 @@ export class PushWatcher {
         lastMcap: pair.marketCap,
       });
     }
+    spent.rows.ms = Date.now() - rowsStart;
+    spent.rows.trips = trips - rowsTrips;
 
     // Holder refresh (Birdeye CU-bounded): oldest-checked first, alive coins only.
+    const holdersStart = Date.now();
+    const holdersTrips = trips;
     if (this.birdeye && cfg.maxHolderChecksPerTick > 0) {
       const due = activeRows
         .filter(
@@ -1884,6 +1930,8 @@ export class PushWatcher {
         }
       }
     }
+    spent.holders.ms = Date.now() - holdersStart;
+    spent.holders.trips = trips - holdersTrips;
 
     // Coverage note: present whenever any active row went unchecked OR a
     // stale row was absorbed, so a starved tracker can never again look like
@@ -1907,7 +1955,7 @@ export class PushWatcher {
       `${terminalAbandoned > 0 ? ` abandoned ${terminalAbandoned}` : ""}` +
       `${rearmedCards > 0 ? ` rearmed ${rearmedCards}` : ""}` +
       `${recoveredThisPass > 0 ? ` recovered ${recoveredThisPass}` : ""}` +
-      `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
+      `${budgetCut ? " budget-cut" : ""} ${stageNote()} trips ${trips}`;
 
     return {
       checked,

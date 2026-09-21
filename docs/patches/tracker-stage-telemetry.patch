@@ -1,0 +1,100 @@
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -1240,6 +1240,8 @@
+     // push falls back to the current mcap and is the only case that measures
+     // "from tracking start". Extra DexScreener call only when something is
+     // actually missing; a no-pair coin retries on the next tick.
++    const healStart = Date.now();
++    const healTrips = trips;
+     try {
+       trips += 1;
+       const missing = await this.db.findUntrackedPushes(
+@@ -1462,6 +1464,8 @@
+     } catch {
+       /* healing is best-effort */
+     }
++    spent.heal.ms = Date.now() - healStart;
++    spent.heal.trips = trips - healTrips;
+     if (past()) return deferred;
+     // Reuse the snapshot (see the merge note at the top of the pass). Rows the
+     // prune removed — everything past the window, i.e. exactly the ones the
+@@ -1487,7 +1491,7 @@
+       return {
+         checked: 0,
+         alerted: 0,
+-        note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"} trips ${trips}`,
++        note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"} ${stageNote()} trips ${trips}`,
+         trips,
+         undelivered: 0,
+         undeliveredTotal: this.undeliveredTotal,
+@@ -1516,15 +1520,19 @@
+     const tokens = head.map((r) => r.token);
+     // Published for the scanner's next pair phase (see lastHeadTokens).
+     this.lastHeadTokens = tokens;
++    const pairsStart = Date.now();
++    const pairsTrips = trips;
+     let pairs = new Map<string, import("./dexscreener").PairInfo>();
+     try {
+       pairs = await this.pairsFor(tokens, now + TRACKER_PAIRS_BUDGET_MS);
+     } catch (err) {
+       // feed down — retry next tick; surface the reason via the heartbeat.
++      spent.pairs.ms = Date.now() - pairsStart;
++      spent.pairs.trips = trips - pairsTrips;
+       return {
+         checked: 0,
+         alerted: 0,
+-        note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)} trips ${trips}`,
++        note: `pairs-failed:${(err instanceof Error ? err.message : String(err)).slice(0, 80)} ${stageNote()} trips ${trips}`,
+         trips,
+         undelivered: 0,
+         undeliveredTotal: this.undeliveredTotal,
+@@ -1533,6 +1541,9 @@
+       };
+     }
+ 
++    spent.pairs.ms = Date.now() - pairsStart;
++    spent.pairs.trips = trips - pairsTrips;
++
+     let checked = 0;
+     let alerted = 0;
+     let backfilled = 0;
+@@ -1560,6 +1571,8 @@
+      */
+     let terminalAbandoned = 0;
+     let firstRow = true;
++    const rowsStart = Date.now();
++    const rowsTrips = trips;
+     for (const row of head) {
+       // Budget check BETWEEN rows: the claim and the alert reservation for a
+       // row both happen after this point, so leaving a row to the next tick
+@@ -1876,8 +1889,12 @@
+         lastMcap: pair.marketCap,
+       });
+     }
++    spent.rows.ms = Date.now() - rowsStart;
++    spent.rows.trips = trips - rowsTrips;
+ 
+     // Holder refresh (Birdeye CU-bounded): oldest-checked first, alive coins only.
++    const holdersStart = Date.now();
++    const holdersTrips = trips;
+     if (this.birdeye && cfg.maxHolderChecksPerTick > 0) {
+       const due = activeRows
+         .filter(
+@@ -1913,6 +1930,8 @@
+         }
+       }
+     }
++    spent.holders.ms = Date.now() - holdersStart;
++    spent.holders.trips = trips - holdersTrips;
+ 
+     // Coverage note: present whenever any active row went unchecked OR a
+     // stale row was absorbed, so a starved tracker can never again look like
+@@ -1936,7 +1955,7 @@
+       `${terminalAbandoned > 0 ? ` abandoned ${terminalAbandoned}` : ""}` +
+       `${rearmedCards > 0 ? ` rearmed ${rearmedCards}` : ""}` +
+       `${recoveredThisPass > 0 ? ` recovered ${recoveredThisPass}` : ""}` +
+-      `${budgetCut ? " budget-cut" : ""} trips ${trips}`;
++      `${budgetCut ? " budget-cut" : ""} ${stageNote()} trips ${trips}`;
+ 
+     return {
+       checked,
