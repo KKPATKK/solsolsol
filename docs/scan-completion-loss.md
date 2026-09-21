@@ -1262,3 +1262,50 @@ JSON.stringify(heartbeat) × 2000 → 25.1ms  ⇒ 0.013ms / 次
   成本時才值得追。
 - `steps.json` 由 `heartbeatAt` 開始量，而 `heartbeatAt` 喺「fallback heartbeat read」之後：cron 同
   HTTP fallback 都會傳入嗰個 read，所以只有 `/debug/tick` 嗰條路會多一個 read 而唔計入任何 step。
+
+### 線上實錄（2026-09-21 11:38–11:40Z，deploy `ca37a83` 之後）
+
+三個連續 **cron** tick（entry 都喺 `:50`），由 `/health.heartbeat.summary.preTick` 讀（done heartbeat
+本身已經帶 `summary`，所以跨 isolate 都讀得到）：
+
+| flush（Z） | `bump` | `init` | `gate` | `outage` | `json` | `claim` | `preStartMs` | `preRaceMs` | `raceMs` | tick `ms` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 11:38:54 | **564** | 193 | 164 | 0 | 0 | 195 | 921 | 195 | 4805 | 3463 |
+| 11:39:55 | **620** | 181 | 165 | 0 | 0 | 333 | 966 | 333 | 4667 | 3631 |
+| 11:40:56 | **749** | 190 | 173 | 0 | 0 | 189 | 1112 | 189 | 4811 | 4953 |
+
+三條算式全部對得上（即係四個 stamp 冇漏、冇重疊）：
+
+```
+preStartMs = bump + init + gate + outage        921 = 564+193+164+0 ✓  966 ✓  1112 ✓
+preRaceMs  = json + claim                        195 = 0+195 ✓   333 = 0+333 ✓   189 ✓
+raceMs     = 9500 − 4500 − preRaceMs            4805 ✓  4667 ✓  4811 ✓
+```
+
+**讀到嘅結論：**
+
+1. **`preRaceMs`（唯一會食掃描窗口嘅那截）係 189–333ms，而且全部係 `claim`**；`json` 三次都係 **0**。
+   ⇒ 「payload CPU 貴」正式排除；平靜狀態下窗口係 4667–4811ms（唔貼 4200 deadline），10:53 嗰個
+   ≥2500ms preRace 係**離群值**（claim 由 ~200ms 跳到 ≥2.5s），唔係常態。
+2. **真正嘅大頭唔喺 preRace，而喺 `bump`：564–749ms**（cron counter 寫，用自己一個 raw `Db` client、
+   喺 `ensureInitialized` 之前）。加 `init`（~185ms）+ `gate`（~167ms）= handler 前置 **~0.9–1.1s**，
+   即係每個 tick 有大約 1.1–1.3s（entry → race）花喺掃描之前。呢截**唔食** race 窗口，但**食**
+   invocation 嘅 wall clock —— 即係「died before completion flush」嗰條線。
+3. `outage` 0ms（走 cache），`gate` 穩定 ~165ms（一次 read，同 `docs/push-baseline-ledger.md` 記嘅
+   ~110ms 同一個量級）。
+
+**可以減嘅位（未做，等決定）：**
+
+- `bump` 用**獨立** client（`new Db` + 一個 round trip，每 tick 一次連線）≈ 0.6–0.75s/tick。改成搭
+  claim batch（+0 round trip）可以直接回收大部分 —— 代價係「init 慢／死 tick 之前就冇咗 cron 到場
+  證明」嗰個原始保護（當初正是因為 init 慢而把 counter 提早）。而家有讀數：正常 envelope 係
+  3.5–5.0s / 9.5s，死喺 claim 之前嘅 tick 屬罕見。
+- `init`（~185ms）+ 首 tick 嘅 gate read 可以合併（兩者都係第一次 DB 接觸）。
+
+**順帶留意（唔係今次改動引起）**：`/health.heartbeat.summary.preTick` 係**完成**嗰個 tick 嘅快照，
+但模組內嘅 `preTick` 會被**之後任何一個 HTTP 請求**嘅 fallback 路徑重設（`maybeRunScanIfStale` 一入去
+就 `beginPreTick`），所以：
+
+- 讀 cron 拆帳要讀 **heartbeat 內嘅 `summary`**（flush 時序列化，唔受之後嘅請求影響）✔；
+- `/health.summary`（記憶體）或者 `/debug/tick` 讀到嘅，好可能係 **HTTP fallback** 嗰個 tick（`bump` / `init` / `gate` 全部 0、`preStartMs` ≈ dedupe read 嘅 ~100ms）—— 唔要攞嚟代表 cron。
+- 下一版值得加 `path: "cron" | "http"` 同「掃描進行中唔准重設 split」嘅守衛，令兩者一眼分得開。
