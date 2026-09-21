@@ -862,8 +862,20 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * counters (pool/candidates/pushed) are carried by the NEXT tick's row via
  * scanner.lastSummary. Deferred candidates stay in the re-eval pool, so a
  * shorter budget costs tick latency, never coin coverage.
+ *
+ * 2026-09-21 (reverted inside the hour): 9_500 → 12_000 was tried to fund the
+ * new post-flush tracker pass out of this same envelope, and the live
+ * signature of the 2026-09-15 outage came straight back — /debug/scan-history
+ * showed `previous tick died before its completion flush` 8 times in 40
+ * minutes (gaps 60-104s) because the race then ends at ~7.5s and the flush
+ * reserve runs to 12s, past the ~9.6s cron kill this envelope is sized
+ * against. The tracker pass does NOT need a wider envelope: the scan plus its
+ * completion flush settle at ~2.3-3.1s of the 9.5s (measured on the live
+ * heartbeat: `ms 2149`/`2201`/`2358` at flush), so the pass is funded from
+ * the tail that was already going unused. Never widen this number to make
+ * room for a new tail stage — the tail IS what is left after the flush.
  */
-const SCAN_TICK_BUDGET_MS = 12_000;
+const SCAN_TICK_BUDGET_MS = 9_500;
 /**
  * Wall-clock slice, taken at the END of a tick, for ONE post-push tracker
  * pass (see Scanner.runTrackerPass and pushwatch.TRACKER_TICK_BUDGET_MS).
@@ -880,8 +892,17 @@ const SCAN_TICK_BUDGET_MS = 12_000;
  * flush, so a slow pass can never cost the tick its completion write, which is
  * the one loss the whole dead-tick machinery exists to prevent. A pass that
  * overruns its slice is clamped by the next tick's budget, not by the scan.
+ *
+ * 2026-09-21: 2_500 → 3_500, measured rather than guessed. /health's
+ * `summary.pushWatch` on the live tick read
+ * `allow 2500 spend[setup 746/3 heal 2926/7 pairs 0/0 rows 0/0] trips 10`:
+ * the pass starts at ~2.5-3.5s of the 9.5s envelope (flush ms 2.3-3.1s plus a
+ * ~300ms deferral sync), so 3_500 has the pass ending by ~7s and still leaves
+ * TRACKER_PASS_TAIL_MS and ~1.5s of margin against the ~9.6s kill. The same
+ * line is why the allowance was not the only thing wrong — a housekeeping
+ * stage had already eaten the whole 2_500 (see pushwatch.TRACKER_HEAL_BUDGET_MS).
  */
-const TRACKER_PASS_BUDGET_MS = 2_500;
+const TRACKER_PASS_BUDGET_MS = 3_500;
 /**
  * Tick tail kept clear after the tracker pass for the tick's own bookkeeping
  * (streak counters, an isolate rebuild's re-init, the scan-lock safety
@@ -2766,6 +2787,20 @@ export default {
       } catch {
         // telemetry only — never fail /health over the mode read
       }
+      // The last tracker pass's coverage line, read from Turso rather than
+      // from this isolate's scanner: the pass persists it (see
+      // Scanner.runTrackerPass), which is what lets the STAGE SPLIT be read
+      // from any isolate. The in-memory copy in `summary.pushWatch` is only
+      // populated when the next tick lands on the same isolate, so on the
+      // 2026-09-21 stall it was usually absent — the one number that explained
+      // the zero-row tracker was the one number /health could not show.
+      let pushWatchPass: unknown = null;
+      try {
+        const rawPass = await db?.getWorkerState("push_watch_pass");
+        pushWatchPass = rawPass ? JSON.parse(rawPass) : null;
+      } catch {
+        pushWatchPass = null;
+      }
       // Cross-isolate cron diagnostics: the scheduled handler persists a
       // running total + last event time to Turso, so any isolate serving
       // /health can prove whether the Cron Trigger is actually delivering.
@@ -2840,6 +2875,7 @@ export default {
         heartbeat,
         lastScanGapMs,
         summary: scanner?.lastSummary ?? null,
+        pushWatchPass,
         now: new Date().toISOString(),
       });
     }
@@ -2874,6 +2910,13 @@ export default {
         let scheduledTickTotal: number | null = null;
         let scheduledTickAt: number | null = null;
         let outageAlertAt: number | null = null;
+        // The last tracker pass's coverage line, as persisted by the pass
+        // itself (see Scanner.runTrackerPass): the stage split that explains
+        // HOW a rotation tick was spent, on the page built for exactly this
+        // kind of forensics. In-memory carrying reached /health only when the
+        // next tick landed on the same isolate (rare in practice), which is
+        // why the 2026-09-21 stall had no stage split to read.
+        let pushWatchPass: unknown = null;
         try {
           const rawRing = await db?.getWorkerState("scheduled_tick_ring");
           if (rawRing) {
@@ -2885,9 +2928,11 @@ export default {
           const rawTotal = await db?.getWorkerState("scheduled_tick_total");
           const rawAt = await db?.getWorkerState("scheduled_tick_at");
           const rawAlert = await db?.getWorkerState("outage_alert_at");
+          const rawPass = await db?.getWorkerState("push_watch_pass");
           scheduledTickTotal = rawTotal ? parseInt(rawTotal, 10) || 0 : null;
           scheduledTickAt = rawAt ? parseInt(rawAt, 10) || 0 : null;
           outageAlertAt = rawAlert ? Number(rawAlert) : null;
+          pushWatchPass = rawPass ? JSON.parse(rawPass) : null;
         } catch {
           // telemetry only — never fail the endpoint over these reads
         }
@@ -2906,6 +2951,7 @@ export default {
             pushed: r.pushed,
           })),
           gaps: gaps.slice(0, 20),
+          pushWatchPass,
           scheduledTickTotal,
           scheduledTickAt: scheduledTickAt
             ? new Date(scheduledTickAt).toISOString()

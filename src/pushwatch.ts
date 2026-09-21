@@ -78,8 +78,7 @@ import {
  * silent row (~110-200ms each) plus any card sends — which are gated
  * separately by TRACKER_SEND_MIN_MS, not by this number.
  */
-const TRACKER_TICK_BUDGET_MS = 2_500;
-/**
+const TRACKER_TICK_BUDGET_MS = 3_500;
 /**
  * Budget reserved BEFORE a row is claimed (see the row loop). A SILENT row —
  * nothing to announce, which is nearly every row on nearly every pass — costs
@@ -96,6 +95,48 @@ const TRACKER_TICK_BUDGET_MS = 2_500;
  * rotation measured in tens of minutes (live 2026-09-21).
  */
 const TRACKER_ROW_MIN_MS = 300;
+/**
+ * Slice the SELF-HEAL stage may spend before it stands down and leaves the
+ * rest of the pass to the rotation. Measured live 2026-09-21 03:12Z with the
+ * stage clock on, this is the stage that stopped the whole tracker:
+ *
+ *   `ok:0/0 deferred:tick-budget allow 2500 spend[setup 746/3 heal 2926/7
+ *    pairs 0/0 rows 0/0 holders 0/0] trips 10`
+ *
+ * The heal alone outran the entire allowance (its path — untracked-push
+ * listing, delivered-card proof, push ledger, trade mode, one DexScreener
+ * batch, the batched enroll INSERT and the audit row — is five to seven
+ * store round trips at ~250-420ms each), so the pair batch never dispatched,
+ * the row loop never ran, and the pass returned `deferred` with ZERO rows
+ * evaluated on every tick: a 29-row rotation whose oldest row was 99 minutes
+ * stale while /health read healthy, and the same heal work redone next tick.
+ * The heal is a backstop (a push whose enrollment hook never ran), so it may
+ * never eat the rotation's slice. The cap is sized to COMPLETE the stage when
+ * the batch answers: the measured 2_926ms is seven round trips at the slow
+ * end of the live range (~420ms), so 2_600 holds a working heal (and is what
+ * lets a chronic one actually finish and stop being chronic) while still
+ * leaving the reserve below untouched — the same seven trips at the healthy
+ * ~250ms are ~1_750ms.
+ */
+const TRACKER_HEAL_BUDGET_MS = 2_600;
+/**
+ * Room the heal needs before it is even started. Below this the stage is
+ * skipped whole and says so in the coverage note (`heal-skipped`), costing
+ * the rotation nothing: the missing pushes are re-offered on the next pass by
+ * the same listing. Its listing alone is one round trip (~250-420ms live).
+ */
+const TRACKER_HEAL_MIN_MS = 450;
+/**
+ * Rows the pass reserves for the ROTATION before any housekeeping stage may
+ * spend anything: the pair batch (TRACKER_PAIRS_BUDGET_MS) plus this many
+ * rows at TRACKER_ROW_MIN_MS each. The 2026-09-21 stall was housekeeping (the
+ * heal) spending what the rows needed, so every optional stage's deadline is
+ * now derived by SUBTRACTING this instead of hoping the rows still fit.
+ * Two rows (plus the batch) is the floor that keeps a rotation moving even on
+ * a tick where the heal had real work; a pass with nothing to heal gets the
+ * whole allowance and runs the head.
+ */
+const TRACKER_ROW_RESERVE = 2;
 /**
  * Hard ceiling on the time ONE ROW may spend sending its cards. A row can
  * carry up to four 🚀 stage cards and the sends were awaited with NOTHING
@@ -1124,9 +1165,21 @@ export class PushWatcher {
       rows: { ms: 0, trips: 0 }, // the row loop: claim, reserve, send, write
       holders: { ms: 0, trips: 0 }, // Birdeye holder probes (additive)
     };
+    // Self-heal OUTCOME, next to its clock: the trips count alone cannot tell
+    // a chronic heal (the same missing pushes re-read every tick) from a
+    // one-off, and it cannot show that the stage was skipped for room or cut
+    // at its slice. `heal 1800/7 miss3 enrolled3`, `heal-cut 1000/4 miss3
+    // enrolled0` and `heal-skipped 40/0 miss0 enrolled0` are the three shapes
+    // the 2026-09-21 stall hid behind.
+    let healMissing = 0;
+    let healEnrolled = 0;
+    let healCut = false;
+    let healSkipped = false;
     const stageNote = () =>
       `allow ${budgetMs} spend[setup ${spent.setup.ms}/${spent.setup.trips}` +
-      ` heal ${spent.heal.ms}/${spent.heal.trips}` +
+      ` heal${healSkipped ? "-skipped" : healCut ? "-cut" : ""}` +
+      ` ${spent.heal.ms}/${spent.heal.trips}` +
+      ` miss${healMissing} enrolled${healEnrolled}` +
       ` pairs ${spent.pairs.ms}/${spent.pairs.trips}` +
       ` rows ${spent.rows.ms}/${spent.rows.trips}` +
       ` holders ${spent.holders.ms}/${spent.holders.trips}]`;
@@ -1232,12 +1285,31 @@ export class PushWatcher {
     // actually missing; a no-pair coin retries on the next tick.
     const healStart = Date.now();
     const healTrips = trips;
+    // The heal's slice: its own cap, and never past the rotation's reserve
+    // (see TRACKER_HEAL_BUDGET_MS / TRACKER_ROW_RESERVE). Everything below is
+    // bounded by it, so a chronic heal costs the pass a slice instead of the
+    // whole allowance.
+    const healDeadline = Math.min(
+      healStart + TRACKER_HEAL_BUDGET_MS,
+      deadline -
+        (TRACKER_PAIRS_BUDGET_MS + TRACKER_ROW_RESERVE * TRACKER_ROW_MIN_MS),
+    );
+    const healPast = () => Date.now() > healDeadline;
+    if (healDeadline - healStart < TRACKER_HEAL_MIN_MS) healSkipped = true;
     try {
-      trips += 1;
-      const missing = await this.db.findUntrackedPushes(
-        now - cfg.windowHours * 3_600_000,
-        10,
-      );
+      let missing: Array<{
+        token: string;
+        chatId: string;
+        pushedAt: number;
+      }> = [];
+      if (!healSkipped) {
+        trips += 1;
+        missing = await this.db.findUntrackedPushes(
+          now - cfg.windowHours * 3_600_000,
+          10,
+        );
+        healMissing = missing.length;
+      }
       if (missing.length > 0) {
         // Two reads hoisted out of the per-coin loop: the audit ring is ONE
         // worker_state row (hasInitialPushAudit re-read it for every coin) and
@@ -1300,10 +1372,21 @@ export class PushWatcher {
         } | null = null;
         // Call-time deadline, like the head batch above: this stage runs even
         // LATER in the pass than that batch does, so a `now`-based cap here is
-        // always already spent.
+        // always already spent. Clamped to the heal's own slice as well: past
+        // it the client's dispatch guard answers an EMPTY map (it refuses to
+        // issue the request at all), which is exactly what a cut stage means —
+        // nothing is enrolled or re-sent off a request that never went out,
+        // and the next pass re-reads the same missing tokens. Marking the cut
+        // is what makes a starved heal visible in the note instead of it
+        // looking like "those coins have no pairs".
+        if (healPast()) healCut = true;
         const missPairs = await this.pairsFor(
           missing.map((m) => m.token),
-          Date.now() + TRACKER_PAIRS_BUDGET_MS,
+          Date.now() +
+            Math.max(
+              0,
+              Math.min(TRACKER_PAIRS_BUDGET_MS, healDeadline - Date.now()),
+            ),
         );
         for (const m of missing) {
           const pair = missPairs.get(m.token);
@@ -1422,6 +1505,7 @@ export class PushWatcher {
           });
           if (resent) continue; // fresh card just went out — skip holder seed noise
         }
+        healEnrolled = enroll.length;
         // ONE round trip for every healed coin (was one per coin). The insert
         // is idempotent (ON CONFLICT DO NOTHING) and the self-heal re-runs next
         // tick, so batching late cannot lose an enrollment.

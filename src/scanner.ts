@@ -280,6 +280,14 @@ const CARD_SEND_FLOOR_MS = 600;
  */
 const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
 /**
+ * Wall clock the tracker pass's durable coverage write may spend (see
+ * runTrackerPass). It is telemetry, so it is raced against this bound like the
+ * deferral-counter sync: a hung Turso write must never carry the tick past the
+ * pass's own deadline, and a write that lands late is harmless (same key, same
+ * shape).
+ */
+const PUSH_WATCH_PASS_STATE_BOUND_MS = 400;
+/**
  * Least send slice worth starting. Below it the card is DEFERRED rather than
  * attempted: a deferral writes NOTHING (no claim, no audit, no failure record)
  * and the re-eval pool plus the deferred registry re-push the coin next tick,
@@ -1732,6 +1740,32 @@ export class Scanner {
           pw.recoveredUndelivered ?? 0,
         );
         this.lastSummary.trackerMs = Date.now() - startedAt;
+      }
+      // DURABLE copy of the coverage line. The in-memory carries above only
+      // reach /health when the next tick's flush happens to run on THIS
+      // isolate, and on 2026-09-21 that was the exception, not the rule: four
+      // consecutive /health polls showed no note at all while the pass was
+      // demonstrably running, so the stage split that explained the whole
+      // rotation stall was unreadable exactly when it mattered. One
+      // worker_state row makes it survive its isolate (/health.pushWatchPass,
+      // /debug/scan-history.pushWatchPass). Bounded and best-effort — see
+      // PUSH_WATCH_PASS_STATE_BOUND_MS.
+      try {
+        await Promise.race([
+          this.db.setWorkerState(
+            "push_watch_pass",
+            JSON.stringify({
+              at: Date.now(),
+              note,
+              trackerMs: Date.now() - startedAt,
+            }),
+          ),
+          new Promise((resolve) =>
+            setTimeout(resolve, PUSH_WATCH_PASS_STATE_BOUND_MS),
+          ),
+        ]);
+      } catch {
+        /* telemetry only */
       }
       return note;
     } catch (err) {

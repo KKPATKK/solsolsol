@@ -4551,6 +4551,71 @@ async function main() {
     );
   });
 
+  await test("PushWatcher: a chronic self-heal is cut at its slice instead of eating the pass", async () => {
+    // Live 2026-09-21 03:12Z, the pass's own stage clock, verbatim:
+    //   `ok:0/0 deferred:tick-budget allow 2500 spend[setup 746/3 heal 2926/7
+    //    pairs 0/0 rows 0/0 holders 0/0] trips 10`
+    // The self-heal's path is five to seven store round trips; against a
+    // 2_500ms allowance it spent 2_926ms, so the pass deferred BEFORE the pair
+    // batch and the row loop — zero rows evaluated, tick after tick, while the
+    // note read healthy and the same work was redone on the next pass. The old
+    // 29-row rotation's oldest row measured 99 minutes stale.
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const updated = [];
+    const slow = (ms) => new Promise((r) => setTimeout(r, ms));
+    const db = {
+      ...watchDb(rows, updated),
+      findUntrackedPushes: async () => [
+        { token: "MISS1", chatId: "c", pushedAt: Date.now() - 300_000 },
+      ],
+      // The heal's own reads: the delivered-card ring, the unconfirmed-send
+      // record and the push ledger are one worker_state row each in
+      // production, ~250-420ms apiece live.
+      getWorkerState: async () => { await slow(600); return null; },
+      getInitialPushAuditTokens: async () => { await slow(600); return new Set(); },
+    };
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick(Date.now() + 2_500);
+    assert.ok(
+      out.checked >= 1,
+      `the rotation must still be served behind a chronic heal, got ${out.checked} rows`,
+    );
+    assert.match(String(out.note), /heal-cut/, `a heal stopped at its slice says so: ${out.note}`);
+    assert.match(String(out.note), /miss1/, `the note names what the listing found: ${out.note}`);
+  });
+
+  await test("PushWatcher: a self-heal with no room stands down whole, not mid-path", async () => {
+    // The other half of the same guarantee: when the tick hands the pass a
+    // short allowance (a slow completion flush), the heal must not start, spend
+    // its round trips and THEN let the pass defer — the rotation keeps the
+    // whole slice, and the missing pushes are re-offered by the next listing.
+    const rows = [watchRow("AAA")];
+    const updated = [];
+    let healReads = 0;
+    const db = {
+      ...watchDb(rows, updated),
+      findUntrackedPushes: async () => {
+        healReads += 1;
+        return [{ token: "MISS1", chatId: "c", pushedAt: Date.now() - 300_000 }];
+      },
+      getWorkerState: async () => null,
+      getInitialPushAuditTokens: async () => { healReads += 1; return new Set(); },
+    };
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick(Date.now() + 900);
+    assert.match(String(out.note), /heal-skipped/, `note: ${out.note}`);
+    assert.equal(healReads, 0, "a skipped heal makes no call at all");
+    assert.ok(out.checked >= 1, `rows: ${out.checked}`);
+  });
+
   await test("PushWatcher: a pair batch that resolved NOTHING is a failed fetch, not a screen of dead coins", async () => {
     // Live 2026-09-21 02:18-02:23Z, with the pass's stage clock on:
     // `pairs 0/6 miss 6` pass after pass while all six head tokens still had
