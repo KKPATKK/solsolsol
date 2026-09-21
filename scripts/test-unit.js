@@ -5074,7 +5074,9 @@ async function main() {
   await test("PushWatcher: a hanging Birdeye holder probe is capped and skipped", async () => {
     // The holder probe is purely additive (nothing is reserved before it and
     // holders_checked_at is only written on success), so a miss costs nothing
-    // and is retried next tick — it must never hold the pass open.
+    // beyond its own cap and never holds the pass open — the row is parked for
+    // TRACKER_HOLDER_BACKOFF_MS instead of re-burning the cap next tick (see
+    // the park test below).
     const rows = [watchRow("AAA")];
     const updated = [];
     let probes = 0;
@@ -5092,6 +5094,53 @@ async function main() {
     assert.equal(probes, 1, "the probe is attempted once");
     assert.equal(out.checked, 1);
     assert.ok(elapsed < 2_000, `the pass must return near the holder cap, took ${elapsed}ms`);
+  });
+
+  await test("PushWatcher: a MISSED holder probe parks its row (held N) and a success clears the park", async () => {
+    // Measured live 2026-09-21: `holders 1600/0` on every pass — four probes
+    // (4 × the 400ms cap of the day) burning 45% of a 3_560ms pass while every
+    // holders_checked_at row sat 15-20h stale, because a miss writes nothing
+    // and the due list (oldest-check first) re-offered the same slow head
+    // forever. The park is what lets the rows behind it take their turn.
+    const rows = [watchRow("AAA")];
+    const updated = [];
+    const holderWrites = [];
+    let probes = 0;
+    const db = {
+      ...watchDb(rows, updated),
+      setPushWatchHolders: async (token, count) => {
+        holderWrites.push([token, count]);
+      },
+    };
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      {
+        getTokenOverview: async () => {
+          probes += 1;
+          // The first probe misses its cap; every later one answers.
+          if (probes === 1) return new Promise(() => {});
+          return { holderCount: 123 };
+        },
+      },
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const first = await pw.runTick();
+    assert.equal(probes, 1, "the first pass probes once and misses");
+    assert.doesNotMatch(String(first.note), /held[1-9]/, `nothing is parked yet: ${first.note}`);
+    const second = await pw.runTick();
+    assert.equal(probes, 1, "the parked row is not probed again while the backoff holds");
+    assert.match(String(second.note), /held1/, `the note names the parked row: ${second.note}`);
+    // The park expires on its own: age the entry out, and the row is probed
+    // again — and this time the probe answers, so the park is cleared.
+    pw.holdersFailedAt.set("AAA", Date.now() - 11 * 60_000);
+    const third = await pw.runTick();
+    assert.equal(probes, 2, "an expired park is retried");
+    assert.deepEqual(holderWrites, [["AAA", 123]], "the count lands once");
+    assert.equal(pw.holdersFailedAt.has("AAA"), false, "a success clears the park");
+    assert.match(String(third.note), /holders \d+\/1/, `the stage reports the write: ${third.note}`);
   });
 
   await test("PushWatcher: a silent row claims and writes in ONE round trip, and only when it fits", async () => {

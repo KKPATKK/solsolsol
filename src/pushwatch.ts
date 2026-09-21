@@ -183,8 +183,34 @@ const TRACKER_SEND_MIN_MS = 350;
  * success, so a miss costs nothing and is retried on the next tick. It was
  * the other unbounded await in the pass (a cold Birdeye round trip is
  * ~400-1500ms against a 1000ms budget).
+ *
+ * 2026-09-21: 400 → 1_200, measured. Once the rotation was funded (see
+ * TRACKER_TICK_BUDGET_MS) this stage became the LARGEST line item of the
+ * pass and the only one producing nothing: the live pass note read
+ * `holders 1600/0` — four probes (4 × this cap) burning 45% of a 3_560ms
+ * pass with ZERO holder counts written — while every `holders_checked_at`
+ * row in `push_watch` was 15-20h stale. The endpoint was healthy the whole
+ * time (`/debug/birdeye-overview` on live tracked mints: 303 / 305 / 673 /
+ * 816 / 907 / 2_870 ms), i.e. 400ms sat below the endpoint's own common
+ * latency AND the due list (oldest-check first, misses write nothing) only
+ * ever re-offered those same slow rows — so the stage timed out on the same
+ * four rows on every pass, forever. 1_200 covers the measured common range
+ * and still respects the row loop: the probe only starts when the whole cap
+ * fits inside the pass deadline, so the rotation always runs first.
  */
-const TRACKER_HOLDER_CAP_MS = 400;
+const TRACKER_HOLDER_CAP_MS = 1_200;
+/**
+ * Park a row whose holder probe MISSED its cap for this long — the stage's
+ * negative cache (the same pattern as Scanner's `dataFailedAt`). Without it
+ * a slow row keeps its place at the head of the due list (a miss writes
+ * nothing, so `holders_checked_at` stays oldest) and re-burns the cap on
+ * every pass while the fast rows behind it never get a turn: measured
+ * 2026-09-21 as 12 rows pinned at 15-20h staleness with `holders 1600/0`
+ * pass after pass. Ten minutes sits well under the 30-minute refresh
+ * interval (PUSH_WATCH_HOLDERS_REFRESH_MIN), so a parked row still gets ~3
+ * attempts per refresh window, and only MISSES park — a success clears it.
+ */
+const TRACKER_HOLDER_BACKOFF_MS = 10 * 60_000;
 /**
  * Hard cap on the tracker's OWN DexScreener batch (the pass's one mandatory
  * request, handed to the client as a caller deadline so it stops dispatching
@@ -940,6 +966,13 @@ export class PushWatcher {
    */
   private readonly pendingUndelivered = new Set<string>();
   /**
+   * Rows whose holder probe missed its cap, and when (see
+   * TRACKER_HOLDER_BACKOFF_MS). Entries expire as the stage walks them, so
+   * the map stays bounded by the watch listing — the only rows the stage
+   * ever looks at.
+   */
+  private readonly holdersFailedAt = new Map<string, number>();
+  /**
    * TERMINAL cards (the 💧 drain card) whose send was ABANDONED this isolate
    * has seen: the race stopped waiting while the request was still in flight,
    * so the card may or may not be in the chat. Cumulative for /health (the
@@ -1168,7 +1201,7 @@ export class PushWatcher {
       heal: { ms: 0, trips: 0 }, // untracked-push self-heal (reads + 補發)
       pairs: { ms: 0, trips: 0 }, // the head pair batch (one request)
       rows: { ms: 0, trips: 0 }, // the row loop: claim, reserve, send, write
-      holders: { ms: 0, trips: 0 }, // Birdeye holder probes (additive)
+      holders: { ms: 0, trips: 0 }, // Birdeye holder probes (additive; see TRACKER_HOLDER_CAP_MS)
     };
     // Self-heal OUTCOME, next to its clock: the trips count alone cannot tell
     // a chronic heal (the same missing pushes re-read every tick) from a
@@ -1180,6 +1213,13 @@ export class PushWatcher {
     let healEnrolled = 0;
     let healCut = false;
     let healSkipped = false;
+    // Holder-stage visibility, next to its clock: `holders 1200/1` alone
+    // cannot tell "one probe landed" from "four probes timed out and one row
+    // is parked", because the trips count only counts a probe that actually
+    // WROTE a count (both shapes read 0 on a miss). Same reasoning as the
+    // heal's miss/enrolled pair.
+    let holdersHeld = 0;
+    let holdersCut = 0;
     const stageNote = () =>
       `allow ${budgetMs} spend[setup ${spent.setup.ms}/${spent.setup.trips}` +
       ` heal${healSkipped ? "-skipped" : healCut ? "-cut" : ""}` +
@@ -1187,7 +1227,8 @@ export class PushWatcher {
       ` miss${healMissing} enrolled${healEnrolled}` +
       ` pairs ${spent.pairs.ms}/${spent.pairs.trips}` +
       ` rows ${spent.rows.ms}/${spent.rows.trips}` +
-      ` holders ${spent.holders.ms}/${spent.holders.trips}]`;
+      ` holders ${spent.holders.ms}/${spent.holders.trips}` +
+      ` held${holdersHeld} cut${holdersCut}]`;
     const deferred = {
       checked: 0,
       alerted: 0,
@@ -2040,7 +2081,20 @@ export class PushWatcher {
     const holdersStart = Date.now();
     const holdersTrips = trips;
     if (this.birdeye && cfg.maxHolderChecksPerTick > 0) {
-      const due = activeRows
+      // A row that MISSED its probe is parked (see TRACKER_HOLDER_BACKOFF_MS)
+      // and dropped BEFORE the slice, so a slow head cannot hold the stage's
+      // slots while the rows behind it — the ones that answer inside the cap —
+      // wait for turns that never come.
+      const parked = (r: PushWatchRow) => {
+        const failedAt = this.holdersFailedAt.get(r.token);
+        if (failedAt === undefined) return false;
+        if (now - failedAt >= TRACKER_HOLDER_BACKOFF_MS) {
+          this.holdersFailedAt.delete(r.token);
+          return false;
+        }
+        return true;
+      };
+      const head = activeRows
         .filter(
           (r) =>
             pairs.has(r.token) &&
@@ -2049,13 +2103,20 @@ export class PushWatcher {
         )
         .sort((a, b) => (a.holdersCheckedAt ?? 0) - (b.holdersCheckedAt ?? 0))
         .slice(0, cfg.maxHolderChecksPerTick);
-      for (const r of due) {
+      const due = head.filter((r) => !parked(r));
+      holdersHeld = head.length - due.length;
+      for (let i = 0; i < due.length; i++) {
+        const r = due[i];
         // Holder counts are a slow-moving card detail; drop the rest of the
         // batch rather than carry the tick past its window. The check reserves
         // the probe's own cap (not just "are we past the deadline?"), and the
         // probe itself is raced — it was one of the two unbounded awaits in
         // the pass.
-        if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) break;
+        if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) {
+          holdersCut = due.length - i;
+          break;
+        }
+        let wrote = false;
         try {
           const overview = await this.bounded(
             this.birdeye.getTokenOverview(r.token),
@@ -2065,6 +2126,7 @@ export class PushWatcher {
           if (overview && overview.holderCount !== null) {
             trips += 1;
             await this.db.setPushWatchHolders(r.token, overview.holderCount, now);
+            wrote = true;
           }
         } catch (err) {
           console.error(
@@ -2072,6 +2134,10 @@ export class PushWatcher {
             err instanceof Error ? err.message : err,
           );
         }
+        // Only a probe that WROTE a count clears the park: a timeout, a
+        // malformed body and a throw all mean "no holder data this time".
+        if (wrote) this.holdersFailedAt.delete(r.token);
+        else this.holdersFailedAt.set(r.token, Date.now());
       }
     }
     spent.holders.ms = Date.now() - holdersStart;

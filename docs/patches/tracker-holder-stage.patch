@@ -1,0 +1,193 @@
+Subject: Tracker holder stage: measured cap, per-row park, and stage markers
+
+Live measurement 2026-09-21 04:12Z, `push_watch_pass.note`:
+  ok:10/0 rows 10/23 pairs 10/10 miss 0 lost 0 allow 5000
+  spend[setup 327/3 heal 109/1 miss0 enrolled0 pairs 204/0 rows 1320/10
+        holders 1600/0] trips 14
+
+The rotation is back (10 rows/pass over 23 active rows = ~3 passes ≈ 3 min),
+and the stage split now names what is left: `holders 1600/0` — four probes
+(4 × the old 400ms cap) burning ~45% of the pass and writing NOTHING, while
+every `holders_checked_at` row in `push_watch` sat 15-20h stale. The endpoint
+itself was healthy (`/debug/birdeye-overview` on live tracked mints: 303 /
+305 / 673 / 816 / 907 / 2_870 ms), so 400ms sat below its own common latency,
+and because a miss writes nothing the due list (oldest-check first) re-offered
+the same slow head on every pass.
+
+Fix, three parts:
+  - cap 400 → 1_200ms (covers the measured common range);
+  - a MISS now parks that row for TRACKER_HOLDER_BACKOFF_MS (10 min, under the
+    30-min refresh interval), so a slow row cannot hold the stage's slots
+    while the rows behind it never get a turn;
+  - the stage reports `held N cut M` next to its clock, so a starved holder
+    stage is visible in /health instead of hiding behind `holders 1600/0`.
+
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -1212,15 +1212,23 @@
+     let healMissing = 0;
+     let healEnrolled = 0;
+     let healCut = false;
+     let healSkipped = false;
++    // Holder-stage visibility, next to its clock: `holders 1200/1` alone
++    // cannot tell "one probe landed" from "four probes timed out and one row
++    // is parked", because the trips count only counts a probe that actually
++    // WROTE a count (both shapes read 0 on a miss). Same reasoning as the
++    // heal's miss/enrolled pair.
++    let holdersHeld = 0;
++    let holdersCut = 0;
+     const stageNote = () =>
+       `allow ${budgetMs} spend[setup ${spent.setup.ms}/${spent.setup.trips}` +
+       ` heal${healSkipped ? "-skipped" : healCut ? "-cut" : ""}` +
+       ` ${spent.heal.ms}/${spent.heal.trips}` +
+       ` miss${healMissing} enrolled${healEnrolled}` +
+       ` pairs ${spent.pairs.ms}/${spent.pairs.trips}` +
+       ` rows ${spent.rows.ms}/${spent.rows.trips}` +
+-      ` holders ${spent.holders.ms}/${spent.holders.trips}]`;
++      ` holders ${spent.holders.ms}/${spent.holders.trips}` +
++      ` held${holdersHeld} cut${holdersCut}]`;
+     const deferred = {
+       checked: 0,
+       alerted: 0,
+@@ -2073,16 +2081,32 @@
+     const holdersStart = Date.now();
+     const holdersTrips = trips;
+     if (this.birdeye && cfg.maxHolderChecksPerTick > 0) {
+-      const due = activeRows
+-        .filter(
+-          (r) =>
+-            pairs.has(r.token) &&
+-            (r.holdersCheckedAt === null ||
+-              now - r.holdersCheckedAt >= cfg.holdersRefreshMin * 60_000),
+-        )
+-        .sort((a, b) => (a.holdersCheckedAt ?? 0) - (b.holdersCheckedAt ?? 0))
+-        .slice(0, cfg.maxHolderChecksPerTick);
+-      for (const r of due) {
++      // A row that MISSED its probe is parked (see TRACKER_HOLDER_BACKOFF_MS)
++      // and dropped BEFORE the slice, so a slow head cannot hold the stage's
++      // slots while the rows behind it — the ones that answer inside the cap —
++      // wait for turns that never come.
++      const parked = (r: PushWatchRow) => {
++        const failedAt = this.holdersFailedAt.get(r.token);
++        if (failedAt === undefined) return false;
++        if (now - failedAt >= TRACKER_HOLDER_BACKOFF_MS) {
++          this.holdersFailedAt.delete(r.token);
++          return false;
++        }
++        return true;
++      };
++      const head = activeRows
++        .filter(
++          (r) =>
++            pairs.has(r.token) &&
++            (r.holdersCheckedAt === null ||
++              now - r.holdersCheckedAt >= cfg.holdersRefreshMin * 60_000),
++        )
++        .sort((a, b) => (a.holdersCheckedAt ?? 0) - (b.holdersCheckedAt ?? 0))
++        .slice(0, cfg.maxHolderChecksPerTick);
++      const due = head.filter((r) => !parked(r));
++      holdersHeld = head.length - due.length;
++      for (let i = 0; i < due.length; i++) {
++        const r = due[i];
+         // Holder counts are a slow-moving card detail; drop the rest of the
+         // batch rather than carry the tick past its window. The check reserves
+         // the probe's own cap (not just "are we past the deadline?"), and the
+@@ -2091,21 +2115,30 @@
+         // the pass.
+-        if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) break;
++        if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) {
++          holdersCut = due.length - i;
++          break;
++        }
++        let wrote = false;
+         try {
+           const overview = await this.bounded(
+             this.birdeye.getTokenOverview(r.token),
+             TRACKER_HOLDER_CAP_MS,
+             null,
+           );
+           if (overview && overview.holderCount !== null) {
+             trips += 1;
+             await this.db.setPushWatchHolders(r.token, overview.holderCount, now);
++            wrote = true;
+           }
+         } catch (err) {
+           console.error(
+             "[push-watch] holder refresh failed:",
+             err instanceof Error ? err.message : err,
+           );
+         }
++        // Only a probe that WROTE a count clears the park: a timeout, a
++        // malformed body and a throw all mean "no holder data this time".
++        if (wrote) this.holdersFailedAt.delete(r.token);
++        else this.holdersFailedAt.set(r.token, Date.now());
+       }
+     }
+     spent.holders.ms = Date.now() - holdersStart;
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -5074,7 +5074,9 @@
+   await test("PushWatcher: a hanging Birdeye holder probe is capped and skipped", async () => {
+     // The holder probe is purely additive (nothing is reserved before it and
+     // holders_checked_at is only written on success), so a miss costs nothing
+-    // and is retried next tick — it must never hold the pass open.
++    // beyond its own cap and never holds the pass open — the row is parked for
++    // TRACKER_HOLDER_BACKOFF_MS instead of re-burning the cap next tick (see
++    // the park test below).
+     const rows = [watchRow("AAA")];
+     const updated = [];
+     let probes = 0;
+@@ -5093,6 +5095,53 @@
+     assert.equal(probes, 1, "the probe is attempted once");
+     assert.equal(out.checked, 1);
+     assert.ok(elapsed < 2_000, `the pass must return near the holder cap, took ${elapsed}ms`);
+   });
+ 
++  await test("PushWatcher: a MISSED holder probe parks its row (held N) and a success clears the park", async () => {
++    // Measured live 2026-09-21: `holders 1600/0` on every pass — four probes
++    // (4 × the 400ms cap of the day) burning 45% of a 3_560ms pass while every
++    // holders_checked_at row sat 15-20h stale, because a miss writes nothing
++    // and the due list (oldest-check first) re-offered the same slow head
++    // forever. The park is what lets the rows behind it take their turn.
++    const rows = [watchRow("AAA")];
++    const updated = [];
++    const holderWrites = [];
++    let probes = 0;
++    const db = {
++      ...watchDb(rows, updated),
++      setPushWatchHolders: async (token, count) => {
++        holderWrites.push([token, count]);
++      },
++    };
++    const pw = new PushWatcher(
++      db,
++      watchBot,
++      {
++        getTokenOverview: async () => {
++          probes += 1;
++          // The first probe misses its cap; every later one answers.
++          if (probes === 1) return new Promise(() => {});
++          return { holderCount: 123 };
++        },
++      },
++      loadConfig({}),
++      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
++      null,
++    );
++    const first = await pw.runTick();
++    assert.equal(probes, 1, "the first pass probes once and misses");
++    assert.doesNotMatch(String(first.note), /held[1-9]/, `nothing is parked yet: ${first.note}`);
++    const second = await pw.runTick();
++    assert.equal(probes, 1, "the parked row is not probed again while the backoff holds");
++    assert.match(String(second.note), /held1/, `the note names the parked row: ${second.note}`);
++    // The park expires on its own: age the entry out, and the row is probed
++    // again — and this time the probe answers, so the park is cleared.
++    pw.holdersFailedAt.set("AAA", Date.now() - 11 * 60_000);
++    const third = await pw.runTick();
++    assert.equal(probes, 2, "an expired park is retried");
++    assert.deepEqual(holderWrites, [["AAA", 123]], "the count lands once");
++    assert.equal(pw.holdersFailedAt.has("AAA"), false, "a success clears the park");
++    assert.match(String(third.note), /holders \d+\/1/, `the stage reports the write: ${third.note}`);
++  });
++
+   await test("PushWatcher: a silent row claims and writes in ONE round trip, and only when it fits", async () => {
