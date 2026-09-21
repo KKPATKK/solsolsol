@@ -2134,3 +2134,102 @@ export class PushWatcher {
     return { rearmed, trips };
   }
 }
+
+/**
+ * TERMINAL-ROW HYGIENE (the "Bruce" class).
+ *
+ * A 💧 drain row is the one terminal transition the tracker produces by
+ * CONSUMING an alert, and `push_watch` records it in two columns written at
+ * two different moments inside the same pass:
+ *
+ *   - `last_alert_at` — `reservePushWatchAlert` writes the pass's `now`;
+ *   - `last_checked` — `claimPushWatch` writes that same `now`, and then the
+ *     completion write re-stamps it with a FRESH `Date.now()`
+ *     (Db.updatePushWatchCheck), i.e. AFTER the row's card was delivered.
+ *
+ * A well-formed drain row therefore has `0 < last_checked - last_alert_at`,
+ * the delta being the part of the pass that ran after the reserve — the send.
+ * Two shapes break that, and both are provable from the row alone:
+ *
+ *   - `last_alert_at === last_checked` — the completion write never landed
+ *     (the isolate died between the reserve and the flush, the dead-tick
+ *     shape). The row is frozen at claim+reserve: its measurements are a pass
+ *     stale and the card's delivery is unproven. It cannot happen otherwise,
+ *     because the completion stamp is a fresh clock read taken after the send.
+ *   - `last_alert_at === 0`, or arbitrarily far behind `last_checked` — no
+ *     alert was ever armed behind the transition: an older single-column
+ *     writer (`setPushWatchState`, which touches only `last_state`) recorded 💧
+ *     semantics it never accounted for. The card may never have been sent
+ *     while the row sits silent for good.
+ *
+ * Third, independent check: the verdict can only be produced by a sub-floor
+ * reading (evaluateWatch's liquidity branch), so a stored `last_liquidity` at
+ * or above the floor does not support the state it is attached to — the
+ * fingerprint of a verdict taken on a leg the floor was never calibrated for
+ * (the Jupiter half-value bug) or of a lost completion write.
+ */
+export type TerminalRowIssue =
+  | "unarmed_alert_clock"
+  | "lost_completion_write"
+  | "measurement_above_floor";
+
+/**
+ * Slack for "the pass outlived its own budget". A legitimate delta is the send
+ * slice (sub-second, see TRACKER_SEND_CAP_MS) and the whole tick envelope is
+ * two orders of magnitude below this, so anything past it is not a send.
+ */
+const TERMINAL_CLOCK_SLACK_MS = 5 * 60_000;
+
+export function terminalRowIssues(
+  row: {
+    lastState: string | null;
+    lastChecked: number;
+    lastAlertAt: number;
+    lastLiquidity: number | null;
+  },
+  opts: { liquidityFloorUsd?: number; clockSlackMs?: number } = {},
+): TerminalRowIssue[] {
+  // Only "rug" is produced by consuming an alert. "unwatched" (the user's 🔕)
+  // and "expired" (window recap) are terminal for another reason and
+  // legitimately carry no alert clock.
+  if (row.lastState !== "rug") return [];
+  const issues: TerminalRowIssue[] = [];
+  if (row.lastChecked > 0) {
+    const delta = row.lastChecked - row.lastAlertAt;
+    const slack = opts.clockSlackMs ?? TERMINAL_CLOCK_SLACK_MS;
+    if (row.lastAlertAt <= 0 || delta > slack) {
+      issues.push("unarmed_alert_clock");
+    } else if (delta === 0) {
+      issues.push("lost_completion_write");
+    }
+  }
+  const floor = opts.liquidityFloorUsd ?? LIQ_FLOOR_USD;
+  if (row.lastLiquidity !== null && row.lastLiquidity >= floor) {
+    issues.push("measurement_above_floor");
+  }
+  return issues;
+}
+
+/**
+ * The repair for a diagnosed row. It mirrors the policy the tracker's own
+ * settle applies to a cut terminal card (deferrallog.cardSendDisposition +
+ * settleUnconfirmedCardSends): the delivery audit is the proof, and proof
+ * decides between "the card is in the chat, only the bookkeeping is wrong"
+ * (keep the transition, arm the clock — inert, the row is never re-checked)
+ * and "the card may be lost, so the row must not sit silent" (re-arm it: the
+ * 💧 condition is re-derived and re-announced if it still holds).
+ *
+ * Only the unarmed-clock class is repairable from the row alone. A lost
+ * completion write keeps a transition a real reserve produced, and a
+ * measurement that contradicts its own state is a stale number rather than a
+ * wrong verdict — both are reported for a human, never rewritten.
+ */
+export type TerminalRowRepair = "arm_alert_clock" | "re_arm_row" | "none";
+
+export function terminalRowRepair(
+  issues: readonly TerminalRowIssue[],
+  provedDelivered: boolean,
+): TerminalRowRepair {
+  if (!issues.includes("unarmed_alert_clock")) return "none";
+  return provedDelivered ? "arm_alert_clock" : "re_arm_row";
+}

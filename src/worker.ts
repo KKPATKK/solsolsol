@@ -37,6 +37,7 @@ import {
   loadPushDeferralSnapshot,
   nextPushDeferralSnapshot,
   deliveredDeferredTokens,
+  deliveredFollowupTokens,
   duplicateInitialTokens,
   parsePushDeferralSnapshot,
   pushDeferralAlreadyApplied,
@@ -55,7 +56,11 @@ import { PumpFunClient } from "./pumpfun";
 import { GeckoTerminalClient } from "./geckoterminal";
 // Heal-path counters: module scope in the tracker, read here so /health can
 // answer "did the self-heal reuse the push-time baseline, and how often".
-import { pushWatchHealStats } from "./pushwatch";
+import {
+  pushWatchHealStats,
+  terminalRowIssues,
+  terminalRowRepair,
+} from "./pushwatch";
 import { JupTokensClient } from "./jupfeeds";
 import { GmgnClient } from "./gmgn";
 import { AxiomClient, parseAxiomTokenInfo, type AxiomTokenInfo } from "./axiom";
@@ -3374,10 +3379,70 @@ export default {
         await db.setPushWatchState(mint, "unwatched");
         return Response.json({ ok: true, unwatched: mint });
       }
-      const rows = db ? await db.listPushWatch(40) : [];
+      // POST ?repair=<address> — apply the documented repair to ONE row whose
+      // terminal state disagrees with the write that produced it (see
+      // pushwatch.terminalRowIssues: the pre-fix single-column terminalizer and
+      // the dead-tick lost-completion class). Per-row on purpose, because a
+      // repair can RE-ARM a row and there is no bulk lever for that. The delivery
+      // audit decides which repair, exactly as the tracker's own settle does for
+      // a cut terminal send: a card PROVED delivered keeps the transition and
+      // only re-stamps the alert clock (inert — a 'rug' row is never
+      // re-evaluated); an unproved one is re-armed so the 💧 condition is
+      // re-derived instead of the row sitting silent for good.
+      const repair = url.searchParams.get("repair");
+      if (repair && request.method === "POST") {
+        if (!db) return Response.json({ ok: false, error: "no db" });
+        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(repair)) {
+          return Response.json({ ok: false, error: "invalid mint" }, { status: 400 });
+        }
+        const row = (await db.listPushWatch(500)).find((r) => r.token === repair);
+        if (!row) return Response.json({ ok: false, error: "not tracked" });
+        const rowIssues = terminalRowIssues(row);
+        if (rowIssues.length === 0) {
+          return Response.json({ ok: true, repaired: false, reason: "consistent" });
+        }
+        const proved = new Set(
+          deliveredFollowupTokens(await db.getPushAudit()),
+        ).has(repair);
+        const plan = terminalRowRepair(rowIssues, proved);
+        if (plan === "arm_alert_clock") {
+          const done = await db.armTerminalAlertClock(repair);
+          return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
+        }
+        if (plan === "re_arm_row") {
+          const done = await db.rearmPushWatchAlert(repair);
+          return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
+        }
+        // The transition itself is sound (a reserve wrote it); only its
+        // measurements are stale. Reported for a human, never rewritten.
+        return Response.json({ ok: true, repaired: false, plan, proved, manual: true, issues: rowIssues });
+      }
+      // ?limit=N widens the census past the 40-row default: rows can outlive the
+      // 24h window (prune races the enrollment self-heal), so a fixed cap can
+      // hide exactly the rows being audited. `issues` runs the same rule the
+      // repair action applies, so ONE read answers "is anything inconsistent".
+      const limitRaw = Number(url.searchParams.get("limit") ?? 40);
+      const limit = Number.isFinite(limitRaw)
+        ? Math.min(Math.max(Math.trunc(limitRaw), 1), 500)
+        : 40;
+      const rows = db ? await db.listPushWatch(limit) : [];
+      const issues = rows
+        .map((r) => ({
+          token: r.token,
+          symbol: r.symbol,
+          lastState: r.lastState,
+          lastChecked: r.lastChecked,
+          lastAlertAt: r.lastAlertAt,
+          lastLiquidity: r.lastLiquidity,
+          issues: terminalRowIssues(r),
+        }))
+        .filter((r) => r.issues.length > 0);
       return Response.json({
         ok: true,
         count: rows.length,
+        limit,
+        issueCount: issues.length,
+        issues,
         rows: rows.map((r) => ({
           ...r,
           chgSincePushPct:

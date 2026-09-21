@@ -197,3 +197,48 @@ tracker 只將 `comparableLiquidity(pair)` 交畀規則（非 DexScreener → `n
 - 線上驗收（deploy 後）：下次再見到 💧 卡而 `/debug/push-watch` 嘅 `lastState` 係空，即係呢個修
   未生效；預期係卡片同 DB 一致（`rug` + cooldown 武裝），而且 **唔會**再出現「同一張停止追蹤卡
   隔幾分鐘再出一次」。
+
+## 6. 終態行嘅一致性（fix 前留低嘅唔一致 row，2026-09-20）
+
+💧 抽乾係 tracker **唯一**會消費一張卡去換返嚟嘅終態，所以 `push_watch` 用兩欄記低佢，而兩欄係
+同一個 pass 裡**唔同時間**寫：
+
+- `last_alert_at` ← `reservePushWatchAlert` 寫入 pass 嘅 `now`；
+- `last_checked` ← `claimPushWatch` 寫同一個 `now`，之後**完成寫入**（`Db.updatePushWatchCheck`）
+  用一個**新鮮** `Date.now()` 再覆一次 —— 即係喺張卡送出之後。
+
+所以一行健康嘅終態行必定係 `0 < last_checked − last_alert_at`，而個差額就係 reserve 之後行嘅那
+段時間（送卡）。三個可從行本身直接證明嘅唔一致形狀：
+
+| 形狀 | 意思 |
+|---|---|
+| `last_alert_at === last_checked` | 完成寫入冇落地（isolate 喺 reserve 同 flush 之間死；即 dead-tick 形）。行凍結喺 claim+reserve：量度值係上一個 pass 嘅、卡片有冇到係未知。**正常**行冇可能 0 差，因為完成寫入個 stamp 係送卡之後讀嘅鐘。 |
+| `last_alert_at === 0`（或者落後到超出一個 pass 預算） | 個轉換背後從來冇武裝過一張卡：舊嘅單欄寫入（`setPushWatchState` 只碰 `last_state`）寫低咗 💧 語意但冇記低佢。卡片可能從來冇送出，而行就永久靜音。 |
+| `last_liquidity >= LIQ_FLOOR_USD` | 判斷只可能由**低於地板**嘅讀數產生（`evaluateWatch` 嘅流動性分支），所以一筆高於地板嘅存量數值支撐唔到佢自己嗰個狀態 —— 就係「用錯腿」或者「完成寫入唔見咗」嘅指紋。 |
+
+規則同修理都係純函數：`pushwatch.terminalRowIssues(row)` 診斷，`pushwatch.terminalRowRepair(issues, provedDelivered)`
+決定動作 —— 同 tracker 自己 settle 一張被切嘅終態卡用完全同一套政策（audit 就係證明）：
+
+- **有 audit 證明** → 卡片已經喺 chat，只係簿記未動 → 保留轉換、`armTerminalAlertClock`
+  （同 re-arm 唔同，行照樣終態；而且係 inert —— `rug` 行永遠唔會被再評估，見 runTick 嘅
+  `activeRows` filter）；
+- **冇證明** → 卡片可能真係唔見咗 → `rearmPushWatchAlert` 令下一個 pass 重新推導同一個判斷，
+  而行唔會就咁靜音落去；
+- 另外兩類（lost write / 量度同狀態矛盾）**只報告、唔改寫**：前者嘅轉換係一個真嘅 reserve 寫落嘅，
+  後者只係一個過時數字，唔係一個錯判斷。
+
+落地：`docs/patches/terminal-row-hygiene.patch`（pushwatch 規則 + `Db.armTerminalAlertClock` +
+`/debug/push-watch` 嘅 `?limit=` census 同 `POST ?repair=<mint>`，三個檔案一齊 apply）。
+`/debug/push-watch?limit=N`（上限 500）順便修好 audit 上嘅盲點：原本硬性 40 行，而行係可以活過
+24 小時窗口（prune 同 enrollment self-heal 打對台），即係普查嗰陣正好可能睇唔到要睇嘅行。
+
+### 量度（2026-09-21 普查前，線上 40 行）
+
+9 行 `rug`：8 行嘅時鐘差係 1.2–2.1s（正常 —— 就是送卡用嘅時間），唯一例外係 **Bogdanoff**
+（差 `0.000s`、存量 `last_liquidity = 12,420` ≥ 地板）。即係 dead-tick 嘅完成寫入冇落地，行
+凍結喺 claim+reserve。fix 前嘅「rug 但時鐘未武裝」嗰類（Bruce）已經隨 24 小時窗口被 prune 走，
+普查亦冇發現新嘅一行。
+
+**誠實 caveat**：delivery audit ring 只裝 30 條、跨度約 6 小時（09-20 17:46→23:59），所以一條 13–23
+小時前嘅舊終態行一律讀成「冇證明」—— 對舊行而言「未證實」係**缺席嘅證明**，唔係證明咗冇送。
+照 at-least-once 嘅原則行（寧願重複都唔可以唔見卡），但代價係有機會重發一張其實已經到咗嘅卡。

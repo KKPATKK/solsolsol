@@ -1,0 +1,230 @@
+diff --git a/src/pushwatch.ts b/src/pushwatch.ts
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -2134,3 +2134,96 @@
+     return { rearmed, trips };
+   }
+ }
++
++/**
++ * TERMINAL-ROW HYGIENE (the "Bruce" class).
++ *
++ * A 💧 drain row is the one terminal transition the tracker produces by
++ * CONSUMING an alert, and `push_watch` records it in two columns written at
++ * two different moments inside the same pass:
++ *
++ *   - `last_alert_at` — `reservePushWatchAlert` writes the pass's `now`;
++ *   - `last_checked` — `claimPushWatch` writes that same `now`, and then the
++ *     completion write re-stamps it with a FRESH `Date.now()`
++ *     (Db.updatePushWatchCheck), i.e. AFTER the row's card was delivered.
++ *
++ * A well-formed drain row therefore has `0 < last_checked - last_alert_at`,
++ * the delta being the part of the pass that ran after the reserve — the send.
++ * Two shapes break that, and both are provable from the row alone:
++ *
++ *   - `last_alert_at === last_checked` — the completion write never landed
++ *     (the isolate died between the reserve and the flush, the dead-tick
++ *     shape). The row is frozen at claim+reserve: its measurements are a pass
++ *     stale and the card's delivery is unproven. It cannot happen otherwise,
++ *     because the completion stamp is a fresh clock read taken after the send.
++ *   - `last_alert_at === 0`, or arbitrarily far behind `last_checked` — no
++ *     alert was ever armed behind the transition: an older single-column
++ *     writer (`setPushWatchState`, which touches only `last_state`) recorded 💧
++ *     semantics it never accounted for. The card may never have been sent
++ *     while the row sits silent for good.
++ *
++ * Third, independent check: the verdict can only be produced by a sub-floor
++ * reading (evaluateWatch's liquidity branch), so a stored `last_liquidity` at
++ * or above the floor does not support the state it is attached to — the
++ * fingerprint of a verdict taken on a leg the floor was never calibrated for
++ * (the Jupiter half-value bug) or of a lost completion write.
++ */
++export type TerminalRowIssue =
++  | "unarmed_alert_clock"
++  | "lost_completion_write"
++  | "measurement_above_floor";
++
++/**
++ * Slack for "the pass outlived its own budget". A legitimate delta is the send
++ * slice (sub-second, see TRACKER_SEND_CAP_MS) and the whole tick envelope is
++ * two orders of magnitude below this, so anything past it is not a send.
++ */
++const TERMINAL_CLOCK_SLACK_MS = 5 * 60_000;
++
++export function terminalRowIssues(
++  row: {
++    lastState: string | null;
++    lastChecked: number;
++    lastAlertAt: number;
++    lastLiquidity: number | null;
++  },
++  opts: { liquidityFloorUsd?: number; clockSlackMs?: number } = {},
++): TerminalRowIssue[] {
++  // Only "rug" is produced by consuming an alert. "unwatched" (the user's 🔕)
++  // and "expired" (window recap) are terminal for another reason and
++  // legitimately carry no alert clock.
++  if (row.lastState !== "rug") return [];
++  const issues: TerminalRowIssue[] = [];
++  if (row.lastChecked > 0) {
++    const delta = row.lastChecked - row.lastAlertAt;
++    const slack = opts.clockSlackMs ?? TERMINAL_CLOCK_SLACK_MS;
++    if (row.lastAlertAt <= 0 || delta > slack) {
++      issues.push("unarmed_alert_clock");
++    } else if (delta === 0) {
++      issues.push("lost_completion_write");
++    }
++  }
++  const floor = opts.liquidityFloorUsd ?? LIQ_FLOOR_USD;
++  if (row.lastLiquidity !== null && row.lastLiquidity >= floor) {
++    issues.push("measurement_above_floor");
++  }
++  return issues;
++}
++
++/**
++ * The repair for a diagnosed row. It mirrors the policy the tracker's own
++ * settle applies to a cut terminal card (deferrallog.cardSendDisposition +
++ * settleUnconfirmedCardSends): the delivery audit is the proof, and proof
++ * decides between "the card is in the chat, only the bookkeeping is wrong"
++ * (keep the transition, arm the clock — inert, the row is never re-checked)
++ * and "the card may be lost, so the row must not sit silent" (re-arm it: the
++ * 💧 condition is re-derived and re-announced if it still holds).
++ *
++ * Only the unarmed-clock class is repairable from the row alone. A lost
++ * completion write keeps a transition a real reserve produced, and a
++ * measurement that contradicts its own state is a stale number rather than a
++ * wrong verdict — both are reported for a human, never rewritten.
++ */
++export type TerminalRowRepair = "arm_alert_clock" | "re_arm_row" | "none";
++
++export function terminalRowRepair(
++  issues: readonly TerminalRowIssue[],
++  provedDelivered: boolean,
++): TerminalRowRepair {
++  if (!issues.includes("unarmed_alert_clock")) return "none";
++  return provedDelivered ? "arm_alert_clock" : "re_arm_row";
++}
+diff --git a/src/db.ts b/src/db.ts
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -2827,6 +2827,35 @@
+   async rearmPushWatchAlert(token: string): Promise<boolean> {
+     const res = await this.get().execute({
+       sql: "UPDATE push_watch SET last_state = NULL, last_alert_at = 0, last_checked = 0\n            WHERE token = ?\n              AND last_state = 'rug'",
+       args: [token],
+     });
+     return Number(res.rowsAffected ?? 0) > 0;
+   }
+ 
++  /**
++   * Record that the alert behind an already-terminal 💧 row was consumed, for
++   * a row that reached the terminal state without arming its clock — the row
++   * hygiene rule in pushwatch.terminalRowIssues("unarmed_alert_clock").
++   *
++   * Used when the delivery audit PROVES the card is in the chat (so the
++   * transition is legitimate and must stay), but the bookkeeping never moved:
++   * an older single-column writer set `last_state` alone, leaving
++   * `last_alert_at` at 0 or at a pre-drain value. Arming the clock makes the
++   * row self-consistent and, unlike rearmPushWatchAlert, keeps it terminal —
++   * it is inert by construction, since a 'rug' row is never re-evaluated (see
++   * PushWatcher.runTick's activeRows filter).
++   *
++   * Guarded three ways so it can only ever tighten a real drain row: 'rug'
++   * only (never the user's 🔕 tombstone or a window 'expired'), a claimed row
++   * only, and never backwards (`last_alert_at < last_checked`).
++   */
++  async armTerminalAlertClock(token: string): Promise<boolean> {
++    const res = await this.get().execute({
++      sql: `UPDATE push_watch SET last_alert_at = last_checked
++            WHERE token = ?
++              AND last_state = 'rug'
++              AND last_checked > 0
++              AND last_alert_at < last_checked`,
++      args: [token],
++    });
++    return Number(res.rowsAffected ?? 0) > 0;
++  }
++
+   /**
+    * Atomic per-tick claim (compare-and-swap on last_checked): bump the
+    * stamp only if it still holds the value the caller read. Two isolates
+diff --git a/src/worker.ts b/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -3381,12 +3381,72 @@
+         return Response.json({ ok: true, unwatched: mint });
+       }
++      // POST ?repair=<address> — apply the documented repair to ONE row whose
++      // terminal state disagrees with the write that produced it (see
++      // pushwatch.terminalRowIssues: the pre-fix single-column terminalizer and
++      // the dead-tick lost-completion class). Per-row on purpose, because a
++      // repair can RE-ARM a row and there is no bulk lever for that. The delivery
++      // audit decides which repair, exactly as the tracker's own settle does for
++      // a cut terminal send: a card PROVED delivered keeps the transition and
++      // only re-stamps the alert clock (inert — a 'rug' row is never
++      // re-evaluated); an unproved one is re-armed so the 💧 condition is
++      // re-derived instead of the row sitting silent for good.
++      const repair = url.searchParams.get("repair");
++      if (repair && request.method === "POST") {
++        if (!db) return Response.json({ ok: false, error: "no db" });
++        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(repair)) {
++          return Response.json({ ok: false, error: "invalid mint" }, { status: 400 });
++        }
++        const row = (await db.listPushWatch(500)).find((r) => r.token === repair);
++        if (!row) return Response.json({ ok: false, error: "not tracked" });
++        const rowIssues = terminalRowIssues(row);
++        if (rowIssues.length === 0) {
++          return Response.json({ ok: true, repaired: false, reason: "consistent" });
++        }
++        const proved = new Set(
++          deliveredFollowupTokens(await db.getPushAudit()),
++        ).has(repair);
++        const plan = terminalRowRepair(rowIssues, proved);
++        if (plan === "arm_alert_clock") {
++          const done = await db.armTerminalAlertClock(repair);
++          return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
++        }
++        if (plan === "re_arm_row") {
++          const done = await db.rearmPushWatchAlert(repair);
++          return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
++        }
++        // The transition itself is sound (a reserve wrote it); only its
++        // measurements are stale. Reported for a human, never rewritten.
++        return Response.json({ ok: true, repaired: false, plan, proved, manual: true, issues: rowIssues });
++      }
++      // ?limit=N widens the census past the 40-row default: rows can outlive the
++      // 24h window (prune races the enrollment self-heal), so a fixed cap can
++      // hide exactly the rows being audited. `issues` runs the same rule the
++      // repair action applies, so ONE read answers "is anything inconsistent".
++      const limitRaw = Number(url.searchParams.get("limit") ?? 40);
++      const limit = Number.isFinite(limitRaw)
++        ? Math.min(Math.max(Math.trunc(limitRaw), 1), 500)
++        : 40;
+-      const rows = db ? await db.listPushWatch(40) : [];
++      const rows = db ? await db.listPushWatch(limit) : [];
++      const issues = rows
++        .map((r) => ({
++          token: r.token,
++          symbol: r.symbol,
++          lastState: r.lastState,
++          lastChecked: r.lastChecked,
++          lastAlertAt: r.lastAlertAt,
++          lastLiquidity: r.lastLiquidity,
++          issues: terminalRowIssues(r),
++        }))
++        .filter((r) => r.issues.length > 0);
+       return Response.json({
+         ok: true,
+         count: rows.length,
++        limit,
++        issueCount: issues.length,
++        issues,
+         rows: rows.map((r) => ({
+           ...r,
+           chgSincePushPct:
+             r.mcapAtPush > 0
+               ? Math.round((r.peakMcap / r.mcapAtPush - 1) * 1000) / 10
+               : null,
+         })),
+       });
+     }

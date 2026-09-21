@@ -18,7 +18,7 @@ const { parsePumpCoins } = require("../dist/pumpfun.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, GECKO_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
@@ -460,6 +460,119 @@ async function main() {
     // whitelist — reusing it here would re-announce (or hold back) the wrong
     // cards in both directions.
     assert.deepEqual(deliveredCardTokens(ring), ["A", "C"]);
+  });
+
+  // ---------- terminal-row hygiene (the pre-fix "Bruce" class) ----------
+  //
+  // push_watch records a 💧 drain verdict in two columns written at two
+  // different moments of one pass: `last_alert_at` (the reserve, at the pass's
+  // `now`) and `last_checked` (the claim, at that same `now`, RE-stamped with a
+  // fresh Date.now() by the completion write — see Db.updatePushWatchCheck). A
+  // well-formed row therefore has 0 < last_checked − last_alert_at, the delta
+  // being the send that ran in between. The two shapes that break it are what
+  // the fix-前 rows are made of: a frozen claim+reserve (the dead-tick
+  // lost-completion write) and a transition no alert was ever armed behind (the
+  // old single-column terminalizer).
+
+  await test("terminalRowIssues: a drain row must carry the alert it consumed", () => {
+    const FLOOR = 10_000;
+    const at = 1_000_000;
+    // Well-formed: delta = the send slice, and the verdict's reading is under
+    // the floor (the only way evaluateWatch's drain branch can fire).
+    assert.deepEqual(
+      terminalRowIssues({ lastState: "rug", lastChecked: at + 1_200, lastAlertAt: at, lastLiquidity: 4_000 }),
+      [],
+    );
+    // Frozen at claim+reserve: the completion write never landed, so the
+    // measurements are a pass stale and the delivery is unproven.
+    assert.deepEqual(
+      terminalRowIssues({ lastState: "rug", lastChecked: at, lastAlertAt: at, lastLiquidity: 4_000 }),
+      ["lost_completion_write"],
+    );
+    // No alert behind the transition at all — never armed, or armed long before
+    // the claim (a pass cannot outlive its own budget by an hour).
+    for (const lastAlertAt of [0, at - 60 * 60_000]) {
+      assert.deepEqual(
+        terminalRowIssues({ lastState: "rug", lastChecked: at, lastAlertAt, lastLiquidity: 4_000 }),
+        ["unarmed_alert_clock"],
+      );
+    }
+    // A drain verdict can only come from a sub-floor reading, so a stored
+    // reading at or above the floor does not support its own state.
+    assert.deepEqual(
+      terminalRowIssues(
+        { lastState: "rug", lastChecked: at, lastAlertAt: at - 1, lastLiquidity: 12_420 },
+        { liquidityFloorUsd: FLOOR },
+      ),
+      ["measurement_above_floor"],
+    );
+    // …and the two corroborate each other on the same row (the live Bogdanoff
+    // shape: a 12.4K reading attached to a drain state whose clock never moved).
+    assert.deepEqual(
+      terminalRowIssues(
+        { lastState: "rug", lastChecked: at, lastAlertAt: at, lastLiquidity: 12_420 },
+        { liquidityFloorUsd: FLOOR },
+      ),
+      ["lost_completion_write", "measurement_above_floor"],
+    );
+    // Only "rug" is produced BY consuming an alert: the user's 🔕 tombstone,
+    // a window recap and every live state legitimately carry no drain clock.
+    for (const lastState of [null, "dead", "weak", "up100", "unwatched", "expired"]) {
+      assert.deepEqual(
+        terminalRowIssues({ lastState, lastChecked: at, lastAlertAt: 0, lastLiquidity: 12_420 }),
+        [],
+      );
+    }
+    // An unclaimed row has no write to disagree with, and an unknown reading is
+    // never read as "below the floor".
+    assert.deepEqual(
+      terminalRowIssues({ lastState: "rug", lastChecked: 0, lastAlertAt: 0, lastLiquidity: null }),
+      [],
+    );
+    assert.deepEqual(
+      terminalRowIssues({ lastState: "rug", lastChecked: at, lastAlertAt: at - 1_000, lastLiquidity: null }),
+      [],
+    );
+  });
+
+  await test("terminalRowRepair: the delivery audit picks between arming and re-arming", () => {
+    // Proved delivered: the card is in the chat, so only the bookkeeping is
+    // wrong — keep the transition, arm the clock. Inert by construction, since
+    // a 'rug' row is never re-evaluated (runTick's activeRows filter).
+    assert.equal(terminalRowRepair(["unarmed_alert_clock"], true), "arm_alert_clock");
+    // Unproved: the card may be lost, so the row must not sit silent — re-arm it
+    // and let the next pass re-derive the verdict.
+    assert.equal(terminalRowRepair(["unarmed_alert_clock"], false), "re_arm_row");
+    // A lost completion write keeps a transition a real reserve produced, and a
+    // measurement that contradicts its state is a stale number rather than a
+    // wrong verdict: both are reported for a human, never rewritten.
+    assert.equal(terminalRowRepair(["lost_completion_write"], false), "none");
+    assert.equal(terminalRowRepair(["measurement_above_floor"], true), "none");
+    assert.equal(terminalRowRepair([], false), "none");
+    // The repairable class wins when it co-occurs with an unrepairable one.
+    assert.equal(terminalRowRepair(["unarmed_alert_clock", "measurement_above_floor"], false), "re_arm_row");
+  });
+
+  await test("terminal-row hygiene patch: rules, db method and endpoint land together", () => {
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const dbSrc = read("src/db.ts");
+    const workerSrc = read("src/worker.ts");
+    const applied = {
+      "rules (terminalRowIssues)": pushwatchSrc.includes("export function terminalRowIssues("),
+      "policy (terminalRowRepair)": pushwatchSrc.includes("export function terminalRowRepair("),
+      "db (armTerminalAlertClock)": dbSrc.includes("async armTerminalAlertClock("),
+      "endpoint (repair action)": workerSrc.includes('url.searchParams.get("repair")'),
+      "endpoint (census issues)": workerSrc.includes("issueCount: issues.length"),
+    };
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    // Same rule as the other out-of-window artifact: all of it, or none of it.
+    // A partial paste is the dangerous state (rules without the endpoint leave
+    // the census blind; an endpoint without the db method throws on repair).
+    assert.ok(
+      missing.length === 0 || missing.length === Object.keys(applied).length,
+      `partial paste of docs/patches/terminal-row-hygiene.patch — missing: ${missing.join(", ")}`,
+    );
   });
 
   // ---------- the tracker's terminal (💧 drain) card ----------

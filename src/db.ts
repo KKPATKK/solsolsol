@@ -2834,6 +2834,35 @@ export class Db {
   }
 
   /**
+   * Record that the alert behind an already-terminal 💧 row was consumed, for
+   * a row that reached the terminal state without arming its clock — the row
+   * hygiene rule in pushwatch.terminalRowIssues("unarmed_alert_clock").
+   *
+   * Used when the delivery audit PROVES the card is in the chat (so the
+   * transition is legitimate and must stay), but the bookkeeping never moved:
+   * an older single-column writer set `last_state` alone, leaving
+   * `last_alert_at` at 0 or at a pre-drain value. Arming the clock makes the
+   * row self-consistent and, unlike rearmPushWatchAlert, keeps it terminal —
+   * it is inert by construction, since a 'rug' row is never re-evaluated (see
+   * PushWatcher.runTick's activeRows filter).
+   *
+   * Guarded three ways so it can only ever tighten a real drain row: 'rug'
+   * only (never the user's 🔕 tombstone or a window 'expired'), a claimed row
+   * only, and never backwards (`last_alert_at < last_checked`).
+   */
+  async armTerminalAlertClock(token: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: `UPDATE push_watch SET last_alert_at = last_checked
+            WHERE token = ?
+              AND last_state = 'rug'
+              AND last_checked > 0
+              AND last_alert_at < last_checked`,
+      args: [token],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
+  /**
    * Atomic per-tick claim (compare-and-swap on last_checked): bump the
    * stamp only if it still holds the value the caller read. Two isolates
    * can run overlapping tracker ticks (deploy soft-switch, cron overlap)
