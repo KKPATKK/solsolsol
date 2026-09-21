@@ -78,7 +78,7 @@ import {
  * silent row (~110-200ms each) plus any card sends — which are gated
  * separately by TRACKER_SEND_MIN_MS, not by this number.
  */
-const TRACKER_TICK_BUDGET_MS = 3_500;
+const TRACKER_TICK_BUDGET_MS = 5_000;
 /**
  * Budget reserved BEFORE a row is claimed (see the row loop). A SILENT row —
  * nothing to announce, which is nearly every row on nearly every pass — costs
@@ -202,11 +202,16 @@ const TRACKER_PAIRS_BUDGET_MS = 600;
  * asking DexScreener for all 30 addresses spent the pass's one mandatory
  * request on coins that were never evaluated this tick — and a batch that
  * missed its cap then made EVERY row a pair miss, so the pass did nothing at
- * all and reported `pairs 0/30 miss 30` (live 2026-09-18 02:01Z). Six rows is
- * three passes' worth of headroom and keeps the request inside the cache
- * window of the coins actually being checked.
+ * all and reported `pairs 0/30 miss 30` (live 2026-09-18 02:01Z).
+ *
+ * 6 → 10 with the 5_000ms allowance (2026-09-21): at 3_500 the pass was
+ * budget-cut after three rows (`rows 3/23 ... budget-cut`), so six covered
+ * the head twice over; at 5_000 the loop can reach ~8-9 rows, and a head
+ * smaller than that would silently cap the rotation at the head size. Ten
+ * addresses is still ONE DexScreener request (the API takes up to 30) inside
+ * the same ~150-600ms cap.
  */
-const TRACKER_PAIR_HEAD = 6;
+const TRACKER_PAIR_HEAD = 10;
 /**
  * Age past which a row the tracker has NEVER evaluated is treated as a
  * BACKFILL instead of a live follow-up: its push is older than the alert

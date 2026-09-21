@@ -893,16 +893,25 @@ const SCAN_TICK_BUDGET_MS = 9_500;
  * the one loss the whole dead-tick machinery exists to prevent. A pass that
  * overruns its slice is clamped by the next tick's budget, not by the scan.
  *
- * 2026-09-21: 2_500 → 3_500, measured rather than guessed. /health's
- * `summary.pushWatch` on the live tick read
- * `allow 2500 spend[setup 746/3 heal 2926/7 pairs 0/0 rows 0/0] trips 10`:
- * the pass starts at ~2.5-3.5s of the 9.5s envelope (flush ms 2.3-3.1s plus a
- * ~300ms deferral sync), so 3_500 has the pass ending by ~7s and still leaves
- * TRACKER_PASS_TAIL_MS and ~1.5s of margin against the ~9.6s kill. The same
- * line is why the allowance was not the only thing wrong — a housekeeping
- * stage had already eaten the whole 2_500 (see pushwatch.TRACKER_HEAL_BUDGET_MS).
+ * 2026-09-21: 2_500 → 3_500 → 5_000, measured at every step rather than
+ * guessed. The first live sample of the stage clock was
+ * `allow 2500 spend[setup 746/3 heal 2926/7 pairs 0/0 rows 0/0] trips 10` —
+ * a housekeeping stage eating the whole allowance (see
+ * pushwatch.TRACKER_HEAL_BUDGET_MS for that half of the fix).
+ *
+ * With the heal sliced and the pass moved in front of the deferral sync (so
+ * it starts right behind the flush instead of up to a second later), the live
+ * tick reads `flush 03:53:46 → note 03:53:50 trackerMs 3590`, i.e. the pass
+ * runs 3.1s into a 9.5s envelope, spends 3.6s and the invocation is done at
+ * ~5.5s. At 3_500 the pass was still budget-cut after THREE rows — a ~420ms
+ * Turso round trip per row, and rows only get what setup (~785ms/3 trips) and
+ * the pair batch (~150ms) leave — so 22-26 active rows needed ~8 ticks.
+ * 5_000 spends the tick's unused tail instead: the pass ends by ~8.1s, its
+ * note (its last write) by ~8.5s, and the tick still keeps
+ * TRACKER_PASS_TAIL_MS against the ~9.6s kill — while each pass fits
+ * TRACKER_PAIR_HEAD rows instead of half of it.
  */
-const TRACKER_PASS_BUDGET_MS = 3_500;
+const TRACKER_PASS_BUDGET_MS = 5_000;
 /**
  * Tick tail kept clear after the tracker pass for the tick's own bookkeeping
  * (streak counters, an isolate rebuild's re-init, the scan-lock safety

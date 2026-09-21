@@ -4707,12 +4707,15 @@ async function main() {
   });
 
   await test("PushWatcher: the pair batch covers only the rows the pass can actually reach", async () => {
-    // Ten tracked coins, one DexScreener request. Asking for all of them spent
+    // 24 tracked coins, one DexScreener request. Asking for all of them spent
     // the pass's only mandatory call on addresses the loop never evaluates —
     // and a slow batch then made every row a pair miss, so the pass did
-    // nothing at all (`pairs 0/30 miss 30`, live 2026-09-18).
+    // nothing at all (`pairs 0/30 miss 30`, live 2026-09-18). The head the
+    // batch covers is deliberately NOT hard-coded here: the point is that it
+    // is a strict subset of the watch list (and that only covered rows can be
+    // blamed), not the size of the head on any given day.
     const rows = [];
-    for (let i = 0; i < 10; i++) rows.push(watchRow(`T${i}`));
+    for (let i = 0; i < 24; i++) rows.push(watchRow(`T${i}`));
     const updated = [];
     const asked = [];
     const pairsFor = async (addrs) => {
@@ -4724,15 +4727,18 @@ async function main() {
     );
     const out = await pw.runTick();
     assert.equal(asked.length, 1);
-    assert.ok(asked[0] <= 6, `batch asked for ${asked[0]} addresses, expected the queue head`);
+    assert.ok(
+      asked[0] > 0 && asked[0] < rows.length,
+      `batch asked for ${asked[0]} of ${rows.length} addresses, expected the queue head`,
+    );
     assert.equal(out.checked, 1, "the row that did resolve a pair is evaluated");
-    assert.match(String(out.note), /rows 1\/10/);
-    assert.match(String(out.note), /pairs 1\/6/);
+    assert.match(String(out.note), /rows 1\/24/);
+    assert.match(String(out.note), new RegExp(`pairs 1\\/${asked[0]}`));
     // Only the rows the batch COVERED may be counted as misses — a coin can
     // never be judged delisted off a request it was not part of.
-    assert.match(String(out.note), /miss 5/);
+    assert.match(String(out.note), new RegExp(`miss ${asked[0] - 1}\\b`));
     assert.ok(
-      !/miss 10/.test(String(out.note)),
+      !new RegExp(`miss ${rows.length}\\b`).test(String(out.note)),
       `rows outside the batch must not be reported as misses: ${out.note}`,
     );
   });
@@ -4895,8 +4901,8 @@ async function main() {
     // batch is the only request that ever asks for them and a rate-limited
     // DexScreener leaves the pass with no prices at all.
     const rows = [];
-    for (let i = 0; i < 8; i++) {
-      rows.push(watchRow(`T${i}`, { lastChecked: Date.now() - (8 - i) * 60_000 }));
+    for (let i = 0; i < 12; i++) {
+      rows.push(watchRow(`T${i}`, { lastChecked: Date.now() - (12 - i) * 60_000 }));
     }
     const updated = [];
     const pw = new PushWatcher(
@@ -4906,7 +4912,10 @@ async function main() {
     assert.deepEqual(pw.headTokens(), [], "nothing published before the first pass");
     await pw.runTick();
     const head = pw.headTokens();
-    assert.ok(head.length > 0 && head.length <= 6, `head size ${head.length}`);
+    assert.ok(
+      head.length > 0 && head.length < rows.length,
+      `head size ${head.length} of ${rows.length}`,
+    );
     assert.equal(head[0], "T0", "least-recently-checked first, i.e. the rotation order");
   });
 
