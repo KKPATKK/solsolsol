@@ -3692,6 +3692,61 @@ export default {
         );
       }
     }
+    // Fleet-wide DexScreener rate-limit history — the durable half of the 429
+    // bookkeeping (see db.bumpDex429). Read-only: three worker_state rows, no
+    // writes, so it is safe to poll while diagnosing.
+    //
+    // What each number is: `total` counts every 429 RESPONSE ever recorded
+    // (the drip), while `ring` holds the EPISODES the client notified one per
+    // 90s backoff window (see DexScreenerClient.note429 — a storm is three
+    // retry attempts per batch, and the hook is debounced so the durable write
+    // is not a write flood). So `total` answers "how hard", the ring answers
+    // "clustered or steady" — and the ring is the reason this endpoint exists:
+    // 2026-09-21 the shared egress IP started 429ing the profiles endpoint on
+    // nearly every tick, and the only way to tell a deploy-clustered burst
+    // from a steady drip was this READ, which had no reader.
+    if (url.pathname === "/debug/dex429") {
+      try {
+        const [rawTotal, rawAt, rawRing] = await Promise.all([
+          db?.getWorkerState("dex_429_total"),
+          db?.getWorkerState("dex_429_at"),
+          db?.getWorkerState("dex_429_ring"),
+        ]);
+        let ring: number[] = [];
+        if (rawRing) {
+          try {
+            const parsed = JSON.parse(rawRing);
+            if (Array.isArray(parsed)) {
+              ring = parsed.filter((v): v is number => typeof v === "number");
+            }
+          } catch {
+            ring = []; // corrupted ring — report the totals instead of failing
+          }
+        }
+        const now = Date.now();
+        const countSince = (ms: number) => ring.filter((t) => now - t <= ms).length;
+        return Response.json({
+          ok: true,
+          total: rawTotal ? parseInt(rawTotal, 10) || 0 : 0,
+          lastAt: rawAt ? new Date(Number(rawAt)).toISOString() : null,
+          // The ring holds the last 50 EPISODES, so the window counts below
+          // undercount a storm longer than 50 episodes — `total` is the volume
+          // and these are the shape.
+          ringSize: ring.length,
+          lastHour: countSince(3_600_000),
+          last6h: countSince(6 * 3_600_000),
+          last24h: countSince(24 * 3_600_000),
+          ring: ring
+            .slice(-20)
+            .map((t) => ({ at: new Date(t).toISOString(), agoMin: Math.round((now - t) / 60_000) })),
+        });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        );
+      }
+    }
     if (url.pathname === "/debug/pushes") {
       const rows = (await db?.listSeenTokens()) ?? [];
       const byDay = new Map<string, number>();
