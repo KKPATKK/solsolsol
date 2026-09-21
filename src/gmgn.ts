@@ -14,6 +14,26 @@ import type { AppConfig } from "./config";
 
 const BASE_URL = "https://openapi.gmgn.ai";
 
+/**
+ * Back off ALL GMGN calls for this long after one 429 — the same policy the
+ * GeckoTerminal and Jupiter token clients already use.
+ *
+ * 2026-09-21: GMGN 429s a Cloudflare Worker's shared egress IP for the whole
+ * window (the repo's own note on the gecko trending feed: "the replacement for
+ * GMGN trending (GMGN's edge blocks Cloudflare Worker egress with 429)"), and
+ * /debug/gmgn answered `GMGN HTTP 429` on every live sample. Without this
+ * window the client's 2s/4s retry ladder re-hit the same wall EVERY time, and
+ * the cost is not the one request the caller sees: `getJson`'s retry chain
+ * keeps running ~6s in the background after the caller's deadline race has
+ * already given up — once per tick for the discovery feed and once per
+ * CANDIDATE for the enrichment — competing with the eval and push phases for
+ * the isolate, inside a tick envelope sized (worker.SCAN_TICK_BUDGET_MS)
+ * against a ~9.6s kill. Retrying an IP-level rate limit inside the same tick
+ * was never going to succeed; one attempt per window can, and it keeps GMGN a
+ * cheap standing probe instead of a per-tick cost.
+ */
+export const GMGN_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Spaces out HTTP requests so we stay under GMGN's rate limit. */
@@ -122,22 +142,101 @@ export function parseTokenInfo(data: unknown): GmgnTokenInfo | null {
   };
 }
 
+/**
+ * Feed state for telemetry, published by the isolate's client (see
+ * gmgnFeedStats). Never read by any decision.
+ */
+export interface GmgnFeedStats {
+  /** False when this isolate has not built a client (disabled / no key). */
+  active: boolean;
+  requests: number;
+  http429: number;
+  consecutive429: number;
+  lastStatus: number;
+  last429At: number;
+  lastOkAt: number;
+  backoffMs: number;
+  backoffUntil: number;
+}
+
+/**
+ * The isolate's client, for telemetry only (same channel as
+ * geckoterminal.geckoFeedStats): the worker builds exactly one per isolate and
+ * the summary is what the completion heartbeat serializes.
+ */
+let lastClient: GmgnClient | null = null;
+
+/** Feed state of this isolate's client, or an inactive zero record. */
+export function gmgnFeedStats(): GmgnFeedStats {
+  if (lastClient === null) {
+    return {
+      active: false,
+      requests: 0,
+      http429: 0,
+      consecutive429: 0,
+      lastStatus: 0,
+      last429At: 0,
+      lastOkAt: 0,
+      backoffMs: 0,
+      backoffUntil: 0,
+    };
+  }
+  return lastClient.stats();
+}
+
 export class GmgnClient {
   private readonly throttle: Throttle;
+  /** Timestamp until which all calls are skipped (after a 429). */
+  private rateLimitedUntil = 0;
+  /** Telemetry (see GmgnFeedStats) — never read by any decision. */
+  private requests = 0;
+  private http429 = 0;
+  private consecutive429 = 0;
+  private lastStatus = 0;
+  private last429At = 0;
+  private lastOkAt = 0;
+  private backoffMs = 0;
 
   constructor(private readonly config: AppConfig) {
     this.throttle = new Throttle(config.gmgnRequestIntervalMs);
+    // Publish this client's feed state (see gmgnFeedStats).
+    lastClient = this;
+  }
+
+  private rateLimited(): boolean {
+    return Date.now() < this.rateLimitedUntil;
+  }
+
+  /** Feed state for /health (see GmgnFeedStats). */
+  stats(): GmgnFeedStats {
+    return {
+      active: true,
+      requests: this.requests,
+      http429: this.http429,
+      consecutive429: this.consecutive429,
+      lastStatus: this.lastStatus,
+      last429At: this.last429At,
+      lastOkAt: this.lastOkAt,
+      backoffMs: this.backoffMs,
+      backoffUntil: this.rateLimitedUntil,
+    };
   }
 
   /**
-   * GET with X-APIKEY auth + timestamp/client_id, retries for 429/5xx
-   * (2s/4s backoff), unwraps the `{ code, data }` envelope when present.
+   * GET with X-APIKEY auth + timestamp/client_id, retries 5xx (2s/4s
+   * backoff), unwraps the `{ code, data }` envelope when present.
    * Deterministic 4xx returns null (retrying never helps).
+   *
+   * A 429 is NOT a retry case: it arms the shared backoff window and returns
+   * null immediately (see GMGN_RATE_LIMIT_BACKOFF_MS), so the caller's deadline
+   * race cannot leave a retry chain running in the background. While the
+   * window is armed every call returns null before touching the network.
    */
   private async getJson(
     path: string,
     query: Record<string, string | number>,
   ): Promise<unknown> {
+    if (this.rateLimited()) return null;
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -154,6 +253,8 @@ export class GmgnClient {
             signal: AbortSignal.timeout(15_000),
           }),
         );
+        this.requests += 1;
+        this.lastStatus = res.status;
         if (res.status === 429 || res.status >= 500) {
           // Surface the API's error detail (RATE_LIMIT_EXCEEDED vs
           // RATE_LIMIT_BANNED + reset_at) for diagnostics via /debug/gmgn.
@@ -168,6 +269,21 @@ export class GmgnClient {
           } catch {
             // body not JSON — keep the plain status
           }
+          if (res.status === 429) {
+            // Rate limit: pause the client instead of retrying into the same
+            // wall (see GMGN_RATE_LIMIT_BACKOFF_MS).
+            this.http429 += 1;
+            this.consecutive429 += 1;
+            this.last429At = Date.now();
+            this.backoffMs = GMGN_RATE_LIMIT_BACKOFF_MS;
+            this.rateLimitedUntil = this.last429At + this.backoffMs;
+            console.warn(
+              `[gmgn] 429${detail} — pausing the client ${Math.round(
+                this.backoffMs / 1000,
+              )}s (one probe per window instead of a retry ladder per tick)`,
+            );
+            return null;
+          }
           throw new Error(`GMGN HTTP ${res.status}${detail}`);
         }
         if (!res.ok) return null; // 4xx — deterministic
@@ -176,6 +292,15 @@ export class GmgnClient {
         // endpoints nest it twice (observed 2026-08-16:
         // {code,data:{code,data:{rank}}}) while token/info's payload has no
         // `data` key of its own, so the loop terminates on the real object.
+        this.lastOkAt = Date.now();
+        if (this.consecutive429 > 0) {
+          console.log(
+            `[gmgn] client recovered after ${this.consecutive429} consecutive 429(s)`,
+          );
+          this.consecutive429 = 0;
+          this.backoffMs = 0;
+          this.rateLimitedUntil = 0;
+        }
         let unwrapped: unknown = body;
         while (
           unwrapped !== null &&

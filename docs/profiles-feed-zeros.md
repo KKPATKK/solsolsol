@@ -108,6 +108,25 @@ profiles 修好之後，逐個 feed 量度，發現**同一類問題還有四個
 | `jupfeeds.ts` | trending leg 由死掉的 `/trending/24h` 改指 `/toporganicscore/24h`（同日實測：top 20 裡 4 個落在年齡窗內：12.5h–24h、mcap 177K–4.0M、organic 75+） |
 | `tickprobe.ts` | `summary.gecko` 移出 `captured.length > 0` 的 guard —— 所有 `markPhase` 都在 per-candidate 鏈裡，所以「0 candidate」的 tick（多數 tick，而且正正就是 `geo 0` 的形狀）以前**乜都唔發佈**，解釋 `geo 0` 的數字剛好在需要時讀不到（live：8/8 次取樣都缺） |
 
+## 另一個每 tick 都焼成本嘅：GMGN 429 重試階梯
+
+GMGN 在生產係**開住**嘅（`GMGN_ENABLED` 預設 true + `GMGN_API_KEY` 有值 ⇒ `/health.gmgnConfigured true`），
+但 GMGN 嘅 edge 對 Worker egress 一直 429（`/debug/gmgn` → `GMGN HTTP 429`；而 gecko trending 出現時嘅註釋
+本身就寫住佢係 GMGN trending 嘅替代品）。而 `GmgnClient.getJson` 對 429 用 **2s/4s 重試階梯**：
+
+- 每次 call = 3 次嘗試 ≈ 6 秒；
+- discovery 每 tick 一次；
+- enrichment **每個 candidate 一次**（`/v1/token/info`）。
+
+caller 嘅 deadline race 只封住 await，封唔住條鏈 —— 佢喺背景繼續跑足 ~6 秒，同 eval / push 階段爭同一個 isolate，
+而 tick envelope（`worker.SCAN_TICK_BUDGET_MS = 9500`）係對住 ~9.6s 殺點設計嘅。
+
+修法（`src/gmgn.ts`）：429 就當 rate limit —— arm 一個 5 分鐘共用 backoff、即刻 return null，
+唔再重試（重試同一面牆唔會通）；5xx 保留原本 2s/4s 重試（那是真係暫時性嘅）。
+backoff 期間所有 call（含 enrichment）零請求，恢復成功就自動清零 —— GMGN 因此變成每 5 分鐘一次嘅**廉價探針**，
+唔再係每 tick 每 candidate 嘅固定成本。順手加 `gmgnFeedStats()` 發佈到 `summary.gmgnFeed`
+（同 `summary.gecko` 同一條通道），令「GMGN 係被封鎖、抑或每 tick 白打」可以直接讀，唔需要再靠推論。
+
 ## 為什麼 revert 咗 scanner 那一半
 
 `4434fe6` 部署後即刻量到：

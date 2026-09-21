@@ -1,4 +1,5 @@
 import { geckoFeedStats } from "./geckoterminal";
+import { gmgnFeedStats } from "./gmgn";
 
 /*
  * Per-tick probe for the scan (2026-09-19).
@@ -609,6 +610,11 @@ export function installTickProbe(
         // feed state is a cumulative view of the client, not a tick-scoped
         // stamp, so it belongs to every tick.
         summary.gecko = geckoFeedStats();
+        // GMGN rides along for the same reason (see gmgn.GmgnFeedStats): its
+        // edge 429s a Worker's egress IP, and whether the client is currently
+        // paused (and for how long) is the difference between "GMGN is
+        // blocked" and "GMGN is being re-probed every tick for nothing".
+        summary.gmgnFeed = gmgnFeedStats();
         if (marker !== null && captured.length > 0) {
           summary.phases = captured;
           // Published here rather than by the worker's onTickEnd hook: this
