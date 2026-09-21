@@ -242,3 +242,47 @@ tracker 只將 `comparableLiquidity(pair)` 交畀規則（非 DexScreener → `n
 **誠實 caveat**：delivery audit ring 只裝 30 條、跨度約 6 小時（09-20 17:46→23:59），所以一條 13–23
 小時前嘅舊終態行一律讀成「冇證明」—— 對舊行而言「未證實」係**缺席嘅證明**，唔係證明咗冇送。
 照 at-least-once 嘅原則行（寧願重複都唔可以唔見卡），但代價係有機會重發一張其實已經到咗嘅卡。
+
+### 清理（2026-09-21 00:28–00:48Z，線上）
+
+`/debug/push-watch?limit=500` 全表普查：**46 行 → 2 行有 issue**，兩個都係 `unarmed_alert_clock`
+（即 fix 前留低嘅「rug 但 alert clock 未武裝」），兩個都冇 audit 證明（ring 30 條／跨度 5.2 小時；
+兩行嘅最後檢查已經係 6.1／9.4 小時前，屬上面講嘅「缺席嘅證明」），所以照 at-least-once 行
+`re_arm_row`：
+
+| 幣 | 存量 `last_liquidity` | 診斷 | 動作 |
+|---|---|---|---|
+| BARREN | 9,636（< 地板，同 rug 一致） | `unarmed_alert_clock` | `re_arm_row` |
+| JPC | 9,796（同上） | `unarmed_alert_clock` | `re_arm_row` |
+
+`POST /debug/push-watch?repair=<mint>` 兩次都回 `{"repaired":true,"plan":"re_arm_row","proved":false}`；
+普查亦即刻轉 `issueCount 0`（兩行變 `last_state = NULL`、`last_alert_at = 0`、`last_checked = 0`）。
+
+**收斂（線上）**
+
+- **BARREN**：下一個 pass（00:29:18Z）就重新評估 → `lastState = null`（返 ACTIVE）。佢線上
+  DexScreener 主池係 **$16.2K**，即係 9,636 嗰個讀數已經唔再成立；該 pass 讀到嘅係非可比腿，
+  所以流動性未判、`last_liquidity` 照留舊值，下一個可比腿 tick 就會寫返真值。
+- **JPC**：修復後約兩分鐘**由表消失**，00:33:45Z 又由 self-heal（`findUntrackedPushes`）重新
+  enroll（`last_checked` = 插入鐘、`last_liquidity` / `last_mcap` 都係 null）。佢線上主池仍然係
+  $2.8K，即係判決本身冇錯，只係嗰行以身殉咗。
+
+**點解 JPC 會唔見（同一個 fix 家族嘅第二個窿）**：唔係 prune —— 佢 `pushed_at` 只係 6.9 小時前，
+窗係 26 小時。係 row loop 嘅 pair-miss 分支：寬限由**最後一次成功 check** 起計
+（`Math.max(pushedAt, lastChecked)`），而 re-arm 啱啱好把 `last_checked` 清零 —— fallback 於是變咗
+`pushedAt`，即係「unfindable 夠 2 小時先 drop」嘅寬限**喺 re-arm 之後嘅第一次 pass 就已經超時**，
+第一次 miss 就 delete 咗行。re-arm 嘅承諾（下一個 pass 重新推導、需要時重發同一張卡）就咁被一個
+miss 抵銷 —— 正正係呢份 doc 一路修嘅「冇卡喺 chat、行又靜靜哋消失」形狀。今次 self-heal 救返
+（推播只係 6.9 小時前，喺 heal lookback 內）；再舊啲嘅行就會係永久消失。
+
+**修法**（`docs/patches/rearm-pair-miss.patch`，已 apply）：寬限一定要由**真嘅 check 鐘**起計 ——
+`row.lastChecked > 0 && now - lastSeen > 2h`。冇鐘（arm/re-arm 之後未 check 過）＝冇「2 小時搵唔到」
+嘅證據，行留畀下一個 pass 再試；終點仍然係窗口 prune（`pushed_at` + 窗），而一次成功 check 就會
+還原個鐘。負向對照：喺 build artifact 度移走 fix，同一個測試即刻紅（`231 passed, 1 failed`）。
+
+- `npm run test:unit` → **232 passed / 0 failed**，新增
+  `PushWatcher: a re-armed row is not deleted on its first pair miss`（同一份 6 小時前嘅 `pushed_at`：
+  `last_checked = 0` 嗰行要留、`last_checked = pushed_at` 嗰行照樣 drop）。
+- `npm run typecheck` ✅。
+- 呢個 fix 要 deploy 先喺線上生效；未 deploy 前再手動 repair 舊行，仍然有機會被第一次 miss 刪走
+  （self-heal 會喺 lookback 內補返，但唔應該靠佢）。

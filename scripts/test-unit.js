@@ -4483,6 +4483,30 @@ async function main() {
     assert.match(String(out.note), /miss 2/);
   });
 
+  await test("PushWatcher: a re-armed row is not deleted on its first pair miss", async () => {
+    // rearmPushWatchAlert zeroes last_checked so the row re-enters the rotation
+    // at the front; the pair-miss grace then has NO check clock to measure from,
+    // and falling back to pushed_at counts a push that is already hours old — so
+    // the first miss deleted the row one pass after the repair, silently
+    // cancelling the re-announce (live 2026-09-21 00:33Z: a legacy drain row
+    // whose pool was still sub-floor). Control below: the SAME staleness WITH a
+    // real clock is still dropped once it has gone unseen for the full grace.
+    const deleted = [];
+    const db = watchDb([], []);
+    db.deletePushWatch = async (token) => { deleted.push(token); };
+    const stalePush = Date.now() - 6 * 3_600_000;
+    db.listPushWatch = async () => [
+      watchRow("REARMED", { pushedAt: stalePush, lastChecked: 0, lastLiquidity: 9_000 }),
+      watchRow("STALE", { pushedAt: stalePush, lastChecked: stalePush, lastLiquidity: 9_000 }),
+    ];
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}), async () => new Map(), null,
+    );
+    const out = await pw.runTick();
+    assert.deepEqual(deleted, ["STALE"], "only a row with a check clock may be dropped");
+    assert.match(String(out.note), /miss 2/);
+  });
+
   await test("PushWatcher: a card that cannot be sent leaves its row untouched", async () => {
     // The reservation happens BEFORE the send and is never retried, so a row
     // started without the send slice loses its card for good (live 2026-09-18

@@ -1552,9 +1552,22 @@ export class PushWatcher {
         // linger. The clock runs from the LAST SUCCESSFUL CHECK, not the
         // push time — the batched feed occasionally omits pairs (flaky
         // shared egress), and a single miss must not delete a live row.
+        //
+        // That clock is exactly what a RE-ARMED row does not have:
+        // rearmPushWatchAlert zeroes `last_checked` so the row goes back to the
+        // front of the rotation, and measuring the grace from `pushed_at` then
+        // counts a push that is already hours old — so the FIRST miss deletes
+        // the row. Live 2026-09-21 00:33Z: a legacy drain row repaired out of
+        // the unarmed-clock class vanished that way, one pass after the repair,
+        // with its verdict never re-derived (its pool was still sub-floor, so
+        // what the repair was re-announcing was simply lost). No check clock
+        // means there is no unfindable-for-2h evidence either way, so such a
+        // row is left for the next pass to retry: the age prune (pushed_at +
+        // window) is still its backstop, and one successful check gives it a
+        // real clock again.
         pairMiss += 1;
         const lastSeen = Math.max(row.pushedAt, row.lastChecked);
-        if (now - lastSeen > 2 * 3_600_000) {
+        if (row.lastChecked > 0 && now - lastSeen > 2 * 3_600_000) {
           trips += 1;
           await this.db.deletePushWatch(row.token);
         }

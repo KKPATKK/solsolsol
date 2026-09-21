@@ -1,0 +1,60 @@
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -1550,13 +1550,26 @@
+       if (!pair) {
+         // Delisted/unfindable: drop after a grace period so stale rows don't
+         // linger. The clock runs from the LAST SUCCESSFUL CHECK, not the
+         // push time — the batched feed occasionally omits pairs (flaky
+         // shared egress), and a single miss must not delete a live row.
++        //
++        // That clock is exactly what a RE-ARMED row does not have:
++        // rearmPushWatchAlert zeroes `last_checked` so the row goes back to the
++        // front of the rotation, and measuring the grace from `pushed_at` then
++        // counts a push that is already hours old — so the FIRST miss deletes
++        // the row. Live 2026-09-21 00:33Z: a legacy drain row repaired out of
++        // the unarmed-clock class vanished that way, one pass after the repair,
++        // with its verdict never re-derived (its pool was still sub-floor, so
++        // what the repair was re-announcing was simply lost). No check clock
++        // means there is no unfindable-for-2h evidence either way, so such a
++        // row is left for the next pass to retry: the age prune (pushed_at +
++        // window) is still its backstop, and one successful check gives it a
++        // real clock again.
+         pairMiss += 1;
+         const lastSeen = Math.max(row.pushedAt, row.lastChecked);
+-        if (now - lastSeen > 2 * 3_600_000) {
++        if (row.lastChecked > 0 && now - lastSeen > 2 * 3_600_000) {
+           trips += 1;
+           await this.db.deletePushWatch(row.token);
+         }
+         continue;
+       }
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -4484,3 +4484,27 @@
+   });
+ 
++  await test("PushWatcher: a re-armed row is not deleted on its first pair miss", async () => {
++    // rearmPushWatchAlert zeroes last_checked so the row re-enters the rotation
++    // at the front; the pair-miss grace then has NO check clock to measure from,
++    // and falling back to pushed_at counts a push that is already hours old — so
++    // the first miss deleted the row one pass after the repair, silently
++    // cancelling the re-announce (live 2026-09-21 00:33Z: a legacy drain row
++    // whose pool was still sub-floor). Control below: the SAME staleness WITH a
++    // real clock is still dropped once it has gone unseen for the full grace.
++    const deleted = [];
++    const db = watchDb([], []);
++    db.deletePushWatch = async (token) => { deleted.push(token); };
++    const stalePush = Date.now() - 6 * 3_600_000;
++    db.listPushWatch = async () => [
++      watchRow("REARMED", { pushedAt: stalePush, lastChecked: 0, lastLiquidity: 9_000 }),
++      watchRow("STALE", { pushedAt: stalePush, lastChecked: stalePush, lastLiquidity: 9_000 }),
++    ];
++    const pw = new PushWatcher(
++      db, watchBot, null, loadConfig({}), async () => new Map(), null,
++    );
++    const out = await pw.runTick();
++    assert.deepEqual(deleted, ["STALE"], "only a row with a check clock may be dropped");
++    assert.match(String(out.note), /miss 2/);
++  });
++
+   await test("PushWatcher: a card that cannot be sent leaves its row untouched", async () => {
