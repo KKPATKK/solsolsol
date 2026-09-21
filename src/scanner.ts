@@ -283,10 +283,19 @@ const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
  * Wall clock the tracker pass's durable coverage write may spend (see
  * runTrackerPass). It is telemetry, so it is raced against this bound like the
  * deferral-counter sync: a hung Turso write must never carry the tick past the
- * pass's own deadline, and a write that lands late is harmless (same key, same
- * shape).
+ * pass's own deadline.
+ *
+ * 400 → 900 (2026-09-21). At 400ms the bound was BELOW the live round trip
+ * (Turso trips measured 250-420ms, the 03:35Z note's own stage clock shows
+ * ~420ms), so the race resolved with the write still in flight, the pass
+ * returned, and the invocation ended before the abandoned promise landed —
+ * i.e. the write was cancelled, not slow. Live symptom: the note was written
+ * once every several minutes while every tick's row writes proved the pass
+ * was completing. 900 keeps the hang protection (the tick still cannot be
+ * carried past its tail by one Turso call) while leaving ~2x the observed
+ * round trip for the write to land.
  */
-const PUSH_WATCH_PASS_STATE_BOUND_MS = 400;
+const PUSH_WATCH_PASS_STATE_BOUND_MS = 900;
 /**
  * Least send slice worth starting. Below it the card is DEFERRED rather than
  * attempted: a deferral writes NOTHING (no claim, no audit, no failure record)
