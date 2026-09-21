@@ -5857,6 +5857,196 @@ async function main() {
     assert.equal(c3.loaded, false);
   });
 
+  await test("CrimeWalletClient: a cold isolate hydrates the fleet copy — no fetch, no re-persist", async () => {
+    // The 2026-09-21 fix: the TTL is fleet-wide, not per isolate. A recycled
+    // isolate used to re-download + re-persist the whole ~216KB list
+    // (2.8-3.6s live) on its first tick, and that block sat BEFORE the scan's
+    // feed phase, whose window is only 900ms — so the DexScreener profiles
+    // call was never dispatched and the tick evaluated `profiles 0`.
+    const good = "11111111111111111111111111111111";
+    const good2 = "22222222222222222222222222222222";
+    const refreshMs = 6 * 3600_000;
+    const fetchedAt = Date.now() - 60_000; // the fleet refreshed a minute ago
+    const state = new Map([
+      ["crime_wallets_list", `${good}\n${good2}`],
+      ["crime_wallets_updated_at", String(fetchedAt)],
+    ]);
+    let writeCalls = 0;
+    const db = {
+      async setWorkerState(k, v) {
+        writeCalls += 1;
+        state.set(k, v);
+      },
+      async getWorkerState(k) {
+        return state.get(k) ?? null;
+      },
+    };
+    let fetchCalls = 0;
+    const cfg = { crimeWallets: { url: "https://x", refreshMs, timeoutMs: 1000 } };
+    const cold = new CrimeWalletClient(cfg, db, async () => {
+      fetchCalls += 1;
+      throw new Error("must not fetch inside refreshMs");
+    });
+    const r = await cold.refreshIfStale();
+    assert.equal(r.ok, true);
+    assert.equal(r.size, 2, "the persisted copy is the list");
+    assert.equal(fetchCalls, 0, "no network on a cold isolate inside the TTL");
+    assert.equal(writeCalls, 0, "and no second 216KB re-persist");
+    assert.equal(cold.loaded, true);
+    assert.equal(cold.status.loadedFrom, "persisted");
+    assert.equal(cold.status.loadedAt, fetchedAt, "the stamp is the fleet's, not \"now\"");
+    // The list is usable on that very tick — the crime check is not skipped.
+    const chk = await cold.checkToken("T", good2, null, { checkHolders: false, holderTopN: 8 });
+    assert.equal(chk.loaded, true);
+    assert.equal(chk.creatorHit, true);
+    // Warm second call: still no network.
+    await cold.refreshIfStale();
+    assert.equal(fetchCalls, 0);
+
+    // A stamp past refreshMs is NOT a free pass: hydrate (so the tick still
+    // has a blocklist) but let the refresh run.
+    const staleState = new Map([
+      ["crime_wallets_list", `${good}\n`],
+      ["crime_wallets_updated_at", String(Date.now() - refreshMs - 1000)],
+    ]);
+    const staleDb = {
+      async setWorkerState(k, v) {
+        staleState.set(k, v);
+      },
+      async getWorkerState(k) {
+        return staleState.get(k) ?? null;
+      },
+    };
+    let staleFetches = 0;
+    const stale = new CrimeWalletClient(cfg, staleDb, async () => {
+      staleFetches += 1;
+      return new Response(`${good}\n${good2}\n`, { status: 200 });
+    });
+    const rs = await stale.refreshIfStale();
+    assert.equal(staleFetches, 1, "a stale stamp still refreshes");
+    assert.equal(rs.size, 2);
+    assert.equal(stale.status.loadedFrom, "network");
+    // The stamp must never certify a copy it predates: list first, then stamp.
+    assert.equal(
+      staleState.get("crime_wallets_updated_at"),
+      String(stale.status.loadedAt),
+      "the persisted stamp names the copy that was persisted with it",
+    );
+  });
+
+  await test("Scanner: a slow pre-feed step cannot steal the profiles feed's window", async () => {
+    // The live 2026-09-21 signature (measured on /debug/tick): `profiles 0`,
+    // `feedsMs 0`, `feedRequests 0` — the profiles call was never DISPATCHED,
+    // because the pre-feed steps (the enabled-chats read + a cold isolate's
+    // crime-wallet load) had already spent the 900ms window. The fetch now
+    // starts at tick start and is awaited at its call site, so the window
+    // belongs to the fetch whatever those steps cost.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      await db.saveChatSettings({
+        chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
+        minAgeMinutes: 0, maxAgeMinutes: 100_000,
+        min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+        enabled: true,
+      });
+      const dex = new DexScreenerClient(cfg);
+      let feedCalls = 0;
+      dex.fetchLatestSolanaProfiles = async () => {
+        feedCalls += 1;
+        return [{ tokenAddress: "FEEDCOIN1" }];
+      };
+      dex.fetchPairsForTokens = async () => new Map();
+      // 800ms of the 900ms window: the cold-isolate crime load, live-sized.
+      const slowCrime = {
+        refreshIfStale: async () => {
+          await new Promise((r) => setTimeout(r, 800));
+          return { ok: true, size: 0 };
+        },
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, null, null, null, null, null, slowCrime,
+      );
+      await scanner.runOnce();
+      assert.equal(
+        feedCalls,
+        1,
+        "the profiles call must be dispatched at tick start, before the pre-feed awaits",
+      );
+      assert.ok(
+        scanner.lastSummary.profiles > 0,
+        `the feed must still be evaluated (got profiles ${scanner.lastSummary.profiles})`,
+      );
+      assert.equal(scanner.lastSummary.profilesSettled, true);
+      assert.ok(
+        scanner.lastSummary.preFeedMs >= 700,
+        `preFeedMs must expose the stolen window (got ${scanner.lastSummary.preFeedMs})`,
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: a profiles call that never settles falls back to the deferred lane", async () => {
+    // The other half of the skip path: the call IS dispatched and the upstream
+    // hangs, so the feed race resolves with `empty` — which used to be `[]`,
+    // costing the tick the deferred coins the request exists to carry back.
+    // The fallback supplies them now, and `profilesSettled: false` keeps the
+    // reading honest (the number is the make-up lane, not the upstream's).
+    const { Scanner } = require("../dist/scanner.js");
+    const { addDeferredToken, dropDeferredToken } = require("../dist/deferredmakeup.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    addDeferredToken("DEFERCOIN1", Date.now());
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      await db.saveChatSettings({
+        chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
+        minAgeMinutes: 0, maxAgeMinutes: 100_000,
+        min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+        enabled: true,
+      });
+      const dex = new DexScreenerClient(cfg);
+      // A hung upstream: never answers (the live shape is a retry chain the
+      // client abandons at its own budget; this one simply never lands).
+      dex.fetchLatestSolanaProfiles = () => new Promise(() => {});
+      dex.fetchPairsForTokens = async () => new Map();
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg, null, null, null,
+      );
+      await scanner.runOnce();
+      assert.equal(scanner.lastSummary.profilesSettled, false, "the call did not answer");
+      assert.ok(
+        scanner.lastSummary.profiles >= 1,
+        `the deferred coin must still be evaluated (got ${scanner.lastSummary.profiles})`,
+      );
+    } finally {
+      dropDeferredToken("DEFERCOIN1");
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
   await test("CrimeWalletClient.checkToken: creator hit flags without spending holder RPCs", async () => {
     const bad = "11111111111111111111111111111111";
     const client = new CrimeWalletClient(

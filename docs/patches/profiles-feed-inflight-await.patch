@@ -1,0 +1,53 @@
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -1917,20 +1917,34 @@
+   /**
+    * Run one feed fetch capped by the feed deadline (see FEED_DEADLINE_MS).
+-   * Skips outright when the deadline has passed; otherwise races the fetch
+-   * against the remaining feed budget so a hanging upstream call resolves
+-   * empty at the deadline instead of starving the core scan. The abandoned
+-   * promise keeps its race handlers attached, so a late settlement (or
+-   * rejection) is swallowed — no unhandled-rejection crash.
++   * Otherwise races the fetch against the remaining feed budget so a hanging
++   * upstream call resolves empty at the deadline instead of starving the core
++   * scan. The abandoned promise keeps its race handlers attached, so a late
++   * settlement (or rejection) is swallowed — no unhandled-rejection crash.
++   *
++   * `inFlight` marks a feed whose call was ALREADY started by the caller (the
++   * profiles fetch, dispatched at tick start — see FEED_DEADLINE_MS). The
++   * 250ms floor below exists to stop the scanner DISPATCHING a request it can
++   * no longer use; for a call that is already in flight there is nothing left
++   * to save, and the floor would be actively wrong: measured 2026-09-21, the
++   * cold-isolate crime-wallet load held the tick for 800ms of the 900ms
++   * window, so the floor short-circuited a call that was already 800ms into
++   * its own answer — the exact `profiles 0` tick this change removes. With
++   * `inFlight`, only the deadline decides: a window already past resolves
++   * `empty` (through the same race, so the call keeps running and its
++   * bookkeeping still lands) while a window with time left is awaited.
+    */
+   private async fetchFeedCapped<T>(
+     feed: () => Promise<T>,
+     empty: T,
+     feedDeadline: number,
++    inFlight = false,
+   ): Promise<T> {
+     const remaining = feedDeadline - Date.now();
+-    if (remaining <= 250) return empty;
++    if (!inFlight && remaining <= 250) return empty;
+     return Promise.race([
+       feed(),
+-      new Promise<T>((resolve) => setTimeout(() => resolve(empty), remaining)),
++      new Promise<T>((resolve) =>
++        setTimeout(() => resolve(empty), Math.max(0, remaining)),
++      ),
+     ]);
+   }
+@@ -2148,7 +2148,8 @@
+           list: missingDeferredTokens([]).map((tokenAddress) => ({ tokenAddress })),
+           settled: false,
+         },
+         feedDeadline,
++        true,
+       );
+       const profiles = profilesOutcome.list;
+       diag.profilesSettled = profilesOutcome.settled;

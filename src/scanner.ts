@@ -25,6 +25,7 @@ import {
   deferredTokenList,
   dropDeferredToken,
   isDeferredToken,
+  missingDeferredTokens,
 } from "./deferredmakeup";
 
 
@@ -641,6 +642,23 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  * with it. The actual fix for the skip path is passing the make-up list as
  * `empty` at the profiles call site (the call site sits past this tool's
  * edit window; the patch is recorded in docs/push-baseline-ledger.md).
+ *
+ * 2026-09-21 — both halves of that skip path are now closed, after the hour
+ * of `profiles 0` ticks that made the cost of leaving it open concrete. The
+ * measured cause was the PRE-FEED steps, not the feed: the enabled-chats read
+ * plus a cold isolate's crime-wallet load (2.8-3.6s live) sat between tick
+ * start and the fan-out, and the persisted crime-list stamp showed a cold
+ * tick every 25-45s — so the window was nearly always gone before the fan-out
+ * was reached. /debug/tick named it exactly: `profiles 0`, `feedsMs 0`,
+ * `feedRequests 0` (the client was never called) while the pool still
+ * evaluated 72-146 coins. Hence:
+ *   1. the profiles fetch is STARTED at tick start, before those steps, and
+ *      awaited where its result is used — it gets the whole window this
+ *      constant sizes, whatever the pre-feed steps cost (`preFeedMs`);
+ *   2. the call site passes the pending make-up coins as `fetchFeedCapped`'s
+ *      `empty`, so a tick whose call is short-circuited or raced away still
+ *      evaluates the deferred lane instead of nothing — with
+ *      `profilesSettled: false` saying that is what happened.
  */
 const FEED_DEADLINE_MS = 900;
 /**
@@ -966,6 +984,23 @@ export interface ScanSummary {
   pool: number;
   /** Wall-clock ms spent in the discovery-feed phase (profiles → backfill). */
   feedsMs?: number;
+  /**
+   * Wall-clock ms from tick start to the start of the feed fan-out. The
+   * profiles call only dispatches while the tick's 900ms feed window
+   * (FEED_DEADLINE_MS) still has its floor left, so this is the number that
+   * decides whether the tick discovers anything: measured live 2026-09-21,
+   * the `profiles 0` ticks are exactly the ones where the pre-feed steps (the
+   * enabled-chats read plus the cold isolate's crime-wallet load) had already
+   * spent past 650ms of that window.
+   */
+  preFeedMs?: number;
+  /**
+   * Whether the profiles call ANSWERED inside the feed window. False means
+   * this tick evaluated the make-up fallback instead (see the profiles call
+   * site) — read the two together: `settled: false` with a non-zero
+   * `profiles` means that number is the deferred lane, not the feed.
+   */
+  profilesSettled?: boolean;
   /** Wall-clock ms spent on the post-push tracker pass. */
   trackerMs?: number;
   /** Wall-clock ms for the re-eval pool query + rotation slice. */
@@ -1915,22 +1950,36 @@ export class Scanner {
 
   /**
    * Run one feed fetch capped by the feed deadline (see FEED_DEADLINE_MS).
-   * Skips outright when the deadline has passed; otherwise races the fetch
-   * against the remaining feed budget so a hanging upstream call resolves
-   * empty at the deadline instead of starving the core scan. The abandoned
-   * promise keeps its race handlers attached, so a late settlement (or
-   * rejection) is swallowed — no unhandled-rejection crash.
+   * Otherwise races the fetch against the remaining feed budget so a hanging
+   * upstream call resolves empty at the deadline instead of starving the core
+   * scan. The abandoned promise keeps its race handlers attached, so a late
+   * settlement (or rejection) is swallowed — no unhandled-rejection crash.
+   *
+   * `inFlight` marks a feed whose call was ALREADY started by the caller (the
+   * profiles fetch, dispatched at tick start — see FEED_DEADLINE_MS). The
+   * 250ms floor below exists to stop the scanner DISPATCHING a request it can
+   * no longer use; for a call that is already in flight there is nothing left
+   * to save, and the floor would be actively wrong: measured 2026-09-21, the
+   * cold-isolate crime-wallet load held the tick for 800ms of the 900ms
+   * window, so the floor short-circuited a call that was already 800ms into
+   * its own answer — the exact `profiles 0` tick this change removes. With
+   * `inFlight`, only the deadline decides: a window already past resolves
+   * `empty` (through the same race, so the call keeps running and its
+   * bookkeeping still lands) while a window with time left is awaited.
    */
   private async fetchFeedCapped<T>(
     feed: () => Promise<T>,
     empty: T,
     feedDeadline: number,
+    inFlight = false,
   ): Promise<T> {
     const remaining = feedDeadline - Date.now();
-    if (remaining <= 250) return empty;
+    if (!inFlight && remaining <= 250) return empty;
     return Promise.race([
       feed(),
-      new Promise<T>((resolve) => setTimeout(() => resolve(empty), remaining)),
+      new Promise<T>((resolve) =>
+        setTimeout(() => resolve(empty), Math.max(0, remaining)),
+      ),
     ]);
   }
 
@@ -1966,6 +2015,29 @@ export class Scanner {
     // clamped to this, so no combination of them can consume the tick.
     const frontDeadline = startedAt + FRONT_PHASE_WINDOW_MS;
     const feedDeadline = Math.min(startedAt + FEED_DEADLINE_MS, frontDeadline);
+    // The profiles fetch is STARTED here — at tick start, before the
+    // enabled-chats read and the crime-wallet load below — and awaited where
+    // its result is used (see the call site). Its window is `feedDeadline`,
+    // i.e. FEED_DEADLINE_MS measured from tick start, and the point of
+    // starting it early is that it is already in flight while those pre-feed
+    // steps run: they used to run FIRST, and on a cold isolate they spent
+    // 2.8-3.6s of the 900ms window, so `fetchFeedCapped` short-circuited and
+    // this call was never even dispatched (2026-09-21, see FEED_DEADLINE_MS).
+    // Both handlers are attached HERE, so every early return below — no
+    // enabled chats, the stop checks — can abandon the promise without an
+    // unhandled rejection, and a late settle still reaches the client's own
+    // bookkeeping (noteProfileFeed) exactly as it did when the call was made
+    // later in the tick.
+    const profilesCall = this.dex.fetchLatestSolanaProfiles().then(
+      (list) => ({ list, settled: true }),
+      (err: unknown) => {
+        console.error(
+          "[scanner] dexscreener profile feed failed:",
+          err instanceof Error ? err.message : err,
+        );
+        return { list: [] as TokenProfile[], settled: true };
+      },
+    );
     const diag: ScanSummary = {
       // Carried from the previous tick's tracker pass, which runs AFTER this
       // scan's flush (see runTrackerPass / worker.TRACKER_PASS_BUDGET_MS).
@@ -2085,18 +2157,25 @@ export class Scanner {
       // feeds.
       if (this.shouldStopEarly()) return;
       const feedsStart = Date.now();
+      diag.preFeedMs = feedsStart - startedAt;
       const feedJobs: Array<Promise<void>> = [];
-      const profiles = await this.fetchFeedCapped(
-        () => this.dex.fetchLatestSolanaProfiles(),
-        [],
+      // The fallback is the make-up lane, not `[]`: the deferred coins are
+      // what the feed request exists to carry back into the tick, so a tick
+      // that cannot get an answer must not also lose them (see
+      // FEED_DEADLINE_MS, and docs/push-baseline-ledger.md for the ticks this
+      // used to cost). `settled` keeps the reading honest — a fallback count
+      // can never be mistaken for the upstream's answer.
+      const profilesOutcome = await this.fetchFeedCapped(
+        () => profilesCall,
+        {
+          list: missingDeferredTokens([]).map((tokenAddress) => ({ tokenAddress })),
+          settled: false,
+        },
         feedDeadline,
-      ).catch((err: unknown): TokenProfile[] => {
-        console.error(
-          "[scanner] dexscreener profile feed failed:",
-          err instanceof Error ? err.message : err,
-        );
-        return [];
-      });
+        true,
+      );
+      const profiles = profilesOutcome.list;
+      diag.profilesSettled = profilesOutcome.settled;
       diag.profiles = profiles.length;
       // pump.fun discovery — the widest free source of brand-new coins
       // (DexScreener's profiles feed only returns ~24 Solana profiles per
