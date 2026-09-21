@@ -1750,32 +1750,7 @@ export class Scanner {
         );
         this.lastSummary.trackerMs = Date.now() - startedAt;
       }
-      // DURABLE copy of the coverage line. The in-memory carries above only
-      // reach /health when the next tick's flush happens to run on THIS
-      // isolate, and on 2026-09-21 that was the exception, not the rule: four
-      // consecutive /health polls showed no note at all while the pass was
-      // demonstrably running, so the stage split that explained the whole
-      // rotation stall was unreadable exactly when it mattered. One
-      // worker_state row makes it survive its isolate (/health.pushWatchPass,
-      // /debug/scan-history.pushWatchPass). Bounded and best-effort — see
-      // PUSH_WATCH_PASS_STATE_BOUND_MS.
-      try {
-        await Promise.race([
-          this.db.setWorkerState(
-            "push_watch_pass",
-            JSON.stringify({
-              at: Date.now(),
-              note,
-              trackerMs: Date.now() - startedAt,
-            }),
-          ),
-          new Promise((resolve) =>
-            setTimeout(resolve, PUSH_WATCH_PASS_STATE_BOUND_MS),
-          ),
-        ]);
-      } catch {
-        /* telemetry only */
-      }
+      await this.persistPassNote(note, startedAt);
       return note;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1783,7 +1758,45 @@ export class Scanner {
       if (this.lastSummary) {
         this.lastSummary.pushWatch = `err:${msg.slice(0, 140)}`;
       }
+      // Persisted like the success path, because "the note stopped moving" is
+      // exactly the signal this row exists to carry: a pass that threw leaves
+      // no stage split and no rows, and from /health alone that is
+      // indistinguishable from a tick that never reached the pass at all
+      // (2026-09-21 04:03-04:05Z: fast ticks, no note, no way to tell the two
+      // apart without the Cloudflare log the operator cannot read).
+      await this.persistPassNote(`err:${msg.slice(0, 140)}`, startedAt);
       return null;
+    }
+  }
+
+  /**
+   * The tracker pass's coverage line, in ONE worker_state row — the durable
+   * copy the in-memory carries above cannot give. The in-memory path only
+   * reaches /health when the next tick's flush happens to run on THIS isolate,
+   * and on 2026-09-21 that was the exception, not the rule: four consecutive
+   * /health polls showed no note at all while the pass was demonstrably
+   * running, so the stage split that explained the whole rotation stall was
+   * unreadable exactly when it mattered (/health.pushWatchPass,
+   * /debug/scan-history.pushWatchPass). Bounded and best-effort — see
+   * PUSH_WATCH_PASS_STATE_BOUND_MS.
+   */
+  private async persistPassNote(note: string, startedAt: number): Promise<void> {
+    try {
+      await Promise.race([
+        this.db.setWorkerState(
+          "push_watch_pass",
+          JSON.stringify({
+            at: Date.now(),
+            note,
+            trackerMs: Date.now() - startedAt,
+          }),
+        ),
+        new Promise((resolve) =>
+          setTimeout(resolve, PUSH_WATCH_PASS_STATE_BOUND_MS),
+        ),
+      ]);
+    } catch {
+      /* telemetry only */
     }
   }
 
