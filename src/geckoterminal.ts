@@ -204,6 +204,10 @@ export interface GeckoFeedStats {
   altOk: number;
   /** Alternate-host 429s (its own bucket, so its pause is separate). */
   alt429: number;
+  /** Failures (429 **or** a hard refusal) that armed the alternate's pause. */
+  altFailures: number;
+  /** HTTP status of the newest alternate-host failure (0 = none yet). */
+  altLastStatus: number;
   /** Epoch the alternate host's pause expires at (0 = not paused). */
   altBackoffUntil: number;
 }
@@ -369,6 +373,8 @@ export function geckoFeedStats(): GeckoFeedStats {
       altAttempts: 0,
       altOk: 0,
       alt429: 0,
+      altFailures: 0,
+      altLastStatus: 0,
       altBackoffUntil: 0,
     };
   }
@@ -407,7 +413,9 @@ export class GeckoTerminalClient {
   private altAttempts = 0;
   private altOk = 0;
   private alt429 = 0;
-  private altConsecutive429 = 0;
+  /** Every failure that paused the alternate — see armAltPause. */
+  private altFailures = 0;
+  private altLastStatus = 0;
   private altRateLimitedUntil = 0;
 
   constructor(config: AppConfig) {
@@ -445,6 +453,8 @@ export class GeckoTerminalClient {
       altAttempts: this.altAttempts,
       altOk: this.altOk,
       alt429: this.alt429,
+      altFailures: this.altFailures,
+      altLastStatus: this.altLastStatus,
       altBackoffUntil: this.altRateLimitedUntil,
     };
   }
@@ -496,6 +506,11 @@ export class GeckoTerminalClient {
    * egress IP's — the primary stops being 429ed at all — and the alternate
    * becomes a full mirror (see geckoAltEligible). Unkeyed behaviour is
    * unchanged.
+   *
+   * ANY failure pauses the alternate, not just a 429 (see armAltPause): live
+   * 2026-09-21 the Worker's egress got a 403 there, which is a refusal rather
+   * than a rate limit, and without this the fallback would have spent a request
+   * per tick for nothing.
    */
   private async get(path: string): Promise<unknown> {
     if (this.rateLimited()) {
@@ -510,6 +525,29 @@ export class GeckoTerminalClient {
       return this.attempt(GECKO_ALT_BASE_URL, path, true);
     }
     return this.attempt(BASE_URL, path, false);
+  }
+
+  /**
+   * Arm the fallback's own pause. A 429 and a hard refusal share ONE
+   * escalation: both mean "the alternate is not usable right now", and the
+   * only difference is what the log says. What matters is that the fallback
+   * stops asking — without this, a 403 (its live shape from the Worker's own
+   * egress) spent one request per tick forever while `geo` stayed 0.
+   */
+  private armAltPause(
+    path: string,
+    status: number,
+    retryAfterMs: number | null = null,
+  ): void {
+    this.altFailures += 1;
+    this.altLastStatus = status;
+    const window = geckoBackoffMs(this.altFailures, retryAfterMs);
+    this.altRateLimitedUntil = Date.now() + window;
+    console.warn(
+      `[gecko] alternate host ${status} on ${path} (failure #${this.altFailures}) — pausing it ${Math.round(
+        window / 1000,
+      )}s (primary still paused)`,
+    );
   }
 
   /**
@@ -538,14 +576,7 @@ export class GeckoTerminalClient {
         const asked = parseRetryAfterMs(res.headers.get("retry-after"), now);
         if (alt) {
           this.alt429 += 1;
-          this.altConsecutive429 += 1;
-          const window = geckoBackoffMs(this.altConsecutive429, asked);
-          this.altRateLimitedUntil = now + window;
-          console.warn(
-            `[gecko] alternate host 429 #${this.altConsecutive429} on ${path} — pausing it ${Math.round(
-              window / 1000,
-            )}s (primary still paused)`,
-          );
+          this.armAltPause(path, 429, asked);
           return null;
         }
         this.http429 += 1;
@@ -559,13 +590,22 @@ export class GeckoTerminalClient {
         );
         return null;
       }
-      if (!res.ok) return null;
+      if (!res.ok) {
+        // A hard refusal (401/403/5xx) is NOT a rate limit — it means the
+        // alternate does not serve this path keyless, or its edge blocks the
+        // Worker's egress. Deployed 2026-09-21 this was the live shape (a 403
+        // per tick, zero payoff), so it pauses the fallback exactly like a 429
+        // does: one probe per escalated window, which still self-heals if the
+        // refusal is lifted or a key is configured.
+        if (alt) this.armAltPause(path, res.status);
+        return null;
+      }
       if (alt) {
-        if (this.altConsecutive429 > 0) {
+        if (this.altFailures > 0) {
           console.log(
-            `[gecko] alternate host recovered after ${this.altConsecutive429} 429(s)`,
+            `[gecko] alternate host recovered after ${this.altFailures} failure(s)`,
           );
-          this.altConsecutive429 = 0;
+          this.altFailures = 0;
         }
         this.altOk += 1;
         this.lastOkAt = Date.now();

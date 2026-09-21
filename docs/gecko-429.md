@@ -106,7 +106,8 @@ export const GECKO_ALT_BASE_URL = "https://api.coingecko.com/api/v3/onchain";
 | alt 自己 429 | **alt 自己嘅 pause**（同主 host 分開，一樣 5→60 分鐘遞增）；主 host 嘅 pause **唔會被 alt 成功清零** |
 | alt 成功 | discovery 照舊有幣；主 host 到佢自己窗口先再試 |
 
-成本上限：兩個 host 都封 → **每個 alt 窗口一次探測**（唔係每 tick 一次）。
+成本上限：任何失敗（包括 429 以外嘅硬拒收）都會 arm alt 自己嘅 pause ⇒
+**每個 alt 窗口一次探測**（唔係每 tick 一次）。
 
 ### 遙測
 
@@ -147,9 +148,33 @@ curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko}'
 - **快取唔中**：`gecko.lastStatus: 429` 但 `http429` **唔再每 5 分鐘 +1**（改成 10/20/40/60 分鐘），
   `backoffUntil` 對得上，`geo` 仍然 0 —— 即係「真係 upstream 封 IP，但唔再盲目撞」；
 - **反面驗收**：`geo 0` 期間 `profiles`／`jup` 照樣有數（實測 28／20），卡片推送不受影響。
-- **fallback 生效**（主 host 被封時）：`gecko.lastHost: "alt"`、`altOk` 上升、`geo` 回復 20。
-  注意 **worker egress 能唔能問到 CoinGecko Onchain 係 deploy 後先算數**：
-  `alt429` 上升即係兩邊都被 IP 封，嗰陣先值得考慮 key（見上）。
+- **fallback**：`gecko.lastHost`／`altOk`／`altAttempts`／`altFailures`／`altLastStatus`。
+  `altAttempts` 上升但 `altOk 0` ⇒ 睇 `altLastStatus` 分辨（**實測係 403，見下節**）。
+- **探針**：`/debug/gecko-alt` —— 同一個 URL 兩種打法（有／冇 `cf` 快取選項），
+  回 status、`cf-cache-status`、body 頭 200 字，用嚟分辨 WAF 擋、要 key、同快取選項本身。
+
+## 部署後實測：alt host 由 Worker egress 係 **403**（`15982ea`，2026-09-21 08:08–08:15Z）
+
+```
+geo 0  prof 28 | req 7  ok 0  429 2  cacheHits 0  lastStatus 429  backoffS 648
+               | altAtt 5  altOk 0  alt429 0  altBackoffUntil 0   ← 舊寫法（只認 429）
+```
+
+1. **fallback 確實有喺 worker 內部發出**：`altAttempts` 4 → 5，約每分鐘一次，即係 `get()` 真係
+   路由到 CoinGecko Onchain（唔係靜靜地被跳過）。
+2. **但答案係 403**（唔係 429、唔係 200）——同一個 URL 由乾淨主機係 **200 / 29,960 bytes**，
+   由 Worker egress 係 **403**：即係該 host 對 Cloudflare Worker egress（或對無 key 嘅請求）直接拒收。
+3. **`alt429 0` 就係漏洞**：403 唔會入 429 統計，所以「只認 429」嘅寫法會**每個 tick 燒一個 request**
+   而 `geo` 照樣 0（上面 `altAtt 5` 就係證據）。
+4. **因此修成：任何失敗都 arm alt 嘅 pause**（403 ↔ 429 共用同一條 5→60 分鐘 escalation，
+   成功即清零），成本由「每 tick 1 次」降到「每個窗口 1 次」，而萬一將來解封或加了 key 會自動回復。
+   遙測加 `altFailures` / `altLastStatus`，所以「係唔係真係 403」一眼睇得到。
+
+**截至此刻嘅結論**：免費 alt host **由 Worker egress 用唔到**（403）。免費路徑就係原本嘅
+keyless 主 host ＋ 快取（同一批讀數裏面 `ok 0 429 2`，即係主 host 都仍然被封），
+而 gecko 貢獻 0 **唔影響其他 feed**：同一時間 `profiles 27–28`、`jup 20`、`jupTrend 15`。
+下一步只有三種：**帶 key**（`COINGECKO_API_KEY`，CoinGecko 對 keyed 流量用另一條路；未驗證）、
+**另一個 keyless 源**、或者**接受 gecko 降級**（re-eval pool ＋ Birdeye backfill 兜住）。
 
 ## 部署後實測（`92cb2ea`，2026-09-20 10:08–10:15Z）
 
@@ -194,7 +219,8 @@ gecko: coins 1575, pushed 21
 - `GeckoTerminalClient backs off all calls for 5 min after a 429`
   —— 更新為：暫停期間**只准** alt host 嘅 `new_pools` 一次、唔合資格嘅路徑零請求、窗口過後主 host 再試；
 - `GeckoTerminalClient asks the alternate host while the primary is paused`
-  —— 主 host 中毒下 discovery 照樣拎到 pool、alt 成功**唔會**清零主 host 嘅 pause、alt 自己 429 之後唔會再探；
+  —— 主 host 中毒下 discovery 照樣拎到 pool、alt 成功**唔會**清零主 host 嘅 pause、
+  alt 自己 429 之後唔會再探，**同埋 403 硬拒收一樣會煞停 fallback**（`altFailures 2`、`altLastStatus 403`）；
 - `geckoAltEligible / keyed mode: a CoinGecko key rides every request and unlocks the mirror`
   —— 純規則（keyless 只有 `new_pools`）＋ demo/pro header ＋ `keyed` 讀數；
 - `geckoBackoffMs / parseRetryAfterMs: Retry-After wins, capped`

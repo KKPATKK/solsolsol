@@ -53,7 +53,7 @@ import {
 } from "./pushledger";
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
-import { GeckoTerminalClient } from "./geckoterminal";
+import { GeckoTerminalClient, GECKO_ALT_BASE_URL } from "./geckoterminal";
 // Heal-path counters: module scope in the tracker, read here so /health can
 // answer "did the self-heal reuse the push-time baseline, and how often".
 import {
@@ -3450,6 +3450,53 @@ export default {
         count: Array.isArray(items) ? items.length : 0,
         bodyPreview: text.slice(0, 200),
       });
+    }
+
+    // Alternate-host probe (see GECKO_ALT_BASE_URL): the gecko fallback asks
+    // CoinGecko's Onchain API when the primary is paused. Deployed 2026-09-21,
+    // the worker's own egress got **403** there while a normal host gets 200 —
+    // so this fetches the same URL twice, with and without the client's
+    // Cloudflare cache options, and reports both: a WAF/bot block is told apart
+    // from a missing-key rule or from the cache options themselves.
+    if (url.pathname === "/debug/gecko-alt") {
+      const target = `${GECKO_ALT_BASE_URL}/networks/solana/new_pools?page=1`;
+      const probe = async (withCache: boolean) => {
+        try {
+          const init: Record<string, unknown> = {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(10_000),
+          };
+          if (withCache) {
+            init.cf = {
+              cacheEverything: true,
+              cacheTtl: 60,
+              cacheTtlByStatus: { "200-299": 60, "300-399": 0, "400-599": 0 },
+            };
+          }
+          const res = await fetch(target, init as RequestInit);
+          const text = await res.text();
+          let items: unknown[] = [];
+          try {
+            const parsed = JSON.parse(text) as { data?: unknown[] };
+            items = Array.isArray(parsed?.data) ? parsed.data : [];
+          } catch {
+            // non-JSON body
+          }
+          return {
+            status: res.status,
+            ok: res.ok,
+            cacheStatus: res.headers.get("cf-cache-status"),
+            contentType: res.headers.get("content-type"),
+            rawBytes: text.length,
+            count: items.length,
+            bodyPreview: text.slice(0, 200),
+          };
+        } catch (err) {
+          return { error: err instanceof Error ? err.message : String(err) };
+        }
+      };
+      const [plain, cached] = await Promise.all([probe(false), probe(true)]);
+      return Response.json({ target, plain, cached });
     }
 
     // Jupiter Token v2 feed probe — verifies the discovery client's two

@@ -5716,6 +5716,25 @@ async function main() {
       const poisoned = geckoFeedStats();
       assert.equal(poisoned.alt429, 1);
       assert.equal(poisoned.http429, 1, "the fallback's 429 is not counted against the primary");
+      // A HARD REFUSAL (the live 403 from the worker's own egress) must pause
+      // the fallback exactly like a 429 does — otherwise it spends one request
+      // per tick forever while `geo` stays 0. Only the fallback's window is
+      // expired here; the primary stays poisoned, so the request is forced to
+      // the alternate host.
+      client.altRateLimitedUntil = Date.now() - 1;
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return new Response("blocked", { status: 403 });
+      };
+      const beforeRefusal = calls.length;
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal(calls.length, beforeRefusal + 1, "the refusal is seen");
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal(calls.length, beforeRefusal + 1, "...and then the fallback stops probing");
+      const refused = geckoFeedStats();
+      assert.equal(refused.altLastStatus, 403);
+      assert.equal(refused.altFailures, 2, "a 429 and a refusal share one escalation");
+      assert.equal(refused.http429, 1, "a refusal is never counted as a primary 429");
     } finally {
       global.fetch = origFetch;
     }
