@@ -535,7 +535,7 @@ async function main() {
     );
   });
 
-  await test("terminalRowRepair: the delivery audit picks between arming and re-arming", () => {
+  await test("terminalRowRepair: the delivery audit picks the repair each class gets", () => {
     // Proved delivered: the card is in the chat, so only the bookkeeping is
     // wrong — keep the transition, arm the clock. Inert by construction, since
     // a 'rug' row is never re-evaluated (runTick's activeRows filter).
@@ -543,14 +543,22 @@ async function main() {
     // Unproved: the card may be lost, so the row must not sit silent — re-arm it
     // and let the next pass re-derive the verdict.
     assert.equal(terminalRowRepair(["unarmed_alert_clock"], false), "re_arm_row");
-    // A lost completion write keeps a transition a real reserve produced, and a
-    // measurement that contradicts its state is a stale number rather than a
-    // wrong verdict: both are reported for a human, never rewritten.
-    assert.equal(terminalRowRepair(["lost_completion_write"], false), "none");
+    // A lost completion write is the SAME unproven-send shape the abandoned-card
+    // settle handles (a real reserve wrote the transition; the send that
+    // followed it is what nobody recorded). Proved → keep the transition and
+    // write the missing completion stamp back; unproved → the row must not sit
+    // silent either, so the 💧 condition is re-derived on the next pass.
+    assert.equal(terminalRowRepair(["lost_completion_write"], true), "restamp_completion");
+    assert.equal(terminalRowRepair(["lost_completion_write"], false), "re_arm_row");
+    // A measurement that contradicts its own state is a stale number rather
+    // than a wrong verdict: reported for a human, never rewritten.
     assert.equal(terminalRowRepair(["measurement_above_floor"], true), "none");
     assert.equal(terminalRowRepair([], false), "none");
-    // The repairable class wins when it co-occurs with an unrepairable one.
+    // Co-occurring classes pick the strongest lever: the corroborating
+    // measurement never overrides a repair, and the proof picks the branch.
     assert.equal(terminalRowRepair(["unarmed_alert_clock", "measurement_above_floor"], false), "re_arm_row");
+    assert.equal(terminalRowRepair(["lost_completion_write", "measurement_above_floor"], true), "restamp_completion");
+    assert.equal(terminalRowRepair(["lost_completion_write", "measurement_above_floor"], false), "re_arm_row");
   });
 
   await test("terminal-row hygiene patch: rules, db method and endpoint land together", () => {
@@ -562,7 +570,9 @@ async function main() {
       "rules (terminalRowIssues)": pushwatchSrc.includes("export function terminalRowIssues("),
       "policy (terminalRowRepair)": pushwatchSrc.includes("export function terminalRowRepair("),
       "db (armTerminalAlertClock)": dbSrc.includes("async armTerminalAlertClock("),
+      "db (restampTerminalCompletion)": dbSrc.includes("async restampTerminalCompletion("),
       "endpoint (repair action)": workerSrc.includes('url.searchParams.get("repair")'),
+      "endpoint (restamp_completion plan)": workerSrc.includes('plan === "restamp_completion"'),
       "endpoint (census issues)": workerSrc.includes("issueCount: issues.length"),
     };
     const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
@@ -573,6 +583,65 @@ async function main() {
       missing.length === 0 || missing.length === Object.keys(applied).length,
       `partial paste of docs/patches/terminal-row-hygiene.patch — missing: ${missing.join(", ")}`,
     );
+  });
+
+  await test("Db.restampTerminalCompletion: writes back the lost half of a drain row, and only that shape", async () => {
+    // The live 2026-09-21 rows (TIGRINO / Apu / SCAT): the reserve wrote
+    // last_state='rug' + last_alert_at=now in the same pass as the claim, and
+    // the completion write — a FRESH clock read taken after the send — never
+    // landed, so the row is frozen at last_checked === last_alert_at. Proved
+    // delivered, the transition and its clock stay; only the missing stamp is
+    // written back, and the row reads as a well-formed drain afterwards.
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({
+        chatId: "c", ...DEFAULT_SETTINGS,
+        minMarketCapUsd: 40_000, maxMarketCapUsd: 380_000, enabled: true,
+      });
+      const frozen = "FROZEN1";
+      await db.upsertPushWatch({
+        token: frozen, chatId: "c", symbol: "FROZEN1",
+        // SUB-floor liquidity: the drain verdict can only come from one, so a
+        // fixture above the floor would also (correctly) corroborate as
+        // "measurement_above_floor" and blur what this test is pinning.
+        pushedAt: Date.now() - 3_600_000, mcapAtPush: 100_000, liquidityUsd: 4_000,
+      });
+      const claimed = (await db.listPushWatch(10)).find((r) => r.token === frozen);
+      // The drain consumed its alert at the same stamp the claim wrote (the
+      // reserve is atomic in BOTH columns; only the send-after-half is missing).
+      assert.ok(await db.reservePushWatchAlert(frozen, null, 0, "rug", claimed.lastChecked));
+      const before = (await db.listPushWatch(10)).find((r) => r.token === frozen);
+      assert.deepEqual(terminalRowIssues(before), ["lost_completion_write"], "the frozen shape is the issue");
+      assert.equal(await db.restampTerminalCompletion(frozen), true);
+      const after = (await db.listPushWatch(10)).find((r) => r.token === frozen);
+      assert.deepEqual(terminalRowIssues(after), [], "the row is well-formed now");
+      assert.equal(after.lastState, "rug", "the transition stands");
+      assert.equal(after.lastAlertAt, before.lastAlertAt, "and so does the alert clock it consumed");
+      assert.ok(after.lastChecked > after.lastAlertAt, "the completion stamp lands after the alert");
+      assert.ok(
+        after.lastChecked - after.lastAlertAt <= 5 * 60_000,
+        "inside the terminal-row slack, so the row is not mistaken for an unarmed clock",
+      );
+      assert.equal(await db.restampTerminalCompletion(frozen), false, "idempotent: a landed completion is never restamped");
+      // Guards, one shape each: a live row, a user tombstone, an unarmed clock
+      // and an unclaimed row are all out of reach.
+      const live = "LIVE1";
+      await db.upsertPushWatch({ token: live, chatId: "c", symbol: "LIVE1", pushedAt: Date.now() - 60_000, mcapAtPush: 100_000, liquidityUsd: 50_000 });
+      assert.equal(await db.restampTerminalCompletion(live), false);
+      const tomb = "TOMB1";
+      await db.upsertPushWatch({ token: tomb, chatId: "c", symbol: "TOMB1", pushedAt: Date.now() - 60_000, mcapAtPush: 100_000, liquidityUsd: 50_000 });
+      await db.reservePushWatchAlert(tomb, null, 0, "rug", Date.now());
+      await db.setPushWatchState(tomb, "unwatched");
+      assert.equal(await db.restampTerminalCompletion(tomb), false, "the user's 🔕 tombstone is terminal for another reason");
+      const unarmed = "UNARMED1";
+      await db.upsertPushWatch({ token: unarmed, chatId: "c", symbol: "UNARMED1", pushedAt: Date.now() - 60_000, mcapAtPush: 100_000, liquidityUsd: 50_000 });
+      await db.setPushWatchState(unarmed, "rug");
+      assert.equal(await db.restampTerminalCompletion(unarmed), false, "an unarmed clock belongs to the other repair");
+    } finally {
+      await t.cleanup();
+    }
   });
 
   // ---------- the tracker's terminal (💧 drain) card ----------

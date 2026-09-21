@@ -2490,17 +2490,35 @@ export function terminalRowIssues(
  * and "the card may be lost, so the row must not sit silent" (re-arm it: the
  * 💧 condition is re-derived and re-announced if it still holds).
  *
- * Only the unarmed-clock class is repairable from the row alone. A lost
- * completion write keeps a transition a real reserve produced, and a
- * measurement that contradicts its own state is a stale number rather than a
- * wrong verdict — both are reported for a human, never rewritten.
+ * A lost completion write is the SAME unproven-send shape, one step further
+ * along: the reserve PROVED the transition (both columns in one statement) and
+ * the send that followed it is what nobody recorded — exactly the question the
+ * abandoned-card settle answers with the delivery audit
+ * (deferrallog.cardSendDisposition + settleUnconfirmedCardSends). So the class
+ * gets the same policy instead of a human: proved delivered → keep the
+ * transition and write the missing completion stamp back
+ * (Db.restampTerminalCompletion); unproved → re-arm, because a drain card that
+ * may never have arrived must not leave the row silent for good.
+ *
+ * What is NOT repairable is a measurement that contradicts its own state: a
+ * stale number rather than a wrong verdict, reported for a human, never
+ * rewritten.
  */
-export type TerminalRowRepair = "arm_alert_clock" | "re_arm_row" | "none";
+export type TerminalRowRepair =
+  | "arm_alert_clock"
+  | "restamp_completion"
+  | "re_arm_row"
+  | "none";
 
 export function terminalRowRepair(
   issues: readonly TerminalRowIssue[],
   provedDelivered: boolean,
 ): TerminalRowRepair {
-  if (!issues.includes("unarmed_alert_clock")) return "none";
-  return provedDelivered ? "arm_alert_clock" : "re_arm_row";
+  if (issues.includes("unarmed_alert_clock")) {
+    return provedDelivered ? "arm_alert_clock" : "re_arm_row";
+  }
+  if (issues.includes("lost_completion_write")) {
+    return provedDelivered ? "restamp_completion" : "re_arm_row";
+  }
+  return "none";
 }

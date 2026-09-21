@@ -3543,12 +3543,16 @@ export default {
           const done = await db.armTerminalAlertClock(repair);
           return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
         }
+        if (plan === "restamp_completion") {
+          const done = await db.restampTerminalCompletion(repair);
+          return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
+        }
         if (plan === "re_arm_row") {
           const done = await db.rearmPushWatchAlert(repair);
           return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
         }
-        // The transition itself is sound (a reserve wrote it); only its
-        // measurements are stale. Reported for a human, never rewritten.
+        // A measurement that contradicts its own state is a stale number
+        // rather than a wrong verdict. Reported for a human, never rewritten.
         return Response.json({ ok: true, repaired: false, plan, proved, manual: true, issues: rowIssues });
       }
       // ?limit=N widens the census past the 40-row default: rows can outlive the

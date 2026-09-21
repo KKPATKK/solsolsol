@@ -77,6 +77,16 @@ export const SCAN_DB_TIMEOUT_MS = 1_200;
  * HTTP fallback) share one cadence.
  */
 const TOKEN_STATS_PRUNE_INTERVAL_MS = 10 * 60_000;
+/**
+ * How far behind the alert clock the RECONSTRUCTED completion stamp of a
+ * terminal row sits (see Db.restampTerminalCompletion). One send slice — the
+ * same "a card send takes a beat" arithmetic as pushwatch.TRACKER_SEND_CAP_MS.
+ * It exists so a repaired row reads as a well-formed drain
+ * (`0 < last_checked - last_alert_at <= the 5-minute slack` in
+ * pushwatch.terminalRowIssues) instead of delta 0, which IS the
+ * lost-completion signature the repair exists to clear.
+ */
+const TERMINAL_COMPLETION_SEND_MS = 1_000;
 
 export interface ChatSettings {
   chatId: string;
@@ -2883,6 +2893,39 @@ export class Db {
     const res = await this.get().execute({
       sql: "UPDATE push_watch SET last_state = NULL, last_alert_at = 0, last_checked = 0\n            WHERE token = ?\n              AND last_state = 'rug'",
       args: [token],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
+  /**
+   * Write back the half of a terminal row's completion that never landed — the
+   * row hygiene rule in pushwatch.terminalRowIssues("lost_completion_write"),
+   * used only when the delivery audit PROVES the 💧 card is in the chat (so
+   * the transition is legitimate and must stay).
+   *
+   * The reserve wrote `last_state = 'rug'` and `last_alert_at = now` in ONE
+   * statement and the completion write (a FRESH clock read taken after the
+   * send) never followed, so the row is frozen at
+   * `last_checked === last_alert_at` — the exact shape a well-formed drain row
+   * cannot have (delta 0 IS the lost-completion signature, see
+   * terminalRowIssues). Re-stamping `last_checked` one send slice behind the
+   * alert clock reconstructs a well-formed row without claiming anything about
+   * the delivery: the state, the clock and the last-written measurements all
+   * stay exactly as the reserve left them, and the row is inert either way (a
+   * 'rug' row is never re-evaluated — see PushWatcher.runTick's activeRows).
+   *
+   * Guarded on the frozen shape AND on 'rug' only, so it can never touch a
+   * live row, a 🔕 tombstone (unwatched), a window recap (expired) or a row
+   * whose completion already landed. Returns false when nothing matched.
+   */
+  async restampTerminalCompletion(token: string): Promise<boolean> {
+    const res = await this.get().execute({
+      sql: `UPDATE push_watch SET last_checked = last_alert_at + ?
+            WHERE token = ?
+              AND last_state = 'rug'
+              AND last_alert_at > 0
+              AND last_checked = last_alert_at`,
+      args: [TERMINAL_COMPLETION_SEND_MS, token],
     });
     return Number(res.rowsAffected ?? 0) > 0;
   }

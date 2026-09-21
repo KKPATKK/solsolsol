@@ -1,0 +1,129 @@
+Subject: Make the lost_completion_write class repairable (audit decides, as the abandoned-card settle does)
+
+Live 2026-09-21: /debug/push-watch reported 3 rows frozen at
+`last_checked === last_alert_at` (TIGRINO / Apu / SCAT) — the completion write
+never landed, so the 💧 transition a real reserve produced sits next to a
+claim stamp whose send-half nobody recorded. The repair endpoint could only
+answer `manual: true` for that class, so the rows stayed inconsistent.
+
+The class is the SAME unproven-send shape the abandoned-card settle already
+answers with the delivery audit (deferrallog.cardSendDisposition +
+settleUnconfirmedCardSends). Apply that policy:
+
+  - proved delivered  → `restamp_completion`: the transition and the alert
+    clock stand, and the missing completion stamp is written back
+    (last_checked = last_alert_at + one send slice) so the row reads as a
+    well-formed drain instead of a frozen claim;
+  - unproved          → `re_arm_row`, exactly as the unarmed-clock class: the
+    card may never have arrived, so the row must not sit silent for good —
+    the next pass re-derives the 💧 condition and re-announces if it holds.
+
+Guards keep the new write to the exact frozen shape (state 'rug', both stamps
+> 0 and equal), so it can never touch a live row, a 🔕 tombstone, a window
+recap or a row whose completion already landed.
+
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -2490,17 +2490,35 @@
+  * and "the card may be lost, so the row must not sit silent" (re-arm it: the
+  * 💧 condition is re-derived and re-announced if it still holds).
+  *
+- * Only the unarmed-clock class is repairable from the row alone. A lost
+- * completion write keeps a transition a real reserve produced, and a
+- * measurement that contradicts its own state is a stale number rather than a
+- * wrong verdict — both are reported for a human, never rewritten.
++ * A lost completion write is the SAME unproven-send shape, one step further
++ * along: the reserve PROVED the transition (both columns in one statement) and
++ * the send that followed it is what nobody recorded — exactly the question the
++ * abandoned-card settle answers with the delivery audit
++ * (deferrallog.cardSendDisposition + settleUnconfirmedCardSends). So the class
++ * gets the same policy instead of a human: proved delivered → keep the
++ * transition and write the missing completion stamp back
++ * (Db.restampTerminalCompletion); unproved → re-arm, because a drain card that
++ * may never have arrived must not leave the row silent for good.
++ *
++ * What is NOT repairable is a measurement that contradicts its own state: a
++ * stale number rather than a wrong verdict, reported for a human, never
++ * rewritten.
+  */
+-export type TerminalRowRepair = "arm_alert_clock" | "re_arm_row" | "none";
++export type TerminalRowRepair =
++  | "arm_alert_clock"
++  | "restamp_completion"
++  | "re_arm_row"
++  | "none";
+ 
+ export function terminalRowRepair(
+   issues: readonly TerminalRowIssue[],
+   provedDelivered: boolean,
+ ): TerminalRowRepair {
+-  if (!issues.includes("unarmed_alert_clock")) return "none";
+-  return provedDelivered ? "arm_alert_clock" : "re_arm_row";
++  if (issues.includes("unarmed_alert_clock")) {
++    return provedDelivered ? "arm_alert_clock" : "re_arm_row";
++  }
++  if (issues.includes("lost_completion_write")) {
++    return provedDelivered ? "restamp_completion" : "re_arm_row";
++  }
++  return "none";
+ }
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -2907,4 +2907,37 @@
+     return Number(res.rowsAffected ?? 0) > 0;
+   }
+ 
++  /**
++   * Write back the half of a terminal row's completion that never landed — the
++   * row hygiene rule in pushwatch.terminalRowIssues("lost_completion_write"),
++   * used only when the delivery audit PROVES the 💧 card is in the chat (so
++   * the transition is legitimate and must stay).
++   *
++   * The reserve wrote `last_state = 'rug'` and `last_alert_at = now` in ONE
++   * statement and the completion write (a FRESH clock read taken after the
++   * send) never followed, so the row is frozen at
++   * `last_checked === last_alert_at` — the exact shape a well-formed drain row
++   * cannot have (delta 0 IS the lost-completion signature, see
++   * terminalRowIssues). Re-stamping `last_checked` one send slice behind the
++   * alert clock reconstructs a well-formed row without claiming anything about
++   * the delivery: the state, the clock and the last-written measurements all
++   * stay exactly as the reserve left them, and the row is inert either way (a
++   * 'rug' row is never re-evaluated — see PushWatcher.runTick's activeRows).
++   *
++   * Guarded on the frozen shape AND on 'rug' only, so it can never touch a
++   * live row, a 🔕 tombstone (unwatched), a window recap (expired) or a row
++   * whose completion already landed. Returns false when nothing matched.
++   */
++  async restampTerminalCompletion(token: string): Promise<boolean> {
++    const res = await this.get().execute({
++      sql: `UPDATE push_watch SET last_checked = last_alert_at + ?
++            WHERE token = ?
++              AND last_state = 'rug'
++              AND last_alert_at > 0
++              AND last_checked = last_alert_at`,
++      args: [TERMINAL_COMPLETION_SEND_MS, token],
++    });
++    return Number(res.rowsAffected ?? 0) > 0;
++  }
++
+   /**
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -3541,11 +3541,15 @@
+           const done = await db.armTerminalAlertClock(repair);
+           return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
+         }
++        if (plan === "restamp_completion") {
++          const done = await db.restampTerminalCompletion(repair);
++          return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
++        }
+         if (plan === "re_arm_row") {
+           const done = await db.rearmPushWatchAlert(repair);
+           return Response.json({ ok: true, repaired: done, plan, proved, issues: rowIssues });
+         }
+-        // The transition itself is sound (a reserve wrote it); only its
+-        // measurements are stale. Reported for a human, never rewritten.
++        // A measurement that contradicts its own state is a stale number
++        // rather than a wrong verdict. Reported for a human, never rewritten.
+         return Response.json({ ok: true, repaired: false, plan, proved, manual: true, issues: rowIssues });
+       }
