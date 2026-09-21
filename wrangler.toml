@@ -12,9 +12,14 @@ compatibility_flags = ["nodejs_compat"]
 crons = ["* * * * *"]
 
 # Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
-# TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY) must NOT live here — set
-# them in the Cloudflare dashboard (Workers > solana-meme-bot > Settings >
-# Variables and Secrets) or via `wrangler secret put <NAME>`.
+# TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY, COINGECKO_API_KEY) must NOT
+# live here — set them in the Cloudflare dashboard (Workers > solana-meme-bot >
+# Settings > Variables and Secrets) or via `wrangler secret put <NAME>`.
+# COINGECKO_API_KEY (optional, with COINGECKO_API_PLAN=demo|pro) moves the
+# GeckoTerminal/CoinGecko rate limit from the shared Worker egress IP onto the
+# key — see docs/gecko-429.md. It is a fallback amplifier, not a replacement for
+# the free path: the demo plan's 10K calls/month is under this bot's ~86K/month
+# of gecko calls.
 [vars]
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one finished less

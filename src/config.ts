@@ -215,6 +215,23 @@ export interface AppConfig {
   /** GMGN OpenAPI key for smart-money enrichment + trending feed (optional). */
   gmgnApiKey?: string;
   /**
+   * CoinGecko / GeckoTerminal API key (COINGECKO_API_KEY, a SECRET — set it
+   * in the Cloudflare dashboard or the workspace Keys UI, never in
+   * wrangler.toml). The free feeds are metered on the CALLER'S IP and
+   * Cloudflare Worker egress is a small shared pool, so that quota is spent
+   * by other Workers before this one asks — the sustained `geo 0` 429s. A key
+   * moves the meter onto the key, which is the only way off the shared-IP
+   * limit. Optional: unkeyed, the gecko client still discovers through the
+   * free path plus its alternate-host fallback.
+   */
+  coingeckoApiKey?: string;
+  /**
+   * Which CoinGecko plan `coingeckoApiKey` belongs to (COINGECKO_API_PLAN,
+   * "demo" by default, "pro" for a paid key). It only selects the header
+   * name (`x-cg-demo-api-key` / `x-cg-pro-api-key`).
+   */
+  coingeckoApiPlan: "demo" | "pro";
+  /**
    * Arkham Intelligence API key (ARKHAM_API_KEY, a SECRET — set in the
    * Cloudflare dashboard, never here). Enables smart-money attribution on
    * push cards: the top-100 holders are checked for entity types in
@@ -542,6 +559,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     tursoAuthToken: env.TURSO_AUTH_TOKEN || undefined,
     birdeyeApiKey: env.BIRDEYE_API_KEY || undefined,
     gmgnApiKey: env.GMGN_API_KEY || undefined,
+    coingeckoApiKey: env.COINGECKO_API_KEY || undefined,
+    coingeckoApiPlan:
+      (env.COINGECKO_API_PLAN ?? "demo").toLowerCase() === "pro"
+        ? "pro"
+        : "demo",
     arkhamApiKey: env.ARKHAM_API_KEY || undefined,
     arkhamEnabled: env.ARKHAM_ENABLED === "true" || env.ARKHAM_ENABLED === "1",
     arkhamSmartMoneyTypes: parseSmartMoneyTypes(env.ARKHAM_SMART_MONEY_TYPES),

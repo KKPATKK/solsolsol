@@ -42,6 +42,49 @@ export const GECKO_BACKOFF_JITTER = 0.1;
  * into the 80m–26h window), so a minute of staleness costs nothing.
  */
 export const GECKO_CACHE_TTL_S = 60;
+/**
+ * SECOND host for the one path both serve keyless (see get): the same
+ * `new_pools` payload is published by CoinGecko's Onchain API, and it is a
+ * DIFFERENT hostname on a different rate-limit bucket, so a Worker whose
+ * egress IP is over GeckoTerminal's quota can still discover.
+ *
+ * Why this is the shape of the compensation (measured 2026-09-21):
+ * `api.geckoterminal.com` 429s the Worker's egress on every attempt while a
+ * normal host answers 200, and the colo edge cache cannot heal it — a MISS
+ * goes to the origin, the origin refuses to serve a 200, so nothing ever
+ * enters the cache for the next request to HIT (`summary.gecko` live:
+ * `ok2 429x2 cacheHits1 lastCacheStatus BYPASS`). The limiter is an IP quota,
+ * so the only free lever left is asking a different host.
+ *
+ * VERIFIED SAME SHAPE (statically, from a clean host):
+ * `/api/v3/onchain/networks/solana/new_pools` returns the identical
+ * `{data:[{id:"solana_…", attributes:{pool_created_at, fdv_usd,
+ * reserve_in_usd, transactions, volume_usd}, relationships.base_token}]}`
+ * field set parseNewPools already reads, so the fallback needs no parser.
+ * `trending_pools` is NOT eligible — keyless access to it on this host answers
+ * 401 ("Requests without API key are not allowed for this endpoint"), which is
+ * why the fallback is per-path instead of per-host.
+ */
+export const GECKO_ALT_BASE_URL = "https://api.coingecko.com/api/v3/onchain";
+/** Paths the alternate host serves without an API key (see GECKO_ALT_BASE_URL). */
+const ALT_ELIGIBLE_PREFIX = "/networks/solana/new_pools";
+/** Header carrying a CoinGecko Demo-plan key (the free tier's keyed route). */
+export const COINGECKO_DEMO_HEADER = "x-cg-demo-api-key";
+/** Header carrying a CoinGecko Pro-plan key. */
+export const COINGECKO_PRO_HEADER = "x-cg-pro-api-key";
+
+/**
+ * Whether `path` may be asked on the alternate host while the primary is
+ * paused (pure — unit-tested). KEYLESS only new_pools is public there;
+ * `trending_pools` answers 401 without a key. WITH a CoinGecko key the
+ * alternate is a full mirror of the primary, so every path qualifies — and
+ * the key is also what makes a request count against the key's quota instead
+ * of the shared egress IP, i.e. the durable escape from the 429 (see
+ * AppConfig.coingeckoApiKey).
+ */
+export function geckoAltEligible(path: string, keyed: boolean): boolean {
+  return keyed || path.startsWith(ALT_ELIGIBLE_PREFIX);
+}
 
 export interface NewPool {
   tokenAddress: string;
@@ -131,6 +174,8 @@ export function geckoBackoffMs(
 export interface GeckoFeedStats {
   /** True once a client was built in this isolate (the worker always does). */
   active: boolean;
+  /** True when every request carries a CoinGecko key (see AppConfig.coingeckoApiKey). */
+  keyed: boolean;
   /** HTTP requests actually issued (backed-off calls cost 0). */
   requests: number;
   /** Responses that parsed as OK. */
@@ -151,6 +196,16 @@ export interface GeckoFeedStats {
   backoffMs: number;
   /** Epoch the current backoff expires at (0 = not backing off). */
   backoffUntil: number;
+  /** Which host answered last: the primary, or the alternate fallback. */
+  lastHost: "primary" | "alt" | null;
+  /** Attempts against the alternate host while the primary is paused. */
+  altAttempts: number;
+  /** Alternate-host responses that parsed as OK. */
+  altOk: number;
+  /** Alternate-host 429s (its own bucket, so its pause is separate). */
+  alt429: number;
+  /** Epoch the alternate host's pause expires at (0 = not paused). */
+  altBackoffUntil: number;
 }
 
 /** Spaces out HTTP requests so we stay well under GeckoTerminal's rate limit. */
@@ -298,6 +353,7 @@ export function geckoFeedStats(): GeckoFeedStats {
   if (lastClient === null) {
     return {
       active: false,
+      keyed: false,
       requests: 0,
       ok: 0,
       http429: 0,
@@ -309,6 +365,11 @@ export function geckoFeedStats(): GeckoFeedStats {
       lastOkAt: 0,
       backoffMs: 0,
       backoffUntil: 0,
+      lastHost: null,
+      altAttempts: 0,
+      altOk: 0,
+      alt429: 0,
+      altBackoffUntil: 0,
     };
   }
   return lastClient.stats();
@@ -325,6 +386,9 @@ export function geckoFeedStats(): GeckoFeedStats {
  */
 export class GeckoTerminalClient {
   private readonly throttle: Throttle;
+  /** Keyed mode (see geckoAltEligible): every request carries this header. */
+  private readonly apiKey: string | null;
+  private readonly apiKeyHeader: string;
   /** Timestamp until which all calls are skipped (after a 429). */
   private rateLimitedUntil = 0;
   /** Telemetry (see GeckoFeedStats) — never read by any decision. */
@@ -338,9 +402,21 @@ export class GeckoTerminalClient {
   private last429At = 0;
   private lastOkAt = 0;
   private backoffMs = 0;
+  /** See GeckoFeedStats.lastHost / alt* — the fallback host's own state. */
+  private lastHost: "primary" | "alt" | null = null;
+  private altAttempts = 0;
+  private altOk = 0;
+  private alt429 = 0;
+  private altConsecutive429 = 0;
+  private altRateLimitedUntil = 0;
 
   constructor(config: AppConfig) {
     this.throttle = new Throttle(config.geckoterminalRequestIntervalMs);
+    // A key moves the rate limit from the caller's shared egress IP onto the
+    // key itself — the only lever that survives a poisoned IP pool.
+    this.apiKey = config.coingeckoApiKey ?? null;
+    this.apiKeyHeader =
+      config.coingeckoApiPlan === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
     // Publish this client's feed state (see geckoFeedStats).
     lastClient = this;
   }
@@ -353,6 +429,7 @@ export class GeckoTerminalClient {
   stats(): GeckoFeedStats {
     return {
       active: true,
+      keyed: this.apiKey !== null,
       requests: this.requests,
       ok: this.ok,
       http429: this.http429,
@@ -364,6 +441,11 @@ export class GeckoTerminalClient {
       lastOkAt: this.lastOkAt,
       backoffMs: this.backoffMs,
       backoffUntil: this.rateLimitedUntil,
+      lastHost: this.lastHost,
+      altAttempts: this.altAttempts,
+      altOk: this.altOk,
+      alt429: this.alt429,
+      altBackoffUntil: this.altRateLimitedUntil,
     };
   }
 
@@ -375,7 +457,10 @@ export class GeckoTerminalClient {
    */
   private requestInit(): CloudflareFetchInit {
     const init: CloudflareFetchInit = {
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json",
+        ...(this.apiKey !== null ? { [this.apiKeyHeader]: this.apiKey } : {}),
+      },
       signal: AbortSignal.timeout(10_000),
       cf: {
         cacheEverything: true,
@@ -394,12 +479,51 @@ export class GeckoTerminalClient {
    * Shared GET: throttle-spaced, 429-aware, cache-friendly. Returns the parsed
    * JSON on success, null on rate-limit (escalating the backoff window) or any
    * other failure — callers degrade to [] without throwing.
+   *
+   * ONE FALLBACK HOST, ONLY WHILE THE PRIMARY IS PAUSED (2026-09-21): the
+   * limiter is an IP quota on GeckoTerminal's side, and a poisoned quota never
+   * heals through the edge cache (a MISS reaches the origin, the origin 429s,
+   * nothing is cached for the next request to HIT). CoinGecko's Onchain API
+   * serves the same `new_pools` payload from a different hostname, so while
+   * the primary is paused an eligible path is asked there instead. The
+   * primary's backoff is NOT cleared by an alternate success — its escalation
+   * is a fact about the primary — and the alternate has its OWN pause that is
+   * armed only by its own 429, so the cost when both are blocked is one probe
+   * per alternate window, not one per tick.
+   *
+   * KEYED MODE (see AppConfig.coingeckoApiKey): with a CoinGecko key every
+   * request carries it, so the quota is the key's rather than the shared
+   * egress IP's — the primary stops being 429ed at all — and the alternate
+   * becomes a full mirror (see geckoAltEligible). Unkeyed behaviour is
+   * unchanged.
    */
   private async get(path: string): Promise<unknown> {
-    if (this.rateLimited()) return null;
+    if (this.rateLimited()) {
+      const now = Date.now();
+      if (
+        !geckoAltEligible(path, this.apiKey !== null) ||
+        now < this.altRateLimitedUntil
+      ) {
+        return null;
+      }
+      this.altAttempts += 1;
+      return this.attempt(GECKO_ALT_BASE_URL, path, true);
+    }
+    return this.attempt(BASE_URL, path, false);
+  }
+
+  /**
+   * One request against one host, with the counter/backoff bookkeeping for
+   * whichever side it belongs to (see get). Never throws.
+   */
+  private async attempt(
+    baseUrl: string,
+    path: string,
+    alt: boolean,
+  ): Promise<unknown> {
     try {
       const res = await this.throttle.run(() =>
-        fetch(`${BASE_URL}${path}`, this.requestInit()),
+        fetch(`${baseUrl}${path}`, this.requestInit()),
       );
       this.requests += 1;
       this.lastStatus = res.status;
@@ -410,10 +534,22 @@ export class GeckoTerminalClient {
       }
       if (res.status === 429) {
         const now = Date.now();
-        this.http429 += 1;
-        this.consecutive429 += 1;
         this.last429At = now;
         const asked = parseRetryAfterMs(res.headers.get("retry-after"), now);
+        if (alt) {
+          this.alt429 += 1;
+          this.altConsecutive429 += 1;
+          const window = geckoBackoffMs(this.altConsecutive429, asked);
+          this.altRateLimitedUntil = now + window;
+          console.warn(
+            `[gecko] alternate host 429 #${this.altConsecutive429} on ${path} — pausing it ${Math.round(
+              window / 1000,
+            )}s (primary still paused)`,
+          );
+          return null;
+        }
+        this.http429 += 1;
+        this.consecutive429 += 1;
         this.backoffMs = geckoBackoffMs(this.consecutive429, asked);
         this.rateLimitedUntil = now + this.backoffMs;
         console.warn(
@@ -424,6 +560,23 @@ export class GeckoTerminalClient {
         return null;
       }
       if (!res.ok) return null;
+      if (alt) {
+        if (this.altConsecutive429 > 0) {
+          console.log(
+            `[gecko] alternate host recovered after ${this.altConsecutive429} 429(s)`,
+          );
+          this.altConsecutive429 = 0;
+        }
+        this.altOk += 1;
+        this.lastOkAt = Date.now();
+        this.lastHost = "alt";
+        console.log(
+          `[gecko] discovery served by the alternate host (primary still paused ${Math.round(
+            Math.max(0, this.rateLimitedUntil - Date.now()) / 1000,
+          )}s)`,
+        );
+        return res.json();
+      }
       if (this.consecutive429 > 0) {
         console.log(
           `[gecko] feed recovered after ${this.consecutive429} consecutive 429(s)`,
@@ -433,6 +586,7 @@ export class GeckoTerminalClient {
       }
       this.ok += 1;
       this.lastOkAt = Date.now();
+      this.lastHost = "primary";
       return res.json();
     } catch {
       return null;

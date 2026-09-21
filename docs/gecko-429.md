@@ -74,12 +74,66 @@ fetch(url, {
 
 以前 `geo 0` 分唔清「被封」同「市場靜」；而家一眼睇得到，`cacheHits` 更直接證明快取有冇生效。
 
-## 為何唔係降頻／換源
+## 補償：主 host 被封時改問另一個 host ＋ 可選 keyed quota（2026-09-21）
+
+### 為何快取救唔到（先講清楚）
+
+`cacheEverything` 只幫到「origin 肯出 200」嘅情況：IP quota 用光之後 origin 直接 429，而
+`cacheTtlByStatus["400-599"] = 0` 令嗰個 429 **唔入 cache**，所以下一個 request 照樣 MISS → 照樣 429 ——
+快取永遠冇一個 200 可以 HIT。線上讀數正是咁：`ok2 429x2 cacheHits1 lastCacheStatus BYPASS`，而 `geo` 長期 0。
+
+### 主刀：同一個 payload，另一個 hostname
+
+```ts
+export const GECKO_ALT_BASE_URL = "https://api.coingecko.com/api/v3/onchain";
+```
+
+- `api.geckoterminal.com` 同 `api.coingecko.com` 係**兩個 host**（唔同 rate-limit bucket），
+  而 CoinGecko Onchain API 一樣發佈 `new_pools`。
+- 由乾淨主機實測（2026-09-21 07:57Z）：
+  `GET /api/v3/onchain/networks/solana/new_pools?page=1` → **200 / 29,960 bytes**，
+  `parseNewPools()` **20/20 全中**，全部有 `pool_created_at`（age 1 分鐘）⇒ **唔需要新 parser**。
+- 唔係全 host mirror：`trending_pools` 喺呢個 host **keyless 係 401**
+  （`Requests without API key are not allowed for this endpoint`），所以 fallback 係 **per-path**。
+
+### 規則（全部喺 `get()`）
+
+| 情況 | 行為 |
+|---|---|
+| 主 host 未暫停 | 照舊只問主 host |
+| 主 host 暫停＋path 合資格（keyless 只有 `new_pools`） | 改問 alt host |
+| 主 host 暫停＋path 唔合資格 | 一個 request 都唔花 |
+| alt 自己 429 | **alt 自己嘅 pause**（同主 host 分開，一樣 5→60 分鐘遞增）；主 host 嘅 pause **唔會被 alt 成功清零** |
+| alt 成功 | discovery 照舊有幣；主 host 到佢自己窗口先再試 |
+
+成本上限：兩個 host 都封 → **每個 alt 窗口一次探測**（唔係每 tick 一次）。
+
+### 遙測
+
+`summary.gecko` 新增：`lastHost: "primary" | "alt"`、`altAttempts`、`altOk`、`alt429`、`altBackoffUntil`、`keyed`。
+
+### 可選：keyed quota（唯一真正離開 IP 限流嘅方法）
+
+```bash
+# 唔好放 wrangler.toml —— 係 SECRET，用 Cloudflare dashboard（或 Freebuff 嘅 Keys UI）
+COINGECKO_API_KEY  = "CG-..."
+COINGECKO_API_PLAN = "demo"   # demo → x-cg-demo-api-key；pro → x-cg-pro-api-key
+```
+
+有 key 時**每個 request** 都帶 key ⇒ quota 由 key 計（唔再係共用 egress IP），主 host 唔會再 429，
+而且 alt 變成**全 mirror**。`gecko.keyed` 就係「有冇生效」嘅讀數。
+
+**要老實講嘅 quota 數學**：我們每個 tick 打 gecko 約 2 次（`new_pools` 1 ＋ trending 1）＝
+**~86K 次／月**，而 CoinGecko Demo plan 係 **10K 次／月** ⇒ 免費 key 只夠 ~3 日連續使用。
+所以 key 係「**fallback 放大器**」（只喺主 host 被封時先燒）或者付費 plan 先合理，
+唔係免費路徑嘅替代品 —— 免費主路徑仍然係 keyless ＋ 快取 ＋ alt fallback。
+
+## 為何唔係降頻
 
 - **降頻冇用**：quota 唔係我們嘅用量造成（共用 egress IP 被其他 Worker 用光），
   拉到 90s 只係少一半請求，仍然係食 429。
-- **換源**＝CoinGecko Onchain API（付費 key、`x-cg-demo-api-key`，要換 endpoint 同整條 client）。
-  如果快取都唔生效，呢個係下一步，等 operator 決定（有 key 我可以接）。
+- **換源已經做咗**（見上一節）：同一個 payload 嘅第二個 host，零 key、零成本；
+  付費／keyed 路線保留做 operator 嘅選項（quota 數學見上）。
 - **唔會漏推**：gecko 只係 **discovery ＋ tracker 嘅第三 pair 來源**，兩邊都有
   DexScreener／Jupiter 嘅 fail-open 路徑，所以 gecko 全死都唔可以令任何一張卡唔推。
 
@@ -93,6 +147,9 @@ curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko}'
 - **快取唔中**：`gecko.lastStatus: 429` 但 `http429` **唔再每 5 分鐘 +1**（改成 10/20/40/60 分鐘），
   `backoffUntil` 對得上，`geo` 仍然 0 —— 即係「真係 upstream 封 IP，但唔再盲目撞」；
 - **反面驗收**：`geo 0` 期間 `profiles`／`jup` 照樣有數（實測 28／20），卡片推送不受影響。
+- **fallback 生效**（主 host 被封時）：`gecko.lastHost: "alt"`、`altOk` 上升、`geo` 回復 20。
+  注意 **worker egress 能唔能問到 CoinGecko Onchain 係 deploy 後先算數**：
+  `alt429` 上升即係兩邊都被 IP 封，嗰陣先值得考慮 key（見上）。
 
 ## 部署後實測（`92cb2ea`，2026-09-20 10:08–10:15Z）
 
@@ -128,16 +185,19 @@ gecko: coins 1575, pushed 21
    （`count 1`、`requests 0`）唔代表嗰分鐘冇 request，只係嗰個 isolate 未跑過 gecko。跨 isolate
    只可以睇累計嘅 `/debug/feed-stats`。
 
-## 單元測試（`test:unit` = 219 passed）
+## 單元測試（`test:unit` = 245 passed）
 
 - `GeckoTerminalClient: every call asks for the Cloudflare edge cache`
   —— 釘住 `cacheEverything` / `cacheTtl` / `400-599: 0`，同 `cacheHits` 有計數；
 - `GeckoTerminalClient: consecutive 429s escalate the pause; a success resets it`
-  —— 第一次 5 分鐘、第二次更長、backoff 期間**零請求**、成功清零；
+  —— 第一次 5 分鐘、第二次更長、成功清零；
+- `GeckoTerminalClient backs off all calls for 5 min after a 429`
+  —— 更新為：暫停期間**只准** alt host 嘅 `new_pools` 一次、唔合資格嘅路徑零請求、窗口過後主 host 再試；
+- `GeckoTerminalClient asks the alternate host while the primary is paused`
+  —— 主 host 中毒下 discovery 照樣拎到 pool、alt 成功**唔會**清零主 host 嘅 pause、alt 自己 429 之後唔會再探；
+- `geckoAltEligible / keyed mode: a CoinGecko key rides every request and unlocks the mirror`
+  —— 純規則（keyless 只有 `new_pools`）＋ demo/pro header ＋ `keyed` 讀數；
 - `geckoBackoffMs / parseRetryAfterMs: Retry-After wins, capped`
   —— 純規則：加倍、封頂、硬上限、秒數／HTTP-date 兩種 `Retry-After`。
 
-（新增嗰條 219 係 writeDrain 嘅窗口外 patch 防半貼 pin，見 `docs/scan-completion-loss.md`。）
-
-（原有嗰條 `GeckoTerminalClient backs off all calls for 5 min after a 429` 保持不變：
-今次改動令第一次 429 嘅行為同以前一致。）
+（第一批 219 條之中有一條係 writeDrain 嘅窗口外 patch 防半貼 pin，見 `docs/scan-completion-loss.md`。）

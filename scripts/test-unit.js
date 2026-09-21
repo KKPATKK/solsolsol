@@ -15,7 +15,7 @@ const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("..
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
-const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, GECKO_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
+const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
@@ -5646,18 +5646,112 @@ async function main() {
       };
       assert.equal((await client.fetchTrendingPools(20)).length, 0);
       const callsAfter429 = calls.length;
-      // During backoff: no fetch should happen for either endpoint.
+      // While the primary is paused the ONLY request allowed is new_pools on
+      // the alternate host (see the dedicated test below); trending_pools is
+      // not served there keyless, so it must not cost a request either.
       assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal(calls.length, callsAfter429 + 1, "the paused primary is not asked again");
+      assert.ok(calls[callsAfter429].startsWith("https://api.coingecko.com/api/v3/onchain"));
       assert.equal((await client.fetchTrendingPools(20)).length, 0);
-      assert.equal(calls.length, callsAfter429, "backoff must not hit the API");
-      // Expire the backoff window → next call fetches again.
+      assert.equal(calls.length, callsAfter429 + 1, "an ineligible path spends nothing while paused");
+      // Expire the backoff window → next call fetches the primary again.
       client.rateLimitedUntil = Date.now() - 1;
       global.fetch = async (url) => {
         calls.push(String(url));
         return new Response(okBody, { status: 200, headers: { "Content-Type": "application/json" } });
       };
       assert.equal((await client.fetchNewPools(1)).length, 1);
-      assert.equal(calls.length, callsAfter429 + 1, "expired backoff must fetch again");
+      assert.equal(calls.length, callsAfter429 + 2, "expired backoff must fetch again");
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("GeckoTerminalClient asks the alternate host while the primary is paused", async () => {
+    const calls = [];
+    const origFetch = global.fetch;
+    const okBody = JSON.stringify({ data: [{ id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump", type: "pool", attributes: { pool_created_at: "2026-08-15T16:21:21Z" }, relationships: { base_token: { data: { id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump" } } } }] });
+    try {
+      const client = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+      // The primary 429s → the feed pauses on the shared egress IP's quota.
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return new Response("{}", { status: 429 });
+      };
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      const primaryPauseUntil = client.rateLimitedUntil;
+      assert.ok(primaryPauseUntil > Date.now(), "the first 429 pauses the primary");
+      // The primary stays poisoned; the alternate host answers new_pools.
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return String(url).startsWith("https://api.coingecko.com/api/v3/onchain")
+          ? new Response(okBody, { status: 200, headers: { "Content-Type": "application/json" } })
+          : new Response("{}", { status: 429 });
+      };
+      const beforeAlt = calls.length;
+      assert.equal((await client.fetchNewPools(1)).length, 1, "discovery survives the poisoned IP");
+      assert.equal(calls.length, beforeAlt + 1, "exactly one request bought that answer");
+      assert.ok(calls[beforeAlt].startsWith("https://api.coingecko.com/api/v3/onchain"));
+      const served = geckoFeedStats();
+      assert.equal(served.lastHost, "alt");
+      assert.equal(served.altAttempts, 1);
+      assert.equal(served.altOk, 1);
+      assert.equal(client.rateLimitedUntil, primaryPauseUntil, "an alternate success does not clear the primary's pause");
+      // trending_pools is 401 keyless on the alternate host → no request at all.
+      const beforeIneligible = calls.length;
+      assert.equal((await client.fetchTrendingPools(20)).length, 0);
+      assert.equal(calls.length, beforeIneligible, "an ineligible path is never sent to the fallback");
+      // The alternate's OWN 429 (its own bucket) pauses just the fallback: one
+      // probe per window, never one per call.
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return new Response("{}", { status: 429 });
+      };
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      const callsAfterAlt429 = calls.length;
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal(calls.length, callsAfterAlt429, "the alternate's 429 stops the probing");
+      assert.ok(client.altRateLimitedUntil > Date.now(), "the fallback has its own pause");
+      const poisoned = geckoFeedStats();
+      assert.equal(poisoned.alt429, 1);
+      assert.equal(poisoned.http429, 1, "the fallback's 429 is not counted against the primary");
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("geckoAltEligible / keyed mode: a CoinGecko key rides every request and unlocks the mirror", async () => {
+    // Keyless: only new_pools is public on the alternate host.
+    assert.equal(geckoAltEligible("/networks/solana/new_pools?page=1", false), true);
+    assert.equal(geckoAltEligible("/networks/solana/trending_pools?limit=20", false), false);
+    // Keyed: the alternate becomes a full mirror.
+    assert.equal(geckoAltEligible("/networks/solana/trending_pools?limit=20", true), true);
+    assert.equal(geckoAltEligible("/networks/solana/tokens/abc", true), true);
+    const seen = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url, init) => {
+      seen.push({ url: String(url), headers: (init && init.headers) || {} });
+      return new Response(JSON.stringify({ data: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    try {
+      const demo = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0, coingeckoApiKey: "CG-test", coingeckoApiPlan: "demo" });
+      await demo.fetchNewPools(1);
+      assert.equal(seen[0].headers[COINGECKO_DEMO_HEADER], "CG-test", "the key rides the request");
+      assert.equal(geckoFeedStats().keyed, true, "and the feed state says the quota is keyed");
+      const pro = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0, coingeckoApiKey: "CG-test", coingeckoApiPlan: "pro" });
+      await pro.fetchNewPools(1);
+      assert.equal(seen[1].headers["x-cg-pro-api-key"], "CG-test", "a Pro plan uses the Pro header");
+      const plain = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+      await plain.fetchNewPools(1);
+      assert.equal(Object.prototype.hasOwnProperty.call(seen[2].headers, COINGECKO_DEMO_HEADER), false, "unkeyed requests stay keyless");
+      assert.equal(geckoFeedStats().keyed, false);
+      // Keyed + paused primary: the mirror serves the paths the keyless one 401s.
+      demo.rateLimitedUntil = Date.now() + 60_000;
+      seen.length = 0;
+      await demo.fetchTrendingPools(20);
+      assert.equal(seen.length, 1);
+      assert.ok(seen[0].url.startsWith("https://api.coingecko.com/api/v3/onchain"), "a keyed mirror answers on the other host");
     } finally {
       global.fetch = origFetch;
     }
