@@ -1,0 +1,77 @@
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -3569,6 +3569,36 @@
+       const solanaBoosts = (json: unknown): ProbeReport => {
+         const rows = Array.isArray(json) ? json : [];
+         return {
+           count: rows.filter((r) => (r as { chainId?: string } | null)?.chainId === "solana")
+             .length,
+         };
+       };
++      // Meteora's CURRENT Data API host. The old `dlmm-api.meteora.ag`
++      // answers 404 to EVERY path, root included (measured 2026-09-21), which
++      // is why this source was previously written off as "does not exist" —
++      // the docs now publish `dlmm.datapi.meteora.ag` / `damm-v2.datapi.meteora.ag`.
++      // Rows live under `data[]` with `created_at` in ms, the pool's two sides
++      // under `token_x` / `token_y`, and the endpoint sorts server-side by
++      // `sort_by=pool_created_at:desc` — i.e. it can answer "the newest pools",
++      // which Raydium and Orca both cannot. Wrapped SOL is quoted on every
++      // launch pool, so the OTHER side is the mint a caller would register.
++      const pools = (json: unknown): ProbeReport => {
++        const raw = (json as { data?: unknown } | null)?.data;
++        const list = (Array.isArray(raw) ? raw : []) as Array<{
++          created_at?: number;
++          launchpad?: string | null;
++          tvl?: number | null;
++          token_x?: { address?: string } | null;
++          token_y?: { address?: string } | null;
++        }>;
++        const times = list
++          .map((r) => Number(r?.created_at))
++          .filter((n) => Number.isFinite(n) && n > 0);
++        const newest = times.length > 0 ? Math.max(...times) : 0;
++        const head = list.find((r) => Number(r?.created_at) === newest) ?? list[0];
++        const quote = "So11111111111111111111111111111111111111112";
++        const xs = head?.token_x?.address;
++        const ys = head?.token_y?.address;
++        return {
++          count: list.length,
++          newestAgeS: newest > 0 ? Math.round((Date.now() - newest) / 1000) : null,
++          newestMint: (xs === quote ? ys : xs)?.slice(0, 12) ?? null,
++          newestLaunchpad: head?.launchpad ?? null,
++          newestTvl: head?.tvl ?? null,
++        };
++      };
+       const results = await Promise.all([
+         probe(
+           "pumpfun-v3",
+@@ -3585,12 +3615,28 @@
+         probe(
+           "raydium-list-v2",
+           "https://api-v3.raydium.io/pools/info/list-v2?poolType=Standard&size=5&sortField=liquidity&sortType=desc",
+           envelope,
+         ),
+         probe("orca-pools", "https://api.orca.so/v2/solana/pools?limit=3", envelope),
+-        probe("meteora-dlmm", "https://dlmm-api.meteora.ag/pair/all_by_groups?page=0&limit=5", envelope),
++        probe(
++          "meteora-dlmm-old-host",
++          "https://dlmm-api.meteora.ag/pair/all_by_groups?page=0&limit=5",
++          envelope,
++        ),
++        probe(
++          "meteora-damm-v2",
++          "https://damm-v2.datapi.meteora.ag/pools?page=1&page_size=10&sort_by=pool_created_at:desc",
++          pools,
++        ),
++        probe(
++          "meteora-dlmm",
++          "https://dlmm.datapi.meteora.ag/pools?page=1&page_size=10&sort_by=pool_created_at:desc",
++          pools,
++        ),
++        probe(
++          "meteora-dbc",
++          "https://dbc.datapi.meteora.ag/pools?page=1&page_size=10&sort_by=pool_created_at:desc",
++          pools,
++        ),
+       ]);
+       return Response.json({ ok: true, results });
