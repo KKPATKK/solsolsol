@@ -90,8 +90,8 @@ export function parseJupTokens(data: unknown): TokenProfile[] {
  *   - fetchRecentTokens: seconds-old launchpad launches (pump.fun & co.) —
  *     the replacement for the blocked pump.fun frontend-api feed, with the
  *     same "enter the coin before DexScreener notices it" purpose.
- *   - fetchTrendingTokens: momentum-ranked established coins (mostly land
- *     outside the age window — kept for early catch of resurging mints).
+ *   - fetchTrendingTokens: organic-score ranked coins (see the method: the
+ *     /trending/24h endpoint it used to read went empty on 2026-09-21).
  * Both degrade to [] on any failure; a rate limit sets a shared 5-minute
  * backoff so the scan never hammers a throttled upstream.
  */
@@ -289,13 +289,28 @@ export class JupTokensClient {
     );
   }
 
-  /** Momentum-ranked tokens over the trailing 24h window. */
+  /**
+   * Organic-score ranked tokens over the trailing 24h window.
+   *
+   * 2026-09-21 — the endpoint moved. `/trending/24h` answers HTTP 200 with an
+   * EMPTY array (`[]`, 2 bytes) now, from the worker's egress AND from a
+   * normal host, while `/recent` on the same API serves data in the same
+   * minute — so this was not a 429, not a parse problem and not our egress:
+   * the endpoint stopped serving. The feed never produced a coin again
+   * (`jupTrend 0` on every sampled tick), i.e. one subrequest per tick for
+   * nothing. `/toporganicscore/24h` is the live endpoint for what this feed
+   * exists for — "early catch of resurging mints": measured the same day, 4
+   * of its top 20 entries sat inside the scanner's qualifying age window
+   * (12.5h–24h, mcap 177K–4.0M, organic score 75+) on established liquidity,
+   * which is the resurging-mint shape this feed is for. Entries outside the
+   * window are rejected by the age gate exactly as before — "mostly outside
+   * the qualifying window" was already this feed's documented behaviour.
+   */
   async fetchTrendingTokens(limit: number): Promise<TokenProfile[]> {
     const wanted = Math.max(1, Math.min(Math.floor(limit), 100));
-    return parseJupTokens(await this.get(`/trending/24h?limit=${wanted}`)).slice(
-      0,
-      wanted,
-    );
+    return parseJupTokens(
+      await this.get(`/toporganicscore/24h?limit=${wanted}`),
+    ).slice(0, wanted);
   }
 
   /**

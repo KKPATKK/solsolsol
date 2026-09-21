@@ -588,15 +588,8 @@ export function installTickProbe(
           cardSend.lastCutMs = captured.length > 0 ? captured[captured.length - 1].ms : 0;
         }
       }
-      if (marker !== null && captured.length > 0 && target.lastSummary && typeof target.lastSummary === "object") {
+      if (target.lastSummary && typeof target.lastSummary === "object") {
         const summary = target.lastSummary as Record<string, unknown>;
-        summary.phases = captured;
-        // Published here rather than by the worker's onTickEnd hook: this file
-        // is inside the file-sync window and worker.ts's telemetry block is
-        // not, and the summary is the channel the completion heartbeat
-        // already serializes.
-        summary.cardSend = cardSendView();
-        summary.deliveryDuplicates = deliveryDuplicatesView();
         // GeckoTerminal's feed state (src/geckoterminal.ts). The summary's own
         // `geo` / `geoTrend` counts say the feed returned nothing; this says
         // WHY — a 429 streak, the backoff window it armed, and whether the
@@ -604,7 +597,27 @@ export function installTickProbe(
         // origin. Needed because the 2026-09-20 measurement (worker egress
         // 429ed on every attempt, `geo 0 / geoTrend 0` on every tick) was
         // otherwise indistinguishable from a quiet market.
+        //
+        // OUTSIDE the phase guard below on purpose (2026-09-21). Every
+        // `markPhase` call sits in the per-candidate chain, so a tick that
+        // evaluated NO candidate collected no stamps — and the guard that
+        // gates `phases` / `cardSend` therefore swallowed this record too.
+        // Most ticks are candidate-less, and `geo 0` is precisely a
+        // candidate-less signature, so the one number built to explain it was
+        // unreadable exactly when a reader needed it (live: `summary.gecko`
+        // was absent on 8 of 8 polls while `geo` read 0 on every one). The
+        // feed state is a cumulative view of the client, not a tick-scoped
+        // stamp, so it belongs to every tick.
         summary.gecko = geckoFeedStats();
+        if (marker !== null && captured.length > 0) {
+          summary.phases = captured;
+          // Published here rather than by the worker's onTickEnd hook: this
+          // file is inside the file-sync window and worker.ts's telemetry
+          // block is not, and the summary is the channel the completion
+          // heartbeat already serializes.
+          summary.cardSend = cardSendView();
+          summary.deliveryDuplicates = deliveryDuplicatesView();
+        }
       }
       try {
         hooks.onTickEnd?.(target.lastSummary);

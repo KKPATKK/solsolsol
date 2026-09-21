@@ -4415,6 +4415,38 @@ async function main() {
     assert.equal(calls, before); // zero network calls while backed off
   });
 
+  await test("JupTokensClient: the trending leg reads /toporganicscore/24h (its old endpoint went empty)", async () => {
+    // `/trending/24h` answers HTTP 200 with an EMPTY array since 2026-09-21 —
+    // from the worker's egress AND from a normal host, while `/recent` on the
+    // same API served data in the same minute. So the leg spent a subrequest
+    // per tick and never produced a coin (`jupTrend 0` on every sampled tick,
+    // and no log line said why). This asserts the replacement endpoint by URL,
+    // because a quiet revert to the dead one is invisible in the counts: both
+    // read as 0.
+    const urls = [];
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const body = JSON.stringify([
+      { id: mint, createdAt: "2026-09-20T18:00:00.000Z" },
+      { id: "not-a-mint", createdAt: "2026-09-20T18:00:00.000Z" },
+    ]);
+    const client = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async (url) => {
+        urls.push(url);
+        return new Response(body, { status: 200 });
+      },
+    );
+    const out = await client.fetchTrendingTokens(5);
+    assert.equal(urls.length, 1);
+    assert.ok(
+      urls[0].includes("/toporganicscore/24h?limit=5"),
+      `the trending leg must not read the dead /trending/24h (got ${urls[0]})`,
+    );
+    assert.equal(out.length, 1, "the payload still parses through parseJupTokens");
+    assert.equal(out[0].tokenAddress, mint);
+    assert.equal(out[0].openTimestamp, Date.parse("2026-09-20T18:00:00.000Z"));
+  });
+
   await test("fetchOrganicScore: parses score/label/traders; genuine 0 ≠ absent", async () => {
     const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
     const body = JSON.stringify([
@@ -6042,6 +6074,83 @@ async function main() {
       );
     } finally {
       dropDeferredToken("DEFERCOIN1");
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: every discovery feed is dispatched at tick start, not at the fan-out", async () => {
+    // The same 2026-09-21 shape as the profiles test above, one layer out. The
+    // gecko/jupiter/gmgn/axiom/pump calls were all CONSTRUCTED at the fan-out,
+    // so the window they raced was only what the pre-feed steps left, and
+    // `fetchFeedCapped` refuses to dispatch under 250ms — measured live, a
+    // fifth of ticks logged `jup 0 / geo 0 / geoTrend 0` while the pool still
+    // evaluated 100+ coins, and the lost tick costs exactly the seconds-old
+    // launchpad window these feeds exist for. They are started at tick start
+    // now, so a slow pre-feed step cannot take their window away.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      await db.saveChatSettings({
+        chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
+        minAgeMinutes: 0, maxAgeMinutes: 100_000,
+        min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+        enabled: true,
+      });
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: "FEEDCOIN1" }];
+      dex.fetchPairsForTokens = async () => new Map();
+      const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+      let geckoCalls = 0;
+      let jupCalls = 0;
+      const gecko = {
+        fetchNewPools: async () => {
+          geckoCalls += 1;
+          return [{ tokenAddress: "GECKOCOIN1", createdAtMs: Date.now() - 3_600_000 }];
+        },
+        fetchTrendingPools: async () => [],
+      };
+      const jupiter = {
+        fetchRecentTokens: async () => {
+          jupCalls += 1;
+          return [{ tokenAddress: mint }];
+        },
+        fetchTrendingTokens: async () => [],
+        // The pair fallback fires whenever DexScreener answers with under half
+        // the requested pairs — this tick's shape.
+        fetchTokenDataBatch: async () => new Map(),
+      };
+      // 800ms of the 900ms window: the pre-feed cost that used to starve them.
+      const slowCrime = {
+        refreshIfStale: async () => {
+          await new Promise((r) => setTimeout(r, 800));
+          return { ok: true, size: 0 };
+        },
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, gecko, jupiter, null, null, null, slowCrime,
+      );
+      await scanner.runOnce();
+      assert.equal(geckoCalls, 1, "gecko new-pools must be dispatched at tick start");
+      assert.equal(jupCalls, 1, "jupiter recent must be dispatched at tick start");
+      assert.equal(scanner.lastSummary.geo, 1, "and its answer must still land");
+      assert.equal(scanner.lastSummary.jup, 1, "same for the jupiter recent leg");
+      assert.ok(
+        scanner.lastSummary.preFeedMs >= 700,
+        `the stolen window is what makes this a regression test (got ${scanner.lastSummary.preFeedMs})`,
+      );
+    } finally {
       globalThis.fetch = origFetch;
       await t.cleanup();
     }

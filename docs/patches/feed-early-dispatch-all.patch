@@ -1,0 +1,373 @@
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -1977,6 +1977,55 @@
+       ),
+     ]);
+   }
+ 
++  /**
++   * Start a discovery-feed call NOW and hand back a thunk that resolves to its
++   * result (see the tick-start block in runOnce). Every feed call used to be
++   * constructed at the fan-out, so the window it raced was only whatever the
++   * pre-feed steps left; starting it at tick start gives it the full
++   * FEED_DEADLINE_MS whatever those steps cost (2026-09-21, the same fix the
++   * profiles fetch got that day).
++   *
++   * The rejection handler is attached at creation, so a call whose job is
++   * abandoned — an early return below, or a feed race the deadline wins — can
++   * never surface as an unhandled rejection. `[]` is the same degradation
++   * every feed job already applies, and `label` keeps the console line the
++   * per-job catch used to print.
++   */
++  private startFeedCall<T>(
++    label: string,
++    start: () => Promise<T>,
++  ): () => Promise<T> {
++    const call = start().catch((err: unknown) => {
++      console.error(
++        `[scanner] ${label} discovery failed:`,
++        err instanceof Error ? err.message : err,
++      );
++      return [] as unknown as T;
++    });
++    return () => call;
++  }
++
++  /**
++   * GeckoTerminal new-pools pages → discovery profiles. Extracted from the
++   * fan-out so the call can be STARTED at tick start (see startFeedCall): the
++   * page loop is the reason this one cannot be a one-line thunk.
++   */
++  private async collectGeckoNewPools(): Promise<TokenProfile[]> {
++    const first = await this.gecko!.fetchNewPools(1);
++    const pools = [...first];
++    for (
++      let page = 2;
++      page <= this.config.geckoterminalPoolPages && first.length > 0;
++      page++
++    ) {
++      const got = await this.gecko!.fetchNewPools(page);
++      pools.push(...got);
++      if (got.length === 0) break;
++    }
++    return pools
++      .filter((p) => p.createdAtMs !== null)
++      .map((p) => ({
++        tokenAddress: p.tokenAddress,
++        openTimestamp: p.createdAtMs ?? undefined,
++      }));
++  }
++
++  /**
++   * GeckoTerminal trending-pools → discovery profiles (same extraction
++   * rationale as collectGeckoNewPools).
++   */
++  private async collectGeoTrendingPools(): Promise<TokenProfile[]> {
++    const trending = await this.gecko!.fetchTrendingPools(
++      this.config.geckoterminalTrendingLimit,
++    );
++    return trending
++      .filter((p) => p.createdAtMs !== null)
++      .map((p) => ({
++        tokenAddress: p.tokenAddress,
++        openTimestamp: p.createdAtMs ?? undefined,
++      }));
++  }
++
+   /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
+   async runOnce(): Promise<void> {
+@@ -2029,6 +2076,71 @@
+         return { list: [] as TokenProfile[], settled: true };
+       },
+     );
++    // The OTHER discovery feeds get the same window, for the same reason (see
++    // FEED_DEADLINE_MS and startFeedCall). They were all DISPATCHED at the
++    // fan-out below, so the window they raced was only what the pre-feed steps
++    // left: measured live 2026-09-21, the enabled-chats read plus the isolate's
++    // crime-wallet load left under `fetchFeedCapped`'s 250ms dispatch floor on
++    // roughly a fifth of ticks, and those ticks logged `jup 0 / geo 0 /
++    // geoTrend 0` while the pool still evaluated 100+ coins. A skipped tick
++    // costs exactly the seconds-old launchpad window these feeds exist for
++    // (Jupiter `recent` is the pump.fun frontend-api replacement), and the
++    // window is the whole point of running a per-minute monitor.
++    //
++    // Each call is started here and only AWAITED at its job, with `inFlight`
++    // there so the dispatch floor cannot refuse a request that is already
++    // running. This makes the same trade the profiles call above already
++    // makes: a tick that returns early (no enabled chats, a tripped stop
++    // check) discards requests it used to skip — one request per feed, paid
++    // only on the ticks that do not push anything anyway, against losing the
++    // feed window on every slow tick.
++    const pumpCall =
++      this.pumpfun && this.config.pumpfunProfileLimit > 0
++        ? this.startFeedCall("pump.fun", () =>
++            this.pumpfun!.fetchNewestCoins(this.config.pumpfunProfileLimit),
++          )
++        : null;
++    const geckoPoolsCall = this.gecko
++      ? this.startFeedCall("geckoterminal", () => this.collectGeckoNewPools())
++      : null;
++    const geoTrendCall =
++      this.gecko && this.config.geckoterminalTrendingLimit > 0
++        ? this.startFeedCall("geckoterminal trending", () =>
++            this.collectGeoTrendingPools(),
++          )
++        : null;
++    const gmgnCall =
++      this.gmgn && this.config.gmgnTrendingLimit > 0
++        ? this.startFeedCall("gmgn trending", async () => {
++            const trending = await this.gmgn!.fetchTrending(
++              this.config.gmgnTrendingLimit,
++            );
++            return trending
++              .filter((t) => !t.isWashTrading)
++              .map((t) => ({
++                tokenAddress: t.address,
++                openTimestamp: t.createdAtMs ?? undefined,
++              }));
++          })
++        : null;
++    const axiomCall =
++      this.axiom && this.config.axiomTrendingLimit > 0
++        ? this.startFeedCall("axiom trending", async () => {
++            const trending = await this.fetchTrendingCached();
++            return trending
++              .filter((t) => t.createdAtMs !== null)
++              .map((t) => ({
++                tokenAddress: t.address,
++                openTimestamp: t.createdAtMs ?? undefined,
++              }));
++          })
++        : null;
++    const jupCall =
++      this.jupiter && this.config.jupiterRecentLimit > 0
++        ? this.startFeedCall("jupiter recent", () =>
++            this.jupiter!.fetchRecentTokens(this.config.jupiterRecentLimit),
++          )
++        : null;
++    const jupTrendCall =
++      this.jupiter && this.config.jupiterTrendLimit > 0
++        ? this.startFeedCall("jupiter trending", () =>
++            this.jupiter!.fetchTrendingTokens(this.config.jupiterTrendLimit),
++          )
++        : null;
+     const diag: ScanSummary = {
+@@ -2186,31 +2298,17 @@
+       // scan). Best-effort: any failure returns [] and the scan continues
+       // on DexScreener alone (see /health summary.pump to verify liveness).
+       let pumpProfiles: TokenProfile[] = [];
+-      if (this.pumpfun && this.config.pumpfunProfileLimit > 0) {
++      if (pumpCall) {
+         feedJobs.push(
+-          this.fetchFeedCapped(
+-            () =>
+-              this.pumpfun!.fetchNewestCoins(this.config.pumpfunProfileLimit),
+-            [],
+-            feedDeadline,
+-          )
++          this.fetchFeedCapped(pumpCall, [], feedDeadline, true)
+             .then((p) => {
+               pumpProfiles = p;
+               diag.pump = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] pump.fun discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+             }),
+         );
+       }
+@@ -2217,44 +2315,17 @@
+       if (this.shouldStopEarly()) {
+         await Promise.all(feedJobs);
+         return;
+       }
+-      if (this.gecko) {
++      if (geckoPoolsCall) {
+         feedJobs.push(
+-          this.fetchFeedCapped(
+-            async () => {
+-              const pools = [];
+-              for (
+-                let page = 1;
+-                page <= this.config.geckoterminalPoolPages;
+-                page++
+-              ) {
+-                const got = await this.gecko!.fetchNewPools(page);
+-                pools.push(...got);
+-                if (got.length === 0) break;
+-              }
+-              return pools
+-                .filter((p) => p.createdAtMs !== null)
+-                .map((p) => ({
+-                  tokenAddress: p.tokenAddress,
+-                  openTimestamp: p.createdAtMs ?? undefined,
+-                }));
+-            },
+-            [],
+-            feedDeadline,
+-          )
++          this.fetchFeedCapped(geckoPoolsCall, [], feedDeadline, true)
+             .then((p) => {
+               geckoProfiles = p;
+               diag.geo = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] geckoterminal discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+             }),
+         );
+       }
+@@ -2258,27 +2329,12 @@
+       // disabled); best-effort — failures return [] and the scan continues.
+       let geoTrendProfiles: TokenProfile[] = [];
+-      if (this.gecko && this.config.geckoterminalTrendingLimit > 0) {
++      if (geoTrendCall) {
+         feedJobs.push(
+-          this.fetchFeedCapped(
+-            async () => {
+-              const trending = await this.gecko!.fetchTrendingPools(
+-                this.config.geckoterminalTrendingLimit,
+-              );
+-              return trending
+-                .filter((p) => p.createdAtMs !== null)
+-                .map((p) => ({
+-                  tokenAddress: p.tokenAddress,
+-                  openTimestamp: p.createdAtMs ?? undefined,
+-                }));
+-            },
+-            [],
+-            feedDeadline,
+-          )
++          this.fetchFeedCapped(geoTrendCall, [], feedDeadline, true)
+             .then((p) => {
+               geoTrendProfiles = p;
+               diag.geoTrend = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] geckoterminal trending discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+             }),
+         );
+       }
+@@ -2292,27 +2348,12 @@
+       // GMGN_TRENDING_LIMIT (0 = disabled).
+       let gmgnProfiles: TokenProfile[] = [];
+-      if (this.gmgn && this.config.gmgnTrendingLimit > 0) {
++      if (gmgnCall) {
+         feedJobs.push(
+-          this.fetchFeedCapped(
+-            async () => {
+-              const trending = await this.gmgn!.fetchTrending(
+-                this.config.gmgnTrendingLimit,
+-              );
+-              return trending
+-                .filter((t) => !t.isWashTrading)
+-                .map((t) => ({
+-                  tokenAddress: t.address,
+-                  openTimestamp: t.createdAtMs ?? undefined,
+-                }));
+-            },
+-            [],
+-            feedDeadline,
+-          )
++          this.fetchFeedCapped(gmgnCall, [], feedDeadline, true)
+             .then((p) => {
+               gmgnProfiles = p;
+               diag.gmgn = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] gmgn trending discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+             }),
+         );
+       }
+@@ -2329,27 +2370,12 @@
+       // continues.
+       let axiomProfiles: TokenProfile[] = [];
+-      if (this.axiom && this.config.axiomTrendingLimit > 0) {
++      if (axiomCall) {
+         feedJobs.push(
+-          this.fetchFeedCapped(
+-            async () => {
+-              const trending = await this.fetchTrendingCached();
+-              return trending
+-                .filter((t) => t.createdAtMs !== null)
+-                .map((t) => ({
+-                  tokenAddress: t.address,
+-                  openTimestamp: t.createdAtMs ?? undefined,
+-                }));
+-            },
+-            [],
+-            feedDeadline,
+-          )
++          this.fetchFeedCapped(axiomCall, [], feedDeadline, true)
+             .then((p) => {
+               axiomProfiles = p;
+               diag.axiom = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] axiom trending discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+             }),
+         );
+       }
+@@ -2363,22 +2389,12 @@
+       // failures return [] and the scan continues.
+       let jupProfiles: TokenProfile[] = [];
+-      if (this.jupiter && this.config.jupiterRecentLimit > 0) {
++      if (jupCall) {
+         feedJobs.push(
+-          this.fetchFeedCapped(
+-            () =>
+-              this.jupiter!.fetchRecentTokens(this.config.jupiterRecentLimit),
+-            [],
+-            feedDeadline,
+-          )
++          this.fetchFeedCapped(jupCall, [], feedDeadline, true)
+             .then((p) => {
+               jupProfiles = p;
+               diag.jup = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] jupiter recent discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+             }),
+         );
+       }
+@@ -2388,22 +2404,12 @@
+       // best-effort — failures return [] and the scan continues.
+       let jupTrendProfiles: TokenProfile[] = [];
+-      if (this.jupiter && this.config.jupiterTrendLimit > 0) {
++      if (jupTrendCall) {
+         feedJobs.push(
+-          this.fetchFeedCapped(
+-            () =>
+-              this.jupiter!.fetchTrendingTokens(this.config.jupiterTrendLimit),
+-            [],
+-            feedDeadline,
+-          )
++          this.fetchFeedCapped(jupTrendCall, [], feedDeadline, true)
+             .then((p) => {
+               jupTrendProfiles = p;
+               diag.jupTrend = p.length;
+             })
+             .catch((err: unknown) => {
+               console.error(
+                 "[scanner] jupiter trending discovery failed:",
+                 err instanceof Error ? err.message : err,
+               );
+             }),
+         );
+       }

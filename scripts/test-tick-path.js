@@ -104,6 +104,34 @@ installTickProbe(fakeScanner, {
   );
   assert.equal(typeof fakeScanner.lastSummary.gecko.http429, "number");
 
+  // A CANDIDATE-LESS tick must still publish it. Every `markPhase` call sits in
+  // the per-candidate chain, so a tick that evaluated no candidate collected no
+  // stamps — and the guard that gates `phases`/`cardSend` therefore swallowed
+  // the gecko record too. Most ticks are candidate-less and `geo 0` IS a
+  // candidate-less signature, so the one number built to explain `geo 0` was
+  // unreadable exactly when a reader needed it (live 2026-09-21: absent on 8 of
+  // 8 /health polls while `geo` read 0 on every one of them).
+  const idle = {
+    lastSummary: { profiles: 27, geo: 0 },
+    markPhase() {
+      /* never called: zero candidates walked the chain */
+    },
+    async runOnce() {
+      /* a tick that ends without evaluating a single coin */
+    },
+  };
+  installTickProbe(idle, {}, now);
+  await idle.runOnce();
+  assert.equal(
+    idle.lastSummary.gecko?.active,
+    false,
+    "the feed state rides a candidate-less tick too",
+  );
+  assert.equal(typeof idle.lastSummary.gecko.http429, "number");
+  assert.equal("phases" in idle.lastSummary, false, "no stamps → no phase chain is published");
+  assert.equal("cardSend" in idle.lastSummary, false, "nor a card-send snapshot");
+  assert.equal(idle.lastSummary.geo, 0, "the probe never rewrites the scanner's own counts");
+
   // A long tick keeps the NEWEST stamps: the interesting ticks are the ones
   // that walk many phases and still end without a push, and the last step
   // before the refusal is what a reader needs.

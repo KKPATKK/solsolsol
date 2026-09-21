@@ -57,12 +57,16 @@ i=4  totalMs 4049  profiles 31  feedsMs 279  feedReq 1  raw 25  injected 6
 | `scanner.ts` | 新增 `preFeedMs`（tick 起 → fan-out 起）同 `profilesSettled`（call 有冇喺窗口內答）—— 今次缺嘅就係呢兩個數 |
 | `crimewallets.ts` | TTL 改成**全 fleet 共用**：cold isolate 由 `worker_state` 嘅副本 + 時間戳 hydrate（兩次讀），只有時間戳過期（6h）才真係上網；寫入次序改成**先 list 後 stamp**，令 stamp 永遠唔會早於佢所認證嘅副本 |
 
-## 驗收
+## 驗收（deploy `d493dcb` 之後，實測）
 
-待 deploy 後補：
-
-- `scan-history` 嘅 `profiles` 唔再係 0（或顯示 `profilesSettled: false` + make-up 條數）
-- `/debug/crime-wallets` 嘅 `persistedUpdatedAt` **唔再每 25–45 秒跳**（改為每 6 小時一次）
+- `scan-history` 200 行（03:38–06:41Z）：`profiles==0` 由 **66%（114/172）跌到 4%（1/28）**；
+  部署後 28 行裡 25 行 `profiles 20–30`、2 行 `6`（make-up lane）、1 行 `0`。
+- `/health.summary.feedMakeup`：`lastRawProfiles 21–23`、`injectedTotal` 每 tick +6、
+  `emptyFeedTotal 0`、`failedTotal 0` —— 上游答得到，make-up 疊加正常。
+- 出事的形狀親眼見到一次：`pre 847 / feedsMs 0 / profiles 29` —— 前段食咗 847ms（窗口 900ms），
+  但因為 call 喺 tick 開頭已經飛出去，答案照樣拿到 29。
+- `/debug/crime-wallets` 嘅 `persistedUpdatedAt` 連續 5 次取樣**完全不動**（改為每 6 小時一次）；
+  冷 isolate 出現 `loadedFrom: "persisted"`（零上網 hydrate），`?refresh=1` 走 network 且 stamp 與副本一致。
 
 ## 順帶發現（唔屬今次改動）
 
@@ -70,3 +74,43 @@ i=4  totalMs 4049  profiles 31  feedsMs 279  feedReq 1  raw 25  injected 6
 authority 係 `.cool` TLD 自己嘅 SOA）——即係個自訂域名已經冇 delegation（過期／被刪），
 `.cool` 嘅 RDAP 主機亦連唔到。Worker 本身完全正常，只係要經
 `https://solana-meme-bot.cool1999k.workers.dev` 入。
+
+---
+
+# 後續（2026-09-21 同日）：其他 feed 一樣被前段偷窗口
+
+profiles 修好之後，逐個 feed 量度，發現**同一類問題還有四個 feed**，另加兩個上游死亡。
+
+## 量度
+
+| feed | 實測 | 判定 |
+|---|---|---|
+| profiles | raw 21–23 + make-up 6 → 27–29，`failedTotal 0` | ✅ 已修好 |
+| pairs（batch） | tracker note `rows 10/24 pairs 10/10` | ✅ |
+| jup recent | `/debug/jupiter` recent 5；每 tick `jup 20`，但**間中 `jup 0`** | ⚠️ 窗口被偷 |
+| geo（new_pools） | worker egress 3/3 → **429**「You've exceeded the Rate Limit」；同一 endpoint 由普通 host → **200 / 29KB** | ⚠️ 依 IP 限流 + 窗口被偷 |
+| geoTrend | 全部樣本 0（同一個 client、共用 backoff） | ⚠️ 同上 |
+| jupTrend | `/trending/24h` → HTTP 200 但 body `[]`（2 bytes），普通 host 都一樣；`/toporganicscore/24h` → 7691 bytes 有數據 | ❌ 上游端點已空 |
+| pump.fun | `frontend-api.pump.fun/coins` → **530 / CF 1016**（origin DNS 冇了） | ❌ 上游已死（設計上由 jup recent 代替） |
+| gmgn | `/debug/gmgn` → 429 | ❌ 已知被擋 |
+| axiom / arkham | `AXIOM_TRENDING_LIMIT=0` / 無 key | ⚪ 設定關閉 |
+| birdeye backfill | `/debug/backfill` fetched 140 seeded 140 | ✅ |
+
+至於「每 tick 有無問題」：200 行裡 `ok 159`，41 個 notOk **全部 ≤ 06:25:10Z**（部署前）；
+部署後 28 行裡 27 ok（唯一一個係我自己的 `/debug/tick` probe）。
+節奏 median 63s / p90 81s / max 118s，`gaps>120s: 0`。
+
+## 修法（三層）
+
+| 位置 | 變更 |
+|---|---|
+| `scanner.ts` | pump / geo / geoTrend / gmgn / axiom / jup recent / jupTrend **全部改為 tick 開頭 dispatch**（`startFeedCall`），job 側只 await 並傳 `inFlight: true` —— 七個 feed 各自拿到由 tick 起計的 900ms 窗口，前段（enabled-chats 讀、crime hydrate）幾慢都偷不走 |
+| `jupfeeds.ts` | trending leg 由死掉的 `/trending/24h` 改指 `/toporganicscore/24h`（同日實測：top 20 裡 4 個落在年齡窗內：12.5h–24h、mcap 177K–4.0M、organic 75+） |
+| `tickprobe.ts` | `summary.gecko` 移出 `captured.length > 0` 的 guard —— 所有 `markPhase` 都在 per-candidate 鏈裡，所以「0 candidate」的 tick（多數 tick，而且正正就是 `geo 0` 的形狀）以前**乜都唔發佈**，解釋 `geo 0` 的數字剛好在需要時讀不到（live：8/8 次取樣都缺） |
+
+代價：冇 enabled chat 的 tick 現在也會發出這幾個請求（每個 feed 一次），與 profiles 當日已接受的同一個取捨。
+
+## 驗收（今次）
+
+- 單元測試 **243 passed / 0 failed**（新增 2 條：`JupTokensClient: the trending leg reads /toporganicscore/24h`、`Scanner: every discovery feed is dispatched at tick start, not at the fan-out`），`test-tick-path.js` 新增「0-candidate tick 仍要發佈 `summary.gecko`」斷言。
+- Live：同一輪 sweep 之後，`geo 0` 的 tick 上 `/health.heartbeat.summary.gecko` 應該有 `http429 / consecutive429 / backoffMs` 可以直接讀（唔再靠推論）。
