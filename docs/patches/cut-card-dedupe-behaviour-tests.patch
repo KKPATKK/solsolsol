@@ -1,0 +1,28 @@
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -5410,7 +5410,13 @@
+     assert.equal(written.followupsSent, rows[0].followupsSent, "not counted as sent");
+     assert.equal(written.lastAlertAt, rows[0].lastAlertAt, "the alert clock is rolled back");
+     assert.equal(written.lastState, rows[0].lastState, "and so is the state");
+-    assert.equal(written.upStages, rows[0].upStages, "and the announced rocket stage");
++    // The stage itself stays unannounced — but the ATTEMPT now leaves its own
++    // mark, because the next tick must be able to ask the delivery audit
++    // whether this card landed before it sends the same transition again.
++    assert.match(
++      String(written.upStages ?? ""),
++      /^p:up100:\d+$/,
++      `only the cut attempt rides the marks: ${written.upStages}`,
++    );
+     assert.equal(written.lastMcap, 100_000, "while the measurements still advance");
+   });
+@@ -5571,9 +5577,10 @@
+     assert.equal(written.followupsSent, 0, "suppressed alerts are not counted as delivered");
+     assert.equal(written.lastAlertAt, 0, "the alert clock is left alone");
+-    // Only the highest crossed stage is marked (one stage per check), so
+-    // no 🚀 card can be re-announced when tracking resumes.
+-    assert.equal(written.upStages, "up100");
++    // EVERY crossed stage is marked, not just the highest: one card announces
++    // the whole crossing (a gap is history, and each card names the milestone
++    // above it), so the milestones below must not be re-announced on resume.
++    assert.equal(written.upStages, "up100,up50");
+   });

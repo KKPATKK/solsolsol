@@ -1,0 +1,249 @@
+Engine half of the duplicate fix (src/pushwatch.ts)
+
+Every alert now carries a TRANSITION SIGNATURE — the identity that survives a
+re-derivation, which the card's text cannot provide (it carries live numbers).
+The rules engine also learns the two things that let a re-derived card be
+recognised as a duplicate: a cut-card mark read off the row's own mark CSV, and
+the audit-derived delivery proof. And the 🚀 memory walk marks every crossed
+stage instead of one per cooldown window, which is what turned a single gap into
+five near-identical POPEYE cards.
+
+Apply BEFORE cut-card-dedupe.patch (which wires the tracker side).
+
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -20,6 +20,7 @@
+   addUnconfirmedCardSend,
+   cardSendDisposition,
+   deliveredCardTokens,
++  deliveredFollowupProofs,
+   deliveredFollowupTokens,
+   parseUnconfirmedCardSends,
+   removeUnconfirmedCardSend,
+@@ -576,6 +577,22 @@ export interface WatchAlert {
+     | "ignition"
+     | "sell-pressure";
+   text: string;
++  /**
++   * WHICH TRANSITION this card announces — its identity across a re-derivation.
++   * The text cannot serve: it carries live numbers (mcap, %, 5m) and is never
++   * byte-identical twice, so it can never answer "is this the card the last
++   * attempt already sent?". The sig can, and that question is the whole
++   * duplicate fix (see CUT_MARK_PREFIX).
++   */
++  sig: string;
++  /**
++   * The delivery audit PROVED this transition is already in the chat (an
++   * earlier attempt's send was cut at the deadline and landed anyway). The card
++   * is announced — the transition and its counters land with the row's write —
++   * but NOT sent again. Live duplicates this removes: 💀 REK 20:39 → 21:02 HKT,
++   * 🚀 POPEYE 18:36/18:39/18:43/18:46/18:49 HKT.
++   */
++  deduped?: boolean;
+ }
+ 
+ export interface WatchEval {
+@@ -610,6 +627,77 @@ function pct(n: number): string {
+   return `${n >= 0 ? "+" : ""}${n.toFixed(0)}%`;
+ }
+ 
++/**
++ * CUT-CARD MARK — "an attempt for THIS transition is in flight".
++ *
++ * The duplicate the operator reports (💀 REK twice 23 minutes apart, 🚀 POPEYE
++ * five times in 13 minutes) is not a rules-engine mistake: the transition is
++ * derived once and re-derived identically afterwards. It is the SEND that
++ * happens twice. A follow-up card is sent with the two-state `bounded(send,
++ * slice, null)`, and `null` there means "we stopped WAITING", not "Telegram
++ * refused" — the request is still in flight and the card is usually already in
++ * the chat. The tracker read that as a failure, rolled the row's announcement
++ * bookkeeping back, and the next pass re-derived the same card and sent it
++ * again. The audit ring agrees: the cards that repeated have no `followup`
++ * entry at all (nothing is audited on the cut path), so the evidence of their
++ * delivery was thrown away with them.
++ *
++ * The fix rides the ONE column that already survives a rollback and is read by
++ * every check: the persistent mark CSV (`up_stages`). A cut send writes
++ * `p:<sig>:<minute>` next to the marks, the next evaluation of that row reads
++ * it, and — only if the audit ring PROVES a follow-up card for the token landed
++ * at or after that minute — announces the transition without sending it a
++ * second time. The mark is not announcement memory: the next check write
++ * recomputes the column without it, so it lives exactly one evaluation, and a
++ * re-derived transition that finds no proof is sent normally (never-miss).
++ */
++const CUT_MARK_PREFIX = "p:";
++/**
++ * Granularity of the mark's stamp. A minute is far coarser than the send it
++ * describes (sub-second) and far finer than any re-announcement gap we care
++ * about, and it keeps the mark three characters wide.
++ */
++export const CUT_MARK_BUCKET_MS = 60_000;
++
++/** `p:<sig>:<minute>` — the mark one cut card leaves behind. */
++export function cutMarkFor(sig: string, at: number): string {
++  return `${CUT_MARK_PREFIX}${sig}:${Math.floor(at / CUT_MARK_BUCKET_MS)}`;
++}
++
++/** Every cut mark in a mark CSV, oldest first. Garbage is skipped. */
++export function parseCutMarks(
++  csv: string | null | undefined,
++): Array<{ sig: string; at: number }> {
++  const out: Array<{ sig: string; at: number }> = [];
++  for (const m of (csv ?? "").split(",")) {
++    if (!m.startsWith(CUT_MARK_PREFIX)) continue;
++    const [, sig, bucket] = m.split(":");
++    if (!sig || !bucket) continue;
++    const n = Number(bucket);
++    if (!Number.isFinite(n)) continue;
++    out.push({ sig, at: n * CUT_MARK_BUCKET_MS });
++  }
++  return out;
++}
++
++/**
++ * The CSV a rolled-back row is written with: the marks it already had, plus the
++ * mark for the ONE card whose send was just cut. Older cut marks are replaced
++ * (the send loop breaks on the first cut, so a row can only have one attempt in
++ * flight) and the result keeps the column's sorted shape.
++ */
++export function addCutMark(
++  csv: string | null | undefined,
++  sig: string,
++  at: number,
++): string {
++  const kept = (csv ?? "")
++    .split(",")
++    .filter((m) => m.length > 0 && !m.startsWith(CUT_MARK_PREFIX));
++  kept.push(cutMarkFor(sig, at));
++  return kept.sort().join(",");
++}
++
+ /**
+  * Pure rules engine (exported for offline unit tests). Given the stored row
+  * and the freshly-fetched pair data, decide which alerts fire and what to
+@@ -627,7 +715,17 @@ export function evaluateWatch(
+     buysH1: number;
+     sellsH1: number;
+   },
+-  cfg: { cooldownMs: number; liqFloorUsd?: number },
++  cfg: {
++    cooldownMs: number;
++    liqFloorUsd?: number;
++    /**
++     * Delivery proof for the cut-card marks: token → the newest `at` the audit
++     * ring shows a follow-up card Telegram ACCEPTED for it (see
++     * deferrallog.deliveredFollowupProofs). Absent = nothing is proven, which
++     * only ever means a card is SENT — fail-open in the never-miss direction.
++     */
++    followupProofAt?: ReadonlyMap<string, number>;
++  },
+ ): WatchEval {
+   const alerts: WatchAlert[] = [];
+   const symbol = row.symbol ?? "?";
+@@ -642,8 +740,18 @@ export function evaluateWatch(
+   let resetBaselineHolders: number | undefined;
+   let announcedUpStages: string | undefined;
+ 
+-  const fire = (kind: WatchAlert["kind"], text: string) => {
+-    alerts.push({ kind, text });
++  // The cut-card mark this row's LAST alert left behind (see CUT_MARK_PREFIX):
++  // a send that was cut means the card may already be in the chat, and the
++  // audit's proof is what turns "may" into a decision.
++  const cut = parseCutMarks(row.upStages)[0] ?? null;
++  const fire = (kind: WatchAlert["kind"], text: string, sig: string) => {
++    const deduped =
++      cut !== null &&
++      cut.sig === sig &&
++      (cfg.followupProofAt?.get(row.token) ?? 0) >= cut.at;
++    // Only ever SET, never `false`: an alert that has nothing to say about the
++    // proof should compare equal to one written before this rule existed.
++    alerts.push(deduped ? { kind, text, sig, deduped } : { kind, text, sig });
+     lastAlertAt = now;
+     followupsSent += 1;
+   };
+@@ -654,7 +762,13 @@ export function evaluateWatch(
+   // readings to terminalize (see DRAIN_CONFIRM_MARK), the first one warning.
+   const liqFloor = cfg.liqFloorUsd ?? LIQ_FLOOR_USD;
+   const marks = new Set<string>();
+-  for (const m of (row.upStages ?? "").split(",")) if (m) marks.add(m);
++  for (const m of (row.upStages ?? "").split(",")) {
++    // Cut marks are consumed, not carried: they describe an attempt, and the
++    // next check write recomputes this column from `marks`, so a mark that is
++    // not re-added here disappears — one attempt, one mark, no staleness that
++    // could suppress a LATER, genuinely new transition.
++    if (m && !m.startsWith(CUT_MARK_PREFIX)) marks.add(m);
++  }
+   // undefined = the mark set is unchanged, so the caller leaves the column as
+   // it is (the same contract the 🚀 stages use).
+   const marksChanged = (): string | undefined => {
+@@ -672,6 +786,7 @@ export function evaluateWatch(
+         "liquidity",
+         `⚠️ 流動性跌穿地板 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}）— 已記錄第一次讀數，下一次檢查仍低於地板就會停止追蹤（市值數據隨 LP 失真）`,
++        "liqwarn",
+       );
+@@ -691,6 +806,7 @@ export function evaluateWatch(
+       "liquidity",
+       `💧 流動性枯竭 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}，連續 2 次檢查），市值數據已失真（LP 被抽乾），停止追蹤`,
++      "drain",
+     );
+@@ -723,6 +839,7 @@ export function evaluateWatch(
+         "rising",
+         `🟢 死而復生 ${symbol} | 從低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），重置基準繼續追蹤`,
++        "revive",
+       );
+@@ -759,6 +876,7 @@ export function evaluateWatch(
+       "dead",
+       `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(live.mcap * RESURRECTION_MULT)}＝低點 ×1.5 會再通知）`,
++      "dead",
+     );
+@@ -796,6 +914,7 @@ export function evaluateWatch(
+       "sell-pressure",
+       `🩸 賣壓主導 ${symbol} | 1h 買賣比 ${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1，` +
+         `連續 ${sellDomStreak} 次檢查賣壓佔優（賣 ${live.sellsH1} vs 買 ${live.buysH1}）— 分佈出貨形態`,
++      "sell",
+     );
+@@ -811,6 +930,7 @@ export function evaluateWatch(
+         "ignition",
+         `🔥 量能點火 ${symbol} | 5m量 ${fmtUsd(live.vol5m)}（前值 ${fmtUsd(row.lastVol5m ?? 0)}）| 5m ${pct(live.chg5m)} — 疑似新一段行情啟動`,
++        "ignite",
+       );
+@@ -839,10 +959,18 @@ export function evaluateWatch(
+           "rising",
+           `🚀 續漲 ${symbol} | 推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
+             (nextStage ? ` | 下一關 +${nextStage}%` : " | 已達最高里程碑"),
++          state,
+         );
+-        firedStages.add(state);
+-        lastState = state;
+-        break; // one stage per cooldown window
++        // EVERY crossed stage is marked, not just this one. The memory walk
++        // used to advance ONE milestone per cooldown window, highest first, so
++        // a coin that gapped several stages in one tick (POPEYE: push → +230%)
++        // produced a card per window in DESCENDING order — "下一關 +400%", then
++        // "+200%", then "+100%" — each reporting the same move. A milestone
++        // already sailed past is history, and every card names the next one
++        // above it, so announcing the crossing once loses nothing.
++        for (let j = 0; j <= i; j++) firedStages.add(`up${RISING_STAGES[j]}`);
++        lastState = state;
++        break; // one card per crossing, however many stages it spans
+       }
+@@ -871,6 +997,7 @@ export function evaluateWatch(
+         "weak",
+         `⚠️ 動能轉弱 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})`,
++        weakMark,
+       );
+@@ -892,6 +1019,7 @@ export function evaluateWatch(
+         "liquidity",
+         `💧 流動性驟降 ${symbol} | ${fmtUsd(row.lastLiquidity)} → ${fmtUsd(live.liquidity)} (${pct(dropPct)})`,
++        "liqcrash",
+       );
+@@ -913,6 +1041,7 @@ export function evaluateWatch(
+           "holders",
+           `📈 持倉增長 ${symbol} | ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (+${growth.toFixed(0)}%)`,
++          "hold",
+         );
+@@ -942,6 +1071,7 @@ export function evaluateWatch(
+           "divergence",
+           `⚡ 籌碼集中 ${symbol} | 價 ${pct(chgSincePush)}（推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)}）| 持倉 ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (${pct((holderRatio - 1) * 100)})— 價漲人跌：漲幅由越來越少的錢包推動，回撤會又快又深`,
++          "div",
+         );

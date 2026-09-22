@@ -1,0 +1,13 @@
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -1381,7 +1381,11 @@
+      * Cards NOT sent because the audit proved the same transition already
+      * reached the chat (see `dup-skip` in the note and CUT_MARK_PREFIX).
+      * Part of `alerted`: the announcement landed, the duplicate did not.
++     * Optional: every return that defers BEFORE the row loop attempted no card
++     * at all, which is the same reason `terminalAbandoned` is optional here.
+      */
+-    deduped: number;
++    deduped?: number;
+     /** Cumulative undelivered cards this isolate (survives the pass note). */
+     undeliveredTotal: number;

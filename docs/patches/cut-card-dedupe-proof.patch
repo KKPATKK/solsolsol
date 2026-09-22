@@ -1,0 +1,53 @@
+The delivery proof a cut card is judged against (src/deferrallog.ts)
+
+deliveredFollowupTokens answers "was ANY follow-up card for this token
+delivered?". A duplicate needs a sharper question: "was a card delivered at or
+AFTER the attempt I am about to re-send?" Only the entry's own stamp can answer
+that, and an entry without a usable stamp proves nothing — which re-sends the
+card, the never-miss direction.
+
+--- a/src/deferrallog.ts
++++ b/src/deferrallog.ts
+@@ -522,6 +522,42 @@ export function deliveredFollowupTokens(
+   return out;
+ }
+ 
++/**
++ * The same follow-up proof, WITH TIMES: token → the newest `at` the audit ring
++ * shows a `followup` card Telegram accepted for it.
++ *
++ * A tracker alert can be re-derived (a rolled-back announcement re-announces
++ * itself on the next pass), so "a card for this token was delivered" is not
++ * enough to refuse a duplicate — the entry has to be NEWER than the attempt it
++ * is meant to stand for. The tracker writes a cut-card mark carrying the
++ * attempt's minute (see CUT_MARK_PREFIX in src/pushwatch.ts) and asks this map
++ * whether a delivery landed at or after it. Entries without a usable stamp are
++ * skipped: an unproven card is re-sent, which is the never-miss direction.
++ *
++ * Pure and exported: the read that feeds it is a durable round trip, so the
++ * RULE is what the unit tests pin.
++ */
++export function deliveredFollowupProofs(
++  audit: ReadonlyArray<{
++    token?: string | null;
++    kind?: string | null;
++    at?: unknown;
++  }>,
++): Map<string, number> {
++  const out = new Map<string, number>();
++  if (audit.length === 0) return out;
++  for (const entry of audit) {
++    if (entry?.kind !== "followup") continue;
++    const token = entry.token;
++    if (typeof token !== "string" || token.length === 0) continue;
++    const at =
++      typeof entry.at === "number" && Number.isFinite(entry.at) ? entry.at : 0;
++    if (at <= 0) continue;
++    if (at > (out.get(token) ?? 0)) out.set(token, at);
++  }
++  return out;
++}
++
+ /**
+  * Tokens the delivery audit shows Telegram accepted as a FRESH card more than
+  * once — the duplicate the operator reports by hand (2026-09-20: "PONDER

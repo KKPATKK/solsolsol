@@ -20,6 +20,7 @@ import {
   addUnconfirmedCardSend,
   cardSendDisposition,
   deliveredCardTokens,
+  deliveredFollowupProofs,
   deliveredFollowupTokens,
   parseUnconfirmedCardSends,
   removeUnconfirmedCardSend,
@@ -576,6 +577,22 @@ export interface WatchAlert {
     | "ignition"
     | "sell-pressure";
   text: string;
+  /**
+   * WHICH TRANSITION this card announces — its identity across a re-derivation.
+   * The text cannot serve: it carries live numbers (mcap, %, 5m) and is never
+   * byte-identical twice, so it can never answer "is this the card the last
+   * attempt already sent?". The sig can, and that question is the whole
+   * duplicate fix (see CUT_MARK_PREFIX).
+   */
+  sig: string;
+  /**
+   * The delivery audit PROVED this transition is already in the chat (an
+   * earlier attempt's send was cut at the deadline and landed anyway). The card
+   * is announced — the transition and its counters land with the row's write —
+   * but NOT sent again. Live duplicates this removes: 💀 REK 20:39 → 21:02 HKT,
+   * 🚀 POPEYE 18:36/18:39/18:43/18:46/18:49 HKT.
+   */
+  deduped?: boolean;
 }
 
 export interface WatchEval {
@@ -611,6 +628,77 @@ function pct(n: number): string {
 }
 
 /**
+ * CUT-CARD MARK — "an attempt for THIS transition is in flight".
+ *
+ * The duplicate the operator reports (💀 REK twice 23 minutes apart, 🚀 POPEYE
+ * five times in 13 minutes) is not a rules-engine mistake: the transition is
+ * derived once and re-derived identically afterwards. It is the SEND that
+ * happens twice. A follow-up card is sent with the two-state `bounded(send,
+ * slice, null)`, and `null` there means "we stopped WAITING", not "Telegram
+ * refused" — the request is still in flight and the card is usually already in
+ * the chat. The tracker read that as a failure, rolled the row's announcement
+ * bookkeeping back, and the next pass re-derived the same card and sent it
+ * again. The audit ring agrees: the cards that repeated have no `followup`
+ * entry at all (nothing is audited on the cut path), so the evidence of their
+ * delivery was thrown away with them.
+ *
+ * The fix rides the ONE column that already survives a rollback and is read by
+ * every check: the persistent mark CSV (`up_stages`). A cut send writes
+ * `p:<sig>:<minute>` next to the marks, the next evaluation of that row reads
+ * it, and — only if the audit ring PROVES a follow-up card for the token landed
+ * at or after that minute — announces the transition without sending it a
+ * second time. The mark is not announcement memory: the next check write
+ * recomputes the column without it, so it lives exactly one evaluation, and a
+ * re-derived transition that finds no proof is sent normally (never-miss).
+ */
+const CUT_MARK_PREFIX = "p:";
+/**
+ * Granularity of the mark's stamp. A minute is far coarser than the send it
+ * describes (sub-second) and far finer than any re-announcement gap we care
+ * about, and it keeps the mark three characters wide.
+ */
+export const CUT_MARK_BUCKET_MS = 60_000;
+
+/** `p:<sig>:<minute>` — the mark one cut card leaves behind. */
+export function cutMarkFor(sig: string, at: number): string {
+  return `${CUT_MARK_PREFIX}${sig}:${Math.floor(at / CUT_MARK_BUCKET_MS)}`;
+}
+
+/** Every cut mark in a mark CSV, oldest first. Garbage is skipped. */
+export function parseCutMarks(
+  csv: string | null | undefined,
+): Array<{ sig: string; at: number }> {
+  const out: Array<{ sig: string; at: number }> = [];
+  for (const m of (csv ?? "").split(",")) {
+    if (!m.startsWith(CUT_MARK_PREFIX)) continue;
+    const [, sig, bucket] = m.split(":");
+    if (!sig || !bucket) continue;
+    const n = Number(bucket);
+    if (!Number.isFinite(n)) continue;
+    out.push({ sig, at: n * CUT_MARK_BUCKET_MS });
+  }
+  return out;
+}
+
+/**
+ * The CSV a rolled-back row is written with: the marks it already had, plus the
+ * mark for the ONE card whose send was just cut. Older cut marks are replaced
+ * (the send loop breaks on the first cut, so a row can only have one attempt in
+ * flight) and the result keeps the column's sorted shape.
+ */
+export function addCutMark(
+  csv: string | null | undefined,
+  sig: string,
+  at: number,
+): string {
+  const kept = (csv ?? "")
+    .split(",")
+    .filter((m) => m.length > 0 && !m.startsWith(CUT_MARK_PREFIX));
+  kept.push(cutMarkFor(sig, at));
+  return kept.sort().join(",");
+}
+
+/**
  * Pure rules engine (exported for offline unit tests). Given the stored row
  * and the freshly-fetched pair data, decide which alerts fire and what to
  * persist. Never throws; cooldown suppresses spam but bookkeeping still
@@ -627,7 +715,17 @@ export function evaluateWatch(
     buysH1: number;
     sellsH1: number;
   },
-  cfg: { cooldownMs: number; liqFloorUsd?: number },
+  cfg: {
+    cooldownMs: number;
+    liqFloorUsd?: number;
+    /**
+     * Delivery proof for the cut-card marks: token → the newest `at` the audit
+     * ring shows a follow-up card Telegram ACCEPTED for it (see
+     * deferrallog.deliveredFollowupProofs). Absent = nothing is proven, which
+     * only ever means a card is SENT — fail-open in the never-miss direction.
+     */
+    followupProofAt?: ReadonlyMap<string, number>;
+  },
 ): WatchEval {
   const alerts: WatchAlert[] = [];
   const symbol = row.symbol ?? "?";
@@ -642,8 +740,18 @@ export function evaluateWatch(
   let resetBaselineHolders: number | undefined;
   let announcedUpStages: string | undefined;
 
-  const fire = (kind: WatchAlert["kind"], text: string) => {
-    alerts.push({ kind, text });
+  // The cut-card mark this row's LAST alert left behind (see CUT_MARK_PREFIX):
+  // a send that was cut means the card may already be in the chat, and the
+  // audit's proof is what turns "may" into a decision.
+  const cut = parseCutMarks(row.upStages)[0] ?? null;
+  const fire = (kind: WatchAlert["kind"], text: string, sig: string) => {
+    const deduped =
+      cut !== null &&
+      cut.sig === sig &&
+      (cfg.followupProofAt?.get(row.token) ?? 0) >= cut.at;
+    // Only ever SET, never `false`: an alert that has nothing to say about the
+    // proof should compare equal to one written before this rule existed.
+    alerts.push(deduped ? { kind, text, sig, deduped } : { kind, text, sig });
     lastAlertAt = now;
     followupsSent += 1;
   };
@@ -654,7 +762,13 @@ export function evaluateWatch(
   // readings to terminalize (see DRAIN_CONFIRM_MARK), the first one warning.
   const liqFloor = cfg.liqFloorUsd ?? LIQ_FLOOR_USD;
   const marks = new Set<string>();
-  for (const m of (row.upStages ?? "").split(",")) if (m) marks.add(m);
+  for (const m of (row.upStages ?? "").split(",")) {
+    // Cut marks are consumed, not carried: they describe an attempt, and the
+    // next check write recomputes this column from `marks`, so a mark that is
+    // not re-added here disappears — one attempt, one mark, no staleness that
+    // could suppress a LATER, genuinely new transition.
+    if (m && !m.startsWith(CUT_MARK_PREFIX)) marks.add(m);
+  }
   // undefined = the mark set is unchanged, so the caller leaves the column as
   // it is (the same contract the 🚀 stages use).
   const marksChanged = (): string | undefined => {
@@ -672,6 +786,7 @@ export function evaluateWatch(
       fire(
         "liquidity",
         `⚠️ 流動性跌穿地板 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}）— 已記錄第一次讀數，下一次檢查仍低於地板就會停止追蹤（市值數據隨 LP 失真）`,
+        "liqwarn",
       );
       return {
         alerts,
@@ -691,6 +806,7 @@ export function evaluateWatch(
     fire(
       "liquidity",
       `💧 流動性枯竭 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}，連續 2 次檢查），市值數據已失真（LP 被抽乾），停止追蹤`,
+      "drain",
     );
     return {
       alerts,
@@ -723,6 +839,7 @@ export function evaluateWatch(
       fire(
         "rising",
         `🟢 死而復生 ${symbol} | 從低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），重置基準繼續追蹤`,
+        "revive",
       );
       return {
         alerts,
@@ -759,6 +876,7 @@ export function evaluateWatch(
     fire(
       "dead",
       `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(live.mcap * RESURRECTION_MULT)}＝低點 ×1.5 會再通知）`,
+      "dead",
     );
     return {
       alerts,
@@ -796,6 +914,7 @@ export function evaluateWatch(
       "sell-pressure",
       `🩸 賣壓主導 ${symbol} | 1h 買賣比 ${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1，` +
         `連續 ${sellDomStreak} 次檢查賣壓佔優（賣 ${live.sellsH1} vs 買 ${live.buysH1}）— 分佈出貨形態`,
+      "sell",
     );
   }
 
@@ -811,6 +930,7 @@ export function evaluateWatch(
       fire(
         "ignition",
         `🔥 量能點火 ${symbol} | 5m量 ${fmtUsd(live.vol5m)}（前值 ${fmtUsd(row.lastVol5m ?? 0)}）| 5m ${pct(live.chg5m)} — 疑似新一段行情啟動`,
+        "ignite",
       );
       lastState = "ignite";
     }
@@ -839,10 +959,18 @@ export function evaluateWatch(
           "rising",
           `🚀 續漲 ${symbol} | 推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
             (nextStage ? ` | 下一關 +${nextStage}%` : " | 已達最高里程碑"),
+          state,
         );
-        firedStages.add(state);
+        // EVERY crossed stage is marked, not just this one. The memory walk
+        // used to advance ONE milestone per cooldown window, highest first, so
+        // a coin that gapped several stages in one tick (POPEYE: push → +230%)
+        // produced a card per window in DESCENDING order — "下一關 +400%", then
+        // "+200%", then "+100%" — each reporting the same move. A milestone
+        // already sailed past is history, and every card names the next one
+        // above it, so announcing the crossing once loses nothing.
+        for (let j = 0; j <= i; j++) firedStages.add(`up${RISING_STAGES[j]}`);
         lastState = state;
-        break; // one stage per cooldown window
+        break; // one card per crossing, however many stages it spans
       }
     }
     {
@@ -871,6 +999,7 @@ export function evaluateWatch(
       fire(
         "weak",
         `⚠️ 動能轉弱 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})`,
+        weakMark,
       );
       firedStages.add(weakMark);
       lastState = "weak";
@@ -892,6 +1021,7 @@ export function evaluateWatch(
       fire(
         "liquidity",
         `💧 流動性驟降 ${symbol} | ${fmtUsd(row.lastLiquidity)} → ${fmtUsd(live.liquidity)} (${pct(dropPct)})`,
+        "liqcrash",
       );
       lastState = "liq";
     }
@@ -913,6 +1043,7 @@ export function evaluateWatch(
         fire(
           "holders",
           `📈 持倉增長 ${symbol} | ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (+${growth.toFixed(0)}%)`,
+          "hold",
         );
         lastState = "hold";
         resetBaselineHolders = row.holdersLast;
@@ -942,6 +1073,7 @@ export function evaluateWatch(
         fire(
           "divergence",
           `⚡ 籌碼集中 ${symbol} | 價 ${pct(chgSincePush)}（推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)}）| 持倉 ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (${pct((holderRatio - 1) * 100)})— 價漲人跌：漲幅由越來越少的錢包推動，回撤會又快又深`,
+          "div",
         );
         firedStages.add("div");
         lastState = "divergence";
@@ -1249,6 +1381,14 @@ export class PushWatcher {
      * the call threw). Every one is rolled back and re-announced later.
      */
     undelivered: number;
+    /**
+     * Cards NOT sent because the audit proved the same transition already
+     * reached the chat (see `dup-skip` in the note and CUT_MARK_PREFIX).
+     * Part of `alerted`: the announcement landed, the duplicate did not.
+     * Optional: every return that defers BEFORE the row loop attempted no card
+     * at all, which is the same reason `terminalAbandoned` is optional here.
+     */
+    deduped?: number;
     /** Cumulative undelivered cards this isolate (survives the pass note). */
     undeliveredTotal: number;
     /** Of those, the ones a later pass actually re-announced. */
@@ -1739,6 +1879,26 @@ export class PushWatcher {
     const tokens = head.map((r) => r.token);
     // Published for the scanner's next pair phase (see lastHeadTokens).
     this.lastHeadTokens = tokens;
+    // Cut-card proof (see CUT_MARK_PREFIX): read ONCE per pass, and ONLY when a
+    // row in this rotation head actually carries a cut mark — a pass with
+    // nothing cut pays no round trip. The lookups inside the row loop are then
+    // free (in memory).
+    let followupProofAt: ReadonlyMap<string, number> | undefined;
+    if (head.some((r) => parseCutMarks(r.upStages).length > 0)) {
+      const auditRead = (this.db as Partial<Pick<Db, "getPushAudit">>)
+        .getPushAudit;
+      if (typeof auditRead === "function") {
+        try {
+          followupProofAt = deliveredFollowupProofs(
+            await auditRead.call(this.db),
+          );
+          trips += 1;
+        } catch {
+          // Nothing proven = the card is re-sent below: fail-open in the
+          // never-miss direction, like every other proof read in this pass.
+        }
+      }
+    }
     // The batch's deadline is measured from the CALL, not from the pass start
     // (`now`): the setup stages above (listing, recap/prune, terminal settle,
     // self-heal) routinely cost 400-700ms, so a deadline derived from the pass
@@ -1819,6 +1979,14 @@ export class PushWatcher {
     /** Rows refused because their cards did not fit the pass (no card lost). */
     let sendDeferred = 0;
     /**
+     * Cards NOT sent because the delivery audit proved the same transition is
+     * already in the chat (see CUT_MARK_PREFIX). Counted apart from `alerted`
+     * because they are announcements without a send: the row's transition and
+     * counters land with its own write, exactly as if the card had gone out —
+     * which it did, one cut send earlier.
+     */
+    let dupSkipped = 0;
+    /**
      * TERMINAL cards whose send was abandoned this pass. NOT part of
      * `undelivered`: those are rolled back and re-announced, these KEEP their
      * transition (that is the fix) and are counted here so the two different
@@ -1892,7 +2060,7 @@ export class PushWatcher {
           buysH1: pair.txns.h1Buys,
           sellsH1: pair.txns.h1Sells,
         },
-        { cooldownMs: cfg.cooldownMin * 60_000 },
+        { cooldownMs: cfg.cooldownMin * 60_000, followupProofAt },
       );
 
       // Backfill pass (see STALE_BACKFILL_MS): a row the tracker has never
@@ -1924,7 +2092,7 @@ export class PushWatcher {
       // them into its claim (one round trip), the alerting path writes them
       // after its sends — with `hold` rolling the announcement columns back
       // when a card did not go out (see the final write).
-      const checkFields = (hold: boolean) => ({
+      const checkFields = (hold: boolean, cutSig: string | null = null) => ({
         peakMcap: evalResult.peakMcap,
         lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
         lastVol5m: pair.volume.m5,
@@ -1945,7 +2113,15 @@ export class PushWatcher {
         holdersAtPush: hold
           ? (row.holdersAtPush ?? undefined)
           : evalResult.resetBaselineHolders,
-        upStages: hold ? row.upStages : evalResult.announcedUpStages,
+        // A rollback restores the marks the row had — EXCEPT for the one card
+        // whose send was cut: its attempt is still in flight, so the mark it
+        // leaves is how the next evaluation knows to ask the audit before
+        // sending the same transition again (see CUT_MARK_PREFIX).
+        upStages: hold
+          ? cutSig !== null
+            ? addCutMark(row.upStages, cutSig, now)
+            : row.upStages
+          : evalResult.announcedUpStages,
         deadTroughMcap: hold
           ? (row.deadTroughMcap ?? null)
           : (evalResult.deadTroughMcap ?? null),
@@ -2037,8 +2213,25 @@ export class PushWatcher {
       // failed row must not roll back a later row's delivered cards.
       const undeliveredBefore = undelivered;
       let sentCount = 0;
+      /**
+       * The sig of the one card whose send this row's slice cut (null = none).
+       * It rides the row's own mark CSV so the next evaluation can ask the
+       * audit before sending the same transition again.
+       */
+      let cutSig: string | null = null;
       for (const a of evalResult.alerts) {
         if (backfill) break;
+        // DEDUPE FIRST: a card the audit already proves delivered needs no send
+        // slice, and skipping it here keeps it out of the held-back count (so
+        // the row's transition lands instead of being rolled back with it). The
+        // engine sets the flag only on a mark+proof match, so an unproven card
+        // falls straight through to the send below.
+        if (a.deduped) {
+          dupSkipped += 1;
+          alerted += 1;
+          sentCount += 1;
+          continue;
+        }
         const sendLeft = sendBudgetEnd - Date.now();
         if (sendLeft <= 0) {
           console.error(
@@ -2096,11 +2289,42 @@ export class PushWatcher {
             }
             sent = outcome.message as { message_id?: unknown };
           } else {
+            // Hold the REQUEST, not just its outcome: a send that misses its
+            // slice (the `null` below) is CUT, not failed — the race stops
+            // waiting, the request does not, and the card is usually already in
+            // the chat. The chain below writes the audit entry that late
+            // success deserves, and that entry is the ONLY proof the next pass
+            // can use to refuse the duplicate, because the rollback restores
+            // this pass's marks and leaves nothing else behind.
+            const inFlight = this.bot.api.sendMessage(row.chatId, a.text);
             sent = (await this.bounded(
-              this.bot.api.sendMessage(row.chatId, a.text),
+              inFlight,
               sendLeft,
               null,
             )) as { message_id?: unknown } | null;
+            if (sent === null) {
+              cutSig = a.sig;
+              void inFlight.then(
+                async (late) => {
+                  try {
+                    await this.db.recordPushDelivery({
+                      chatId: row.chatId,
+                      token: row.token,
+                      symbol: row.symbol,
+                      messageId: Number(
+                        (late as { message_id?: unknown })?.message_id ?? 0,
+                      ),
+                      kind: "followup",
+                    });
+                  } catch {
+                    /* best-effort — an unproven card is simply re-sent */
+                  }
+                },
+                () => {
+                  /* a rejection writes nothing: the card is re-sent */
+                },
+              );
+            }
           }
           if (sent === null) {
             // Timed out: the transition stays reserved for the rest of this
@@ -2167,7 +2391,7 @@ export class PushWatcher {
       const holdAnnouncements = undelivered > undeliveredBefore;
       await this.db.updatePushWatchCheck(
         row.token,
-        checkFields(holdAnnouncements),
+        checkFields(holdAnnouncements, cutSig),
       );
     }
     spent.rows.ms = Date.now() - rowsStart;
@@ -2257,6 +2481,7 @@ export class PushWatcher {
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
+      `${dupSkipped > 0 ? ` dup-skip ${dupSkipped}` : ""}` +
       `${undelivered > 0 ? ` undelivered ${undelivered}` : ""}` +
       `${terminalAbandoned > 0 ? ` abandoned ${terminalAbandoned}` : ""}` +
       `${rearmedCards > 0 ? ` rearmed ${rearmedCards}` : ""}` +
@@ -2266,6 +2491,7 @@ export class PushWatcher {
     return {
       checked,
       alerted,
+      deduped: dupSkipped,
       note,
       trips,
       undelivered,

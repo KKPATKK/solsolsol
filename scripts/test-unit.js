@@ -20,7 +20,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterM
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
-const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard } = require("../dist/pushwatch.js");
+const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS } = require("../dist/worker.js");
@@ -36,7 +36,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, deliveredFollowupProofs, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
@@ -894,6 +894,186 @@ async function main() {
       1,
       "the record waits out its grace",
     );
+  });
+
+  // ---------- cut-card marks: the duplicate a CUT send used to cause ----------
+  //
+  // The reported duplicates (💀 REK 20:39 → 21:02 HKT, 🚀 POPEYE
+  // 18:36/18:39/18:43/18:46/18:49 HKT) are one transition announced twice: the
+  // send missed its slice (`bounded` returns null = "stopped waiting", NOT
+  // "Telegram refused"), the pass rolled the announcement back, and the next
+  // pass re-derived the same card and sent it again. Nothing was audited on the
+  // cut path, so the evidence of the first delivery was thrown away with it.
+  // Now the cut leaves `p:<sig>:<minute>` on the row's own mark CSV and the late
+  // success writes its audit entry; the next evaluation refuses the duplicate on
+  // that proof alone, and re-sends when there is none.
+
+  await test("cut marks: one attempt per row, replaced on a re-cut, consumed by the next evaluation", () => {
+    const at = 1_700_000_000_000;
+    assert.equal(cutMarkFor("dead", at), `p:dead:${Math.floor(at / CUT_MARK_BUCKET_MS)}`);
+    assert.deepEqual(parseCutMarks(cutMarkFor("dead", at)), [
+      { sig: "dead", at: Math.floor(at / CUT_MARK_BUCKET_MS) * CUT_MARK_BUCKET_MS },
+    ]);
+    // Announcement memory is not a challenge, and neither is garbage.
+    assert.deepEqual(parseCutMarks("up50,w35,liq1"), []);
+    assert.deepEqual(parseCutMarks(null), []);
+    assert.deepEqual(parseCutMarks("p:,:,p:dead:x,p:dead"), []);
+    // The rollback keeps the marks it had and REPLACES an older attempt: the
+    // send loop breaks on the first cut, so a row has at most one in flight.
+    const once = addCutMark("up50,up100", "dead", 60_000);
+    assert.equal(once, "p:dead:1,up100,up50");
+    assert.equal(addCutMark(once, "dead", 120_000), "p:dead:2,up100,up50");
+    assert.equal(addCutMark(null, "hold", 0), "p:hold:0");
+  });
+
+  await test("deliveredFollowupProofs: the newest follow-up per token, and only with a stamp", () => {
+    const map = deliveredFollowupProofs([
+      { token: "A", kind: "followup", at: 100 },
+      { token: "A", kind: "followup", at: 300 },
+      { token: "A", kind: "initial", at: 900 },
+      { token: "B", kind: "followup" },
+      { token: "C", kind: "resend", at: 500 },
+      { token: "", kind: "followup", at: 500 },
+      { token: "D", kind: "followup", at: Number.NaN },
+    ]);
+    assert.equal(map.get("A"), 300, "the newest follow-up entry is the proof");
+    assert.equal(map.has("B"), false, "a stamp-less entry cannot be ordered against an attempt");
+    assert.equal(map.has("C"), false, "only the tracker's own follow-up cards count");
+    assert.equal(map.has("D"), false);
+    assert.equal(deliveredFollowupProofs([]).size, 0);
+  });
+
+  await test("evaluateWatch: a gap across several 🚀 stages fires ONE card and marks them all", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "POPEYE", pushedAt: 0,
+      mcapAtPush: 111_000, peakMcap: 111_000, lastLiquidity: 30_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      upStages: null,
+      ...over,
+    });
+    const live = (mcap) => ({ mcap, liquidity: 30_000, chg5m: 16, buysH1: 200, sellsH1: 100 });
+    const cfg = { cooldownMs: 30 * 60_000 };
+
+    // +230% in ONE tick crosses three stages. The old memory walk announced the
+    // highest, marked only that one, and spent the next two cooldown windows on
+    // +100% then +50% — three near-identical cards for a single move, which is
+    // the live POPEYE shape.
+    const gap = evaluateWatch(row(), 3600_000, live(366_650), cfg);
+    assert.equal(gap.alerts.length, 1, "one card per crossing");
+    assert.equal(gap.alerts[0].sig, "up200");
+    assert.match(gap.alerts[0].text, /下一關 \+400%/);
+    const marked = String(gap.announcedUpStages).split(",");
+    for (const s of ["up50", "up100", "up200"]) {
+      assert.ok(marked.includes(s), `${s} is marked: ${gap.announcedUpStages}`);
+    }
+    assert.ok(!marked.includes("up400"), "the milestone still ahead stays open");
+
+    // The same price next window: nothing left to say about crossed stages.
+    const hold = evaluateWatch(
+      row({ upStages: gap.announcedUpStages, lastState: "up200", lastAlertAt: 3600_000 }),
+      3600_000 + 3600_000,
+      live(366_650),
+      cfg,
+    );
+    assert.deepEqual(hold.alerts, [], "no descending re-announcement");
+
+    // …and the next milestone still fires when it is actually reached.
+    const next = evaluateWatch(
+      row({ upStages: gap.announcedUpStages, lastState: "up200", lastAlertAt: 3600_000 }),
+      3600_000 + 3600_000,
+      live(570_000),
+      cfg,
+    );
+    assert.equal(next.alerts.length, 1);
+    assert.equal(next.alerts[0].sig, "up400");
+  });
+
+  await test("evaluateWatch: a cut mark plus a NEWER proof refuses the duplicate, and only then", () => {
+    const at = 1_800_000_000_000;
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "REK", pushedAt: 0,
+      mcapAtPush: 170_000, peakMcap: 240_000, lastLiquidity: 32_000,
+      deadTroughMcap: null, holdersAtPush: null, holdersLast: null,
+      holdersCheckedAt: null, lastChecked: 0, lastAlertAt: 0,
+      followupsSent: 0, lastState: null, upStages: null,
+      ...over,
+    });
+    const live = { mcap: 59_000, liquidity: 32_000, chg5m: -2, buysH1: 120, sellsH1: 180 };
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const proven = new Map([["T", at + 1_000]]);
+
+    const proved = evaluateWatch(row({ upStages: cutMarkFor("dead", at) }), at + 60_000, live, { ...cfg, followupProofAt: proven });
+    assert.equal(proved.alerts.length, 1);
+    assert.equal(proved.alerts[0].sig, "dead");
+    assert.equal(proved.alerts[0].deduped, true, "the transition is announced, not sent");
+    assert.equal(proved.lastState, "dead", "and it still lands");
+    assert.equal(proved.followupsSent, 1, "with its counter");
+    assert.ok(!String(proved.announcedUpStages ?? "").includes("p:"), "the mark is consumed by the write that follows");
+
+    // No proof — and an OLDER proof — both send. Never-miss wins.
+    assert.equal(
+      evaluateWatch(row({ upStages: cutMarkFor("dead", at) }), at + 60_000, live, cfg).alerts[0].deduped,
+      undefined,
+    );
+    assert.equal(
+      evaluateWatch(row({ upStages: cutMarkFor("dead", at) }), at + 60_000, live, { ...cfg, followupProofAt: new Map([["T", at - 60_000]]) }).alerts[0].deduped,
+      undefined,
+      "a delivery older than the attempt proves nothing about it",
+    );
+    // A mark for a DIFFERENT transition cannot suppress this one.
+    assert.equal(
+      evaluateWatch(row({ upStages: cutMarkFor("up100", at) }), at + 60_000, live, { ...cfg, followupProofAt: proven }).alerts[0].deduped,
+      undefined,
+    );
+  });
+
+  await test("PushWatcher: a CUT card leaves a mark, a late send proves itself, and the next pass refuses the duplicate", async () => {
+    const deadRow = (over = {}) =>
+      termRow({ peakMcap: 240_000, mcapAtPush: 170_000, upStages: null, lastLiquidity: 32_000, ...over });
+    const deadPair = (token) => ({ ...termPair(token, 32_000), marketCap: 59_000 });
+    const makeWatcher = (db, bot) =>
+      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, deadPair(a)])), null);
+
+    // Pass 1 — the send never answers inside its slice, so it is CUT: the
+    // rollback keeps the marks AND records the attempt, and the request's own
+    // settlement writes the proof afterwards.
+    const db = termDb([deadRow()]);
+    const delivered = [];
+    db.recordPushDelivery = async (e) => { delivered.push(e); };
+    let settle;
+    const pw = makeWatcher(db, { api: { sendMessage: () => new Promise((res) => { settle = res; }) } });
+    const out1 = await pw.runTick(Date.now() + 1_500);
+    assert.equal(out1.undelivered, 1, "a cut card is held back, so the transition is re-derived");
+    const [, w1] = db.updated[0];
+    assert.match(String(w1.upStages), /(^|,)p:dead:/, `the attempt rides the row's marks: ${w1.upStages}`);
+    assert.equal(w1.lastState, null, "the rollback leaves the transition to the next pass");
+    assert.equal(delivered.length, 0, "a request still in flight proves nothing");
+    settle({ message_id: 4242 });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(delivered.length, 1, "the late success writes the audit proof");
+    assert.equal(delivered[0].kind, "followup");
+
+    // Pass 2 — the same row is re-derived and the audit now proves the card is
+    // already in the chat: announced, not sent. This is the 💀 REK duplicate.
+    const db2 = termDb([deadRow({ upStages: w1.upStages })], {
+      audit: [{ chatId: "c", token: "LOBBY", kind: "followup", at: Date.now() }],
+    });
+    let sends2 = 0;
+    const out2 = await makeWatcher(db2, { api: { sendMessage: async () => { sends2 += 1; return { message_id: 7 }; } } }).runTick(Date.now() + 1_500);
+    assert.equal(sends2, 0, "the duplicate card is NOT sent");
+    assert.equal(out2.deduped, 1);
+    assert.match(String(out2.note), /dup-skip 1/);
+    const [, w2] = db2.updated[0];
+    assert.equal(w2.lastState, "dead", "the transition lands anyway");
+    assert.ok(!String(w2.upStages ?? "").includes("p:"), `and the mark is consumed: ${w2.upStages}`);
+
+    // Pass 3 — the same cut mark with NO proof still sends (never-miss).
+    const db3 = termDb([deadRow({ upStages: w1.upStages })]);
+    let sends3 = 0;
+    const out3 = await makeWatcher(db3, { api: { sendMessage: async () => { sends3 += 1; return { message_id: 8 }; } } }).runTick(Date.now() + 1_500);
+    assert.equal(sends3, 1, "an unproven card is re-sent");
+    assert.equal(out3.deduped, 0);
   });
 
   await test("out-of-window patch: the terminal card's three-state send is all in (docs/patches/terminal-send-and-liq-prune.patch)", () => {
@@ -5233,7 +5413,14 @@ async function main() {
     assert.equal(written.followupsSent, rows[0].followupsSent, "not counted as sent");
     assert.equal(written.lastAlertAt, rows[0].lastAlertAt, "the alert clock is rolled back");
     assert.equal(written.lastState, rows[0].lastState, "and so is the state");
-    assert.equal(written.upStages, rows[0].upStages, "and the announced rocket stage");
+    // The stage itself stays unannounced — but the ATTEMPT now leaves its own
+    // mark, because the next tick must be able to ask the delivery audit
+    // whether this card landed before it sends the same transition again.
+    assert.match(
+      String(written.upStages ?? ""),
+      /^p:up100:\d+$/,
+      `only the cut attempt rides the marks: ${written.upStages}`,
+    );
     assert.equal(written.lastMcap, 100_000, "while the measurements still advance");
   });
 
@@ -5388,9 +5575,10 @@ async function main() {
     assert.equal(written.lastState, "up100", "already-crossed stages are marked as absorbed");
     assert.equal(written.followupsSent, 0, "suppressed alerts are not counted as delivered");
     assert.equal(written.lastAlertAt, 0, "the alert clock is left alone");
-    // Only the highest crossed stage is marked (one stage per check), so
-    // no 🚀 card can be re-announced when tracking resumes.
-    assert.equal(written.upStages, "up100");
+    // EVERY crossed stage is marked, not just the highest: one card announces
+    // the whole crossing (a gap is history, and each card names the milestone
+    // above it), so the milestones below must not be re-announced on resume.
+    assert.equal(written.upStages, "up100,up50");
   });
 
   await test("PushWatcher: one listing per tick, recap claims batched, no no-op prune, trips reported", async () => {

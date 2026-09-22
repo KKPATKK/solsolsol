@@ -1,0 +1,198 @@
+Cut-card dedupe (tracker half of the duplicate fix)
+
+A follow-up card is sent with the two-state bounded(send, slice, null), where
+`null` means "we stopped waiting" — the request is still in flight and the card
+is usually already in the chat. The pass read that as a failure, rolled the
+row's announcement bookkeeping back, and the next pass re-derived the SAME card
+and sent it again. The live duplicates (💀 REK 20:39 → 21:02 HKT, 🚀 POPEYE
+18:36/18:39/18:43/18:46/18:49 HKT) all have no `followup` audit entry at all,
+which is that path's signature: nothing is audited on a cut.
+
+This half: keep the request object, write the audit entry a late success
+deserves (the proof), record the attempt as a cut-card mark on the row's own
+mark CSV, and refuse the re-send when the audit proves the earlier attempt
+landed. Nothing proven = sent, exactly as before (never-miss).
+
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -1870,6 +1870,25 @@
+     // Published for the scanner's next pair phase (see lastHeadTokens).
+     this.lastHeadTokens = tokens;
++    // Cut-card proof (see CUT_MARK_PREFIX): read ONCE per pass, and ONLY when a
++    // row in this rotation head actually carries a cut mark — a pass with
++    // nothing cut pays no round trip. The lookups inside the row loop are then
++    // free (in memory).
++    let followupProofAt: ReadonlyMap<string, number> | undefined;
++    if (head.some((r) => parseCutMarks(r.upStages).length > 0)) {
++      const auditRead = (this.db as Partial<Pick<Db, "getPushAudit">>)
++        .getPushAudit;
++      if (typeof auditRead === "function") {
++        try {
++          followupProofAt = deliveredFollowupProofs(
++            await auditRead.call(this.db),
++          );
++          trips += 1;
++        } catch {
++          // Nothing proven = the card is re-sent below: fail-open in the
++          // never-miss direction, like every other proof read in this pass.
++        }
++      }
++    }
+     // The batch's deadline is measured from the CALL, not from the pass start
+     // (`now`): the setup stages above (listing, recap/prune, terminal settle,
+     // self-heal) routinely cost 400-700ms, so a deadline derived from the pass
+@@ -2023,7 +2042,7 @@
+           buysH1: pair.txns.h1Buys,
+           sellsH1: pair.txns.h1Sells,
+         },
+-        { cooldownMs: cfg.cooldownMin * 60_000 },
++        { cooldownMs: cfg.cooldownMin * 60_000, followupProofAt },
+       );
+ 
+       // Backfill pass (see STALE_BACKFILL_MS): a row the tracker has never
+@@ -1955,6 +1974,12 @@
+     let undelivered = 0;
+     /** Cards THIS pass re-announced after a previous pass held them back. */
+     let recoveredThisPass = 0;
+     /** Rows refused because their cards did not fit the pass (no card lost). */
+     let sendDeferred = 0;
++    /**
++     * Cards NOT sent because the delivery audit proved the same transition is
++     * already in the chat (see CUT_MARK_PREFIX). Counted apart from `alerted`
++     * because they are announcements without a send: the row's transition and
++     * counters land with its own write, exactly as if the card had gone out —
++     * which it did, one cut send earlier.
++     */
++    let dupSkipped = 0;
+     /**
+      * TERMINAL cards whose send was abandoned this pass. NOT part of
+      * `undelivered`: those are rolled back and re-announced, these KEEP their
+@@ -2057,7 +2082,7 @@
+       // after its sends — with `hold` rolling the announcement columns back
+       // when a card did not go out (see the final write).
+-      const checkFields = (hold: boolean) => ({
++      const checkFields = (hold: boolean, cutSig: string | null = null) => ({
+         peakMcap: evalResult.peakMcap,
+         lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
+         lastVol5m: pair.volume.m5,
+@@ -2078,7 +2103,13 @@
+         holdersAtPush: hold
+           ? (row.holdersAtPush ?? undefined)
+           : evalResult.resetBaselineHolders,
+-        upStages: hold ? row.upStages : evalResult.announcedUpStages,
++        // A rollback restores the marks the row had — EXCEPT for the one card
++        // whose send was cut: its attempt is still in flight, so the mark it
++        // leaves is how the next evaluation knows to ask the audit before
++        // sending the same transition again (see CUT_MARK_PREFIX).
++        upStages: hold
++          ? cutSig !== null
++            ? addCutMark(row.upStages, cutSig, now)
++            : row.upStages
++          : evalResult.announcedUpStages,
+         deadTroughMcap: hold
+           ? (row.deadTroughMcap ?? null)
+           : (evalResult.deadTroughMcap ?? null),
+@@ -2166,7 +2166,22 @@
+       const undeliveredBefore = undelivered;
+       let sentCount = 0;
++      /**
++       * The sig of the one card whose send this row's slice cut (null = none).
++       * It rides the row's own mark CSV so the next evaluation can ask the
++       * audit before sending the same transition again.
++       */
++      let cutSig: string | null = null;
+       for (const a of evalResult.alerts) {
+         if (backfill) break;
++        // DEDUPE FIRST: a card the audit already proves delivered needs no send
++        // slice, and skipping it here keeps it out of the held-back count (so
++        // the row's transition lands instead of being rolled back with it). The
++        // engine sets the flag only on a mark+proof match, so an unproven card
++        // falls straight through to the send below.
++        if (a.deduped) {
++          dupSkipped += 1;
++          alerted += 1;
++          sentCount += 1;
++          continue;
++        }
+         const sendLeft = sendBudgetEnd - Date.now();
+         if (sendLeft <= 0) {
+           console.error(
+@@ -2227,13 +2265,44 @@
+             }
+             sent = outcome.message as { message_id?: unknown };
+           } else {
++            // Hold the REQUEST, not just its outcome: a send that misses its
++            // slice (the `null` below) is CUT, not failed — the race stops
++            // waiting, the request does not, and the card is usually already in
++            // the chat. The chain below writes the audit entry that late
++            // success deserves, and that entry is the ONLY proof the next pass
++            // can use to refuse the duplicate, because the rollback restores
++            // this pass's marks and leaves nothing else behind.
++            const inFlight = this.bot.api.sendMessage(row.chatId, a.text);
+             sent = (await this.bounded(
+-              this.bot.api.sendMessage(row.chatId, a.text),
++              inFlight,
+               sendLeft,
+               null,
+             )) as { message_id?: unknown } | null;
++            if (sent === null) {
++              cutSig = a.sig;
++              void inFlight.then(
++                async (late) => {
++                  try {
++                    await this.db.recordPushDelivery({
++                      chatId: row.chatId,
++                      token: row.token,
++                      symbol: row.symbol,
++                      messageId: Number(
++                        (late as { message_id?: unknown })?.message_id ?? 0,
++                      ),
++                      kind: "followup",
++                    });
++                  } catch {
++                    /* best-effort — an unproven card is simply re-sent */
++                  }
++                },
++                () => {
++                  /* a rejection writes nothing: the card is re-sent */
++                },
++              );
++            }
+           }
+           if (sent === null) {
+             // Timed out: the transition stays reserved for the rest of this
+@@ -2297,7 +2366,7 @@
+       const holdAnnouncements = undelivered > undeliveredBefore;
+       await this.db.updatePushWatchCheck(
+         row.token,
+-        checkFields(holdAnnouncements),
++        checkFields(holdAnnouncements, cutSig),
+       );
+     }
+     spent.rows.ms = Date.now() - rowsStart;
+@@ -2387,6 +2456,7 @@
+       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
+       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
++      `${dupSkipped > 0 ? ` dup-skip ${dupSkipped}` : ""}` +
+       `${undelivered > 0 ? ` undelivered ${undelivered}` : ""}` +
+       `${terminalAbandoned > 0 ? ` abandoned ${terminalAbandoned}` : ""}` +
+       `${rearmedCards > 0 ? ` rearmed ${rearmedCards}` : ""}` +
+@@ -2398,6 +2468,7 @@
+     return {
+       checked,
+       alerted,
++      deduped: dupSkipped,
+       note,
+       trips,
+       undelivered,
+@@ -1381,6 +1452,12 @@
+     undelivered: number;
++    /**
++     * Cards NOT sent because the audit proved the same transition already
++     * reached the chat (see `dup-skip` in the note and CUT_MARK_PREFIX).
++     * Part of `alerted`: the announcement landed, the duplicate did not.
++     */
++    deduped: number;
+     /** Cumulative undelivered cards this isolate (survives the pass note). */
+     undeliveredTotal: number;
+     /** Of those, the ones a later pass actually re-announced. */
