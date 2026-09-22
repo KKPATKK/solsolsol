@@ -64,7 +64,7 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 ## 四、「唔會漏」點保證
 
 * 冇 mark、冇 proof、proof 太舊（早過 attempt）、或者 mark 講嘅係**另一個** sig ⇒ **照送**（fail-open 方向）。
-* audit ring 讀唔到（throw）⇒ `followupProofAt` 缺席 ⇒ 照送。
+* audit ring 讀唔到（throw）⇒ `followupProofAt` 缺席 ⇒ **唔會即刻送**：該 attempt 如果仲屬於 row 最近一次 check，就延後一個 check（見 §7）；下一個 check 冇 proof 就照送。
 * proof 只係「同一 token、同一 sig、時間 ≥ 該 attempt」先算數；30 筆 ring 被 evict 之後就冇 proof，會重送（可能多一張）——同今日嘅 at-most-one-duplicate 一致，但唔會退化成靜默漏卡。
 * `p:` mark 讀取成本：只有 rotation head 真有 `p:` mark 時才讀一次 audit ring（1 trip）；一般 pass 零成本。
 
@@ -78,12 +78,71 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 ## 六、未驗 / 已知限制（老實講）
 
 * **未 deploy**：以上係本地實作＋單元測試；線上嘅 `dup-skip`、`p:` mark、補 audit 仲未見過真讀數。
-* **proof 係 token 級 ＋ 30 筆 ring**：一條 row 若一次帶多過一張卡，被切嘅只係最後一張（loop 喺第一個 cut 就 break），所以該 pass **較早、已經送達嗰幾張卡**仍可能重新公告（只係少數多卡 row 會撞到）。
+* **已修（見 §7）**：proof 已由 token 級改為 per-card（`cardProofKey`）。
+* **仍然存在**：一條 row 若一次帶多過一張卡，row loop 只為**被切嗰張**寫 mark，所以該 pass 較早、
+  已經送達嗰幾張卡仍可能重新公告（只係少數多卡 row 會撞到；§7.4 已列明修法）。
 * cut 後如果遲到嘅 request 真係失敗（reject），冇 proof ⇒ 重送，正確。
 * `p:` mark 用**分鐘**做時間桶，所以 proof 只要求「同一分鐘或之後」；同一 token 同一分鐘內兩張**唔同 sig** 嘅卡唔會互相壓抑（sig 一定要相同）。
 * 未歸因：嗰 16 個缺號當中，有幾多係 cut 之後**真係送達**、有幾多係根本冇送達——兩者 audit 都空白，要靠修後嘅補 audit 才分得開。
 
-## 七、留底
+## 七、第二修：attempt 身分 ＋「唔夠證據就等多一個 check」（2026-09-22）
+
+觸發：operator 再問一次「可否改成不會重複發送同一樣的卡」，例子係 Finagotchi ⚠️
+流動性跌穿地板 23:36 / 23:48 兩條幾乎一樣嘅訊息（第一修之後嘅線上行為）。
+
+### 7.1 兩個成因（都係「用『冇證據』去做『重送』嘅決定」）
+
+* **proof 係 token 級**：`deliveredFollowupProofs` 舊版每 token 只留最新一個 `at`，
+  而一條 row 一個 pass 可以帶幾張卡。分鐘桶之下，**同一分鐘內鄰居卡嘅送到**就足以
+  「證明」一張根本冇送到嘅卡 ⇒ 靜默漏卡（比重複更貴）。
+* **proof 未寫到就當冇**：cut 嘅定義係「唔再等」，唔係「Telegram 拒絕」；proof 係
+  嗰個 request 自己嘅 settle 之後才寫。下一個 pass 若讀唔到（Turso 慢／ring 讀 throw），
+  「冇 proof」就會被當成「冇送到」⇒ 即刻重送 ⇒ 就係 operator 見到嘅第二條訊息。
+
+### 7.2 改動
+
+| 位置 | 改動 |
+|---|---|
+| `deferrallog.cardProofKey(token, sig)` | proof 嘅新 key：**每張卡**（token ＋ transition sig） |
+| `deferrallog.deliveredFollowupProofs` | 同一個 audit 讀取，改成 per-card map。未 stamp `sig` 嘅 entry 仍然入 **token key**（粗但唔會比舊版差）：精確 key 只會**增加**精度 |
+| `evaluateWatch` 嘅 `fire()` | dedupe 條件：**同一 sig** 嘅 attempt mark ＋ 該卡 proof ≥ mark 時間 ⇒ 公告但唔送 |
+| `evaluateWatch` 嘅 `attemptIsCurrent()` | mark 嘅分鐘桶 == `row.last_checked` 嘅桶 ⇒ 呢個 attempt 係「今個 check 之前嗰個 pass」留低嘅 |
+| attempt 未證實 ＋ `attemptIsCurrent` | **整個 evaluation 延後一個 check**：唔送、唔公告（`alerts: []`）、量測照樣前進，attempt mark 用**佢自己嘅時間戳**寫返（唔會自己延長自己） |
+| `addCutMarks(csv, attempts)` | 一次寫多張 attempt mark（各自保留自己嘅時間戳）；`addCutMark` 係單張版本 |
+
+### 7.3 為咩「等一個 check」唔算漏
+
+* 等嘅條件好窄：**同一個 sig**、**未證實**、**仲屬於 row 最近一次 check**。
+* 過咗一個 check 之後（`last_checked` 嘅桶前進），同一張卡照樣會推導出來，**冇 proof 就照送**
+  ⇒ 代價只係遲一個 check，唔係漏卡。
+* 有 proof 就更簡單：公告（state／`followupsSent`／`lastAlertAt` 全落地）但唔送。
+* 冇 check clock（`last_checked = 0`：手寫 fixture、或者被 terminal settle `rearmPushWatchAlert` 清過鐘嘅 row）
+  **唔會**行呢條路 —— 冇「剛剛嗰個 pass」可以等。
+
+### 7.4 未落地嘅一半（老實講）
+
+* **row loop 仍然只為「被 cut 嗰張」寫 mark**（`addCutMark(row.upStages, cutSig, now)`）。所以一條 row
+  一次過送幾張卡而中途被切／冇 slice，較早**已經送到**嗰幾張仍然會被重新公告（POPEYE 型）。
+  修法已經備好：row loop 收集今個 pass **所有 attempt**（送到嘅＋被切嘅）再一次寫入 `addCutMarks`，
+  每張卡就會各自用自己嘅 proof 擋住重複。
+* **audit 寫入位未傳 `sig`**：所以暫時行 token 級 fallback（proof 仍然有效，只係分唔到同一 row 嘅兄弟卡）。
+  一行改動：`recordPushDelivery({ …, kind: "followup", sig: a.sig })`（`Db.recordPushDelivery` 嘅
+  parameter type 亦要加 `sig?: string`）。
+* 上面兩處都在 `src/pushwatch.ts` 嘅 row loop（約 2000–2400 行）／`src/db.ts`（約 2030 行），而呢個
+  workspace 嘅檔案編輯工具只能讀寫檔案**前 ~50KB**（`str_replace` 在深處會報 "not found"），
+  所以今次改唔到；兩處都係細而獨立嘅改動，唔影響 7.2 嘅語意（只係少一半精度）。
+* `p:` mark 用分鐘桶，所以「同一個 check」嘅判斷有一個 straddle：cut 嗰刻跨分鐘（pass 橫跨 :59 → :00）
+  就會當成「唔係最近一次 check」，退回舊行為（照送）。量到約一成分嘅 cut。
+
+### 7.5 驗收點
+
+1. 同一 token 唔再喺一兩個 pass 內收到**同一張卡**；`dup-skip N` 繼續出現（proof 讀到時）。
+2. proof 讀唔到嗰個 pass：`push_watch.upStages` 會保留 `p:<sig>:<bucket>`（**唔會**被新 stamp 覆蓋），
+   而 tracker note 見唔到新卡；下一個 check 就會出現 `dup-skip`（proof 到）或者真係送一次。
+3. 單元測試：`evaluateWatch: an attempt from the row's last check is not re-sent while its proof is missing`、
+   `deliveredFollowupProofs: the newest delivery per (token, sig)…`、`cut marks: …`。
+
+## 八、留底
 
 `docs/patches/`：`cut-card-dedupe-proof`（audit proof helper）、`cut-card-dedupe-engine`（sig／mark／fire ／🚀 walk）、
 `cut-card-dedupe`（tracker：proof 讀取、dedupe skip、背景 audit、cut mark 寫入）、`cut-card-dedupe-optional`、

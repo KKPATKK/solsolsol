@@ -523,24 +523,63 @@ export function deliveredFollowupTokens(
 }
 
 /**
- * The same follow-up proof, WITH TIMES: token → the newest `at` the audit ring
- * shows a `followup` card Telegram accepted for it.
+ * The key a CARD's delivery proof is stored under: the row's token AND the
+ * card's own transition signature (see CUT_MARK_PREFIX in src/pushwatch.ts).
  *
- * A tracker alert can be re-derived (a rolled-back announcement re-announces
- * itself on the next pass), so "a card for this token was delivered" is not
- * enough to refuse a duplicate — the entry has to be NEWER than the attempt it
- * is meant to stand for. The tracker writes a cut-card mark carrying the
- * attempt's minute (see CUT_MARK_PREFIX in src/pushwatch.ts) and asks this map
- * whether a delivery landed at or after it. Entries without a usable stamp are
- * skipped: an unproven card is re-sent, which is the never-miss direction.
+ * WHY NOT THE TOKEN ALONE (the rule this replaced, 2026-09-21). The first
+ * version of the cut-card proof asked a token-level question — "was ANY
+ * follow-up card for this token accepted at or after this attempt's minute?" —
+ * and one row can carry SEVERAL cards in a single pass. Two ways that proved the
+ * WRONG card:
+ *
+ *   * the cards a pass delivered before its slice ran out are re-derived when
+ *     the announcement is rolled back, and the token-level max then proves
+ *     them from the very deliveries they are about to repeat;
+ *   * a minute-granularity mark means any OTHER card delivered in that same
+ *     minute (a different transition, maybe the one that ate the slice) passes
+ *     `at >= mark`, so a cut card that never landed is suppressed on a
+ *     neighbour's delivery — a silent miss, the one outcome worse than a
+ *     duplicate.
+ *
+ * Keying on (token, sig) is exact: the sig is the card's identity across a
+ * re-derivation, and the audit entry records it, so a proof can only ever stand
+ * for the transition it is about.
+ *
+ * WHAT AN UNSIGGED ENTRY STILL PROVES. The tracker's own writer is the one that
+ * gained the field, and until every writer stamps it, an entry that carries no
+ * sig is indexed under the TOKEN alone — the coarse rule above, kept as a
+ * fallback so the exact key can only ever ADD precision. A cut card whose
+ * neighbour's delivery falls in the same minute is then provable again, which is
+ * why the exact key exists; the caller reaches for the token key only when the
+ * exact one is absent (see the tracker's proof lookup).
  *
  * Pure and exported: the read that feeds it is a durable round trip, so the
  * RULE is what the unit tests pin.
+ */
+export function cardProofKey(token: string, sig: string): string {
+  return `${token}\u0000${sig}`;
+}
+
+/**
+ * Per-CARD delivery proof, WITH TIMES: `cardProofKey(token, sig)` → the newest
+ * `at` the audit ring shows a `followup` card Telegram accepted for that row and
+ * that transition. (The name still says "followup" because that is the audit
+ * kind it reads, and because the tracker's pass has imported it under this name
+ * since the token-level rule it replaced — only the KEY changed.)
+ *
+ * The timestamp is what makes it a proof of THIS attempt rather than of an
+ * earlier episode of the same transition: a tracker alert can be re-derived
+ * (a rolled-back announcement re-announces itself on the next pass), and the
+ * tracker writes a cut-card mark carrying the attempt's minute
+ * (CUT_MARK_PREFIX) which the entry has to be NEWER than. Entries without a
+ * usable stamp are skipped; an entry without a sig is stored under the token
+ * key instead of the card key (see above).
  */
 export function deliveredFollowupProofs(
   audit: ReadonlyArray<{
     token?: string | null;
     kind?: string | null;
+    sig?: string | null;
     at?: unknown;
   }>,
 ): Map<string, number> {
@@ -553,7 +592,12 @@ export function deliveredFollowupProofs(
     const at =
       typeof entry.at === "number" && Number.isFinite(entry.at) ? entry.at : 0;
     if (at <= 0) continue;
-    if (at > (out.get(token) ?? 0)) out.set(token, at);
+    const sig = entry.sig;
+    const key =
+      typeof sig === "string" && sig.length > 0
+        ? cardProofKey(token, sig)
+        : token;
+    if (at > (out.get(key) ?? 0)) out.set(key, at);
   }
   return out;
 }

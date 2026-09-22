@@ -19,6 +19,7 @@ import {
   UNCONFIRMED_TERMINAL_STATE_KEY,
   addUnconfirmedCardSend,
   cardSendDisposition,
+  cardProofKey,
   deliveredCardTokens,
   deliveredFollowupProofs,
   deliveredFollowupTokens,
@@ -643,23 +644,45 @@ function pct(n: number): string {
  * delivery was thrown away with them.
  *
  * The fix rides the ONE column that already survives a rollback and is read by
- * every check: the persistent mark CSV (`up_stages`). A cut send writes
- * `p:<sig>:<minute>` next to the marks, the next evaluation of that row reads
- * it, and — only if the audit ring PROVES a follow-up card for the token landed
- * at or after that minute — announces the transition without sending it a
- * second time. The mark is not announcement memory: the next check write
- * recomputes the column without it, so it lives exactly one evaluation, and a
- * re-derived transition that finds no proof is sent normally (never-miss).
+ * every check: the persistent mark CSV (`up_stages`). A send whose outcome is
+ * unknown writes `p:<sig>:<minute>` next to the marks, the next evaluation of
+ * that row reads it, and — only if the audit ring PROVES THAT CARD (token and
+ * sig, at or after that minute) landed — announces the transition without
+ * sending it a second time. The mark is not announcement memory: the next check
+ * write recomputes the column without it, so it lives exactly one evaluation.
+ *
+ * TWO REFINEMENTS (2026-09-22, the operator's "can it just never repeat?"):
+ *
+ *   * The mark set is a LIST of attempts, not one (addCutMarks). A pass
+ *     delivers its cards in order and can run out of send slice midway, and the
+ *     rollback that follows restores the WHOLE announcement — so the cards that
+ *     had just been delivered get re-derived too (the POPEYE shape: five cards
+ *     in thirteen minutes). Each of them has its own audit entry, so marking
+ *     each of them is what lets the next evaluation refuse each repeat
+ *     separately (deferrallog.deliveredFollowupProofs). The row loop still
+ *     writes only its cut card's mark; passing it the whole attempt list is the
+ *     one-line follow-up that finishes this half (docs/duplicate-cards.md §7.4).
+ *   * An attempt that belongs to the row's MOST RECENT check is not re-sent
+ *     while its proof is missing. The proof is written by the request's own
+ *     settlement, so a slow DB or a proof read that failed makes "no proof"
+ *     indistinguishable from "not delivered" — and re-sending on that guess is
+ *     exactly the duplicate. Such an attempt instead defers the whole
+ *     evaluation by one check (see `attemptIsCurrent`), so the decision waits
+ *     for the evidence the next check reads, and the mark keeps the attempt's
+ *     own stamp so the wait cannot prolong itself.
  */
 const CUT_MARK_PREFIX = "p:";
 /**
  * Granularity of the mark's stamp. A minute is far coarser than the send it
  * describes (sub-second) and far finer than any re-announcement gap we care
- * about, and it keeps the mark three characters wide.
+ * about, and it keeps the mark three characters wide. The bucket is ALSO how an
+ * attempt is tied to the check that made it (see `attemptIsCurrent`), and the
+ * proof is per card (see deferrallog.deliveredFollowupProofs), so a coarse
+ * bucket can no longer let a NEIGHBOUR's delivery stand in for this attempt.
  */
 export const CUT_MARK_BUCKET_MS = 60_000;
 
-/** `p:<sig>:<minute>` — the mark one cut card leaves behind. */
+/** `p:<sig>:<minute>` — the mark one unknown-outcome send leaves behind. */
 export function cutMarkFor(sig: string, at: number): string {
   return `${CUT_MARK_PREFIX}${sig}:${Math.floor(at / CUT_MARK_BUCKET_MS)}`;
 }
@@ -681,21 +704,38 @@ export function parseCutMarks(
 }
 
 /**
- * The CSV a rolled-back row is written with: the marks it already had, plus the
- * mark for the ONE card whose send was just cut. Older cut marks are replaced
- * (the send loop breaks on the first cut, so a row can only have one attempt in
- * flight) and the result keeps the column's sorted shape.
+ * The CSV a row is written with while one of its attempts is still open (see
+ * CUT_MARK_PREFIX): the marks it already had, plus one mark per attempt the
+ * caller hands it — each an unknown-outcome send, delivered or cut mid-flight.
+ * Older attempt marks are replaced, because they describe a check that is over;
+ * the ones passed in are the current evidence, and the result keeps the
+ * column's sorted shape.
+ *
+ * Each attempt keeps its OWN stamp: for a cut card that is the instant the pass
+ * stopped waiting (its proof can only be NEWER than that), and for a delivered
+ * one the pass's clock read, which its own audit entry is by construction
+ * newer than. Preserving the stamp is also what makes the wait work — a mark
+ * re-stamped on every evaluation would tie the attempt to the check that just
+ * ran, forever.
  */
+export function addCutMarks(
+  csv: string | null | undefined,
+  attempts: ReadonlyArray<{ sig: string; at: number }>,
+): string {
+  const kept = (csv ?? "")
+    .split(",")
+    .filter((m) => m.length > 0 && !m.startsWith(CUT_MARK_PREFIX));
+  for (const a of attempts) kept.push(cutMarkFor(a.sig, a.at));
+  return kept.sort().join(",");
+}
+
+/** One attempt's mark in an otherwise unchanged CSV (see addCutMarks). */
 export function addCutMark(
   csv: string | null | undefined,
   sig: string,
   at: number,
 ): string {
-  const kept = (csv ?? "")
-    .split(",")
-    .filter((m) => m.length > 0 && !m.startsWith(CUT_MARK_PREFIX));
-  kept.push(cutMarkFor(sig, at));
-  return kept.sort().join(",");
+  return addCutMarks(csv, [{ sig, at }]);
 }
 
 /**
@@ -719,10 +759,16 @@ export function evaluateWatch(
     cooldownMs: number;
     liqFloorUsd?: number;
     /**
-     * Delivery proof for the cut-card marks: token → the newest `at` the audit
-     * ring shows a follow-up card Telegram ACCEPTED for it (see
-     * deferrallog.deliveredFollowupProofs). Absent = nothing is proven, which
-     * only ever means a card is SENT — fail-open in the never-miss direction.
+     * Delivery proof for the attempt marks, keyed per CARD
+     * (`deferrallog.cardProofKey(token, sig)`) → the newest `at` the audit ring
+     * shows a follow-up card Telegram ACCEPTED for that row AND that
+     * transition. Keyed per card, not per token: one row can carry several
+     * cards in one pass, and a token-level max lets a delivered neighbour's
+     * entry stand in for an attempt that never landed (see
+     * deferrallog.deliveredFollowupProofs for why that was a silent miss).
+     * Absent = nothing is proven, which for an attempt from the row's most
+     * recent check means one check of waiting and then a send — fail-open in the
+     * never-miss direction.
      */
     followupProofAt?: ReadonlyMap<string, number>;
   },
@@ -740,15 +786,87 @@ export function evaluateWatch(
   let resetBaselineHolders: number | undefined;
   let announcedUpStages: string | undefined;
 
-  // The cut-card mark this row's LAST alert left behind (see CUT_MARK_PREFIX):
-  // a send that was cut means the card may already be in the chat, and the
-  // audit's proof is what turns "may" into a decision.
-  const cut = parseCutMarks(row.upStages)[0] ?? null;
+  // The attempt marks this row's last pass left behind (see CUT_MARK_PREFIX):
+  // a send whose outcome was unknown means the card may already be in the chat,
+  // and the audit's proof is what turns "may" into a decision. Indexed by the
+  // transition they stand for, the NEWEST attempt per transition — a row can
+  // carry several (see addCutMarks).
+  const attemptMarks = parseCutMarks(row.upStages);
+  const attemptAt = new Map<string, number>();
+  for (const m of attemptMarks) {
+    attemptAt.set(m.sig, Math.max(attemptAt.get(m.sig) ?? 0, m.at));
+  }
+  /**
+   * When the audit ring proves a card for this transition was ACCEPTED, as the
+   * newest `at` it carries; 0 = nothing proven.
+   *
+   * The exact key (token + sig) is asked first, and the token-only key is the
+   * fallback for an entry whose writer did not stamp the sig (see
+   * deferrallog.deliveredFollowupProofs): that one is coarser — it cannot say
+   * WHICH card landed — so it is only consulted when the exact proof is absent.
+   */
+  const proofFor = (sig: string): number => {
+    const proofs = cfg.followupProofAt;
+    if (!proofs) return 0;
+    const exact = proofs.get(cardProofKey(row.token, sig)) ?? 0;
+    return exact > 0 ? exact : (proofs.get(row.token) ?? 0);
+  };
+  /**
+   * An attempt FROM THE ROW'S MOST RECENT CHECK — its stamp sits in the same
+   * minute bucket as `last_checked`, which is the clock the pass that cut it
+   * wrote.
+   *
+   * This is the whole "how long do we wait?" rule, and it needs no timer: the
+   * proof of a cut send is written by the request itself, right after Telegram
+   * answers — a moment no pass can wait for (that is what the cut IS). It lands
+   * within the request's own latency, but the very next pass may read the ring
+   * before it, or fail to read it at all, and both look exactly like "this card
+   * never arrived". Waiting that ONE check is the only answer that cannot
+   * duplicate: the attempt still belongs to the check the pass just made, and
+   * the row is re-checked within a rotation, when the proof is either there
+   * (→ announced, no second send) or genuinely absent (→ sent, exactly once: the
+   * never-miss direction is a delay, never a loss).
+   *
+   * The gate is also why a mark with no check clock behind it (last_checked = 0,
+   * a hand-written fixture or a row the terminal settle re-armed) is judged
+   * normally: there is no recent pass for it to be waiting on.
+   */
+  const attemptIsCurrent = (m: { at: number }): boolean =>
+    Math.floor(m.at / CUT_MARK_BUCKET_MS) ===
+    Math.floor(row.lastChecked / CUT_MARK_BUCKET_MS);
+  const young = attemptMarks.filter(
+    (m) => attemptIsCurrent(m) && proofFor(m.sig) < m.at,
+  );
+  if (young.length > 0) {
+    // DEFER THE WHOLE EVALUATION — announce nothing, send nothing, and write the
+    // attempt marks back with THEIR OWN stamps (a fresh stamp would tie the
+    // attempt to THIS check and push the wait out forever). The measurements
+    // still advance, because they describe the coin and not the announcement.
+    //
+    // Why the WHOLE row rather than just the card in question: the announcement
+    // columns are shared (last_alert_at, followups_sent, the mark CSV), so
+    // letting a sibling card land them would land THIS card's transition too —
+    // and a transition recorded as announced is one that never gets re-derived,
+    // i.e. the card would be lost the moment the attempt really had failed.
+    return {
+      alerts: [],
+      peakMcap,
+      followupsSent: row.followupsSent,
+      lastState: row.lastState,
+      lastAlertAt: row.lastAlertAt,
+      stopTracking: false,
+      sellDomStreak: row.sellDomStreak ?? 0,
+      // The stored trough is the 💀 row's resurrection anchor: a deferral
+      // announces nothing, so it must not be dropped by the write either.
+      deadTroughMcap: row.deadTroughMcap ?? null,
+      announcedUpStages: addCutMarks(row.upStages, young),
+    };
+  }
   const fire = (kind: WatchAlert["kind"], text: string, sig: string) => {
-    const deduped =
-      cut !== null &&
-      cut.sig === sig &&
-      (cfg.followupProofAt?.get(row.token) ?? 0) >= cut.at;
+    // Proof is asked per CARD, so an entry for another transition of the same
+    // row can never stand in for this attempt (the token-only fallback aside).
+    const at = attemptAt.get(sig);
+    const deduped = at !== undefined && proofFor(sig) >= at;
     // Only ever SET, never `false`: an alert that has nothing to say about the
     // proof should compare equal to one written before this rule existed.
     alerts.push(deduped ? { kind, text, sig, deduped } : { kind, text, sig });

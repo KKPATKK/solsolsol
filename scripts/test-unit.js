@@ -20,7 +20,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterM
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
-const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
+const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS } = require("../dist/worker.js");
@@ -36,7 +36,7 @@ const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallet
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
 const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
-const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, deliveredFollowupProofs, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
+const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, deliveredFollowupProofs, cardProofKey, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
 let passed = 0;
@@ -924,23 +924,108 @@ async function main() {
     assert.equal(once, "p:dead:1,up100,up50");
     assert.equal(addCutMark(once, "dead", 120_000), "p:dead:2,up100,up50");
     assert.equal(addCutMark(null, "hold", 0), "p:hold:0");
+    // EVERY attempt of a pass, each with its OWN stamp: a card delivered before
+    // the slice ran out keeps the pass clock (its audit entry is newer by
+    // construction), the cut one keeps the instant the pass stopped waiting.
+    // A fresh stamp per evaluation would push the wait out forever, so the
+    // stamp is the one thing addCutMarks must not recompute.
+    assert.equal(
+      addCutMarks("up50,p:dead:9", [{ sig: "dead", at: 60_000 }, { sig: "hold", at: 120_000 }]),
+      "p:dead:1,p:hold:2,up50",
+    );
+    assert.equal(addCutMarks("p:dead:1,up50", []), "up50", "a pass that attempted nothing drops stale attempts");
   });
 
-  await test("deliveredFollowupProofs: the newest follow-up per token, and only with a stamp", () => {
+  await test("deliveredFollowupProofs: the newest delivery per (token, sig), the token key for an unstamped entry", () => {
     const map = deliveredFollowupProofs([
-      { token: "A", kind: "followup", at: 100 },
-      { token: "A", kind: "followup", at: 300 },
-      { token: "A", kind: "initial", at: 900 },
-      { token: "B", kind: "followup" },
-      { token: "C", kind: "resend", at: 500 },
-      { token: "", kind: "followup", at: 500 },
-      { token: "D", kind: "followup", at: Number.NaN },
+      { token: "A", kind: "followup", sig: "dead", at: 100 },
+      { token: "A", kind: "followup", sig: "dead", at: 300 },
+      { token: "A", kind: "followup", sig: "up50", at: 200 },
+      { token: "A", kind: "initial", sig: "dead", at: 900 },
+      { token: "B", kind: "followup", sig: "dead" },
+      { token: "C", kind: "resend", sig: "dead", at: 500 },
+      { token: "", kind: "followup", sig: "dead", at: 500 },
+      { token: "D", kind: "followup", sig: "dead", at: Number.NaN },
+      { token: "E", kind: "followup", at: 700 },
+      { token: "E", kind: "followup", sig: "dead", at: 400 },
     ]);
-    assert.equal(map.get("A"), 300, "the newest follow-up entry is the proof");
-    assert.equal(map.has("B"), false, "a stamp-less entry cannot be ordered against an attempt");
-    assert.equal(map.has("C"), false, "only the tracker's own follow-up cards count");
-    assert.equal(map.has("D"), false);
+    assert.equal(map.get(cardProofKey("A", "dead")), 300, "the newest delivery of THAT card is the proof");
+    assert.equal(map.get(cardProofKey("A", "up50")), 200, "and each card keeps its own");
+    assert.equal(map.has(cardProofKey("A", "up400")), false, "a card that never landed has no proof");
+    assert.equal(map.has(cardProofKey("B", "dead")), false, "a stamp-less entry cannot be ordered against an attempt");
+    assert.equal(map.has(cardProofKey("C", "dead")), false, "only the tracker's own follow-up cards count");
+    assert.equal(map.has(cardProofKey("D", "dead")), false);
+    assert.equal(map.get("E"), 700, "an entry with no sig proves the TOKEN only — the coarse fallback");
+    assert.equal(map.get(cardProofKey("E", "dead")), 400, "while a stamped sibling keeps its exact key");
     assert.equal(deliveredFollowupProofs([]).size, 0);
+  });
+
+  await test("evaluateWatch: an attempt from the row's last check is not re-sent while its proof is missing", () => {
+    const at = 1_800_000_000_000; // exactly on a mark bucket boundary
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "REK", pushedAt: 0,
+      mcapAtPush: 170_000, peakMcap: 240_000, lastLiquidity: 32_000,
+      deadTroughMcap: null, holdersAtPush: null, holdersLast: null,
+      holdersCheckedAt: null,
+      // The check clock of the pass that cut the attempt: same minute bucket.
+      lastChecked: at + 2_000,
+      lastAlertAt: 0, followupsSent: 0, lastState: null, upStages: null,
+      ...over,
+    });
+    const live = { mcap: 59_000, liquidity: 32_000, chg5m: -2, buysH1: 120, sellsH1: 180 };
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const marked = () => row({ upStages: cutMarkFor("dead", at) });
+
+    // The pass that cut it has just run and the ring proves nothing yet: the
+    // proof is written by the request's own settlement, so its absence is not
+    // evidence the card is missing — and the immediate re-send it used to cause
+    // is exactly the duplicate the operator sees. The whole evaluation defers:
+    // nothing sent, nothing announced, measurements still advancing, and the
+    // attempt written back with ITS OWN stamp so the wait cannot extend itself.
+    const waited = evaluateWatch(marked(), at + 30_000, live, cfg);
+    assert.deepEqual(waited.alerts, [], "no card while the attempt is unproven");
+    assert.equal(waited.lastState, null, "nothing is announced");
+    assert.equal(waited.followupsSent, 0, "not the counter");
+    assert.equal(waited.lastAlertAt, 0, "nor the alert clock");
+    assert.equal(waited.announcedUpStages, cutMarkFor("dead", at), "the attempt keeps its own stamp");
+    assert.equal(waited.peakMcap, 240_000, "while the measurement still lands");
+
+    // One check later the row's clock has moved on, so this attempt is no longer
+    // "the one just made": the question is answered now, and an unproven card is
+    // sent. Never-miss — a delay, never a loss.
+    const decided = evaluateWatch(
+      row({ upStages: cutMarkFor("dead", at), lastChecked: at + CUT_MARK_BUCKET_MS + 2_000 }),
+      at + CUT_MARK_BUCKET_MS + 30_000,
+      live,
+      cfg,
+    );
+    assert.equal(decided.alerts.length, 1);
+    assert.equal(decided.alerts[0].sig, "dead");
+    assert.equal(decided.alerts[0].deduped, undefined, "an unproven card is sent");
+
+    // A delivery of THIS card, newer than the attempt, refuses the second send
+    // — the 💀 REK duplicate — while still landing the transition.
+    const proved = evaluateWatch(marked(), at + 30_000, live, {
+      ...cfg,
+      followupProofAt: new Map([[cardProofKey("T", "dead"), at + 4_000]]),
+    });
+    assert.equal(proved.alerts.length, 1);
+    assert.equal(proved.alerts[0].deduped, true, "announced, not sent");
+    assert.equal(proved.lastState, "dead");
+    assert.equal(proved.followupsSent, 1);
+    assert.ok(
+      !String(proved.announcedUpStages ?? "").includes("p:"),
+      "the mark is consumed by the write that follows",
+    );
+    // A mark with NO check clock behind it (a fixture, or a row the terminal
+    // settle re-armed) is judged normally: there is no recent pass to wait on.
+    const legacy = evaluateWatch(
+      row({ upStages: cutMarkFor("dead", at), lastChecked: 0 }),
+      at + 30_000,
+      live,
+      cfg,
+    );
+    assert.equal(legacy.alerts.length, 1, "no check clock → no deferral");
   });
 
   await test("evaluateWatch: a gap across several 🚀 stages fires ONE card and marks them all", () => {
