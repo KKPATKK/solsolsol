@@ -77,7 +77,8 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 
 ## 六、未驗 / 已知限制（老實講）
 
-* **未 deploy**：以上係本地實作＋單元測試；線上嘅 `dup-skip`、`p:` mark、補 audit 仲未見過真讀數。
+* **已 deploy（2026-09-22 17:29Z）**：`p:` mark 已經線上讀到；`dup-skip` 仲未出現過，原因見 §8.2。
+  （呢一段寫嘅時候仍未上線，讀數見 §8。）
 * **已修（見 §7）**：proof 已由 token 級改為 per-card（`cardProofKey`）。
 * **仍然存在**：一條 row 若一次帶多過一張卡，row loop 只為**被切嗰張**寫 mark，所以該 pass 較早、
   已經送達嗰幾張卡仍可能重新公告（只係少數多卡 row 會撞到；§7.4 已列明修法）。
@@ -142,7 +143,63 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 3. 單元測試：`evaluateWatch: an attempt from the row's last check is not re-sent while its proof is missing`、
    `deliveredFollowupProofs: the newest delivery per (token, sig)…`、`cut marks: …`。
 
-## 八、留底
+## 八、線上驗收（2026-09-22 18:12–18:26Z，deploy 之後）
+
+Deploy 證據：`5aa4624`（Wait one check for a cut card's proof）嘅
+「Deploy Worker to Cloudflare」執行成功（17:29:42Z，1m10s）——部署通道係
+`.github/workflows/deploy.yml`（push main → typecheck → unit tests → wrangler），
+唔係 Freebuff hosting。
+
+### 8.1 `p:` mark：確認保留（唔會被新 stamp 覆蓋）
+
+`/debug/push-watch?limit=200` 讀到 **8 行** 帶 `p:<sig>:<bucket>`，每行保留自己嘅時間戳：
+
+| row | `upStages` | mark 時間 | 該行 `lastChecked` |
+|---|---|---|---|
+| MC | `p:dead:29835013` | 18:13:00Z | 18:13:14Z |
+| JOLLYBOT | `p:w45:29835019,up50` | 18:19:00Z | 18:19:48Z |
+| Transfinance | `p:liqwarn:29834865` | 18:14:00Z | 18:14:31Z |
+| CLOUT | `p:liqwarn:29834928,up50,w45` | 16:48:00Z | 18:13:12Z |
+| BIRDDOG | `p:dead:29834976` | 17:36:00Z | 18:14:26Z |
+| Commotitty | `p:dead:29834963,up100,up50,w45` | 17:23:00Z | 18:17:24Z |
+| USDC | `p:w45:29834957,up100,up50,w35` | 17:17:00Z | 18:19:46Z |
+| AMD | `p:revive:29834950,up100,…,w35` | 17:10:00Z | 18:09:20Z |
+
+讀取期間 **有新 mark 出現**（MC 18:13、JOLLYBOT 18:19），所以唔係舊行殘留：
+cut 寫 mark 呢條路係線上活嘅。（舊 mark 會被**下一次 attempt** 取代 —— `addCutMarks` 語意；
+Transfinance 由 `p:dead:29834865` 變成 `p:liqwarn` 就係一例。）
+
+### 8.2 `dup-skip`：未見到，而且讀得出「為咩」
+
+`worker_state.push_watch_pass`（`/health.pushWatchPass`）嘅 note 冇 `dup-skip`：
+
+```
+ok:6/0 rows 6/30 pairs 10/10 miss 0 lost 0 budget-cut allow 3024
+spend[setup 677/3 heal 231/1 miss0 enrolled0 pairs 274/0 rows 1490/6 holders 0/0 held0 cut4] trips 11
+```
+
+`dup-skip` 只喺 `fire()` 內部算（`evaluateWatch` 只喺**同一個 transition 重新推導**時才問 proof）。
+而 8 行帶 mark 嘅 row **全部係 terminal 狀態**（`dead` / `rug`：14 dead、14 rug、4 unwatched），
+terminal row 唔會再推導同一張卡 ⇒ dedupe 冇機會被評估，mark 就一直留喺 row 度。
+最接近觸發嘅係 **JOLLYBOT**：`lastState=up50`、mark 係 current（18:19 桶 == `last_checked` 桶）、
+而 audit ring 有 `followup` 18:19:48Z ≥ mark 18:19:00Z ⇒ 佢下一次再推導 `w45` 就會「公告但唔送」
+（pass note 出 `dup-skip 1`）。
+
+### 8.3 順手量到嘅兩件事（老實講）
+
+* **proof 仍然係 token 級**：`/debug/push-audit` 30 筆之中 **0 筆**帶 `sig`，
+  即係 §7.4 第二條（audit 寫入傳 `sig`）未落地，線上走嘅係 token fallback。
+  精度少一半，但方向仍然係 fail-open（多送一張，唔會靜默漏）。
+* **durable note 有停滯**：note 由 18:09:23Z 起冇再更新，而 row 檢查一路做到 18:19:48Z
+  （pass 明顯有跑）——`persistPassNote` 嘅 900ms race 輸咗；同一時段仲有一 tick 死喺 18:22
+  （110s，下一個 tick backfill）。所以 `dup-skip` 可能發生過而未入到 note，
+  驗收要直接睇 row 嘅 mark ＋ audit proof（8.1／8.2 就係咁讀）。
+* **mark 喺 terminal row 會長留**：`p:` mark 只在分支重算 `up_stages` 時才被清
+  （revive 寫 `""`、stage 寫 `marks`），`dead` 分支回 `announcedUpStages: undefined`（保持原狀），
+  所以 §3「一個 attempt 一個 mark」對 terminal row 唔成立：mark 一直留到該 row 再 fire 同一個 sig。
+  代價係每次 pass 多一次 audit ring 讀（head 有 mark 就讀），同一個「同 sig 再 fire」有機會被舊 proof 擋。
+
+## 九、留底
 
 `docs/patches/`：`cut-card-dedupe-proof`（audit proof helper）、`cut-card-dedupe-engine`（sig／mark／fire ／🚀 walk）、
 `cut-card-dedupe`（tracker：proof 讀取、dedupe skip、背景 audit、cut mark 寫入）、`cut-card-dedupe-optional`、
