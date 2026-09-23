@@ -1309,3 +1309,72 @@ raceMs     = 9500 − 4500 − preRaceMs            4805 ✓  4667 ✓  4811 ✓
 - 讀 cron 拆帳要讀 **heartbeat 內嘅 `summary`**（flush 時序列化，唔受之後嘅請求影響）✔；
 - `/health.summary`（記憶體）或者 `/debug/tick` 讀到嘅，好可能係 **HTTP fallback** 嗰個 tick（`bump` / `init` / `gate` 全部 0、`preStartMs` ≈ dedupe read 嘅 ~100ms）—— 唔要攞嚟代表 cron。
 - 下一版值得加 `path: "cron" | "http"` 同「掃描進行中唔准重設 split」嘅守衛，令兩者一眼分得開。
+
+## 2026-09-23：dead tick 嘅真身 —— invocation 級 subrequest 上限（新證據）
+
+呢個 doc 之前一直把 dead tick 歸因於「Cloudflare 用 wall clock 殺 invocation」。2026-09-23 05:10:19Z 嘅一個
+讀數指向一個**更硬、量得到、而且解釋得到全部形狀**嘅機制：**invocation 嘅 subrequest 上限**。
+
+### 證據
+
+`/debug/tick`（05:10:19Z 嗰個 invocation）嘅 `summary.pushWatch`：
+
+```
+err:Too many subrequests by single Worker invocation. To configure this limit, refer to
+https://developers.cloudflare.com/workers/wrangler/configuration/#limits
+```
+
+Cloudflare 官方 limits（實查 2026-09-23）：
+
+| 項目 | Workers Free | Workers Paid |
+|---|---|---|
+| **Subrequests per invocation** | **50** | 10,000（可調到 10M；Free 唔可以調高） |
+| CPU time per Cron Trigger | 10 ms | 30 s（<1h interval） |
+| Cron Trigger duration | 15 min | 15 min |
+
+「subrequest」＝ **每個 fetch** 同每個 Cloudflare service 呼叫。關鍵：**本 bot 嘅 Turso 連線走 HTTP transport**
+（`src/db.ts` `createRawClient`：`libsql://` 換成 `https://`＋自帶 abort signal 嘅 `fetch`），
+所以**每一個 DB round trip 都係一個 subrequest**；而且 libsql HTTP client 內部會自己重試
+（同一段註釋：「abort 之後個 promise 可以再跑 2–3 倍」）—— 一個慢 call 可以食幾個。
+
+### 一個上限解釋晒之前分開追嘅三樣
+
+一個 tick 嘅預算由**前面**開始燒：profiles／pump pagination／meteora／gecko／jup ＋ pair 批次 ＋
+每個候選嘅 holder／Birdeye／Helius probe，**再加上所有 Turso round trip**（bump、init DDL、gate read、
+claim batch、pool query、token_stats、seen_tokens、deferral sync、drain、pass 自己嗰 11 個 trips）。
+燒到 50 之後，**下一個** fetch／DB call 就 throw；而 tick 尾段每個寫入都係 best-effort try/catch
+（telemetry 唔可以殺 tick），所以爆預算唔會出 error row，只會**靜靜地冇咗**：
+
+| 爆預算嘅位置 | 見到嘅形狀 |
+|---|---|
+| completion flush（`persistScanCompletion` 係一個 fetch） | 冇 history row、heartbeat 停在 `phase=scanning` ⇒ 下一 tick 補 **`previous tick died before its completion flush`**。`ms` 60–105s 係**偵測延遲**（`dead.at` 到自己 claim），**唔係**個 tick 跑咗 60 秒 |
+| pass 嘅最終 note 寫入（`persistPassNote` 都係 DB 寫） | `/health.pushWatchPass` 停在 **`phase:"running"`**（`persistPassStart` 寫得早，預算未爆） |
+| pass 內部嘅 call | `summary.pushWatch = err:Too many subrequests …`（今次影到嘅） |
+| terminal 卡嘅 settle 寫入 | `push_watch.last_checked == last_alert_at` ⇒ `/debug/push-watch.issues` 出 **`lost_completion_write`**（05:17Z：9 行） |
+| deferred write drain | 舊讀數 `writeDrain 4 calls / 4 failures`（同一類：寫入被擋／被取消） |
+
+### 點驗（唔需要睇 code）
+
+1. Cloudflare dashboard → Workers & Pages → `solana-meme-bot` → Metrics → Errors → Invocation Statuses：
+   對住 `/debug/scan-history` 嗰行嘅時間，睇有冇超 limit 嘅 invocation outcome。
+2. `/debug/tick` 或 `/health.heartbeat.summary.pushWatch` 出現上面嗰句 `Too many subrequests` ⇒ 直接中。
+3. 對照：同一段時間 `pushWatchPass.phase` 係唔係停喺 `running`、`/debug/push-watch.issues` 係唔係多咗
+   `lost_completion_write`。
+
+### 修法（要 operator 決定；唔係 code 一兩行）
+
+* **最直接：Workers Paid（US$5/月）** ⇒ subrequest 50 → 10,000、cron CPU 10ms → 30s。Free **唔可以調高**
+  （wrangler `[limits] subrequests` 只係喺 Paid 之內再調）。本 bot 一個 tick 嘅真實用量
+  （feeds 8–12 ＋ pair 批次 4–6 ＋ DB round trip 二三十 ＋ probe／send）本身就**貼住 50 行**，
+  所以爆預算係常態，唔係意外。
+* **唔付費**：減 invocation 內嘅 Turso round trip（每個都係一個 subrequest）。歷來 audit 過嘅位：
+  `bump` 自己一個 raw client（0.6–0.75s ＋ 1 round trip，可搭入 claim batch）、`init` 同首 tick 嘅 gate read
+  可以合併、pass 嗰 11 個 trips 可以批埋、pair 階段嘅重複讀。慢工，每次都要量。
+* **唔可以靠「加 counter」驗證**：爆預算時**最後死嘅就係 telemetry 寫入**（note／heartbeat／history 全靠 Turso），
+  「寫唔到 counter」本身就係症狀 —— 觀測要喺 worker 外面做（dashboard／dashboard logs）。
+
+### 同推送正確性嘅關係
+
+呢批失敗全部係 telemetry／bookkeeping，冇一個出口會令卡唔送（唯一「唔送」出口係 `deduped`，而佢要
+exact per-card proof，見 `docs/duplicate-cards.md` §10.2）。代價係**掃描節奏嘅洞**（一個 dead tick =
+一個 rotation turn 冇咗）同埋讀數斷層，即係 operator 追緊嗰啲「唔知發生咩事」嘅來源。

@@ -703,3 +703,73 @@ scan 窗口回到 ~4.6s，pass 亦有預算開。
   喺「reservation → 最後寫」呢段入面砍（見 17.3），所以「唔可以漏卡」嘅方向冇變。
 * 若果 watchdog 開火而 pass 當時正停喺某一行嘅**送卡**度（reservation 已落），嗰張卡一樣係漏 ——
   同「唔開火、永遠等落去」嘅結果相同，唔會更差；但呢個窗口係已知嘅，屬下一輪要處理嘅對象。
+
+## 十八、`d7eb660` 落線驗收：`cut:watchdog` 冇出現，6 位數 ms **仍然出現**（2026-09-23 04:44–05:17Z）
+
+Deploy：run **35819455746** success（04:42:59Z 開始、1m6s）⇒ **04:44:05Z 上線**。
+
+### 18.1 `cut:watchdog`：冇出現（即係 pass 冇唔 return）
+
+| 讀邊度 | 讀數 | 意思 |
+|---|---|---|
+| `/health.pushWatchPass` | 05:10:28Z `ok:7/0 … cut4 db 3803ms`、`phase:"done"`、`trackerMs 4132`；05:15:13Z／05:16:24Z 亦見 `running`（pass 開頭）之後正常收尾 | pass 正常 return（4.0–4.4s，遠低於 8s overrun）⇒ watchdog 冇開火 |
+| note 帶 `cut:watchdog` ／ `phase:"cut"` | **0 次**（05:10–05:17Z 連續讀） | 冇影到「pass 唔 return」 |
+
+### 18.2 6 位數 ms：仍然出現，而且 watchdog 覆蓋唔到
+
+`/debug/scan-history?limit=1000`（120 行 ring ≈ 2h）嘅 dead row **10 行**：
+
+```
+03:59:24=62197  04:00:26=78014  04:13:24=60476  04:18:14=61833  04:19:16=62589
+04:29:24=60704  04:30:25=61440  04:57:24=60242  04:58:24=59722  05:13:26=105014
+```
+
+（04:57／04:58／05:13 係 post-deploy；其餘 7 行喺 03:59–04:30。）
+
+**要更正 §17.1 嘅歸因**：`previous tick died before its completion flush` **唔可能**係「pass 冇 return」造成 ——
+pass 係喺 **completion flush 之後**才跑（`worker.ts` 2471–2500：flush 批次同一時間寫 history row 同
+`phase:done`，pass 喺其後）。所以死喺 flush 之前嘅 tick，pass 根本未開始；§17.1 影到嘅 78s／62s
+（03:59:24、04:00:26）亦**早過** 04:01:51 嗰個卡住嘅 pass，兩者係唔同事件。Watchdog 針對嘅係另一個形狀：
+
+| 形狀 | 一眼認出嘅讀數 | 例子 | watchdog |
+|---|---|---|---|
+| pass 唔 return（tick 已 flush） | `pushWatchPass.phase` **停留喺 `running`**、history row 係 `ok` | §14.2 形狀 B；§17.2 嗰 61 秒 | ✅ 8s overrun 之後寫 `cut:watchdog` 並 return |
+| tick 死喺 flush 之前 | `previous tick died before its completion flush`、heartbeat 停 `phase=scanning` | 上面 10 行（`ms` 60–105s 只係**偵測延遲**，唔係 tick 跑咗咁久） | ❌ 覆蓋唔到（pass 未開始） |
+
+### 18.3 共同根因（新證據）：invocation subrequest 上限
+
+同一個時段 `/debug/tick.summary.pushWatch` 讀到：
+
+```
+err:Too many subrequests by single Worker invocation. To configure this limit, refer to
+https://developers.cloudflare.com/workers/wrangler/configuration/#limits
+```
+
+Cloudflare limits：**subrequest per invocation = 50（Free）／10,000（Paid，Free 唔可以調高）**；而呢個 bot 嘅
+Turso 連線走 **HTTP transport**（`src/db.ts` `createRawClient`：`libsql://` → `https://` ＋ `fetch`），
+所以**每一個 DB round trip 都係一個 subrequest**（libsql client 內部仲會自己重試，一個慢 call 可以食幾個）。
+燒到 50 之後，**下一個** fetch／DB call 就 throw，而 tick 尾段每一個寫入都係 best-effort ⇒ 症狀係「靜靜地冇咗」：
+
+| 爆預算嘅位置 | 見到嘅形狀 |
+|---|---|
+| completion flush | 冇 history row、heartbeat 停 `phase=scanning` ⇒ 下一 tick 補 **`previous tick died before its completion flush`** |
+| pass 嘅最終 note 寫入 | `pushWatchPass.phase` 停在 **`running`**（`persistPassStart` 較早寫，預算未爆） |
+| pass 內部嘅 call | `summary.pushWatch = err:Too many subrequests …` |
+| terminal 卡嘅 settle | `last_checked == last_alert_at` ⇒ `/debug/push-watch.issues` 出 **`lost_completion_write`**（05:17Z：9 行） |
+| deferred write drain | 舊讀數 `writeDrain 4 calls / 4 failures`（同一類：寫入被平台擋） |
+
+即係之前分開追嘅三樣（dead tick、note 凍結、lost completion write）係**同一個上限嘅三個出口**。
+完整拆解、點驗（dashboard → Workers & Pages → `solana-meme-bot` → Metrics → Errors → Invocation Statuses）、
+同修法（Workers Paid 50→10,000，或者減 invocation 內嘅 Turso round trip）：
+見 `docs/scan-completion-loss.md` 嘅「2026-09-23：dead tick 嘅真身 —— invocation 級 subrequest 上限」。
+
+### 18.4 卡片方向：呢批失敗冇新增漏卡路徑
+
+* 三個出口全部都係 **telemetry／bookkeeping 寫入**，冇一個會令卡唔送：唯一「唔送」出口係 `deduped`，
+  而佢要 exact per-card proof（§10.2）；proof 讀唔到 ⇒ 照送（fail-open）。舊讀數亦證實 dead tick 照樣推卡
+  （`docs/scan-completion-loss.md`：落入 ring 嘅 8 條卡全部由 dead tick 推）。
+* Dedupe 現況（05:17Z）：52 行之中 **4 行**帶 `p:` mark（全部 `dead`／`weak`）；最接近觸發嘅係 **BillSmith**
+  `p:up100:29835664`（05:04 桶；`last_checked` 05:04:11 同桶 ⇒ attempt 係 current），audit ring 未見
+  `(BillSmith, up100)` 嘅 proof ⇒ 下一次重新推導 `up100` 會先「等一個 check」，跟住 `dup-skip` 或者真送。
+  讀法照 §11.3（唔可以只睇 note：note 嘅寫入本身就係會爆預算嗰批）。
+
