@@ -124,9 +124,38 @@ deadline 才開始」—— 但 row loop 每次都先花光 allowance。讀數�
   （400ms/row vs 2s）之下仍然 4 個 probe 起步、4 個 count 一次 batch 寫入（舊 code 喺同一
   shape 下係 `probes 0`，所以係真 regression test）；(b) allowance 剩返 < cap 時一個 probe
   都唔起，note 讀 `held0 cut1`。
+* note 多兩個讀數：`probe<N> miss<M>`（patch `holder-stage-probe-counters.apply.js`）。
+  理由係實測逼出來嘅：`holders 0/0 held0 cut0` 可以係「冇 row due」又可以是
+  「4 個 probe 起步、4 個都 miss」——因為 miss 唔寫任何嘢，而且被 miss 嘅 row 係剛剛
+  檢查完，佢已經離開 rotation 頭，park 永遠唔會顯示成 `held`。舊讀數就係因此隱瞞咗
+  颟餓一個鐘。
 * 改動落線紀錄：`docs/patches/holder-stage-probes-early.apply.js`
   （＋ `holder-stage-cut-semantics.apply.js` 修正第一版寫錯嘅一條測試 —— 「起步咗但未完」
-  嘅路徑其實到唔到，見上面）。
+  嘅路徑其實到唔到，見上面；＋ `holder-stage-probe-counters.apply.js` 上一個 bullet）。
+
+#### 4.1.1 上線後讀數（deploy `57e06c7` @ 08:05Z，note 版本 `010d319` @ 08:21Z）
+
+| 時間（UTC） | note 尾段 |
+| --- | --- |
+| 08:10:27 | `holders 274/1 held0 cut0`（第一批 count 落地） |
+| 08:23:54 | `holders 131/1 held0 cut0 probe4 miss3` |
+| 08:25:01 | `holders 120/1 held0 cut0 probe4 miss3` |
+
+1. **`probe4 miss3`** = 每個 pass 4 個 probe 都真係起步，3 個撞 cap／冇 count
+   （park 10 分鐘），1 個答到 → 一個 batch 寫入（`holders …/1`）。同一 shape 之下舊 code
+   係 `holders 0/0 … cut4`。
+2. **卡片層面**：`/debug/push-watch` 有 `holders_checked_at` 嘅 row 由 **5 → 15**，
+   30 分鐘內刷新過嘅有 **9** 行（counts 1937 / 193 / 536 / 853 / 546 / 253 / 232 /
+   1042 / 1144）——「35 行從來冇 count」嘅颟餓狀態結束。
+3. **速率對得住設計**：29 行 active ÷ 30 分鐘 refresh window ≈ 0.97 行/min，實測
+   ~1 行/pass（1 pass/min）⇒ 行得切。
+4. **`cut0` 全程**：冇一個 due row 得唔到 turn（舊 shape `cut4` 冇再出現）。
+5. 唯一未改善嘅係 Birdeye 自己嘅長尾（`/debug/birdeye-overview` 實測 323 / 323 /
+   **2296**ms）：過 1200ms cap 嘅 probe 就算 miss（park 10 分鐘再試）。呢個係 cap 嘅原意，
+   唔係 bug；要推高命中率先要動 `TRACKER_HOLDER_CAP_MS`，而家冇必要（見第 3 點）。
+6. 順帶一個不是今次改動嘅數字：`/debug/push-watch.issueCount` 3 → 4，新增嘅係
+   04:17Z 嘅 `REALLY`（`lost_completion_write`，checked == alertAt）——時間戳比今次
+   deploy（08:05Z）早四個鐘，同 holder 改動無關，但既然看到就照記。
 
 ### 4.2 未做
 
