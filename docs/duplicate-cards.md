@@ -219,6 +219,20 @@ Deploy：「Deploy Worker to Cloudflare」成功（run 35800552243，00:06:28Z �
 
 睇 `dup-skip` 嘅正確方法（唔係只睇 note）：某行 fire 同一張卡之後，row 仍然帶 `p:<sig>` 而 `followupsSent` 冇升。
 
+### 8.5 一個 pass 出多張卡，係幾時嘅事（2026-09-23 分析）
+
+* 一個 pass **最多只出一張 🚀**（stage walk 有 `break`），而 💀／💧 係 terminal 而且只有一張。所以要 2 張
+  就一定係**跨分支**：🚀 ＋（⚠️ weak ／ 📈 holders ／ ⚡ div ／ 🩸 sell-pressure）。
+* 「🚀(S) ＋ ⚠️」需要 **`peak/push ≥ (1+S/100)/0.65`**（S=50 → 2.31、100 → 3.08、200 → 4.62、400 → 7.69），
+  而且該 ⚠️ mark 未被用過。用真引擎驗過（push $100K／peak $400K，ratio 4.0）：mcap $205K 出 `["up100","w45"]`、
+  $230K 出 `["up100","w35"]`；ratio 2.0 或者 ⚠️ mark 已用 ⇒ 只出 1 張。
+* 線上 17 條 active row（~00:2xZ payload，mcap 掃 0.3×–4× push、liquidity 用 row 儲存值）：**0 條**出得到 2 張。
+  其中 4 條（inu、F-35、BM、BOP）嘅 🚀／⚠️ mark 全部用盡（只剩 💀）；最近嘅係 UPTOBER（ratio 2.27 vs 需要 3.08）。
+* 即係話：呢個 fix 係為 **POPEYE 型**（推送 → 大幅拉升 → 回落：曾經真出現過）而設，唔係現時常態。
+* 多 mark 嘅形狀（用真 `PushWatcher` 造：一個 pass 一張送到、一張被切）：
+  `upStages = p:up100:29835382,p:w35:29835382` — 每張卡各自 `p:<sig>:<分鐘桶>`，同一 pass 所以桶相同，
+  逗號排序（`p:` 在最前，跟住 stage mark）；送到嗰張嘅 audit entry 帶 `sig: "up100"`。
+
 ## 九、留底
 
 `docs/patches/`：`cut-card-dedupe-proof`（audit proof helper）、`cut-card-dedupe-engine`（sig／mark／fire ／🚀 walk）、
