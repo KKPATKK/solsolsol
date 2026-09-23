@@ -1,0 +1,20 @@
+diff --git a/docs/duplicate-cards.md b/docs/duplicate-cards.md
+--- a/docs/duplicate-cards.md
++++ b/docs/duplicate-cards.md
+@@ -546,2 +546,19 @@
+ `phase:"skip"` **今次未影到**：deploy 之後每個 tick 嘅 scan 都係 2.1–3.1s，`trackerBudgetMs > 0` ⇒ 冇 tick 需要跳過 pass。
+ 呢條分支由單元測試釘住；下一次 burst（scan＋flush ≥ 8.5s 嘅 cut tick，即 02:37–02:41Z 嗰種）出現就會睇到。
++
++### 14.6 第一次線上「卡死嘅 pass」讀得到（2026-09-23 03:10–03:11Z）
++
++修好之後第二個 sample 就影到形狀 B 本身，而佢而家有簽名：
++
++| 讀數（`/health.pushWatchPass`） | 值 | 意思 |
++|---|---|---|
++| 03:10:36Z、03:10:54Z、03:11:18Z | `phase:"running"`、`at 03:10:23Z`（停留 **55 秒**） | 03:10:23Z 開嘅 pass 冇 return ⇒ 就係形狀 B（一行食盡 pass）。舊版呢一刻只會見到 note 靜止，分唔清「卡死」定「寫入失敗」 |
++| 03:11:39Z | `phase:"done"`、`at 03:11:25Z`、`trackerMs 4436` | 下一個 tick（03:11:20Z 開）嘅 pass 正常完成，`running` stamp 亦被覆蓋 |
++
++即係 §14.1 形狀 B 唔係一次性，而家每次發生都留得住證據（`running` ＋ 舊 `at`，`at` 自己講得出幾點開始卡）。
++
++`phase:"skip"`（形狀 A 嘅簽名）到 03:12Z 仍然未影到：deploy 之後所有 tick 嘅 scan 都完成喺 2.1–3.1s，
++所以每個 tick 都有預算開 pass。要等下一次 11500ms burst。
