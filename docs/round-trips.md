@@ -7,7 +7,8 @@
 > note 停在 `running`、`err:Too many subrequests`、`lost_completion_write`。
 > 診斷全文見 `docs/scan-completion-loss.md` 嘅「2026-09-23：dead tick 嘅真身」。
 
-呢份 doc 記低「唔付費」方向第一刀落咗嘅 code（2026-09-23，未 push／未 deploy）。
+呢份 doc 記低「唔付費」方向第一刀落咗嘅 code（2026-09-23，已 push 並經
+`.github/workflows/deploy.yml` 上線：commit `bba1312`，deploy run 35832992942 success，1m9s）。
 
 ## 1. 改咗邊五個位
 
@@ -49,6 +50,41 @@ claim / prune / heal / holder 呢四項，全部係 `src/pushwatch.ts` 嘅 deep 
    `/debug/push-watch.issues` 唔應該再增加 `lost_completion_write`。
 5. 卡片方向：`dup-skip` 唔應該上升（呢批改動冇新增任何「唔送」出口）。
 
+### 3.1 落線實測（2026-09-23 07:41–07:47Z，即 HKT 15:41–15:47，deploy 後第一節）
+
+抽 `/health.pushWatchPass` 嘅 pass note（順序即時間序）：
+
+| pass（UTC） | note 尾段 |
+| --- | --- |
+| 07:42:32 | `ok:0/0 deferred:tick-budget allow 2637 spend[setup 784/3 heal-cut 4254/8 miss1 enrolled1 pairs 0/0 rows 0/0 holders 0/0 held0 cut0] trips 11 db 4793ms` |
+| 07:43:24 | `ok:4/0 rows 4/30 pairs 10/10 miss 0 lost 0 budget-cut allow 2500 spend[setup 508/2 heal 504/1 miss0 enrolled0 pairs 54/0 rows 1127/4 holders 0/0 held0 cut4] trips 8 db 2398ms` |
+| 07:44:16 | `ok:3/0 rows 3/30 pairs 10/10 miss 0 lost 0 budget-cut allow 1844 spend[setup 509/2 heal-skipped 0/0 miss0 enrolled0 pairs 49/0 rows 802/3 holders 0/0 held0 cut4] trips 6 db 1565ms` |
+| 07:46:52 | `ok:5/0 rows 5/30 pairs 10/10 miss 0 lost 0 budget-cut allow 3787 spend[setup 610/2 heal 1200/1 miss0 enrolled0 pairs 54/0 rows 1388/5 holders 0/0 held0 cut4] trips 9 db 3456ms` |
+
+對照舊基線（`docs/duplicate-cards.md`：`setup 677/3 heal 231/1 … rows 6 → trips 11`
+同 `rows 9 → trips 18`）：
+
+1. **setup 3 → 2 trips**：`508/2`、`509/2`、`610/2`，三個有落 row 嘅 pass 都係 2（
+   init／gate 合併一個 heartbeat read）。
+2. **heal 2 → 1 trip**：07:43:24 同 07:46:52 都係 `heal …/1`（untracked ＋ ledger 一個
+   batch）；冇嘢要 heal 嘅 pass 直接 `heal-skipped 0/0`，唔再為 ledger 付一個 subrequest。
+3. **`trips` 總數**：rows 3 / 4 / 5 分別 `trips 6 / 8 / 9`，而每個 pass 嘅固定成本比舊
+   基線低 2（setup −1、heal −1）；row loop 嘅 per-row CAS 仍然係主導項（§4 未做）。
+4. **`spent.holders` 仍係 `0/0`**：呢幾分鐘冇一行 due（`holdersCheckedAt` 未夠
+   `holdersRefreshMin`），所以「N 次 probe → 1 trip」未喺線上行使到；行為由 unit test
+   嘅 `holders` 段釘住，下一節要等有 probe 嘅 pass 再讀一次。
+5. **cron 到達真係搭咗 claim**：`scheduled_tick_total` 54267 → 54273、
+   `scheduled_tick_at` 每分鐘前行（07:41:31 → 07:44:16 → 07:45:18 → 07:46:32 →
+   07:47:16），而同一時間 `/health.summary.preTick.steps` 係
+   `{bump:0, json:0, claim:174/311}`：到達記錄由 claim batch 帶走，唔再自己一個 raw
+   client（`bump 564–2211ms` 冇再出現）。
+6. **冇爆 budget**：抽樣期間 heartbeat `err` 只有一個 race 切掃描嘅紀錄
+   （07:46:25 `scan exceeded its 4689ms race window … preRace 311ms = json 0 + claim 311`，
+   係 poll 撞正 in-flight scan），**冇** `err:Too many subrequests`；
+   `/debug/push-watch.issueCount` 全程等於 **3**（CashFrog／Bengal／DeadCatBounce，
+   全部係 2026-09-22 嘅舊 row），`lost_completion_write` 冇增加。
+7. **`dup-skip` 冇上升**：抽樣期間冇任何 pass note 帶 `dup-skip`（`miss 0 lost 0`）。
+
 ## 4. 未做（同一條 audit 剩返落嚟）
 
 * pair 階段嘅重複讀。
@@ -57,12 +93,14 @@ claim / prune / heal / holder 呢四項，全部係 `src/pushwatch.ts` 嘅 deep 
   再入 loop 消費，屬下一步）。
 * `bumpScheduledTick` 本体仍然留喺 `Db`（legacy fallback 用），冇再喺正常 tick 出現。
 
-## 5. 驗證狀態（本地）
+## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
 * `node scripts/test-unit.js` → **275 passed, 0 failed** ✅（fakes 已跟新 shape，
   `trips` invariant 仍然釘住）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
+* push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅
+* 上線後第一節讀數：見 §3.1（本地三項 + 線上七項都照 §3 走）
 
 ## 6. 點解要一個 script 落呢個改動
 
