@@ -336,9 +336,52 @@ CU 一爆 quota，Birdeye 會開始回 429／要求付款，probe 同卡片路�
 `test-unit.js` 由 278 → **279 passed, 0 failed**（新 test：第一個 pass 出 1 個 probe，
 第二個 pass 出 `held0 cut2 probe0 miss0 cu-gate`）。
 
-#### 4.4.1 上線後讀數
+#### 4.4.1 上線後讀數（`66a9321`，deploy run 35854326659，2026-09-23 11:24–11:28Z）
 
-見 §5（deploy 後補上）。
+抽 `/health.pushWatchPass` 三個相鄰 pass（全部 `ok:10/0`、`rows 10/29`、`pairs 10/10`）：
+
+| pass（`at`） | holder stage | allow | trips | db |
+| --- | --- | --- | --- | --- |
+| 11:24:26 | `holders 0/0 held0 cut3 probe0 miss0` | 2087 | 6 | 1286ms |
+| 11:26:53 | `holders 140/1 held0 cut1 probe1 miss0` | 4880 | 12 | 1633ms |
+| 11:27:51 | `holders 0/0 held0 cut2 probe0 miss0 cu-gate` | 4883 | 5 | 614ms |
+
+* 11:26:53 ＝ gap 開閘後第一個 due row：**一個 call 收到一個 count**（`probe1 miss0`）、collect
+  140ms、**零 park**、零 miss。舊形狀（`probe4 miss3`、collect 1162–2307ms、每 pass 4 個已付費
+  但掉棄嘅 call）冇再出現。
+* 11:27:51 ＝ 被 gap 擋嘅 pass：note 尾 `cu-gate`、`probe0 miss0`、holder stage 0ms／**0 CU**，
+  due row 只報 `cut`（唔 park）。冇 paid call，所以個 pass 反而最短（614ms、5 trips）。
+* 11:24:26 嘅 `cut3` **唔係** gate（冇 `cu-gate`）：嗰個 pass 嘅 allowance 只有 `allow 2087`，而
+  開 probe 嘅條件係整個 cap（2400）要落喺 deadline 內 ⇒ 剩 2.0s 開唔到，三行照留隊頭。
+  即係 cap 2400 之後，**probe 只會喺 allowance ≥ ~2.4s 嘅 pass 出現**（今日讀數 2.0–4.9s）——
+  coverage 嘅真上限係 pass allowance，唔止係 gap。
+
+#### 4.4.2 Quota 賬目（同日實測）：holder probe 唔係大戶
+
+30,000 CU/月 係**全個 bot 共用**，而三個 Birdeye 消費者係：
+
+| 消費者 | 單價 | 次數/日（實測） | CU/月 |
+| --- | --- | --- | --- |
+| holder probe（§4.4 之後） | 20 CU（`/defi/token_overview`） | 24（gap 60 分鐘） | **14.4K** |
+| 卡片持有人數 `resolveHolderCount` | 20 CU（同上） | ~40–52（＝卡片數） | **24–31K** |
+| 卡片 `resolveTraderData` | **未核實**（`/defi/v2/tokens/top_traders`，repo 冇記錄單價） | ~40–52 | 未核實 |
+| `new_listing` backfill（4 次/日 × 1 chunk） | 30–80 CU | 4 | 3.6–9.6K |
+
+卡片數實測（`/debug/pushes.byDay`）：09-16 25、09-17 43、09-18 33、09-19 32、09-20 40、09-21 52、
+09-22 52、09-23（至 11:31Z）18 ⇒ **~40–52 張/日**。
+
+⇒ holder probe 嘅 14.4K 只係 quota 一半唔到，**卡片側嘅 `token_overview`（20 CU × 40–52 ＝ 24–31K）
+單獨就已經可以頂爆 30K**。今次**冇**動卡片側：改嘅係卡片顯示同 push 驗證嘅語意，唔應該順手做。
+
+兩個省 CU 嘅位（兩個來源都已經喺 repo 內）：
+
+* 卡片持有人數：同一張卡已經有 GMGN `holder_count`（`gmgn.ts`，0 Birdeye CU；卡片本身已有
+  `🧠 GMGN: 👤N` 一行），改用佢即省 20 CU × 40–52 ＝ **24–31K CU/月**。
+* tracker probe：同理改用 GMGN／Axiom 嘅持有人數，probe 就唔使 60 分鐘 gap，「30 行全輪」
+  可以由 1.25 日壓到 ~30 分鐘。
+
+CU 用量本身**冇任何計數器**（repo 內冇 Birdeye call 統計，`/debug/birdeye-overview` 只係手動
+probe），所以上表除咗 probe 一項之外都係由卡片數推算 —— 見 §4.5。
 
 ### 4.5 未做
 
@@ -348,18 +391,24 @@ CU 一爆 quota，Birdeye 會開始回 429／要求付款，probe 同卡片路�
   600ms，而個 pass 依然係 1/10 行）。要查係「scan 前排嗰個批次早已 429／被 cut，令
   `lastPairs` 空」定係「head 轉咗位令 10 個 address 全部唔喺 cache 内」。
 * `bumpScheduledTick` 本体仍然留喺 `Db`（legacy fallback 用），冇再喺正常 tick 出現。
+* **Birdeye 每日 CU counter**：卡片側（`resolveHolderCount` 20 CU、`resolveTraderData` 未核實）每次成功
+  都係一個 paid call，但冇儀器，§4.4.2 嘅 24–31K/月 係推算。要盯 quota 就要一個 counter（worker_state
+  每日一個 key，或在 pass 收尾把 in-memory 計數一齊 flush）。
+* **卡片側 CU**（§4.4.2）：持有人數改用 GMGN 已抓嘅 `holder_count`，同一個 coin 唔使再買一次
+  `token_overview`；同時要決定 `resolveTraderData`（`top_traders`）值唔值呢個 CU。
 
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **278 passed, 0 failed** ✅（fakes 已跟新 shape，`trips` invariant
-  仍然釘住；278 = 舊 277 ＋ §4.1 gate test；§4.3 只係重釘三條既有 test，冇新增條數）
+* `node scripts/test-unit.js` → **279 passed, 0 failed** ✅（278 → 279：§4.4 新增一條 CU-gate test；
+  fakes 已跟新 shape，`trips` invariant 仍然釘住）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
   → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809
-  **success**（1m16s）✅；`2b4b9fe`（§4.3 probe cap／slot）→ run 35851038091 **success**（1m20s）✅
+  **success**（1m16s）✅；`2b4b9fe`（§4.3 probe cap／slot）→ run 35851038091 **success**（1m20s）✅；
+  `66a9321`（§4.4 CU budget）→ run 35854326659 **success**（1m20s）✅
 * 上線後讀數：§3.1（第一刀）、§4.1.1（holder 由飢餓救返）、§4.2.1（row loop 一個 head 一個 trip）、
-  §4.3.1（`probe1 miss0` 同 collect 回落）
+  §4.3.1（`probe1 miss0` 同 collect 回落）、§4.4.1（`probe1 miss0` → 下一個 pass `cu-gate`）
 * 卡片側：`/debug/push-audit` 有帶 `sig` 嘅 follow-up entry（ARGUS 嘅 `ignite`／`liqwarn`／`drain`、
   HANDLES 嘅 `ignite` 等，30 條 ring），`/debug/push-watch.issueCount` = **1**
   （DeadCatBounce，2026-09-22 嘅舊 row）
