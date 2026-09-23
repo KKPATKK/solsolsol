@@ -6181,10 +6181,10 @@ async function main() {
     assert.equal(probes, 1, "the probe is attempted once");
     assert.equal(out.checked, 1);
     assert.ok(
-      elapsed >= 1_300,
-      `the cap carries the 200ms gate (1200 + 200), took ${elapsed}ms`,
+      elapsed >= 2_500,
+      `the cap carries the 200ms gate (2400 + 200), took ${elapsed}ms`,
     );
-    assert.ok(elapsed < 2_000, `the pass must return near the holder cap, took ${elapsed}ms`);
+    assert.ok(elapsed < 3_400, `the pass must return near the holder cap, took ${elapsed}ms`);
   });
 
   await test("PushWatcher: a MISSED holder probe parks its row (held N) and a success clears the park", async () => {
@@ -6242,8 +6242,8 @@ async function main() {
     // The other half of that move: probes are STARTED behind the pairs, so the
     // dispatch sees the pass's whole allowance — and still must not start what
     // the collect cannot reach (see the slot test below). This pass hands the
-    // stage a ~1_950ms slice, which is less than the 1_200 + 1_100 one gate
-    // costs, so only the single probe that needs no gate starts.
+    // stage a ~2_900ms slice, which covers the 2_400 + 1_100 one gate costs,
+    // so the single probe the stage starts is one it can wait out.
     const rows = [watchRow("AAA"), watchRow("BBB"), watchRow("CCC"), watchRow("DDD")];
     const updated = [];
     const holderWrites = [];
@@ -6251,7 +6251,8 @@ async function main() {
     const db = {
       ...watchDb(rows, updated),
       // The row loop is the pass's clock (Turso round trips): one batched trip
-      // that costs the whole 2s allowance leaves the tail nothing at all.
+      // that costs 1_600ms of the 4.5s allowance still leaves the stage room
+      // for the one probe its cap needs.
       claimPushWatchChecksMany: async (rows) => {
         await new Promise((r) => setTimeout(r, 400 * rows.length));
         for (const r of rows) updated.push([r.token, r.v]);
@@ -6269,8 +6270,8 @@ async function main() {
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
-    const out = await pw.runTick(Date.now() + 2_000);
-    assert.equal(probes, 1, "a slice shorter than gate + fetch starts only the gate-free probe");
+    const out = await pw.runTick(Date.now() + 4_500);
+    assert.equal(probes, 1, "one probe a pass is the rate the window needs");
     assert.equal(holderWrites.length, 1, "and the count it proves still lands");
     assert.ok(holderWrites.every(([, holders]) => holders === 321));
     assert.match(String(out.note), /holders \d+\/1/, `one batch write for it: ${out.note}`);
@@ -6285,12 +6286,14 @@ async function main() {
     // One rate gate serves every Birdeye call in the isolate
     // (BIRDEYE_REQUEST_INTERVAL_MS, 1100ms live — the stage shares it with the
     // scan's own Birdeye use). It is not a per-call queue: calls that arrived
-    // in the same window fire TOGETHER, so probe 0 pays the fetch and every
-    // later probe pays the fetch plus ONE gate (measured against the real
-    // client: 302 / 1_402 / 1_402 / 1_404ms). Live 2026-09-23 every pass with
-    // four due rows read `probe4 miss3` — three calls spent and three rows
-    // parked for the 10-minute backoff, for ONE count — because each probe's
-    // cap was the bare fetch cap.
+    // in the same window fire TOGETHER, so N probes cost ONE wait, not N — and
+    // the stage therefore starts ONE of them: the refresh window needs ~1
+    // count a minute (29 tracked rows / 30 minutes ≈ 0.97), while each extra
+    // probe is another Birdeye subrequest out of the invocation's 50 that the
+    // old 1_200ms cap collected as a miss (`probe4 miss3`: three calls spent,
+    // three rows parked for the 10-minute backoff, ONE count) — the endpoint's
+    // own live latency is 1_008–2_525ms (measured 2026-09-23 from the
+    // worker's egress), above that cap for five of six calls.
     const rows = [watchRow("AAA"), watchRow("BBB"), watchRow("CCC"), watchRow("DDD")];
     const updated = [];
     const holderWrites = [];
@@ -6310,14 +6313,18 @@ async function main() {
       null,
     );
     const out = await pw.runTick();
-    assert.equal(probes, 4, "the slice covers gate + fetch, so the whole due head starts");
-    assert.equal(holderWrites.length, 4, "every count comes back, in the one batch");
-    assert.match(String(out.note), /probe4 miss0/, `nothing is thrown away to the gate: ${out.note}`);
-    assert.match(String(out.note), /held0 cut0/, `every due row got its turn: ${out.note}`);
+    assert.equal(probes, 1, "one probe a pass — the rate the window needs");
+    assert.equal(holderWrites.length, 1, "and the count it brings back lands in the one batch");
+    assert.match(String(out.note), /probe1 miss0/, `nothing is thrown away to the gate: ${out.note}`);
+    assert.match(
+      String(out.note),
+      /held0 cut3/,
+      `the rows it cannot reach stay due, never parked: ${out.note}`,
+    );
 
-    // The cap carries the GATE, not just the fetch: with a 200ms interval both
-    // hanging probes settle at 1_400 — one gate plus the fetch cap — where the
-    // bare 1_200 used to collect them as misses.
+    // The cap carries the GATE, not just the fetch: with a 200ms interval the
+    // hanging probe is given 2_400 + 200 and settles there, where the old bare
+    // fetch cap used to collect it as a miss earlier.
     const hangRows = [watchRow("AAA"), watchRow("BBB")];
     const hangUpdated = [];
     let hangProbes = 0;
@@ -6332,13 +6339,13 @@ async function main() {
     const t0 = Date.now();
     const hangOut = await hangPw.runTick();
     const elapsed = Date.now() - t0;
-    assert.equal(hangProbes, 2, "a hanging probe does not stop the second slot from starting");
+    assert.equal(hangProbes, 1, "one slot, so one hanging probe — the second row stays due");
     assert.ok(
-      elapsed >= 1_300,
-      `each cap carries the 200ms gate (1200 + 200), so the pass waits for it: ${elapsed}ms`,
+      elapsed >= 2_500,
+      `the cap carries the 200ms gate (2400 + 200), so the pass waits for it: ${elapsed}ms`,
     );
-    assert.ok(elapsed < 2_300, `and returns as soon as they settle: ${elapsed}ms`);
-    assert.match(String(hangOut.note), /probe2 miss2/, `two turns, two misses: ${hangOut.note}`);
+    assert.ok(elapsed < 3_400, `and returns as soon as it settles: ${elapsed}ms`);
+    assert.match(String(hangOut.note), /probe1 miss1/, `one turn, one miss: ${hangOut.note}`);
   });
 
   await test("PushWatcher: a pass with no room for the probes reports its due rows as cut", async () => {
@@ -6358,7 +6365,7 @@ async function main() {
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
-    // 1s allowance: less than the 1200ms cap a probe needs, so none starts.
+    // 1s allowance: less than the 2400ms cap a probe needs, so none starts.
     const out = await pw.runTick(Date.now() + 1_000);
     assert.equal(probes, 0, "a probe with no room for its cap is never started");
     assert.equal(pw.holdersFailedAt.has("AAA"), false, "and nothing is parked for a probe that never ran");

@@ -219,11 +219,22 @@ const TRACKER_SEND_MIN_MS = 350;
  * 816 / 907 / 2_870 ms), i.e. 400ms sat below the endpoint's own common
  * latency AND the due list (oldest-check first, misses write nothing) only
  * ever re-offered those same slow rows — so the stage timed out on the same
- * four rows on every pass, forever. 1_200 covers the measured common range
+ * four rows on every pass, forever. 1_200 covered that day's measured range
  * and still respects the row loop: the probe only starts when the whole cap
  * fits inside the pass deadline, so the rotation always runs first.
+ *
+ * 2026-09-23: 1_200 → 2_400, measured again, because the ENDPOINT itself got
+ * slower (the cap was never the problem). The same probe from the worker's own
+ * egress against a live tracked mint (EYMBTNraihZkLhjVQhDivPhjAWFgRF1By2zVd8rcNcGz,
+ * `/debug/birdeye-overview`) answered 1_008 / 2_368 / 2_525 / 2_281 / 2_451 /
+ * 2_272ms — five of six calls above the old cap, where the same probe read
+ * 303–907ms for five of six two days earlier. A cap below the endpoint's own
+ * median collects the fastest call and throws the rest away: live, every pass
+ * read `probe4 miss3` — three Birdeye calls spent, three rows parked for
+ * TRACKER_HOLDER_BACKOFF_MS — for ONE count written, while `/health` showed
+ * the stage as healthy.
  */
-const TRACKER_HOLDER_CAP_MS = 1_200;
+const TRACKER_HOLDER_CAP_MS = 2_400;
 /**
  * How long the holder stage is willing to WAIT for the probes it started —
  * which is what decides HOW MANY it may start, because they all queue behind
@@ -239,12 +250,22 @@ const TRACKER_HOLDER_CAP_MS = 1_200;
  * gave every probe the bare fetch cap, so those three were reported as MISSES:
  * three Birdeye calls spent, three rows parked for TRACKER_HOLDER_BACKOFF_MS,
  * ONE count written — live `probe4 miss3` on every pass with four due rows.
- * The slice below covers one gate on top of the fetch cap (1_100 + 1_200 <
- * 2_400) and is clamped by the pass deadline, so the pass never starts a probe
- * it cannot collect; the rows it cannot reach stay DUE (reported as `cut`,
- * never parked) for the next pass.
+ * The slice below is exactly what the cap above charges a call — the fetch plus
+ * the one gate it may queue behind (2_400 + 1_100) — and is clamped by the pass
+ * deadline, so the pass never starts a probe it cannot collect; the rows it
+ * cannot reach stay DUE (reported as `cut`, never parked) for the next pass.
+ *
+ * It is also what makes the probe COUNT honest. Probes dispatched together
+ * fire in the same gate window, so N of them cost the same wall clock as one
+ * (that is why the old rule could start the whole head) — but each one is a
+ * Birdeye subrequest of its own out of the invocation's 50, and the refresh
+ * window only needs about one count a minute (29 tracked rows ÷ 30 minutes ≈
+ * 0.97 row/min, measured 2026-09-23). So the stage starts ONE probe per pass
+ * (see the slot rule at the dispatch): with the gate at 1_100ms and today's
+ * 2.3s endpoint, one queued call settles at ~3.5s — the most a ~4.8s pass can
+ * wait out — and the rest of the due head keeps its place as `cut`.
  */
-const TRACKER_HOLDER_STAGE_MS = 2_400;
+const TRACKER_HOLDER_STAGE_MS = 3_500;
 /**
  * Park a row whose holder probe MISSED its cap for this long — the stage's
  * negative cache (the same pattern as Scanner's `dataFailedAt`). Without it
@@ -2337,16 +2358,22 @@ export class PushWatcher {
         // What a probe costs on top of its fetch: ONE gate (see
         // TRACKER_HOLDER_STAGE_MS for the measured shape — the gate fires the
         // calls that queued behind it together, so extra probes do not stack
-        // cost). A slice that covers gate + fetch can serve the WHOLE due head;
-        // a shorter one is only worth the single probe that needs no gate,
-        // because every other probe would be collected as a miss and parked.
+        // cost). A probe whose whole cost the stage cannot wait out is started
+        // by neither rule below: it would be collected as a miss and parked.
         const intervalMs = Math.max(1, this.config.birdeyeRequestIntervalMs);
+        // What ONE probe is allowed to cost: its fetch plus the single gate it
+        // may queue behind — the same quantity the stage's collect waits out
+        // (see TRACKER_HOLDER_CAP_MS / TRACKER_HOLDER_STAGE_MS).
         const probeCapMs = TRACKER_HOLDER_CAP_MS + intervalMs;
-        const stageMs = Math.max(
-          0,
-          Math.min(TRACKER_HOLDER_STAGE_MS, deadline - Date.now()),
-        );
-        const holderSlots = stageMs >= probeCapMs ? cfg.maxHolderChecksPerTick : 1;
+        // ONE probe per pass — the rate the refresh window needs, not the whole
+        // due head (see TRACKER_HOLDER_STAGE_MS for the measurements: ~1 count a
+        // minute keeps a 30-minute window turning on ~30 tracked rows). Every
+        // extra probe is another Birdeye subrequest out of the invocation's 50,
+        // and the old cap threw 3 of every 4 of them away. The config cap stays
+        // the upper bound, so the table can be widened again by changing this
+        // rule alone; the rows it cannot reach are reported as `cut` and keep
+        // the front of the next pass's due list.
+        const holderSlots = Math.min(cfg.maxHolderChecksPerTick, 1);
         for (const r of due) {
           // The start condition is UNCHANGED — the whole cap must fit inside
           // the pass deadline — it is simply evaluated where the pass still has

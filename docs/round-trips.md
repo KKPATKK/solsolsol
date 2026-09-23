@@ -96,7 +96,7 @@ claim / prune / heal / holder 呢四項，全部係 `src/pushwatch.ts` 嘅 deep 
 
 ## 4. audit 剩返落嚟嘅嘢
 
-### 4.1 holder stage 嘅飢餓 — 已修（2026-09-23，未 deploy）
+### 4.1 holder stage 嘅飢餓 — 已修（2026-09-23，已 deploy `57e06c7`／`010d319`）
 
 第一節上線讀數揭到嘅唔係「冇 row due」，而係 stage 永遠起步唔到：佢排喺 pass 最尾，
 而佢自己嘅規矩係「probe 嘅整個 `TRACKER_HOLDER_CAP_MS`（1200ms）要 fit 得入 pass
@@ -153,11 +153,13 @@ deadline 才開始」—— 但 row loop 每次都先花光 allowance。讀數�
 5. 唯一未改善嘅係 Birdeye 自己嘅長尾（`/debug/birdeye-overview` 實測 323 / 323 /
    **2296**ms）：過 1200ms cap 嘅 probe 就算 miss（park 10 分鐘再試）。呢個係 cap 嘅原意，
    唔係 bug；要推高命中率先要動 `TRACKER_HOLDER_CAP_MS`，而家冇必要（見第 3 點）。
+   **2026-09-23 更正**：同一個 probe 再量係 `1_008–2_525ms`（六個裡面五個過 1200），即係
+   endpoint 自己慢咗一個量級 ⇒ cap 已經唔再係「原意」，變咗命中率嘅天花板。呢點就係 §4.3。
 6. 順帶一個不是今次改動嘅數字：`/debug/push-watch.issueCount` 3 → 4，新增嘅係
    04:17Z 嘅 `REALLY`（`lost_completion_write`，checked == alertAt）——時間戳比今次
    deploy（08:05Z）早四個鐘，同 holder 改動無關，但既然看到就照記。
 
-### 4.2 row loop 嘅 per-row CAS — 已修（2026-09-23，未 deploy）
+### 4.2 row loop 嘅 per-row CAS — 已修（2026-09-23，已 deploy `21521eb`）
 
 原本每個 silent row 一個 round trip（`claimPushWatchCheck`：CAS 同 check fields 同一個
 statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 … spend[rows 1388/5] trips 9`，
@@ -189,23 +191,104 @@ statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 …
 * 落線紀錄：`docs/patches/row-loop-batched-silent-claims.apply.js`
   （＋ `…fix1.apply.js` 綁 `now` 嘅編譯修正）。
 
-#### 4.2.1 上線後讀數
+#### 4.2.1 上線後讀數（2026-09-23 10:25–10:41Z，即 HKT 18:25–18:41；deploy `21521eb` @ 08:33Z）
 
-見 §5（deploy 後補上）。
+| pass（UTC） | note 尾段 |
+| --- | --- |
+| 10:25:31 | `ok:10/0 rows 10/30 pairs 10/10 miss 0 lost 0 allow 4860 spend[setup 244/2 heal 244/1 miss0 enrolled0 pairs 146/0 rows 158/1 holders 2286/1 held0 cut0 probe3 miss2] trips 6 db 1243ms` |
+| 10:38:46 | `ok:10/0 rows 10/30 pairs 10/10 miss 0 lost 0 allow 4862 spend[setup 548/3 heal 370/1 miss0 enrolled0 pairs 179/0 rows 133/1 holders 2307/1 held0 cut0 probe4 miss3] trips 7 db 1452ms` |
+| 10:40:09 | `ok:10/0 rows 10/30 pairs 10/10 miss 0 lost 0 undelivered 1 allow 4860 spend[setup 338/3 heal 224/1 miss0 enrolled0 pairs 163/0 rows 1261/4 holders 1162/1 held0 cut0 probe4 miss2] trips 10 db 1603ms` |
 
-### 4.3 未做
+1. **整個 head 一個 trip**：`rows 10/30`（舊基線 `rows 5/30`），而 silent 部分嘅價錢係
+   `rows 133–158ms/1`（舊 `rows 1388/5`，每行 ~150–400ms）——同一個 allowance 由 5 行變 **10 行
+   （head 上限）**，10 行只付一個 subrequest。呢個就係 §4.2 要買嘅嘢，量到咗。
+2. **`trips`**：silent head 6（setup 2 ＋ heal 1 ＋ 有 cut mark 時嘅 audit 1 ＋ rows 1 ＋ holders 1）、
+   alerting head 10（同一批再加 4 行 alerting path 嘅 claim／reserve／final write）。舊基線同樣 5 行係 9。
+3. **`db` 1243–1603ms**：pass 自己嘅 round trip wall time，比舊基線（`db 2398–4793ms`）低一截 ⇒
+   note 尾嗰個數字係回落嘅，唔係搬咗個成本去第二度。
+4. **`pairs 146–179ms/0`**：pair 階段由 `lastPairs`（本 tick scan 前排已為 head 付過嘅批次）服務，
+   冇自己去 DexScreener。同一段時間唯一一次見到 wire 上嘅係 10:29:19
+   （`pairs 601/0 pairs 1/10 miss 9`，601ms ≈ 600ms 嘅 `TRACKER_PAIRS_BUDGET_MS`，即係嗰個 pass
+   嘅 head 全部 miss 咗一次真 request）。所以 §4.4 嗰條「pair 重複讀」今日嘅形狀係 **0 個 HTTP**，
+   唔係一個 tick 兩次 request。
+5. **`miss 0 lost 0`**：head 10 行全部拿到 pair（新 head 每 pass 前進 10 行 ⇒ 30 行一輪約 3 分鐘，
+   舊基線 5 行一輪 = 6 分鐘）。10:40:09 嗰個 pass 帶 `undelivered 1`：一張卡嘅 send 唔成功，
+   rollback 照舊寫咗（下一步由 §11.3 嘅 audit ring 睇，唔靠 note）。
 
-* pair 階段嘅重複讀。
+### 4.3 holder probe 嘅 cap 同 slot — 已修（2026-09-23，未 deploy）
+
+上線後嘅 holder 讀數（09:54Z `ae269d4` 前後）：
+
+| 時間（UTC） | holder 段 |
+| --- | --- |
+| 10:25:31 | `holders 2286/1 held0 cut0 probe3 miss2` |
+| 10:38:46 | `holders 2307/1 held0 cut0 probe4 miss3` |
+| 10:40:09 | `holders 1162/1 held0 cut0 probe4 miss2` |
+
+即係 `ae269d4`（把一個 gate 收進 cap）**冇改變命中率**：仍然係 4 個 probe 起步、2–3 個 miss。
+量到嘅原因唔喺 gate，喺 endpoint：
+
+* `/debug/birdeye-overview` 對一個 live tracked mint（INURANUS 嗰個 token）由 **worker 自己嘅
+  egress** 連打六次：`1_008 / 2_368 / 2_525 / 2_281 / 2_451 / 2_272ms`。同一個 probe 喺
+  2026-09-21 係 `303–907ms`（六個裡面五個）⇒ **endpoint 兩日內慢咗一個量級**，而 cap 仍然寫住
+  1200：cap 落喺今日 median 之下，所以一個 pass 開 4 個 probe 就有 2–3 個一定撞 cap
+  （park 10 分鐘，個 count 掉咗）。
+* gate 本身唔係每個 probe 各付一次（同一 window 嘅 call 一齊 fire，`ae269d4` 嘅 stub 量到
+  `302 / 1_402 / 1_402 / 1_404ms` 就係咁）——所以「N 個 probe = 一個 wait」係真，但每個 probe
+  仍然係**一個獨立嘅 Birdeye subrequest**（invocation 嘅 50 之一），而舊 cap 之下 4 個裡面 3 個係白付。
+
+修法（三樣，全部由上面嘅量決定）：
+
+1. `TRACKER_HOLDER_CAP_MS` **1200 → 2400**（今日實測 median）。
+2. `TRACKER_HOLDER_STAGE_MS` **2400 → 3500** ＝ cap ＋ 一個 gate：collect 一定要蓋得住自己開嘅
+   bound，否則開咗都係 miss（呢個就係舊 shape 嘅 bug）。
+3. slot 規則由「slice 蓋得住 gate＋fetch 就開整個 due head」改成 **一個 pass 一個 probe**：
+   refresh window 只需要 ~1 count/min（29 行 ÷ 30 分鐘 ≈ 0.97，§4.1.1 已量），而每個額外 probe
+   係一個獨立 subrequest；`cfg.maxHolderChecksPerTick` 仍然係上限，所以想開返 head 只需改呢一行。
+
+**唔變嘅保證**：collect 仍然喺 row loop 之後、一個 batch 寫入；`holders_checked_at` 只喺成功時寫；
+拿唔到 count 嘅 due row 照舊報 `cut`（唔 park）；miss 照舊 park `TRACKER_HOLDER_BACKOFF_MS`。
+
+**代價（老實講）**：一個 pass 只 refresh 一行，而命中率 ≈ endpoint 回應喺 cap 之內嘅比例
+（今日 ≈ 2/3），所以 30 分鐘 window 會拉長到 ~45 分鐘。要更密就改 slot 規則一行（或者等 endpoint
+返去 300–900ms 再調返）。
+
+落線紀錄：`docs/patches/holder-probe-slots-measured.apply.js`（＋ `…fix1` 舊 wording、`…fix2`
+移除已無讀者嘅 local、`…tests.apply.js` 重釘三條 test）。測試：`test-unit.js` 由
+`probe4 / held0 cut0` 變 `probe1 miss0 / held0 cut3`，hanging 半由 `probe2 miss2`（1_400ms）變
+`probe1 miss1`（2_600ms）⇒ **278 passed, 0 failed**（詳見 §5）。
+
+### 4.4 未做
+
+* pair 階段嘅重複讀。今日嘅讀數（§4.2.1 第 4 點）話正常 pass 係 `pairs 179/0`——由 `lastPairs`
+  服務，即喺同一個 tick 内並冇重複嘅 HTTP。但仍然有一條唔清楚嘅：10:29:19 嗰個
+  `pairs 601/0 pairs 1/10 miss 9`，即係 head 全 miss 嘅一次真 request（一個 subrequest 加
+  600ms，而個 pass 依然係 1/10 行）。要查係「scan 前排嗰個批次早已 429／被 cut，令
+  `lastPairs` 空」定係「head 轉咗位令 10 個 address 全部唔喺 cache 内」。
 * `bumpScheduledTick` 本体仍然留喺 `Db`（legacy fallback 用），冇再喺正常 tick 出現。
 
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **277 passed, 0 failed** ✅（fakes 已跟新 shape，
-  `trips` invariant 仍然釘住；277 = 舊 275 + §4.1 嘅兩條 holder 測試）
+* `node scripts/test-unit.js` → **278 passed, 0 failed** ✅（fakes 已跟新 shape，`trips` invariant
+  仍然釘住；278 = 舊 275 + §4.1 嘅兩條 holder 測試 + §4.3 重釘嘅三條）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
-* push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅
-* 上線後第一節讀數：見 §3.1（本地三項 + 線上七項都照 §3 走）
+* push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
+  → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809
+  **success**（1m16s）✅
+* 上線後讀數：§3.1（第一刀）、§4.1.1（holder 由飢餓救返）、§4.2.1（row loop 一個 head 一個 trip）、
+  §4.3（holder probe 嘅 cap 同 slot 為何要再調）
+* 卡片側：`/debug/push-audit` 有帶 `sig` 嘅 follow-up entry（ARGUS 嘅 `ignite`／`liqwarn`／`drain`、
+  HANDLES 嘅 `ignite` 等，30 條 ring），`/debug/push-watch.issueCount` = **1**
+  （DeadCatBounce，2026-09-22 嘅舊 row）
+* **仍然未解（同呢兩刀無關）**：invocation 嘅 subrequest 上限照樣咬 —— 抽樣期間
+  `/debug/tick.summary.pushWatch` 出 `err:Too many subrequests …`（10:26Z），而 10:27:09 開嘅 pass
+  個 note 一直停留喺 `phase:"running"` 直到 10:29:19 下一個 pass 接手（2 分 10 秒）；120 行
+  scan-history ring 有 **4 條** dead row（08:59:48／09:34:48／10:20:48 三條
+  `previous tick died before its completion flush`，加 08:57:14 一條 race cut）。呢三條係 §18.2
+  講嘅「偵測延遲」（68–82s），**唔係** tick 跑咗咁久：ring 内 `ms >= 100000` 係 **0** 條
+  （之前見過嘅 6 位數 ms 今次冇再出現），而 `cut:watchdog` 亦冇再出現。下一步只可以繼續減
+  invocation 內嘅 subrequest（§4.4）。
 
 ## 6. 點解要一個 script 落呢個改動
 
