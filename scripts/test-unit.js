@@ -19,7 +19,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
@@ -1250,7 +1250,15 @@ async function main() {
     const pw = makeWatcher(db, { api: { sendMessage: () => new Promise((res) => { settle = res; }) } });
     const out = await pw.runTick(Date.now() + 1_500, (p) => held.push(p));
     assert.equal(out.undelivered, 1, "the send missed its slice: the card is CUT");
-    assert.equal(held.length, 1, "the cut's proof promise is handed to the tick");
+    // TWO promises ride the tick for this row: the reservation → final-write
+    // span hold (holdRowSpan — created before the reservation, released by
+    // the final write) and this cut's proof. The SECOND is the one whose
+    // settlement writes the audit entry.
+    assert.equal(
+      held.length,
+      2,
+      "the span hold AND the cut's proof are handed to the tick",
+    );
     assert.equal(delivered.length, 0, "nothing is written while the request is still in flight");
     settle({ message_id: 99 });
     await Promise.all(held);
@@ -6244,6 +6252,91 @@ async function main() {
     assert.equal(out.checked, 1, "the row's bookkeeping still lands");
     assert.equal(updated.length, 1, "the pass finishes the row it started");
     assert.ok(elapsed < 2_500, `the pass must return near the send cap, took ${elapsed}ms`);
+  });
+
+  await test("PushWatcher: the reservation → final-write span is HELD for the tick", async () => {
+    // docs/duplicate-cards.md §17.5, third bullet. The reservation commits the
+    // transition BEFORE the send, so between it and the final
+    // `updatePushWatchCheck` the row is announced to every other isolate with
+    // none of the bookkeeping that says so. An abandoned pass used to die in
+    // that gap (nothing kept the isolate alive for it), and the next pass read
+    // the reservation and refused to re-fire: a silent missing card.
+    const alerting = (token) =>
+      watchRow(token, { mcapAtPush: 10_000, peakMcap: 10_000 });
+    // 10x the push mcap, so the row really has a card to send.
+    const pairsUp = async (addrs) =>
+      new Map(addrs.map((a) => [a, { ...watchPair(a), marketCap: 100_000 }]));
+
+    // ---- the span is held, and the FINAL WRITE releases it ----------------
+    const updated = [];
+    const db = watchDb([alerting("AAA")], updated);
+    // Hold the final write pending: that is the one moment the row is
+    // reserved-but-unwritten, and therefore the only moment the hold is
+    // load-bearing.
+    let finishFinal;
+    db.updatePushWatchCheck = (token, v) =>
+      new Promise((res) => {
+        finishFinal = () => { updated.push([token, v]); res(); };
+      });
+    const held = [];
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      null,
+      loadConfig({}),
+      pairsUp,
+      null,
+    );
+    const running = pw.runTick(Date.now() + 2_500, (p) => held.push(p));
+    for (let i = 0; i < 60 && !finishFinal; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(finishFinal, "the pass reached the row's final write");
+    assert.equal(held.length, 1, "the reservation → final-write span is handed to the tick");
+    let settled = false;
+    void held[0].then(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(settled, false, "still held while the final write is in flight");
+    finishFinal();
+    await running;
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(settled, true, "the final write releases the hold (not the timer)");
+    assert.equal(updated.length, 1, "the row's bookkeeping landed");
+
+    // ---- a LOST reservation releases at once ------------------------------
+    const updated2 = [];
+    const db2 = watchDb([alerting("BBB")], updated2);
+    db2.reservePushWatchAlert = async () => false;
+    const held2 = [];
+    const pw2 = new PushWatcher(db2, watchBot, null, loadConfig({}), pairsUp, null);
+    const t0 = Date.now();
+    await pw2.runTick(Date.now() + 2_500, (p) => held2.push(p));
+    const elapsed2 = Date.now() - t0;
+    assert.equal(held2.length, 1, "the span is held even across a reservation attempt");
+    let settled2 = false;
+    void held2[0].then(() => { settled2 = true; });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(settled2, true, "a lost reservation releases the span immediately");
+    assert.ok(
+      elapsed2 < TRACKER_ROW_SPAN_HOLD_MS,
+      `the pass returned before the timer could have released it (${elapsed2}ms)`,
+    );
+    assert.equal(updated2.length, 1, "the loser still writes its check fields");
+
+    // ---- the bound itself ------------------------------------------------
+    // It has to COVER the span's worst case (the send window plus the audit
+    // insert and the final write, each inside the row leash) or the hold
+    // releases while the span is still running, and it has to FIT INSIDE the
+    // pass's own envelope (the watchdog's 8s overrun) or a hold could outlive
+    // the pass it exists to protect.
+    assert.ok(
+      TRACKER_ROW_SPAN_HOLD_MS >= 1_000 + 2 * 1_500,
+      "covers the send cap plus two row-leash writes",
+    );
+    assert.ok(
+      TRACKER_ROW_SPAN_HOLD_MS <= 8_000,
+      "fits inside the pass envelope the watchdog bounds",
+    );
   });
 
   await test("PushWatcher: a hanging Birdeye holder probe is capped and skipped", async () => {
