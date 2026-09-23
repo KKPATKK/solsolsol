@@ -1358,6 +1358,47 @@ export class PushWatcher {
     }
   }
 
+  /**
+   * The tick's `waitUntil` hand-off, when the caller has one (see runTick).
+   *
+   * Held on the instance for the duration of a pass rather than threaded
+   * through every call site: the two places that need it (a CUT card's late
+   * settle and the terminal card's background settle) both sit deep inside
+   * the row loop and the send helper, and a pass is serial per isolate.
+   */
+  private keepAliveForTick: ((promise: Promise<unknown>) => void) | null = null;
+
+  /**
+   * Hold a promise this pass CANNOT await.
+   *
+   * Both callers write the ONLY proof their card's delivery will ever produce
+   * (a per-card `followup` audit entry, see deferrallog.cardProofKey), and
+   * both are created at the pass's tail — where an un-awaited promise is
+   * CANCELLED the instant the handler returns. Live 2026-09-23: 12 `p:` marks,
+   * ZERO of them with a proof in the ring, so `deduped` could never become
+   * true: `dup-skip` was unreachable and the duplicate it exists to stop went
+   * out on the next check instead. Same cancellation the worker's
+   * tickWaitUntil was built for (the deferred token_stats writes measured 100%
+   * loss without it).
+   *
+   * Nothing here changes what the pass DECIDES: the rollback, the attempt mark
+   * and the re-announce have all already happened. Only the bookkeeping is kept
+   * alive, so losing it costs a duplicate, never a miss.
+   */
+  private holdForTick(promise: Promise<unknown>): void {
+    const keepAlive = this.keepAliveForTick;
+    if (!keepAlive) {
+      void promise;
+      return;
+    }
+    try {
+      keepAlive(promise);
+    } catch {
+      // A stale/absent execution context must never break the send loop.
+      void promise;
+    }
+  }
+
   constructor(
     private readonly db: Db,
     private readonly bot: {
@@ -1481,8 +1522,18 @@ export class PushWatcher {
    * tokens came back from the pair batch, and why the rest were skipped. That
    * exists so a starved tracker is visible in /health instead of reporting a
    * healthy-looking `ok:0/0`.
+   *
+   * `keepAlive` is the tick's `waitUntil` hand-off, when the caller has one
+   * (the worker passes `tickWaitUntil`). It exists so the two proof writes
+   * this pass cannot wait for — a CUT card's late settle, and the terminal
+   * card's background settle — are HELD instead of cancelled with the handler
+   * (see holdForTick). Optional: tests and any non-worker caller keep the
+   * plain fire-and-forget behaviour.
    */
-  async runTick(deadlineMs?: number): Promise<{
+  async runTick(
+    deadlineMs?: number,
+    keepAlive?: (promise: Promise<unknown>) => void,
+  ): Promise<{
     checked: number;
     alerted: number;
     /**
@@ -1529,6 +1580,8 @@ export class PushWatcher {
      */
     terminalAbandonedTotal?: number;
   }> {
+    // The tick's waitUntil hand-off, when the caller has one (see holdForTick).
+    this.keepAliveForTick = keepAlive ?? null;
     const cfg = this.config.pushWatch;
     const now = Date.now();
     const budgetMs =
@@ -2408,6 +2461,7 @@ export class PushWatcher {
               a.text,
               sendLeft,
               now,
+              a.sig,
             );
             if (outcome.outcome === "abandoned") {
               // We stopped WAITING, which is not a failure: the card may
@@ -2454,7 +2508,14 @@ export class PushWatcher {
             )) as { message_id?: unknown } | null;
             if (sent === null) {
               attempts.push({ sig: a.sig, at: attemptAt });
-              void inFlight.then(
+              // The ONLY proof this request will ever produce — and it must be
+              // HELD, not merely started (see holdForTick). This chain is
+              // created at the pass's tail, so an un-awaited promise here is
+              // cancelled when the handler returns and the cut leaves NO audit
+              // entry at all: the live shape measured 2026-09-23 (12 marks, 0
+              // proofs), and the reason the dedupe above could never refuse
+              // anything.
+              const proof = inFlight.then(
                 async (late) => {
                   try {
                     await this.db.recordPushDelivery({
@@ -2479,6 +2540,7 @@ export class PushWatcher {
                   /* a rejection writes nothing: the card is re-sent */
                 },
               );
+              this.holdForTick(proof);
             }
           }
           if (sent === null) {
@@ -2684,6 +2746,12 @@ export class PushWatcher {
     text: string,
     sendLeft: number,
     now: number,
+    /**
+     * The 💧 card's own transition (`drain`). The audit entry its late settle
+     * writes has to NAME the card, or it lands on the coarse TOKEN key that a
+     * NEIGHBOUR's delivery can satisfy — the silent-miss shape §7.1 names.
+     */
+    sig: string,
   ): Promise<TerminalSendOutcome> {
     // The keyboard rides the terminal card only (see resumeTrackingKeyboard):
     // every other follow-up card re-derives itself on the next pass, so the
@@ -2721,7 +2789,11 @@ export class PushWatcher {
       // chat, and the audit entry written here is hard proof Telegram accepted
       // it. Errors are swallowed — this runs after the pass has moved on, the
       // same contract as the initial card's background chain.
-      void settled.then(async (late) => {
+      // HELD for the tick, like the cut path's proof (see holdForTick): this
+      // chain is created after the pass has already moved on, so an un-awaited
+      // promise is cancelled at the handler's return. Losing it costs the 💧
+      // card's own proof — the row is then re-armed into a duplicate.
+      const settle = settled.then(async (late) => {
         if (late.outcome !== "sent") return; // a rejection leaves the record
         try {
           await this.db.recordPushDelivery({
@@ -2732,12 +2804,14 @@ export class PushWatcher {
               (late.message as { message_id?: unknown })?.message_id ?? 0,
             ),
             kind: "followup",
+            sig,
           });
         } catch {
           /* audit is best-effort */
         }
         await this.clearAbandonedTerminalCard(row.chatId, row.token);
       });
+      this.holdForTick(settle);
     }
     return raced;
   }

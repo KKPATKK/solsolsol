@@ -1161,6 +1161,49 @@ async function main() {
     assert.equal(out3.deduped, 0);
   });
 
+  await test("PushWatcher: a CUT card's proof is HANDED to the tick, so the invocation cannot cancel it", async () => {
+    // The proof a cut send produces is an un-awaited promise created at the
+    // pass's tail, and an un-awaited promise is cancelled the moment the
+    // handler returns — the shape the worker's tickWaitUntil was built for.
+    // Live 2026-09-23: 12 cut marks, ZERO of them with a proof in the ring, so
+    // the dedupe could never fire (`dup-skip` unreachable) and the duplicate
+    // went out on the next check instead. The hook has to receive the EXACT
+    // promise whose settlement writes that audit entry.
+    const deadRow = (over = {}) =>
+      termRow({ peakMcap: 240_000, mcapAtPush: 170_000, upStages: null, lastLiquidity: 32_000, ...over });
+    const deadPair = (token) => ({ ...termPair(token, 32_000), marketCap: 59_000 });
+    const makeWatcher = (db, bot) =>
+      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, deadPair(a)])), null);
+
+    const db = termDb([deadRow()]);
+    const delivered = [];
+    db.recordPushDelivery = async (e) => { delivered.push(e); };
+    let settle;
+    const held = [];
+    const pw = makeWatcher(db, { api: { sendMessage: () => new Promise((res) => { settle = res; }) } });
+    const out = await pw.runTick(Date.now() + 1_500, (p) => held.push(p));
+    assert.equal(out.undelivered, 1, "the send missed its slice: the card is CUT");
+    assert.equal(held.length, 1, "the cut's proof promise is handed to the tick");
+    assert.equal(delivered.length, 0, "nothing is written while the request is still in flight");
+    settle({ message_id: 99 });
+    await Promise.all(held);
+    assert.equal(delivered.length, 1, "awaiting the HELD promise is what lands the proof");
+    assert.equal(delivered[0].kind, "followup");
+    assert.equal(delivered[0].sig, "dead", "stamped with the cut card's own transition");
+
+    // No hook → the old fire-and-forget behaviour, unchanged: a request that
+    // settles in time still writes its proof (tests, and any non-worker caller).
+    const db2 = termDb([deadRow()]);
+    const delivered2 = [];
+    db2.recordPushDelivery = async (e) => { delivered2.push(e); };
+    let settle2;
+    const pw2 = makeWatcher(db2, { api: { sendMessage: () => new Promise((res) => { settle2 = res; }) } });
+    await pw2.runTick(Date.now() + 1_500);
+    settle2({ message_id: 100 });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(delivered2.length, 1, "no hook → the best-effort write is unchanged");
+  });
+
   await test("PushWatcher: a DELIVERED card is not re-announced when a later sibling is held back (POPEYE)", async () => {
     // Push $100K, peak $400K, now $240K: +140% off the push crosses the 🚀 +100%
     // milestone and -40% off the peak is the ⚠️ w35 card, so ONE pass carries

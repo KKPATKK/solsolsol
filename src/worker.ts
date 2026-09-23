@@ -2467,7 +2467,18 @@ async function runScan(
       );
       if (scanner && trackerBudgetMs > 0) {
         try {
-          await scanner.runTrackerPass(Date.now() + trackerBudgetMs);
+          // Hold the pass's cut-card proofs for this tick (see
+          // pushwatch.holdForTick): the audit entry a CUT send produces is an
+          // un-awaited promise at the pass's tail, and an un-awaited promise is
+          // cancelled the instant this handler returns — which is why the proof
+          // never landed and `dup-skip` never fired (live 2026-09-23: 12 `p:`
+          // marks, 0 with a proof). Nothing about the pass's decisions changes;
+          // only its bookkeeping is kept alive.
+          const holdTick = tickWaitUntil;
+          await scanner.runTrackerPass(
+            Date.now() + trackerBudgetMs,
+            holdTick ? (p: Promise<unknown>) => holdTick(p) : undefined,
+          );
         } catch (err) {
           console.error(
             "[worker] tracker pass failed:",

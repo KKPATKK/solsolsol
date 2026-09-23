@@ -244,4 +244,140 @@ Deploy：「Deploy Worker to Cloudflare」成功（run 35800552243，00:06:28Z �
 一次寫入 ＋ 已證實嘅卡原封帶落去）、`cut-card-dedupe-audit-sig`（audit entry type 加 `sig`）、
 `cut-card-dedupe-attempt-clock`（把 attempt 時鐘讀提升到 terminal／非 terminal 分支之上，兩條路都用到）、
 `pass-note-awaited`（scanner：note 由 race 改 await）、`cut-card-dedupe-popeye-test`（regression test）。
+第三修（09-23，見 §11）：`cut-card-proof-held`（cut／terminal 嘅 proof 由 fire-and-forget 改成 tick 嘅 waitUntil 代持，
+terminal settle 嘅 audit entry 補上 `sig`）——同前面幾塊一樣係獨立 patch，`git apply --recount` 可重播，`-R` 可還原。
 反向 `git apply -R` 亦實測過（negative control）。
+
+## 十、唔會漏卡嘅完整檢查（2026-09-23，`b77f7eb`）
+
+問題係 operator 嗰句：**已完成嘅改動會唔會令卡漏推**（合資格幣嘅推送 ＋ 跟進卡）。方法係逐條
+「唔送」嘅出口驗，再喺線上量 mark 同 proof 嘅實際形狀。
+
+### 10.1 合資格幣嘅推送路徑：改動碰唔到
+
+* `git log --name-only`（`0eb053d` → `b77f7eb`）只改 `src/pushwatch.ts`、`src/deferrallog.ts`、
+  `src/db.ts`（audit entry 加 `sig`）、`src/scanner.ts`（**只有** `persistPassNote`）、`scripts/test-unit.js`
+  同 docs —— 冇一個 scan／gate／push 嘅檔案。
+* `persistPassNote` 嘅唯一呼叫者係 `Scanner.runTrackerPass`（1787／1810／1824），而 `worker.ts:2470`
+  喺 **completion flush 之後**才叫佢（flush 2309–2440）⇒ scan 嘅推送結果已經落地，note 等幾耐都只係
+  蝕自己嗰行 telemetry（連 tail 都蝕埋嘅話，下一 tick 重寫）。線上支持：note `at` 01:06:26Z、
+  `trackerMs 4821`、`rows 8/30 miss 0 lost 0 budget-cut`。
+
+### 10.2 跟進卡：每一個「唔送」都要求同一張卡嘅交付證據
+
+| 出口 | 觸發條件 | 卡會去邊 |
+|---|---|---|
+| `deduped`（公告唔送） | 有 `p:<sig>` attempt mark **＋** 同一 token 同一 sig 嘅 proof ≥ mark 時間 | 唔送；但張卡一個 cut 之前已經入咗 chat（transition／`followupsSent`／`lastAlertAt` 照落） |
+| 延後一個 check | mark 屬於 row 最近一次 check（同一分鐘桶）而 proof 未讀到 | 唔送唔公告、量測照行；mark 用**自己**時間戳寫返（唔會自己延長）⇒ 下一個 check 冇 proof 就照送 |
+| rollback | 卡被切／timeout／throw／send slice 用盡 | `undelivered` ＋ make-up 集合；公告欄位回捲 ⇒ 下一 tick 重新推導 |
+| terminal abandoned | 💧 卡唔再等 | tracked state 保留 ＋ durable unconfirmed 記錄 ⇒ 冇 proof 就 re-arm 重推 |
+| proof 讀唔到（ring throw／`getPushAudit` 缺席） | — | 當「冇證據」⇒ 照送（fail-open） |
+| proof 舊過 mark、或者另一個 sig | — | 照送 |
+
+唯一「唔送」嘅出口係 `deduped`，而佢**必須**有一張同 card 嘅 proof；掉返轉，所有失敗路徑都終結於「送」。
+
+### 10.3 mark 嘅壽命：舊 mark 壓抑唔到新卡
+
+* **active row**：stage／weak／liq／div 一整段都喺 `if (cooledDown)` 內，而 `announcedUpStages = csv` 嘅
+  比較係同 `row.upStages`（**連 `p:` 一齊**）比 ⇒ 只要 CSV 有 `p:` mark，第一個過咗 cooldown 嘅 check
+  就會寫返個唔含 `p:` 嘅 column，mark 用一次就冇。cooldown 之內根本冇卡 fire（🩸 例外，但佢有 1h pace，
+  走唔出 mark 嘅生命期）。
+* **terminal row**：`dead` 分支回 `announcedUpStages: undefined`（COALESCE 保留原狀），所以 mark 會長留 ——
+  但同一個 sig 要再 fire 一定要經 `revive`，而 `revive` 寫 `""` 清空 column。所以「舊 mark ＋ 舊 proof」
+  壓抑「新 transition」呢條路走唔通。
+* 實測（01:0xZ，12 個活 `p:` mark）：最舊 451 分鐘（BIRDDOG），全部係 terminal row。
+
+### 10.4 一個真正 fail-closed 嘅窄縫（已量度，已自行收窄）
+
+`proofFor(sig)` 嘅 token 級 fallback 只喺 **exact key 缺席**時被問，所以同一 token 嘅**另一張**卡（唔同 sig、
+entry 冇 `sig` —— 即 deploy 前寫落）喺 ≥ mark 桶嘅時間送到，就可以「證明」一張根本冇送到嘅 cut 卡 ⇒ 靜默漏。
+呢個正係 §7.1 指名嘅 bug，只係為 legacy entry 而保留（§7.2）；方向唔係保證 fail-open。
+
+線上量度（01:0xZ）：12 個 mark 之中 **2 個** 嘅桶舊過同一 token 嘅 sig-less entry —— UAP `w45`（桶 23:33 vs
+entry 23:56:15）、kirkinu `dead`（桶 23:30 vs 23:55:15）—— 但兩條都 `lastState=dead`，同 sig 唔可能再 fire
+（見 10.3）⇒ **實際暴露 0**。而且所有 sig-less entry 都係 deploy（00:06:28Z）之前寫嘅（最遲 00:06:17Z），
+ring 30 筆一轉就冇，新 entry 一律帶 `sig`（見 10.5）⇒ 窄縫會自己閂。改走呢個 fallback 會令 ring 裡面嗰 17 張
+冇 `sig` 嘅卡即刻冇得 dedupe，所以唔改。
+
+### 10.5 §8.4 掛住嗰個 ⏳ 落實：audit 帶 `sig`
+
+`/debug/push-audit`（01:06Z）：30 筆之中 28 張 followup，**11 筆帶 `sig`**（`w35`、`revive`、`liqwarn`、
+`ignite`、`up100`、`dead`），全部係 deploy 之後寫嘅 ⇒ §7.4 第二條線上落地，新卡嘅 proof 由 token 級升級到
+per-card。`dup-skip` 仍然未出現，而且讀得出為咩：12 個活 mark 之中 **0 個**有 exact proof（＝未有嘗試喺
+「proof 已到」嘅情況下被重新推導）—— 同 §8.2／8.4 一致。
+
+### 10.6 測試
+
+* `npm run build`（tsc）：0 error。
+* `node scripts/test-unit.js`：**269 passed, 0 failed**（含 POPEYE regression、cut-mark、
+  `deliveredFollowupProofs`、attempt-clock）。
+* `node scripts/test-deferred-priority.js`：pass。`node scripts/test-tick-path.js`：pass
+  （含 `card-send outcome (cut / delivered / deferred)`、`duplicate-card counter (audit ring → heartbeat)`）。
+
+### 10.7 結論
+
+冇發現需要修嘅漏卡路徑，所以呢次落地嘅只有呢份記錄（10.4 嘅窄縫係 legacy entry 限定、方向已知、已自行收窄）。
+
+## 十一、`dup-skip` 為何一直未出現，同一個真正觸發得到嘅場景（2026-09-23，`b77f7eb` ＋ `cut-card-proof-held`）
+
+問題係 operator 嗰兩句：**再查一次 `dup-skip` 未出現嘅原因**，同 **設計一個可以喺線上真正觸發 dedupe 嘅場景**。
+
+### 11.1 四個條件，斷喺邊一個
+
+`deduped` 要同時成立四件事：
+
+| # | 條件 | 現狀 |
+|---|---|---|
+| A | 一張卡被 **cut**（send slice 用完）而寫低 `p:<sig>` mark | ✅ 有（12 個活 mark）——但 cut 本身罕有：要 Telegram 一次 send 慢過 350–1000ms |
+| B | 同一個 sig 喺**之後**嘅 check 被重新推導 | ❌ **主因**：11/12 個 mark 都坐喺 `lastState=dead` 嘅 row（💀 已經落地，silent-watch 唔會再推同一個 sig，只有 `revive` 會清 column）——即 §8.2 嗰個原因，仍然成立 |
+| C | proof 真係寫入 audit ring | ❌ **新發現，真正嘅阻塞點**：cut 路徑嘅 proof 係 `void inFlight.then(...)`（`pushwatch.ts`）——**一個喺 pass 尾端建立、冇人 await 嘅 promise**。Cloudflare 喺 handler return 嗰刻會取消未 await 嘅 promise，repo 自己為咗同一件事整咗 `tickWaitUntil`（註釋：deferred writes 冇佢之下 100% 失敗）⇒ proof 通常根本冇寫入 |
+| D | proof 係 per-card | ❌ terminal（💧）卡嘅背景 settle 寫 audit entry 時**冇帶 `sig`** ⇒ 只入 token key（粗），精準唔到 |
+
+量到嘅讀數（01:0xZ）：12 個活 `p:` mark，**0 個**有 exact proof。最硬嘅一個樣本係 **PICKAXE**：
+mark `p:revive:29835415`（00:55）**完全在 ring 窗口（23:50–01:06）之內**，而 ring 裡面一個 PICKAXE entry 都冇
+——即係「request 真係冇送達」或者「送達咗但冇 audit」，両者都指向同一個結論：**cut 卡嘅 proof 信唔過**。
+跟住嘅連鎖反應就係 operator 見到嗰個重複：冇 proof ⇒ `deduped` 永遠唔會 true ⇒ 下一個 check 照送。
+
+### 11.2 修法：`docs/patches/cut-card-proof-held.patch`
+
+| 位置 | 改動 |
+|---|---|
+| `src/pushwatch.ts` | 新增 `keepAliveForTick` ＋ `holdForTick(promise)`（有 hand-off 就交出去，冇就照舊 fire-and-forget） |
+| 同上（cut 路徑） | `void inFlight.then(...)` → `const proof = ...` ＋ `this.holdForTick(proof)` |
+| 同上（terminal settle） | 背景鏈一樣改成 `settle` ＋ hold；audit entry 補上 `sig`（＝ `drain`）⇒ D 補完 |
+| `src/scanner.ts` | `runTrackerPass(deadlineMs, keepAlive?)` 原有參數不變（可選），一路傳落 `runTick` |
+| `src/worker.ts` | 呼叫時傳 `tickWaitUntil`（cron 路徑一定有）。**限制**：`tickWaitUntil` 只在 `scheduled` 內被設；由 HTTP 觸發、而之前未受過 cron 嘅 isolate 係 null ⇒ 退回火-and-forget（deferred writes 今日一樣有呢個限制，唔係新問題） |
+| `scripts/test-unit.js` | 新測試：cut 卡嘅 proof promise **真係交咗給 tick**，`await Promise.all(held)` 之後 audit 才落地；冇 hook 時行為不變 |
+
+方向：呢個改動只令「已經發生嘅 rollback＋mark＋re-announce」嗰筆**記帳**落得實，**唔會改變 pass 任何一個決定**
+（唔會多送、唔會少送）⇒ 冇新增漏卡方向；失去它只會賠一張重複卡，即係現狀。
+
+### 11.3 一個真正可以喺線上觸發嘅場景
+
+要四個條件同時成立。最現實嘅入口唔係「一個 pass 帶兩張卡」（§8.5：現時 0 條 row 做得到），而係**任何一個 cut 之後嗰條 row 嘅 transition 仍然可推導**：
+
+1. 一條 **active** row（`lastState` 唔係 `dead`／`rug`／`expired`／`unwatched`）；
+2. 佢喺某個 pass 被 cut ⇒ `up_stages` 出現 `p:<sig>:<bucket>`；
+3. 該 sig 仲可以 re-derive（`dead`：`lastState` 未係 `dead`；`w45`：drawdown 仍 ≤ -45%；`drain`：仍然 sub-floor）；
+4. 下一個 check 之前 Telegram 答咗 ⇒ proof 入 ring（修完之後由 `tickWaitUntil` 保證）。
+
+**驗收讀法（唔可以只睇 note）**：
+
+| 讀邊度 | 要見到 | 意思 |
+|---|---|---|
+| `/debug/push-audit` | 一條 `followup`，`token`＝該 row、`sig`＝該 mark 嘅 sig、`at` ≥ mark bucket | proof 落地（C/D 修好） |
+| `/debug/push-watch?limit=200` | 下一個 check 之後：`upStages` 冇咗 `p:`、`lastState` 變成該 sig 嘅狀態、而 `followupsSent` **冇升** | 公告但冇送 ⇒ dedupe 真正觸發 |
+| `/health.pushWatchPass.note` | 該 pass 出現 `dup-skip 1` | 計數器（note 已不再被遺棄，所以睇得到） |
+
+**實際操作**：每 1–2 分鐘拉一次 `/debug/push-watch?limit=200`，揀出「有 `p:<sig>` 而 `lastState` ≠ 該 sig 對應狀態」嗰條 row
+（例如 `p:dead` 但 `lastState` 係 `null`/`weak`/`up*`）＝候選；跟住嗰 2–3 個 check 就係睇 audit 有冇該 `(token, sig)`、
+row 有冇被 announce 而冇送。cut 大約每小時一次（12 個 mark／十幾小時），所以候選唔會等太久。
+
+**Offline 對照（已 pin）**：`PushWatcher: a CUT card's proof is HANDED to the tick, so the invocation cannot cancel it`（新）、
+`evaluateWatch: an attempt from the row's last check is not re-sent while its proof is missing`、
+`PushWatcher: a CUT card leaves a mark, a late send proves itself, and the next pass refuses the duplicate`（Pass 2 就係 `dup-skip 1`）。
+
+### 11.4 測試
+
+`npm run build` → 0 error；`npx tsc --noEmit` → 乾淨；`node scripts/test-unit.js` → **270 passed, 0 failed**（新增一條）；
+`test-deferred-priority.js` → pass；`test-tick-path.js` → pass。

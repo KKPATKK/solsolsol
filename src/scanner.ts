@@ -1783,12 +1783,20 @@ export class Scanner {
    * caller only has to bound the wall clock, and the note is published on the
    * LAST summary — /health shows it on the next heartbeat, the same one-tick
    * carry the deferral counters already use.
+   *
+   * `keepAlive` is the worker's tick-level waitUntil hand-off, passed straight
+   * through to the pass so a CUT card's delivery proof — an un-awaited promise
+   * created at the pass's tail — is held rather than cancelled with the handler
+   * (see pushwatch.holdForTick).
    */
-  async runTrackerPass(deadlineMs: number): Promise<string | null> {
+  async runTrackerPass(
+    deadlineMs: number,
+    keepAlive?: (promise: Promise<unknown>) => void,
+  ): Promise<string | null> {
     if (!this.pushWatcher) return null;
     const startedAt = Date.now();
     try {
-      const pw = await this.pushWatcher.runTick(deadlineMs);
+      const pw = await this.pushWatcher.runTick(deadlineMs, keepAlive);
       const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
       this.pushWatchNote = note;
       this.pushWatchRecovered = Number(pw.recoveredUndelivered ?? 0);
