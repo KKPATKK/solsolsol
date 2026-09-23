@@ -24,6 +24,7 @@ import {
   skipCaptureSnapshot,
   takeSkipCaptureDelta,
   type SkipCaptureState,
+  type SkipDelta,
 } from "./skipcapture";
 import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
@@ -367,6 +368,14 @@ const PUSH_LEDGER_SYNC_BOUND_MS = 900;
 let pushLedgerSyncedAt = 0;
 
 /**
+ * The delivery audit ring's `worker_state` key. Db.getPushAudit() reads this
+ * same row; the grouped post-scan telemetry read
+ * (Db.readPostScanTelemetry) fetches it alongside the ledger/skip/Birdeye rows
+ * so the ledger reconciliation costs no extra round trip.
+ */
+const PUSH_AUDIT_STATE_KEY = "push_audit";
+
+/**
  * Fleet-wide early-return counters (src/skipcapture.ts): the durable half of
  * "the sweep returned without evaluating anything, because X". The isolate copy
  * answers why the tick being reported did nothing; this one answers how often
@@ -487,17 +496,27 @@ export async function syncBirdeyeCu(
   database: Db | null = db,
 ): Promise<void> {
   if (!database) return;
-  const delta = peekBirdeyeCuDelta();
-  const durable = parseBirdeyeCuLedger(
-    await database.getWorkerState(BIRDEYE_CU_STATE_KEY),
-  );
-  if (delta.size === 0) return;
-  const next = mergeBirdeyeCuLedger(durable, delta, now);
-  await database.setWorkerState(
-    BIRDEYE_CU_STATE_KEY,
-    JSON.stringify({ v: 1, days: next }),
-  );
+  const raw = await database.getWorkerState(BIRDEYE_CU_STATE_KEY);
+  const { delta, next } = planBirdeyeCuSync(raw, now);
+  if (!next) return;
+  await database.setWorkerState(BIRDEYE_CU_STATE_KEY, next);
   consumeBirdeyeCuDelta(delta);
+}
+
+/**
+ * The Birdeye CU merge as a pure function, shared by the single sync and the
+ * grouped post-scan telemetry path so both write the same row. `next` null
+ * means this isolate has nothing new to persist; the delta is handed back so
+ * the caller can consume it only after a write that actually landed.
+ */
+function planBirdeyeCuSync(
+  raw: string | null,
+  now: number,
+): { delta: Map<string, number>; next: string | null } {
+  const delta = peekBirdeyeCuDelta();
+  if (delta.size === 0) return { delta, next: null };
+  const days = mergeBirdeyeCuLedger(parseBirdeyeCuLedger(raw), delta, now);
+  return { delta, next: JSON.stringify({ v: 1, days }) };
 }
 
 /**
@@ -815,6 +834,52 @@ export async function syncPushLedger(
     database.listPushWatch(60),
     database.listEnabledChats(),
   ]);
+  const { serialized, mirror } = planPushLedgerSync(raw, audit, rows, chats, now);
+  if (serialized !== raw) {
+    await database.setWorkerState(PUSH_LEDGER_STATE_KEY, serialized);
+  }
+  pushLedgerMirror = mirror;
+}
+
+/** One audit-ring entry as this module reads it (Db.getPushAudit's shape). */
+type PushAuditEntryLike = {
+  token: string;
+  at: number;
+  mcapAtPush?: number;
+  kind?: string | null;
+};
+
+/**
+ * Pure mirror of Db.getPushAudit's own parse — both read the same
+ * `worker_state.push_audit` ring — needed because the grouped read hands back
+ * the raw value instead of paying that method's extra round trip. Tolerant, in
+ * the repo's usual style: a missing or non-array row degrades to "nothing yet".
+ */
+function parsePushAuditState(raw: string | null): PushAuditEntryLike[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PushAuditEntryLike[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The push-baseline ledger's merge as a pure function, shared by the single
+ * sync and the grouped post-scan telemetry path (see Db.readPostScanTelemetry)
+ * so both write byte-identical rows — the reason it is not inlined twice.
+ * `mirror` always comes back, even when `serialized` equals the durable row:
+ * /health serves this module's copy, and a tick that reconciles nothing still
+ * has to refresh it from storage.
+ */
+function planPushLedgerSync(
+  raw: string | null,
+  audit: PushAuditEntryLike[],
+  rows: Array<{ token: string; pushedAt: number; mcapAtPush: number }>,
+  chats: Array<{ minMarketCapUsd: number; maxMarketCapUsd: number }>,
+  now: number,
+): { serialized: string; mirror: PushLedgerView } {
   // Widest band across enabled chats, matching how the scan's pool window is
   // derived; null when nothing is enabled (then no band is stamped).
   const band =
@@ -829,7 +894,7 @@ export async function syncPushLedger(
       token: a.token,
       at: a.at,
       mcapAtPush: a.mcapAtPush ?? null,
-      kind: (a as { kind?: string | null }).kind ?? null,
+      kind: a.kind ?? null,
     })),
     rows: rows.map((r) => ({
       token: r.token,
@@ -839,11 +904,10 @@ export async function syncPushLedger(
     band,
     now,
   });
-  const serialized = JSON.stringify(next);
-  if (serialized !== raw) {
-    await database.setWorkerState(PUSH_LEDGER_STATE_KEY, serialized);
-  }
-  pushLedgerMirror = { ...pushLedgerStats(next, now), heal: pushWatchHealStats() };
+  return {
+    serialized: JSON.stringify(next),
+    mirror: { ...pushLedgerStats(next, now), heal: pushWatchHealStats() },
+  };
 }
 
 /**
@@ -861,14 +925,12 @@ export async function syncSkipCaptureState(
   database: Db | null = db,
 ): Promise<void> {
   if (!database) return;
-  const delta = takeSkipCaptureDelta();
   const raw = await database.getWorkerState(SKIP_CAPTURE_STATE_KEY);
-  const durable = parseSkipCaptureState(raw);
-  if (!delta) {
+  const { delta, durable, next } = planSkipCaptureSync(raw, now);
+  if (!delta || !next) {
     skipCaptureMirror = durable;
     return;
   }
-  const next = mergeSkipCaptureState(durable, delta, now);
   await database.setWorkerState(SKIP_CAPTURE_STATE_KEY, JSON.stringify(next));
   skipCaptureMirror = next;
   markSkipCaptureSynced();
@@ -878,44 +940,146 @@ export async function syncSkipCaptureState(
 }
 
 /**
+ * The skip-capture counters' merge as a pure function, shared by the single
+ * sync and the grouped post-scan telemetry path. `next` null means this isolate
+ * has nothing new to persist; `durable` always comes back so the mirror can be
+ * refreshed from the row even on a tick that writes nothing (the cross-isolate
+ * read that keeps /health from serving a stale copy).
+ */
+function planSkipCaptureSync(
+  raw: string | null,
+  now: number,
+): {
+  delta: SkipDelta | null;
+  durable: SkipCaptureState;
+  next: SkipCaptureState | null;
+} {
+  const delta = takeSkipCaptureDelta();
+  const durable = parseSkipCaptureState(raw);
+  if (!delta) return { delta: null, durable, next: null };
+  return { delta, durable, next: mergeSkipCaptureState(durable, delta, now) };
+}
+
+/**
  * Persist non-critical telemetry after the scan completion batch. Keeping
  * these reads off the pre-race path protects the candidate send window.
+ *
+ * The three syncs used to run back to back, each paying its own read — and its
+ * own write when something changed — so a tick where all three came due (the
+ * common 5-minute shape) spent SIX Turso round trips. They are grouped here
+ * into ONE read request and ONE batched write (Db.readPostScanTelemetry /
+ * Db.setWorkerStatesMany): the measured host split put 63-83% of a tick's
+ * subrequests into Turso round trips, and every one of these is a subrequest
+ * out of the invocation's 50 (docs/round-trips.md §4.6.2). The throttles,
+ * guards and per-sync merges are unchanged — the same rows are skipped when
+ * nothing changed — and the writes land as one batch, so a rejected batch
+ * leaves exactly the state three failed single writes did: every in-memory
+ * delta still pending for the next attempt.
  */
 async function syncPostScanTelemetry(now = Date.now()): Promise<void> {
   if (!db) return;
-  if (now - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS) {
-    try {
-      await Promise.race([
-        syncPushLedger(now),
-        new Promise((resolve) => setTimeout(resolve, PUSH_LEDGER_SYNC_BOUND_MS)),
-      ]);
-    } catch (err) {
-      console.warn("[worker] post-scan push-ledger sync failed:", err);
-    }
-    pushLedgerSyncedAt = Date.now();
+  const ledgerDue = now - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS;
+  const skipDue = now - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS;
+  const birdeyeDue = now - birdeyeCuSyncedAt >= BIRDEYE_CU_SYNC_MIN_GAP_MS;
+  if (!ledgerDue && !skipDue && !birdeyeDue) return;
+  try {
+    await Promise.race([
+      runPostScanTelemetry(now, ledgerDue, skipDue, birdeyeDue),
+      new Promise((resolve) =>
+        setTimeout(
+          resolve,
+          Math.max(
+            PUSH_LEDGER_SYNC_BOUND_MS,
+            SKIP_CAPTURE_SYNC_BOUND_MS,
+            BIRDEYE_CU_SYNC_BOUND_MS,
+          ),
+        ),
+      ),
+    ]);
+  } catch (err) {
+    console.warn("[worker] post-scan telemetry sync failed:", err);
   }
-  if (now - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS) {
-    try {
-      await Promise.race([
-        syncSkipCaptureState(now),
-        new Promise((resolve) => setTimeout(resolve, SKIP_CAPTURE_SYNC_BOUND_MS)),
-      ]);
-    } catch (err) {
-      console.warn("[worker] post-scan skip-capture sync failed:", err);
+  // The throttle advances whether or not the batch landed. These rows are
+  // best-effort telemetry, and a failed write is already re-offered through the
+  // un-cleared deltas, so the next attempt waits out the same gap.
+  if (ledgerDue) pushLedgerSyncedAt = Date.now();
+  if (skipDue) skipCaptureSyncedAt = Date.now();
+  if (birdeyeDue) birdeyeCuSyncedAt = Date.now();
+}
+
+/**
+ * The grouped body of syncPostScanTelemetry: one read, the three merges, one
+ * batch write. Split out of the caller so a SINGLE bound covers the whole
+ * block, where the old shape stacked three sequential 900ms bounds.
+ */
+async function runPostScanTelemetry(
+  now: number,
+  ledgerDue: boolean,
+  skipDue: boolean,
+  birdeyeDue: boolean,
+): Promise<void> {
+  const database = db;
+  if (!database) return;
+  const { states, pushWatch, chats } = await database.readPostScanTelemetry(
+    PUSH_LEDGER_STATE_KEY,
+    PUSH_AUDIT_STATE_KEY,
+    SKIP_CAPTURE_STATE_KEY,
+    BIRDEYE_CU_STATE_KEY,
+  );
+  const writes: Array<{ key: string; value: string }> = [];
+  let ledgerMirror: PushLedgerView | null = null;
+  let skipMirror: SkipCaptureState | null = null;
+  let skipDelta: SkipDelta | null = null;
+  let skipMerged: SkipCaptureState | null = null;
+  let birdeyeDelta: Map<string, number> | null = null;
+  if (ledgerDue) {
+    const raw = states.get(PUSH_LEDGER_STATE_KEY) ?? null;
+    const plan = planPushLedgerSync(
+      raw,
+      parsePushAuditState(states.get(PUSH_AUDIT_STATE_KEY) ?? null),
+      pushWatch,
+      chats,
+      now,
+    );
+    if (plan.serialized !== raw) {
+      writes.push({ key: PUSH_LEDGER_STATE_KEY, value: plan.serialized });
     }
-    skipCaptureSyncedAt = Date.now();
+    ledgerMirror = plan.mirror;
   }
-  if (now - birdeyeCuSyncedAt >= BIRDEYE_CU_SYNC_MIN_GAP_MS) {
-    try {
-      await Promise.race([
-        syncBirdeyeCu(now),
-        new Promise((resolve) => setTimeout(resolve, BIRDEYE_CU_SYNC_BOUND_MS)),
-      ]);
-    } catch (err) {
-      console.warn("[worker] post-scan Birdeye CU sync failed:", err);
+  if (skipDue) {
+    const plan = planSkipCaptureSync(
+      states.get(SKIP_CAPTURE_STATE_KEY) ?? null,
+      now,
+    );
+    skipMirror = plan.next ?? plan.durable;
+    if (plan.delta && plan.next) {
+      writes.push({
+        key: SKIP_CAPTURE_STATE_KEY,
+        value: JSON.stringify(plan.next),
+      });
+      skipDelta = plan.delta;
+      skipMerged = plan.next;
     }
-    birdeyeCuSyncedAt = Date.now();
   }
+  if (birdeyeDue) {
+    const plan = planBirdeyeCuSync(states.get(BIRDEYE_CU_STATE_KEY) ?? null, now);
+    if (plan.next) {
+      writes.push({ key: BIRDEYE_CU_STATE_KEY, value: plan.next });
+      birdeyeDelta = plan.delta;
+    }
+  }
+  if (writes.length > 0) await database.setWorkerStatesMany(writes);
+  // Side effects only AFTER the batch lands: a rejected batch leaves every
+  // in-memory delta pending (the same discipline the single syncs kept).
+  if (skipDelta && skipMerged) {
+    markSkipCaptureSynced();
+    console.log(
+      `[worker] skip capture persisted: +${skipDelta.total} early return(s) (fleet total ${skipMerged.total}, last "${skipMerged.lastReason ?? "unknown"}")`,
+    );
+  }
+  if (birdeyeDelta) consumeBirdeyeCuDelta(birdeyeDelta);
+  if (ledgerMirror) pushLedgerMirror = ledgerMirror;
+  if (skipMirror) skipCaptureMirror = skipMirror;
 }
 
 /**

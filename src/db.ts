@@ -478,6 +478,106 @@ export class Db {
   }
 
   /**
+   * The whole post-scan telemetry block in ONE read request: the four
+   * `worker_state` rows the three 5-minute syncs reconcile (push-baseline
+   * ledger, delivery audit ring, skip-capture counters, Birdeye CU ledger) plus
+   * the two live listings the ledger sync needs to detect a rewritten baseline
+   * (`push_watch`'s current baselines and the enabled chats' band).
+   *
+   * Why one request and not six: the tick's binding constraint is the
+   * 50-subrequest invocation budget (docs/round-trips.md §1), the measured host
+   * split put 63-83% of a window into Turso round trips, and the three syncs on
+   * their own paid SIX reads when they came due together — the common
+   * 5-minute shape (§4.6.2). A libsql `batch` is one HTTP request whose results
+   * come back in statement order, so every read keeps its exact shape and loses
+   * nothing but the round trips.
+   *
+   * The listings are deliberately NOT the full listPushWatch / listEnabledChats
+   * projections: the reconciliation reads only `token` / `pushed_at` /
+   * `mcap_at_push` and the two band columns, and the ORDER BY ... LIMIT below is
+   * byte-for-byte the listing's, so the row SET is identical. The unit test
+   * "the grouped post-scan telemetry read is ONE round trip" pins both the row
+   * equivalence and the single-request shape.
+   */
+  async readPostScanTelemetry(
+    ledgerKey: string,
+    auditKey: string,
+    skipKey: string,
+    birdeyeKey: string,
+    pushWatchLimit = 60,
+  ): Promise<{
+    states: Map<string, string>;
+    pushWatch: Array<{ token: string; pushedAt: number; mcapAtPush: number }>;
+    chats: Array<{ minMarketCapUsd: number; maxMarketCapUsd: number }>;
+  }> {
+    const res = await this.get().batch(
+      [
+        {
+          sql: "SELECT key, value FROM worker_state WHERE key IN (?, ?, ?, ?)",
+          args: [ledgerKey, auditKey, skipKey, birdeyeKey],
+        },
+        {
+          // Same set as listPushWatch(pushWatchLimit): active rows claim their
+          // slots first (oldest last_checked first), terminal tombstones fill
+          // any leftovers by pushed_at.
+          sql: `SELECT token, pushed_at, mcap_at_push FROM push_watch
+                 ORDER BY CASE WHEN COALESCE(last_state, '') IN ('rug', 'unwatched', 'expired') THEN 1 ELSE 0 END,
+                          CASE WHEN COALESCE(last_state, '') IN ('rug', 'unwatched', 'expired')
+                               THEN pushed_at ELSE last_checked END ASC
+                 LIMIT ?`,
+          args: [pushWatchLimit],
+        },
+        {
+          sql: "SELECT min_market_cap_usd, max_market_cap_usd FROM chat_settings WHERE enabled = 1",
+          args: [],
+        },
+      ],
+      "read",
+    );
+    const states = new Map<string, string>();
+    for (const row of res[0]?.rows ?? []) {
+      const r = row as Record<string, unknown>;
+      states.set(String(r.key), String(r.value));
+    }
+    const pushWatch = (res[1]?.rows ?? []).map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        token: String(r.token),
+        pushedAt: Number(r.pushed_at ?? 0),
+        mcapAtPush: Number(r.mcap_at_push ?? 0),
+      };
+    });
+    const chats = (res[2]?.rows ?? []).map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        minMarketCapUsd: Number(r.min_market_cap_usd ?? DEFAULT_SETTINGS.minMarketCapUsd),
+        maxMarketCapUsd: Number(r.max_market_cap_usd ?? DEFAULT_SETTINGS.maxMarketCapUsd),
+      };
+    });
+    return { states, pushWatch, chats };
+  }
+
+  /**
+   * The same upsert `setWorkerState` issues, for N keys in ONE write request —
+   * the write half of the grouped post-scan telemetry read above. A rejected
+   * batch leaves every row unwritten, which is exactly the state three failed
+   * single-key writes reached: the caller's in-memory deltas are only cleared
+   * after this resolves (see syncPostScanTelemetry in src/worker.ts).
+   */
+  async setWorkerStatesMany(
+    entries: Array<{ key: string; value: string }>,
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    await this.get().batch(
+      entries.map((e) => ({
+        sql: "INSERT INTO worker_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        args: [e.key, e.value],
+      })),
+      "write",
+    );
+  }
+
+  /**
    * The cron-arrival bookkeeping (worker_state `scheduled_tick_total` /
    * `scheduled_tick_at` / `scheduled_tick_ring`) as READ-FREE statements: the
    * counter increments in SQL, and the ring/timestamp come from the caller,
