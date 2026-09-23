@@ -1,0 +1,51 @@
+diff --git a/docs/duplicate-cards.md b/docs/duplicate-cards.md
+--- a/docs/duplicate-cards.md
++++ b/docs/duplicate-cards.md
+@@ -603,3 +603,45 @@
+ `npx tsc --noEmit` 0 error；`test-unit.js` 272/0、`test-deferred-priority.js`、`test-tick-path.js` 全部 pass。
+ 線上驗收要等落線：下一次 cut 送卡，`/debug/push-audit` 應該見到帶 `sig` 嘅 entry（即使係 cut 出嘅卡），
+ 而 `push_watch.upStages` 嘅 `p:` mark 下一個 check 就會被 proof 擋成 `dup-skip`（讀法見 §14.2）。
++
++## 十六、收窄 §14.4 兩個根因：pass 跑喺 tick 皮帶上、row loop 用實測 trip 做 reserve（2026-09-23）
++
++Patch（依序 `git apply --recount`）：`tick-leash-for-pass-and-prerace`、`tracker-row-reserve-measured`、
++`tracker-row-reserve-cleanup`、`tracker-row-reserve-drop-card-guard`、`tracker-row-reserve-test`。
++
++### 16.1 形狀 B：一行最多五個「3s 硬牆」→ 最多五個 1.4s，而且 loop 唔會再亂開行
++
++* `Scanner.runTrackerPass` 而家自己 `enterScanMode()`／`exitScanMode()`。scanner 嘅 `exitScanMode()` 喺 `runOnce` 尾
++  —— 即係 pass **之前** —— 但 `Db.enterScanMode` 嘅註釋本身寫明呢條皮帶包含「the post-push tracker pass, which all
++  live inside the tick」；實際上 pass 一直行 3s 硬牆（`SCAN_DB_TIMEOUT_MS 1200 × 1.2 = 1.44s` 才對）。修完之後：
++  一行嘅鏈由最多 ~15s 降到最多 ~7s，而且每次呼叫都會喺 tick 內**報錯**，唔會呆等。
++* Row loop 嘅 reserve 由固定 `TRACKER_ROW_MIN_MS 300` 改成**實測**：
++  `tripMs = 本 pass 已用時間 ÷ 本 pass 行過嘅 row-loop trips`，reserve = `clamp(tripMs, 300, 1500)`。
++  健康 Turso 同以前完全一樣（floor 300，唔會少收一行）；degraded 時 loop 會喺未夠一個實測 trip 之前停手，
++  唔會再開一條自己一定完成唔到嘅行（03:10Z 嗰個 55 秒卡死就係開咗嗰種行）。
++* note 尾多咗 `db <ms>`：pass 嘅 round-trip 實時成本（呢個數字以前完全冇，所以「pass 慢」只能靠 stage split 估）。
++
++### 16.2 形狀 A：pre-race 9 秒 → 每個 round trip 都喺皮帶內
++
++`runScan` 一開頭 `db.enterScanMode()`，完成 flush 之前 `db.exitScanMode()`（flush 照舊用長窗口
++`DB_REQUEST_TIMEOUT_MS`，同 Db 註釋一致）；lock-lost 嘅 early return 亦補咗 exit，唔會漏出 tick。
++
++claim 係 1–3 個 round trip（insert-or-ignore → CAS takeover 嘅 SELECT + UPDATE），加埋 dead-predecessor 讀取，
++degraded 時實測 `preRace 9000ms = json 0 + claim 3000` ⇒ scan 只剩 2500ms 下限 ⇒ tick 11500ms ⇒
++**tracker pass 完全被跳過**（一個 rotation turn 冇咗，唔止一張卡）。喺 1.4s／trip 之下，同一階段最多 ~2.9s，
++scan 窗口回到 ~4.6s，pass 亦有預算開。
++
++### 16.3 測試與 negative control
++
++* 新測試 `PushWatcher: a degraded round trip stops the loop before it starts another row`：900ms／trip、1500ms 預算
++  ⇒ 只行一行、`writes ["AAA"]`、note 帶 `budget-cut`。
++* Negative control 實測：`git checkout -- src/pushwatch.ts`（回到回合前嘅 300ms flat reserve）＋保留新測試 ⇒
++  `272 passed, 1 failed`（`the second row is deferred, not started (checked 2)`）；四個 patch 依序
++  `git apply --recount --include=src/pushwatch.ts` 還原後 `273 passed, 0 failed`。
++* `test-deferred-priority.js`、`test-tick-path.js` 都 pass。
++
++### 16.4 仍然冇收（老實講）
++
++* 一行嘅鏈仍然可以跑到 ~7s（5 × 1.44s）：皮帶係「每次呼叫」嘅界，唔係「整條鏈」嘅界。要再收窄需要
++  per-call deadline，而 `reservePushWatchAlert` 係唯一唔可以中途放棄嘅呼叫（放棄＝卡靜默消失），所以唔可以亂 race。
++* Row loop 嘅**第一行永遠照跑**（progress floor，2026-09-17 嘅教訓），所以「第一行食盡成個 tick」仍然可能發生，
++  只係上限由 15s 降到 ~7s，而且 note 嘅 `phase` 會即刻顯示（§14.2 嘅讀法）。
++* 落線後要睇：note 尾嘅 `db <ms>`（正常幾百 ms；degraded 會跳到幾秒）同 burst 期間 `preRace` 仲會唔會到 9000ms。

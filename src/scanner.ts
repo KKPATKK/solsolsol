@@ -1800,9 +1800,22 @@ export class Scanner {
     // pass that never returns would otherwise leave /health.pushWatchPass
     // frozen while the row writes it DID make kept landing.
     await this.persistPassStart();
+    // The pass runs on the TICK's DB leash, not the default one (see
+    // Db.enterScanMode). The scanner's own exitScanMode() happens at the end of
+    // runOnce — i.e. BEFORE this pass, even though the pass is part of the same
+    // tick — so a degraded Turso handed every round trip in here the 3s window
+    // instead of 1.4s, and ONE row's chain (claim, alert reservation, send,
+    // audit, final check write) could spend fifteen seconds of a five-second
+    // pass. That is the shape measured 2026-09-23 03:10Z: one row checked, note
+    // stuck at `running` for 55s (docs/duplicate-cards.md 14.1/14.6).
+    this.enterTickDbLeash();
     try {
       const pw = await this.pushWatcher.runTick(deadlineMs, keepAlive);
-      const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
+      const passDbMs = this.exitTickDbLeash();
+      // `db Nms` rides the note: the pass's round trips are its real cost
+      // driver on a degraded Turso, and without a per-pass number the only
+      // reading was the stage split (which cannot see a stalled call).
+      const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""} db ${passDbMs}ms`;
       this.pushWatchNote = note;
       this.pushWatchRecovered = Number(pw.recoveredUndelivered ?? 0);
       // Cumulative tracker telemetry (the pass note itself only reports the
@@ -1823,6 +1836,7 @@ export class Scanner {
       await this.persistPassNote(note, startedAt);
       return note;
     } catch (err) {
+      this.exitTickDbLeash();
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[scanner] push-watch tick failed:", msg);
       if (this.lastSummary) {
@@ -1934,6 +1948,28 @@ export class Scanner {
    */
   async noteTrackerSkipped(reason: string): Promise<void> {
     await this.persistPassNote(`skip:${reason}`, Date.now(), "skip");
+  }
+
+  /**
+   * Enter the tick's DB leash for work the scanner does outside runOnce (see
+   * Db.enterScanMode): every round trip then fails at 1.4s instead of 3s.
+   * Guarded because unit tests hand the Scanner a stub database.
+   */
+  private enterTickDbLeash(): void {
+    const db = this.db as { enterScanMode?: () => void };
+    if (typeof db.enterScanMode === "function") db.enterScanMode();
+  }
+
+  /**
+   * Leave it and report the wall time the tick-scoped round trips took. Zero
+   * when the caller's database has no leash (a stub) or when the pass threw
+   * before leaving it.
+   */
+  private exitTickDbLeash(): number {
+    const db = this.db as { exitScanMode?: () => number };
+    return typeof db.exitScanMode === "function"
+      ? Number(db.exitScanMode() ?? 0)
+      : 0;
   }
 
   /**

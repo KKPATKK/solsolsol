@@ -2030,6 +2030,21 @@ async function runScan(
   const startedAt = Date.now();
   let scanLock: string | null = null;
   let claimErrored = false;
+  // The PRE-RACE round trips run on the tick's DB leash as well (see
+  // Db.enterScanMode). The claim is 1-3 walled round trips (insert-or-ignore,
+  // then the CAS takeover's SELECT + UPDATE) and the dead-predecessor
+  // heartbeat read can be another, so on a degraded Turso this phase alone
+  // measured 9000ms of a 9500ms tick — `preRace 9000ms = json 0 + claim 3000`
+  // on five consecutive ticks (live 2026-09-23 02:37-02:41Z). The scan then
+  // ran with its 2500ms floor, the tick died at 11500ms, and the tracker pass
+  // was skipped entirely: a whole rotation turn lost, not just a card.
+  // At 1.4s a trip the same phase cannot spend the scan's window.
+  //
+  // Paired exit below: immediately before the completion flush, so the flush
+  // keeps the longer window the tick-scoped leash was never meant to replace
+  // (see DB_REQUEST_TIMEOUT_MS), and the tracker pass re-enters it for itself
+  // (see Scanner.runTrackerPass).
+  db?.enterScanMode();
   // The PRE-CLAIM heartbeat tells us whether the previous tick died before
   // its completion flush (the flush batch sets phase=done atomically with
   // the history row, so a scanning heartbeat long past its budget means its
@@ -2158,6 +2173,9 @@ async function runScan(
       );
     }
     console.log("[worker] scan skipped — another isolate holds the scan lock");
+    // This tick never reaches the finally below, so the leash opened at
+    // startedAt has to be closed here instead of leaking past it.
+    db?.exitScanMode();
     return;
   }
   if (claimErrored) {
@@ -2273,6 +2291,9 @@ async function runScan(
       lastScanError = err instanceof Error ? err.message : String(err);
       console.error("[worker] scheduled scan failed:", lastScanError);
     } finally {
+      // Ends the pre-race leash: the completion flush below keeps the default
+      // window on purpose (see DB_REQUEST_TIMEOUT_MS / Db.enterScanMode).
+      db?.exitScanMode();
       lastScanMs = Date.now() - startedAt;
       lastScanAt = Date.now();
       scanCount++;

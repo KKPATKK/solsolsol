@@ -1,0 +1,137 @@
+diff --git a/src/pushwatch.ts b/src/pushwatch.ts
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -97,6 +97,33 @@
+  */
+ const TRACKER_ROW_MIN_MS = 300;
++/**
++ * Least room the ROW LOOP must leave before it starts another row.
++ *
++ * WHY this is not TRACKER_ROW_MIN_MS: that constant is the EXPECTED cost of a
++ * row (claim + send + audit + write at healthy Turso, ~50-150ms a trip) and
++ * the pass's own budget split is priced in it. The loop has to survive the
++ * DEGRADED cost instead, and that is set by the tick's DB leash, not by the
++ * healthy round trip: every call the pass makes is walled at
++ * SCAN_DB_TIMEOUT_MS * 1.2 (1.4s — the pass runs inside the tick's leash, see
++ * Db.enterScanMode and Scanner.runTrackerPass) and ONE row's chain is up to
++ * five of them. One leash as the reserve means the loop stops while a bounded
++ * call still fits, instead of starting a row whose very first claim can
++ * already outlive the tick.
++ *
++ * Live witness (2026-09-23 03:10Z, docs/duplicate-cards.md 14.1/14.6): a pass
++ * started at 03:10:23Z, checked exactly ONE row and never returned — the note
++ * sat at `running` for 55 seconds while the other 29 rows went unchecked and
++ * the tick's own tail never ran. The 300ms check was satisfied by the row that
++ * ate the tick, because it asked "may I start?" in healthy-trip units and the
++ * row answered in leash ones.
++ */
++const TRACKER_ROW_LEASH_MS = 1_500;
+ /**
+  * Slice the SELF-HEAL stage may spend before it stands down and leaves the
+  * rest of the pass to the rotation. Measured live 2026-09-21 03:12Z with the
+@@ -2193,7 +2220,7 @@
+       // tick is the floor that keeps the tracker moving no matter what
+       // DexScreener or Turso are doing.
+-      if (!firstRow && Date.now() + TRACKER_ROW_MIN_MS > deadline) {
++      if (!firstRow && Date.now() + TRACKER_ROW_LEASH_MS > deadline) {
+         budgetCut = true;
+         break;
+       }
+diff --git a/src/scanner.ts b/src/scanner.ts
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -1795,10 +1795,39 @@
+     // pass that never returns would otherwise leave /health.pushWatchPass
+     // frozen while the row writes it DID make kept landing.
+     await this.persistPassStart();
++    // The pass runs on the TICK's DB leash, not the default one (see
++    // Db.enterScanMode). The scanner's own exitScanMode() happens at the end of
++    // runOnce — i.e. BEFORE this pass, even though the pass is part of the same
++    // tick — so a degraded Turso handed every round trip in here the 3s window
++    // instead of 1.4s, and ONE row's chain (claim, alert reservation, send,
++    // audit, final check write) could spend fifteen seconds of a five-second
++    // pass. That is the shape measured 2026-09-23 03:10Z: one row checked, note
++    // stuck at `running` for 55s (docs/duplicate-cards.md 14.1/14.6).
++    this.enterTickDbLeash();
+     try {
+       const pw = await this.pushWatcher.runTick(deadlineMs, keepAlive);
+-      const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
++      const passDbMs = this.exitTickDbLeash();
++      // `db Nms` rides the note: the pass's round trips are its real cost
++      // driver on a degraded Turso, and without a per-pass number the only
++      // reading was the stage split (which cannot see a stalled call).
++      const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""} db ${passDbMs}ms`;
+       this.pushWatchNote = note;
+@@ -1830,6 +1859,7 @@
+       await this.persistPassNote(note, startedAt);
+       return note;
+     } catch (err) {
++      this.exitTickDbLeash();
+       const msg = err instanceof Error ? err.message : String(err);
+       console.error("[scanner] push-watch tick failed:", msg);
+@@ -1869,6 +1899,27 @@
+   }
+ 
+   /**
++   * Enter the tick's DB leash for work the scanner does outside runOnce (see
++   * Db.enterScanMode): every round trip then fails at 1.4s instead of 3s.
++   * Guarded because unit tests hand the Scanner a stub database.
++   */
++  private enterTickDbLeash(): void {
++    const db = this.db as { enterScanMode?: () => void };
++    if (typeof db.enterScanMode === "function") db.enterScanMode();
++  }
++
++  /**
++   * Leave it and report the wall time the tick-scoped round trips took. Zero
++   * when the caller's database has no leash (a stub) or when the pass threw
++   * before leaving it.
++   */
++  private exitTickDbLeash(): number {
++    const db = this.db as { exitScanMode?: () => number };
++    return typeof db.exitScanMode === "function"
++      ? Number(db.exitScanMode() ?? 0)
++      : 0;
++  }
++
++  /**
+    * Pair lookup for the post-push tracker pass (see lastPairs): serve what
+    * this tick already fetched, ask DexScreener for the rest, then fall back
+    * to Jupiter exactly like the front pair phase does — the same rescue for
+diff --git a/src/worker.ts b/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -2030,3 +2030,19 @@
+   const startedAt = Date.now();
+   let scanLock: string | null = null;
+   let claimErrored = false;
++  // The PRE-RACE round trips run on the tick's DB leash as well (see
++  // Db.enterScanMode). The claim is 1-3 walled round trips (insert-or-ignore,
++  // then the CAS takeover's SELECT + UPDATE) and the dead-predecessor
++  // heartbeat read can be another, so on a degraded Turso this phase alone
++  // measured 9000ms of a 9500ms tick — `preRace 9000ms = json 0 + claim 3000`
++  // on five consecutive ticks (live 2026-09-23 02:37-02:41Z). The scan then
++  // ran with its 2500ms floor, the tick died at 11500ms, and the tracker pass
++  // was skipped entirely: a whole rotation turn lost, not just a card.
++  // At 1.4s a trip the same phase cannot spend the scan's window.
++  //
++  // Paired exit below: immediately before the completion flush, so the flush
++  // keeps the longer window the tick-scoped leash was never meant to replace
++  // (see DB_REQUEST_TIMEOUT_MS), and the tracker pass re-enters it for itself
++  // (see Scanner.runTrackerPass).
++  db?.enterScanMode();
+   // The PRE-CLAIM heartbeat tells us whether the previous tick died before
+@@ -2160,3 +2176,6 @@
+     console.log("[worker] scan skipped — another isolate holds the scan lock");
++    // This tick never reaches the finally below, so the leash opened at
++    // startedAt has to be closed here instead of leaking past it.
++    db?.exitScanMode();
+     return;
+   }
+@@ -2275,3 +2294,6 @@
+     } finally {
++      // Ends the pre-race leash: the completion flush below keeps the default
++      // window on purpose (see DB_REQUEST_TIMEOUT_MS / Db.enterScanMode).
++      db?.exitScanMode();
+       lastScanMs = Date.now() - startedAt;
+       lastScanAt = Date.now();

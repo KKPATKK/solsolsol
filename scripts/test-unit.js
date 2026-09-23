@@ -6116,6 +6116,40 @@ async function main() {
     assert.ok(!/budget-cut/.test(String(out.note)), `nothing may be cut: ${out.note}`);
   });
 
+  await test("PushWatcher: a degraded round trip stops the loop before it starts another row", async () => {
+    // The loop's reserve is priced in the cost THIS pass is paying per round
+    // trip (see TRACKER_ROW_LEASH_MS), not in healthy-Turso units: at ~900ms a
+    // trip the old flat 300ms check was happy to start the second row, whose
+    // first claim can then outlive the tick. Live 2026-09-23 03:10Z: a pass
+    // started, checked ONE row, and sat at `running` for 55s while the other
+    // 29 rows went unchecked and the tick's own tail never ran
+    // (docs/duplicate-cards.md 14.1/14.6). A deferred row is not lost — it is
+    // re-read and re-claimed next tick — so stopping early is the cheap side.
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const writes = [];
+    const db = {
+      ...watchDb(rows, []),
+      claimPushWatch: async () => true,
+      claimPushWatchCheck: async (token) => {
+        writes.push(token);
+        await new Promise((r) => setTimeout(r, 900)); // one degraded trip
+        return true;
+      },
+    };
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    // 1500ms for a 900ms trip: the first row fits, and the second must NOT be
+    // started — its own trip alone would land past the deadline.
+    const out = await pw.runTick(Date.now() + 1_500);
+    assert.equal(out.checked, 1, `the second row is deferred, not started (checked ${out.checked})`);
+    assert.deepEqual(writes, ["AAA"], "only the row that fits is written");
+    assert.match(String(out.note), /budget-cut/, `the pass says why: ${out.note}`);
+    assert.equal(out.alerted, 0);
+  });
+
   await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {
     const row = (over = {}) => ({
       token: "T", chatId: "c", symbol: "GOAT", pushedAt: 0,

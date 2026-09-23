@@ -1,0 +1,24 @@
+diff --git a/src/pushwatch.ts b/src/pushwatch.ts
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -2316,11 +2316,16 @@
+-        if (sendBudgetEnd - Date.now() < needMs) {
+-          sendDeferred += 1;
+-          budgetCut = true;
+-          break;
+-        }
+-        if (Date.now() + cardReserveMs() > deadline) {
++        // Two things a card must have before it is worth a claim: the send
++        // slice its own size asks for (TRACKER_SEND_MIN_MS per card), and the
++        // DB chain that claim starts (see TRACKER_CARD_CHAIN_TRIPS). Neither
++        // refusal can lose the card — a deferred one is re-derived and
++        // re-sent next tick, which is what `sendDeferred` counts — while a
++        // chain started without room is the row that eats the whole tick.
++        if (
++          sendBudgetEnd - Date.now() < needMs ||
++          Date.now() + cardReserveMs() > deadline
++        ) {
+           sendDeferred += 1;
+           budgetCut = true;
+           break;
+         }

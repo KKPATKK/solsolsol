@@ -1,0 +1,52 @@
+diff --git a/src/pushwatch.ts b/src/pushwatch.ts
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -97,6 +97,6 @@
+ const TRACKER_ROW_MIN_MS = 300;
+ /**
+- * Ceiling on the room the row loop must leave before it starts another row or
+- * starts a card's claim chain (see the two reserve helpers in runTick).
++ * Ceiling on the room the row loop must leave before it starts another row
++ * (see rowReserveMs in runTick).
+  *
+  * WHY a cap and not a flat reserve: TRACKER_ROW_MIN_MS is the EXPECTED cost of
+@@ -120,9 +120,6 @@
+ const TRACKER_ROW_LEASH_MS = 1_500;
+-/**
+- * Round trips a card's DB chain costs after the loop has decided to start it:
+- * the claim, the alert reservation, the delivery audit and the final check
+- * write. A silent row's two-trip contract is NOT priced at this (that is what
+- * TRACKER_ROW_MIN_MS is for); a card is the expensive, rare shape, so the loop
+- * asks for its chain before spending a claim on it.
+- */
+-const TRACKER_CARD_CHAIN_TRIPS = 3;
+ /**
+  * Slice the SELF-HEAL stage may spend before it stands down and leaves the
+  * rest of the pass to the rotation. Measured live 2026-09-21 03:12Z with the
+@@ -2178,6 +2175,3 @@
+     /** Room ANOTHER row needs: one observed trip is its first call. */
+     const rowReserveMs = (): number =>
+       Math.min(TRACKER_ROW_LEASH_MS, tripMs());
+-    /** Room a card's claim chain needs (see TRACKER_CARD_CHAIN_TRIPS). */
+-    const cardReserveMs = (): number =>
+-      Math.min(TRACKER_ROW_LEASH_MS, tripMs() * TRACKER_CARD_CHAIN_TRIPS);
+     for (const row of head) {
+@@ -2313,12 +2307,7 @@
+           TRACKER_SEND_MIN_MS * evalResult.alerts.length,
+         );
+-        // Two things a card must have before it is worth a claim: the send
+-        // slice its own size asks for (TRACKER_SEND_MIN_MS per card), and the
+-        // DB chain that claim starts (see TRACKER_CARD_CHAIN_TRIPS). Neither
+-        // refusal can lose the card — a deferred one is re-derived and
+-        // re-sent next tick, which is what `sendDeferred` counts — while a
+-        // chain started without room is the row that eats the whole tick.
+-        if (
+-          sendBudgetEnd - Date.now() < needMs ||
+-          Date.now() + cardReserveMs() > deadline
+-        ) {
++        if (sendBudgetEnd - Date.now() < needMs) {
+           sendDeferred += 1;
+           budgetCut = true;
+           break;
+         }
+       }

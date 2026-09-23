@@ -1,0 +1,92 @@
+diff --git a/src/pushwatch.ts b/src/pushwatch.ts
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -98,24 +98,31 @@
+ const TRACKER_ROW_MIN_MS = 300;
+ /**
+- * Least room the ROW LOOP must leave before it starts another row.
++ * Ceiling on the room the row loop must leave before it starts another row or
++ * starts a card's claim chain (see the two reserve helpers in runTick).
+  *
+- * WHY this is not TRACKER_ROW_MIN_MS: that constant is the EXPECTED cost of a
+- * row (claim + send + audit + write at healthy Turso, ~50-150ms a trip) and
+- * the pass's own budget split is priced in it. The loop has to survive the
+- * DEGRADED cost instead, and that is set by the tick's DB leash, not by the
+- * healthy round trip: every call the pass makes is walled at
+- * SCAN_DB_TIMEOUT_MS * 1.2 (1.4s — the pass runs inside the tick's leash, see
+- * Db.enterScanMode and Scanner.runTrackerPass) and ONE row's chain is up to
+- * five of them. One leash as the reserve means the loop stops while a bounded
+- * call still fits, instead of starting a row whose very first claim can
+- * already outlive the tick.
++ * WHY a cap and not a flat reserve: TRACKER_ROW_MIN_MS is the EXPECTED cost of
++ * a row at healthy Turso (~50-150ms a trip) and the pass's budget split is
++ * priced in it, so a flat leash-sized reserve would cost the healthy pass its
++ * last several rows — the wrong trade for the ~90% of rows that have nothing
++ * to announce. The loop therefore prices its reserve in the cost THIS pass is
++ * actually paying per round trip, floored at TRACKER_ROW_MIN_MS (a healthy
++ * pass behaves exactly as before) and capped here at one tick leash: the
++ * degraded case, where every call is walled at SCAN_DB_TIMEOUT_MS * 1.2 (1.4s
++ * — the pass runs inside the tick's leash, see Db.enterScanMode and
++ * Scanner.runTrackerPass).
+  *
+  * Live witness (2026-09-23 03:10Z, docs/duplicate-cards.md 14.1/14.6): a pass
+  * started at 03:10:23Z, checked exactly ONE row and never returned — the note
+  * sat at `running` for 55 seconds while the other 29 rows went unchecked and
+- * the tick's own tail never ran. The 300ms check was satisfied by the row that
+- * ate the tick, because it asked "may I start?" in healthy-trip units and the
+- * row answered in leash ones.
++ * the tick's own tail never ran. The old 300ms check was satisfied by the row
++ * that ate the tick, because it asked "may I start?" in healthy-trip units and
++ * the row answered in degraded ones.
+  */
+ const TRACKER_ROW_LEASH_MS = 1_500;
++/**
++ * Round trips a card's DB chain costs after the loop has decided to start it:
++ * the claim, the alert reservation, the delivery audit and the final check
++ * write. A silent row's two-trip contract is NOT priced at this (that is what
++ * TRACKER_ROW_MIN_MS is for); a card is the expensive, rare shape, so the loop
++ * asks for its chain before spending a claim on it.
++ */
++const TRACKER_CARD_CHAIN_TRIPS = 3;
+ /**
+  * Slice the SELF-HEAL stage may spend before it stands down and leaves the
+  * rest of the pass to the rotation. Measured live 2026-09-21 03:12Z with the
+@@ -2163,3 +2170,23 @@
+     let firstRow = true;
+     const rowsStart = Date.now();
+     const rowsTrips = trips;
++    /**
++     * Milliseconds this pass has been paying per round trip, measured from
++     * the loop itself (elapsed / trips made in it) rather than assumed from a
++     * healthy Turso. Floored at TRACKER_ROW_MIN_MS so a fast pass keeps the
++     * old reserve, and the callers below cap it at one leash.
++     */
++    const tripMs = (): number =>
++      Math.max(
++        TRACKER_ROW_MIN_MS,
++        (Date.now() - rowsStart) / Math.max(1, trips - rowsTrips),
++      );
++    /** Room ANOTHER row needs: one observed trip is its first call. */
++    const rowReserveMs = (): number =>
++      Math.min(TRACKER_ROW_LEASH_MS, tripMs());
++    /** Room a card's claim chain needs (see TRACKER_CARD_CHAIN_TRIPS). */
++    const cardReserveMs = (): number =>
++      Math.min(TRACKER_ROW_LEASH_MS, tripMs() * TRACKER_CARD_CHAIN_TRIPS);
+     for (const row of head) {
+@@ -2193,3 +2220,3 @@
+-      if (!firstRow && Date.now() + TRACKER_ROW_LEASH_MS > deadline) {
++      if (!firstRow && Date.now() + rowReserveMs() > deadline) {
+         budgetCut = true;
+         break;
+       }
+@@ -2266,4 +2293,8 @@
+         if (sendBudgetEnd - Date.now() < needMs) {
++          sendDeferred += 1;
++          budgetCut = true;
++          break;
++        }
++        if (Date.now() + cardReserveMs() > deadline) {
+           sendDeferred += 1;
+           budgetCut = true;
+           break;
+         }

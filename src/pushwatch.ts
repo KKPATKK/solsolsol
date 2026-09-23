@@ -98,6 +98,29 @@ const TRACKER_TICK_BUDGET_MS = 5_000;
  */
 const TRACKER_ROW_MIN_MS = 300;
 /**
+ * Ceiling on the room the row loop must leave before it starts another row
+ * (see rowReserveMs in runTick).
+ *
+ * WHY a cap and not a flat reserve: TRACKER_ROW_MIN_MS is the EXPECTED cost of
+ * a row at healthy Turso (~50-150ms a trip) and the pass's budget split is
+ * priced in it, so a flat leash-sized reserve would cost the healthy pass its
+ * last several rows — the wrong trade for the ~90% of rows that have nothing
+ * to announce. The loop therefore prices its reserve in the cost THIS pass is
+ * actually paying per round trip, floored at TRACKER_ROW_MIN_MS (a healthy
+ * pass behaves exactly as before) and capped here at one tick leash: the
+ * degraded case, where every call is walled at SCAN_DB_TIMEOUT_MS * 1.2 (1.4s
+ * — the pass runs inside the tick's leash, see Db.enterScanMode and
+ * Scanner.runTrackerPass).
+ *
+ * Live witness (2026-09-23 03:10Z, docs/duplicate-cards.md 14.1/14.6): a pass
+ * started at 03:10:23Z, checked exactly ONE row and never returned — the note
+ * sat at `running` for 55 seconds while the other 29 rows went unchecked and
+ * the tick's own tail never ran. The old 300ms check was satisfied by the row
+ * that ate the tick, because it asked "may I start?" in healthy-trip units and
+ * the row answered in degraded ones.
+ */
+const TRACKER_ROW_LEASH_MS = 1_500;
+/**
  * Slice the SELF-HEAL stage may spend before it stands down and leaves the
  * rest of the pass to the rotation. Measured live 2026-09-21 03:12Z with the
  * stage clock on, this is the stage that stopped the whole tracker:
@@ -2180,6 +2203,20 @@ export class PushWatcher {
     let firstRow = true;
     const rowsStart = Date.now();
     const rowsTrips = trips;
+    /**
+     * Milliseconds this pass has been paying per round trip, measured from
+     * the loop itself (elapsed / trips made in it) rather than assumed from a
+     * healthy Turso. Floored at TRACKER_ROW_MIN_MS so a fast pass keeps the
+     * old reserve, and the callers below cap it at one leash.
+     */
+    const tripMs = (): number =>
+      Math.max(
+        TRACKER_ROW_MIN_MS,
+        (Date.now() - rowsStart) / Math.max(1, trips - rowsTrips),
+      );
+    /** Room ANOTHER row needs: one observed trip is its first call. */
+    const rowReserveMs = (): number =>
+      Math.min(TRACKER_ROW_LEASH_MS, tripMs());
     for (const row of head) {
       // Budget check BETWEEN rows: the claim and the alert reservation for a
       // row both happen after this point, so leaving a row to the next tick
@@ -2190,7 +2227,7 @@ export class PushWatcher {
       // note while 28 active rows went unrefreshed (2026-09-17). One row per
       // tick is the floor that keeps the tracker moving no matter what
       // DexScreener or Turso are doing.
-      if (!firstRow && Date.now() + TRACKER_ROW_MIN_MS > deadline) {
+      if (!firstRow && Date.now() + rowReserveMs() > deadline) {
         budgetCut = true;
         break;
       }
