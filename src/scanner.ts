@@ -282,22 +282,22 @@ const CARD_SEND_FLOOR_MS = 600;
  */
 const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
 /**
- * Wall clock the tracker pass's durable coverage write may spend (see
- * runTrackerPass). It is telemetry, so it is raced against this bound like the
- * deferral-counter sync: a hung Turso write must never carry the tick past the
- * pass's own deadline.
+ * The tracker pass's durable coverage write is AWAITED, not raced (see
+ * persistPassNote). The bound that used to sit here — 400ms, then 900ms
+ * (2026-09-21) — is gone, and this comment is what is left of it: raising the
+ * number did not fix the shape, because the shape was the bug.
  *
- * 400 → 900 (2026-09-21). At 400ms the bound was BELOW the live round trip
- * (Turso trips measured 250-420ms, the 03:35Z note's own stage clock shows
- * ~420ms), so the race resolved with the write still in flight, the pass
- * returned, and the invocation ended before the abandoned promise landed —
- * i.e. the write was cancelled, not slow. Live symptom: the note was written
- * once every several minutes while every tick's row writes proved the pass
- * was completing. 900 keeps the hang protection (the tick still cannot be
- * carried past its tail by one Turso call) while leaving ~2x the observed
- * round trip for the write to land.
+ * A race that resolves at its bound ABANDONS the write, and an abandoned
+ * promise is CANCELLED the moment the invocation ends. Below the live round
+ * trip that cancels every write (the 400ms episode above); above it, it still
+ * cancels all of them as soon as Turso is slower than the bound — measured
+ * 2026-09-22 18:09-18:28Z: the /health note froze for 19 minutes while the
+ * same passes kept landing ROW writes, because those are awaited. What the
+ * bound was protecting against — a hung write carrying the tick past its
+ * deadline — is bounded lower down instead: every Db call runs under
+ * wrapClientWithHardWall, and the tick's other tail write (the deferral
+ * counter sync) is awaited on the same contract.
  */
-const PUSH_WATCH_PASS_STATE_BOUND_MS = 900;
 /**
  * Least send slice worth starting. Below it the card is DEFERRED rather than
  * attempted: a deferral writes NOTHING (no claim, no audit, no failure record)
@@ -1834,24 +1834,28 @@ export class Scanner {
    * /health polls showed no note at all while the pass was demonstrably
    * running, so the stage split that explained the whole rotation stall was
    * unreadable exactly when it mattered (/health.pushWatchPass,
-   * /debug/scan-history.pushWatchPass). Bounded and best-effort — see
-   * PUSH_WATCH_PASS_STATE_BOUND_MS.
+   * /debug/scan-history.pushWatchPass). Awaited and best-effort, never raced:
+   * see persistPassNote.
    */
   private async persistPassNote(note: string, startedAt: number): Promise<void> {
+    // AWAITED, not raced. The race this replaces resolved at its bound while the
+    // write was still in flight, and an abandoned promise is CANCELLED the
+    // moment the invocation ends — so on a slow-Turso stretch every pass lost
+    // its note while the pass itself kept checking rows (live 2026-09-22
+    // 18:09-18:28Z: rows kept moving, `at` froze for 19 minutes, and `dup-skip`
+    // was unverifiable exactly when it mattered). Awaiting is what keeps the
+    // invocation open for the write, and the Db call already runs under
+    // wrapClientWithHardWall, so this cannot hang the tick — the same contract
+    // the deferral-counter sync at the tick's tail relies on.
     try {
-      await Promise.race([
-        this.db.setWorkerState(
-          "push_watch_pass",
-          JSON.stringify({
-            at: Date.now(),
-            note,
-            trackerMs: Date.now() - startedAt,
-          }),
-        ),
-        new Promise((resolve) =>
-          setTimeout(resolve, PUSH_WATCH_PASS_STATE_BOUND_MS),
-        ),
-      ]);
+      await this.db.setWorkerState(
+        "push_watch_pass",
+        JSON.stringify({
+          at: Date.now(),
+          note,
+          trackerMs: Date.now() - startedAt,
+        }),
+      );
     } catch {
       /* telemetry only */
     }

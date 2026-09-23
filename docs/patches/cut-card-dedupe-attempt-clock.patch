@@ -1,0 +1,28 @@
+diff --git a/src/pushwatch.ts b/src/pushwatch.ts
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -2396,8 +2396,14 @@
+             evalResult.stopTracking && a.kind === "liquidity";
+           let sent: { message_id?: unknown } | null = null;
++          // The attempt's OWN clock read, taken BEFORE the request goes out —
++          // the terminal card below included: the audit entry this send writes
++          // (right after Telegram answers, or from a cut one's late settle) is
++          // by construction newer than this read, so a mark can never postdate
++          // its own proof (a mark that did would suppress the card for one
++          // check, the silent-miss direction).
++          const attemptAt = Date.now();
+           if (terminalAlert) {
+             const outcome = await this.sendTerminalAlert(
+               row,
+               a.text,
+@@ -2441,9 +2441,3 @@
+             // this pass's marks and leaves nothing else behind.
+-            // The attempt's OWN clock read, taken before the request goes
+-            // out: the audit entry this send writes — here or from the late
+-            // settle below — is by construction newer, so the mark can never
+-            // postdate its own proof (one that did would suppress the card for
+-            // a check, the silent-miss direction).
+-            const attemptAt = Date.now();
+             const inFlight = this.bot.api.sendMessage(row.chatId, a.text);
+             sent = (await this.bounded(
+               inFlight,

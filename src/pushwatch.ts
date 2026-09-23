@@ -2210,7 +2210,10 @@ export class PushWatcher {
       // them into its claim (one round trip), the alerting path writes them
       // after its sends — with `hold` rolling the announcement columns back
       // when a card did not go out (see the final write).
-      const checkFields = (hold: boolean, cutSig: string | null = null) => ({
+      const checkFields = (
+        hold: boolean,
+        attempts: ReadonlyArray<{ sig: string; at: number }> = [],
+      ) => ({
         peakMcap: evalResult.peakMcap,
         lastLiquidity: comparableLiquidity(pair) ?? row.lastLiquidity,
         lastVol5m: pair.volume.m5,
@@ -2231,13 +2234,16 @@ export class PushWatcher {
         holdersAtPush: hold
           ? (row.holdersAtPush ?? undefined)
           : evalResult.resetBaselineHolders,
-        // A rollback restores the marks the row had — EXCEPT for the one card
-        // whose send was cut: its attempt is still in flight, so the mark it
-        // leaves is how the next evaluation knows to ask the audit before
-        // sending the same transition again (see CUT_MARK_PREFIX).
+        // A rollback restores the marks the row had — PLUS one mark per card
+        // this pass ATTEMPTED (see CUT_MARK_PREFIX): every one of those sends
+        // is still in flight, so each mark is how the next evaluation knows to
+        // ask the audit before re-sending that same transition. ALL of them,
+        // not just the cut one: a rollback re-derives every card of the row,
+        // and a card the audit can prove was delivered must not be announced
+        // again merely because a LATER sibling ate the slice (POPEYE).
         upStages: hold
-          ? cutSig !== null
-            ? addCutMark(row.upStages, cutSig, now)
+          ? attempts.length > 0
+            ? addCutMarks(row.upStages, attempts)
             : row.upStages
           : evalResult.announcedUpStages,
         deadTroughMcap: hold
@@ -2332,11 +2338,25 @@ export class PushWatcher {
       const undeliveredBefore = undelivered;
       let sentCount = 0;
       /**
-       * The sig of the one card whose send this row's slice cut (null = none).
-       * It rides the row's own mark CSV so the next evaluation can ask the
-       * audit before sending the same transition again.
+       * Every card this pass ATTEMPTED on this row: the ones it delivered and
+       * any whose send the slice cut. Each rides the row's own mark CSV with
+       * its OWN stamp (see addCutMarks), so the next evaluation asks the audit
+       * per card before re-sending that transition.
        */
-      let cutSig: string | null = null;
+      const attempts: Array<{ sig: string; at: number }> = [];
+      /**
+       * The marks this row already carried, read BEFORE the engine consumes
+       * them (evaluateWatch rebuilds the column from its stage marks, so an
+       * attempt mark only survives a pass that re-adds it). A card the audit
+       * already proves is not attempted again (`a.deduped`, skipped below), so
+       * its mark must be carried forward UNCHANGED: re-stamping it with this
+       * pass's clock would put the mark after the very proof that justifies
+       * the skip and re-open the duplicate the skip exists to prevent.
+       */
+      const priorMarks = new Map<string, number>();
+      for (const m of parseCutMarks(row.upStages)) {
+        priorMarks.set(m.sig, Math.max(priorMarks.get(m.sig) ?? 0, m.at));
+      }
       for (const a of evalResult.alerts) {
         if (backfill) break;
         // DEDUPE FIRST: a card the audit already proves delivered needs no send
@@ -2348,6 +2368,11 @@ export class PushWatcher {
           dupSkipped += 1;
           alerted += 1;
           sentCount += 1;
+          // Carry the proof's mark forward unchanged (see `attempts`): the
+          // rollback below re-derives this transition, and only the
+          // mark-plus-proof pair keeps it from being announced again.
+          const prior = priorMarks.get(a.sig);
+          if (prior !== undefined) attempts.push({ sig: a.sig, at: prior });
           continue;
         }
         const sendLeft = sendBudgetEnd - Date.now();
@@ -2370,6 +2395,13 @@ export class PushWatcher {
           const terminalAlert =
             evalResult.stopTracking && a.kind === "liquidity";
           let sent: { message_id?: unknown } | null = null;
+          // The attempt's OWN clock read, taken BEFORE the request goes out —
+          // the terminal card below included: the audit entry this send writes
+          // (right after Telegram answers, or from a cut one's late settle) is
+          // by construction newer than this read, so a mark can never postdate
+          // its own proof (a mark that did would suppress the card for one
+          // check, the silent-miss direction).
+          const attemptAt = Date.now();
           if (terminalAlert) {
             const outcome = await this.sendTerminalAlert(
               row,
@@ -2421,7 +2453,7 @@ export class PushWatcher {
               null,
             )) as { message_id?: unknown } | null;
             if (sent === null) {
-              cutSig = a.sig;
+              attempts.push({ sig: a.sig, at: attemptAt });
               void inFlight.then(
                 async (late) => {
                   try {
@@ -2433,6 +2465,11 @@ export class PushWatcher {
                         (late as { message_id?: unknown })?.message_id ?? 0,
                       ),
                       kind: "followup",
+                      // The CUT card's identity: this late settle is the only
+                      // proof that request ever produces, and the next pass's
+                      // mark for this transition has to be able to find it
+                      // (see deferrallog.cardProofKey).
+                      sig: a.sig,
                     });
                   } catch {
                     /* best-effort — an unproven card is simply re-sent */
@@ -2461,6 +2498,7 @@ export class PushWatcher {
           }
           alerted += 1;
           sentCount += 1;
+          attempts.push({ sig: a.sig, at: attemptAt });
           trips += 1; // the delivery audit insert below
           // Audit follow-ups as well: comparing this ring against the
           // initial-card ring distinguishes "the client drops everything"
@@ -2474,6 +2512,7 @@ export class PushWatcher {
                 (sent as { message_id?: unknown }).message_id ?? 0,
               ),
               kind: "followup",
+              sig: a.sig,
             });
           } catch {
             /* audit is best-effort */
@@ -2509,7 +2548,7 @@ export class PushWatcher {
       const holdAnnouncements = undelivered > undeliveredBefore;
       await this.db.updatePushWatchCheck(
         row.token,
-        checkFields(holdAnnouncements, cutSig),
+        checkFields(holdAnnouncements, attempts),
       );
     }
     spent.rows.ms = Date.now() - rowsStart;

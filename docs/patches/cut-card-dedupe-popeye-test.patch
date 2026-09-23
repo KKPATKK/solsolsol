@@ -1,0 +1,77 @@
+diff --git a/scripts/test-unit.js b/scripts/test-unit.js
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -1160,5 +1160,65 @@
+     assert.equal(sends3, 1, "an unproven card is re-sent");
+     assert.equal(out3.deduped, 0);
+   });
++
++  await test("PushWatcher: a DELIVERED card is not re-announced when a later sibling is held back (POPEYE)", async () => {
++    // Push $100K, peak $400K, now $240K: +140% off the push crosses the 🚀 +100%
++    // milestone and -40% off the peak is the ⚠️ w35 card, so ONE pass carries
++    // both. The 09-22 rule marked only the card whose send was CUT, so a 🚀 the
++    // chat had already received was re-announced as soon as its ⚠️ sibling
++    // failed and rolled the row's announcement back.
++    const popeyeRow = (over = {}) =>
++      termRow({ peakMcap: 400_000, mcapAtPush: 100_000, upStages: null, lastLiquidity: 32_000, ...over });
++    const popeyePair = (token) => ({ ...termPair(token, 32_000), marketCap: 240_000 });
++    const mkWatcher = (db, bot) =>
++      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, popeyePair(a)])), null);
++
++    // Pass 1 — the 🚀 card is DELIVERED, its ⚠️ sibling is REJECTED, so the row
++    // is rolled back and BOTH transitions are re-derived next pass. Only the
++    // delivered one may then be refused.
++    const db = termDb([popeyeRow()]);
++    const delivered = [];
++    db.recordPushDelivery = async (e) => { delivered.push(e); };
++    const texts1 = [];
++    const out1 = await mkWatcher(db, {
++      api: {
++        sendMessage: async (_chat, text) => {
++          texts1.push(text);
++          if (text.includes("🚀")) return { message_id: 111 };
++          throw new Error("400 Bad Request: chat not found");
++        },
++      },
++    }).runTick(Date.now() + 1_500);
++    assert.deepEqual(
++      texts1.map((t) => (t.includes("🚀") ? "rising" : "weak")),
++      ["rising", "weak"],
++      "one pass carries both cards",
++    );
++    assert.equal(out1.undelivered, 1, "the rejected sibling holds the row back");
++    const [, w1] = db.updated[0];
++    assert.equal(w1.lastState, null, "so the announcement is rolled back");
++    assert.match(
++      String(w1.upStages),
++      /(^|,)p:up100:/,
++      `the DELIVERED card leaves an attempt mark too: ${w1.upStages}`,
++    );
++    assert.ok(
++      !String(w1.upStages).includes("p:w35:"),
++      "a rejected send leaves none — nothing reached the chat",
++    );
++    assert.equal(delivered.length, 1);
++    assert.equal(delivered[0].kind, "followup");
++    assert.equal(delivered[0].sig, "up100", "the audit entry names the card it proves");
++
++    // Pass 2 — the same row plus the audit entry pass 1 wrote. The 🚀 card is
++    // proved delivered and refused; the ⚠️ card never landed and is still owed,
++    // so it goes out exactly once. Before this change the 🚀 was re-sent here.
++    const db2 = termDb([popeyeRow({ upStages: w1.upStages })], {
++      audit: [{ ...delivered[0], at: Date.now() }],
++    });
++    const texts2 = [];
++    const out2 = await mkWatcher(db2, {
++      api: { sendMessage: async (_chat, text) => { texts2.push(text); return { message_id: 222 }; } },
++    }).runTick(Date.now() + 1_500);
++    assert.equal(out2.deduped, 1, "the delivered card is refused");
++    assert.match(String(out2.note), /dup-skip 1/);
++    assert.deepEqual(
++      texts2.map((t) => (t.includes("🚀") ? "rising" : "weak")),
++      ["weak"],
++      "only the card that never landed is re-sent",
++    );
++  });
+ 
+   await test("out-of-window patch: the terminal card's three-state send is all in (docs/patches/terminal-send-and-liq-prune.patch)", () => {

@@ -120,20 +120,26 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 * 冇 check clock（`last_checked = 0`：手寫 fixture、或者被 terminal settle `rearmPushWatchAlert` 清過鐘嘅 row）
   **唔會**行呢條路 —— 冇「剛剛嗰個 pass」可以等。
 
-### 7.4 未落地嘅一半（老實講）
+### 7.4 補完：兩個「未落地嘅一半」＋ pass note 嘅遺棄（2026-09-23）
 
-* **row loop 仍然只為「被 cut 嗰張」寫 mark**（`addCutMark(row.upStages, cutSig, now)`）。所以一條 row
-  一次過送幾張卡而中途被切／冇 slice，較早**已經送到**嗰幾張仍然會被重新公告（POPEYE 型）。
-  修法已經備好：row loop 收集今個 pass **所有 attempt**（送到嘅＋被切嘅）再一次寫入 `addCutMarks`，
-  每張卡就會各自用自己嘅 proof 擋住重複。
-* **audit 寫入位未傳 `sig`**：所以暫時行 token 級 fallback（proof 仍然有效，只係分唔到同一 row 嘅兄弟卡）。
-  一行改動：`recordPushDelivery({ …, kind: "followup", sig: a.sig })`（`Db.recordPushDelivery` 嘅
-  parameter type 亦要加 `sig?: string`）。
-* 上面兩處都在 `src/pushwatch.ts` 嘅 row loop（約 2000–2400 行）／`src/db.ts`（約 2030 行），而呢個
-  workspace 嘅檔案編輯工具只能讀寫檔案**前 ~50KB**（`str_replace` 在深處會報 "not found"），
-  所以今次改唔到；兩處都係細而獨立嘅改動，唔影響 7.2 嘅語意（只係少一半精度）。
-* `p:` mark 用分鐘桶，所以「同一個 check」嘅判斷有一個 straddle：cut 嗰刻跨分鐘（pass 橫跨 :59 → :00）
-  就會當成「唔係最近一次 check」，退回舊行為（照送）。量到約一成分嘅 cut。
+09-22 個 deploy 只落地一半，原因係 workspace 嘅檔案編輯工具只寫得到檔案**前 ~50KB**（`str_replace`
+在深處報 "not found"），而兩處都在深處。今次用 `git apply --recount`（patch 留底在 `docs/patches/`）
+逐個落地，共四個改動：
+
+| 改動 | 位置 | 內容 |
+|---|---|---|
+| row loop 寫**所有** attempt | `src/pushwatch.ts`（`checkFields` ／ row loop） | `cutSig: string \| null` 換成 `attempts: Array<{sig, at}>`：送到嘅卡（成功 send，stamp = **送出前**嘅 `Date.now()`）＋被切嘅卡，一次 `addCutMarks` 寫入 `up_stages` |
+| 已證實嘅卡**原封**帶落去 | 同上（`priorMarks`） | `a.deduped` 嘅卡今個 pass 冇 attempt；佢個 mark 用**原本**時間戳帶落去 — 重新 stamp 會令 mark 排喺 proof 之後，反而放返個 duplicate 出嚟 |
+| audit entry 帶 `sig` | `src/pushwatch.ts`（成功 send ＋ cut 嘅 late settle）／`src/db.ts`（entry type） | `recordPushDelivery({ …, kind: "followup", sig: a.sig })` ⇒ proof 由 token 級升級到 per-card（§7.2 第一條） |
+| pass note 唔再被遺棄 | `src/scanner.ts`（`persistPassNote`） | 由 `Promise.race` 改成直接 `await`（`PUSH_WATCH_PASS_STATE_BOUND_MS` 已刪）：race 輸咗就係放棄個 write，而未 await 嘅 promise 喺 invocation 完結時會被**取消**。09-22 18:09–18:28Z 實測 shape：row 檢查一路跑，note `at` 凍結 19 分鐘。Db 自己已經有 hard wall（`wrapClientWithHardWall`），所以 await 唔會吊死 tick |
+
+`p:` mark 用分鐘桶，所以「同一個 check」嘅判斷有一個 straddle：cut 嗰刻跨分鐘（pass 橫跨 :59 → :00）
+就會當成「唔係最近一次 check」，退回舊行為（照送）。量到約一成分嘅 cut。呢個仍然存在。
+
+驗收測試：`PushWatcher: a DELIVERED card is not re-announced when a later sibling is held back (POPEYE)`
+（一行 row 一個 pass 帶 🚀＋⚠️，🚀 送到、⚠️ 被 Telegram 拒 ⇒ 下一個 pass 只可以重送 ⚠️）。
+Negative control 已實測：反轉 `cut-card-dedupe-all-attempts` ＋ `cut-card-dedupe-attempt-clock` 再 build，
+該測試 fail（`the DELIVERED card leaves an attempt mark too: null`），還原後 `269 passed, 0 failed`。
 
 ### 7.5 驗收點
 
@@ -205,3 +211,9 @@ terminal row 唔會再推導同一張卡 ⇒ dedupe 冇機會被評估，mark �
 `cut-card-dedupe`（tracker：proof 讀取、dedupe skip、背景 audit、cut mark 寫入）、`cut-card-dedupe-optional`、
 `cut-card-dedupe-tests`、`cut-card-dedupe-behaviour-tests`（兩條既有測試斷言隨行為改變更新）。
 六個 patch 依序 `git apply` 可重建整個改動，反向亦可還原到 HEAD。
+
+第二修嘅補完（09-23，依序 `git apply --recount`）：`cut-card-dedupe-all-attempts`（row loop：所有 attempt
+一次寫入 ＋ 已證實嘅卡原封帶落去）、`cut-card-dedupe-audit-sig`（audit entry type 加 `sig`）、
+`cut-card-dedupe-attempt-clock`（把 attempt 時鐘讀提升到 terminal／非 terminal 分支之上，兩條路都用到）、
+`pass-note-awaited`（scanner：note 由 race 改 await）、`cut-card-dedupe-popeye-test`（regression test）。
+反向 `git apply -R` 亦實測過（negative control）。

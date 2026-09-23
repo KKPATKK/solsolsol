@@ -2034,6 +2034,14 @@ export class Db {
     mcapAtPush?: number;
     /** "initial" = first push card (scanner); "followup" = tracker alert. */
     kind?: string;
+    /**
+     * The tracker card's transition signature (see CUT_MARK_PREFIX in
+     * src/pushwatch.ts): the identity a re-derivation of the SAME card can be
+     * matched against, so a proof can only ever stand for the transition it is
+     * about (deferrallog.deliveredFollowupProofs). Untagged entries are indexed
+     * under the token alone — the coarse rule this key replaced.
+     */
+    sig?: string;
   }): Promise<void> {
     const raw = await this.getWorkerState("push_audit");
     let list: unknown[] = [];
@@ -2089,6 +2097,8 @@ export class Db {
       mcapAtPush?: number;
       /** "initial" (scanner) | "followup" (tracker) | … — see deferrallog. */
       kind?: string;
+      /** The card's transition sig (recordPushDelivery / cardProofKey). */
+      sig?: string;
       at: number;
     }>
   > {
