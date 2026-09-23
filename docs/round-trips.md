@@ -215,7 +215,7 @@ statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 …
    舊基線 5 行一輪 = 6 分鐘）。10:40:09 嗰個 pass 帶 `undelivered 1`：一張卡嘅 send 唔成功，
    rollback 照舊寫咗（下一步由 §11.3 嘅 audit ring 睇，唔靠 note）。
 
-### 4.3 holder probe 嘅 cap 同 slot — 已修（2026-09-23，未 deploy）
+### 4.3 holder probe 嘅 cap 同 slot — 已修（2026-09-23，已 deploy `2b4b9fe`）
 
 上線後嘅 holder 讀數（09:54Z `ae269d4` 前後）：
 
@@ -385,6 +385,11 @@ probe），所以上表除咗 probe 一項之外都係由卡片數推算 —— 
 
 ### 4.5 未做
 
+* **durable cron 到達記錄會停**（2026-09-23 13:46:27Z 起 ≥ 30 分鐘，見 §5.1 第 3 點）：
+  `scheduled_tick_total` / `scheduled_tick_at` / ring 尾一齊凍結，而 scan row 照落。要一個**唔經
+  claim batch** 嘅到達標記（或者直接睇 Cloudflare 嘅 cron 指標）才分得開「cron 冇投遞」同
+  「cron 死喺 init」；而後者係 §1 搬走 pre-init 寫入之後新開嘅盲點（舊 code 喺 init **之前**寫到達
+  記錄，正正係為咗呢件事）。fix 之前唔應該再加任何「到達記錄搭去第二個 write」嘅優化。
 * pair 階段嘅重複讀。今日嘅讀數（§4.2.1 第 4 點）話正常 pass 係 `pairs 179/0`——由 `lastPairs`
   服務，即喺同一個 tick 内並冇重複嘅 HTTP。但仍然有一條唔清楚嘅：10:29:19 嗰個
   `pairs 601/0 pairs 1/10 miss 9`，即係 head 全 miss 嘅一次真 request（一個 subrequest 加
@@ -396,7 +401,7 @@ probe），所以上表除咗 probe 一項之外都係由卡片數推算 —— 
   `token_overview`；同時要決定 `resolveTraderData`（`top_traders`）值唔值呢個 CU。
   2026-09-23：**暫時唔做** —— 呢個就係 §4.5.1 個 counter 要答嘅問題，等有實測數字先。
 
-### 4.5.1 Birdeye CU 帳簿：由推算變成量度（2026-09-23，已修，未 deploy）
+### 4.5.1 Birdeye CU 帳簿：由推算變成量度（2026-09-23，已修，已 deploy `8a6c6fe`）
 
 §4.4.2 嘅 quota 表除 holder probe 一項之外全部係由卡片數**推算** —— repo 從來沒有任何 Birdeye
 call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable ledger ＋ `/health` 讀數**。
@@ -436,19 +441,116 @@ call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable
    呢個差異就係下一個決定嘅材料。
 4. `pendingCu` 在冇 scan 嘅 tick 會繼續存在（drain 跟節流），有 scan 後回落。
 
+#### 4.5.2 上線後讀數（deploy `8a6c6fe` @ 12:54Z，run 35863485480 success 1m21s；抽樣 13:52–14:17Z）
+
+`/health.birdeyeCu` 已經上線，shape 同設計一模一樣（`monthlyMax` 由 `BIRDEYE_MONTHLY_CU_MAX`
+讀到 30000）：
+
+| 讀數（UTC） | `birdeyeCu` |
+| --- | --- |
+| 13:52 / 13:55 / 14:02 | `{ day:"2026-09-23", today:0, monthCu:0, pendingCu:0, monthlyMax:30000 }` |
+
+1. **charge 半已經證實**：`/debug/birdeye-overview?address=AVXPQqxd…`（＝一個真嘅
+   `token_overview`，20 CU）之後，**同一個 isolate 嘅下一個請求**就報 `pendingCu 20`；再打一次
+   （14:17Z）之後嗰個 isolate 持 `pendingCu 40`。即係「per-attempt 記帳 → module delta →
+   /health.pendingCu」全程通，同 §4.5.1 嘅設計一致。順帶量到今日 endpoint 唔慢：`507ms`
+   （14:06:25）、`174ms`（14:17Z）、`holderCount` 2704 / 2703 —— 同 §4.3 嗰六次
+   `1_008–2_525ms` 唔同時段，所以 cap 2400 呢個 hit-rate dial 今日唔係瓶頸。
+2. **`pendingCu` 係 per-isolate，讀法要跟**：同一分鐘內連續兩個 `/health` 可以一個報 20、一個報
+   0（實測 14:10:32–14:11:20 交替出現，即 LB 喺兩隻 isolate 之間輪流）。所以**月用量讀數要
+   `monthCu + pendingCu` 而且抽幾次**，唔可以單發定論 —— 呢條係 §4.5.1「落線點驗」第 1 點嘅
+   操作細節。
+3. **durable 半今日未行使，原因係位置而唔係壞**：到 14:17Z 為止 `today 0 / monthCu 0` 冇動，
+   而 `pendingCu` 由一隻 isolate 持住 40 未落庫。flush 搭住**收費嗰個 isolate 自己**嘅
+   post-scan telemetry（5 分鐘節流 ＋ 要有一個完成嘅 scan），而今次嘅收費係由一支**唔掃描嘅
+   HTTP isolate** 付（`/debug/birdeye-overview` 係手動 probe）—— 佢要等到自己下一次真係掃描才
+   flush。生產路徑唔同：卡片嘅 `token_overview` 同 holder probe 都係**掃描裡面**付嘅，付錢嗰個
+   isolate 就一定係會 flush 嗰個（scan 完就係 completion flush → `syncPostScanTelemetry`）。
+   ⇒ 老實講：**charge 半已證、durable 半未證**（等一次自然掃描落庫，見落線點驗第 1 點）。
+   * **手動 probe 嘅賬會卡住更耐，甚至永遠唔落**：`/debug/birdeye-overview` 係一支**只服務
+     HTTP** 嘅 isolate 付錢，而佢唔會主動掃描（心跳一值新鮮就唔會 claim）—— 抽樣三段（14:06、
+     14:17、14:18）共 ~60 CU 到 14:19Z 一條都冇落庫，就係呢個形狀。呢個係**量度工具嘅限制**，
+     唔係生產帳目嘅限制（生產嘅 charge 一律喺 scan 裡面），但如果日後有人用呢條 route 去驗
+     `monthCu`，要預佢唔動，唔好誤判成 ledger 壞咗。
+4. **`pendingCu` 跨冇 scan 嘅 tick 一直存在**（抽樣期間反覆讀到 20/40），即落線點驗第 4 點嘅
+   前半（drain 跟節流）成立。
+5. **`cu-gate` 真係閘住**：抽樣嘅 pass note 全部係 `probe0 miss0` ＋ 尾段 `cu-gate`，例如 13:54
+   `ok:10/0 rows 10/30 pairs 10/10 miss 0 lost 0 allow 4778 spend[setup 351/3 heal 228/1 miss0
+   enrolled0 pairs 246/0 rows 143/1 holders 0/0 held0 cut4 probe0 miss0 cu-gate] trips 7 db 1099ms`
+   —— 60 分鐘 gap 未開閘時一個 probe 都唔開、**0 CU**，而 §4.1 嘅「probe 搭 pair batch 起步」
+   冇被今次改動影響（`pairs 490/0`、`rows 35/1` 呢種單 trip pass 照樣出現）。
+6. **冇新增 push-watch issue**：`/debug/push-watch.issueCount` = 2，兩條都係舊嘅
+   `lost_completion_write`（01:41Z APECAT、04:17Z REALLY），同今次 deploy 無關。
+
+### 4.6 invocation 預算：先量度，才切（2026-09-23，已修，未 deploy）
+
+§5 尾嘅結論係「下一步只可以繼續減 invocation 內嘅 subrequest」，但 repo 從來**冇一個數**可以答
+「邊個 phase 燒咗個預算」：pass note 嘅 `trips` 只算 pass 自己嘅 DB round trip，`dbSteps` 只包三個
+wrapped Db method，`writeDrain` 只算 drain。之前每一刀（§1、§4.2）都係靠「stage 分解」推，唔係靠總數
+—— 所以今次先補呢個儀器，唔再靠估。
+
+**量度點**：`src/subreqs.ts` ＋ worker 喺 module load 裝嘅一個 `fetch` wrapper（**唯一**嗰個 seam：
+DB 係 `@libsql/client/web`，即 HTTP，所以 Turso round trip、Telegram send、所有 feed 都經同一個
+function —— 一計就係 Cloudflare 真係限制嗰個量）。
+
+* **window**：`beginPreTick` 開一個 new window（cron 同 HTTP fallback 都經呢個 seam）⇒ 一個 window
+  ＝一次掃描嘅開支。`countSubreq()` 每 call 加一。
+* **phase ring**：tick probe 嘅 `markPhase` wrapper 會 stamp 一個
+  `{ phase, total, ms }`（保留最新 8 個）—— 呢個就係「邊個 phase 燒」嘅答案，而佢**唔需要新
+  round trip**（`markPhase` 本來就有）。
+* **死 tick 讀法**：被殺嘅 invocation 自己永遠 publish 唔到，所以 `beginSubreqWindow` 會把**上一個
+  window** 捲入 `recent`（最新兩個）—— 下一個 tick（即 backfill 佢 history row 嗰個）就看得見
+  「死嗰個去到邊、走到幾多」。呢個就係 counter 放喺 module scope 而唔係 per-call 嘅原因。
+* **讀數**：`/health.heartbeat.subreqs = { budget: 50, current: {at,total,phases}, recent: [≤2], windows }`。
+  completion heartbeat 帶嘅就係嗰個 tick 嘅 `current` ＋ 上一個 window 嘅 `recent`。
+* 測試：`test-unit.js` 加 6 條（budget／ring 常數、累加、phase point 係該刻嘅 running total ＋
+  window-relative ms、ring 保留最新、roll 嘅 newest-first＋cap＋idle window 唔佔位、被殺 window
+  由下一個讀得到）⇒ 286 → **292 passed, 0 failed**。
+* 落線紀錄：`docs/patches/subreq-counter.apply.js`（worker.ts）＋
+  `…-tests.apply.js`（test-unit.js）＋ `…-tests.fix1.apply.js`（修正 roll test 嘅算術 —— 原本
+  assert 一個「已經計過 1 個 call」嘅 window 唔會入 recent，係測試寫錯，唔係 counter 錯）。
+
+#### 4.6.1 由 code 得出嘅清單（切嘅候選，等數字定次序）
+
+| # | 消費者 | 次數／tick | 註 |
+| --- | --- | --- | --- |
+| 1 | **candidate chain**（per coin：`isTokenSeen`、rugcheck、`token_overview`、`top_traders`、ohlcv、helius／flurry、supply-flow 寫入、proTraders／sniper 寫入、claim／send／delivery） | **~12–18 per candidate** | 唯一可以單 tick 加十幾個嘅項 ⇒ 懷疑係死 tick 嘅來源；但亦係改動風險最高嘅位（推卡語意） |
+| 2 | pair phase | 2–8 | 250ms 一個 batch，2s 預算 ≈ 6–8 個 |
+| 3 | feeds（profiles 1 ＋ 每條 leg 1 ＋ gecko pages） | 4–7 | 健康 gecko 時 fallback 層唔行 |
+| 4 | 每 tick 固定 DB（gate read／claim／`listEnabledChats`／pool／prune due-check／`getTokenStatsMany`／flush） | ~7 | 基本盤 |
+| 5 | post-flush tail（deferral read **1/tick** ＋ 三個 5 分鐘 sync 嘅 **4–7 reads** ＋ drain） | 2–9 | 唔會殺 row（flush 已落），但同 pass 搶預算 ⇒ pass note 嘅 `err:Too many subrequests` |
+| 6 | pass 自己（`trips`） | 5–13 | §1／§4.2 已批過 |
+
+**落線點驗**：
+
+1. 安靜嘅 tick：`subreqs.current.total` 應該 ~20–30（清單 1 唔行），而 `phases` 嘅尾段會指出最大增
+   幅係喺 `pool`／`pairs`／`gate` 邊個位。
+2. 有 candidate 嘅 tick：`total` 會跳上 35–50 ⇒ 清單 1 就係目標；`phases` 入面 `gate` 之後嘅增幅
+   直接指出係邊個 per-coin call。
+3. 死 tick：下一個 tick 嘅 `recent[0]`（`total` 貼近 50、`phases` 尾 = 死者最後 stamp）—— 呢個數
+   就係「應該切邊個」嘅最終答案，唔使再估。
+4. `windows` 遞增（代表 counter 活著）；`/health` 兩個連續請求可能出現兩個 isolate 嘅 window
+   （per-isolate，讀法同 §4.5.2 第 2 點一樣）。
+
+**下一刀（跟數字）**：清單 5 係已確認可以「batch 埋」嘅（三個 5 分鐘 sync 嘅 read 合成一個 grouped
+read ＋ 一個 batch write）；清單 1 係最大但風險最高，等 §4.6.1 第 2 點嘅數字確認係唔係佢才動手。
+
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **286 passed, 0 failed** ✅（279 → 286：§4.5.1 新增 7 條 CU-ledger test
+* `node scripts/test-unit.js` → **292 passed, 0 failed** ✅（§4.6 新增 6 條 subrequest-counter test；
+  其餘見下 —— 279 → 286 係 §4.5.1 嗰 7 條 CU-ledger test
   —— 單價表、attempt 記帳、mid-write charge、parser 容錯、merge＋剪枝、today/month 分界、
   sync 落地＋失敗 re-offer；§4.4 嗰條 CU-gate test 與 `trips` invariant 仍然釘住）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
   → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809
   **success**（1m16s）✅；`2b4b9fe`（§4.3 probe cap／slot）→ run 35851038091 **success**（1m20s）✅；
-  `66a9321`（§4.4 CU budget）→ run 35854326659 **success**（1m20s）✅
+  `66a9321`（§4.4 CU budget）→ run 35854326659 **success**（1m20s）✅；`8a6c6fe`（§4.5.1 Birdeye
+  CU 帳簿）→ run 35863485480 **success**（1m21s，12:54:28Z）✅
 * 上線後讀數：§3.1（第一刀）、§4.1.1（holder 由飢餓救返）、§4.2.1（row loop 一個 head 一個 trip）、
-  §4.3.1（`probe1 miss0` 同 collect 回落）、§4.4.1（`probe1 miss0` → 下一個 pass `cu-gate`）
+  §4.3.1（`probe1 miss0` 同 collect 回落）、§4.4.1（`probe1 miss0` → 下一個 pass `cu-gate`）、
+  §4.5.2（CU 帳簿：charge 半已證、durable 半未證）、§5.1（note／history 觀察）
 * 卡片側：`/debug/push-audit` 有帶 `sig` 嘅 follow-up entry（ARGUS 嘅 `ignite`／`liqwarn`／`drain`、
   HANDLES 嘅 `ignite` 等，30 條 ring），`/debug/push-watch.issueCount` = **1**
   （DeadCatBounce，2026-09-22 嘅舊 row）
@@ -460,6 +562,45 @@ call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable
   講嘅「偵測延遲」（68–82s），**唔係** tick 跑咗咁久：ring 内 `ms >= 100000` 係 **0** 條
   （之前見過嘅 6 位數 ms 今次冇再出現），而 `cut:watchdog` 亦冇再出現。下一步只可以繼續減
   invocation 內嘅 subrequest（§4.4）。
+  **13:52–14:17Z 更新：呢組讀數已經唔再成立** —— dead row 24/120、`ms >= 100000` 3 條、pass note
+  亦再停喺 `running`；只有 `cut:watchdog` 一樣冇出現。抽樣同判讀見 §5.1。
+
+### 5.1 note／history 觀察（2026-09-23 13:52–14:17Z，即 HKT 21:52–22:17）
+
+| 睇嘅嘢 | 今次抽樣 | 判讀 |
+| --- | --- | --- |
+| `cut:watchdog` | **冇出現**（抽到嘅每個 pass note 都係正常尾段） | 8s watchdog 仍然 hold：pass 一定 return |
+| 6 位數 ms | **返嚟**：120 行 ring 有 3 條 `ms >= 100000`（101889 @13:46:27、102737 @13:50:25、111176 @13:26:27） | 見第 1 點 —— 呢個 ms **唔係** tick 時長 |
+| `previous tick died before its completion flush` | 120 行 ring（11:41:50–13:55:18Z）**21 條**：12 點鐘 9 條、13 點鐘 12 條 | 即 ~**20%** tick 死喺 completion flush 之前 |
+| `scan exceeded its … race window` | 3 條（12:26:10、12:52:31、13:08:31） | race cut 正常（有 history row，唔係 dead tick） |
+| `err:Too many subrequests` | **仍然出現**（`/debug/tick.summary.pushWatch` 抽到） | 50-subrequest 上限照舊係兇手；pass note 因此停喺 `phase:"running"` |
+
+1. **6 位數 ms 係「偵測延遲」，唔係 tick 跑咗 100 秒**：`ms` 由 `deadTickBackfillInfo` 計，係
+   `now - 死者 heartbeat.at` —— 前人 tick 開咗 scan（`phase:"scanning"`）之後死咗，下一個贏到
+   lease 嘅 tick 幾耐之後才發現。所以 `102737` 係「一個 tick 死喺 13:48:43，13:50:25 才被
+   backfill」，中間 102 秒冇人贏到 lease（45s 嘅 `BACKFILL_STALE_MS` 之後還要等下一個掃描 tick）。
+   同 §18.2 嘅講法一致：**呢條數答「偵測延遲」，唔答「tick 有幾長」**。
+2. **pass note 會停喺 `running`**：13:57:16 / 13:57:44 / 13:58:11 / 13:58:39 連續四個樣本（跨 4
+   分鐘）都係 `phase:"running"`，14:02:18 又回 `done`。即被殺嗰個 tick 嘅 pass 永遠唔會寫 terminal
+   note，要等下一個 tick 接手 —— 睇 note 一定要連 `phase` 一齊睇，唔好當 `running` 係「跑緊」。
+3. **新發現：durable 嘅 cron 到達記錄會停**。`scheduled_tick_total` 凍在 **54546**、
+   `scheduled_tick_at` 同 ring 尾凍在 **13:46:27.007Z**，由 13:46 一直到 14:17 都冇動；同一時間
+   heartbeat 每分鐘前進、scan row 照落（heartbeat `phase:"done"`、`lastScanGapMs` 幾秒）。再早一段
+   ring 仲有一個 **2400s 洞**（12:16:26 → 12:56:27）同三個 120s 洞（13:26／13:30／13:37）。
+   兩個可能，喺 /health 上長得一樣：
+   * **cron 冇投遞** —— HTTP monitor 每分鐘 ping `/health` 照樣驅動掃描（docs/uptime-monitor.md
+     設計嘅保險），所以 bot 冇停，只係「cron 仲生唔生」呢個信號靜咗；或者
+   * **cron 有投遞但死喺 init** —— §1 把到達記錄搬上 claim batch（每個 tick 慳 ~2 個 round trip），
+     代價係「到唔到 claim」以外嘅死亡路徑（`ensureInitialized` throw；或者 gate 讀 throw 而
+     legacy bump 亦 throw）**連到達記錄都唔會寫**。舊 code 係喺 init **之前**寫嘅，正正為咗呢件事
+     （worker.ts 嘅註解原話："a slow/failed init … otherwise kills the scheduled event inside the
+     init"）。
+   ⇒ 分開呢兩者要一個**唔經 claim batch** 嘅到達標記（或睇 Cloudflare 嘅 cron 指標）：抽樣期間
+   `/health.scheduledTicks`（module counter）喺我打到嘅樣本全部係 0，但嗰啲 isolate 亦可能根本唔
+   收 cron，所以**唔算證據**，唔應該當結論。呢條列入 §4.5 未做第一項。
+4. **掃描冇斷**（呢點要講清楚，否則上面嘅讀數會被誤讀成「bot 死咗」）：抽樣期間 scan row 每 ~60s
+   落一條、heartbeat `phase:"done"`、`lastScanError` null、`initError` null、`issueCount` 冇升 ——
+   即係 push 檢查／卡片路徑照跑，問題集中喺「invocation 預算」同「cron 到達信號」。
 
 ## 6. 點解要一個 script 落呢個改動
 

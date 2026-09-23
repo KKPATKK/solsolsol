@@ -1,5 +1,10 @@
 import { geckoFeedStats } from "./geckoterminal";
 import { gmgnFeedStats } from "./gmgn";
+// The subrequest window is stamped here, because this wrapper is the only
+// place that sees EVERY phase the scanner marks (see src/subreqs.ts): the
+// scanner itself is past the file-sync window, and the probe already
+// intercepts its marker.
+import { markSubreqPhase } from "./subreqs";
 
 /*
  * Per-tick probe for the scan (2026-09-19).
@@ -553,6 +558,10 @@ export function installTickProbe(
       const stamp: TickPhaseStamp = { phase: name, ms: now() - tickStartedAt };
       if (stamps.length >= TICK_PROBE_MAX_PHASES) stamps.shift();
       stamps.push(stamp);
+      // Same stamp, counted against the invocation's subrequest budget: the
+      // phase points are what say WHERE a tick spent it, and they survive on
+      // the isolate even when the invocation dies on it (see subreqView).
+      markSubreqPhase(name, now());
     };
   }
   target.runOnce = async (): Promise<unknown> => {

@@ -77,6 +77,33 @@ import { ArkhamClient } from "./arkham";
 import { CrimeWalletClient } from "./crimewallets";
 import { WalletAnalyzer } from "./walletanalysis";
 import { FlurryAnalyzer } from "./flurry";
+import {
+  beginSubreqWindow,
+  countSubreq,
+  subreqView,
+} from "./subreqs";
+
+/**
+ * Count every subrequest this invocation makes — the quantity Cloudflare
+ * limits to 50 per invocation, and the one this tick dies on (see
+ * src/subreqs.ts for the whole rationale).
+ *
+ * Installed once per isolate, at module load, so it cannot miss a client: the
+ * DB is @libsql/client/web (one HTTP request per statement batch) and every
+ * upstream client (gecko, pump.fun, Meteora, DexScreener, Jupiter, Birdeye,
+ * Helius, GMGN, Telegram) calls this same global. The wrapper counts and then
+ * forwards the call unchanged — one increment, no clone, no extra request.
+ * The window it counts into is opened per tick by beginPreTick, and its phase
+ * ring is stamped by the tick probe's markPhase wrapper.
+ */
+const realFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = ((
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+) => {
+  countSubreq();
+  return realFetch(input, init);
+}) as typeof fetch;
 
 /**
  * Cloudflare Worker entry for the scanner.
@@ -1287,6 +1314,14 @@ export function preTickView(): PreTickView {
 
 /** Start a fresh pre-scan split for a tick entering the handler. */
 function beginPreTick(entryAt: number): void {
+  // The subrequest window opens here, with the pre-scan split: both
+  // handlers (cron and the HTTP fallback) enter through this seam, so a
+  // window is one scan attempt's spend — the unit Cloudflare limits to 50
+  // per invocation (see src/subreqs.ts). Anything else this isolate serves
+  // inside the same window (a webhook, a /debug probe) is counted too, so
+  // the reading is an upper bound on the tick; the phase ring is what
+  // localizes it.
+  beginSubreqWindow(entryAt);
   preTickEntryAt = entryAt;
   preTick = {
     at: entryAt,
@@ -2292,6 +2327,10 @@ async function runScan(
     err: null,
     skip: startSkip?.reason ?? null,
     skipAt: startSkip?.at ?? null,
+    // Subrequests counted so far in this invocation (see src/subreqs.ts).
+    // At claim time this is the pre-scan front (init + gate + claim), which
+    // is exactly the slice the tick's OWN budget measurement excludes.
+    subreqs: subreqView(),
     // Fleet-wide early-return counters (durable row): the isolate view above
     // answers why the tick being reported did nothing, this answers how often.
     skipCapture: skipCaptureMirror,
@@ -2557,6 +2596,12 @@ async function runScan(
             skipAt: skipView?.at ?? null,
             // Fleet-wide early-return counters (durable row).
             skipCapture: skipCaptureMirror,
+            // The invocation's subrequest reading (see src/subreqs.ts):
+            // `current` is this tick's spend with the phase ring that says
+            // WHERE it went, and `recent` is the window before it — which
+            // is how a tick that died on the budget is read, since a killed
+            // invocation never gets to publish anything itself.
+            subreqs: subreqView(),
             // The idle-tick signature: green, but nothing was evaluated
             // because BOTH the profile feed and the re-eval pool read came
             // back empty. Kept ALONGSIDE `skip` because they answer different

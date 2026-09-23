@@ -25,6 +25,7 @@ const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRI
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
+const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -9960,6 +9961,116 @@ async function main() {
       consumeBirdeyeCuDelta(peekBirdeyeCuDelta());
       await t.cleanup();
     }
+  });
+
+  // ---------- Subrequest counter (src/subreqs.ts) ----------
+
+  await test("subreqs: the budget and the ring sizes are the platform facts", async () => {
+    // 50 subrequests per invocation is Workers Free's documented cap and the
+    // number every reading in /health.heartbeat.subreqs is spent against; the
+    // runtime's throw is what kills a tick before its completion flush.
+    assert.equal(SUBREQ_BUDGET_FREE, 50);
+    // The ring keeps the NEWEST phase points (the dead window's tail).
+    assert.equal(SUBREQ_PHASE_RING, 8);
+    // Two finished windows: the window right before a tick can be a plain
+    // HTTP request, and the reader is after the tick-sized one.
+    assert.equal(SUBREQ_RECENT_WINDOWS, 2);
+  });
+
+  await test("subreqs: calls accumulate into the open window", async () => {
+    resetSubreqWindows();
+    beginSubreqWindow(1_000);
+    let view = subreqView();
+    assert.equal(view.current.at, 1_000);
+    assert.equal(view.current.total, 0);
+    assert.deepEqual(view.recent, []);
+    assert.equal(view.windows, 1);
+    countSubreq();
+    countSubreq();
+    countSubreq();
+    view = subreqView();
+    assert.equal(view.current.total, 3);
+    assert.equal(view.windows, 1, "counting never opens a window");
+  });
+
+  await test("subreqs: a phase point is the running total at that stamp", async () => {
+    resetSubreqWindows();
+    beginSubreqWindow(1_000);
+    countSubreq();
+    countSubreq();
+    markSubreqPhase("pool", 1_250);
+    countSubreq();
+    markSubreqPhase("pairs", 1_900);
+    const view = subreqView();
+    assert.deepEqual(view.current.phases, [
+      { phase: "pool", total: 2, ms: 250 },
+      { phase: "pairs", total: 3, ms: 900 },
+    ]);
+  });
+
+  await test("subreqs: the phase ring keeps the newest stamps, not the first", async () => {
+    resetSubreqWindows();
+    beginSubreqWindow(0);
+    for (let i = 0; i < SUBREQ_PHASE_RING + 2; i += 1) {
+      countSubreq();
+      markSubreqPhase("p" + i, i);
+    }
+    const phases = subreqView().current.phases;
+    assert.equal(phases.length, SUBREQ_PHASE_RING);
+    assert.equal(phases[0].phase, "p2", "the oldest two fell off");
+    assert.equal(phases[phases.length - 1].phase, "p9");
+  });
+
+  await test("subreqs: a finished window rolls into recent, newest first", async () => {
+    resetSubreqWindows();
+    beginSubreqWindow(1_000);
+    countSubreq();
+    beginSubreqWindow(2_000);
+    countSubreq();
+    countSubreq();
+    // An idle window (nothing counted, no phase) must not take a slot: HTTP
+    // requests that return before their first call are the common case.
+    beginSubreqWindow(3_000);
+    beginSubreqWindow(4_000);
+    const view = subreqView();
+    assert.equal(view.windows, 4);
+    // The idle 3000 window took no slot, so the two counted ones are both
+    // still there, newest first.
+    assert.equal(view.recent.length, 2);
+    assert.equal(view.recent[0].at, 2_000);
+    assert.equal(view.recent[0].total, 2);
+    assert.equal(view.recent[1].at, 1_000);
+    assert.equal(view.recent[1].total, 1);
+    // Capped at SUBREQ_RECENT_WINDOWS, newest first.
+    countSubreq();
+    beginSubreqWindow(5_000);
+    countSubreq();
+    beginSubreqWindow(6_000);
+    countSubreq();
+    beginSubreqWindow(7_000);
+    const capped = subreqView();
+    assert.equal(capped.recent.length, SUBREQ_RECENT_WINDOWS);
+    assert.equal(capped.recent[0].at, 6_000);
+    assert.equal(capped.recent[1].at, 5_000);
+  });
+
+  await test("subreqs: a window killed at the budget is read from the next one", async () => {
+    // The whole point: a tick killed by `Too many subrequests` publishes
+    // nothing, so its spend and its last phase have to survive the roll.
+    resetSubreqWindows();
+    beginSubreqWindow(10_000);
+    for (let i = 0; i < SUBREQ_BUDGET_FREE; i += 1) countSubreq();
+    markSubreqPhase("gate", 12_000);
+    beginSubreqWindow(20_000);
+    const killed = subreqView().recent[0];
+    assert.equal(killed.total, SUBREQ_BUDGET_FREE);
+    assert.equal(killed.at, 10_000);
+    assert.equal(killed.phases[killed.phases.length - 1].phase, "gate");
+    assert.equal(
+      killed.phases[killed.phases.length - 1].total,
+      SUBREQ_BUDGET_FREE,
+      "the last phase reports the total the window died with",
+    );
   });
   console.log("\n===== UNIT TESTS =====");
   for (const line of results) console.log(line);
