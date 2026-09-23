@@ -1,0 +1,22 @@
+diff --git a/docs/duplicate-cards.md b/docs/duplicate-cards.md
+--- a/docs/duplicate-cards.md
++++ b/docs/duplicate-cards.md
+@@ -525,2 +525,24 @@
+ * 形狀 A 嘅根因（pre-race 9 秒）係 Turso 延遲造成嘅三個硬牆 round trip，唔關 note 事；但它同時令呢啲 tick
+   **完全冇 scan、亦冇 pass**，係下一步值得查嘅對象。
++
++### 14.5 部署後讀數（2026-09-23 03:02–03:07Z，`ed20dbf`）
++
++Deploy：push `ed20dbf` →「Deploy Worker to Cloudflare」成功（run 35812517983，1m13s，03:00:23Z 完成）。
++下面係 `/health.pushWatchPass` 嘅連續讀數：
++
++| 讀數 | 值 | 結論 |
++|---|---|---|
++| deploy 前（03:01:08–03:02:08Z） | `phase` 缺席、`at` 停留 02:58:26Z | 舊版 Worker 寫嘅 row |
++| 03:02:26Z | `phase:"running"`、`at 03:02:24Z`、`trackerMs 0`、`note:"running"` | ✅ running stamp 線上出現 |
++| 03:02:45Z | `phase:"done"`、`at 03:02:26Z`、`trackerMs 1690`、`ok:1/0 … budget-cut` | ✅ 同一個 tick 完成；該 tick `hbMs 5000`（已經係被切嘅 tick），pass 仍然開得成 |
++| 03:03:25／03:04:25／03:05:24／03:06:25／03:07:24Z | `phase:"done"`，`trackerMs 4074–4822`，每次都前進 | ✅ **note 每個 tick 都動**（凍結唔再重現） |
++| 03:04:21Z、03:05:20Z | `phase:"running"`（兩個 tick 都影到中間態） | ✅ |
++
++`phase:"skip"` **今次未影到**：deploy 之後每個 tick 嘅 scan 都係 2.1–3.1s，`trackerBudgetMs > 0` ⇒ 冇 tick 需要跳過 pass。
++呢條分支由單元測試釘住；下一次 burst（scan＋flush ≥ 8.5s 嘅 cut tick，即 02:37–02:41Z 嗰種）出現就會睇到。
