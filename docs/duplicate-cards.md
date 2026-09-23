@@ -366,7 +366,7 @@ mark `p:revive:29835415`（00:55）**完全在 ring 窗口（23:50–01:06）之
 | 讀邊度 | 要見到 | 意思 |
 |---|---|---|
 | `/debug/push-audit` | 一條 `followup`，`token`＝該 row、`sig`＝該 mark 嘅 sig、`at` ≥ mark bucket | proof 落地（C/D 修好） |
-| `/debug/push-watch?limit=200` | 下一個 check 之後：`upStages` 冇咗 `p:`、`lastState` 變成該 sig 嘅狀態、而 `followupsSent` **冇升** | 公告但冇送 ⇒ dedupe 真正觸發 |
+| `/debug/push-watch?limit=200` | 下一個 check 之後：`upStages` 冇咗 `p:`（mark 被消費）、`lastState` 變成該 sig 嘅狀態、`followupsSent` **升 1**（公告落地）——而該 `(token, sig)` 嘅 audit **冇新 entry** | 公告但冇送 ⇒ dedupe 真正觸發（`followupsSent` 係**公告**計數，唔係送出計數） |
 | `/health.pushWatchPass.note` | 該 pass 出現 `dup-skip 1` | 計數器（note 已不再被遺棄，所以睇得到） |
 
 **實際操作**：每 1–2 分鐘拉一次 `/debug/push-watch?limit=200`，揀出「有 `p:<sig>` 而 `lastState` ≠ 該 sig 對應狀態」嗰條 row
@@ -381,3 +381,22 @@ row 有冇被 announce 而冇送。cut 大約每小時一次（12 個 mark／十
 
 `npm run build` → 0 error；`npx tsc --noEmit` → 乾淨；`node scripts/test-unit.js` → **270 passed, 0 failed**（新增一條）；
 `test-deferred-priority.js` → pass；`test-tick-path.js` → pass。
+
+### 11.5 線上驗收：第一張 post-deploy cut 已經觸發到 dedupe（09-23 01:39–01:48Z，`43bb323`）
+
+Deploy：run **35805867249** success，**01:21:27Z 上線**。第一張上線後嘅 cut 係 **REALLY**（`HraqV71u`）嘅 `revive`：
+
+| 步驟 | 讀數 | 意思 |
+|---|---|---|
+| 1. cut 寫 mark | `push_watch.upStages = p:revive:2983569x`（桶 01:39）、`lastState=dead`、`fu=1` | cut 有被記錄 |
+| 2. proof 入 ring | `/debug/push-audit`：`01:39:45Z followup sig=revive msgId=3840`（**exact card key**） | **`holdForTick` 真係令 proof 落到地**（修前 12 個 mark 全部冇 proof） |
+| 3. 下一個 check 重新推導 | 01:46:16Z：`lastState` dead→`null`、`followupsSent` 1→2、`lastAlertAt` 落地、`upStages` 清空 | 公告落地、mark 被消費 |
+| 4. 冇再送 | `(HraqV71u, revive)` 嘅 audit entry **仍然只有 1 條**（01:39:45） | **第二次公告冇送出 ⇒ dedupe 真正觸發** |
+
+這四個讀數只有一個路徑解釋得到：`deduped`（送出失敗會 rollback 令 mark 及 `lastState` 留住；cut 會寫新 mark；
+真送會多一條 audit entry）。即係 §7.2 嗰個設計終於在線上生效，同時 **冇漏卡**（唯一一張 revive 卡早在 01:39:45 已入 chat）。
+
+**惟要注意：嗰個 pass 嘅 note 沒寫入。** 01:45:14Z 之後直接跳到 01:47:26Z，中間 01:46:16Z 嗰個 pass（就係 dedupe 嗰個）
+冇持久化 note，所以 `dup-skip 1` 冇痕跡。呢個就係 §8.3／§10.1 嗰個間歇性凍結（本次讀到凍結 01:36:25Z→01:45:14Z，
+row 檢查一路跑到 01:43），**已 deploy 嘅 `pass-note-awaited`（改 await）未能完全解決**。結論同 operator 講嘅一樣：
+**驗 dedupe 要直接睇 row mark ＋ audit proof，唔可以只睇 note**。
