@@ -25,7 +25,7 @@ const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRI
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
-const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS } = require("../dist/subreqs.js");
+const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -10052,6 +10052,68 @@ async function main() {
     assert.equal(capped.recent.length, SUBREQ_RECENT_WINDOWS);
     assert.equal(capped.recent[0].at, 6_000);
     assert.equal(capped.recent[1].at, 5_000);
+  });
+
+  await test("subreqs: the host split names who spent the window", async () => {
+    // The common failed tick has NO phase point (the ring only stamps once a
+    // candidate reaches the chain, and most ticks process none), so the axis
+    // that has to localize it is the host split. Measured live 2026-09-23:
+    // windows of 34/44/56 subrequests with an empty phase ring.
+    resetSubreqWindows();
+    beginSubreqWindow(1_000);
+    for (let i = 0; i < 3; i += 1) countSubreq("https://api.telegram.org/botX/sendMessage");
+    countSubreq(new URL("https://solana-meme-db.turso.io/v2/pipeline"));
+    // A Request target (what a client that builds one passes) must land too.
+    if (typeof Request === "function") {
+      countSubreq(new Request("https://api.geckoterminal.com/api/v2/networks/solana"));
+    } else {
+      countSubreq("https://api.geckoterminal.com/api/v2/networks/solana");
+    }
+    countSubreq({ url: "https://api.dexscreener.com/latest/dex/tokens/x" });
+    // An unparseable target is still a spent subrequest, just unnamed.
+    countSubreq("not a url");
+    const view = subreqView();
+    assert.equal(view.current.total, 7);
+    assert.deepEqual(view.current.hosts, [
+      { host: "api.telegram.org", count: 3 },
+      // Ties break on the host name, so the same spend always reads back in
+      // the same order — and "(" sorts ahead of the dotted names.
+      { host: "(unknown)", count: 1 },
+      { host: "api.dexscreener.com", count: 1 },
+      { host: "api.geckoterminal.com", count: 1 },
+      { host: "solana-meme-db.turso.io", count: 1 },
+    ]);
+    const sum = view.current.hosts.reduce((n, h) => n + h.count, 0);
+    assert.equal(sum, view.current.total, "the split always adds up to the total");
+  });
+
+  await test("subreqs: the host split is bounded and its remainder stays counted", async () => {
+    resetSubreqWindows();
+    beginSubreqWindow(1_000);
+    // More distinct hosts than the read row count: the rows stay bounded and
+    // the folded row carries the difference, so a reader can still total it.
+    const hosts = SUBREQ_HOST_RING + 5;
+    for (let i = 0; i < hosts; i += 1) {
+      countSubreq("https://host" + String(i).padStart(2, "0") + ".example.com/x");
+    }
+    const view = subreqView();
+    assert.equal(view.current.total, hosts);
+    assert.equal(view.current.hosts.length, SUBREQ_HOST_RING + 1);
+    assert.equal(
+      view.current.hosts[view.current.hosts.length - 1].host,
+      SUBREQ_OTHER_HOST,
+      "the remainder is visible, not dropped",
+    );
+    assert.equal(
+      view.current.hosts.reduce((n, h) => n + h.count, 0),
+      hosts,
+      "folding keeps the sum equal to the window total",
+    );
+    // The split survives the roll, exactly like the phase ring does — that is
+    // what makes a killed window readable from the next tick.
+    beginSubreqWindow(2_000);
+    assert.equal(subreqView().recent[0].hosts.length, SUBREQ_HOST_RING + 1);
+    assert.equal(subreqView().recent[0].hosts[0].count, 1);
   });
 
   await test("subreqs: a window killed at the budget is read from the next one", async () => {

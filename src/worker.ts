@@ -94,14 +94,16 @@ import {
  * Helius, GMGN, Telegram) calls this same global. The wrapper counts and then
  * forwards the call unchanged — one increment, no clone, no extra request.
  * The window it counts into is opened per tick by beginPreTick, and its phase
- * ring is stamped by the tick probe's markPhase wrapper.
+ * ring is stamped by the tick probe's markPhase wrapper. The target is passed
+ * through so the window carries a per-host split as well (see countSubreq):
+ * the ring is blind in the common zero-candidate tick, the host split is not.
  */
 const realFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = ((
   input: Parameters<typeof fetch>[0],
   init?: Parameters<typeof fetch>[1],
 ) => {
-  countSubreq();
+  countSubreq(input);
   return realFetch(input, init);
 }) as typeof fetch;
 

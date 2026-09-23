@@ -24,7 +24,22 @@
  * statement batch, so Turso round trips, Telegram sends and every upstream
  * feed (gecko, pump.fun, Meteora, DexScreener, Jupiter, Birdeye, Helius, GMGN)
  * all come through the same function. One counter therefore measures the exact
- * quantity the platform limits.
+ * quantity the platform limits. (src/db.ts passes its own `fetch` closure into
+ * createClient — the libsql HTTP client would otherwise hold the fetch it
+ * snapshotted at import time, which is the pre-wrapper global — and that
+ * closure resolves THIS one at call time, so Turso round trips are counted.)
+ *
+ * TWO AXES, BECAUSE ONE OF THEM IS BLIND IN THE COMMON CASE
+ * The phase ring is stamped from the scanner's own phase marks, which only
+ * fire once a CANDIDATE enters the chain (deferred/seen/flow/…). Most ticks
+ * process zero candidates (see the `candidates` column of scan_history), so a
+ * killed tick usually publishes an empty ring — measured live on 2026-09-23:
+ * windows of 34, 44 and 56 subrequests with no phase point at all. The host
+ * split is the second axis and it never depends on the scanner reaching a
+ * phase: it attributes every counted call to the host it was sent to, so a
+ * dead window still says WHO spent the budget (`…turso.io` = DB round trips,
+ * `api.telegram.org` = sends, `api.geckoterminal.com` / `api.dexscreener.com`
+ * / the other feeds = the scan's upstream calls).
  *
  * HOW A KILLED INVOCATION IS READ
  * The counter is per INVOCATION but the module outlives it on a warm isolate.
@@ -57,6 +72,24 @@ export const SUBREQ_PHASE_RING = 8;
  */
 export const SUBREQ_RECENT_WINDOWS = 2;
 
+/**
+ * Host buckets listed per window before the rest is folded into one row. Kept
+ * small because /health is polled every minute: the split is meant to be read
+ * at a glance (which upstream owns the budget), not archived.
+ */
+export const SUBREQ_HOST_RING = 7;
+
+/**
+ * Distinct hosts tracked per window. A pathological tick (many backfills, many
+ * feeds in fallback) could otherwise grow the map without bound; past this the
+ * calls land in the folded row instead, so the split still sums to the total.
+ */
+export const SUBREQ_HOST_TRACK_MAX = 24;
+
+/** The folded row's key: every host past SUBREQ_HOST_TRACK_MAX, plus the ones
+ *  past SUBREQ_HOST_RING at read time. Keeps `sum(hosts) === total` readable. */
+export const SUBREQ_OTHER_HOST = "(other)";
+
 /** One phase stamp: the window's total when the scanner reached `phase`. */
 export interface SubreqPhasePoint {
   phase: string;
@@ -64,6 +97,12 @@ export interface SubreqPhasePoint {
   total: number;
   /** Window-relative ms, so a point's cost can be read next to summary.phases. */
   ms: number;
+}
+
+/** One host's share of a window: `count` calls were sent to `host`. */
+export interface SubreqHostCount {
+  host: string;
+  count: number;
 }
 
 /** One invocation's counter state. */
@@ -74,6 +113,12 @@ export interface SubreqWindowView {
   total: number;
   /** Newest last, at most SUBREQ_PHASE_RING points. */
   phases: SubreqPhasePoint[];
+  /**
+   * Where the window's `total` went, biggest first, at most SUBREQ_HOST_RING
+   * rows plus one SUBREQ_OTHER_HOST row carrying the remainder — so the counts
+   * always add up to `total` and a reader can check that.
+   */
+  hosts: SubreqHostCount[];
 }
 
 export interface SubreqView {
@@ -90,10 +135,50 @@ export interface SubreqView {
   windows: number;
 }
 
+/** Internally the host split is a map; the view flattens it to sorted rows. */
+interface SubreqWindowState {
+  at: number;
+  total: number;
+  phases: SubreqPhasePoint[];
+  hosts: Map<string, number>;
+}
+
 /** The window being spent, and the finished ones behind it (newest first). */
-let current: SubreqWindowView = { at: 0, total: 0, phases: [] };
-let recent: SubreqWindowView[] = [];
+let current: SubreqWindowState = { at: 0, total: 0, phases: [], hosts: new Map() };
+let recent: SubreqWindowState[] = [];
 let windows = 0;
+
+/**
+ * The host a fetch target belongs to. Both shapes a client uses are handled:
+ * a URL string and a Request (the DB's own closure passes a string; the
+ * upstream clients pass either). Anything unparseable still counts as a
+ * subrequest — it just has no host to name.
+ */
+function hostOf(input: unknown): string {
+  try {
+    if (typeof input === "string") return new URL(input).host || "(no host)";
+    if (input instanceof URL) return input.host || "(no host)";
+    const url = (input as { url?: unknown } | null | undefined)?.url;
+    if (typeof url === "string") return new URL(url).host || "(no host)";
+  } catch {
+    // fall through: a target we cannot parse is still a spent subrequest
+  }
+  return "(unknown)";
+}
+
+/** Flatten a window's host map into the published rows (bounded, summing). */
+function hostRows(hosts: Map<string, number>): SubreqHostCount[] {
+  const sorted = [...hosts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (sorted.length <= SUBREQ_HOST_RING) {
+    return sorted.map(([host, count]) => ({ host, count }));
+  }
+  const rows = sorted
+    .slice(0, SUBREQ_HOST_RING)
+    .map(([host, count]) => ({ host, count }));
+  const rest = sorted.slice(SUBREQ_HOST_RING).reduce((sum, [, count]) => sum + count, 0);
+  rows.push({ host: SUBREQ_OTHER_HOST, count: rest });
+  return rows;
+}
 
 /**
  * Start a fresh window for an invocation entering the tick path. The window
@@ -108,18 +193,28 @@ export function beginSubreqWindow(at = Date.now()): void {
   if (current.total > 0 || current.phases.length > 0) {
     recent = [current, ...recent].slice(0, SUBREQ_RECENT_WINDOWS);
   }
-  current = { at, total: 0, phases: [] };
+  current = { at, total: 0, phases: [], hosts: new Map() };
   windows += 1;
 }
 
 /**
- * Count one subrequest. Called by the fetch wrapper in src/worker.ts for every
- * call, before the request is issued — the same discipline the Birdeye CU
- * ledger uses (an attempt that is billed is counted whether or not it lands),
- * because a request the runtime refuses mid-flight was still an attempt.
+ * Count one subrequest, attributed to the host it is going to. Called by the
+ * fetch wrapper in src/worker.ts for every call, before the request is issued —
+ * the same discipline the Birdeye CU ledger uses (an attempt that is billed is
+ * counted whether or not it lands), because a request the runtime refuses
+ * mid-flight was still an attempt.
  */
-export function countSubreq(): void {
+export function countSubreq(input?: unknown): void {
   current.total += 1;
+  const host = hostOf(input);
+  const seen = current.hosts.get(host);
+  if (seen !== undefined) {
+    current.hosts.set(host, seen + 1);
+  } else if (current.hosts.size < SUBREQ_HOST_TRACK_MAX) {
+    current.hosts.set(host, 1);
+  } else {
+    current.hosts.set(SUBREQ_OTHER_HOST, (current.hosts.get(SUBREQ_OTHER_HOST) ?? 0) + 1);
+  }
 }
 
 /**
@@ -138,25 +233,23 @@ export function markSubreqPhase(phase: string, at = Date.now()): void {
 
 /** What the heartbeat publishes (see the `subreqs` field there). */
 export function subreqView(): SubreqView {
+  const flat = (w: SubreqWindowState): SubreqWindowView => ({
+    at: w.at,
+    total: w.total,
+    phases: w.phases.map((p) => ({ ...p })),
+    hosts: hostRows(w.hosts),
+  });
   return {
     budget: SUBREQ_BUDGET_FREE,
-    current: {
-      at: current.at,
-      total: current.total,
-      phases: current.phases.map((p) => ({ ...p })),
-    },
-    recent: recent.map((w) => ({
-      at: w.at,
-      total: w.total,
-      phases: w.phases.map((p) => ({ ...p })),
-    })),
+    current: flat(current),
+    recent: recent.map(flat),
     windows,
   };
 }
 
 /** Test seam: forget the boot's windows (never called on the tick path). */
 export function resetSubreqWindows(): void {
-  current = { at: 0, total: 0, phases: [] };
+  current = { at: 0, total: 0, phases: [], hosts: new Map() };
   recent = [];
   windows = 0;
 }
