@@ -225,6 +225,27 @@ const TRACKER_SEND_MIN_MS = 350;
  */
 const TRACKER_HOLDER_CAP_MS = 1_200;
 /**
+ * How long the holder stage is willing to WAIT for the probes it started —
+ * which is what decides HOW MANY it may start, because they all queue behind
+ * ONE rate gate.
+ *
+ * Every Birdeye call in the isolate passes through the same throttle
+ * (`birdeyeRequestIntervalMs`, 1100ms live — the stage shares it with the
+ * scan's own Birdeye use). That gate is NOT a per-call queue: calls that
+ * arrived during the same window wake and fire TOGETHER, so the second and
+ * every later probe pay the fetch plus ONE gate, not one gate each. Measured
+ * 2026-09-23 against the real client with a 300ms stub endpoint — four probes
+ * dispatched together settled at 302 / 1_402 / 1_402 / 1_404ms. The old shape
+ * gave every probe the bare fetch cap, so those three were reported as MISSES:
+ * three Birdeye calls spent, three rows parked for TRACKER_HOLDER_BACKOFF_MS,
+ * ONE count written — live `probe4 miss3` on every pass with four due rows.
+ * The slice below covers one gate on top of the fetch cap (1_100 + 1_200 <
+ * 2_400) and is clamped by the pass deadline, so the pass never starts a probe
+ * it cannot collect; the rows it cannot reach stay DUE (reported as `cut`,
+ * never parked) for the next pass.
+ */
+const TRACKER_HOLDER_STAGE_MS = 2_400;
+/**
  * Park a row whose holder probe MISSED its cap for this long — the stage's
  * negative cache (the same pattern as Scanner's `dataFailedAt`). Without it
  * a slow row keeps its place at the head of the due list (a miss writes
@@ -2313,17 +2334,31 @@ export class PushWatcher {
         const due = holderHead.filter((r) => !parked(r));
         holderProbeHeld = holderHead.length - due.length;
         holderProbeDue = due.length;
+        // What a probe costs on top of its fetch: ONE gate (see
+        // TRACKER_HOLDER_STAGE_MS for the measured shape — the gate fires the
+        // calls that queued behind it together, so extra probes do not stack
+        // cost). A slice that covers gate + fetch can serve the WHOLE due head;
+        // a shorter one is only worth the single probe that needs no gate,
+        // because every other probe would be collected as a miss and parked.
+        const intervalMs = Math.max(1, this.config.birdeyeRequestIntervalMs);
+        const probeCapMs = TRACKER_HOLDER_CAP_MS + intervalMs;
+        const stageMs = Math.max(
+          0,
+          Math.min(TRACKER_HOLDER_STAGE_MS, deadline - Date.now()),
+        );
+        const holderSlots = stageMs >= probeCapMs ? cfg.maxHolderChecksPerTick : 1;
         for (const r of due) {
           // The start condition is UNCHANGED — the whole cap must fit inside
           // the pass deadline — it is simply evaluated where the pass still has
           // its allowance (setup + heal + pairs leave 1.0-3.0s of it).
+          if (holderProbeStarted >= holderSlots) break;
           if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) break;
           holderProbeStarted += 1;
           holderProbeUnsettled.add(r.token);
           holderProbePending.push(
             this.bounded(
               birdeye.getTokenOverview(r.token),
-              TRACKER_HOLDER_CAP_MS,
+              probeCapMs,
               null,
             )
               .then((overview) => {
@@ -2875,13 +2910,14 @@ export class PushWatcher {
     const holdersStart = Date.now();
     const holdersTrips = trips;
     if (holderProbePending.length > 0) {
-      // No new unbounded await: every probe is already capped by
-      // TRACKER_HOLDER_CAP_MS, and this only decides how long the pass is
-      // willing to WAIT for the ones still in flight — the same slice the old
-      // stage demanded before it started one.
+      // No new unbounded await: every probe is already capped by its own
+      // fetch plus one gate (see TRACKER_HOLDER_CAP_MS and the dispatch above),
+      // and this only decides how long the pass is willing to WAIT for the ones
+      // still in flight — the stage slice those caps were sized to fit inside
+      // (TRACKER_HOLDER_STAGE_MS).
       await this.bounded(
         Promise.all(holderProbePending),
-        Math.max(0, Math.min(TRACKER_HOLDER_CAP_MS, deadline - Date.now())),
+        Math.max(0, Math.min(TRACKER_HOLDER_STAGE_MS, deadline - Date.now())),
         null,
       );
     }

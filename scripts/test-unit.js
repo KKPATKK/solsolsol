@@ -6159,7 +6159,11 @@ async function main() {
     // holders_checked_at is only written on success), so a miss costs nothing
     // beyond its own cap and never holds the pass open — the row is parked for
     // TRACKER_HOLDER_BACKOFF_MS instead of re-burning the cap next tick (see
-    // the park test below).
+    // the park test below). The cap is the fetch plus ONE gate (they all queue
+    // behind the shared Birdeye throttle — see TRACKER_HOLDER_STAGE_MS), so a
+    // 200ms gate keeps the test quick while still pinning that the gate is IN
+    // the cap: the bare fetch number is what collected three of four live
+    // probes as misses (`probe4 miss3`).
     const rows = [watchRow("AAA")];
     const updated = [];
     let probes = 0;
@@ -6167,7 +6171,7 @@ async function main() {
       watchDb(rows, updated),
       watchBot,
       { getTokenOverview: async () => { probes += 1; return new Promise(() => {}); } },
-      loadConfig({}),
+      loadConfig({ BIRDEYE_REQUEST_INTERVAL_MS: "200" }),
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
@@ -6176,6 +6180,10 @@ async function main() {
     const elapsed = Date.now() - t0;
     assert.equal(probes, 1, "the probe is attempted once");
     assert.equal(out.checked, 1);
+    assert.ok(
+      elapsed >= 1_300,
+      `the cap carries the 200ms gate (1200 + 200), took ${elapsed}ms`,
+    );
     assert.ok(elapsed < 2_000, `the pass must return near the holder cap, took ${elapsed}ms`);
   });
 
@@ -6231,6 +6239,11 @@ async function main() {
     // of 40 tracked rows carried no holders_checked_at at all). The probes now
     // start behind the pair batch and only their COLLECT stays after the rows,
     // so the pass still writes the counts it proved — and still in ONE batch.
+    // The other half of that move: probes are STARTED behind the pairs, so the
+    // dispatch sees the pass's whole allowance — and still must not start what
+    // the collect cannot reach (see the slot test below). This pass hands the
+    // stage a ~1_950ms slice, which is less than the 1_200 + 1_100 one gate
+    // costs, so only the single probe that needs no gate starts.
     const rows = [watchRow("AAA"), watchRow("BBB"), watchRow("CCC"), watchRow("DDD")];
     const updated = [];
     const holderWrites = [];
@@ -6257,12 +6270,75 @@ async function main() {
       null,
     );
     const out = await pw.runTick(Date.now() + 2_000);
-    assert.equal(probes, 4, "every due row is probed, not just the head of a queue that never runs");
-    assert.equal(holderWrites.length, 4, "every count comes back");
+    assert.equal(probes, 1, "a slice shorter than gate + fetch starts only the gate-free probe");
+    assert.equal(holderWrites.length, 1, "and the count it proves still lands");
     assert.ok(holderWrites.every(([, holders]) => holders === 321));
-    assert.match(String(out.note), /holders \d+\/1/, `one batch write for all of them: ${out.note}`);
-    assert.match(String(out.note), /cut0/, `every due row got its turn: ${out.note}`);
-    assert.match(String(out.note), /probe4 miss0/, `all four were started and all four answered: ${out.note}`);
+    assert.match(String(out.note), /holders \d+\/1/, `one batch write for it: ${out.note}`);
+    assert.match(
+      String(out.note),
+      /held0 cut3 probe1 miss0/,
+      `the rows the stage could not reach stay due, not parked: ${out.note}`,
+    );
+  });
+
+  await test("PushWatcher: holder probe slots follow the Birdeye throttle, so the pass stops paying for probes it cannot collect", async () => {
+    // One rate gate serves every Birdeye call in the isolate
+    // (BIRDEYE_REQUEST_INTERVAL_MS, 1100ms live — the stage shares it with the
+    // scan's own Birdeye use). It is not a per-call queue: calls that arrived
+    // in the same window fire TOGETHER, so probe 0 pays the fetch and every
+    // later probe pays the fetch plus ONE gate (measured against the real
+    // client: 302 / 1_402 / 1_402 / 1_404ms). Live 2026-09-23 every pass with
+    // four due rows read `probe4 miss3` — three calls spent and three rows
+    // parked for the 10-minute backoff, for ONE count — because each probe's
+    // cap was the bare fetch cap.
+    const rows = [watchRow("AAA"), watchRow("BBB"), watchRow("CCC"), watchRow("DDD")];
+    const updated = [];
+    const holderWrites = [];
+    let probes = 0;
+    const db = {
+      ...watchDb(rows, updated),
+      setPushWatchHoldersMany: async (updates) => {
+        for (const u of updates) holderWrites.push([u.token, u.holders]);
+      },
+    };
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      { getTokenOverview: async () => { probes += 1; return { holderCount: 321 }; } },
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick();
+    assert.equal(probes, 4, "the slice covers gate + fetch, so the whole due head starts");
+    assert.equal(holderWrites.length, 4, "every count comes back, in the one batch");
+    assert.match(String(out.note), /probe4 miss0/, `nothing is thrown away to the gate: ${out.note}`);
+    assert.match(String(out.note), /held0 cut0/, `every due row got its turn: ${out.note}`);
+
+    // The cap carries the GATE, not just the fetch: with a 200ms interval both
+    // hanging probes settle at 1_400 — one gate plus the fetch cap — where the
+    // bare 1_200 used to collect them as misses.
+    const hangRows = [watchRow("AAA"), watchRow("BBB")];
+    const hangUpdated = [];
+    let hangProbes = 0;
+    const hangPw = new PushWatcher(
+      watchDb(hangRows, hangUpdated),
+      watchBot,
+      { getTokenOverview: async () => { hangProbes += 1; return new Promise(() => {}); } },
+      loadConfig({ BIRDEYE_REQUEST_INTERVAL_MS: "200" }),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const t0 = Date.now();
+    const hangOut = await hangPw.runTick();
+    const elapsed = Date.now() - t0;
+    assert.equal(hangProbes, 2, "a hanging probe does not stop the second slot from starting");
+    assert.ok(
+      elapsed >= 1_300,
+      `each cap carries the 200ms gate (1200 + 200), so the pass waits for it: ${elapsed}ms`,
+    );
+    assert.ok(elapsed < 2_300, `and returns as soon as they settle: ${elapsed}ms`);
+    assert.match(String(hangOut.note), /probe2 miss2/, `two turns, two misses: ${hangOut.note}`);
   });
 
   await test("PushWatcher: a pass with no room for the probes reports its due rows as cut", async () => {
