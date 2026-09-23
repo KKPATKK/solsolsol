@@ -555,3 +555,48 @@ Deploy：push `ed20dbf` →「Deploy Worker to Cloudflare」成功（run 3581251
 
 `phase:"skip"`（形狀 A 嘅簽名）到 03:12Z 仍然未影到：deploy 之後所有 tick 嘅 scan 都完成喺 2.1–3.1s，
 所以每個 tick 都有預算開 pass。要等下一次 11500ms burst。
+
+## 十五、BillSmith 三張 up50 卡：冇證明 ⇒ fail-open 重送（2026-09-23 02:26／02:35／03:03Z）
+
+Operator 報告（HKT 10:26／10:35／11:03）：`🚀 續漲 BillSmith | 推送時 $14.31K → …，下一關 +100%` 收到三次。
+
+### 15.1 係重複，而且三張都係同一級
+
+三次漲幅 +59%／+60%／+73% 都未過 100%，而三張都寫「下一關 +100%」⇒ 三次都係 `up50` 呢個 transition。
+Row 讀數（03:2xZ）：`pushedAt` 09-22 23:52:15Z、`mcapAtPush` 14310.62（＝卡上嘅 $14.31K）、`lastState "up50"`、
+`upStages "up50"`、`lastAlertAt 03:03:20Z`、`followupsSent 5`、`peakMcap` 27472。即係第三次（03:03）之後 mark 才真正落地。
+
+### 15.2 audit ring：只有第三張有證明
+
+`/debug/push-audit`（30 筆，覆蓋 01:19–03:21Z）BillSmith 只有兩筆：`01:31:32Z revive`（msg 3839）、
+`03:03:23Z up50`（msg 3865）。即 02:26 同 02:35 兩張卡**冇任何 audit entry**（ring 時間覆蓋得到，唔係被 evict）。
+而 02:17:22Z → 02:36:25Z 之間整段 ring 空白 —— 正好係 §14 嗰段切割／飢餓期。
+
+### 15.3 機制（設計上嘅 fail-open）
+
+1. 02:26 送卡時 slice 用盡 ⇒ **cut**（唔係 Telegram 拒絕）。cut 之後 rollback 咗公告欄位，只留一個 attempt mark
+   `p:up50:<桶>`；佢嘅 proof（遲到嘅 settle）要寫入 audit 才算數。
+2. 02:35 個 check 重新推導 `up50`（mark 唔係 stage mark），問 audit 攞 `(token, up50)` 嘅 proof ≥ 02:26 ⇒ **冇** ⇒
+   fail-open ⇒ 再送；又 cut，mark 換成 `p:up50:29835515`（02:35 桶）—— 就係 02:44Z 線上讀到嘅值。
+3. 03:03 再一次；今次送得完 ⇒ `upStages` 變 `up50`、`lastAlertAt 03:03:20Z`、audit `sig up50` msg 3865 ⇒
+   從此唔會再出 `up50`（下一級只可以係 +100%）。
+
+所以「重複」係 at-least-once 設計嘅代價：**冇證據就必須重送**（寧願多一張，唔可以靜默漏）。
+唯一可以擋住佢嘅就係嗰個 per-card proof，所以一條永遠產生唔到 proof 嘅路徑就等於保證重複。
+
+### 15.4 為何 02:26／02:35 冇證明：fallback tick 冇 wire waitUntil（已修）
+
+`pushwatch.holdForTick`：冇 keepAlive 就 `void promise` —— 即係直接放棄嗰個 promise，invocation 一完就取消。
+`keepAliveForTick` 來自 worker 嘅 `tickWaitUntil`，而 `tickWaitUntil` **只喺 `scheduled` 入面設定**；
+HTTP fallback（`maybeRunScanIfStale`，由任何 request 經 `ctx.waitUntil` 觸發）行同一個 tick tail，
+但從來冇設定過佢 ⇒ 嗰啲 tick 嘅 cut proof 一定掉落 ⇒ 永遠冇 proof ⇒ 永遠 fail-open。
+
+修法（`docs/patches/fallback-tick-waituntil.patch`）：`maybeRunScanIfStale(env, ctx)`，entry 就
+`if (ctx) tickWaitUntil = (promise) => ctx.waitUntil(promise);`，呼叫點傳 `ctx`。
+同一時間亦修好 `writeDrain`（同一個 hand-off；§10 之前量到 fallback tick 100% 掉落）。
+
+### 15.5 驗收
+
+`npx tsc --noEmit` 0 error；`test-unit.js` 272/0、`test-deferred-priority.js`、`test-tick-path.js` 全部 pass。
+線上驗收要等落線：下一次 cut 送卡，`/debug/push-audit` 應該見到帶 `sig` 嘅 entry（即使係 cut 出嘅卡），
+而 `push_watch.upStages` 嘅 `p:` mark 下一個 check 就會被 proof 擋成 `dup-skip`（讀法見 §14.2）。

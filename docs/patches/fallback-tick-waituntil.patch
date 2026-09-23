@@ -1,0 +1,38 @@
+diff --git a/src/worker.ts b/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -2829,8 +2829,29 @@
+-async function maybeRunScanIfStale(env?: Env): Promise<void> {
++async function maybeRunScanIfStale(
++  env?: Env,
++  ctx?: ExecutionContextLike,
++): Promise<void> {
+   if (!scanner) return;
+   const now = Date.now();
++  // This request's waitUntil, wired for the SAME tick tail the cron path
++  // wires at `scheduled` (see tickWaitUntil). Without it a fallback-driven
++  // tick runs the tracker pass with a null (or a stale, already-finished)
++  // keepAlive, so `pushwatch.holdForTick` drops every CUT card's proof on the
++  // floor (`void promise` — the promise is cancelled with the invocation) and
++  // the audit ring gets no entry for a card that DID reach the chat.
++  //
++  // Consequence, measured live 2026-09-23: BillSmith's up50 card was
++  // announced three times (02:26Z, 02:35Z, 03:03Z) and only the third left an
++  // audit entry (msg 3865, sig up50). The first two were cut sends: their
++  // rollback left only an attempt mark, and the missing proof is exactly what
++  // the next check asks for before it may refuse a duplicate. No proof ⇒
++  // fail-open ⇒ send again. The proof is the ONLY thing that can stop it, so
++  // a tick path that can never produce one guarantees the duplicate.
++  //
++  // Ordering: set BEFORE the scan so the pass inherits it, and never cleared
++  // — the held proofs still need this context after runScan returns, and the
++  // next invocation overwrites it at its own entry.
++  if (ctx) tickWaitUntil = (promise) => ctx.waitUntil(promise);
+   // The HTTP fallback's own pre-scan slice: measured from here, because this
+   // is where a request's work before the scan starts (see PreTickView).
+   beginPreTick(now);
+@@ -2875,4 +2896,4 @@
+     // "previous-scan-still-running"). Guarded by the last-trigger timestamp.
+-    ctx.waitUntil(maybeRunScanIfStale(env));
++    ctx.waitUntil(maybeRunScanIfStale(env, ctx));
+     const url = new URL(request.url);
