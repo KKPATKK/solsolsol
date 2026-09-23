@@ -1028,6 +1028,65 @@ async function main() {
     assert.equal(legacy.alerts.length, 1, "no check clock → no deferral");
   });
 
+  // The STRADDLE (2026-09-23, §7.4): the mark's stamp is minute-TRUNCATED while
+  // `last_checked` is the exact claim of the pass that wrote it, so a pass that
+  // claimed at :59 and cut at :00 records the attempt ONE BUCKET AHEAD of its own
+  // clock. The gate used to read that as "an earlier pass", skip the wait and
+  // re-send the card whose late proof was still in flight — the last duplicate
+  // path left, measured at ~10% of cuts.
+  await test("evaluateWatch: an attempt that straddles the minute IS the row's last check", () => {
+    const bucket = 1_800_000_000_000; // exactly on a mark bucket boundary
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "REK", pushedAt: 0,
+      mcapAtPush: 170_000, peakMcap: 240_000, lastLiquidity: 32_000,
+      deadTroughMcap: null, holdersAtPush: null, holdersLast: null,
+      holdersCheckedAt: null,
+      // The pass that cut the attempt CLAIMED one bucket earlier than the cut.
+      lastChecked: bucket - 1_000,
+      lastAlertAt: 0, followupsSent: 0, lastState: null, upStages: null,
+      ...over,
+    });
+    const live = { mcap: 59_000, liquidity: 32_000, chg5m: -2, buysH1: 120, sellsH1: 180 };
+    const cfg = { cooldownMs: 30 * 60_000 };
+    // Cut 4s after the minute rolled: the mark lands in the NEXT bucket.
+    const cutAt = bucket + 4_000;
+    const mark = cutMarkFor("dead", cutAt);
+    assert.equal(
+      Math.floor(cutAt / CUT_MARK_BUCKET_MS),
+      Math.floor(row().lastChecked / CUT_MARK_BUCKET_MS) + 1,
+      "the fixture really straddles the minute",
+    );
+
+    // Proof not read yet ⇒ wait ONE check instead of re-sending the card the
+    // pass just cut: the straddle is this attempt, not an older one.
+    const waited = evaluateWatch(row({ upStages: mark }), bucket + 30_000, live, cfg);
+    assert.deepEqual(waited.alerts, [], "no card while the straddling attempt is unproven");
+    assert.equal(waited.lastState, null, "nothing is announced");
+    assert.equal(waited.followupsSent, 0, "not the counter");
+    assert.equal(waited.announcedUpStages, mark, "the attempt keeps its own stamp");
+
+    // The late success lands: the SAME card is refused (announced, not sent).
+    const proved = evaluateWatch(row({ upStages: mark }), bucket + 30_000, live, {
+      ...cfg,
+      followupProofAt: new Map([[cardProofKey("T", "dead"), cutAt + 1_000]]),
+    });
+    assert.equal(proved.alerts.length, 1);
+    assert.equal(proved.alerts[0].deduped, true, "the straddling cut's proof refuses the duplicate");
+
+    // …and the wait is BOUNDED: an attempt whose check clock is a bucket further
+    // on is not "the one just made", so an unproven card is sent (a delay is
+    // never a loss).
+    const decided = evaluateWatch(
+      row({ upStages: mark, lastChecked: bucket + CUT_MARK_BUCKET_MS + 2_000 }),
+      bucket + CUT_MARK_BUCKET_MS + 30_000,
+      live,
+      cfg,
+    );
+    assert.equal(decided.alerts.length, 1);
+    assert.equal(decided.alerts[0].sig, "dead");
+    assert.equal(decided.alerts[0].deduped, undefined, "an unproven card is sent");
+  });
+
   await test("evaluateWatch: a gap across several 🚀 stages fires ONE card and marks them all", () => {
     const row = (over = {}) => ({
       token: "T", chatId: "c", symbol: "POPEYE", pushedAt: 0,

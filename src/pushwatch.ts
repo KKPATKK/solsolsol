@@ -814,7 +814,18 @@ export function evaluateWatch(
   /**
    * An attempt FROM THE ROW'S MOST RECENT CHECK — its stamp sits in the same
    * minute bucket as `last_checked`, which is the clock the pass that cut it
-   * wrote.
+   * wrote — OR in the bucket right after it.
+   *
+   * The one-bucket slop is the straddle, not a wider window: the mark carries a
+   * minute-TRUNCATED stamp (see cutMarkFor) while `last_checked` is the exact
+   * claim of the pass that wrote it, so a pass that claimed at :59 and cut at
+   * :00 records the attempt one bucket AHEAD of its own clock. Reading that as
+   * "an earlier pass" skipped the wait and re-sent the card while its proof was
+   * still in flight — measured at ~10% of cuts (2026-09-23, §7.4). Attempts
+   * always POSTDATE their pass's claim, so the only buckets that can hold this
+   * row's last attempt are these two; an attempt from an earlier check is two
+   * or more buckets behind (a carried-forward dedupe mark included), and is
+   * judged normally.
    *
    * This is the whole "how long do we wait?" rule, and it needs no timer: the
    * proof of a cut send is written by the request itself, right after Telegram
@@ -831,9 +842,11 @@ export function evaluateWatch(
    * a hand-written fixture or a row the terminal settle re-armed) is judged
    * normally: there is no recent pass for it to be waiting on.
    */
-  const attemptIsCurrent = (m: { at: number }): boolean =>
-    Math.floor(m.at / CUT_MARK_BUCKET_MS) ===
-    Math.floor(row.lastChecked / CUT_MARK_BUCKET_MS);
+  const attemptIsCurrent = (m: { at: number }): boolean => {
+    const attemptBucket = Math.floor(m.at / CUT_MARK_BUCKET_MS);
+    const checkBucket = Math.floor(row.lastChecked / CUT_MARK_BUCKET_MS);
+    return attemptBucket === checkBucket || attemptBucket === checkBucket + 1;
+  };
   const young = attemptMarks.filter(
     (m) => attemptIsCurrent(m) && proofFor(m.sig) < m.at,
   );

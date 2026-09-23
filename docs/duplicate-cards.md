@@ -400,3 +400,41 @@ Deploy：run **35805867249** success，**01:21:27Z 上線**。第一張上線後
 冇持久化 note，所以 `dup-skip 1` 冇痕跡。呢個就係 §8.3／§10.1 嗰個間歇性凍結（本次讀到凍結 01:36:25Z→01:45:14Z，
 row 檢查一路跑到 01:43），**已 deploy 嘅 `pass-note-awaited`（改 await）未能完全解決**。結論同 operator 講嘅一樣：
 **驗 dedupe 要直接睇 row mark ＋ audit proof，唔可以只睇 note**。
+
+## 十二、straddle 收窄：跨分鐘嘅 attempt 一樣算「最近一次 check」（2026-09-23，`cut-card-straddle-hold`）
+
+問題：§7.4 尾段量到約一成分嘅 cut 跨分鐘（pass 由 :59 跑落 :00）。`p:` mark 用**分鐘桶**存
+（`cutMarkFor` 截斷），而 `last_checked` 係寫 mark 嗰個 pass 嘅**精確** claim 時間，所以跨分鐘嗰個
+attempt 嘅桶會係自己 pass 時鐘嘅**下一個**桶。舊 gate（桶相等才叫 current）就當佢係「更早嘅一個 pass」
+⇒ 跳過「等一個 check」，而嗰張卡嘅 late proof 仲喺飛 ⇒ 照送 ⇒ 就係最後一條已知重複路徑。
+
+改動（`src/pushwatch.ts`，`attemptIsCurrent`）：桶相等 **或** 係下一個桶
+（`attemptBucket === checkBucket || attemptBucket === checkBucket + 1`）。
+呢個係 straddle 嘅 slop，**唔係**「放寬窗口」：attempt 一定發生喺自己 pass 嘅 claim **之後**，
+所以只有呢兩個桶可能裝住該 row 最近一次 attempt；再早一個 check 嘅 attempt（包括 dedupe 原封帶落去嗰個 mark）
+都係落後兩個桶以上 ⇒ 照舊判斷。`last_checked = 0`（fixture／terminal settle 重 arm 過嘅 row）唔會誤中：
+真 mark 嘅桶係幾千萬，唔會等於 0 或 1。
+
+代價：跨分鐘嗰次最多等兩個 check（同「同桶」規則本身一樣 —— 等 `last_checked` 嘅桶行過個 mark），
+唔會漏卡：過咗之後冇 proof 就照送。呢個 patch 唔改任何送／唔送嘅**出口**，方向仍然 fail-open。
+
+驗收（offline，已 pin）：
+
+* 新測試 `evaluateWatch: an attempt that straddles the minute IS the row's last check`：fixture 真跨分鐘
+  （claim 桶 = attempt 桶 − 1）⇒ 冇 proof 時 defer（`alerts: []`、mark 原封、量測照行）；proof 到 ⇒
+  `deduped`（公告唔送）；再過一個桶 ⇒ 照送（等嘅時間有界）。
+* Negative control：`git apply -R --recount --include=src/pushwatch.ts docs/patches/cut-card-straddle-hold.patch`
+  之後 `npm run build`，該測試 fail（`no card while the straddling attempt is unproven`，270 passed / 1 failed）；
+  還原後 **271 passed, 0 failed**。
+* `npx tsc --noEmit` 0 error；`test-deferred-priority.js`、`test-tick-path.js` pass。
+
+線上讀數（02:11–02:15Z，`152523b` 之後，即係 commit／push／deploy 前）：
+
+| 讀邊度 | 讀數 | 意思 |
+|---|---|---|
+| `/health.pushWatchPass` | note `at` 02:11:23Z → 02:14:25Z（`trackerMs` 3.9–4.4s），該 pass `ok:10/0 … cut4` | 冇停滯（§11.5 嗰段凍結今回讀唔到）；冇 `dup-skip`（該 pass 0 張卡） |
+| `/debug/push-watch?limit=200` | 55 行之中 **6 行**帶 `p:` mark，**全部** 坐喺 `lastState=dead` 嘅 row（5 × `p:dead`、1 × `p:liqwarn`） | 冇 dedupe 候選：`dead` 分支吸收一切（只有 `revive` 會再推導，而 revive 寫 `""` 清 column） |
+| `/debug/push-audit`（30 筆 ring） | **23 筆**帶 `sig`（7 筆冇，全部係 00:06:28Z deploy 之前寫落），含 01:39:45Z `HraqV7 revive` | §7.4 第二條線上落地；§11.5 嗰次 dedupe 嘅 proof 仍然係 `(token, sig)` 唯一一條 |
+
+留底：`docs/patches/cut-card-straddle-hold.patch`（`src/pushwatch.ts` 嘅 `attemptIsCurrent` ＋ 新 unit test），
+`git apply --recount` 可重播，`-R` 可還原（兩種方向都實測過）。
