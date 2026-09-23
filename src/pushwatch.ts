@@ -1727,10 +1727,28 @@ export class PushWatcher {
       for (let i = 0; i < expiring.length; i++) {
         if (!won[i]) continue;
         try {
-          await this.bot.api.sendMessage(
+          // BOUNDED like every other send in the pass (see bounded): this was
+          // the last unbounded await in runTick, and the one that measured
+          // live (2026-09-23 04:01:51Z: the note sat at `phase:"running"` for
+          // 61 seconds while two ticks died at 78014ms and 62197ms against a
+          // healthy 3-4s). Telegram does not reject on a 429 — grammy SLEEPS
+          // `retry_after` internally (30-60s is routine for a bot that just
+          // burst a handful of cards) — so awaiting it held the whole pass
+          // open no matter what budget it had, and the note never reached its
+          // `done` write.
+          //
+          // The request is NOT cancelled, it is HANDED OVER first (see
+          // holdForTick): the tick's waitUntil keeps it alive past this pass,
+          // so the card still gets its chance to land. The recap is explicitly
+          // best-effort (its row is claimed before the send and the prune
+          // deletes it either way), so a bound that trips costs a 🏁 summary
+          // card at worst — never a follow-up.
+          const recapCard: Promise<unknown> = this.bot.api.sendMessage(
             expiring[i].chatId,
             recapMessage(expiring[i]),
           );
+          this.holdForTick(recapCard);
+          await this.bounded(recapCard, TRACKER_SEND_CAP_MS, undefined);
         } catch {
           /* best-effort */
         }

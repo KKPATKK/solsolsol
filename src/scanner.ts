@@ -525,6 +525,33 @@ export class DeferredPushLedger {
  */
 const TRACKER_GECKO_LOOKUPS = 2;
 /**
+ * How far PAST its own deadline a pass may run before Scanner.runTrackerPass
+ * abandons waiting for it — the pass's watchdog (see racePassWatchdog).
+ *
+ * A pass cannot be cut in half and still be correct: its rule is
+ * reserve-then-send. Db.reservePushWatchAlert flips (last_state, last_alert_at)
+ * BEFORE the card goes out, and only the row's FINAL updatePushWatchCheck rolls
+ * that announcement back when a card did not go out. Abandon a pass between
+ * those two writes and the transition stays reserved with no card in the chat
+ * and nothing for the next pass to re-derive — a SILENT MISS, the one outcome
+ * this whole subsystem exists to prevent. So the watchdog has to sit OUTSIDE
+ * every bound the pass itself enforces, and catch only an await nothing bounds.
+ *
+ * That outer edge is ONE row's worst-case bounded chain, audited 2026-09-23:
+ *   claim          TRACKER_ROW_LEASH_MS   1_500ms
+ *   reservation    TRACKER_ROW_LEASH_MS   1_500ms
+ *   sends (row)    TRACKER_SEND_CAP_MS    1_350ms  (sendBudgetEnd's window)
+ *   audit insert   TRACKER_ROW_LEASH_MS   1_500ms
+ *   final write    TRACKER_ROW_LEASH_MS   1_500ms
+ *                                        -------
+ *                                        7_350ms
+ * plus the pair batch (TRACKER_PAIRS_BUDGET_MS 600ms) on the row that opens a
+ * pass, so 8_000ms is that chain with slack. A pass on a degraded Turso can
+ * genuinely need all of it; anything LONGER is an await no bound covers — which
+ * is exactly what this is for (live 2026-09-23: 61 seconds on one pass).
+ */
+const TRACKER_PASS_OVERRUN_MS = 8_000;
+/**
  * Slice of the chain kept for the gates that run LAST (wallet analysis, the
  * top-10 band, Flurry deploy-slot forensics) so the CARD-ONLY enrichments in
  * the middle of the chain (Birdeye trader/overview, GMGN, Arkham, Jupiter
@@ -1418,6 +1445,13 @@ export class Scanner {
   /** Cards the last pass recovered (its own counter, see runTrackerPass). */
   private pushWatchRecovered = 0;
   /**
+   * How far past the pass's own deadline the watchdog waits before abandoning
+   * it (see racePassWatchdog and TRACKER_PASS_OVERRUN_MS). An instance field so
+   * a unit test can pin the abandonment without waiting out the real bound; the
+   * default is the audited worst case of one row's bounded chain.
+   */
+  trackerPassOverrunMs = TRACKER_PASS_OVERRUN_MS;
+  /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
    * without Cloudflare log access: "previous-scan-still-running",
@@ -1810,7 +1844,30 @@ export class Scanner {
     // stuck at `running` for 55s (docs/duplicate-cards.md 14.1/14.6).
     this.enterTickDbLeash();
     try {
-      const pw = await this.pushWatcher.runTick(deadlineMs, keepAlive);
+      // WATCHDOG (see racePassWatchdog / TRACKER_PASS_OVERRUN_MS): the pass
+      // MUST return. Every stage inside runTick is bounded — the DB calls by
+      // the tick leash below, the sends and probes by bounded() — so reaching
+      // this outer bound means an await nothing covers, which is exactly what
+      // held a pass open for 61s on 2026-09-23 and cost two ticks (78014ms,
+      // 62197ms).
+      const pw = await this.racePassWatchdog(
+        this.pushWatcher.runTick(deadlineMs, keepAlive),
+        deadlineMs,
+      );
+      if (pw === null) {
+        // Abandoned, not cancelled (see racePassWatchdog). Publish it: without
+        // this the row would stay at `phase:"running"` for the abandoned pass
+        // and a reader could not tell a watchdog cut from a pass still in
+        // flight.
+        const cutNote = `cut:watchdog ${Date.now() - startedAt}ms db ${this.exitTickDbLeash()}ms`;
+        this.pushWatchNote = cutNote;
+        if (this.lastSummary) {
+          this.lastSummary.pushWatch = cutNote;
+          this.lastSummary.trackerMs = Date.now() - startedAt;
+        }
+        await this.persistPassNote(cutNote, startedAt, "cut");
+        return cutNote;
+      }
       const passDbMs = this.exitTickDbLeash();
       // `db Nms` rides the note: the pass's round trips are its real cost
       // driver on a degraded Turso, and without a per-pass number the only
@@ -1854,6 +1911,56 @@ export class Scanner {
   }
 
   /**
+   * Wall-clock watchdog for the WHOLE pass (see runTrackerPass).
+   *
+   * WHY: every stage inside the pass is bounded and the row loop re-checks its
+   * budget BETWEEN rows, but that still leaves one way for a pass never to
+   * return — an await that NO bound covers. Live shape (2026-09-23): a pass
+   * started 04:01:51Z, its durable note sat at `phase:"running"` for 61
+   * seconds, and the two ticks around it died at 78014ms and 62197ms
+   * (`previous tick died before its completion flush`) against a healthy 3-4s.
+   * The DB leash cannot help there because every DB call is already inside it;
+   * the offender was the case-closed recap send, now bounded too (see its call
+   * site).
+   *
+   * The bound is deliberately OUTSIDE every bound the pass enforces, never
+   * inside one — see TRACKER_PASS_OVERRUN_MS for the audit and the reason (a
+   * pass cut between its alert reservation and its final check write would drop
+   * a card silently, the one outcome this subsystem must not have).
+   *
+   * The abandoned pass is NOT cancelled: the caller stops waiting and a late
+   * settle is dropped by the race, exactly like the per-stage bounded() inside
+   * the pass. Its row writes still land, and any CUT card's delivery proof was
+   * already handed to the tick's waitUntil (see pushwatch.holdForTick), so it
+   * outlives this promise independently.
+   */
+  private async racePassWatchdog<T>(
+    pass: Promise<T>,
+    deadlineMs: number,
+  ): Promise<T | null> {
+    // A stale deadline still gets a full overrun rather than an instant fire:
+    // the worker only calls the pass with a future deadline (its trackerBudgetMs
+    // is > 0), but a test may hand it anything.
+    const overrunMs = Math.max(
+      deadlineMs + this.trackerPassOverrunMs - Date.now(),
+      this.trackerPassOverrunMs,
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        pass,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), overrunMs);
+        }),
+      ]);
+    } finally {
+      // Release the timer as soon as the pass settles (same discipline as the
+      // DB hard wall) so a busy isolate holds no idle timers.
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
    * The tracker pass's coverage line, in ONE worker_state row — the durable
    * copy the in-memory carries above cannot give. The in-memory path only
    * reaches /health when the next tick's flush happens to run on THIS isolate,
@@ -1869,10 +1976,11 @@ export class Scanner {
     startedAt: number,
     /**
      * "done" = a completed pass; "skip" = a tick that never got one (see
-     * noteTrackerSkipped). Written to the row so a reader can tell a pass in
-     * flight from a pass that is stuck (see persistPassStart).
+     * noteTrackerSkipped); "cut" = a pass the watchdog abandoned before it
+     * returned (see racePassWatchdog). Written to the row so a reader can tell
+     * a pass in flight from a pass that is stuck (see persistPassStart).
      */
-    phase: "done" | "skip" = "done",
+    phase: "done" | "skip" | "cut" = "done",
   ): Promise<void> {
     // AWAITED, not raced. The race this replaces resolved at its bound while the
     // write was still in flight, and an abandoned promise is CANCELLED the
@@ -1889,7 +1997,7 @@ export class Scanner {
         JSON.stringify({
           at: Date.now(),
           note,
-          trackerMs: phase === "done" ? Date.now() - startedAt : 0,
+          trackerMs: phase === "skip" ? 0 : Date.now() - startedAt,
           phase,
         }),
       );

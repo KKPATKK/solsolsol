@@ -644,3 +644,62 @@ scan 窗口回到 ~4.6s，pass 亦有預算開。
 * Row loop 嘅**第一行永遠照跑**（progress floor，2026-09-17 嘅教訓），所以「第一行食盡成個 tick」仍然可能發生，
   只係上限由 15s 降到 ~7s，而且 note 嘅 `phase` 會即刻顯示（§14.2 嘅讀法）。
 * 落線後要睇：note 尾嘅 `db <ms>`（正常幾百 ms；degraded 會跳到幾秒）同 burst 期間 `preRace` 仲會唔會到 9000ms。
+
+## 十七、pass 一定要 return：watchdog ＋ recap send 收皮帶（2026-09-23 04:01Z 嘅 61 秒）
+
+### 17.1 讀數
+
+| 讀數 | 值 |
+|---|---|
+| `/health.pushWatchPass` | `phase:"running"`、`at 04:01:51Z` **停留 61 秒**（04:01:51 → 04:02:52） |
+| `scan_history` | `04:00:26 False 78014`、`03:59:24 False 62197`（`previous tick died before its completion flush`）＋ `04:01:49 False 5000` |
+| 回復 | `04:03:19 True 3623`、`04:04:20 True 3077` |
+
+健康 tick 3–4s、envelope 9.5s、pass 上限 8.5s（§16.1 嘅 `db 3616ms`）。所以 78s／62s 嘅 tick 唔係
+「預算唔夠」，係 pass **冇 return**；§16 嘅皮帶（每次呼叫 ≤1.44s）救唔到，因為卡死一定喺一個
+**冇 bound 嘅非 DB await**。
+
+### 17.2 兩個真兇
+
+1. **`pushwatch.runTick` 嘅 case-closed recap 送卡**：pass 四個 send 之中唯一冇經 `bounded()` 嘅一個。
+   Telegram 429 唔會 reject —— grammy 內部 sleep `retry_after`（30–60s 好平常）——所以 `await` 佢就等於
+   等成分鐘，而個 pass 唔理有幾多預算都會被佢揸住。呢個正正解釋到 61 秒。
+2. **任何其他未被 bound 嘅 await**：逐個 stage 審核之後，其餘全部有界 —— DB 喺皮帶內、send／holder／
+   Jupiter／Gecko 經 `bounded()`、`pairsForTracker` 嘅 DexScreener 腿有自家 `PAIRS_FETCH_BUDGET_MS` ＋
+   呼叫者 deadline。所以需要一個「最後防線」。
+
+### 17.3 修法（`docs/patches/tracker-pass-watchdog.patch`）
+
+* `Scanner.runTrackerPass`：`Promise.race([pushWatcher.runTick(...), 時限])`。watchdog 一開火 ⇒ 寫
+  `cut:watchdog <ms> db <ms>` 同 `phase:"cut"`（`persistPassNote` 多一個相位，同 `running`／`done`／`skip` 並列）。
+  **放棄唔等於取消**：被放棄嗰條 pass 自己繼續跑（佢已寫落嘅 row mark 照算，下一個 check 重新推導），
+  而佢啲 cut 卡嘅 proof 早就交咗俾 tick 嘅 `waitUntil`（§15.4 嘅 `holdForTick`），所以出界唔會掉卡。
+* 時限 = `deadline + TRACKER_PASS_OVERRUN_MS`，而 8s 係**一行 chain 嘅實測上界**：
+  claim 1.5 ＋ reservation 1.5 ＋ send 1.35 ＋ audit 1.5 ＋ 最後寫 1.5 = 7.35s（＋開場 pair batch 0.6s）。
+  刻意放喺**所有既有界之外**：pass 嘅規則係 reserve-then-send，如果喺 reservation 同最後
+  `updatePushWatchCheck` 之間被砍，就會「reservation 已落、卡冇出、下個 pass 亦唔會再推導」＝
+  **靜默漏卡**，即係唯一唔可以發生嘅事。所以只有「冇 bound 嘅 await」先會超越 8s，正中目標。
+* `src/pushwatch.ts`：recap 送卡入 `bounded(…, TRACKER_SEND_CAP_MS)`，而且**先** `holdForTick(card)` 再 await ——
+  超時只係唔再等，卡照樣有機會遲到送達。
+
+### 17.4 測試與 negative control
+
+* 新測試一 `Scanner.runTrackerPass: the watchdog abandons a pass that never returns, and says so`：
+  `runTick` 永不 resolve ＋ `trackerPassOverrunMs = 40` ⇒ note `cut:watchdog …ms db …ms`、
+  `writes[1].phase === "cut"`、note 上到 `/health`；同時釘住「時限 ＝ deadline ＋ overrun」
+  （`deadline = now + 60` ⇒ 最少等 80ms 先砍）。
+* 新測試二 `PushWatcher: the case-closed recap send is BOUNDED`：`sendMessage` 永不 resolve ⇒ `runTick`
+  仍然 return、`held.length === 1`（卡交咗俾 `waitUntil`）、note 照有 `trips`。
+* Negative control：只反轉實作（`git apply -R --include=src/scanner.ts` 同
+  `git apply -R --include=src/pushwatch.ts` 兩個指令）、保留測試 ⇒ suite **連 summary 都印唔到**
+  （node 冇 pending handle 就靜靜哋退出）—— 即係「pass 冇 return」本身。還原後 **275 passed, 0 failed**
+  （原本 273 ＋ 新 2）；`test-deferred-priority.js`、`test-tick-path.js` pass；`npx tsc --noEmit` 0 error。
+
+### 17.5 仍未收（老實講）
+
+* 8s 係**上限**，唔係正常值：正常 pass 3–4s 完成，watchdog 唔應該開火。落線之後要睇 note 有冇
+  `cut:watchdog` —— 一出現就代表仲有一個未被 bound 嘅 await，而個 `<ms>` 就係佢嘅成本。
+* 卡片路徑本身冇放寬：`reservePushWatchAlert` 仍然係唯一唔可以中途放棄嘅呼叫，watchdog 亦刻意唔會
+  喺「reservation → 最後寫」呢段入面砍（見 17.3），所以「唔可以漏卡」嘅方向冇變。
+* 若果 watchdog 開火而 pass 當時正停喺某一行嘅**送卡**度（reservation 已落），嗰張卡一樣係漏 ——
+  同「唔開火、永遠等落去」嘅結果相同，唔會更差；但呢個窗口係已知嘅，屬下一輪要處理嘅對象。

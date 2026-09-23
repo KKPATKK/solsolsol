@@ -1,0 +1,106 @@
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -2942,6 +2942,54 @@
+     assert.equal(writes[2].trackerMs, 0, "no pass ran, so there is no pass duration to report");
+   });
+ 
++  await test("Scanner.runTrackerPass: the watchdog abandons a pass that never returns, and says so", async () => {
++    // WHY (2026-09-23): every stage inside the pass is bounded and the row loop
++    // re-checks its budget BETWEEN rows, but an await NOTHING bounds still held
++    // a pass open — live 04:01:51Z, `phase:"running"` frozen for 61s while two
++    // ticks died at 78014ms and 62197ms. The watchdog is that last resort: the
++    // pass must RETURN. Abandoning is not cancelling (the abandoned pass keeps
++    // its row writes, and its cut-card proofs were handed to waitUntil), so the
++    // cost is tick tail, never a card.
++    const { Scanner } = require("../dist/scanner.js");
++    const cfg = loadConfig({});
++    const writes = [];
++    const db = {
++      setWorkerState: async (key, value) => { writes.push(JSON.parse(value)); },
++    };
++    const scanner = new Scanner(
++      db, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
++    );
++    // A short overrun so the test pins the abandonment without waiting out the
++    // real bound (the instance field exists for exactly this).
++    scanner.trackerPassOverrunMs = 40;
++    scanner.pushWatcher = {
++      headTokens: () => [],
++      onPush: async () => {},
++      runTick: () => new Promise(() => {}), // never returns
++    };
++    scanner.lastSummary = {};
++    // The pass never returns and its deadline is already gone: the watchdog
++    // still grants a full overrun rather than firing instantly, which is the
++    // path a pass stalled on a real tick takes.
++    const t0 = Date.now();
++    const note = await scanner.runTrackerPass(Date.now() - 1_000);
++    const waited = Date.now() - t0;
++    assert.match(String(note), /^cut:watchdog \d+ms db \d+ms$/, `the note names the watchdog cut (got ${note})`);
++    assert.ok(waited < 1_000, `the watchdog returns the pass instead of hanging (waited ${waited}ms)`);
++    assert.equal(writes[0].phase, "running", "the running stamp still lands before the pass works");
++    assert.equal(writes[1].phase, "cut", "the durable row says the pass was cut, not that it finished");
++    assert.equal(scanner.lastSummary.pushWatch, note, "the cut rides /health like any other note");
++    assert.equal(scanner.pushWatchNote, note, "the cut note is carried into the next summary");
++    // The bound is the pass's own DEADLINE plus the overrun, not the overrun
++    // alone: a pass with a live deadline keeps that grace too, so a merely slow
++    // pass is never cut where a stalled one would be.
++    const t1 = Date.now();
++    await scanner.runTrackerPass(Date.now() + 60);
++    const waited2 = Date.now() - t1;
++    assert.ok(waited2 >= 80, `a live deadline is honoured before the cut (waited ${waited2}ms)`);
++    assert.ok(waited2 < 1_000, `and the cut still lands promptly (waited ${waited2}ms)`);
++  });
++
+   await test("parseTokenSnapshot: FDV and summed reserve are the usable numbers", () => {
+     // Verified against the live API on a tracked XCAT pool (2026-09-18):
+     // market_cap_usd comes back null for Solana memecoins, fdv_usd is the
+@@ -5945,6 +5945,48 @@
+     assert.match(String(out.note), /trips \d+/, "the coverage note names the round-trip count");
+   });
+ 
++  await test("PushWatcher: the case-closed recap send is BOUNDED (a hung Telegram 429 cannot hold the pass)", async () => {
++    // WHY (2026-09-23): this was the last unbounded await in runTick. Telegram
++    // does not reject on a 429 — grammy sleeps `retry_after` internally, 30-60s
++    // — so an awaited recap card held the WHOLE pass open no matter what budget
++    // it had (live 04:01:51Z: note at `phase:"running"` for 61s, the two ticks
++    // around it at 78014ms/62197ms). The bound also has to keep the card alive:
++    // the request is handed to the tick's waitUntil FIRST (holdForTick), so a
++    // cut recap is still allowed to land late instead of being cancelled with
++    // the handler.
++    const window = loadConfig({}).pushWatch.windowHours * 3_600_000;
++    const rows = [watchRow("OLD", { pushedAt: Date.now() - window - 60_000 })];
++    const db = {
++      listPushWatch: async () => rows,
++      prunePushWatch: async () => 1,
++      markRecapClaimedMany: async (tokens) => tokens.map(() => true),
++      findUntrackedPushes: async () => [],
++      claimPushWatch: async () => true,
++      claimPushWatchCheck: async () => true,
++      reservePushWatchAlert: async () => true,
++      updatePushWatchCheck: async () => {},
++      deletePushWatch: async () => {},
++      setPushWatchHolders: async () => {},
++    };
++    let sends = 0;
++    const held = [];
++    const pw = new PushWatcher(
++      db,
++      { api: { sendMessage: () => { sends += 1; return new Promise(() => {}); } } },
++      null,
++      loadConfig({}),
++      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
++      null,
++    );
++    const t0 = Date.now();
++    const out = await pw.runTick(Date.now() + 2_500, (p) => held.push(p));
++    const waited = Date.now() - t0;
++    assert.equal(sends, 1, "the expiring row's recap card is attempted");
++    assert.ok(waited < 2_500, `the hung recap must not hold the pass open (waited ${waited}ms)`);
++    assert.equal(held.length, 1, "the recap request is handed to the tick's waitUntil before being cut");
++    assert.match(String(out.note), /trips \d+/, "the pass still reports its coverage");
++  });
++
+   await test("PushWatcher: the prune is skipped when it provably deletes nothing", async () => {
+     // Same merge: the prune is `DELETE ... WHERE pushed_at < cutoff`, so with a
+     // COMPLETE listing (fewer rows than the limit, nothing outside the
