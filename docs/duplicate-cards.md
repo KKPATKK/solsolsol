@@ -438,3 +438,32 @@ attempt 嘅桶會係自己 pass 時鐘嘅**下一個**桶。舊 gate（桶相等
 
 留底：`docs/patches/cut-card-straddle-hold.patch`（`src/pushwatch.ts` 嘅 `attemptIsCurrent` ＋ 新 unit test），
 `git apply --recount` 可重播，`-R` 可還原（兩種方向都實測過）。
+
+## 十三、第二次線上 dedupe，而 note 讀得到 `dup-skip 1`（2026-09-23 02:17Z）
+
+`93148ee` push 之後（deploy run 35810030834，02:22:43Z 完成）第一個讀數，影到嘅係 deploy 前最後幾個 pass；
+其中 **02:17:26Z** 嗰個 note 第一次帶住 `dup-skip`：
+
+```
+ok:9/2 rows 9/30 pairs 10/10 miss 0 lost 0 dup-skip 1 recovered 1 budget-cut allow 5000 spend[…] trips 18
+```
+
+即 §11.3 第三個讀法（note 出 `dup-skip 1`）落實，而且係第二次真正觸發（第一次係 §11.5 嘅 REALLY `revive`，嗰次 note 冇入到）。
+
+被 dedupe 嘅 row：**PICKAXE**（`6QxMcE…`）：
+
+* `lastAlertAt` 02:17:20Z（該 pass 公告咗）、`upStages` 只剩 `up50`（`p:` mark 已被消費）、`followupsSent = 2`；
+* `/debug/push-audit` 只得兩條：`01:16:24Z revive`、`02:13:25Z up50 msgId 3848` —— 02:17 嗰個 pass **冇**新 entry。
+* 讀法：02:13:25Z 嗰張 up50 卡係 **cut**（audit entry 係嗰個 request 自己嘅 late settle，就係 §11.2 嘅形狀，
+  所以 `followupsSent` 冇當佢送過），rollback 寫低 `p:up50:<02:13 桶>`；02:17:20Z 同一個 transition 被重新推導，
+  proof（02:13:25 ≥ mark 桶）已到 ⇒ 公告但**唔送** ⇒ `dup-skip 1`。chat 冇重複卡，亦冇漏（卡早喺 02:13:25 入咗）。
+
+同一個 pass 嘅另一張卡（**JOLLYBOT** `9Vkx8J`、`revive`）係**真送**：audit 02:17:22Z msgId 3849、`lastState` → null、
+`upStages` 清空 —— 即兩條路（送／唔送）同一個 pass 一齊出現，note 都數得到（`ok:9/2`）。
+
+**惟 note 之後又停**：02:23:09Z 讀 `/health` 時 note 仍然係 02:17:26Z，而 row 檢查已經做到 02:19:08Z
+（Commotitty、BULLFART）⇒ §8.3／§11.5 嗰個間歇性凍結再現（今次係 02:17:26Z 之後）。所以 §11.3 嘅結論唔變：
+**驗 dedupe 要睇 row mark ＋ audit proof，note 只係加分。**
+
+**下一張 post-deploy（`93148ee`，02:22:43Z 上線）嘅 cut 仍然要盯**：候選＝任何 `lastState` 唔係 `dead`／`rug`、
+而 `upStages` 帶 `p:<sig>` 嘅 row（straddle 修好之後，跨分鐘嗰啲都會行「等一個 check」，verdict 只會更準）。
