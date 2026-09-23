@@ -1714,15 +1714,23 @@ export class PushWatcher {
       (x) => x.pushedAt < windowCutoff && x.lastState !== "unwatched",
     );
     if (expiring.length > 0) {
-      // Claims FIRST, in ONE batched round trip, then the cards: the
-      // claim-before-send guarantee is unchanged (a batch is one request,
-      // executed in order), but N expiring rows now cost 1 trip instead of N.
-      let won: boolean[];
+      // Claims FIRST, in the SAME batched round trip as the prune that
+      // follows them, then the cards: the claim-before-send guarantee is
+      // unchanged (a batch is one request, executed in statement order), but N
+      // expiring rows plus the bulk DELETE now cost 1 subrequest instead of
+      // N+1 — on an invocation whose real budget is Workers Free's 50
+      // subrequests (Turso's HTTP transport counts one per statement batch),
+      // that is the difference between this stage and a whole tick.
+      let won: boolean[] = expiring.map(() => false);
       try {
-        won = await this.db.markRecapClaimedMany(expiring.map((r) => r.token));
+        const claimed = await this.db.claimRecapsAndPrune(
+          expiring.map((r) => r.token),
+          windowCutoff,
+        );
+        won = claimed.won;
         trips += 1;
       } catch {
-        won = expiring.map(() => false); // best-effort: no card without a claim
+        /* best-effort: no card without a claim */
       }
       for (let i = 0; i < expiring.length; i++) {
         if (!won[i]) continue;
@@ -1754,13 +1762,16 @@ export class PushWatcher {
         }
       }
     }
-    // The prune deletes exactly the rows past the window. When the listing was
-    // COMPLETE (fewer rows than the limit, so nothing sat outside it) and held
-    // no such row, the DELETE provably matches nothing — skip the round trip.
+    // The prune deletes exactly the rows past the window, and whenever a row
+    // was claimed above it rode that very batch (claimRecapsAndPrune deletes
+    // exactly the rows past the window). This arm is left for the passes with
+    // NOTHING to claim — a listing that failed, or an unwatched-only tail —
+    // and even then a COMPLETE listing holding no past-window row still skips
+    // the round trip outright.
     const listingComplete = snapshot !== null && snapshot.length < cfg.maxTracked;
     const pruneNeeded =
       !listingComplete || (snapshot ?? []).some((r) => r.pushedAt < windowCutoff);
-    if (pruneNeeded) {
+    if (pruneNeeded && expiring.length === 0) {
       await this.db.prunePushWatch(windowCutoff);
       trips += 1;
     }
@@ -1809,12 +1820,23 @@ export class PushWatcher {
         chatId: string;
         pushedAt: number;
       }> = [];
+      /**
+       * The heal's push-baseline ledger row, read in the SAME batched round
+       * trip as the untracked list (see findUntrackedPushesAndLedger): it used
+       * to be a SECOND subrequest out of the invocation's 50, paid only once
+       * something was missing — which is exactly when the pass is closest to
+       * its budget cut.
+       */
+      let ledgerRaw: string | null = null;
       if (!healSkipped) {
         trips += 1;
-        missing = await this.db.findUntrackedPushes(
+        const healRead = await this.db.findUntrackedPushesAndLedger(
           now - cfg.windowHours * 3_600_000,
+          PUSH_LEDGER_STATE_KEY,
           10,
         );
+        missing = healRead.missing;
+        ledgerRaw = healRead.ledgerRaw;
         healMissing = missing.length;
       }
       if (missing.length > 0) {
@@ -1850,10 +1872,9 @@ export class PushWatcher {
         // Durable push-baseline ledger (src/pushledger.ts): the true
         // push-time mcap per token, copied out of the delivery audit ring and
         // kept across deploys. ONE worker_state read covers the whole batch.
-        const ledger = parsePushLedger(
-          await this.db.getWorkerState(PUSH_LEDGER_STATE_KEY),
-        );
-        trips += 1;
+        // (read with the untracked list above — ONE round trip for both, see
+        // findUntrackedPushesAndLedger)
+        const ledger = parsePushLedger(ledgerRaw);
         const resendMode = await this.tradeMode();
         if (this.hasTrade()) trips += 1;
         const enroll: Array<{
@@ -2712,6 +2733,11 @@ export class PushWatcher {
         .slice(0, cfg.maxHolderChecksPerTick);
       const due = head.filter((r) => !parked(r));
       holdersHeld = head.length - due.length;
+      // Holder counts proven this pass, written in ONE batch after the loop
+      // (see setPushWatchHoldersMany): N probed rows used to cost N subrequests
+      // on an invocation whose budget is 50.
+      const holderWrites: Array<{ token: string; holders: number; at: number }> =
+        [];
       for (let i = 0; i < due.length; i++) {
         const r = due[i];
         // Holder counts are a slow-moving card detail; drop the rest of the
@@ -2723,7 +2749,11 @@ export class PushWatcher {
           holdersCut = due.length - i;
           break;
         }
-        let wrote = false;
+        // The WRITE is deferred to the one batch after the loop (see
+        // setPushWatchHoldersMany): the probe, its cap and the park rule are
+        // unchanged — a probe that returned no count parks its row right here,
+        // and a rejected batch parks every row it covered below.
+        let probed = false;
         try {
           const overview = await this.bounded(
             this.birdeye.getTokenOverview(r.token),
@@ -2731,9 +2761,12 @@ export class PushWatcher {
             null,
           );
           if (overview && overview.holderCount !== null) {
-            trips += 1;
-            await this.db.setPushWatchHolders(r.token, overview.holderCount, now);
-            wrote = true;
+            holderWrites.push({
+              token: r.token,
+              holders: overview.holderCount,
+              at: now,
+            });
+            probed = true;
           }
         } catch (err) {
           console.error(
@@ -2743,8 +2776,25 @@ export class PushWatcher {
         }
         // Only a probe that WROTE a count clears the park: a timeout, a
         // malformed body and a throw all mean "no holder data this time".
-        if (wrote) this.holdersFailedAt.delete(r.token);
-        else this.holdersFailedAt.set(r.token, Date.now());
+        if (!probed) this.holdersFailedAt.set(r.token, Date.now());
+      }
+      if (holderWrites.length > 0) {
+        // The whole stage in ONE round trip (N before this).
+        trips += 1;
+        try {
+          await this.db.setPushWatchHoldersMany(holderWrites);
+          for (const w of holderWrites) this.holdersFailedAt.delete(w.token);
+        } catch (err) {
+          console.error(
+            "[push-watch] holder batch write failed:",
+            err instanceof Error ? err.message : err,
+          );
+          // A rejected batch wrote NOTHING: park every row it covered, the
+          // same state a row whose own write failed used to reach.
+          for (const w of holderWrites) {
+            this.holdersFailedAt.set(w.token, Date.now());
+          }
+        }
       }
     }
     spent.holders.ms = Date.now() - holdersStart;

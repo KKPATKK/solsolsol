@@ -2,7 +2,7 @@ import { webhookCallback, type Bot } from "grammy";
 import { BirdeyeClient } from "./birdeye";
 import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
-import { Db } from "./db";
+import { Db, parseScheduledTickRing, type ScheduledTickEntry } from "./db";
 // Subclass with the last-good pool fallback: the method it wraps lives past
 // the file-sync window in src/db.ts, so the production path is adjusted here.
 import { PoolFallbackDb, poolFallbackStats } from "./poolfallback";
@@ -1101,6 +1101,46 @@ let preTick: PreTickView = {
 /** Handler entry of the tick in progress (0 = nothing recorded). */
 let preTickEntryAt = 0;
 
+/**
+ * The tick's heartbeat read, shared between the three consumers that would
+ * each otherwise pay their own round trip for the SAME worker_state row:
+ * ensureInitialized's dead-tick recovery check, the cadence gate in the
+ * scheduled handler, and the HTTP fallback's own gate (maybeRunScanIfStale).
+ * Every read is a subrequest and the invocation's budget is the binding
+ * constraint (Workers Free: 50 subrequests per invocation), so this is reused
+ * within one tick only — see HEARTBEAT_REUSE_MS.
+ */
+let lastHeartbeatRead: { raw: string | null; at: number } | null = null;
+
+/**
+ * How long the shared heartbeat read above stays reusable. Wide enough to cover
+ * the few hundred ms between ensureInitialized and the gate in the same tick,
+ * short enough that the next tick (or a /health request a second later) always
+ * re-reads: a stale heartbeat would shift the cadence gate and the dead-tick
+ * backfill test by exactly that much.
+ */
+const HEARTBEAT_REUSE_MS = 2_000;
+
+/**
+ * Cron-arrival bookkeeping through a standalone raw client — the pre-2026-09-23
+ * shape, kept for the paths where the claim batch that normally carries it
+ * provably will not run: no scanner (a broken init would otherwise make cron
+ * look dead from /health, which is exactly what this counter is for) and an
+ * unreadable worker_state. Returns what it cost, for summary.preTick.steps.bump.
+ */
+async function bumpScheduledTickLegacy(env: Env): Promise<number> {
+  const at = Date.now();
+  try {
+    if (env.TURSO_DATABASE_URL && env.TURSO_AUTH_TOKEN) {
+      const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
+      await probe.bumpScheduledTick();
+    }
+  } catch (err) {
+    console.error("[worker] standalone cron counter failed:", err);
+  }
+  return Date.now() - at;
+}
+
 /** Pre-scan split of the tick that finished most recently (see the header). */
 export function preTickView(): PreTickView {
   return { ...preTick, steps: { ...preTick.steps } };
@@ -1561,6 +1601,12 @@ async function ensureInitialized(env: Env): Promise<void> {
         ),
       ]);
       const now = Date.now();
+      // This IS the tick's heartbeat read: the cadence gate below and the HTTP
+      // fallback's own gate would each re-read the SAME row — one subrequest
+      // apiece out of a 50-subrequest invocation budget, plus ~110-265ms of
+      // wall clock each. Shared instead of duplicated (see lastHeartbeatRead /
+      // HEARTBEAT_REUSE_MS).
+      lastHeartbeatRead = { raw: prevRaw, at: now };
       const verdict = deadTickRebuildDecision(prevRaw, now, BACKFILL_STALE_MS);
       if (verdict.rebuild) {
         console.error(
@@ -2009,6 +2055,13 @@ async function ensureInitialized(env: Env): Promise<void> {
 async function runScan(
   prevHeartbeatRawArg?: string | null,
   envRef?: Env,
+  /**
+   * Cron-arrival bookkeeping to ride the claim batch (see
+   * Db.scheduledTickStatements): the handler read the ring with its gate read,
+   * so the counter/timestamp/ring cost this tick ZERO extra round trips when
+   * the claim lands, and are written on their own only when it does not.
+   */
+  cronTick?: ScheduledTickEntry | null,
 ): Promise<void> {
   if (!scanner) return;
   // Cross-isolate single-flight: cron and the HTTP fallback may run on
@@ -2144,6 +2197,7 @@ async function runScan(
         SCAN_LOCK_TTL_MS,
         heartbeatJson,
         backfillEntry,
+        cronTick ?? null,
       );
     } catch (err) {
       claimErrored = true;
@@ -2173,6 +2227,17 @@ async function runScan(
       );
     }
     console.log("[worker] scan skipped — another isolate holds the scan lock");
+    // The claim never carried the cron-arrival bookkeeping, so write it here:
+    // this tick DID arrive (that is what the counter records), it simply lost
+    // the lease to another isolate's scan. ONE write, no read — the handler
+    // already holds the ring.
+    if (cronTick) {
+      try {
+        await db?.writeScheduledTick(cronTick);
+      } catch {
+        /* cron bookkeeping is best-effort — never blocks the tick */
+      }
+    }
     // This tick never reaches the finally below, so the leash opened at
     // startedAt has to be closed here instead of leaking past it.
     db?.exitScanMode();
@@ -2185,6 +2250,15 @@ async function runScan(
       await db?.setWorkerState("scan_heartbeat", heartbeatJson);
     } catch (err) {
       console.error("[worker] start heartbeat write failed:", err);
+    }
+    // The claim batch never ran, so it cannot have carried the cron-arrival
+    // bookkeeping either — write it on its own (ONE write, no read).
+    if (cronTick) {
+      try {
+        await db?.writeScheduledTick(cronTick);
+      } catch (err) {
+        console.error("[worker] cron bookkeeping write failed:", err);
+      }
     }
   }
   if (scanLock !== null && backfillEntry) {
@@ -2888,7 +2962,14 @@ async function maybeRunScanIfStale(
   // adds no extra round trip on the wall-clock-critical path.
   let hbRaw: string | null = null;
   try {
-    hbRaw = (await db?.getWorkerState("scan_heartbeat")) ?? null;
+    // Reuse the read ensureInitialized just paid for when it is still fresh
+    // (see lastHeartbeatRead): the uptime monitor drives this path once a
+    // minute, and both reads are the very same row.
+    const cachedHb = lastHeartbeatRead;
+    hbRaw =
+      cachedHb !== null && Date.now() - cachedHb.at <= HEARTBEAT_REUSE_MS
+        ? cachedHb.raw
+        : ((await db?.getWorkerState("scan_heartbeat")) ?? null);
     const at = hbRaw ? ((JSON.parse(hbRaw) as { at?: number } | null)?.at ?? 0) : 0;
     if (typeof at === "number" && now - at < SCAN_TRIGGER_INTERVAL_MS) return;
   } catch {
@@ -4668,26 +4749,23 @@ export default {
     beginPreTick(Date.now());
     tickWaitUntil = (promise) => ctx.waitUntil(promise);
     scheduledTicks++;
-    // Record the cron event BEFORE init, with a raw client: a slow/failed
-    // init (Turso degraded) otherwise kills the scheduled event inside the
-    // ~30s wall clock before the counter was written, making cron look dead
-    // from /health even though the trigger fires (observed 2026-08-14:
-    // post-init counter stayed null while HTTP-driven scans ran fine). This
-    // is the cross-isolate proof that scheduled events arrive at all.
-    try {
-      const bumpAt = Date.now();
-      if (env.TURSO_DATABASE_URL && env.TURSO_AUTH_TOKEN) {
-        const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
-        await probe.bumpScheduledTick();
-      }
-      preTick.steps.bump = Date.now() - bumpAt;
-    } catch (err) {
-      console.error("[worker] pre-init cron counter failed:", err);
-    }
+    // Cron-arrival bookkeeping rides the scan-lock claim (see
+    // Db.scheduledTickStatements), so a normal tick pays ZERO extra round trips
+    // for it: it used to pay a read AND a write through its own raw client
+    // (live `bump 564-2211ms` in summary.preTick) on an invocation whose
+    // binding constraint is the 50-subrequest budget. Every path that cannot
+    // reach a claim still records the arrival — the cadence-gate skip below,
+    // both no-claim arms of runScan, and the !scanner fallback right here —
+    // because the counter exists so a slow/failed init cannot make cron look
+    // dead from /health (observed 2026-08-14).
+    const cronAt = Date.now();
     const initAt = Date.now();
     await ensureInitialized(env);
     preTick.steps.init = Date.now() - initAt;
-    if (!scanner) return;
+    if (!scanner) {
+      preTick.steps.bump = await bumpScheduledTickLegacy(env);
+      return;
+    }
     // Cadence gate: the cron trigger fires every minute; SCAN_INTERVAL_SECONDS
     // (default 60s) lets the operator slow the scan (e.g. 90s — every other
     // tick, halving upstream API pressure and Turso rows-read). Skip the
@@ -4702,26 +4780,58 @@ export default {
     // the 60s cadence (2026-09-07 live: 121s history gaps). The scan lock,
     // not this gate, prevents overlapping scans.
     const gateMs = scanGapMs - SCAN_GATE_MARGIN_MS;
-    // The heartbeat read doubles as the backfill input for runScan (a dead
-    // predecessor's stale scanning heartbeat) and the outage check — pass
-    // both down so the tick adds no extra round trips.
+    // This gate read ALSO carries the cron-tick ring: the heartbeat doubles as
+    // the backfill input for runScan (a dead predecessor's stale scanning
+    // heartbeat) and the outage check — pass both down so the tick adds no
+    // extra round trips — and the ring is what the claim batch needs to record
+    // the arrival. One subrequest for all of it, and the heartbeat itself is
+    // usually REUSED from ensureInitialized (see lastHeartbeatRead), so a cron
+    // tick's front reads one row instead of three.
     const gateAt = Date.now();
     let hbRaw: string | null = null;
     let hbAt: number | null = null;
+    let cronTick: ScheduledTickEntry | null = null;
     try {
-      hbRaw = (await db?.getWorkerState("scan_heartbeat")) ?? null;
+      const cachedHb =
+        lastHeartbeatRead !== null &&
+        Date.now() - lastHeartbeatRead.at <= HEARTBEAT_REUSE_MS
+          ? lastHeartbeatRead.raw
+          : undefined;
+      const keys = ["scheduled_tick_total", "scheduled_tick_ring"];
+      if (cachedHb === undefined) keys.push("scan_heartbeat");
+      const kb = await db?.getWorkerStates(keys);
+      hbRaw =
+        cachedHb !== undefined ? cachedHb : (kb?.get("scan_heartbeat") ?? null);
       const at = hbRaw
         ? ((JSON.parse(hbRaw) as { at?: number } | null)?.at ?? 0)
         : 0;
       hbAt = typeof at === "number" && at > 0 ? at : null;
+      cronTick = {
+        at: cronAt,
+        ring: [
+          ...parseScheduledTickRing(kb?.get("scheduled_tick_ring") ?? null),
+          cronAt,
+        ],
+      };
       if (hbAt !== null && Date.now() - hbAt < gateMs) {
         console.log(
           `[worker] cron tick skipped — last scan claimed ${Math.round((Date.now() - hbAt) / 1000)}s ago (< ${Math.round(gateMs / 1000)}s)`,
         );
+        // A skipped tick still ARRIVED — record it (ONE write, no read).
+        try {
+          await db?.writeScheduledTick(cronTick);
+        } catch (err) {
+          console.error("[worker] skipped-tick cron bookkeeping failed:", err);
+        }
         return;
       }
     } catch {
-      // heartbeat unreadable — fail open and run the scan
+      // Heartbeat unreadable — fail open and run the scan. The arrival is
+      // recorded through the standalone raw-client bump: with worker_state
+      // unreadable there is no ring to hand the claim, and no reason to trust
+      // the claim batch to run at all.
+      cronTick = null;
+      preTick.steps.bump = await bumpScheduledTickLegacy(env);
     } finally {
       // Covers the `return` arm too: a SKIPPED tick still reports what its
       // gate read cost, which is the tick shape a reader is chasing.
@@ -4737,7 +4847,7 @@ export default {
     }
     scanRunning = true;
     try {
-      await runScan(hbRaw, env);
+      await runScan(hbRaw, env, cronTick);
     } finally {
       scanRunning = false;
     }

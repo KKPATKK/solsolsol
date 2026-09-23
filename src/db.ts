@@ -392,6 +392,41 @@ interface PushWatchCheckValues {
   lastMcap?: number;
 }
 
+/**
+ * Hard cap on the cron-tick ring kept in worker_state (`scheduled_tick_ring`):
+ * 90 entries ≈ 90 minutes of delivery history, which is what tells "cron did
+ * not deliver" apart from "the tick died before its completion flush" after
+ * the fact.
+ */
+export const SCHEDULED_TICK_RING_MAX = 90;
+
+/**
+ * Parse the cron-tick ring (see SCHEDULED_TICK_RING_MAX / bumpScheduledTick).
+ * Corrupted or non-numeric entries are dropped rather than thrown: the ring is
+ * a diagnostic and must never cost a tick.
+ */
+export function parseScheduledTickRing(raw: string | null): number[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is number => typeof v === "number");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The cron-arrival bookkeeping that can ride a tick's claim batch (see
+ * Db.scheduledTickStatements): the cron event time plus the ring to store.
+ */
+export interface ScheduledTickEntry {
+  /** Cron event time (epoch ms) — `scheduled_tick_at` and the ring's tail. */
+  at: number;
+  /** The ring to store (the caller appends and caps, see the parser above). */
+  ring: number[];
+}
+
 export class Db {
   private client: Client | null = null;
   private readonly url: string;
@@ -413,6 +448,186 @@ export class Db {
     this.url = url;
     this.authToken = authToken;
     this.injectedClient = injectedClient;
+  }
+
+  /**
+   * Many keys, ONE round trip. Every getWorkerState call is a subrequest, and
+   * the invocation's budget counts Turso's HTTP requests too (Workers Free: 50
+   * subrequests per invocation) — so the tick-front reads (scan_heartbeat plus
+   * the cron-tick counter/ring) are read together instead of one key at a
+   * time. Missing rows are simply absent from the map.
+   *
+   * It lives in the reachable head of this class on purpose: the worker's
+   * scheduled handler cannot reach getWorkerState's own neighbourhood (the
+   * same ~48KB file-sync window that produced getReevalPoolBatched).
+   */
+  async getWorkerStates(keys: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (keys.length === 0) return out;
+    const res = await this.get().execute({
+      sql: `SELECT key, value FROM worker_state WHERE key IN (${keys
+        .map(() => "?")
+        .join(",")})`,
+      args: keys,
+    });
+    for (const row of res.rows) {
+      const rec = row as Record<string, unknown>;
+      out.set(String(rec.key), String(rec.value));
+    }
+    return out;
+  }
+
+  /**
+   * The cron-arrival bookkeeping (worker_state `scheduled_tick_total` /
+   * `scheduled_tick_at` / `scheduled_tick_ring`) as READ-FREE statements: the
+   * counter increments in SQL, and the ring/timestamp come from the caller,
+   * which already read the ring with its cadence-gate read. That is what lets a
+   * normal cron tick pay ZERO extra round trips — the statements ride inside
+   * the scan-lock claim batch (see claimScanLock), the tick's first must-land
+   * write. Before this, every cron tick paid a read AND a write through its own
+   * raw client (live `bump 564-2211ms` in summary.preTick) on an invocation
+   * whose binding constraint is the 50-subrequest budget.
+   */
+  scheduledTickStatements(
+    entry: ScheduledTickEntry,
+  ): Array<{ sql: string; args: Array<string | number | null> }> {
+    return [
+      {
+        // The row must exist before the UPDATE can increment it.
+        sql: "INSERT OR IGNORE INTO worker_state (key, value) VALUES ('scheduled_tick_total', '0')",
+        args: [],
+      },
+      {
+        sql: "UPDATE worker_state SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'scheduled_tick_total'",
+        args: [],
+      },
+      {
+        sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        args: [String(entry.at)],
+      },
+      {
+        sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_tick_ring', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        args: [JSON.stringify(entry.ring.slice(-SCHEDULED_TICK_RING_MAX))],
+      },
+    ];
+  }
+
+  /**
+   * The same bookkeeping in ONE write and NO read, for a tick that never
+   * reaches a claim (the cadence-gate skip path, or a lease lost to another
+   * isolate): the caller already holds the ring.
+   */
+  async writeScheduledTick(entry: ScheduledTickEntry): Promise<void> {
+    await this.get().batch(this.scheduledTickStatements(entry), "write");
+  }
+
+  /**
+   * The tracker pass's setup writes in ONE round trip: the 🏁 recap claims for
+   * the rows leaving the tracking window, plus the prune that deletes exactly
+   * those rows. Statement order is the caller's (claims first, then the
+   * DELETE) and batch results come back in statement order, so the per-row
+   * `won` flags still come from the claim statements themselves — the
+   * compare-and-swap that stops a second isolate from re-announcing a recap is
+   * untouched. `pruned` is the DELETE's row count.
+   *
+   * Each of the two was its own subrequest out of the invocation's
+   * 50-subrequest budget (Workers Free counts Turso's HTTP requests too), and
+   * the pass's whole design is its round-trip count (the `trips N` in the
+   * note): on a pass with rows leaving the window this is 2 trips → 1, and the
+   * DELETE can never run without the claims it belongs with — the same batch
+   * either lands both or neither, so a row can no longer be deleted while the
+   * claim that would have announced it never went out.
+   */
+  async claimRecapsAndPrune(
+    tokens: string[],
+    olderThanMs: number,
+  ): Promise<{ won: boolean[]; pruned: number }> {
+    const statements: Array<{ sql: string; args: Array<string | number | null> }> =
+      tokens.map((token) => ({
+        sql: `UPDATE push_watch SET last_state = 'expired'
+            WHERE token = ?
+              AND (last_state IS NULL OR last_state NOT IN ('expired', 'unwatched'))`,
+        args: [token],
+      }));
+    statements.push({
+      sql: "DELETE FROM push_watch WHERE pushed_at < ?",
+      args: [olderThanMs],
+    });
+    const res = await this.get().batch(statements, "write");
+    return {
+      won: res.slice(0, tokens.length).map((r) => Number(r.rowsAffected ?? 0) > 0),
+      pruned: Number(res[tokens.length]?.rowsAffected ?? 0),
+    };
+  }
+
+  /**
+   * The tracker pass's heal-stage opening reads in ONE round trip: the
+   * untracked pushes (seen_tokens rows with no push_watch row — pushes whose
+   * enrollment hook never ran) and the durable push-baseline ledger row. The
+   * heal needs both at the same moment, and each was its own subrequest; the
+   * ledger read also used to be paid only after the untracked list came back
+   * non-empty, which on a starved pass pushed the enrollments themselves into
+   * the budget cut. Same rows, same order, one request.
+   */
+  async findUntrackedPushesAndLedger(
+    sinceMs: number,
+    ledgerKey: string,
+    limit = 10,
+  ): Promise<{
+    missing: Array<{ token: string; chatId: string; pushedAt: number }>;
+    ledgerRaw: string | null;
+  }> {
+    const res = await this.get().batch(
+      [
+        {
+          sql: `SELECT s.token, s.chat_id, MIN(s.first_seen_at) AS pushed_at
+                  FROM seen_tokens s
+                 WHERE s.first_seen_at > ?
+                   AND NOT EXISTS (SELECT 1 FROM push_watch pw WHERE pw.token = s.token)
+                 GROUP BY s.token, s.chat_id
+                 ORDER BY pushed_at DESC
+                 LIMIT ?`,
+          args: [sinceMs, limit],
+        },
+        { sql: "SELECT value FROM worker_state WHERE key = ?", args: [ledgerKey] },
+      ],
+      "read",
+    );
+    const missing = (res[0]?.rows ?? []).map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        token: String(r.token),
+        chatId: String(r.chat_id),
+        pushedAt: Number(r.pushed_at ?? 0),
+      };
+    });
+    const ledgerRow = (res[1]?.rows ?? [])[0] as Record<string, unknown> | undefined;
+    return { missing, ledgerRaw: ledgerRow ? String(ledgerRow.value) : null };
+  }
+
+  /**
+   * The tracker pass's holder writes in ONE round trip: one UPDATE per probed
+   * row, batched. Scope is unchanged — each row still gets exactly its own
+   * count and its own `holders_checked_at`, so the refresh cadence per row is
+   * the same — but N probes now cost 1 subrequest instead of N on an
+   * invocation whose budget is 50. A rejected batch parks every row it covered
+   * (see the holder stage in src/pushwatch.ts), the same state a row whose own
+   * write failed used to reach.
+   */
+  async setPushWatchHoldersMany(
+    updates: Array<{ token: string; holders: number; at: number }>,
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    await this.get().batch(
+      updates.map((u) => ({
+        sql: `UPDATE push_watch SET
+                holders_at_push = COALESCE(holders_at_push, ?),
+                holders_last = ?, holders_checked_at = ?
+              WHERE token = ?`,
+        args: [u.holders, u.holders, u.at, u.token],
+      })),
+      "write",
+    );
   }
 
   /**
@@ -1505,6 +1720,13 @@ export class Db {
       candidates: number | null;
       pushed: number | null;
     } | null,
+    /**
+     * Cron-arrival bookkeeping that rides THIS claim batch (see
+     * scheduledTickStatements): the caller read the ring with its gate read, so
+     * a cron tick's counter/timestamp/ring land with its own first must-land
+     * write instead of costing their own round trips.
+     */
+    cronTick?: ScheduledTickEntry | null,
   ): Promise<string | null> {
     const value = `${now + ttlMs}|${owner}`;
     const claimStmt: { sql: string; args: Array<string | number | null> } = {
@@ -1527,12 +1749,14 @@ export class Db {
             args: [historyEntry.at, historyEntry.ms, historyEntry.err, value],
           }
         : null;
-    const winBatch = [claimStmt, heartbeatStmt, historyStmt].filter(
+    const cronStatements = cronTick ? this.scheduledTickStatements(cronTick) : [];
+    const winBatch = [claimStmt, heartbeatStmt, historyStmt, ...cronStatements].filter(
       (s): s is { sql: string; args: Array<string | number | null> } => s !== null,
     );
     // Winner path: one batched round trip carrying the claim + heartbeat
-    // (+ the dead-tick backfill row when a predecessor died mid-scan).
-    if (heartbeatStmt || historyStmt) {
+    // (+ the dead-tick backfill row when a predecessor died mid-scan,
+    //  + the caller's cron-arrival bookkeeping).
+    if (heartbeatStmt || historyStmt || cronStatements.length > 0) {
       const batch = await this.get().batch(winBatch, "write");
       if (Number(batch[0]?.rowsAffected ?? 0) > 0) return value;
     } else {
@@ -1549,7 +1773,7 @@ export class Db {
     if (!raw) {
       // Row vanished between insert and read (owner released mid-claim) —
       // retry once instead of losing this claim to a race.
-      if (heartbeatStmt || historyStmt) {
+      if (heartbeatStmt || historyStmt || cronStatements.length > 0) {
         const batch = await this.get().batch(winBatch, "write");
         return Number(batch[0]?.rowsAffected ?? 0) > 0 ? value : null;
       }
@@ -1564,12 +1788,12 @@ export class Db {
       args: [value, raw],
     });
     const won = Number(upd.rowsAffected ?? 0) > 0;
-    if (won && (heartbeatStmt || historyStmt)) {
+    if (won && (heartbeatStmt || historyStmt || cronStatements.length > 0)) {
       // Rare path (dead holder): restore liveness with a separate write —
       // one extra round trip only when a takeover actually happens.
       try {
         await this.get().batch(
-          [heartbeatStmt, historyStmt].filter(
+          [heartbeatStmt, historyStmt, ...cronStatements].filter(
             (s): s is { sql: string; args: Array<string | number | null> } => s !== null,
           ),
           "write",

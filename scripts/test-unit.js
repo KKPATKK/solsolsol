@@ -786,6 +786,9 @@ async function main() {
       updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
       deletePushWatch: async () => {},
       setPushWatchHolders: async () => {},
+      setPushWatchHoldersMany: async () => {},
+      claimRecapsAndPrune: async (tokens) => ({ won: tokens.map(() => false), pruned: 0 }),
+      findUntrackedPushesAndLedger: async () => ({ missing: [], ledgerRaw: null }),
       recordPushDelivery: async () => {},
       getWorkerState: async (key) => state.get(key) ?? null,
       setWorkerState: async (key, value) => { state.set(key, value); },
@@ -3137,6 +3140,11 @@ async function main() {
         listPushWatch: async () => [],
         prunePushWatch: async () => 0,
         findUntrackedPushes: async () => [{ token, chatId: "c", pushedAt }],
+        findUntrackedPushesAndLedger: async () => ({
+          missing: [{ token, chatId: "c", pushedAt }],
+          ledgerRaw: ledgerValue,
+        }),
+        claimRecapsAndPrune: async (list) => ({ won: list.map(() => false), pruned: 0 }),
         markRecapClaimed: async () => false,
         markRecapClaimedMany: async (list) => list.map(() => false),
         getInitialPushAuditTokens: async () => new Set([token]),
@@ -3457,6 +3465,11 @@ async function main() {
       listPushWatch: async () => [],
       prunePushWatch: async () => 0,
       findUntrackedPushes: async () => tokens.map((t) => ({ token: t, chatId: "c", pushedAt })),
+      findUntrackedPushesAndLedger: async () => ({
+        missing: tokens.map((t) => ({ token: t, chatId: "c", pushedAt })),
+        ledgerRaw: ledgerValue,
+      }),
+      claimRecapsAndPrune: async (list) => ({ won: list.map(() => false), pruned: 0 }),
       markRecapClaimed: async () => false,
       markRecapClaimedMany: async (list) => list.map(() => false),
       getInitialPushAuditTokens: async () => new Set(tokens),
@@ -5451,6 +5464,9 @@ async function main() {
     listPushWatch: async () => rows,
     prunePushWatch: async () => 0,
     findUntrackedPushes: async () => [],
+    findUntrackedPushesAndLedger: async () => ({ missing: [], ledgerRaw: null }),
+    claimRecapsAndPrune: async (tokens) => ({ won: tokens.map(() => false), pruned: 0 }),
+    setPushWatchHoldersMany: async () => {},
     markRecapClaimed: async () => false,
     markRecapClaimedMany: async (tokens) => tokens.map(() => false),
     getInitialPushAuditTokens: async () => new Set(),
@@ -5541,9 +5557,13 @@ async function main() {
     const slow = (ms) => new Promise((r) => setTimeout(r, ms));
     const db = {
       ...watchDb(rows, updated),
-      findUntrackedPushes: async () => [
-        { token: "MISS1", chatId: "c", pushedAt: Date.now() - 300_000 },
-      ],
+      findUntrackedPushesAndLedger: async () => {
+        await slow(600);
+        return {
+          missing: [{ token: "MISS1", chatId: "c", pushedAt: Date.now() - 300_000 }],
+          ledgerRaw: null,
+        };
+      },
       // The heal's own reads: the delivered-card ring, the unconfirmed-send
       // record and the push ledger are one worker_state row each in
       // production, ~250-420ms apiece live.
@@ -5574,9 +5594,12 @@ async function main() {
     let healReads = 0;
     const db = {
       ...watchDb(rows, updated),
-      findUntrackedPushes: async () => {
+      findUntrackedPushesAndLedger: async () => {
         healReads += 1;
-        return [{ token: "MISS1", chatId: "c", pushedAt: Date.now() - 300_000 }];
+        return {
+          missing: [{ token: "MISS1", chatId: "c", pushedAt: Date.now() - 300_000 }],
+          ledgerRaw: null,
+        };
       },
       getWorkerState: async () => null,
       getInitialPushAuditTokens: async () => { healReads += 1; return new Set(); },
@@ -5935,12 +5958,15 @@ async function main() {
     assert.equal(written.upStages, "up100,up50");
   });
 
-  await test("PushWatcher: one listing per tick, recap claims batched, no no-op prune, trips reported", async () => {
+  await test("PushWatcher: one listing per tick, claims + prune in ONE batch, trips reported", async () => {
     // 2026-09-17 round-trip merge: the pass read push_watch TWICE per tick
     // (recap pass + row loop), claimed every expiring row with its own request,
     // and always ran the prune even when it provably deleted nothing. On a
     // pass budget of ~1s those round trips are what starves the rotation, so
     // the mocks count every call and the pass must report the same number.
+    // 2026-09-23: the claims AND the DELETE now ride ONE batch
+    // (Db.claimRecapsAndPrune) — the invocation's real ceiling is Workers
+    // Free's 50 subrequests, and Turso's HTTP transport is one per batch.
     const window = loadConfig({}).pushWatch.windowHours * 3_600_000;
     const rows = [
       watchRow("OLD", { pushedAt: Date.now() - window - 60_000 }),
@@ -5949,13 +5975,15 @@ async function main() {
     const calls = { list: 0, prune: 0, claims: [], total: 0, updated: [] };
     const db = {
       listPushWatch: async () => { calls.list += 1; calls.total += 1; return rows; },
-      prunePushWatch: async () => { calls.prune += 1; calls.total += 1; return 1; },
-      markRecapClaimedMany: async (tokens) => {
+      claimRecapsAndPrune: async (tokens) => {
         calls.claims.push(tokens);
         calls.total += 1;
-        return tokens.map(() => true);
+        return { won: tokens.map(() => true), pruned: 1 };
       },
-      findUntrackedPushes: async () => { calls.total += 1; return []; },
+      findUntrackedPushesAndLedger: async () => {
+        calls.total += 1;
+        return { missing: [], ledgerRaw: null };
+      },
       claimPushWatch: async () => { calls.total += 1; return true; },
       claimPushWatchCheck: async (token, _expected, _now, v) => {
         calls.total += 1;
@@ -5984,7 +6012,10 @@ async function main() {
     assert.equal(calls.claims.length, 1, "recap claims for N rows must ride in ONE batch");
     assert.deepEqual(calls.claims[0], ["OLD"], "only the expiring row is claimed");
     assert.equal(cards, 1, "the expiring row still gets its recap card");
-    assert.equal(calls.prune, 1, "a row past the window still triggers the prune");
+    assert.equal(
+      calls.prune, 0,
+      "the DELETE rides the recap-claim batch instead of spending its own round trip",
+    );
     assert.deepEqual(
       calls.updated.map(([t]) => t), ["AAA"],
       "a recapped row must never be evaluated again (the prune removes it)",
@@ -6006,9 +6037,8 @@ async function main() {
     const rows = [watchRow("OLD", { pushedAt: Date.now() - window - 60_000 })];
     const db = {
       listPushWatch: async () => rows,
-      prunePushWatch: async () => 1,
-      markRecapClaimedMany: async (tokens) => tokens.map(() => true),
-      findUntrackedPushes: async () => [],
+      claimRecapsAndPrune: async (tokens) => ({ won: tokens.map(() => true), pruned: 1 }),
+      findUntrackedPushesAndLedger: async () => ({ missing: [], ledgerRaw: null }),
       claimPushWatch: async () => true,
       claimPushWatchCheck: async () => true,
       reservePushWatchAlert: async () => true,
@@ -6045,8 +6075,14 @@ async function main() {
     const db = {
       listPushWatch: async () => { calls.list += 1; calls.total += 1; return rows; },
       prunePushWatch: async () => { calls.prune += 1; calls.total += 1; return 0; },
-      markRecapClaimedMany: async (tokens) => { calls.total += 1; return tokens.map(() => true); },
-      findUntrackedPushes: async () => { calls.total += 1; return []; },
+      claimRecapsAndPrune: async (tokens) => {
+        calls.total += 1;
+        return { won: tokens.map(() => true), pruned: 0 };
+      },
+      findUntrackedPushesAndLedger: async () => {
+        calls.total += 1;
+        return { missing: [], ledgerRaw: null };
+      },
       claimPushWatch: async () => { calls.total += 1; return true; },
       claimPushWatchCheck: async () => { calls.total += 1; return true; },
       reservePushWatchAlert: async () => { calls.total += 1; return true; },
@@ -6134,8 +6170,8 @@ async function main() {
     let probes = 0;
     const db = {
       ...watchDb(rows, updated),
-      setPushWatchHolders: async (token, count) => {
-        holderWrites.push([token, count]);
+      setPushWatchHoldersMany: async (updates) => {
+        for (const u of updates) holderWrites.push([u.token, u.holders]);
       },
     };
     const pw = new PushWatcher(

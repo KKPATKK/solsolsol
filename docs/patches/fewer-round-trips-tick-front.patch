@@ -1,0 +1,40 @@
+diff --git a/src/db.ts b/src/db.ts
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -1612,3 +1612,10 @@
+       pushed: number | null;
+     } | null,
++    /**
++     * Cron-arrival bookkeeping that rides THIS claim batch (see
++     * scheduledTickStatements): the caller read the ring with its gate read, so
++     * a cron tick's counter/timestamp/ring land with its own first must-land
++     * write instead of costing their own round trips.
++     */
++    cronTick?: ScheduledTickEntry | null,
+   ): Promise<string | null> {
+@@ -1636,6 +1636,9 @@
+-    const winBatch = [claimStmt, heartbeatStmt, historyStmt].filter(
++    const cronStatements = cronTick ? this.scheduledTickStatements(cronTick) : [];
++    const winBatch = [claimStmt, heartbeatStmt, historyStmt, ...cronStatements].filter(
+       (s): s is { sql: string; args: Array<string | number | null> } => s !== null,
+     );
+     // Winner path: one batched round trip carrying the claim + heartbeat
+-    // (+ the dead-tick backfill row when a predecessor died mid-scan).
+-    if (heartbeatStmt || historyStmt) {
++    // (+ the dead-tick backfill row when a predecessor died mid-scan,
++    //  + the caller's cron-arrival bookkeeping).
++    if (heartbeatStmt || historyStmt || cronStatements.length > 0) {
+@@ -1656,3 +1656,3 @@
+       // Row vanished between insert and read (owner released mid-claim) —
+       // retry once instead of losing this claim to a race.
+-      if (heartbeatStmt || historyStmt) {
++      if (heartbeatStmt || historyStmt || cronStatements.length > 0) {
+@@ -1673,3 +1673,5 @@
+-    if (won && (heartbeatStmt || historyStmt)) {
++    if (won && (heartbeatStmt || historyStmt || cronStatements.length > 0)) {
+       // Rare path (dead holder): restore liveness with a separate write —
+       // one extra round trip only when a takeover actually happens.
+       try {
+         await this.get().batch(
+-          [heartbeatStmt, historyStmt].filter(
++          [heartbeatStmt, historyStmt, ...cronStatements].filter(
