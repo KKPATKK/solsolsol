@@ -190,6 +190,25 @@ SUPPLY_FLOW_BUDGET_MS = "1500"
 # 0 extra RPC.
 FLURRY_BUDGET_MS = "1200"
 PUSH_WATCH_WINDOW_HOURS = "26"
+# Birdeye holder probe: how long ONE probe may take, ms. A probe is BILLED
+# whether or not its count lands, so this is the hit-rate dial, not a latency
+# knob: the endpoint measured 1_008–2_525ms from the Worker's own egress on
+# 2026-09-23 (/debug/birdeye-overview on a live tracked mint), where the same
+# probe read 303–907ms two days earlier. At the old 1_200 the four probes a
+# pass started collected ONE count and parked three rows for ten minutes
+# (`probe4 miss3`), i.e. three paid calls thrown away every pass. Lower it only
+# to bound the pass, never to save CU.
+PUSH_WATCH_HOLDER_CAP_MS = "2400"
+# Birdeye CU budget: minimum MINUTES between holder probes (0 = off). The free
+# tier is 30_000 CU/month and /defi/token_overview is 20 CU, i.e. ~50 calls a
+# DAY for the whole bot — while the 1-minute cron probing once a pass would be
+# 1_440 calls/day (28_800 CU/DAY). 60 = 24 probes/day ≈ 480 CU/day ≈ 14.4K
+# CU/month, which leaves the card path and the periodic new_listing backfill
+# inside the quota. At 30 minutes the stage alone is ~28.8K CU/month (the whole
+# free tier); at 10 it is ~86K. Raise this only against a PAID plan.
+# The stamp is durable (worker_state.holder_probe_at), so the cap holds across
+# isolates; rows the gap skips stay DUE (`cut` in the pass note, plus `cu-gate`).
+PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
 # Insider self-pump gate: rejects pushes where newWallets/checked top-holder
 # wallets exceeds WALLET_NEW_RATIO_MAX (the Cheems shape — 8/8 profiled
 # holders were brand-new wallets). Only judges once at least

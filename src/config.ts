@@ -380,6 +380,28 @@ export interface AppConfig {
     cooldownMin: number;
     holdersRefreshMin: number;
     maxHolderChecksPerTick: number;
+    /**
+     * How long ONE Birdeye holder probe may take, ms
+     * (PUSH_WATCH_HOLDER_CAP_MS, default 2400). A probe is BILLED whether or
+     * not its count lands, so this is the hit-rate dial: the endpoint measured
+     * 1_008–2_525ms from the worker's own egress on 2026-09-23 (303–907ms two
+     * days earlier), and a cap below that median pays for calls it then throws
+     * away. Lower it only for latency, never for CU.
+     */
+    holderCapMs: number;
+    /**
+     * Minimum gap between holder probes, MINUTES
+     * (PUSH_WATCH_HOLDER_MIN_GAP_MIN, default 60, 0 = off).
+     *
+     * The CU guard. `/defi/token_overview` is 20 CU and the free tier is
+     * 30K CU/month — about 50 calls a DAY for the whole bot — while a probe
+     * every pass (the 1-minute cron) would be 1_440 calls/day. 60 minutes =
+     * 24 probes/day ≈ 480 CU/day ≈ 14.4K CU/month, which leaves the card path
+     * and the periodic backfill inside the quota (see docs/round-trips.md
+     * §4.4 for the table). Raise it only against a PAID plan: at 10 minutes the
+     * stage alone is ~86K CU/month.
+     */
+    holderMinGapMin: number;
   };
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
@@ -681,6 +703,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxHolderChecksPerTick: Number.isFinite(Number(env.PUSH_WATCH_MAX_HOLDER_CHECKS ?? 4))
         ? Math.max(0, Math.min(Math.floor(Number(env.PUSH_WATCH_MAX_HOLDER_CHECKS ?? 4)), 10))
         : 4,
+      holderCapMs: Number.isFinite(Number(env.PUSH_WATCH_HOLDER_CAP_MS ?? 2400))
+        ? Math.max(500, Math.min(Math.floor(Number(env.PUSH_WATCH_HOLDER_CAP_MS ?? 2400)), 5000))
+        : 2400,
+      holderMinGapMin: Number.isFinite(Number(env.PUSH_WATCH_HOLDER_MIN_GAP_MIN ?? 60))
+        ? Math.max(0, Math.min(Math.floor(Number(env.PUSH_WATCH_HOLDER_MIN_GAP_MIN ?? 60)), 1440))
+        : 60,
     },
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,

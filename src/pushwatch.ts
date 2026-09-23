@@ -273,11 +273,23 @@ const TRACKER_HOLDER_STAGE_MS = 3_500;
  * nothing, so `holders_checked_at` stays oldest) and re-burns the cap on
  * every pass while the fast rows behind it never get a turn: measured
  * 2026-09-21 as 12 rows pinned at 15-20h staleness with `holders 1600/0`
- * pass after pass. Ten minutes sits well under the 30-minute refresh
- * interval (PUSH_WATCH_HOLDERS_REFRESH_MIN), so a parked row still gets ~3
- * attempts per refresh window, and only MISSES park — a success clears it.
+ * pass after pass. Only MISSES park — a success clears it.
+ *
+ * 2026-09-23: 10 minutes → 3, DOUBLING per consecutive miss up to
+ * TRACKER_HOLDER_PARK_MAX_MS. Three minutes is what "faster coverage" costs
+ * when the probe rate is CU-bounded (a probe is billed whether or not its
+ * count lands, and the stage keeps a gap of PUSH_WATCH_HOLDER_MIN_GAP_MIN), so
+ * a row that misses should not also sit out ten scarce turns. The ladder
+ * stops the other failure: a chronically slow row is ALWAYS the oldest
+ * `holders_checked_at`, so with a flat park it takes every probe and the 29
+ * rows behind it never get a turn — the starvation the flat 10-minute park was
+ * introduced to break, one CU budget smaller. 3 → 6 → 12 → 24, capped at 30.
  */
-const TRACKER_HOLDER_BACKOFF_MS = 10 * 60_000;
+const TRACKER_HOLDER_BACKOFF_MS = 3 * 60_000;
+/** Longest a holder row may be parked by the miss ladder above (ms). */
+const TRACKER_HOLDER_PARK_MAX_MS = 30 * 60_000;
+/** worker_state key holding the last holder-probe stamp (see the CU gate). */
+const HOLDER_PROBE_STAMP_KEY = "holder_probe_at";
 /**
  * Hard cap on the tracker's OWN DexScreener batch (the pass's one mandatory
  * request, handed to the client as a caller deadline so it stops dispatching
@@ -1397,6 +1409,19 @@ export class PushWatcher {
    */
   private readonly holdersFailedAt = new Map<string, number>();
   /**
+   * Consecutive misses per parked row (see TRACKER_HOLDER_BACKOFF_MS): the
+   * park LENGTH doubles with each one, so a chronically slow row cannot take
+   * every probe a CU-bounded rate allows. Cleared by a count, like the park.
+   */
+  private readonly holderMissStreak = new Map<string, number>();
+  /**
+   * Epoch ms of the last holder probe (see the CU gate in the holder
+   * dispatch). Also carries the DURABLE stamp (worker_state
+   * `holder_probe_at`) once it has been read, so a satisfied gap is answered
+   * from memory and the read costs one round trip per gap, not per pass.
+   */
+  private holderProbeAt: number | null = null;
+  /**
    * TERMINAL cards (the 💧 drain card) whose send was ABANDONED this isolate
    * has seen: the race stopped waiting while the request was still in flight,
    * so the card may or may not be in the chat. Cumulative for /health (the
@@ -1608,6 +1633,35 @@ export class PushWatcher {
    * (see holdForTick). Optional: tests and any non-worker caller keep the
    * plain fire-and-forget behaviour.
    */
+  /**
+   * Park a row whose holder probe missed, DOUBLING the wait per consecutive
+   * miss (see TRACKER_HOLDER_BACKOFF_MS): the first miss costs 3 minutes, so a
+   * row comes back quickly under a CU-bounded probe rate, while a row that
+   * keeps missing — always the oldest `holders_checked_at`, so always at the
+   * head of the due list — stops taking every scarce probe from the rows
+   * behind it.
+   */
+  private parkHolderRow(token: string, at: number): void {
+    this.holdersFailedAt.set(token, at);
+    const streak = Math.min((this.holderMissStreak.get(token) ?? 0) + 1, 8);
+    this.holderMissStreak.set(token, streak);
+  }
+
+  /** A landed count clears both the park and its ladder. */
+  private clearHolderPark(token: string): void {
+    this.holdersFailedAt.delete(token);
+    this.holderMissStreak.delete(token);
+  }
+
+  /** How long this row's next park lasts (see TRACKER_HOLDER_BACKOFF_MS). */
+  private holderParkMs(token: string): number {
+    const streak = this.holderMissStreak.get(token) ?? 1;
+    return Math.min(
+      TRACKER_HOLDER_BACKOFF_MS * 2 ** Math.min(streak - 1, 3),
+      TRACKER_HOLDER_PARK_MAX_MS,
+    );
+  }
+
   async runTick(
     deadlineMs?: number,
     keepAlive?: (promise: Promise<unknown>) => void,
@@ -1717,6 +1771,10 @@ export class PushWatcher {
     // BEFORE the dispatch block — a `let` declared down there would put every
     // one of those calls in its temporal dead zone.
     let holderProbeDue = 0;
+    /** This pass's probe was refused by the CU gap (see cfg.holderMinGapMin). */
+    let holderGateBlocked = false;
+    /** A probe started, so the durable CU stamp still has to land (see below). */
+    let holderStampPending = false;
     let holderProbeHeld = 0;
     /** Probes this pass actually STARTED (see the dispatch behind the pairs). */
     let holderProbeStarted = 0;
@@ -1731,7 +1789,8 @@ export class PushWatcher {
       ` rows ${spent.rows.ms}/${spent.rows.trips}` +
       ` holders ${spent.holders.ms}/${spent.holders.trips}` +
       ` held${holdersHeld} cut${holdersCut}` +
-      ` probe${holderProbeStarted} miss${holderProbeMisses}]`;
+      ` probe${holderProbeStarted} miss${holderProbeMisses}` +
+      `${holderGateBlocked ? " cu-gate" : ""}]`;
     const deferred = {
       checked: 0,
       alerted: 0,
@@ -2337,7 +2396,7 @@ export class PushWatcher {
         const parked = (r: PushWatchRow) => {
           const failedAt = this.holdersFailedAt.get(r.token);
           if (failedAt === undefined) return false;
-          if (now - failedAt >= TRACKER_HOLDER_BACKOFF_MS) {
+          if (now - failedAt >= this.holderParkMs(r.token)) {
             this.holdersFailedAt.delete(r.token);
             return false;
           }
@@ -2361,10 +2420,11 @@ export class PushWatcher {
         // cost). A probe whose whole cost the stage cannot wait out is started
         // by neither rule below: it would be collected as a miss and parked.
         const intervalMs = Math.max(1, this.config.birdeyeRequestIntervalMs);
+        const fetchCapMs = cfg.holderCapMs;
         // What ONE probe is allowed to cost: its fetch plus the single gate it
         // may queue behind — the same quantity the stage's collect waits out
         // (see TRACKER_HOLDER_CAP_MS / TRACKER_HOLDER_STAGE_MS).
-        const probeCapMs = TRACKER_HOLDER_CAP_MS + intervalMs;
+        const probeCapMs = fetchCapMs + intervalMs;
         // ONE probe per pass — the rate the refresh window needs, not the whole
         // due head (see TRACKER_HOLDER_STAGE_MS for the measurements: ~1 count a
         // minute keeps a 30-minute window turning on ~30 tracked rows). Every
@@ -2373,14 +2433,43 @@ export class PushWatcher {
         // the upper bound, so the table can be widened again by changing this
         // rule alone; the rows it cannot reach are reported as `cut` and keep
         // the front of the next pass's due list.
-        const holderSlots = Math.min(cfg.maxHolderChecksPerTick, 1);
+        //
+        // CU GATE (see docs/round-trips.md §4.4): a probe is BILLED whether or
+        // not its count lands (`/defi/token_overview` = 20 CU, and the free tier
+        // is 30K CU a MONTH ≈ 50 calls a DAY for the whole bot), so the stage
+        // also keeps a minimum GAP between probes. The stamp rides worker_state
+        // so the cap holds across isolates; a satisfied gap is answered from
+        // memory, so this read costs one round trip per gap rather than one per
+        // pass, and the write (below, after the row loop) one per probe.
+        const gapMs = Math.max(0, cfg.holderMinGapMin) * 60_000;
+        let cuGateOpen = true;
+        if (gapMs > 0) {
+          let lastAt = this.holderProbeAt ?? 0;
+          if (now - lastAt >= gapMs) {
+            try {
+              const raw = await this.db.getWorkerState(HOLDER_PROBE_STAMP_KEY);
+              trips += 1;
+              lastAt = Math.max(lastAt, raw ? Number(raw) || 0 : 0);
+              this.holderProbeAt = lastAt;
+            } catch {
+              /* unreadable → the in-memory stamp still caps THIS isolate */
+            }
+          }
+          cuGateOpen = now - lastAt >= gapMs;
+        }
+        if (!cuGateOpen) holderGateBlocked = true;
+        const holderSlots = cuGateOpen
+          ? Math.min(cfg.maxHolderChecksPerTick, 1)
+          : 0;
         for (const r of due) {
           // The start condition is UNCHANGED — the whole cap must fit inside
           // the pass deadline — it is simply evaluated where the pass still has
           // its allowance (setup + heal + pairs leave 1.0-3.0s of it).
           if (holderProbeStarted >= holderSlots) break;
-          if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) break;
+          if (Date.now() + fetchCapMs > deadline) break;
           holderProbeStarted += 1;
+          holderStampPending = true;
+          this.holderProbeAt = now;
           holderProbeUnsettled.add(r.token);
           holderProbePending.push(
             this.bounded(
@@ -2396,14 +2485,14 @@ export class PushWatcher {
                     holders: overview.holderCount,
                     at: now,
                   });
-                  this.holdersFailedAt.delete(r.token);
+                  this.clearHolderPark(r.token);
                   return;
                 }
                 // Only a probe that WROTE a count clears the park: a timeout, a
                 // malformed body and a throw all mean "no holder data this
                 // time".
                 holderProbeMisses += 1;
-                this.holdersFailedAt.set(r.token, Date.now());
+                this.parkHolderRow(r.token, Date.now());
               })
               .catch((err) => {
                 holderProbeUnsettled.delete(r.token);
@@ -2412,7 +2501,7 @@ export class PushWatcher {
                   "[push-watch] holder refresh failed:",
                   err instanceof Error ? err.message : err,
                 );
-                this.holdersFailedAt.set(r.token, Date.now());
+                this.parkHolderRow(r.token, Date.now());
               }),
           );
         }
@@ -2927,6 +3016,22 @@ export class PushWatcher {
     spent.rows.ms = Date.now() - rowsStart;
     spent.rows.trips = trips - rowsTrips;
 
+    // The holder probe's CU stamp lands HERE: after the row loop, so a probe
+    // never delays the rotation with its bookkeeping, and BEFORE the holder
+    // stage, so that stage's own `holders <ms>/<trips>` keeps counting the
+    // writes its probes produced. It lands for a MISS too (a miss is a billed
+    // Birdeye call, and nothing else records it for the next isolate): one
+    // round trip per pass that probed, bounded by the budget it implements,
+    // and a failure costs this isolate's memory of the stamp, never a count.
+    if (holderStampPending) {
+      try {
+        trips += 1;
+        await this.db.setWorkerState(HOLDER_PROBE_STAMP_KEY, String(now));
+      } catch {
+        /* telemetry-grade: the in-memory stamp still covers this isolate */
+      }
+    }
+
     // Holder refresh (Birdeye CU-bounded): the probes were STARTED behind the
     // pair batch (see there); this stage only WAITS for the stragglers and
     // writes what came back. The clock below therefore measures the COLLECT —
@@ -2956,7 +3061,7 @@ export class PushWatcher {
     // loop starved the timers, which is precisely the case that must not end
     // with a row looking checked when no count ever arrived.
     for (const token of holderProbeUnsettled) {
-      this.holdersFailedAt.set(token, Date.now());
+      this.parkHolderRow(token, Date.now());
     }
     holdersHeld = holderProbeHeld;
     holdersCut = holderProbeDue - holderProbeWrites.length - holderProbeMisses;
@@ -2965,7 +3070,7 @@ export class PushWatcher {
       trips += 1;
       try {
         await this.db.setPushWatchHoldersMany(holderProbeWrites);
-        for (const w of holderProbeWrites) this.holdersFailedAt.delete(w.token);
+        for (const w of holderProbeWrites) this.clearHolderPark(w.token);
       } catch (err) {
         console.error(
           "[push-watch] holder batch write failed:",
@@ -2974,7 +3079,7 @@ export class PushWatcher {
         // A rejected batch wrote NOTHING: park every row it covered, the
         // same state a row whose own write failed used to reach.
         for (const w of holderProbeWrites) {
-          this.holdersFailedAt.set(w.token, Date.now());
+          this.parkHolderRow(w.token, Date.now());
         }
       }
     }

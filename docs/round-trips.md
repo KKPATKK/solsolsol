@@ -250,8 +250,8 @@ statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 …
 拿唔到 count 嘅 due row 照舊報 `cut`（唔 park）；miss 照舊 park `TRACKER_HOLDER_BACKOFF_MS`。
 
 **代價（老實講）**：一個 pass 只 refresh 一行，而命中率 ≈ endpoint 回應喺 cap 之內嘅比例
-（今日 ≈ 2/3），所以 30 分鐘 window 會拉長到 ~45 分鐘。要更密就改 slot 規則一行（或者等 endpoint
-返去 300–900ms 再調返）。
+（今日 ≈ 2/3）。而「一個 pass 一個 probe」仍然係 1,440 次/日 —— 相對 Birdeye 免費 quota 仲係天文數字，
+所以 §4.4 再加一個 CU gap，順手把 park 由 10 分鐘縮到 3 分鐘（ladder）。
 
 落線紀錄：`docs/patches/holder-probe-slots-measured.apply.js`（＋ `…fix1` 舊 wording、`…fix2`
 移除已無讀者嘅 local、`…tests.apply.js` 重釘三條 test）。測試：`test-unit.js` 由
@@ -282,7 +282,65 @@ statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 …
    invocation 嘅 subrequest 上限本身**未有解**（§5 尾）。
 
 
-### 4.4 未做
+### 4.4 Birdeye CU 預算：cap 可調、probe 要有 gap、park 3 分鐘加 ladder
+
+**Quota 事實**（Birdeye Data API free tier）：**30,000 CU/月**。本 bot 用到嘅 endpoint 單價
+（repo 內已記錄，同官方 docs 對得上）：`/defi/token_overview`（卡片持有人數 ＋ holder probe）
+**20 CU**、`/defi/ohlcv`（首分鐘量、最低市值）**35 CU**、`/defi/v2/tokens/new_listing`
+（定期 backfill，4 次/日）**30–80 CU**。
+
+30,000 ÷ 20 ＝ **1,500 次/月 ≈ 50 次/日**，而係全個 bot 加起來。holder stage 嘅歷史用量：
+
+| 形狀 | calls/日 | CU/日 | CU/月 |
+| --- | --- | --- | --- |
+| 舊（每 pass 4 個 probe，§4.1 之前） | 5,760 | 115,200 | 3.5M（quota 嘅 115 倍） |
+| §4.3 之後（每 pass 1 個 probe） | 1,440 | 28,800 | 864K（28 倍） |
+| **§4.4 之後（gap 60 分鐘）** | **24** | **480** | **14.4K（quota 嘅 48%）** |
+
+即係「一個 pass 一個 probe」唔夠 —— 1 分鐘 cron 本身就係 1,440 次/日。**一定要有一個 gap。**
+
+三個改動：
+
+1. **cap 由 config 落**（`PUSH_WATCH_HOLDER_CAP_MS`，default `2400`，clamp 500–5000）：呢個係
+   **hit-rate dial，唔係 latency dial** —— probe 收唔到 count 都照計 CU，所以 cap 低過 endpoint
+   自己嘅 median 就等於「付錢、然後掉咗個答案」。實測六次 `1_008 / 2_368 / 2_525 / 2_281 /
+   2_451 / 2_272ms` ⇒ cap 1500 會把 6 次裡面 5 次已付費嘅 call 掉棄（舊 `probe4 miss3` 就係咁），
+   cap 2400 就六次全中（`probe1 miss0`）。
+2. **probe 之間最少一個 gap**（`PUSH_WATCH_HOLDER_MIN_GAP_MIN`，default `60` 分鐘，`0` = 關）：
+   上面張表嘅關鍵。stamp 係 durable（`worker_state.holder_probe_at`）⇒ 跨 isolate 有效；
+   讀一次最多一個 gap（gap 未夠就用內存記住、唔再讀），寫一次一個 probe ⇒ 最多 2 個 round trip/小時。
+   被 gap 擋嘅 pass，note 尾多一個 `cu-gate`，due row 照舊報 `cut`（唔 park —— 佢哋冇出錯，
+   只係今分鐘冇 budget）。
+3. **park 10 分鐘 → 3 分鐘，並每次連續 miss 加倍**（3/6/12/24，上限 30 分鐘）：
+   「faster coverage」嘅另一半。probe 速率被 CU 綁死之後，一個 miss 嘅 row 唔應該再坐 10 個
+   scarce turn；但一個「永遠最舊 `holders_checked_at`」嘅慢 row 亦唔可以食光所有 probe
+   （2026-09-21 嘅 starvation 形狀），所以 ladder 令佢 3/6/12/24 分鐘後才排到。
+
+**唔變嘅保證**：`holders_checked_at` 只喺成功時寫；collect 仍然喺 row loop 之後、一次 batch；
+miss 照舊 park（唔會靜靜地當檢查過）；gap 只會令 probe 變少，唔會令卡少一張（holder 係卡 detail）。
+
+**Tuning 表**（要快就調 `PUSH_WATCH_HOLDER_MIN_GAP_MIN`，唔使 redeploy）：
+
+| gap | calls/日 | CU/日 | CU/月 | 30 行全輪一次 |
+| --- | --- | --- | --- | --- |
+| **60 分鐘（default）** | 24 | 480 | 14.4K | ~1.25 日 |
+| 30 | 48 | 960 | 28.8K | ~15 小時 |
+| 20 | 72 | 1,440 | 43.2K | ~10 小時 |
+| 10 | 144 | 2,880 | 86K | ~5 小時 |
+
+CU 一爆 quota，Birdeye 會開始回 429／要求付款，probe 同卡片路徑一齊受影響，所以 default 保守；
+要更快就明確改呢個 env（同時要知 CU 月費付出）。
+
+落線紀錄：`docs/patches/holder-probe-cu-budget.apply.js`（＋ `…fix1` 把 stamp 移出 holder stage
+嘅 trip 窗、`…tests.apply.js` 加一條 CU-gate test ＋ 關掉 park test 嘅 gap）。測試：
+`test-unit.js` 由 278 → **279 passed, 0 failed**（新 test：第一個 pass 出 1 個 probe，
+第二個 pass 出 `held0 cut2 probe0 miss0 cu-gate`）。
+
+#### 4.4.1 上線後讀數
+
+見 §5（deploy 後補上）。
+
+### 4.5 未做
 
 * pair 階段嘅重複讀。今日嘅讀數（§4.2.1 第 4 點）話正常 pass 係 `pairs 179/0`——由 `lastPairs`
   服務，即喺同一個 tick 内並冇重複嘅 HTTP。但仍然有一條唔清楚嘅：10:29:19 嗰個

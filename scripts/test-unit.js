@@ -6214,7 +6214,9 @@ async function main() {
           return { holderCount: 123 };
         },
       },
-      loadConfig({}),
+      // The CU gap OFF: this test is about the PARK (three passes, and the
+      // third must probe). The gap itself is pinned by its own test below.
+      loadConfig({ PUSH_WATCH_HOLDER_MIN_GAP_MIN: "0" }),
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
@@ -6346,6 +6348,47 @@ async function main() {
     );
     assert.ok(elapsed < 3_400, `and returns as soon as it settles: ${elapsed}ms`);
     assert.match(String(hangOut.note), /probe1 miss1/, `one turn, one miss: ${hangOut.note}`);
+  });
+
+  await test("PushWatcher: the holder probe keeps a CU gap, so a pass cannot spend the Birdeye budget", async () => {
+    // A probe is BILLED whether or not its count lands: /defi/token_overview is
+    // 20 CU and the free tier is 30K CU a MONTH — about 50 calls a DAY for the
+    // whole bot — while the 1-minute cron probing once a pass would be 1_440
+    // calls/day (and 4 probes a pass, the shape before 2026-09-23, 5_760/day).
+    // So the stage keeps PUSH_WATCH_HOLDER_MIN_GAP_MIN between probes, stamped
+    // durably in worker_state so the cap survives isolate rotation, and a pass
+    // inside the gap reports its due rows as `cut` and says `cu-gate`: nothing
+    // about those rows failed, so none of them is parked.
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const updated = [];
+    const holderWrites = [];
+    let probes = 0;
+    const db = {
+      ...watchDb(rows, updated),
+      setPushWatchHoldersMany: async (updates) => {
+        for (const u of updates) holderWrites.push([u.token, u.holders]);
+      },
+    };
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      { getTokenOverview: async () => { probes += 1; return { holderCount: 321 }; } },
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const first = await pw.runTick();
+    assert.equal(probes, 1, "the first pass spends its one probe");
+    assert.equal(holderWrites.length, 1, "and its count lands");
+    assert.doesNotMatch(String(first.note), /cu-gate/, `nothing was gated: ${first.note}`);
+    const second = await pw.runTick();
+    assert.equal(probes, 1, "a pass inside the gap starts no probe at all");
+    assert.match(String(second.note), /cu-gate/, `and says why: ${second.note}`);
+    assert.match(
+      String(second.note),
+      /held0 cut2 probe0 miss0/,
+      `the rows that are still due stay due, never parked: ${second.note}`,
+    );
   });
 
   await test("PushWatcher: a pass with no room for the probes reports its due rows as cut", async () => {
