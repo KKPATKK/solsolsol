@@ -482,7 +482,7 @@ call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable
 6. **冇新增 push-watch issue**：`/debug/push-watch.issueCount` = 2，兩條都係舊嘅
    `lost_completion_write`（01:41Z APECAT、04:17Z REALLY），同今次 deploy 無關。
 
-### 4.6 invocation 預算：先量度，才切（2026-09-23，已修，未 deploy）
+### 4.6 invocation 預算：先量度，才切（2026-09-23，已修，已 deploy `43c6f2c` @ 15:30Z＋`cc333db` @ 16:09Z）
 
 §5 尾嘅結論係「下一步只可以繼續減 invocation 內嘅 subrequest」，但 repo 從來**冇一個數**可以答
 「邊個 phase 燒咗個預算」：pass note 嘅 `trips` 只算 pass 自己嘅 DB round trip，`dbSteps` 只包三個
@@ -510,6 +510,14 @@ function —— 一計就係 Cloudflare 真係限制嗰個量）。
   `…-tests.apply.js`（test-unit.js）＋ `…-tests.fix1.apply.js`（修正 roll test 嘅算術 —— 原本
   assert 一個「已經計過 1 個 call」嘅 window 唔會入 recent，係測試寫錯，唔係 counter 錯）。
 
+* **第二條軸：host split**（`cc333db`，即日加）。上線後第一個讀數就揭到 phase ring 喺**常見情況係盲
+  嘅**：佢只喺有 candidate 入鏈時 stamp（`deferred`／`seen`／…），而大部分 tick `candidates: 0`
+  —— 實測一個 `total 56` 嘅 window `phases` 完全空。所以每個 window 同時記「每個 call 去邊個 host」
+  （`hosts`：count desc、tie 用 host name 排（求穩定）、最多 7 行 ＋ 一行 folded `(other)`，而
+  **rows 一定加返 = `total`**，讀者可以自己核）。呢條軸唔需要 scanner 行到任何 phase，同 phase ring
+  一樣跟 window 捲入 `recent` —— 即係被殺嘅 tick 都讀得到「邊個 consumer 燒咗」。落線：
+  `docs/patches/subreq-host-split-tests.apply.js` ＋ `…fix1.apply.js`（tie-break 順序修一次：
+  `(` 排喺字母前面）；測試 292 → **294 passed, 0 failed**。
 #### 4.6.1 由 code 得出嘅清單（切嘅候選，等數字定次序）
 
 | # | 消費者 | 次數／tick | 註 |
@@ -534,6 +542,41 @@ function —— 一計就係 Cloudflare 真係限制嗰個量）。
 
 **下一刀（跟數字）**：清單 5 係已確認可以「batch 埋」嘅（三個 5 分鐘 sync 嘅 read 合成一個 grouped
 read ＋ 一個 batch write）；清單 1 係最大但風險最高，等 §4.6.1 第 2 點嘅數字確認係唔係佢才動手。
+
+#### 4.6.2 上線後讀數（`43c6f2c` run 35881957854 success 15:30:52Z；`cc333db` run 35886716005
+success ~16:09Z；抽樣 15:31–16:14Z）
+
+**儀器活著**：`/health.heartbeat.subreqs = { budget: 50, current, recent, windows }`；window 每 ~60s
+開一個（實測相鄰兩個 window 相差 **59.878s／60.004s** ⇒ 一個 window 真係一次掃描嘗試）。
+
+**讀數係 tick 自己寫落 Turso 嘅**：claim heartbeat（`phase:"scanning"`）同 completion flush
+（`phase:"done"`，同 history row 同一個 batch）都帶 `subreqView()`，而 `/health` serve 嘅係 persist
+咗嘅 copy。實測 15 秒內打 3 次 `/health` ＋ 2 次 `/debug/*`，`windows`／`current.at`／`total` 完全
+一樣 ⇒ **poll 唔會污染個數**（早前見到嘅「window 凍結」係因為嗰個 tick 已經完，唔係 counter 死）。
+被殺嘅 tick 自己永遠 publish 唔到，只可以喺**下一個** tick 嘅 `recent[0]` 讀。
+
+| window total | host split（`hosts`） | 讀法 |
+| --- | --- | --- |
+| 16 | turso 16 | **冇任何 upstream call** ⇒ 未入 feed 就結束嘅 tick（DB-only：init／gate／claim／lock） |
+| 30 | **turso 25** ＋ jup 2 ＋ gecko 1 ＋ dexscreener 1 ＋ gmgn 1 | DB 佔 83% |
+| 32 | **turso 20** ＋ dexscreener 6 ＋ gecko 2 ＋ jup 2 ＋ pump.fun 1 ＋ gmgn 1 | DB 佔 63%，upstream 12 |
+| 18／19 | —（有 `seen@17`） | 正常完成、有 candidate 入鏈 |
+| rolled 34／44／**56** | — | **56 係超 50 嗰個**（burst 一次 dispatch 幾個 ⇒ 過衝），而且 `phases` 空 |
+
+**phase ring 喺常見情況係盲嘅**（上線後首要發現）：ring 只喺有 candidate 入鏈時 stamp，而最近嘅
+history row 讀 `candidates: 0` —— `total 56` 嗰個 window 就係一例（見上面 4.6 尾段：所以先加 host
+split）。每個 window 樣本嘅 `hosts` 都加得返 = `total`；**DB round trip 佔每個 window 63–83%**，
+feeds 佔其餘（樣本 tick 嘅 upstream 12：dexscreener 6、gecko 2、jup 2、pump.fun 1、gmgn 1；而 pass
+note 嘅 `trips` 只係 9，即係 DB 裡只有約一半係 pass 自己嘅）。
+
+⇒ **下一刀唔係砍 feed，係砍 tick 內嘅 Turso round trip**：pre-tick front（init／gate／claim）＋
+pool／aged-eval reads ＋ flush ＋ deferral read ＋ 三個 5 分鐘 sync ＋ drain（§4.6.1 清單 4／5 合共
+~11–16 個）。清單 5（三個 sync 合成一個 grouped read ＋ 一個 batch write）係已確認可以 batch 嘅
+第一刀。
+
+同 §4.6.1「落線點驗」對照：第 1 點（安靜 tick ~20–30）**中**（18／19／30／32）；第 3 點（死 tick 出
+現喺 `recent[0]`）**中**（56 嗰個）；第 4 點（`windows` 遞增）**中**，但多咗一個決定性細節 ——
+讀數係 persist 嘅，唔係服務嗰個 isolate 嘅 live state，所以兩個 poll 完全一樣係正常，唔係卡住。
 
 ## 5. 驗證狀態（本地 + 上線）
 
