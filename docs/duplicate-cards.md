@@ -149,7 +149,7 @@ Negative control 已實測：反轉 `cut-card-dedupe-all-attempts` ＋ `cut-card
 3. 單元測試：`evaluateWatch: an attempt from the row's last check is not re-sent while its proof is missing`、
    `deliveredFollowupProofs: the newest delivery per (token, sig)…`、`cut marks: …`。
 
-## 八、線上驗收（2026-09-22 18:12–18:26Z，deploy 之後）
+## 八、線上驗收（deploy 之後）
 
 Deploy 證據：`5aa4624`（Wait one check for a cut card's proof）嘅
 「Deploy Worker to Cloudflare」執行成功（17:29:42Z，1m10s）——部署通道係
@@ -204,6 +204,20 @@ terminal row 唔會再推導同一張卡 ⇒ dedupe 冇機會被評估，mark �
   （revive 寫 `""`、stage 寫 `marks`），`dead` 分支回 `announcedUpStages: undefined`（保持原狀），
   所以 §3「一個 attempt 一個 mark」對 terminal row 唔成立：mark 一直留到該 row 再 fire 同一個 sig。
   代價係每次 pass 多一次 audit ring 讀（head 有 mark 就讀），同一個「同 sig 再 fire」有機會被舊 proof 擋。
+
+### 8.4 補完部署後嘅線上讀數（2026-09-23 00:07–00:12Z，`9682d9c`）
+
+Deploy：「Deploy Worker to Cloudflare」成功（run 35800552243，00:06:28Z 開始，1m8s）。
+
+| 驗收項 | 讀數（`/health`、`/debug/push-watch?limit=200`、`/debug/push-audit`） | 結論 |
+|---|---|---|
+| `p:` mark 保留 | 58 行之中 **11 行**帶 `p:<sig>:<bucket>`，每行保留自己嘅時間戳，同 stage mark 並存（例：`p:w45:29835333,up100,up50,w35`） | ✅ 冇被新 stamp 覆蓋 |
+| pass note 唔再停滯 | note `at`：00:07:18Z → 00:09:17Z → 00:10:18Z → 00:11:18Z（`trackerMs` 4.0–4.2s），每個 pass 之後都前進（09-22 同一個位置曾經凍結 19 分鐘） | ✅ 前進；惟 00:08 嗰分鐘冇新 note，未排除係該 tick 本身冇行 tracker pass（唔係「寫入被取消」嘅已知形狀，但單靠呢次讀數分不到） |
+| audit entry 帶 `sig` | `/debug/push-audit` 30 筆**全部早過** deploy（最新 00:06:17Z，26 筆 followup）⇒ 0 筆帶 `sig` 係預期。deploy 之後嘅 pass 一律 `alerted 0`，未有新 followup 卡 | ⏳ 等下一張 followup 卡（呢條路由 §7.4 嘅 unit test 鈞住：`delivered[0].sig === "up100"`） |
+| `dup-skip` | note 冇 `dup-skip`；`ok:10/0`（10 行檢查、**0 卡**）。58 行之中 51 行 terminal，7 行 active 但**冇一行帶 attempt mark** | ⏳ 請不到：dup-skip 要「同一 transition 重新推導」，terminal row 唔再推導、active row 沒 mark ⇒ 現時結構上冇機會出現 |
+| 一個 pass 多張卡嘅 mark | 暫未量到（冇 row 帶 2＋ 個 mark）：要等一條 row 一個 pass 帶 🚀＋⚠️ 而中途被切／拒 | ⏳ unit test 已針住，negative control 反轉 patch 會 fail（§7.4） |
+
+睇 `dup-skip` 嘅正確方法（唔係只睇 note）：某行 fire 同一張卡之後，row 仍然帶 `p:<sig>` 而 `followupsSent` 冇升。
 
 ## 九、留底
 
