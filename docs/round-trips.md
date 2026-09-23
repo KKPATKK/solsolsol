@@ -157,12 +157,45 @@ deadline 才開始」—— 但 row loop 每次都先花光 allowance。讀數�
    04:17Z 嘅 `REALLY`（`lost_completion_write`，checked == alertAt）——時間戳比今次
    deploy（08:05Z）早四個鐘，同 holder 改動無關，但既然看到就照記。
 
-### 4.2 未做
+### 4.2 row loop 嘅 per-row CAS — 已修（2026-09-23，未 deploy）
+
+原本每個 silent row 一個 round trip（`claimPushWatchCheck`：CAS 同 check fields 同一個
+statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 … spend[rows 1388/5] trips 9`，
+每行 ~150–400ms），同時 ~90% 嘅 row 其實係 silent（冇嘢要 announce）。
+
+修法：silent row **入 queue**（`silentChecks`），loop 完之後**一次 batch**
+（`Db.claimPushWatchChecksMany`）——每個 statement 同以前逐行嘅一模一樣：
+`SET <check fields>, last_checked = ? WHERE token = ? AND last_checked = ?`。
+
+* **不動嘅語意**：cross-isolate 排他（輸嘅 row 照舊 count `lost` 兼 skip）、
+  每行原子性（claim ＋ fields 同一 statement）、pair-miss 嘅 row 完全冇 claim、
+  而 **alerting path 一個字都沒改**（claim → reserve → send → final write —— 卡片嘅
+  reservation 一定要在 send 之前落地）。
+* **寫入時序**：silent 嘅 fields 原本逐行即時寫，現在 loop 完一次寫。冇任何 row 會讀
+  自己嘅 stored fields（`evalResult` 來自 snapshot）⇒ 次序不影響結果；唯一分別是
+  「寫之前 pass 死掉」嘅損失由 0 變最多一個 head（下一 pass 重算重寫，high-water mark
+  係單向抬升）。
+* **batch 被拒**：整批唔寫，每行保持未 claim、保住 rotation 位置 —— 同以前
+  「逐行寫失敗」到達嘅狀態一樣；queue 空就零成本。
+* **買到嘅嘢**：一個 pass 嘅 silent 部分由 N trips 變 **1 trip**，所以同一個 allowance
+  覆蓋得到整個 head（10 行）而唔係 5 行；loop 嘅 reserve 機制（`tripMs` /
+  `rowReserveMs`）現在只為 alerting row 服務（send 真嘅唔可以切一半）。
+* 測試：兩條 pin 舊 per-row pricing 嘅 test 改成新形狀
+  （`a silent row claims and writes in ONE round trip…` → `the whole head's silent claims and
+  writes cost ONE trip`；`a degraded round trip stops the loop before it starts another row`
+  → `a degraded store is paid ONCE for the whole silent queue`），另外 8 個 watcher test
+  double 加咗 `claimPushWatchChecksMany`（逐行 mirror 舊行為，所以 `updated` 嘅 assertion
+  全部仍然有效）；holder 餓那個 test 嘅「花光 allowance」道具也改成一個 1.6s 嘅 batch。
+* 落線紀錄：`docs/patches/row-loop-batched-silent-claims.apply.js`
+  （＋ `…fix1.apply.js` 綁 `now` 嘅編譯修正）。
+
+#### 4.2.1 上線後讀數
+
+見 §5（deploy 後補上）。
+
+### 4.3 未做
 
 * pair 階段嘅重複讀。
-* row loop 每行嘅 `claimPushWatchCheck` / `reservePushWatchAlert` / `updatePushWatchCheck`
-  —— 每個 silent row 一次，暫時當係必要嘅 per-row CAS（要改就要預先 batch 拎 claim，
-  再入 loop 消費，屬下一步）。
 * `bumpScheduledTick` 本体仍然留喺 `Db`（legacy fallback 用），冇再喺正常 tick 出現。
 
 ## 5. 驗證狀態（本地 + 上線）

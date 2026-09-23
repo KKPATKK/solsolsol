@@ -631,6 +631,48 @@ export class Db {
   }
 
   /**
+   * The row loop's SILENT half in ONE round trip: claim AND record N rows at
+   * once (see PushWatcher.runTick).
+   *
+   * Every statement is exactly the compare-and-swap `claimPushWatchCheck` sends
+   * today — `SET <check fields>, last_checked = ?` guarded by
+   * `last_checked = ?` — so the cross-isolate exclusion, the per-row atomicity
+   * and the field set are unchanged. What changes is the COUNT: a pass pays one
+   * subrequest for the whole head instead of one round trip per observed row.
+   * That was the row loop's cost (live 2026-09-23: `rows 5/30 spend[…] trips 9`,
+   * a ~150-400ms store trip per row) while ~90% of the rows a pass touches have
+   * nothing to announce — which is why a pass covered a handful of rows a minute
+   * instead of its whole head.
+   *
+   * Result order follows statement order — the same contract the recap claims
+   * rely on — so the caller's `won[i]` belongs to `updates[i]`: false means
+   * another isolate claimed that row first, precisely what the per-row call
+   * reported.
+   */
+  async claimPushWatchChecksMany(
+    updates: Array<{
+      token: string;
+      expectedLastChecked: number;
+      now: number;
+      v: PushWatchCheckValues;
+    }>,
+  ): Promise<boolean[]> {
+    if (updates.length === 0) return [];
+    const res = await this.get().batch(
+      updates.map((u) => {
+        const set = this.pushWatchCheckSet(u.v, u.now);
+        return {
+          sql: `UPDATE push_watch SET ${set.sql}
+            WHERE token = ? AND last_checked = ?`,
+          args: [...set.args, u.token, u.expectedLastChecked],
+        };
+      }),
+      "write",
+    );
+    return res.map((r) => Number(r.rowsAffected ?? 0) > 0);
+  }
+
+  /**
    * One-round-trip variant of getReevalPool (2026-09-19).
    *
    * Why a second method and not a reshape of getReevalPool: the original plus

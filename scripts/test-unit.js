@@ -781,6 +781,10 @@ async function main() {
       getPushAudit: async () => opts.audit ?? [],
       upsertPushWatchMany: async () => {},
       claimPushWatch: async () => true,
+      claimPushWatchChecksMany: async (rows) => {
+        for (const r of rows) updated.push([r.token, r.v]);
+        return rows.map(() => true);
+      },
       claimPushWatchCheck: async (token, _expected, _now, v) => { updated.push([token, v]); return true; },
       reservePushWatchAlert: async () => true,
       updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
@@ -3152,6 +3156,7 @@ async function main() {
         upsertPushWatchMany: async (rows) => { enrolled.push(...rows); },
         recordPushDelivery: async (entry) => { audits.push(entry); },
         claimPushWatch: async () => true,
+        claimPushWatchChecksMany: async (rows) => rows.map(() => true),
         claimPushWatchCheck: async () => true,
         reservePushWatchAlert: async () => true,
         updatePushWatchCheck: async () => {},
@@ -3476,6 +3481,7 @@ async function main() {
       getWorkerState: async () => ledgerValue,
       upsertPushWatchMany: async (rows) => { enrolled.push(...rows); },
       claimPushWatch: async () => true,
+      claimPushWatchChecksMany: async (rows) => rows.map(() => true),
       claimPushWatchCheck: async () => true,
       reservePushWatchAlert: async () => true,
       updatePushWatchCheck: async () => {},
@@ -5472,9 +5478,14 @@ async function main() {
     getInitialPushAuditTokens: async () => new Set(),
     upsertPushWatchMany: async () => {},
     claimPushWatch: async () => true,
-    // The silent row path claims AND writes in one round trip (see
-    // Db.claimPushWatchCheck); the fake records it exactly like the two-step
-    // write, so `updated` still names every row the pass observed.
+    // The silent row path claims AND writes in ONE batched round trip for the
+    // whole head (see Db.claimPushWatchChecksMany); the fake records every row
+    // exactly like the per-row writer did, so `updated` still names every row
+    // the pass observed.
+    claimPushWatchChecksMany: async (rows) => {
+      for (const r of rows) updated.push([r.token, r.v]);
+      return rows.map(() => true);
+    },
     claimPushWatchCheck: async (token, _expected, _now, v) => { updated.push([token, v]); return true; },
     reservePushWatchAlert: async () => true,
     updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
@@ -5985,6 +5996,11 @@ async function main() {
         return { missing: [], ledgerRaw: null };
       },
       claimPushWatch: async () => { calls.total += 1; return true; },
+      claimPushWatchChecksMany: async (rows) => {
+        calls.total += 1;
+        for (const r of rows) calls.updated.push([r.token, r.v]);
+        return rows.map(() => true);
+      },
       claimPushWatchCheck: async (token, _expected, _now, v) => {
         calls.total += 1;
         calls.updated.push([token, v]);
@@ -6040,6 +6056,7 @@ async function main() {
       claimRecapsAndPrune: async (tokens) => ({ won: tokens.map(() => true), pruned: 1 }),
       findUntrackedPushesAndLedger: async () => ({ missing: [], ledgerRaw: null }),
       claimPushWatch: async () => true,
+      claimPushWatchChecksMany: async (rows) => rows.map(() => true),
       claimPushWatchCheck: async () => true,
       reservePushWatchAlert: async () => true,
       updatePushWatchCheck: async () => {},
@@ -6084,6 +6101,10 @@ async function main() {
         return { missing: [], ledgerRaw: null };
       },
       claimPushWatch: async () => { calls.total += 1; return true; },
+      claimPushWatchChecksMany: async (rows) => {
+        calls.total += 1;
+        return rows.map(() => true);
+      },
       claimPushWatchCheck: async () => { calls.total += 1; return true; },
       reservePushWatchAlert: async () => { calls.total += 1; return true; },
       updatePushWatchCheck: async () => { calls.total += 1; },
@@ -6216,12 +6237,12 @@ async function main() {
     let probes = 0;
     const db = {
       ...watchDb(rows, updated),
-      // The row loop is the pass's clock (Turso round trips): 400ms per row
-      // against a 2s allowance leaves the tail nothing at all.
-      claimPushWatchCheck: async (token, _expected, _now, v) => {
-        await new Promise((r) => setTimeout(r, 400));
-        updated.push([token, v]);
-        return true;
+      // The row loop is the pass's clock (Turso round trips): one batched trip
+      // that costs the whole 2s allowance leaves the tail nothing at all.
+      claimPushWatchChecksMany: async (rows) => {
+        await new Promise((r) => setTimeout(r, 400 * rows.length));
+        for (const r of rows) updated.push([r.token, r.v]);
+        return rows.map(() => true);
       },
       setPushWatchHoldersMany: async (updates) => {
         for (const u of updates) holderWrites.push([u.token, u.holders]);
@@ -6274,24 +6295,27 @@ async function main() {
     assert.match(String(third.note), /holders \d+\/1/, `the stage reports the write: ${third.note}`);
   });
 
-  await test("PushWatcher: a silent row claims and writes in ONE round trip, and only when it fits", async () => {
-    // The loop spent TWO store round trips on every row it merely observed — a
-    // separate claim, then the check write — and reserved a flat 900ms before
-    // starting one, five times a silent row's true cost. Both are what capped
-    // the pass at a single row per tick (live `rows 1/29 ... budget-cut` on
-    // tick after tick) while ~90% of the rows a pass touches have nothing to
-    // announce.
-    const rows = [watchRow("AAA"), watchRow("BBB")];
+  await test("PushWatcher: the whole head's silent claims and writes cost ONE trip", async () => {
+    // The loop spent ONE store round trip on every row it merely observed
+    // (~150-400ms live each), which capped the pass at a handful of rows a
+    // minute (live `rows 5/30 … spend[rows 1388/5] trips 9`) while ~90% of the
+    // rows a pass touches have nothing to announce. The silent half is now
+    // queued and written as ONE batched request, so the same allowance covers
+    // the whole head.
+    const rows = [watchRow("AAA"), watchRow("BBB"), watchRow("CCC"), watchRow("DDD")];
     const claims = [];
-    const writes = [];
+    const batches = [];
     const updated = [];
     const db = {
       ...watchDb(rows, updated),
       claimPushWatch: async (token) => { claims.push(token); return true; },
-      claimPushWatchCheck: async (token) => {
-        writes.push(token);
-        await new Promise((r) => setTimeout(r, 500));
-        return true;
+      claimPushWatchCheck: async () => {
+        throw new Error("the per-row silent writer must not be used any more");
+      },
+      claimPushWatchChecksMany: async (rows2) => {
+        batches.push(rows2.map((u) => u.token));
+        for (const u of rows2) updated.push([u.token, u.v]);
+        return rows2.map(() => true);
       },
     };
     const pw = new PushWatcher(
@@ -6299,36 +6323,29 @@ async function main() {
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
-    // 1200ms budget, ~500ms per write: BOTH silent rows fit. The old shape
-    // reserved a flat 900ms per row and stopped after the first (700ms left <
-    // 900ms) — that cap, on ~90% silent rows, is what held the pass to one row
-    // per tick and the 29-row rotation to tens of minutes.
-    const out = await pw.runTick(Date.now() + 1_200);
-    assert.equal(out.checked, 2, "both silent rows fit: one write each");
-    assert.deepEqual(claims, [], "a silent row does not spend a separate claim");
-    assert.deepEqual(writes, ["AAA", "BBB"], "one write per row");
-    assert.equal(updated.length, 0, "the two-step writer is not used for a silent row");
-    assert.ok(!/budget-cut/.test(String(out.note)), `nothing may be cut: ${out.note}`);
+    const out = await pw.runTick(Date.now() + 2_000);
+    assert.equal(out.checked, 4, "every silent row in the head is recorded");
+    assert.deepEqual(batches, [["AAA", "BBB", "CCC", "DDD"]], "ONE batch for all four");
+    assert.deepEqual(claims, [], "a silent row still spends no separate claim");
+    assert.match(String(out.note), /rows \d+\/1/, `the loop's whole cost is one trip: ${out.note}`);
   });
 
-  await test("PushWatcher: a degraded round trip stops the loop before it starts another row", async () => {
-    // The loop's reserve is priced in the cost THIS pass is paying per round
-    // trip (see TRACKER_ROW_LEASH_MS), not in healthy-Turso units: at ~900ms a
-    // trip the old flat 300ms check was happy to start the second row, whose
-    // first claim can then outlive the tick. Live 2026-09-23 03:10Z: a pass
-    // started, checked ONE row, and sat at `running` for 55s while the other
-    // 29 rows went unchecked and the tick's own tail never ran
-    // (docs/duplicate-cards.md 14.1/14.6). A deferred row is not lost — it is
-    // re-read and re-claimed next tick — so stopping early is the cheap side.
+  await test("PushWatcher: a degraded store is paid ONCE for the whole silent queue", async () => {
+    // The per-row pricing this test used to pin (a flat reserve before starting
+    // another row) belongs to the ALERTING path now, where a send really cannot
+    // be cut in half. A silent row costs no trip of its own, so a degraded store
+    // is paid once for the whole queue: the pass's coverage stops being a
+    // function of how slow Turso is (the shape that held it to one row a tick,
+    // live `rows 1/29 … budget-cut`, while 29 rows went unrefreshed).
     const rows = [watchRow("AAA"), watchRow("BBB")];
-    const writes = [];
+    const batches = [];
     const db = {
       ...watchDb(rows, []),
       claimPushWatch: async () => true,
-      claimPushWatchCheck: async (token) => {
-        writes.push(token);
+      claimPushWatchChecksMany: async (rows2) => {
+        batches.push(rows2.map((u) => u.token));
         await new Promise((r) => setTimeout(r, 900)); // one degraded trip
-        return true;
+        return rows2.map(() => true);
       },
     };
     const pw = new PushWatcher(
@@ -6336,12 +6353,11 @@ async function main() {
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
-    // 1500ms for a 900ms trip: the first row fits, and the second must NOT be
-    // started — its own trip alone would land past the deadline.
+    // 1500ms allowance, one 900ms degraded trip: both rows land inside it.
     const out = await pw.runTick(Date.now() + 1_500);
-    assert.equal(out.checked, 1, `the second row is deferred, not started (checked ${out.checked})`);
-    assert.deepEqual(writes, ["AAA"], "only the row that fits is written");
-    assert.match(String(out.note), /budget-cut/, `the pass says why: ${out.note}`);
+    assert.equal(batches.length, 1, "one degraded trip, not one per row");
+    assert.deepEqual(batches[0], ["AAA", "BBB"]);
+    assert.equal(out.checked, 2, `both rows are recorded (checked ${out.checked})`);
     assert.equal(out.alerted, 0);
   });
 

@@ -2356,6 +2356,23 @@ export class PushWatcher {
         }
       }
     }
+    /**
+     * Silent rows, QUEUED instead of written one at a time.
+     *
+     * The loop used to send one `claimPushWatchCheck` per observed row — the CAS
+     * that proves this isolate owns the row plus that row's check fields, in one
+     * statement. That statement is not the problem; paying it N times is, because
+     * the pass's allowance is measured in round trips (live 2026-09-23:
+     * `rows 5/30 … spend[rows 1388/5] trips 9`). So the rows are collected here
+     * and the whole queue is sent as ONE batched request after the loop (see
+     * Db.claimPushWatchChecksMany), where each statement is still the same CAS.
+     */
+    const silentChecks: Array<{
+      token: string;
+      expectedLastChecked: number;
+      backfill: boolean;
+      v: Parameters<Db["claimPushWatchChecksMany"]>[0][number]["v"];
+    }> = [];
     let firstRow = true;
     const rowsStart = Date.now();
     const rowsTrips = trips;
@@ -2513,27 +2530,19 @@ export class PushWatcher {
       });
 
       // SILENT ROW — nothing to announce (or a backfill, whose cards are
-      // deliberately suppressed): the claim and the check write are ONE round
-      // trip. The claim's compare-and-swap on last_checked is the same
-      // cross-isolate exclusion in one statement, and a lost race still skips
-      // the row entirely. This is the pass's throughput: ~90% of the rows a
-      // pass touches have nothing to say, and they used to cost two store
-      // round trips each out of an allowance that fits only a handful.
+      // deliberately suppressed). The row is QUEUED, not written: the whole queue
+      // goes out as ONE batched request after the loop (see silentChecks and
+      // Db.claimPushWatchChecksMany). This is the pass's throughput — ~90% of the
+      // rows a pass touches have nothing to say — and it used to cost one round
+      // trip each out of an allowance that fits only a handful, which is why the
+      // rotation covered five rows a minute.
       if (backfill || evalResult.alerts.length === 0) {
-        trips += 1;
-        if (
-          !(await this.db.claimPushWatchCheck(
-            row.token,
-            row.lastChecked,
-            now,
-            checkFields(false),
-          ))
-        ) {
-          claimLost += 1;
-          continue;
-        }
-        checked += 1;
-        if (backfill) backfilled += 1;
+        silentChecks.push({
+          token: row.token,
+          expectedLastChecked: row.lastChecked,
+          backfill,
+          v: checkFields(false),
+        });
         continue;
       }
 
@@ -2818,6 +2827,40 @@ export class PushWatcher {
         row.token,
         checkFields(holdAnnouncements, attempts),
       );
+    }
+    // The silent half of the loop, in ONE round trip (see silentChecks). Each
+    // statement is the CAS the per-row path sent, and the queue is written even
+    // when the loop cut short: those rows were already evaluated, and one trip is
+    // cheaper than the single write the first of them would have cost on its own.
+    // A rejected batch writes nothing — every queued row stays unclaimed with its
+    // place at the front of the rotation, the same state the per-row path reached
+    // when its own write failed — and an empty queue costs nothing at all.
+    if (silentChecks.length > 0) {
+      trips += 1;
+      let won: boolean[] = silentChecks.map(() => false);
+      try {
+        won = await this.db.claimPushWatchChecksMany(
+          silentChecks.map((s) => ({
+            token: s.token,
+            expectedLastChecked: s.expectedLastChecked,
+            now,
+            v: s.v,
+          })),
+        );
+      } catch (err) {
+        console.error(
+          "[push-watch] silent-row batch failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+      silentChecks.forEach((s, i) => {
+        if (!won[i]) {
+          claimLost += 1;
+          return;
+        }
+        checked += 1;
+        if (s.backfill) backfilled += 1;
+      });
     }
     spent.rows.ms = Date.now() - rowsStart;
     spent.rows.trips = trips - rowsTrips;
