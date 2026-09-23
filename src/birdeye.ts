@@ -25,6 +25,79 @@ class Throttle {
   }
 }
 
+/**
+ * Birdeye Data API CU price per endpoint. The free tier is 30_000 CU/MONTH for
+ * the WHOLE bot, and a request is billed whether or not its payload is usable
+ * — which is why the holder probe's cap is a hit-rate dial, not a latency knob
+ * (docs/round-trips.md §4.4). Prices recorded in this repo against the
+ * published docs: token_overview 20 CU, ohlcv 35 CU, new_listing 30–80 CU
+ * (charge the middle). top_traders has NO recorded price, so it is charged 0 —
+ * an unpriced endpoint must not invent a number that then drives a budget
+ * decision.
+ */
+export const BIRDEYE_CU_PRICES = {
+  tokenOverview: 20,
+  ohlcv: 35,
+  newListing: 40,
+  topTraders: 0,
+} as const;
+
+export type BirdeyeEndpoint = keyof typeof BIRDEYE_CU_PRICES;
+
+/** UTC day key (`YYYY-MM-DD`) — Birdeye's quota resets on a calendar day. */
+export function birdeyeUtcDay(at = Date.now()): string {
+  return new Date(at).toISOString().slice(0, 10);
+}
+
+/**
+ * CU spent since the last persist, per UTC day (module scope = isolate scope,
+ * the same channel gmgn.ts uses for its feed stats). The worker drains this
+ * into the durable worker_state ledger (see worker.syncBirdeyeCu), so the count
+ * survives isolate recycling; the drain rides the post-scan telemetry rather
+ * than a live per-tick write, because a per-tick round trip is exactly what the
+ * 50-subrequest invocation budget cannot pay for (docs/round-trips.md §1).
+ */
+const cuPending = new Map<string, number>();
+
+/**
+ * Charge one request ATTEMPT (`BIRDEYE_CU_PRICES`) — drain-free and never
+ * throwing, so it can sit in the client's hot path.
+ */
+export function chargeBirdeyeCu(
+  endpoint: BirdeyeEndpoint,
+  at = Date.now(),
+): void {
+  const cu = BIRDEYE_CU_PRICES[endpoint];
+  if (cu <= 0) return;
+  const day = birdeyeUtcDay(at);
+  cuPending.set(day, (cuPending.get(day) ?? 0) + cu);
+}
+
+/** A copy of this isolate's unpersisted CU deltas (day → CU). */
+export function peekBirdeyeCuDelta(): Map<string, number> {
+  return new Map(cuPending);
+}
+
+/**
+ * Drop the deltas a LANDED write persisted (see worker.syncBirdeyeCu).
+ * Subtracting the snapshot rather than clearing the map keeps a charge that
+ * arrived while the write was in flight in the pending set — the same
+ * "advance the baseline only after the write landed" rule the deferral and
+ * skip-capture syncs use.
+ */
+export function consumeBirdeyeCuDelta(
+  persisted: Map<string, number>,
+): void {
+  for (const [day, cu] of persisted) {
+    const left = (cuPending.get(day) ?? 0) - cu;
+    if (left > 0) cuPending.set(day, left);
+    else cuPending.delete(day);
+  }
+}
+
+/** Pure helper for the durable ledger's day map: the days kept before pruning. */
+export const BIRDEYE_CU_LEDGER_DAYS = 32;
+
 export class BirdeyeClient {
   private readonly throttle: Throttle;
   private readonly apiKey: string;
@@ -37,9 +110,18 @@ export class BirdeyeClient {
     this.throttle = new Throttle(config.birdeyeRequestIntervalMs);
   }
 
-  private async getJson(path: string): Promise<unknown> {
+  private async getJson(
+    path: string,
+    endpoint: BirdeyeEndpoint,
+  ): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
+      // Charged PER ATTEMPT, before the fetch: a request that reaches Birdeye
+      // is billed whether or not its payload lands, and a request aborted by
+      // the timeout below may still have been processed. Charging the success
+      // path only would under-count exactly the retries this client is most
+      // likely to make (429/5xx/timeout).
+      chargeBirdeyeCu(endpoint);
       try {
         const res = await this.throttle.run(() =>
           fetch(`${BASE_URL}${path}`, {
@@ -83,6 +165,7 @@ export class BirdeyeClient {
     const to = from + 60;
     const data = (await this.getJson(
       `/defi/ohlcv?address=${encodeURIComponent(address)}&type=1m&time_from=${from}&time_to=${to}&currency=usd`,
+      "ohlcv",
     )) as { success?: boolean; data?: { items?: OhlcvItem[] } } | null;
 
     const items = data?.data?.items;
@@ -128,6 +211,7 @@ export class BirdeyeClient {
       `/defi/v2/tokens/top_traders?chain=solana&address=${encodeURIComponent(
         address,
       )}&timeframe=24h&sort_by=volume&limit=10`,
+      "topTraders",
     )) as {
       data?: {
         items?: Array<{
@@ -193,6 +277,7 @@ export class BirdeyeClient {
   ): Promise<Array<{ address: string; createdAtSec: number | null }>> {
     const data = (await this.getJson(
       `/defi/v2/tokens/new_listing?limit=${limit}&meme_platform_enabled=true&time_to=${timeToSec}`,
+      "newListing",
     )) as {
       data?: { tokens?: unknown[]; items?: unknown[]; list?: unknown[] };
     } | null;
@@ -236,6 +321,7 @@ export class BirdeyeClient {
   async probeNewListing(): Promise<unknown> {
     return this.getJson(
       "/defi/v2/tokens/new_listing?limit=1&meme_platform_enabled=true",
+      "newListing",
     );
   }
 
@@ -255,6 +341,7 @@ export class BirdeyeClient {
   }> {
     const data = (await this.getJson(
       `/defi/token_overview?address=${encodeURIComponent(address)}&ui_amount_mode=raw`,
+      "tokenOverview",
     )) as { data?: Record<string, unknown> } | null;
     return parseTokenOverview(data?.data);
   }
@@ -276,6 +363,7 @@ export class BirdeyeClient {
       `/defi/ohlcv?address=${encodeURIComponent(
         address,
       )}&type=${type}&time_from=${Math.floor(createdAtSec)}&time_to=${now}&currency=usd`,
+      "ohlcv",
     )) as { data?: { items?: Array<{ l?: number }> } } | null;
 
     const items = data?.data?.items;

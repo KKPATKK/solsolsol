@@ -1,5 +1,11 @@
 import { webhookCallback, type Bot } from "grammy";
-import { BirdeyeClient } from "./birdeye";
+import {
+  BirdeyeClient,
+  BIRDEYE_CU_LEDGER_DAYS,
+  birdeyeUtcDay,
+  consumeBirdeyeCuDelta,
+  peekBirdeyeCuDelta,
+} from "./birdeye";
 import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
 import { Db, parseScheduledTickRing, type ScheduledTickEntry } from "./db";
@@ -342,6 +348,128 @@ let skipCaptureMirror: SkipCaptureState = emptySkipCaptureState();
 const SKIP_CAPTURE_SYNC_MIN_GAP_MS = 5 * 60_000;
 const SKIP_CAPTURE_SYNC_BOUND_MS = 900;
 let skipCaptureSyncedAt = 0;
+
+/**
+ * Durable Birdeye CU ledger.
+ *
+ * Birdeye's free tier is 30_000 CU a MONTH for the whole bot and, until
+ * now, nothing in this repo counted it: the quota table in
+ * docs/round-trips.md §4.4.2 was inferred from the push count, not
+ * measured. The client charges every request ATTEMPT into module state
+ * (src/birdeye.ts BIRDEYE_CU_PRICES); this is the durable half — a
+ * day-keyed total in worker_state, so the number survives isolate recycling
+ * and /health can read it from any isolate.
+ *
+ * Why not count it live per tick: a per-tick round trip is exactly what the
+ * 50-subrequest invocation budget cannot pay (docs/round-trips.md §1), so
+ * the drain rides the throttled post-scan telemetry instead. What that
+ * costs is bounded and stated: an isolate recycled inside the sync gap
+ * loses its OWN delta (≤ one gap of spend), which is why the read is
+ * unconditional — a fresh isolate republishes the fleet total rather than
+ * starting from zero and under-reporting the month.
+ */
+const BIRDEYE_CU_STATE_KEY = "birdeye_cu_v1";
+/** Same telemetry throttle/bound rationale as the ledger and skip syncs. */
+const BIRDEYE_CU_SYNC_MIN_GAP_MS = 5 * 60_000;
+const BIRDEYE_CU_SYNC_BOUND_MS = 900;
+let birdeyeCuSyncedAt = 0;
+
+/** Birdeye's free-tier allowance, reported when config does not override it. */
+export const BIRDEYE_MONTHLY_CU_DEFAULT = 30_000;
+
+/** `YYYY-MM-DD` and nothing else (the ledger's only accepted day keys). */
+function isBirdeyeDayKey(day: string): boolean {
+  if (day.length !== 10 || day[4] !== "-" || day[7] !== "-") return false;
+  for (let i = 0; i < day.length; i++) {
+    if (i === 4 || i === 7) continue;
+    const c = day.charCodeAt(i);
+    if (c < 48 || c > 57) return false; // 0-9
+  }
+  return true;
+}
+
+/** Pure parser for the durable ledger (`{ v: 1, days: { "YYYY-MM-DD": cu } }`). */
+export function parseBirdeyeCuLedger(raw: string | null): Record<string, number> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as { days?: unknown };
+    const days = parsed?.days;
+    if (!days || typeof days !== "object") return {};
+    const out: Record<string, number> = {};
+    for (const [day, cu] of Object.entries(days as Record<string, unknown>)) {
+      const n = Number(cu);
+      if (isBirdeyeDayKey(day) && Number.isFinite(n) && n >= 0) out[day] = n;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Pure merge: add this isolate's deltas to the durable day map and drop days
+ * older than the retention window. The ledger only has to answer "this
+ * calendar month", so a fixed tail is all a reader can want and keeps the
+ * row small.
+ */
+export function mergeBirdeyeCuLedger(
+  durable: Record<string, number>,
+  delta: Map<string, number>,
+  now = Date.now(),
+): Record<string, number> {
+  const next: Record<string, number> = { ...durable };
+  for (const [day, cu] of delta) next[day] = (next[day] ?? 0) + cu;
+  const cutoff = birdeyeUtcDay(now - BIRDEYE_CU_LEDGER_DAYS * 86_400_000);
+  for (const day of Object.keys(next)) {
+    if (day < cutoff) delete next[day];
+  }
+  return next;
+}
+
+/** Pure reader: today's CU plus the calendar month's total (quota window). */
+export function birdeyeCuStats(
+  days: Record<string, number>,
+  now = Date.now(),
+): { day: string; today: number; monthCu: number } {
+  const day = birdeyeUtcDay(now);
+  const month = day.slice(0, 7);
+  let monthCu = 0;
+  for (const [d, cu] of Object.entries(days)) {
+    if (d.startsWith(month)) monthCu += cu;
+  }
+  return { day, today: days[day] ?? 0, monthCu };
+}
+
+/** This isolate's unpersisted spend, for /health's `pendingCu`. */
+function birdeyeCuPendingTotal(): number {
+  let total = 0;
+  for (const cu of peekBirdeyeCuDelta().values()) total += cu;
+  return total;
+}
+
+/**
+ * Persist this isolate's Birdeye CU delta (see the ledger above). Same
+ * discipline as the push-ledger and skip-capture syncs: the READ is
+ * unconditional, and the in-memory delta is only cleared after a write that
+ * actually landed, so a failed write re-offers it instead of dropping it.
+ */
+export async function syncBirdeyeCu(
+  now = Date.now(),
+  database: Db | null = db,
+): Promise<void> {
+  if (!database) return;
+  const delta = peekBirdeyeCuDelta();
+  const durable = parseBirdeyeCuLedger(
+    await database.getWorkerState(BIRDEYE_CU_STATE_KEY),
+  );
+  if (delta.size === 0) return;
+  const next = mergeBirdeyeCuLedger(durable, delta, now);
+  await database.setWorkerState(
+    BIRDEYE_CU_STATE_KEY,
+    JSON.stringify({ v: 1, days: next }),
+  );
+  consumeBirdeyeCuDelta(delta);
+}
 
 /**
  * Cross-isolate 429 bookkeeping: the scan that trips DexScreener's batched
@@ -747,6 +875,17 @@ async function syncPostScanTelemetry(now = Date.now()): Promise<void> {
       console.warn("[worker] post-scan skip-capture sync failed:", err);
     }
     skipCaptureSyncedAt = Date.now();
+  }
+  if (now - birdeyeCuSyncedAt >= BIRDEYE_CU_SYNC_MIN_GAP_MS) {
+    try {
+      await Promise.race([
+        syncBirdeyeCu(now),
+        new Promise((resolve) => setTimeout(resolve, BIRDEYE_CU_SYNC_BOUND_MS)),
+      ]);
+    } catch (err) {
+      console.warn("[worker] post-scan Birdeye CU sync failed:", err);
+    }
+    birdeyeCuSyncedAt = Date.now();
   }
 }
 
@@ -3159,6 +3298,17 @@ export default {
       let enabledChats: number | null = null;
       let tokenStatsCount: number | null = null;
       let pushedTotal: number | null = null;
+      // Birdeye CU accounting (see the ledger above): the free tier is
+      // 30_000 CU a MONTH for the whole bot, and §4.4.2's table was an
+      // estimate until this existed. Read from Turso, not from an isolate
+      // mirror, so any isolate answers with the fleet's month-to-date.
+      let birdeyeCu: {
+        day: string;
+        today: number;
+        monthCu: number;
+        pendingCu: number;
+        monthlyMax: number;
+      } | null = null;
       try {
         const rawTotal = await db?.getWorkerState("scheduled_tick_total");
         const rawAt = await db?.getWorkerState("scheduled_tick_at");
@@ -3167,6 +3317,15 @@ export default {
         enabledChats = (await db?.listEnabledChats())?.length ?? null;
         tokenStatsCount = (await db?.countTokenStats()) ?? null;
         pushedTotal = (await db?.countSeenTokens()) ?? null;
+        const rawCu = await db?.getWorkerState(BIRDEYE_CU_STATE_KEY);
+        birdeyeCu = {
+          ...birdeyeCuStats(parseBirdeyeCuLedger(rawCu ?? null)),
+          // This isolate's unpersisted spend is real spend too: the durable
+          // row only moves when the throttled sync lands, so the stored
+          // total alone under-reads for up to one sync gap.
+          pendingCu: birdeyeCuPendingTotal(),
+          monthlyMax: cfg?.birdeyeMonthlyCuMax ?? BIRDEYE_MONTHLY_CU_DEFAULT,
+        };
       } catch {
         // telemetry only — never fail /health over the reads
       }
@@ -3202,6 +3361,7 @@ export default {
         enabledChats,
         tokenStatsCount,
         pushedTotal,
+        birdeyeCu,
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         // Cross-isolate single-flight: how often this isolate skipped a

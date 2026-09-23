@@ -408,6 +408,15 @@ export interface AppConfig {
   /** Minimum spacing between Birdeye HTTP requests (rate limiting). */
   birdeyeRequestIntervalMs: number;
   /**
+   * Birdeye's CU allowance per calendar month (BIRDEYE_MONTHLY_CU_MAX,
+   * default 30_000 = the free tier). Reporting only: /health's `birdeyeCu`
+   * carries the measured month-to-date spend alongside this ceiling, so the
+   * quota is observable instead of inferred from the push count. WHICH paid
+   * calls to refuse once it runs out stays a separate, explicit decision —
+   * dropping one changes what the card shows (docs/round-trips.md §4.4.2).
+   */
+  birdeyeMonthlyCuMax: number;
+  /**
    * GMGN trending feed size per scan (GMGN_TRENDING_LIMIT, default 30,
    * 0 = discovery feed disabled). Candidates come momentum-ranked.
    */
@@ -715,6 +724,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     birdeyeRequestIntervalMs: Number.isFinite(Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))
       ? Math.max(0, Number(env.BIRDEYE_REQUEST_INTERVAL_MS ?? 1100))
       : 1100,
+    birdeyeMonthlyCuMax: Number.isFinite(Number(env.BIRDEYE_MONTHLY_CU_MAX ?? 30000))
+      ? Math.max(0, Math.floor(Number(env.BIRDEYE_MONTHLY_CU_MAX ?? 30000)))
+      : 30000,
     gmgnTrendingLimit: Number.isFinite(Number(env.GMGN_TRENDING_LIMIT ?? 30))
       ? Math.max(0, Math.min(Math.floor(Number(env.GMGN_TRENDING_LIMIT ?? 30)), 100))
       : 30,

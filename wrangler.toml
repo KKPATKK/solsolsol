@@ -209,6 +209,17 @@ PUSH_WATCH_HOLDER_CAP_MS = "2400"
 # The stamp is durable (worker_state.holder_probe_at), so the cap holds across
 # isolates; rows the gap skips stay DUE (`cut` in the pass note, plus `cu-gate`).
 PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
+# Birdeye CU allowance per calendar month (code default 30_000 = the free
+# tier). REPORTING ONLY: the client charges every request attempt (per-endpoint
+# prices live in src/birdeye.ts BIRDEYE_CU_PRICES) and a durable day ledger sums
+# it, so /health.birdeyeCu shows { today, monthCu, pendingCu, monthlyMax } —
+# i.e. how much of the 30K the whole bot has actually spent this month, instead
+# of §4.4.2's estimate derived from the push count. 2026-09-23: that estimate
+# says the CARD path alone (40–52 pushes × 20 CU token_overview) can consume the
+# entire tier, so watch `monthCu` here before tuning anything else. WHICH paid
+# calls to refuse once the ceiling is reached is deliberately NOT wired —
+# dropping one changes what the card shows (docs/round-trips.md §4.4.2 / §4.5.1).
+BIRDEYE_MONTHLY_CU_MAX = "30000"
 # Insider self-pump gate: rejects pushes where newWallets/checked top-holder
 # wallets exceeds WALLET_NEW_RATIO_MAX (the Cheems shape — 8/8 profiled
 # holders were brand-new wallets). Only judges once at least

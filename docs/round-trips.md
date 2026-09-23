@@ -381,7 +381,7 @@ CU 一爆 quota，Birdeye 會開始回 429／要求付款，probe 同卡片路�
   可以由 1.25 日壓到 ~30 分鐘。
 
 CU 用量本身**冇任何計數器**（repo 內冇 Birdeye call 統計，`/debug/birdeye-overview` 只係手動
-probe），所以上表除咗 probe 一項之外都係由卡片數推算 —— 見 §4.5。
+probe），所以上表除咗 probe 一項之外都係由卡片數推算 —— 2026-09-23 已補上量度，見 §4.5.1。
 
 ### 4.5 未做
 
@@ -391,17 +391,57 @@ probe），所以上表除咗 probe 一項之外都係由卡片數推算 —— 
   600ms，而個 pass 依然係 1/10 行）。要查係「scan 前排嗰個批次早已 429／被 cut，令
   `lastPairs` 空」定係「head 轉咗位令 10 個 address 全部唔喺 cache 内」。
 * `bumpScheduledTick` 本体仍然留喺 `Db`（legacy fallback 用），冇再喺正常 tick 出現。
-* **Birdeye 每日 CU counter**：卡片側（`resolveHolderCount` 20 CU、`resolveTraderData` 未核實）每次成功
-  都係一個 paid call，但冇儀器，§4.4.2 嘅 24–31K/月 係推算。要盯 quota 就要一個 counter（worker_state
-  每日一個 key，或在 pass 收尾把 in-memory 計數一齊 flush）。
+* ~~**Birdeye 每日 CU counter**~~ → **已修**，見 §4.5.1。
 * **卡片側 CU**（§4.4.2）：持有人數改用 GMGN 已抓嘅 `holder_count`，同一個 coin 唔使再買一次
   `token_overview`；同時要決定 `resolveTraderData`（`top_traders`）值唔值呢個 CU。
+  2026-09-23：**暫時唔做** —— 呢個就係 §4.5.1 個 counter 要答嘅問題，等有實測數字先。
+
+### 4.5.1 Birdeye CU 帳簿：由推算變成量度（2026-09-23，已修，未 deploy）
+
+§4.4.2 嘅 quota 表除 holder probe 一項之外全部係由卡片數**推算** —— repo 從來沒有任何 Birdeye
+call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable ledger ＋ `/health` 讀數**。
+**唔改任何決定**（冇拒發、冇改 cap、冇改 gap）。
+
+* **記帳點**：`src/birdeye.ts` 嘅 `getJson` 每次 **request attempt** 都 charge（唔係成功才 charge）。
+  理由同 cap 一樣：Birdeye 對「到咗伺服器」嘅請求收費，而 timeout 咗嘅請求可能已經被處理；只計成功
+  路徑會**最嚴重地低報**—— retry（429/5xx/timeout，即係呢個 client 最常做嘅事）全部走唔到成功路徑。
+* **單價表**（`BIRDEYE_CU_PRICES`，test 釘住）：`token_overview` **20**、`ohlcv` **35**、
+  `new_listing` **40**（docs 講 30–80，取中間）、`top_traders` **0**。`top_traders` 冇已核實單價，
+  所以 charge 0 —— **未核實嘅 endpoint 唔可以自己作一個數出嚟，然後用嗰個數去做預算決定**。
+* **durable ledger**：`worker_state.birdeye_cu_v1` ＝ `{ v: 1, days: { "YYYY-MM-DD": cu } }`，
+  保留 32 日（ledger 只需要答「本月」）。寫入紀律同 push-ledger／skip-capture 一模一样：
+  **read 無條件**（被回收後嘅 isolate 重新發佈全隊總數，唔會由自己嘅 0 開始而低報個月），
+  **只有真正落地嘅寫入才清 in-memory delta**（寫失敗就下次再報，唔會掉咗筆開支）。
+* **flush 位置**：搭 `syncPostScanTelemetry`（5 分鐘節流、900ms bound），**唔**入 tick path ——
+  每個 tick 多一個 round trip 就係 §1 講嘅 50-subrequest 預算買唔起嘅嘢。代價照寫：sync gap 內
+  被回收嘅 isolate 會掉自己嗰段 delta（上限一個 gap），呢個就係 read 要無條件嘅原因。
+* **讀數**：`/health.birdeyeCu = { day, today, monthCu, pendingCu, monthlyMax }`。`monthlyMax` 由
+  `BIRDEYE_MONTHLY_CU_MAX` 定（default 30_000 ＝ free tier）。`pendingCu` 係本 isolate 未落庫嘅
+  開支，所以 **`monthCu + pendingCu` 才係最近即時嘅月用量**，而 `today` 回答嘅係「今日燒咗幾多」。
+* **刻意唔做**：quota 到頂之後**拒發**哪一些 call。拒一個就改變卡片顯示（§4.4.2 自己嗰句：
+  「改嘅係卡片顯示同 push 驗證嘅語意，唔應該順手做」），而呢個 counter 嘅全部意義就係令嗰個
+  決定有數可依。
+* 測試：`test-unit.js` 加 7 條（單價表、attempt 記帳、mid-write charge、parser 容錯、merge＋剪枝、
+  today／month 分界、sync 落地＋失敗 re-offer）⇒ 279 → **286 passed, 0 failed**。
+* 落線紀錄：`docs/patches/birdeye-cu-ledger.apply.js`（worker.ts／config.ts）
+  ＋ `…fix1.apply.js`（把個 block 移返上 `recordDex429` 註解之前，唔好搶咗人哋嘅 doc）
+  ＋ `docs/patches/birdeye-cu-ledger-tests.apply.js`（test-unit.js）。
+
+**落線點驗**（deploy 後第一個鐘）：
+
+1. `curl /health | jq .birdeyeCu` 有數，而且 `monthCu` 隨時間單向上升（唔會回落、唔會係 0 卡死）。
+2. `birdeyeCu.day` 係 UTC 當日；跨 UTC 午夜後 `today` 歸零而 `monthCu` 繼續累加。
+3. `monthCu + pendingCu` 同 §4.4.2 推算嘅 24–31K/月 對得上或者**更高**（推算假設一張卡一次；
+   實際上一張卡可能唔止一次—— 例如 send 被 defer／`undelivered` 之後下一 tick 重評），
+   呢個差異就係下一個決定嘅材料。
+4. `pendingCu` 在冇 scan 嘅 tick 會繼續存在（drain 跟節流），有 scan 後回落。
 
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **279 passed, 0 failed** ✅（278 → 279：§4.4 新增一條 CU-gate test；
-  fakes 已跟新 shape，`trips` invariant 仍然釘住）
+* `node scripts/test-unit.js` → **286 passed, 0 failed** ✅（279 → 286：§4.5.1 新增 7 條 CU-ledger test
+  —— 單價表、attempt 記帳、mid-write charge、parser 容錯、merge＋剪枝、today/month 分界、
+  sync 落地＋失敗 re-offer；§4.4 嗰條 CU-gate test 與 `trips` invariant 仍然釘住）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
   → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809

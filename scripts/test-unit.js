@@ -22,14 +22,14 @@ const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
-const { syncPushLedger, syncSkipCaptureState, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
+const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
-const { parseTokenOverview } = require("../dist/birdeye.js");
+const { parseTokenOverview, BIRDEYE_CU_PRICES, BIRDEYE_CU_LEDGER_DAYS, birdeyeUtcDay, chargeBirdeyeCu, peekBirdeyeCuDelta, consumeBirdeyeCuDelta } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
 const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
@@ -9822,6 +9822,145 @@ async function main() {
     }
   });
 
+
+  // ---------- Birdeye CU ledger (src/birdeye.ts + worker.syncBirdeyeCu) ----------
+
+  await test("birdeye: the CU price table pins the billed endpoints", async () => {
+    // 20 CU per token_overview is what makes the CARD path (40-52 pushes a
+    // day = 24-31K CU/month) the bot's biggest Birdeye consumer on its own,
+    // so the number is pinned rather than commented.
+    assert.equal(BIRDEYE_CU_PRICES.tokenOverview, 20);
+    assert.equal(BIRDEYE_CU_PRICES.ohlcv, 35);
+    // new_listing is documented as 30-80 CU: the table charges the middle.
+    assert.equal(BIRDEYE_CU_PRICES.newListing, 40);
+    // top_traders has NO recorded price — an unpriced endpoint must not
+    // invent one, so it is charged 0 and cannot silently move a budget.
+    assert.equal(BIRDEYE_CU_PRICES.topTraders, 0);
+    // The ceiling /health divides the month's spend by is the free tier.
+    assert.equal(BIRDEYE_MONTHLY_CU_DEFAULT, 30_000);
+  });
+
+  await test("birdeye: charges accumulate per UTC day and an unpriced call is free", async () => {
+    consumeBirdeyeCuDelta(peekBirdeyeCuDelta()); // clean slate
+    const day = birdeyeUtcDay();
+    chargeBirdeyeCu("tokenOverview");
+    chargeBirdeyeCu("tokenOverview");
+    chargeBirdeyeCu("ohlcv");
+    chargeBirdeyeCu("topTraders"); // charged 0 — no recorded price
+    const pending = peekBirdeyeCuDelta();
+    assert.equal(pending.get(day), 20 + 20 + 35, "two overviews plus one ohlcv");
+    consumeBirdeyeCuDelta(pending);
+    assert.equal(peekBirdeyeCuDelta().size, 0, "a consumed delta leaves nothing pending");
+  });
+
+  await test("birdeye: a charge that lands mid-write stays pending", async () => {
+    consumeBirdeyeCuDelta(peekBirdeyeCuDelta());
+    const day = birdeyeUtcDay();
+    chargeBirdeyeCu("tokenOverview");
+    const snapshot = peekBirdeyeCuDelta();
+    // The write is in flight and another request is billed meanwhile.
+    chargeBirdeyeCu("tokenOverview");
+    consumeBirdeyeCuDelta(snapshot);
+    assert.equal(peekBirdeyeCuDelta().get(day), 20, "only the persisted amount is cleared");
+    consumeBirdeyeCuDelta(peekBirdeyeCuDelta());
+  });
+
+  await test("birdeye: the ledger parser reads good days and drops junk", async () => {
+    assert.deepEqual(parseBirdeyeCuLedger(null), {});
+    assert.deepEqual(parseBirdeyeCuLedger("not json"), {});
+    assert.deepEqual(parseBirdeyeCuLedger(JSON.stringify({ days: ["x"] })), {});
+    assert.deepEqual(
+      parseBirdeyeCuLedger(
+        JSON.stringify({
+          days: {
+            "2026-09-23": 480,
+            "23-09-2026": 9,
+            "2026-09-2x": 9,
+            "2026-09-24": -1,
+            "2026-09-25": "abc",
+          },
+        }),
+      ),
+      { "2026-09-23": 480 },
+      "only real, non-negative day totals are spend",
+    );
+  });
+
+  await test("birdeye: the merge adds deltas and prunes past the retention window", async () => {
+    const now = Date.UTC(2026, 8, 23, 12, 0, 0);
+    const merged = mergeBirdeyeCuLedger(
+      { "2026-09-23": 100, "2026-07-01": 5_000 },
+      new Map([["2026-09-23", 20], ["2026-09-22", 40]]),
+      now,
+    );
+    assert.equal(merged["2026-09-23"], 120, "an existing day accumulates");
+    assert.equal(merged["2026-09-22"], 40, "a new day is created");
+    assert.equal(merged["2026-07-01"], undefined, "a day past the window is pruned");
+    assert.ok(
+      BIRDEYE_CU_LEDGER_DAYS * 86_400_000 >= 31 * 86_400_000,
+      "the retention window must be able to cover a calendar month",
+    );
+  });
+
+  await test("birdeye: the stats split today from the calendar month (the quota window)", async () => {
+    const days = { "2026-08-31": 900, "2026-09-01": 100, "2026-09-23": 460 };
+    assert.deepEqual(
+      birdeyeCuStats(days, Date.UTC(2026, 8, 23, 6, 0, 0)),
+      { day: "2026-09-23", today: 460, monthCu: 560 },
+      "last month's row is reported in NEITHER number",
+    );
+    assert.deepEqual(
+      birdeyeCuStats(days, Date.UTC(2026, 8, 24, 0, 30, 0)),
+      { day: "2026-09-24", today: 0, monthCu: 560 },
+      "a new UTC day starts at zero while the month keeps counting",
+    );
+  });
+
+  await test("worker: syncBirdeyeCu persists the spend and re-offers it after a failed write", async () => {
+    consumeBirdeyeCuDelta(peekBirdeyeCuDelta());
+    const t = tmpDb();
+    const t0 = Date.UTC(2026, 8, 23, 10, 0, 0);
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      chargeBirdeyeCu("tokenOverview", t0);
+      chargeBirdeyeCu("tokenOverview", t0);
+      await syncBirdeyeCu(t0, db);
+      const stored = parseBirdeyeCuLedger(await db.getWorkerState("birdeye_cu_v1"));
+      assert.equal(stored["2026-09-23"], 40, "both attempts are billed and persisted");
+      assert.equal(peekBirdeyeCuDelta().size, 0, "a landed write clears the delta");
+      // A recycled isolate adds ON TOP of the durable total (the read is
+      // unconditional) instead of restarting the day at its own zero.
+      chargeBirdeyeCu("ohlcv", t0);
+      await syncBirdeyeCu(t0 + 1_000, db);
+      const second = parseBirdeyeCuLedger(await db.getWorkerState("birdeye_cu_v1"));
+      assert.equal(second["2026-09-23"], 75, "35 CU of ohlcv joins the same day");
+      // A failed write must RE-OFFER its delta: the spend happened and was
+      // billed even though the row did not land.
+      const writeFail = {
+        execute: (a) => {
+          if (String(a.sql).includes("INSERT INTO worker_state")) {
+            throw new Error("write down");
+          }
+          return t.client.execute(a);
+        },
+        batch: (a, m) => t.client.batch(a, m),
+        close: () => t.client.close(),
+      };
+      const downDb = new Db(t.p, undefined, writeFail);
+      await downDb.init();
+      chargeBirdeyeCu("tokenOverview", t0);
+      await assert.rejects(() => syncBirdeyeCu(t0 + 2_000, downDb), /write down/);
+      assert.equal(
+        peekBirdeyeCuDelta().get("2026-09-23"),
+        20,
+        "the delta is still pending after a failed write",
+      );
+    } finally {
+      consumeBirdeyeCuDelta(peekBirdeyeCuDelta());
+      await t.cleanup();
+    }
+  });
   console.log("\n===== UNIT TESTS =====");
   for (const line of results) console.log(line);
   console.log(`\n  ${passed} passed, ${failed} failed`);
