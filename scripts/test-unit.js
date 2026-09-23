@@ -2891,6 +2891,57 @@ async function main() {
     assert.equal(typeof scanner.lastSummary.trackerMs, "number");
   });
 
+  await test("Scanner.runTrackerPass: the note row is stamped RUNNING before the pass works, and a skipped tick still moves it", async () => {
+    // WHY (2026-09-23): the coverage line is the pass's LAST write, so any pass
+    // that does not return left /health.pushWatchPass frozen while its row
+    // writes kept landing (live: row `SRI` lastChecked 02:45:13Z, note `at`
+    // 02:36:26Z). Two shapes, one fix: the RUNNING stamp below (a pass that
+    // starts always moves the row) and noteTrackerSkipped (a tick with no
+    // budget for a pass publishes that instead of going quiet).
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const writes = [];
+    const db = {
+      setWorkerState: async (key, value) => {
+        assert.equal(key, "push_watch_pass", "the note row is the durable one /health and /debug read");
+        writes.push(JSON.parse(value));
+      },
+    };
+    const scanner = new Scanner(
+      db, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    // Read INSIDE the pass: the stamp must already be in the row before the
+    // pass touches a single row.
+    let stampedBeforeWork = null;
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      runTick: async () => {
+        stampedBeforeWork = writes.length === 1 && writes[0].phase === "running";
+        return {
+          checked: 3, alerted: 0, trips: 7,
+          note: "rows 3/29 pairs 6/6 miss 0 lost 0 trips 7",
+          undeliveredTotal: 0, recoveredUndelivered: 0,
+        };
+      },
+    };
+    scanner.lastSummary = {};
+    await scanner.runTrackerPass(Date.now() + 2_500);
+    assert.equal(stampedBeforeWork, true, "the running stamp must land BEFORE the pass does any work");
+    assert.equal(writes.length, 2, `one write per phase (got ${writes.length})`);
+    assert.equal(writes[0].phase, "running");
+    assert.equal(writes[0].trackerMs, 0, "a running stamp has no pass duration yet");
+    assert.equal(writes[1].phase, "done");
+    assert.match(String(writes[1].note), /^ok:3\/0 rows 3\/29/);
+    assert.equal(typeof writes[1].trackerMs, "number");
+    // A tick whose envelope was spent before the pass ever started.
+    await scanner.noteTrackerSkipped("tick 11500ms timed-out");
+    assert.equal(writes.length, 3);
+    assert.equal(writes[2].phase, "skip");
+    assert.equal(writes[2].note, "skip:tick 11500ms timed-out");
+    assert.equal(writes[2].trackerMs, 0, "no pass ran, so there is no pass duration to report");
+  });
+
   await test("parseTokenSnapshot: FDV and summed reserve are the usable numbers", () => {
     // Verified against the live API on a tracked XCAT pool (2026-09-18):
     // market_cap_usd comes back null for Solana memecoins, fdv_usd is the

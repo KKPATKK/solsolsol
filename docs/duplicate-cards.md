@@ -467,3 +467,61 @@ ok:9/2 rows 9/30 pairs 10/10 miss 0 lost 0 dup-skip 1 recovered 1 budget-cut all
 
 **下一張 post-deploy（`93148ee`，02:22:43Z 上線）嘅 cut 仍然要盯**：候選＝任何 `lastState` 唔係 `dead`／`rug`、
 而 `upStages` 帶 `p:<sig>` 嘅 row（straddle 修好之後，跨分鐘嗰啲都會行「等一個 check」，verdict 只會更準）。
+
+## 十四、pass note 為何仍然停：note 係 pass 嘅最後一個寫入（2026-09-23 02:36–02:48Z）
+
+答案唔係「寫入被取消」——§7.4 已經修好嗰個 race；而係 **note 係 tracker pass 嘅最後一步**：
+pass 冇行完，就冇人寫 note。而 pass 有兩種「行唔完」，今次一次凍結裡面兩種都實測到。
+
+### 14.1 兩個實測形狀
+
+`02:36:26Z` 起 note `at` 凍結，一路到至少 `02:47:54Z`（11 分鐘以上）。同一段時間嘅讀數：
+
+| 讀數 | 值 | 意思 |
+|---|---|---|
+| `scan_history` 02:37–02:41 | 連續 **5 行** `ok:false ms 11500`，err `scan exceeded its 2500ms race window (… preRace 9000ms = json 0 + claim 3000)` | **形狀 A**：tick 喺 pre-race 就燒掉 9 秒（撞硬牆嘅 Turso round trip，硬牆＝1.2×2500＝3000ms），race 只剩 2500ms 下限，成個 tick 11500ms ⇒ `trackerBudgetMs = 9500 − 1000 − 11500 < 0` ⇒ **pass 完全冇開始**，worker 亦冇寫任何嘢 |
+| `scan_history` 02:45:13 | `ok:true ms 4179`（**成功** tick）而 note `at` 仍然 02:36:26Z | **形狀 B**：tick 成功、pass 有開始，但 note 冇更新 |
+| `push_watch` 02:45:13 | 只有 **SRI 一行** `lastChecked 02:45:13Z`（＝該 tick 嘅 claim 時間），其餘行仲係 02:36:22／02:35:22 | pass 行到第一行（row 自己嘅寫入落地），之後就冇咗 ⇒ 第一行食盡成個 pass |
+
+形狀 B 嘅機制：row loop **只在行與行之間**檢查預算（`if (!firstRow && Date.now() + TRACKER_ROW_MIN_MS > deadline) break;`），
+而一行嘅鏈（pair、claim、alert reservation、send、delivery audit、final check write）係最多五個 Turso round trip，
+scan mode 之外每個硬牆 3000ms ⇒ **單單一行就可以超成個 tick**。pass 冇 return ⇒ `persistPassNote` 冇跑 ⇒ note 停，
+但嗰一行自己嘅寫入照樣落地 ⇒ 睇落似「row 檢查一路做、note 一路停」。
+
+即係話 note 凍結唔等於寫入失敗，而係「pass 冇行完」嘅症狀；§8.3／§11.5 教「唔可以只睇 note」係對嘅，
+但唔應該要人繞路讀。
+
+### 14.2 修法：note 由「一個尾寫」變成「三個相位」（`docs/patches/tracker-pass-note-phases.patch`）
+
+| 位置 | 改動 |
+|---|---|
+| `src/scanner.ts` `persistPassStart()` | pass 落**第一步之前**先寫 `{at, note:"running", trackerMs:0, phase:"running"}`：一行都未掂就已經證明自己開始咗 |
+| `src/scanner.ts` `persistPassNote(note, startedAt, phase)` | 完成時寫 `phase:"done"`（同舊行為一樣，只多一個欄位） |
+| `src/scanner.ts` `noteTrackerSkipped(reason)`（public） | 冇預算開 pass 就寫 `{note:"skip:<reason>", phase:"skip", trackerMs:0}` |
+| `src/worker.ts` | `trackerBudgetMs <= 0` 嘅分支叫 `noteTrackerSkipped(\`tick ${lastScanMs}ms[ timed-out]\`)` ⇒ 形狀 A 唔再「靜」，而係明講呢個 tick 冇跑到 pass |
+
+修完之後嘅讀法（`/health.pushWatchPass`、`/debug/scan-history.pushWatchPass`）：
+
+* `phase:"running"` ＋ 新鮮 `at` ⇒ pass 進行中（一個 tick 內正常會變 `done`）；
+* `phase:"running"` 而 `at` 原地停留超過一兩個 tick ⇒ pass 卡死喺某一行（形狀 B），而 `at` 本身講得出幾點開始卡；
+* `phase:"skip"` ＋ `note:"skip:tick 11500ms timed-out"` ⇒ tick 燒爆 envelope，pass 冇開；
+* `at` **完全唔動**（連 running／skip 都冇）⇒ invocation 喺 tick tail 之前就死咗 —— 呢個係唯一 note 幫唔到嘅情況，
+  而 `heartbeat`／`scan_history` 本身已經睇得到。
+
+`phase` 係新增欄位，舊讀者（只讀 `at`／`note`／`trackerMs`）唔受影響。
+
+### 14.3 測試
+
+`Scanner.runTrackerPass: the note row is stamped RUNNING before the pass works, and a skipped tick still moves it`：
+由 `runTick` 內部讀寫入記錄，證明 **running stamp 喺 pass 做任何嘢之前已經落地**，並針住 `done`／`skip` 兩個相位同 `trackerMs`。
+
+Negative control 實測：只反轉 `src/scanner.ts` ＋ `src/worker.ts`（保留測試）再 build ⇒ `271 passed, 1 failed`
+（`the running stamp must land BEFORE the pass does any work`），還原後 `272 passed, 0 failed`。
+`test-deferred-priority.js`、`test-tick-path.js` 一樣 pass；patch 反向 `--check` 確認同 working tree 一模一樣。
+
+### 14.4 仍未收（老實講）
+
+* 形狀 B 嘅**根因**（一行食盡成個 pass）冇改：note 只係由「睇唔到」變成「睇得到」。收窄應該係一行內部都檢查預算，
+  或者將每行嘅 Turso 鏈限制喺一個 slice 內 —— 但嗰個改動會碰 claim／send 嘅時序，唔應該混喺 note 修復度做。
+* 形狀 A 嘅根因（pre-race 9 秒）係 Turso 延遲造成嘅三個硬牆 round trip，唔關 note 事；但它同時令呢啲 tick
+  **完全冇 scan、亦冇 pass**，係下一步值得查嘅對象。

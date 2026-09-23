@@ -1795,6 +1795,11 @@ export class Scanner {
   ): Promise<string | null> {
     if (!this.pushWatcher) return null;
     const startedAt = Date.now();
+    // Stamp the row RUNNING before the pass's first stage (see
+    // persistPassStart). The coverage line below is the pass's LAST write, so a
+    // pass that never returns would otherwise leave /health.pushWatchPass
+    // frozen while the row writes it DID make kept landing.
+    await this.persistPassStart();
     try {
       const pw = await this.pushWatcher.runTick(deadlineMs, keepAlive);
       const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
@@ -1845,7 +1850,16 @@ export class Scanner {
    * /debug/scan-history.pushWatchPass). Awaited and best-effort, never raced:
    * see persistPassNote.
    */
-  private async persistPassNote(note: string, startedAt: number): Promise<void> {
+  private async persistPassNote(
+    note: string,
+    startedAt: number,
+    /**
+     * "done" = a completed pass; "skip" = a tick that never got one (see
+     * noteTrackerSkipped). Written to the row so a reader can tell a pass in
+     * flight from a pass that is stuck (see persistPassStart).
+     */
+    phase: "done" | "skip" = "done",
+  ): Promise<void> {
     // AWAITED, not raced. The race this replaces resolved at its bound while the
     // write was still in flight, and an abandoned promise is CANCELLED the
     // moment the invocation ends — so on a slow-Turso stretch every pass lost
@@ -1861,12 +1875,65 @@ export class Scanner {
         JSON.stringify({
           at: Date.now(),
           note,
-          trackerMs: Date.now() - startedAt,
+          trackerMs: phase === "done" ? Date.now() - startedAt : 0,
+          phase,
         }),
       );
     } catch {
       /* telemetry only */
     }
+  }
+
+  /**
+   * Stamp the pass RUNNING before its first stage runs.
+   *
+   * WHY (2026-09-23, measured live): the coverage line is the pass's LAST
+   * write, so a pass that does not return left the durable row frozen — and a
+   * pass can fail to return without failing to WORK. The row loop checks the
+   * budget only BETWEEN rows, and ONE row's chain (pair lookup, claim, alert
+   * reservation, send, delivery audit, final check write) is up to five Turso
+   * round trips, each walled at 3s outside scan mode. Live shape: the row
+   * `SRI` carried `lastChecked 02:45:13Z` (its own writes landed) while
+   * `push_watch_pass.at` sat at 02:36:26Z for 11+ minutes — rows moving, note
+   * frozen, which is exactly the shape docs/duplicate-cards.md 8.3 told the
+   * operator to read around instead of trusting the note.
+   *
+   * With this stamp the row moves whenever a pass STARTS: `phase:"running"`
+   * with a fresh `at` is a pass in flight, a stale `running` is a pass stuck
+   * inside one row, and `phase:"skip"` is a tick that never got a pass (see
+   * noteTrackerSkipped). A frozen `at` now means the invocation died before
+   * the tick's tail at all, which the heartbeat and scan_history already show.
+   *
+   * Best-effort and awaited exactly like the coverage write below.
+   */
+  private async persistPassStart(): Promise<void> {
+    try {
+      await this.db.setWorkerState(
+        "push_watch_pass",
+        JSON.stringify({
+          at: Date.now(),
+          note: "running",
+          trackerMs: 0,
+          phase: "running",
+        }),
+      );
+    } catch {
+      /* telemetry only */
+    }
+  }
+
+  /**
+   * Public: publish the tick's tracker status for a tick that had NO budget
+   * for a pass (see worker.ts — a cut tick spends its whole envelope before
+   * the pass, so the pass never starts).
+   *
+   * Without this the row simply stopped moving on those ticks (live
+   * 2026-09-23 02:37-02:41Z: five consecutive cut ticks of 11500ms each, note
+   * frozen at 02:36:26Z, indistinguishable from a lost write). A skipped tick
+   * is a real reading, so it is published as one.
+   */
+  async noteTrackerSkipped(reason: string): Promise<void> {
+    await this.persistPassNote(`skip:${reason}`, Date.now(), "skip");
   }
 
   /**

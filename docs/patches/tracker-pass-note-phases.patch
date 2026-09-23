@@ -1,0 +1,193 @@
+diff --git a/src/scanner.ts b/src/scanner.ts
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -1786,6 +1786,11 @@
+   ): Promise<string | null> {
+     if (!this.pushWatcher) return null;
+     const startedAt = Date.now();
++    // Stamp the row RUNNING before the pass's first stage (see
++    // persistPassStart). The coverage line below is the pass's LAST write, so a
++    // pass that never returns would otherwise leave /health.pushWatchPass
++    // frozen while the row writes it DID make kept landing.
++    await this.persistPassStart();
+     try {
+       const pw = await this.pushWatcher.runTick(deadlineMs, keepAlive);
+       const note = `ok:${pw.checked}/${pw.alerted}${pw.note ? ` ${pw.note}` : ""}`;
+@@ -1845,7 +1845,17 @@
+    * see persistPassNote.
+    */
+-  private async persistPassNote(note: string, startedAt: number): Promise<void> {
++  private async persistPassNote(
++    note: string,
++    startedAt: number,
++    /**
++     * "done" = a completed pass; "skip" = a tick that never got one (see
++     * noteTrackerSkipped). Written to the row so a reader can tell a pass in
++     * flight from a pass that is stuck (see persistPassStart).
++     */
++    phase: "done" | "skip" = "done",
++  ): Promise<void> {
+     // AWAITED, not raced. The race this replaces resolved at its bound while the
+@@ -1856,15 +1856,70 @@
+       await this.db.setWorkerState(
+         "push_watch_pass",
+         JSON.stringify({
+           at: Date.now(),
+           note,
+-          trackerMs: Date.now() - startedAt,
++          trackerMs: phase === "done" ? Date.now() - startedAt : 0,
++          phase,
+         }),
+       );
+     } catch {
+       /* telemetry only */
+     }
+   }
++
++  /**
++   * Stamp the pass RUNNING before its first stage runs.
++   *
++   * WHY (2026-09-23, measured live): the coverage line is the pass's LAST
++   * write, so a pass that does not return left the durable row frozen — and a
++   * pass can fail to return without failing to WORK. The row loop checks the
++   * budget only BETWEEN rows, and ONE row's chain (pair lookup, claim, alert
++   * reservation, send, delivery audit, final check write) is up to five Turso
++   * round trips, each walled at 3s outside scan mode. Live shape: the row
++   * `SRI` carried `lastChecked 02:45:13Z` (its own writes landed) while
++   * `push_watch_pass.at` sat at 02:36:26Z for 11+ minutes — rows moving, note
++   * frozen, which is exactly the shape docs/duplicate-cards.md 8.3 told the
++   * operator to read around instead of trusting the note.
++   *
++   * With this stamp the row moves whenever a pass STARTS: `phase:"running"`
++   * with a fresh `at` is a pass in flight, a stale `running` is a pass stuck
++   * inside one row, and `phase:"skip"` is a tick that never got a pass (see
++   * noteTrackerSkipped). A frozen `at` now means the invocation died before
++   * the tick's tail at all, which the heartbeat and scan_history already show.
++   *
++   * Best-effort and awaited exactly like the coverage write below.
++   */
++  private async persistPassStart(): Promise<void> {
++    try {
++      await this.db.setWorkerState(
++        "push_watch_pass",
++        JSON.stringify({
++          at: Date.now(),
++          note: "running",
++          trackerMs: 0,
++          phase: "running",
++        }),
++      );
++    } catch {
++      /* telemetry only */
++    }
++  }
++
++  /**
++   * Public: publish the tick's tracker status for a tick that had NO budget
++   * for a pass (see worker.ts — a cut tick spends its whole envelope before
++   * the pass, so the pass never starts).
++   *
++   * Without this the row simply stopped moving on those ticks (live
++   * 2026-09-23 02:37-02:41Z: five consecutive cut ticks of 11500ms each, note
++   * frozen at 02:36:26Z, indistinguishable from a lost write). A skipped tick
++   * is a real reading, so it is published as one.
++   */
++  async noteTrackerSkipped(reason: string): Promise<void> {
++    await this.persistPassNote(`skip:${reason}`, Date.now(), "skip");
++  }
+ 
+   /**
+    * Pair lookup for the post-push tracker pass (see lastPairs): serve what
+diff --git a/src/worker.ts b/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -2471,6 +2471,25 @@
+         } catch (err) {
+           console.error(
+             "[worker] tracker pass failed:",
+             err instanceof Error ? err.message : err,
+           );
+         }
++      } else if (scanner) {
++        // No room for a pass this tick (a cut tick spends its whole envelope
++        // in the scan and the flush), so the pass never starts and its durable
++        // coverage line would simply stop moving — the 2026-09-23 02:37-02:41Z
++        // shape: five consecutive cut ticks, note frozen at 02:36:26Z, which
++        // /health cannot tell from a lost write. A skipped tick IS a reading,
++        // so publish it as one: the same bounded, awaited worker_state write
++        // every other tick-tail telemetry uses, and the row then says which
++        // kind of tick it was instead of going quiet.
++        try {
++          await scanner.noteTrackerSkipped(
++            `tick ${lastScanMs}ms${timedOut ? " timed-out" : " no-budget"}`,
++          );
++        } catch (err) {
++          console.error(
++            "[worker] tracker skip note failed:",
++            err instanceof Error ? err.message : err,
++          );
++        }
+       }
+       // Cross-isolate deferral counters, synced only after the completion
+       // flush AND the tracker pass have had their turn (see
+diff --git a/scripts/test-unit.js b/scripts/test-unit.js
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -2889,6 +2889,43 @@
+     assert.equal(scanner.pushWatchNote, note, "the note is carried for the next summary");
+     assert.equal(scanner.pushWatchRecovered, 1);
+     assert.equal(typeof scanner.lastSummary.trackerMs, "number");
+   });
+ 
++  await test("Scanner.runTrackerPass: the note row is stamped RUNNING before the pass works, and a skipped tick still moves it", async () => {
++    // WHY (2026-09-23): the coverage line is the pass's LAST write, so any pass
++    // that does not return left /health.pushWatchPass frozen while its row
++    // writes kept landing (live: row `SRI` lastChecked 02:45:13Z, note `at`
++    // 02:36:26Z). Two shapes, one fix: the RUNNING stamp below (a pass that
++    // starts always moves the row) and noteTrackerSkipped (a tick with no
++    // budget for a pass publishes that instead of going quiet).
++    const { Scanner } = require("../dist/scanner.js");
++    const cfg = loadConfig({});
++    const writes = [];
++    const db = {
++      setWorkerState: async (key, value) => {
++        assert.equal(key, "push_watch_pass", "the note row is the durable one /health and /debug read");
++        writes.push(JSON.parse(value));
++      },
++    };
++    const scanner = new Scanner(
++      db, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
++    );
++    // Read INSIDE the pass: the stamp must already be in the row before the
++    // pass touches a single row.
++    let stampedBeforeWork = null;
++    scanner.pushWatcher = {
++      headTokens: () => [],
++      onPush: async () => {},
++      runTick: async () => {
++        stampedBeforeWork = writes.length === 1 && writes[0].phase === "running";
++        return {
++          checked: 3, alerted: 0, trips: 7,
++          note: "rows 3/29 pairs 6/6 miss 0 lost 0 trips 7",
++          undeliveredTotal: 0, recoveredUndelivered: 0,
++        };
++      },
++    };
++    scanner.lastSummary = {};
++    await scanner.runTrackerPass(Date.now() + 2_500);
++    assert.equal(stampedBeforeWork, true, "the running stamp must land BEFORE the pass does any work");
++    assert.equal(writes.length, 2, `one write per phase (got ${writes.length})`);
++    assert.equal(writes[0].phase, "running");
++    assert.equal(writes[0].trackerMs, 0, "a running stamp has no pass duration yet");
++    assert.equal(writes[1].phase, "done");
++    assert.match(String(writes[1].note), /^ok:3\/0 rows 3\/29/);
++    assert.equal(typeof writes[1].trackerMs, "number");
++    // A tick whose envelope was spent before the pass ever started.
++    await scanner.noteTrackerSkipped("tick 11500ms timed-out");
++    assert.equal(writes.length, 3);
++    assert.equal(writes[2].phase, "skip");
++    assert.equal(writes[2].note, "skip:tick 11500ms timed-out");
++    assert.equal(writes[2].trackerMs, 0, "no pass ran, so there is no pass duration to report");
++  });
++
+   await test("parseTokenSnapshot: FDV and summed reserve are the usable numbers", () => {

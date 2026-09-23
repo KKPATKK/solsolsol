@@ -2485,6 +2485,25 @@ async function runScan(
             err instanceof Error ? err.message : err,
           );
         }
+      } else if (scanner) {
+        // No room for a pass this tick (a cut tick spends its whole envelope
+        // in the scan and the flush), so the pass never starts and its durable
+        // coverage line would simply stop moving — the 2026-09-23 02:37-02:41Z
+        // shape: five consecutive cut ticks, note frozen at 02:36:26Z, which
+        // /health cannot tell from a lost write. A skipped tick IS a reading,
+        // so publish it as one: the same bounded, awaited worker_state write
+        // every other tick-tail telemetry uses, and the row then says which
+        // kind of tick it was instead of going quiet.
+        try {
+          await scanner.noteTrackerSkipped(
+            `tick ${lastScanMs}ms${timedOut ? " timed-out" : " no-budget"}`,
+          );
+        } catch (err) {
+          console.error(
+            "[worker] tracker skip note failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
       // Cross-isolate deferral counters, synced only after the completion
       // flush AND the tracker pass have had their turn (see
