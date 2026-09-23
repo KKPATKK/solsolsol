@@ -258,6 +258,30 @@ statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 …
 `probe4 / held0 cut0` 變 `probe1 miss0 / held0 cut3`，hanging 半由 `probe2 miss2`（1_400ms）變
 `probe1 miss1`（2_600ms）⇒ **278 passed, 0 failed**（詳見 §5）。
 
+#### 4.3.1 上線後讀數（deploy `2b4b9fe` @ 10:50Z，run 35851038091 success 1m20s）
+
+| pass（UTC） | note 尾段 |
+| --- | --- |
+| 10:52:53 | `ok:10/1 rows 10/30 pairs 10/10 miss 0 lost 0 dup-skip 1 … spend[setup 209/2 heal 192/1 … pairs 0/0 rows 485/4 holders 570/1 held0 cut3 probe1 miss0] trips 9 db 1234ms` |
+| 10:53:54 | `ok:10/1 rows 10/30 pairs 10/10 miss 0 lost 0 undelivered 1 … spend[setup 205/2 heal 193/1 … pairs 97/0 rows 2327/8 holders 130/1 held0 cut3 probe1 miss0] trips 13 db 2068ms` |
+| 10:54:52 | `ok:10/1 rows 10/30 pairs 10/10 miss 0 lost 0 … spend[setup 201/2 heal 267/1 … pairs 131/0 rows 1138/5 holders 119/1 held0 cut3 probe1 miss0] trips 10 db 1408ms` |
+| 10:55:53 | `ok:10/1 rows 10/30 pairs 10/10 miss 0 lost 0 … spend[setup 199/2 heal 201/1 … pairs 100/0 rows 1283/5 holders 123/1 held0 cut3 probe1 miss0] trips 10 db 1585ms` |
+
+1. **`probe1 miss0` 全程**（舊讀數 `probe4 miss3`／`probe4 miss2`）：一個 Birdeye call、一個 count、
+   **零個 park**。即係之前 4 個 call 裡面 3 個白付嗰條數冇咗。
+2. **`holders` 嘅 collect 由 1162–2307ms 跌到 119–570ms**：probe 仍然開喺 pair batch 後面、同
+   row loop 重疊，而家只等一個 call 嘅 fetch（cap 2400 之下 119–570ms 全部命中）
+   ⇒ pass 嘅 wall clock 亦回落（`trackerMs` 1699–3171，早前同類 pass 係 3792–3938）。
+3. **`held0 cut3`**：其餘三個 due row 照舊留喺 due list 頭位（唔 park、唔燒 call），下一個 pass 接，
+   所以 30 分鐘 window 係靠「每次真係寫一行」而唔係「開四個得一個」。
+4. **`rows 10/30` 同 `pairs 10/10` 不變**（§4.2 嘅 head 冇被影響）；10:52:53 帶 **`dup-skip 1`**
+   —— 即係 audit ring 帶 `sig` 嘅 proof 真係入到去重判斷（一張卡被正確儉返）嘅嗰條路，
+   同 §11.3 嘅要求對得上。
+5. `/debug/tick.summary.pushWatch` 抽到嘅係完整 pass note（唔再係 `err:Too many subrequests`），
+   但抽樣期間仍然有 pass 處於 `phase:"running"`（10:51:53、10:54:50 兩個 sample）——
+   invocation 嘅 subrequest 上限本身**未有解**（§5 尾）。
+
+
 ### 4.4 未做
 
 * pair 階段嘅重複讀。今日嘅讀數（§4.2.1 第 4 點）話正常 pass 係 `pairs 179/0`——由 `lastPairs`
@@ -271,13 +295,13 @@ statement），而 **pass 嘅覆蓋率就係佢嘅 trips**（live `rows 5/30 …
 
 * `npm run build`（tsc）✅
 * `node scripts/test-unit.js` → **278 passed, 0 failed** ✅（fakes 已跟新 shape，`trips` invariant
-  仍然釘住；278 = 舊 275 + §4.1 嘅兩條 holder 測試 + §4.3 重釘嘅三條）
+  仍然釘住；278 = 舊 277 ＋ §4.1 gate test；§4.3 只係重釘三條既有 test，冇新增條數）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
   → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809
-  **success**（1m16s）✅
+  **success**（1m16s）✅；`2b4b9fe`（§4.3 probe cap／slot）→ run 35851038091 **success**（1m20s）✅
 * 上線後讀數：§3.1（第一刀）、§4.1.1（holder 由飢餓救返）、§4.2.1（row loop 一個 head 一個 trip）、
-  §4.3（holder probe 嘅 cap 同 slot 為何要再調）
+  §4.3.1（`probe1 miss0` 同 collect 回落）
 * 卡片側：`/debug/push-audit` 有帶 `sig` 嘅 follow-up entry（ARGUS 嘅 `ignite`／`liqwarn`／`drain`、
   HANDLES 嘅 `ignite` 等，30 條 ring），`/debug/push-watch.issueCount` = **1**
   （DeadCatBounce，2026-09-22 嘅舊 row）
