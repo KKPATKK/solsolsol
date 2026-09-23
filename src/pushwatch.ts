@@ -1660,7 +1660,9 @@ export class PushWatcher {
     // cannot tell "one probe landed" from "four probes timed out and one row
     // is parked", because the trips count only counts a probe that actually
     // WROTE a count (both shapes read 0 on a miss). Same reasoning as the
-    // heal's miss/enrolled pair.
+    // heal's miss/enrolled pair. The clock is the COLLECT: the probes start
+    // behind the pair batch and overlap the row loop (see the holder stage), so
+    // a small `holders` reading next to `trips 1` is the normal shape.
     let holdersHeld = 0;
     let holdersCut = 0;
     const stageNote = () =>
@@ -2239,6 +2241,107 @@ export class PushWatcher {
      * promises stay distinguishable in /health.
      */
     let terminalAbandoned = 0;
+    /**
+     * START the holder probes HERE, behind the pair batch, and COLLECT them
+     * after the row loop (see the holder stage below).
+     *
+     * The stage used to probe at the very END of the pass, under a rule this
+     * move does not soften: a probe only starts when its whole
+     * TRACKER_HOLDER_CAP_MS fits inside the pass deadline. The row loop always
+     * spends that allowance first, so the rule made the stage DEAD — measured
+     * 2026-09-23 on every pass of an hour: `holders 0/0 held0 cut4`, four due
+     * rows selected and not one of them started, while 35 of the 40 tracked rows
+     * carried no `holders_checked_at` at all (oldest stamp 368 minutes — see
+     * docs/round-trips.md §4). Starting them one stage earlier buys the probes a
+     * turn WITHOUT taking one from the rotation, because the two are not the
+     * same kind of time: the probe is I/O-bound HTTP (Birdeye token_overview,
+     * 300-900ms live, the reason the cap is 1_200) while the row loop's wall
+     * clock is Turso round trips, so probes in flight overlap the rows instead
+     * of queueing behind them. Nothing that keeps cards honest moves: every
+     * WRITE still happens after the row loop, in the same order as before, and a
+     * row gets a count only when its probe PROVED one inside the pass.
+     */
+    let holderProbeDue = 0;
+    let holderProbeHeld = 0;
+    let holderProbeMisses = 0;
+    const holderProbeWrites: Array<{
+      token: string;
+      holders: number;
+      at: number;
+    }> = [];
+    const holderProbePending: Array<Promise<void>> = [];
+    /** Tokens whose probe had not answered when the pass moved on (→ parked). */
+    const holderProbeUnsettled = new Set<string>();
+    {
+      const birdeye = this.birdeye;
+      if (birdeye && cfg.maxHolderChecksPerTick > 0) {
+        // A row that MISSED its probe is parked (see TRACKER_HOLDER_BACKOFF_MS)
+        // and dropped BEFORE the slice, so a slow head cannot hold the stage's
+        // slots while the rows behind it — the ones that answer inside the cap —
+        // wait for turns that never come.
+        const parked = (r: PushWatchRow) => {
+          const failedAt = this.holdersFailedAt.get(r.token);
+          if (failedAt === undefined) return false;
+          if (now - failedAt >= TRACKER_HOLDER_BACKOFF_MS) {
+            this.holdersFailedAt.delete(r.token);
+            return false;
+          }
+          return true;
+        };
+        const holderHead = activeRows
+          .filter(
+            (r) =>
+              pairs.has(r.token) &&
+              (r.holdersCheckedAt === null ||
+                now - r.holdersCheckedAt >= cfg.holdersRefreshMin * 60_000),
+          )
+          .sort((a, b) => (a.holdersCheckedAt ?? 0) - (b.holdersCheckedAt ?? 0))
+          .slice(0, cfg.maxHolderChecksPerTick);
+        const due = holderHead.filter((r) => !parked(r));
+        holderProbeHeld = holderHead.length - due.length;
+        holderProbeDue = due.length;
+        for (const r of due) {
+          // The start condition is UNCHANGED — the whole cap must fit inside
+          // the pass deadline — it is simply evaluated where the pass still has
+          // its allowance (setup + heal + pairs leave 1.0-3.0s of it).
+          if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) break;
+          holderProbeUnsettled.add(r.token);
+          holderProbePending.push(
+            this.bounded(
+              birdeye.getTokenOverview(r.token),
+              TRACKER_HOLDER_CAP_MS,
+              null,
+            )
+              .then((overview) => {
+                holderProbeUnsettled.delete(r.token);
+                if (overview && overview.holderCount !== null) {
+                  holderProbeWrites.push({
+                    token: r.token,
+                    holders: overview.holderCount,
+                    at: now,
+                  });
+                  this.holdersFailedAt.delete(r.token);
+                  return;
+                }
+                // Only a probe that WROTE a count clears the park: a timeout, a
+                // malformed body and a throw all mean "no holder data this
+                // time".
+                holderProbeMisses += 1;
+                this.holdersFailedAt.set(r.token, Date.now());
+              })
+              .catch((err) => {
+                holderProbeUnsettled.delete(r.token);
+                holderProbeMisses += 1;
+                console.error(
+                  "[push-watch] holder refresh failed:",
+                  err instanceof Error ? err.message : err,
+                );
+                this.holdersFailedAt.set(r.token, Date.now());
+              }),
+          );
+        }
+      }
+    }
     let firstRow = true;
     const rowsStart = Date.now();
     const rowsTrips = trips;
@@ -2705,95 +2808,53 @@ export class PushWatcher {
     spent.rows.ms = Date.now() - rowsStart;
     spent.rows.trips = trips - rowsTrips;
 
-    // Holder refresh (Birdeye CU-bounded): oldest-checked first, alive coins only.
+    // Holder refresh (Birdeye CU-bounded): the probes were STARTED behind the
+    // pair batch (see there); this stage only WAITS for the stragglers and
+    // writes what came back. The clock below therefore measures the COLLECT —
+    // the probes themselves overlapped the row loop — while `held` and `cut`
+    // keep their meanings: held = rows already parked by an earlier miss, cut =
+    // due rows this pass got no count out of (no room to start their probe, or —
+    // only when the timers were starved — a probe still in flight).
     const holdersStart = Date.now();
     const holdersTrips = trips;
-    if (this.birdeye && cfg.maxHolderChecksPerTick > 0) {
-      // A row that MISSED its probe is parked (see TRACKER_HOLDER_BACKOFF_MS)
-      // and dropped BEFORE the slice, so a slow head cannot hold the stage's
-      // slots while the rows behind it — the ones that answer inside the cap —
-      // wait for turns that never come.
-      const parked = (r: PushWatchRow) => {
-        const failedAt = this.holdersFailedAt.get(r.token);
-        if (failedAt === undefined) return false;
-        if (now - failedAt >= TRACKER_HOLDER_BACKOFF_MS) {
-          this.holdersFailedAt.delete(r.token);
-          return false;
-        }
-        return true;
-      };
-      const head = activeRows
-        .filter(
-          (r) =>
-            pairs.has(r.token) &&
-            (r.holdersCheckedAt === null ||
-              now - r.holdersCheckedAt >= cfg.holdersRefreshMin * 60_000),
-        )
-        .sort((a, b) => (a.holdersCheckedAt ?? 0) - (b.holdersCheckedAt ?? 0))
-        .slice(0, cfg.maxHolderChecksPerTick);
-      const due = head.filter((r) => !parked(r));
-      holdersHeld = head.length - due.length;
-      // Holder counts proven this pass, written in ONE batch after the loop
-      // (see setPushWatchHoldersMany): N probed rows used to cost N subrequests
-      // on an invocation whose budget is 50.
-      const holderWrites: Array<{ token: string; holders: number; at: number }> =
-        [];
-      for (let i = 0; i < due.length; i++) {
-        const r = due[i];
-        // Holder counts are a slow-moving card detail; drop the rest of the
-        // batch rather than carry the tick past its window. The check reserves
-        // the probe's own cap (not just "are we past the deadline?"), and the
-        // probe itself is raced — it was one of the two unbounded awaits in
-        // the pass.
-        if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) {
-          holdersCut = due.length - i;
-          break;
-        }
-        // The WRITE is deferred to the one batch after the loop (see
-        // setPushWatchHoldersMany): the probe, its cap and the park rule are
-        // unchanged — a probe that returned no count parks its row right here,
-        // and a rejected batch parks every row it covered below.
-        let probed = false;
-        try {
-          const overview = await this.bounded(
-            this.birdeye.getTokenOverview(r.token),
-            TRACKER_HOLDER_CAP_MS,
-            null,
-          );
-          if (overview && overview.holderCount !== null) {
-            holderWrites.push({
-              token: r.token,
-              holders: overview.holderCount,
-              at: now,
-            });
-            probed = true;
-          }
-        } catch (err) {
-          console.error(
-            "[push-watch] holder refresh failed:",
-            err instanceof Error ? err.message : err,
-          );
-        }
-        // Only a probe that WROTE a count clears the park: a timeout, a
-        // malformed body and a throw all mean "no holder data this time".
-        if (!probed) this.holdersFailedAt.set(r.token, Date.now());
-      }
-      if (holderWrites.length > 0) {
-        // The whole stage in ONE round trip (N before this).
-        trips += 1;
-        try {
-          await this.db.setPushWatchHoldersMany(holderWrites);
-          for (const w of holderWrites) this.holdersFailedAt.delete(w.token);
-        } catch (err) {
-          console.error(
-            "[push-watch] holder batch write failed:",
-            err instanceof Error ? err.message : err,
-          );
-          // A rejected batch wrote NOTHING: park every row it covered, the
-          // same state a row whose own write failed used to reach.
-          for (const w of holderWrites) {
-            this.holdersFailedAt.set(w.token, Date.now());
-          }
+    if (holderProbePending.length > 0) {
+      // No new unbounded await: every probe is already capped by
+      // TRACKER_HOLDER_CAP_MS, and this only decides how long the pass is
+      // willing to WAIT for the ones still in flight — the same slice the old
+      // stage demanded before it started one.
+      await this.bounded(
+        Promise.all(holderProbePending),
+        Math.max(0, Math.min(TRACKER_HOLDER_CAP_MS, deadline - Date.now())),
+        null,
+      );
+    }
+    // Still in flight means nothing was proven, so the row is parked exactly
+    // like a probe that missed its cap (only a SUCCESS clears a park). This is a
+    // SAFETY NET rather than a path: the dispatch above only starts a probe
+    // whose whole cap fits inside the pass deadline, so the probe's own cap
+    // always fires first and the wait below always covers it — unless the event
+    // loop starved the timers, which is precisely the case that must not end
+    // with a row looking checked when no count ever arrived.
+    for (const token of holderProbeUnsettled) {
+      this.holdersFailedAt.set(token, Date.now());
+    }
+    holdersHeld = holderProbeHeld;
+    holdersCut = holderProbeDue - holderProbeWrites.length - holderProbeMisses;
+    if (holderProbeWrites.length > 0) {
+      // The whole stage in ONE round trip (N before this).
+      trips += 1;
+      try {
+        await this.db.setPushWatchHoldersMany(holderProbeWrites);
+        for (const w of holderProbeWrites) this.holdersFailedAt.delete(w.token);
+      } catch (err) {
+        console.error(
+          "[push-watch] holder batch write failed:",
+          err instanceof Error ? err.message : err,
+        );
+        // A rejected batch wrote NOTHING: park every row it covered, the
+        // same state a row whose own write failed used to reach.
+        for (const w of holderProbeWrites) {
+          this.holdersFailedAt.set(w.token, Date.now());
         }
       }
     }

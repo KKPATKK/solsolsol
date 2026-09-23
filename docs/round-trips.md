@@ -94,14 +94,42 @@ claim / prune / heal / holder 呢四項，全部係 `src/pushwatch.ts` 嘅 deep 
    全部係 2026-09-22 嘅舊 row），`lost_completion_write` 冇增加。
 7. **`dup-skip` 冇上升**：抽樣期間冇任何 pass note 帶 `dup-skip`（`miss 0 lost 0`）。
 
-## 4. 未做（同一條 audit 剩返落嚟）
+## 4. audit 剩返落嚟嘅嘢
 
-* **holder stage 嘅飢餓（新發現，2026-09-23 上線後第一節）**：每個抽樣 pass 都係
-  `holders 0/0 held0 cut4`，即 4 行 due 但一行都開始唔到（pass 到 holder stage 時已經過
-  deadline）。後果係 card 嘅持有人數實際上停寫（40 行裡 35 行冇 `holders_checked_at`，
-  最舊 stamp 368 分鐘前），而 `setPushWatchHoldersMany` 嘅一 trip 寫入亦無從觀察。
-  兩條路都要試：要么把 holder stage 嘅 deadline 排早一点（或 reserve 一個 slice），
-  要么把 `TRACKER_HOLDER_CAP_MS` 壓到能在尾段內起步。
+### 4.1 holder stage 嘅飢餓 — 已修（2026-09-23，未 deploy）
+
+第一節上線讀數揭到嘅唔係「冇 row due」，而係 stage 永遠起步唔到：佢排喺 pass 最尾，
+而佢自己嘅規矩係「probe 嘅整個 `TRACKER_HOLDER_CAP_MS`（1200ms）要 fit 得入 pass
+deadline 才開始」—— 但 row loop 每次都先花光 allowance。讀數：40 行裡 35 行完全冇
+`holders_checked_at`，最舊 stamp 368 分鐘，而每個 pass 都係 `holders 0/0 held0 cut4`。
+
+修法：**probe 搭住 pair batch 起步，collect 留返最尾**（寫入次序一字不改）。
+
+* 起步位：`runTick` 嘅 pair batch 之後（`holderProbe*` 一組 local：`Due`/`Held`/
+  `Misses`/`Writes`/`Pending`/`Unsettled`）。起步條件**一字不改**
+  （`Date.now() + TRACKER_HOLDER_CAP_MS <= deadline`），只係喺呢個位 pass 仲有 1.0–3.0s。
+* 收集位：原本嘅 holder stage，只剩 `await bounded(Promise.all(pending), min(cap, 剩餘))`
+  ＋一個 batch 寫入（`setPushWatchHoldersMany`）。
+* **點解唔搶 row 時間**：probe 係 I/O-bound HTTP（Birdeye `token_overview`，實測
+  300–900ms，就係 cap 定 1200 嘅原因），而 row loop 嘅時鐘係 Turso round trip ——兩種唔
+  同性質嘅時間 ⇒ 並行而唔係排隊。
+* **語意不變**：所有寫入照舊喺 row loop 之後、次序一樣；只有真正拿到 count 嘅 probe 才
+  會有寫入；`bounded(...)` 仍然係唯一上限；答唔到嘅 row 照舊 park（只有成功才清 park）。
+* note 讀數：`holders <ms>/<trips>` 嘅 ms 而家係 **collect** 嘅時間（probe 已同 row loop
+  重疊），`trips` 一樣係「一個 batch = 1」；`held` 不變；`cut` = 今個 pass 拿唔到 count 嘅
+  due row —— 實際上係「起步位都唔夠 1200ms」那批（
+  「起步咗但仲飛緊」係安全網，只有 timers 被星死才會發生，因為起步條件已保證 probe 自己
+  嘅 cap 會先到期）。
+* 測試：`test-unit.js` 加兩條 —— (a) 4 行 due、row loop 食完全部 allowance
+  （400ms/row vs 2s）之下仍然 4 個 probe 起步、4 個 count 一次 batch 寫入（舊 code 喺同一
+  shape 下係 `probes 0`，所以係真 regression test）；(b) allowance 剩返 < cap 時一個 probe
+  都唔起，note 讀 `held0 cut1`。
+* 改動落線紀錄：`docs/patches/holder-stage-probes-early.apply.js`
+  （＋ `holder-stage-cut-semantics.apply.js` 修正第一版寫錯嘅一條測試 —— 「起步咗但未完」
+  嘅路徑其實到唔到，見上面）。
+
+### 4.2 未做
+
 * pair 階段嘅重複讀。
 * row loop 每行嘅 `claimPushWatchCheck` / `reservePushWatchAlert` / `updatePushWatchCheck`
   —— 每個 silent row 一次，暫時當係必要嘅 per-row CAS（要改就要預先 batch 拎 claim，
@@ -111,8 +139,8 @@ claim / prune / heal / holder 呢四項，全部係 `src/pushwatch.ts` 嘅 deep 
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **275 passed, 0 failed** ✅（fakes 已跟新 shape，
-  `trips` invariant 仍然釘住）
+* `node scripts/test-unit.js` → **277 passed, 0 failed** ✅（fakes 已跟新 shape，
+  `trips` invariant 仍然釘住；277 = 舊 275 + §4.1 嘅兩條 holder 測試）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅
 * 上線後第一節讀數：見 §3.1（本地三項 + 線上七項都照 §3 走）

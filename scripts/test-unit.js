@@ -6202,6 +6202,70 @@ async function main() {
     assert.equal(probes, 2, "an expired park is retried");
     assert.deepEqual(holderWrites, [["AAA", 123]], "the count lands once");
     assert.equal(pw.holdersFailedAt.has("AAA"), false, "a success clears the park");
+
+  await test("PushWatcher: holder probes start with the pair batch, so a pass the rows ate still writes a count", async () => {
+    // Live 2026-09-23, every pass of an hour: `holders 0/0 held0 cut4` — four
+    // due rows selected and NOT ONE started, because the probe only began when
+    // its whole 1200ms cap fitted in what the row loop had not already spent (35
+    // of 40 tracked rows carried no holders_checked_at at all). The probes now
+    // start behind the pair batch and only their COLLECT stays after the rows,
+    // so the pass still writes the counts it proved — and still in ONE batch.
+    const rows = [watchRow("AAA"), watchRow("BBB"), watchRow("CCC"), watchRow("DDD")];
+    const updated = [];
+    const holderWrites = [];
+    let probes = 0;
+    const db = {
+      ...watchDb(rows, updated),
+      // The row loop is the pass's clock (Turso round trips): 400ms per row
+      // against a 2s allowance leaves the tail nothing at all.
+      claimPushWatchCheck: async (token, _expected, _now, v) => {
+        await new Promise((r) => setTimeout(r, 400));
+        updated.push([token, v]);
+        return true;
+      },
+      setPushWatchHoldersMany: async (updates) => {
+        for (const u of updates) holderWrites.push([u.token, u.holders]);
+      },
+    };
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      { getTokenOverview: async () => { probes += 1; return { holderCount: 321 }; } },
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick(Date.now() + 2_000);
+    assert.equal(probes, 4, "every due row is probed, not just the head of a queue that never runs");
+    assert.equal(holderWrites.length, 4, "every count comes back");
+    assert.ok(holderWrites.every(([, holders]) => holders === 321));
+    assert.match(String(out.note), /holders \d+\/1/, `one batch write for all of them: ${out.note}`);
+    assert.match(String(out.note), /cut0/, `every due row got its turn: ${out.note}`);
+  });
+
+  await test("PushWatcher: a pass with no room for the probes reports its due rows as cut", async () => {
+    // `cut` keeps the meaning it had before the probes moved: due rows this pass
+    // got NO count out of. The probes still only start when the whole cap fits
+    // inside the pass deadline (that is what the row loop protects), so a pass
+    // that reaches the stage with less than the cap left starts nothing — the
+    // shape the live starvation hid as `holders 0/0 held0 cut4` on every pass.
+    const rows = [watchRow("AAA")];
+    const updated = [];
+    let probes = 0;
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      watchBot,
+      { getTokenOverview: async () => { probes += 1; return { holderCount: 321 }; } },
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    // 1s allowance: less than the 1200ms cap a probe needs, so none starts.
+    const out = await pw.runTick(Date.now() + 1_000);
+    assert.equal(probes, 0, "a probe with no room for its cap is never started");
+    assert.equal(pw.holdersFailedAt.has("AAA"), false, "and nothing is parked for a probe that never ran");
+    assert.match(String(out.note), /holders \d+\/0 held0 cut1/, `the due row is reported as cut: ${out.note}`);
+  });
     assert.match(String(third.note), /holders \d+\/1/, `the stage reports the write: ${third.note}`);
   });
 
