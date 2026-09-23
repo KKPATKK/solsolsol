@@ -70,9 +70,18 @@ claim / prune / heal / holder 呢四項，全部係 `src/pushwatch.ts` 嘅 deep 
    batch）；冇嘢要 heal 嘅 pass 直接 `heal-skipped 0/0`，唔再為 ledger 付一個 subrequest。
 3. **`trips` 總數**：rows 3 / 4 / 5 分別 `trips 6 / 8 / 9`，而每個 pass 嘅固定成本比舊
    基線低 2（setup −1、heal −1）；row loop 嘅 per-row CAS 仍然係主導項（§4 未做）。
-4. **`spent.holders` 仍係 `0/0`**：呢幾分鐘冇一行 due（`holdersCheckedAt` 未夠
-   `holdersRefreshMin`），所以「N 次 probe → 1 trip」未喺線上行使到；行為由 unit test
-   嘅 `holders` 段釘住，下一節要等有 probe 嘅 pass 再讀一次。
+4. **`spent.holders` 全部係 `0/0 held0 cut4`**——呢個係今節最誠實嘅一條，而同
+   「冇 row due」唔一樣。`/debug/push-watch` 話 40 行裡有 35 行根本冇
+   `holders_checked_at`（有 stamp 嘅只 5 行，最舊嘅 stamp 係 352–368 分鐘前），所以
+   `head` 每次都滿（`slice(0, PUSH_WATCH_MAX_HOLDER_CHECKS = 4)` ⇒ `due` 4 行），但
+   `Date.now() + TRACKER_HOLDER_CAP_MS > deadline` 喺 i=0 就 break，`holdersCut = 4`
+   ——即係**舊有**嘅 holder stage 飢餓（跟呢批改動無關），而唔係「冇 probe 做」。
+   後果有兩重，兩重都要講清楚：
+   * 「N 次 probe → 1 trip」**今日喺線上冇行使過**，所以 holder 那項實際省到嘅
+     round trip 係 **0**（舊 code 喺 0 個 write 嘅 pass 亦一樣係 0）；佢仍然係對嘅改動
+     （一次 flush 代替 N 個 subrequest），但要等 holder stage 不再被切才有讀數。
+   * holder 讀數（card 上嘅持有人數）今日實際上停寫：40 行裡 35 行冇 count 落過。
+     呢個係一條獨立嘅覆蓋問題，同 §4 一樣未有解，唔應該當成「今次改動已驗」。
 5. **cron 到達真係搭咗 claim**：`scheduled_tick_total` 54267 → 54273、
    `scheduled_tick_at` 每分鐘前行（07:41:31 → 07:44:16 → 07:45:18 → 07:46:32 →
    07:47:16），而同一時間 `/health.summary.preTick.steps` 係
@@ -87,6 +96,12 @@ claim / prune / heal / holder 呢四項，全部係 `src/pushwatch.ts` 嘅 deep 
 
 ## 4. 未做（同一條 audit 剩返落嚟）
 
+* **holder stage 嘅飢餓（新發現，2026-09-23 上線後第一節）**：每個抽樣 pass 都係
+  `holders 0/0 held0 cut4`，即 4 行 due 但一行都開始唔到（pass 到 holder stage 時已經過
+  deadline）。後果係 card 嘅持有人數實際上停寫（40 行裡 35 行冇 `holders_checked_at`，
+  最舊 stamp 368 分鐘前），而 `setPushWatchHoldersMany` 嘅一 trip 寫入亦無從觀察。
+  兩條路都要試：要么把 holder stage 嘅 deadline 排早一点（或 reserve 一個 slice），
+  要么把 `TRACKER_HOLDER_CAP_MS` 壓到能在尾段內起步。
 * pair 階段嘅重複讀。
 * row loop 每行嘅 `claimPushWatchCheck` / `reservePushWatchAlert` / `updatePushWatchCheck`
   —— 每個 silent row 一次，暫時當係必要嘅 per-row CAS（要改就要預先 batch 拎 claim，
