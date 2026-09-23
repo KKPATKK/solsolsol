@@ -6241,6 +6241,7 @@ async function main() {
     assert.ok(holderWrites.every(([, holders]) => holders === 321));
     assert.match(String(out.note), /holders \d+\/1/, `one batch write for all of them: ${out.note}`);
     assert.match(String(out.note), /cut0/, `every due row got its turn: ${out.note}`);
+    assert.match(String(out.note), /probe4 miss0/, `all four were started and all four answered: ${out.note}`);
   });
 
   await test("PushWatcher: a pass with no room for the probes reports its due rows as cut", async () => {
@@ -6264,7 +6265,11 @@ async function main() {
     const out = await pw.runTick(Date.now() + 1_000);
     assert.equal(probes, 0, "a probe with no room for its cap is never started");
     assert.equal(pw.holdersFailedAt.has("AAA"), false, "and nothing is parked for a probe that never ran");
-    assert.match(String(out.note), /holders \d+\/0 held0 cut1/, `the due row is reported as cut: ${out.note}`);
+    assert.match(
+      String(out.note),
+      /held0 cut1 probe0 miss0/,
+      `the due row is reported as cut and no probe was started: ${out.note}`,
+    );
   });
     assert.match(String(third.note), /holders \d+\/1/, `the stage reports the write: ${third.note}`);
   });

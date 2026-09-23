@@ -1663,8 +1663,23 @@ export class PushWatcher {
     // heal's miss/enrolled pair. The clock is the COLLECT: the probes start
     // behind the pair batch and overlap the row loop (see the holder stage), so
     // a small `holders` reading next to `trips 1` is the normal shape.
+    // `probe`/`miss` close the last of that ambiguity, live-verified
+    // 2026-09-23: `holders 0/0 held0 cut0` reads either way, because a miss
+    // writes nothing AND the row it missed was just checked — it leaves the
+    // head of the rotation before its park can ever show up as `held`.
     let holdersHeld = 0;
     let holdersCut = 0;
+    // Holder-PROBE counters, declared HERE and not next to the dispatch below:
+    // stageNote() reads them, and stageNote() is also called by this pass's
+    // early returns (the deferrals and the empty-rotation exits), which run
+    // BEFORE the dispatch block — a `let` declared down there would put every
+    // one of those calls in its temporal dead zone.
+    let holderProbeDue = 0;
+    let holderProbeHeld = 0;
+    /** Probes this pass actually STARTED (see the dispatch behind the pairs). */
+    let holderProbeStarted = 0;
+    /** Probes that settled WITHOUT a count: capped, threw, or no holderCount. */
+    let holderProbeMisses = 0;
     const stageNote = () =>
       `allow ${budgetMs} spend[setup ${spent.setup.ms}/${spent.setup.trips}` +
       ` heal${healSkipped ? "-skipped" : healCut ? "-cut" : ""}` +
@@ -1673,7 +1688,8 @@ export class PushWatcher {
       ` pairs ${spent.pairs.ms}/${spent.pairs.trips}` +
       ` rows ${spent.rows.ms}/${spent.rows.trips}` +
       ` holders ${spent.holders.ms}/${spent.holders.trips}` +
-      ` held${holdersHeld} cut${holdersCut}]`;
+      ` held${holdersHeld} cut${holdersCut}` +
+      ` probe${holderProbeStarted} miss${holderProbeMisses}]`;
     const deferred = {
       checked: 0,
       alerted: 0,
@@ -2261,9 +2277,6 @@ export class PushWatcher {
      * WRITE still happens after the row loop, in the same order as before, and a
      * row gets a count only when its probe PROVED one inside the pass.
      */
-    let holderProbeDue = 0;
-    let holderProbeHeld = 0;
-    let holderProbeMisses = 0;
     const holderProbeWrites: Array<{
       token: string;
       holders: number;
@@ -2305,6 +2318,7 @@ export class PushWatcher {
           // the pass deadline — it is simply evaluated where the pass still has
           // its allowance (setup + heal + pairs leave 1.0-3.0s of it).
           if (Date.now() + TRACKER_HOLDER_CAP_MS > deadline) break;
+          holderProbeStarted += 1;
           holderProbeUnsettled.add(r.token);
           holderProbePending.push(
             this.bounded(
