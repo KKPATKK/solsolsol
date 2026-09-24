@@ -1639,6 +1639,41 @@ export class PushWatcher {
    */
   private unconfirmedWrites = 0;
   private settleProbed = false;
+  /**
+   * The stage this pass was in when it last moved, and the invocation's
+   * subrequest probe, kept so a THROW can describe itself.
+   *
+   * WHY (2026-09-24): a thrown pass leaves no stage split at all — the note
+   * is written by the scanner's catch, past every stage boundary — so the
+   * live `err:Too many subrequests by single Worker invocation` readings
+   * arrived with nothing but the message, and two of them (14:39:57Z,
+   * 14:40:15Z) sat on invocations whose counter read 18-27. Nothing in
+   * /health could say which stage died or whether the counter agreed the
+   * invocation was full. `passDiag()` is the answer to both.
+   */
+  private passStage = "none";
+  private subreqProbe: (() => number) | null = null;
+
+  /**
+   * What a THROWN pass can say about itself: the stage it was in, and how
+   * many subrequests the invocation still had unspent.
+   *
+   * The probe is called HERE, not snapshotted at each stage: the scanner
+   * asks in its `catch`, i.e. straight after the throw, so the number is
+   * the counter's opinion at the moment the pass died. A pass with no probe
+   * (every caller before 159af44, and every direct test) reports `n/a` rather
+   * than a fabricated number, and a watcher that has not run a pass reports
+   * `null`, so nothing can leak a stale stage into a later note.
+   *
+   * `null` is the honest answer for the happy path — a note only ever asks
+   * for this after something threw, and by then the stage belongs to the
+   * pass that threw.
+   */
+  passDiag(): string | null {
+    if (this.passStage === "none") return null;
+    const left = this.subreqProbe === null ? null : this.subreqProbe();
+    return `${this.passStage} subreq ${left === null ? "n/a" : left}`;
+  }
 
   /** Tokens the last pass put at the front of its rotation queue. */
   headTokens(): string[] {
@@ -1962,6 +1997,10 @@ export class PushWatcher {
   }> {
     // The tick's waitUntil hand-off, when the caller has one (see holdForTick).
     this.keepAliveForTick = keepAlive ?? null;
+    // Name the pass before it does anything, so a throw in the FIRST read
+    // still says `entry` rather than nothing (see passDiag).
+    this.passStage = "entry";
+    this.subreqProbe = typeof subreqLeft === "function" ? subreqLeft : null;
     const cfg = this.config.pushWatch;
     const now = Date.now();
     const budgetMs =
@@ -2116,6 +2155,7 @@ export class PushWatcher {
     // durable note write and no measurement — strictly better than dying
     // having measured nothing.
     if (outOfBudget()) return deferred;
+    this.passStage = "setup";
     // Case-closed recaps: every coin leaving the window gets ONE summary
     // card before the bulk prune deletes it. Best-effort send — a failed
     // delivery must never keep a dead row alive forever.
@@ -2213,6 +2253,7 @@ export class PushWatcher {
     // was already in flight is not sent a second time.
     // Early in the pass on purpose: the re-armed row has its last_checked
     // zeroed, so it takes the front of the next rotation.
+    this.passStage = "settle";
     const settle = await this.settleUnconfirmedCards(now);
     trips += settle.trips;
     const rearmedCards = settle.rearmed;
@@ -2226,6 +2267,7 @@ export class PushWatcher {
     // push falls back to the current mcap and is the only case that measures
     // "from tracking start". Extra DexScreener call only when something is
     // actually missing; a no-pair coin retries on the next tick.
+    this.passStage = "heal";
     const healStart = Date.now();
     const healTrips = trips;
     // The heal's slice: its own cap, and never past the rotation's reserve
@@ -2520,6 +2562,7 @@ export class PushWatcher {
     // recap just handled — are filtered out here; rows the self-heal enrolled
     // this tick simply join the rotation on the next one. The table is read
     // again ONLY when the listing failed (nothing to reuse).
+    this.passStage = "rows";
     const rows: PushWatchRow[] =
       snapshot !== null
         ? snapshot.filter((r) => r.pushedAt >= windowCutoff)
@@ -3484,6 +3527,7 @@ export class PushWatcher {
     // keep their meanings: held = rows already parked by an earlier miss, cut =
     // due rows this pass got no count out of (no room to start their probe, or —
     // only when the timers were starved — a probe still in flight).
+    this.passStage = "holders";
     const holdersStart = Date.now();
     const holdersTrips = trips;
     if (holderProbePending.length > 0) {

@@ -1898,8 +1898,19 @@ export class Scanner {
       this.exitTickDbLeash();
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[scanner] push-watch tick failed:", msg);
+      // WHY the stage and the counter ride the note (2026-09-24): a throw
+      // skips every stage boundary, so the note used to carry the message
+      // and nothing else. Two live `err:Too many subrequests` readings then
+      // sat on invocations whose own counter read 18-27 — which cannot exhaust
+      // 50 — and /health could not say whether the gates were mistuned or the
+      // counter was blind to the spend. `stage` answers where; `subreq N`
+      // answers which: small N means the counter agreed the invocation was
+      // full, large N means it saw room while the runtime refused, and no
+      // gate placement fixes the second case.
+      const diag = this.pushWatcher.passDiag?.() ?? null;
+      const errNote = `err:${msg.slice(0, 120)}${diag ? ` [${diag}]` : ""}`;
       if (this.lastSummary) {
-        this.lastSummary.pushWatch = `err:${msg.slice(0, 140)}`;
+        this.lastSummary.pushWatch = errNote;
       }
       // Persisted like the success path, because "the note stopped moving" is
       // exactly the signal this row exists to carry: a pass that threw leaves
@@ -1907,7 +1918,7 @@ export class Scanner {
       // indistinguishable from a tick that never reached the pass at all
       // (2026-09-21 04:03-04:05Z: fast ticks, no note, no way to tell the two
       // apart without the Cloudflare log the operator cannot read).
-      await this.persistPassNote(`err:${msg.slice(0, 140)}`, startedAt);
+      await this.persistPassNote(errNote, startedAt);
       return null;
     }
   }

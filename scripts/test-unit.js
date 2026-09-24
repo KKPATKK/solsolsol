@@ -1009,6 +1009,112 @@ async function main() {
     assert.equal(out.checked, 0, "and the row loop was never entered");
   });
 
+  await test("PushWatcher: a thrown pass names the stage it died in, with the counter's opinion", async () => {
+    // The reading this exists for: `err:Too many subrequests by single Worker
+    // invocation` on invocations whose counter read 18-27, with nothing saying
+    // which stage threw. The stage says where; the number says whether the
+    // counter agreed the invocation was full — the one reading that separates a
+    // mistuned gate from a counter that cannot see the spend.
+    const boom = (stage) => {
+      const db = termDb([termRow()]);
+      if (stage === "setup") {
+        db.listPushWatch = async () => {
+          throw new Error("Too many subrequests by single Worker invocation");
+        };
+      } else {
+        // The row loop only runs when the listing HAS rows, so an empty
+        // listing would leave `claimPushWatch` uncalled and the pass would
+        // complete without ever hitting the throw.
+        db.listPushWatch = async () => [termRow()];
+        db.claimPushWatch = async () => {
+          throw new Error("Too many subrequests by single Worker invocation");
+        };
+      }
+      return db;
+    };
+
+    // (a) The LISTING throws. The setup swallows that on purpose — the loop
+    // re-reads, so one failed listing is not a failed pass — so the throw
+    // surfaces at the rows re-read. That is the better assertion anyway: it
+    // proves the label ADVANCES with the pass instead of sticking at the
+    // first stage it ever set.
+    const early = boom("setup");
+    const pwEarly = termWatcher(early, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    await assert.rejects(
+      () => pwEarly.runTick(Date.now() + 5_000, undefined, () => 29),
+      /Too many subrequests/,
+      "the throw still propagates — the gates are a budget, not a catch-all",
+    );
+    assert.equal(
+      pwEarly.passDiag(),
+      "rows subreq 29",
+      "the setup swallowed it and the pass died at the rows re-read — the label ADVANCED, and the counter still says 29 were free",
+    );
+
+    // (b) It dies later, in the row loop.
+    const late = boom("rows");
+    const pwLate = termWatcher(late, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    await assert.rejects(
+      () => pwLate.runTick(Date.now() + 5_000, undefined, () => 3),
+      /Too many subrequests/
+    );
+    assert.equal(pwLate.passDiag(), "rows subreq 3", "the stage tracks the pass, and the number is read at the throw");
+
+    // (c) A pass with no probe installed must not invent a number — this is
+    // every caller and every direct test that predates the two ceilings.
+    const plain = boom("rows");
+    const pwPlain = termWatcher(plain, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    await assert.rejects(() => pwPlain.runTick(Date.now() + 5_000));
+    assert.equal(pwPlain.passDiag(), "rows subreq n/a", "`n/a`, not a fabricated count");
+  });
+
+  await test("PushWatcher: passDiag is silent before any pass has run", () => {
+    const db = termDb([termRow()]);
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    assert.equal(pw.passDiag(), null, "no stage, nothing to say — a stale label can never reach a note");
+  });
+
+  await test("Scanner.runTrackerPass: the err note carries the stage and the counter's opinion", async () => {
+    // The scanner half of the same fix: it is the catch that writes the note,
+    // so without this the stage and the count exist but never reach /health.
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const scanner = new Scanner(
+      {}, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    let asked = 0;
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      passDiag: () => {
+        asked += 1;
+        return "rows subreq 4";
+      },
+      runTick: async () => {
+        throw new Error("Too many subrequests by single Worker invocation. To configure this limit, refer to https://developers.cloudflare.com/workers/wrangler/configuration/");
+      },
+    };
+    scanner.lastSummary = {};
+    const note = await scanner.runTrackerPass(Date.now() + 2_500);
+    assert.equal(note, null, "a throw still returns null — the note is telemetry, not a result", );
+    assert.match(String(scanner.lastSummary.pushWatch), /^err:Too many subrequests/, "the message is still first");
+    assert.match(String(scanner.lastSummary.pushWatch), /\[rows subreq 4\]$/, "and the stage plus the counter's opinion ride along");
+    assert.equal(asked, 1, "the watcher is asked exactly once, in the catch");
+
+    // A watcher that predates passDiag (a bare test double, an old deploy's
+    // shape) must not turn a pass failure into a second failure.
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      runTick: async () => {
+        throw new Error("boom");
+      },
+    };
+    const legacy = await scanner.runTrackerPass(Date.now() + 2_500);
+    assert.equal(legacy, null);
+    assert.equal(scanner.lastSummary.pushWatch, "err:boom", "no diag, no suffix — the old note verbatim");
+  });
+
   await test("PushWatcher: a healthy invocation is unbounded by the probe (room reads no gate)", async () => {
     const db = termDb([termRow()]);
     const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
@@ -11035,6 +11141,49 @@ async function main() {
       missing.length,
       0,
       `partial paste of docs/patches/tracker-subreq-budget.apply.js — missing: ${missing.join(", ")}`,
+    );
+  });
+
+  await test("out-of-window patch: a thrown pass describes itself (docs/patches/tracker-pass-err-diag.apply.js)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const scannerSrc = read("src/scanner.ts");
+    const applied = {
+      "pushwatch (the stage is held)": pushwatchSrc.includes('privatepassStage="none";'),
+      "pushwatch (the probe is held)":
+        pushwatchSrc.includes("privatesubreqProbe:(()=>number)|null=null;"),
+      "pushwatch (the reader asks at call time)":
+        pushwatchSrc.includes("constleft=this.subreqProbe===null?null:this.subreqProbe();"),
+      "pushwatch (no probe, no number)":
+        pushwatchSrc.includes('left===null?"n/a":left'),
+      "pushwatch (every stage is named)": ["entry", "setup", "settle", "heal", "rows", "holders"].every((s) =>
+        pushwatchSrc.includes(`this.passStage="${s}";`),
+      ),
+      "scanner (the note asks the watcher)":
+        scannerSrc.includes("constdiag=this.pushWatcher.passDiag?.()??null;"),
+      "scanner (the durable note is the same line)":
+        (scannerSrc.split("awaitthis.persistPassNote(errNote,startedAt);").length - 1) === 1 &&
+        !scannerSrc.includes("awaitthis.persistPassNote(`err:${msg.slice(0,140)}`,startedAt);"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ pass throw diagnostic missing - apply docs/patches/tracker-pass-err-diag.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    // Half a diagnostic is the state that costs the most: the stage exists but
+    // the note does not carry it, and /health still cannot say which stage died.
+    assert.equal(
+      missing.length,
+      0,
+      `partial paste of docs/patches/tracker-pass-err-diag.apply.js — missing: ${missing.join(", ")}`,
     );
   });
 
