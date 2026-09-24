@@ -56,8 +56,10 @@ import {
  * Wall-clock slice ONE post-push tracker pass may use.
  *
  * The pass IS the tracker's rotation mechanism: it walks the tracked rows
- * least-recently-checked first, and each pass advances that queue by a head
- * (TRACKER_PAIR_HEAD rows at best). Where its time comes FROM has moved twice,
+ * least-recently-checked first, and one pass now covers the WHOLE rotation
+ * (TRACKER_PAIR_HEAD = the pool's own 30-row ceiling; it used to advance the
+ * queue by a head of ten, three passes deep). Where its time comes FROM has
+ * moved twice,
  * both times because measurement said so:
  *
  *  - 2026-09-17: 500 → 1000 → 1600. The pass ran INSIDE the scan and its
@@ -74,11 +76,15 @@ import {
  *    ~4s of its budget unused behind the completion flush, so the pass is
  *    funded from there now: after the flush, with this as its ceiling.
  *
- * 2500ms is the measured cost of a full head: ~400ms of setup (listing,
- * recap/prune, terminal settle), ~600ms of pair batch (one DexScreener
- * request, capped by TRACKER_PAIRS_BUDGET_MS), then ONE store round trip per
- * silent row (~110-200ms each) plus any card sends — which are gated
- * separately by TRACKER_SEND_MIN_MS, not by this number.
+ * The measured cost of a full pass (live 2026-09-24 03:29Z) is ~1.4s of it:
+ * ~350ms of setup (listing, recap/prune, terminal settle), ~335ms of pair
+ * batch (ONE DexScreener request, capped by TRACKER_PAIRS_BUDGET_MS), then ONE
+ * store round trip for the WHOLE silent queue (~136ms for ten rows — the
+ * batched claim), plus any card sends, which are gated separately by
+ * TRACKER_SEND_MIN_MS, not by this number. What the allowance therefore buys
+ * is headroom for the ALERTING shape: an alerting row pays its own claim,
+ * reservation, send and audit round trips, so a pass that meets several of
+ * them is the one that spends this number.
  */
 const TRACKER_TICK_BUDGET_MS = 5_000;
 /**
@@ -315,27 +321,59 @@ const HOLDER_PROBE_STAMP_KEY = "holder_probe_at";
  * past it). Without this cap the batch ran on the client's own
  * PAIRS_FETCH_BUDGET_MS (1250ms) — LONGER than the pass budget — so a slow
  * batch silently consumed the entire pass and left the row loop with
- * nothing (see TRACKER_TICK_BUDGET_MS). 600ms still fits the shared
- * 250ms dispatch spacing plus a healthy round trip; a batch that misses it
- * is retried on the next tick (the pair cache makes the retry cheap).
- */
-const TRACKER_PAIRS_BUDGET_MS = 600;
-/**
- * Rows the pair batch covers: the HEAD of the rotation queue, not the whole
- * watch list. The row loop fits one or two rows inside the pass budget, so
- * asking DexScreener for all 30 addresses spent the pass's one mandatory
- * request on coins that were never evaluated this tick — and a batch that
- * missed its cap then made EVERY row a pair miss, so the pass did nothing at
- * all and reported `pairs 0/30 miss 30` (live 2026-09-18 02:01Z).
+ * nothing (see TRACKER_TICK_BUDGET_MS). A batch that misses the cap is
+ * answered as `pairs-empty` (no row judged, nothing deleted — see the guard in
+ * runTick) and retried on the next tick, where the pair cache makes the retry
+ * cheap.
  *
- * 6 → 10 with the 5_000ms allowance (2026-09-21): at 3_500 the pass was
- * budget-cut after three rows (`rows 3/23 ... budget-cut`), so six covered
- * the head twice over; at 5_000 the loop can reach ~8-9 rows, and a head
- * smaller than that would silently cap the rotation at the head size. Ten
- * addresses is still ONE DexScreener request (the API takes up to 30) inside
- * the same ~150-600ms cap.
+ * 600 → 1_200 with the whole-pool head (2026-09-24): the batch now asks for
+ * TRACKER_PAIR_HEAD = 30 addresses instead of 10, and the client sends them as
+ * ONE request (`/latest/dex/tokens/<addresses>` takes 30 per request — see
+ * DexScreenerClient.fetchPairsForTokens's 30-address batching), so the extra
+ * cost is a larger payload on the SAME round trip rather than three round
+ * trips. Measured before the change (live 2026-09-24 03:29Z): the 10-address
+ * batch cost 335ms (`pairs 335/0`) inside a pass that spent 1_376ms of a
+ * 4_873ms allowance — the headroom was already there and unused. The cap is
+ * still well inside the pass, and both the heal's deadline and the row loop's
+ * reserve are derived from it, so a batch that stalls yields to the rows
+ * instead of holding the pass open.
  */
-const TRACKER_PAIR_HEAD = 10;
+const TRACKER_PAIRS_BUDGET_MS = 1_200;
+/**
+ * Rows the pair batch covers: THE WHOLE ROTATION, not a slice of it.
+ *
+ * 30 is the tracking pool's own ceiling (cfg.maxTracked, itself hard-capped at
+ * 30 in config.ts) and the listing is ordered active-rows-by-last-checked, so
+ * the head now IS the rotation queue: ONE pass can evaluate every active row,
+ * and the head stops being a second limit on coverage.
+ *
+ * History. 6 → 10 came with the 5_000ms allowance (2026-09-21), when the row
+ * loop fit one or two rows per pass and the head only had to cover the loop's
+ * own reach — a smaller head would have capped the rotation at the head size,
+ * and asking DexScreener for all 30 addresses spent the pass's one mandatory
+ * request on coins that were never evaluated (`pairs 0/30 miss 30`, live
+ * 2026-09-18 02:01Z). Both halves of that reasoning expired with the batched
+ * silent claims (2026-09-23): a pass now writes the whole head in ONE store
+ * round trip and ends well inside its allowance — live 2026-09-24 03:29Z,
+ * `ok:10/0 rows 10/29 pairs 10/10 … allow 4873 spend[setup 346/3 heal 214/1
+ * pairs 335/0 rows 136/1 holders 0/0 held0 cut4] trips 7 db 1056ms`,
+ * trackerMs 1376 — so what stopped a pass at ten rows was the HEAD itself, not
+ * the budget and not the store. The rotation was therefore still three passes
+ * deep (live age waves of ten rows at 0-30s / 240s / 330s, i.e. a full cycle
+ * of 5-8 minutes) while each pass had ~3.4s to spare, and a `pairs-empty` tick
+ * (the DexScreener batch that never answers) cost a third of a cycle instead
+ * of one tick.
+ *
+ * The wider batch costs ONE request either way (the client batches by 30 — see
+ * DexScreenerClient.fetchPairsForTokens), and rows the loop never reaches are
+ * NOT counted as pair misses (pairMiss is incremented inside the loop only), so
+ * they are never blamed, never deleted and never blocked from the next pass's
+ * head. Side benefit: the holder stage's candidate list is `pairs.has(token)`,
+ * so before this change a row outside the head could not be probed at all —
+ * now the stalest holder row in the whole pool is always the one the pass's
+ * single probe slot can go to.
+ */
+export const TRACKER_PAIR_HEAD = 30;
 /**
  * Age past which a row the tracker has NEVER evaluated is treated as a
  * BACKFILL instead of a live follow-up: its push is older than the alert

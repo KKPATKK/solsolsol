@@ -19,7 +19,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
@@ -5804,6 +5804,14 @@ async function main() {
     // batch and the row loop — zero rows evaluated, tick after tick, while the
     // note read healthy and the same work was redone on the next pass. The old
     // 29-row rotation's oldest row measured 99 minutes stale.
+    //
+    // The fixture asks for 3_200ms rather than the live 2_500ms because the
+    // rotation's reserve (deadline − heal) is priced from the pair batch, and
+    // the whole-pool batch raised it 1_200 → 1_800ms: at 2_500 the heal has no
+    // room to START (setup ~600ms + 1_800 reserve leaves < TRACKER_HEAL_MIN_MS)
+    // and the pass reports `heal-skipped`, which is the NEXT test's guarantee.
+    // 3_200 leaves a slice ~800ms — enough to start, too little to finish —
+    // i.e. the cut-at-its-slice shape this test exists for.
     const rows = [watchRow("AAA"), watchRow("BBB")];
     const updated = [];
     const slow = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -5827,7 +5835,7 @@ async function main() {
       async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
       null,
     );
-    const out = await pw.runTick(Date.now() + 2_500);
+    const out = await pw.runTick(Date.now() + 3_200);
     assert.ok(
       out.checked >= 1,
       `the rotation must still be served behind a chronic heal, got ${out.checked} rows`,
@@ -5958,15 +5966,17 @@ async function main() {
   });
 
   await test("PushWatcher: the pair batch covers only the rows the pass can actually reach", async () => {
-    // 24 tracked coins, one DexScreener request. Asking for all of them spent
-    // the pass's only mandatory call on addresses the loop never evaluates —
-    // and a slow batch then made every row a pair miss, so the pass did
-    // nothing at all (`pairs 0/30 miss 30`, live 2026-09-18). The head the
-    // batch covers is deliberately NOT hard-coded here: the point is that it
-    // is a strict subset of the watch list (and that only covered rows can be
-    // blamed), not the size of the head on any given day.
+    // The head the batch covers IS the pool's ceiling now (TRACKER_PAIR_HEAD
+    // = 30 = cfg.maxTracked — see pushwatch), so a watch list BIGGER than the
+    // cap is the only shape left in which the batch is a strict subset — and
+    // that is exactly the shape the second half of this test's name is about:
+    // only the rows the batch COVERED may be blamed (a coin must never be
+    // judged delisted, and so deleted, off a request it was never part of —
+    // live 2026-09-18 `pairs 0/30 miss 30`). The size is read from the
+    // constant rather than hard-coded, so widening the head cannot silently
+    // retire this guard.
     const rows = [];
-    for (let i = 0; i < 24; i++) rows.push(watchRow(`T${i}`));
+    for (let i = 0; i < 40; i++) rows.push(watchRow(`T${i}`));
     const updated = [];
     const asked = [];
     const pairsFor = async (addrs) => {
@@ -5978,12 +5988,13 @@ async function main() {
     );
     const out = await pw.runTick();
     assert.equal(asked.length, 1);
-    assert.ok(
-      asked[0] > 0 && asked[0] < rows.length,
-      `batch asked for ${asked[0]} of ${rows.length} addresses, expected the queue head`,
+    assert.equal(
+      asked[0],
+      TRACKER_PAIR_HEAD,
+      `batch asked for ${asked[0]} of ${rows.length} addresses, expected the head`,
     );
     assert.equal(out.checked, 1, "the row that did resolve a pair is evaluated");
-    assert.match(String(out.note), /rows 1\/24/);
+    assert.match(String(out.note), /rows 1\/40/);
     assert.match(String(out.note), new RegExp(`pairs 1\\/${asked[0]}`));
     // Only the rows the batch COVERED may be counted as misses — a coin can
     // never be judged delisted off a request it was not part of.
@@ -5992,6 +6003,33 @@ async function main() {
       !new RegExp(`miss ${rows.length}\\b`).test(String(out.note)),
       `rows outside the batch must not be reported as misses: ${out.note}`,
     );
+  });
+
+  await test("PushWatcher: the pair batch asks for the WHOLE rotation when the pool fits the cap", async () => {
+    // The point of the whole-pool head (2026-09-24). The rotation queue IS
+    // the watch listing (LIMIT cfg.maxTracked = 30, hard-capped in
+    // config.ts), so one pass can now evaluate every active row: before
+    // this, a pass stopped at ten and a full cycle took three passes — live
+    // 03:46:28Z age waves of ten rows at 0s / 120s / 360s — while the pass
+    // had ~3.4s of its 4.9s allowance unspent (03:29:07Z: `rows 10/29`,
+    // `spend[... rows 136/1 ...]`, trackerMs 1376, no budget-cut).
+    const rows = [];
+    for (let i = 0; i < 29; i++) rows.push(watchRow(`T${i}`));
+    const updated = [];
+    const asked = [];
+    const pairsFor = async (addrs) => {
+      asked.push(addrs.length);
+      return new Map([["T0", watchPair("T0")]]);
+    };
+    const pw = new PushWatcher(
+      watchDb(rows, updated), watchBot, null, loadConfig({}), pairsFor, null,
+    );
+    const out = await pw.runTick();
+    assert.equal(asked.length, 1, "still ONE DexScreener request");
+    assert.equal(asked[0], rows.length, `asked for ${asked[0]} of ${rows.length}`);
+    assert.match(String(out.note), /rows 1\/29/);
+    assert.match(String(out.note), /pairs 1\/29/);
+    assert.match(String(out.note), /miss 28\b/);
   });
 
   await test("PushWatcher: a row that starts after the deadline sends inside the pass tail", async () => {
@@ -6170,9 +6208,10 @@ async function main() {
     assert.deepEqual(pw.headTokens(), [], "nothing published before the first pass");
     await pw.runTick();
     const head = pw.headTokens();
-    assert.ok(
-      head.length > 0 && head.length < rows.length,
-      `head size ${head.length} of ${rows.length}`,
+    assert.equal(
+      head.length,
+      rows.length,
+      `the head published for the scanner IS the whole rotation when the pool fits the cap: ${head.length} of ${rows.length}`,
     );
     assert.equal(head[0], "T0", "least-recently-checked first, i.e. the rotation order");
   });

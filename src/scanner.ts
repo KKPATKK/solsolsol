@@ -545,12 +545,13 @@ const TRACKER_GECKO_LOOKUPS = 2;
  *   final write    TRACKER_ROW_LEASH_MS   1_500ms
  *                                        -------
  *                                        7_350ms
- * plus the pair batch (TRACKER_PAIRS_BUDGET_MS 600ms) on the row that opens a
- * pass, so 8_000ms is that chain with slack. A pass on a degraded Turso can
- * genuinely need all of it; anything LONGER is an await no bound covers — which
- * is exactly what this is for (live 2026-09-23: 61 seconds on one pass).
+ * plus the pair batch (TRACKER_PAIRS_BUDGET_MS 1_200ms since the whole-pool
+ * head, 2026-09-24) on the row that opens a pass, so 8_600ms is that chain with
+ * slack. A pass on a degraded Turso can genuinely need all of it; anything
+ * LONGER is an await no bound covers — which is exactly what this is for (live
+ * 2026-09-23: 61 seconds on one pass).
  */
-const TRACKER_PASS_OVERRUN_MS = 8_000;
+const TRACKER_PASS_OVERRUN_MS = 8_600;
 /**
  * Slice of the chain kept for the gates that run LAST (wallet analysis, the
  * top-10 band, Flurry deploy-slot forensics) so the CARD-ONLY enrichments in
@@ -2995,8 +2996,11 @@ export class Scanner {
       // this batch is what keeps them in Scanner.lastPairs — without it the
       // tracker's own request is the only one that ever asks for them and
       // the pair cache stays empty for them (see pairsForTracker). At most
-      // TRACKER_PAIR_HEAD extra addresses, so the extra cost is at most one
-      // more batch in a phase that already dispatches several.
+      // TRACKER_PAIR_HEAD extra addresses — the tracker pool's ceiling, i.e.
+      // the whole rotation — so the extra cost is at most one more batch in a
+      // phase that already dispatches several. They are appended LAST, so a
+      // batch the phase's deadline skips is the tracker's pre-fetch, never one
+      // of the scan's own coins (whose pairs the gates need THIS tick).
       const addresses = [
         ...new Set([
           ...scannedProfiles.map((p) => p.tokenAddress),

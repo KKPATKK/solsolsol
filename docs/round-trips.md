@@ -723,6 +723,66 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
    request」呢句**只由 unit test 釘住**（一個 counting client 度到整個讀係 1 個 call、寫係 1 個 call），
    live 冇獨立證據。要 live 量就要喺 window 入面加一個 telemetry 讀數（下一刀）。
 
+## 4.8 追蹤池 head：10 → 30，一個 pass 掃完全池（2026-09-24，未上線）
+
+**問題唔喺「掃唔掃到」，而喺「幾時掃到」。** `/debug/push-watch?limit=500`（03:46:28Z）
+顯示表 46 行 ＝ **31 active ＋ 15 terminal**（`rug` / `unwatched`，故意唔掃）。但 active 行嘅
+`last_checked` 年齡一直係**三堆、每堆十行**：
+
+| 抽樣（Z） | 年齡波浪（30s 桶 → 行數） | 最舊 |
+|---|---|---|
+| 03:29Z | `2min:10 / 4min:10 / 5min:10` | 5.2min |
+| 03:31:13Z | `120s:10 / 210s:10 / 480s:9` | 8.3min |
+| 03:46:28Z | `0:10 / 120s:10 / 360s:10 / 420s:1` | 7.3min |
+
+即一個 pass 只掃 10 行、全池一輪 3 個 pass、最舊嗰批 5–8 分鐘。**但個 pass 根本冇用盡
+allowance**（03:29:07Z）：
+
+```
+ok:10/0 rows 10/29 pairs 10/10 miss 0 lost 0 allow 4873
+spend[setup 346/3 heal 214/1 miss0 enrolled0 pairs 335/0 rows 136/1 holders 0/0 held0 cut4 probe0 miss0 cu-gate] trips 7 db 1056ms
+trackerMs 1376
+```
+
+10 行 silent claim 而家係**一個 trip / 136ms**（§4.2 嘅 batching 成果），成個 pass 只用
+1.4s／4.9s，冇 `budget-cut`。所以停喺 10 行純粹係 `TRACKER_PAIR_HEAD` **呢個 head 上限**，
+唔係時間、唔係 Turso。
+
+**改動**：
+
+| 位 | 前 | 後 | 理由 |
+|---|---|---|---|
+| `pushwatch.TRACKER_PAIR_HEAD` | 10 | **30** | ＝ `cfg.maxTracked`（config.ts 硬 cap 30），而 listing 係 active 行按 `last_checked` 最舊先排 → head 就係輪替隊列本身 |
+| `pushwatch.TRACKER_PAIRS_BUDGET_MS` | 600 | **1_200** | 批次由 10 個 address 變 30 個，**仍然係一個 request**（`/latest/dex/tokens` 一請求食 30 個 address，見 `DexScreenerClient.fetchPairsForTokens` 嘅 30 分批）；10 個實測 335ms，30 個要 ~3 倍 payload 嘅餘裕 |
+| `scanner.TRACKER_PASS_OVERRUN_MS` | 8_000 | **8_600** | watchdog 嘅前提係「枚舉得完嘅 bounded 鏈」：pair batch 600 → 1_200，鏈尾跟住加 600 |
+
+**唔變嘅保證**：`pairMiss` 只喺 loop 內部加（`pairMiss += 1`）—— 批次冇 cover 到嘅行
+（pool > cap 嘅形狀）唔會被 blame，所以亦唔會觸發「2 小時搵唔到」嘅刪行；批次一個都冇回
+仍然係 `pairs-empty`（唔判斷、唔寫、唔刪），下個 tick 重試；row loop 嘅 reserve 同 heal 嘅
+deadline 都由 `TRACKER_PAIRS_BUDGET_MS` 推算，所以一個慢批次一樣要讓路畀啲行。
+
+**一個要知嘅代價**：heal 嘅 slice 係 `deadline − (TRACKER_PAIRS_BUDGET_MS + TRACKER_ROW_RESERVE ×
+TRACKER_ROW_MIN_MS)`，即由 1_200 變 **1_800** —— 一個只淨 ~2.5s 嘅 pass 而家會 `heal-skipped`
+（讓路畀輪替），唔再係以前嗰種「開咗 heal 再喺中途 cut」。兩個形狀都係 fail-open（下一 pass 由
+同一個 listing 重新提供嗰啲 missing push），而 live pass 多數 `allow ≈ 4_800`，heal 一樣食得到
+自己嗰 2_600ms 上限。單元測試嗰個 cut-heal fixture 因此由 2_500 → 3_200ms（見 fix1 script）。
+
+**一個附帶修好**：holder stage 嘅候選集係 `pairs.has(token)`，即係以前 head 以外嘅行
+**永遠冇機會**被 probe；而家 due list 係全 pool 按 `holdersCheckedAt` 排序，最舊嗰行一定
+食到每 pass 唯一嘅 slot。
+
+**active 31 > cap 30**：listing 嘅 `LIMIT ?` ＝ 30，排序係 active 行最舊先，所以多出嚟嗰行
+係**最新檢查**嗰行；下一 pass 佢就係最舊，自然回到隊列 —— 唔會餓死，只係快取／慢取之分。
+
+**上線後要讀**（未做）：
+
+1. `rows X/N` 嘅 X 由 10 升到貼近 N，`pairs N/N`；
+2. active 行嘅年齡由**三堆變一堆**（最舊 < 3 分鐘）；
+3. `allow` 同 `trackerMs` 嘅差距縮返，但唔可以出現 `budget-cut` 或 `cut:watchdog`；
+4. subrequest 窗：掃描 pair phase 而家連 head（最多 30 個 address）一齊 ask，而且 append 喺
+   最後（超 budget 只會剪走 tracker 嘅 pre-fetch），正常 tick 最多多 1 條，要盯住 50 上限
+   （§4.6 量到嘅生還 tick 窗 ≈ 30）。
+
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
