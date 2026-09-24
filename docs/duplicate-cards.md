@@ -925,5 +925,10 @@ Turso 連線走 **HTTP transport**（`src/db.ts` `createRawClient`：`libsql://`
     `p:up100:<bucket>`；下一個 pass（row 帶住嗰個 mark、而 proof 已經偏離個窗 10 分鐘）⇒ 仍然擋得住，
     只有 ⚠️ 重送一次。呢條就係「補寫返 mark」嘅端到端證明。
 * **落線 script**：`docs/patches/cut-card-proof-no-mark.apply.js`（row loop ＋ proof 讀取閘 ＋ 兩條測試）。
+* **落線讀數**（2026-09-24 02:36Z，deploy run 35947790374）：pass note
+  `ok:10/1 rows 10/29 pairs 10/10 miss 0 lost 0 undelivered 1 … trips 14 db 2456ms` ⇒ pass 正常完結
+  （phase `done`），`/debug/push-watch.issueCount` 仍然係 2（兩條舊 `lost_completion_write`，冇新增）。
+  `dup-skip` **未出現** —— 呢條規則要「已送達但 mark 冇落地」嘅巧合，唔會即刻撞到。驗收係佢出現嗰陣
+  **唔會**跟住多送一張卡（同一條 row 嘅 `undelivered` 唔會因為我哋壓抑咗一張而升）。
 
 
