@@ -1347,6 +1347,147 @@ async function main() {
     );
   });
 
+  await test("evaluateWatch: with NO cut mark, a proof from the row's OWN check still refuses the duplicate", () => {
+    // The mark is written by the pass that ATTEMPTED the send, so a pass that
+    // died before its write (a rollback, a killed isolate) leaves a delivered
+    // card unmarked — and the next evaluation re-derives it and sends it. The
+    // audit entry dates the delivery, so it answers the same question the mark
+    // does, but only about THIS check: a re-armed row's older delivery must
+    // never silence a genuinely new card.
+    const at = 1_800_000_000_000; // an exact minute boundary: the buckets are clean
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "REK", pushedAt: 0,
+      mcapAtPush: 170_000, peakMcap: 240_000, lastLiquidity: 32_000,
+      deadTroughMcap: null, holdersAtPush: null, holdersLast: null,
+      holdersCheckedAt: null, lastChecked: at, lastAlertAt: 0,
+      followupsSent: 0, lastState: null, upStages: null,
+      ...over,
+    });
+    const live = { mcap: 59_000, liquidity: 32_000, chg5m: -2, buysH1: 120, sellsH1: 180 };
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const cfgProven = (proofAt, key = cardProofKey("T", "dead")) => ({
+      ...cfg,
+      followupProofAt: new Map([[key, proofAt]]),
+    });
+
+    // A proof inside the row's OWN check bucket: announced, not sent, and it
+    // carries the proof's stamp so the caller can write the mark back.
+    const same = evaluateWatch(row(), at + 60_000, live, cfgProven(at + 30_000));
+    assert.equal(same.alerts.length, 1);
+    assert.equal(same.alerts[0].sig, "dead");
+    assert.equal(same.alerts[0].deduped, true, "the card the chat already has is not sent again");
+    assert.equal(same.alerts[0].dedupedAt, at + 30_000, "and it carries the proof's own stamp");
+    assert.equal(same.lastState, "dead", "the transition lands instead of being re-derived");
+
+    // The NEXT bucket counts too: a pass that claimed at :59 delivers at :00.
+    assert.equal(
+      evaluateWatch(row(), at + 60_000, live, cfgProven(at + 90_000)).alerts[0].deduped,
+      true,
+      "the straddle is the same one-bucket slop the cut-mark rule allows",
+    );
+
+    // Older than that is NOT this check's evidence: a re-armed row announces the
+    // same transition again, and an old delivery must not silence that card.
+    assert.equal(
+      evaluateWatch(row(), at + 60_000, live, cfgProven(at + 120_000)).alerts[0].deduped,
+      undefined,
+      "two buckets on belongs to an earlier check",
+    );
+    assert.equal(
+      evaluateWatch(row(), at + 60_000, live, cfgProven(at - 60_000)).alerts[0].deduped,
+      undefined,
+      "and so does one from before it",
+    );
+
+    // The token-width fallback cannot NAME the card, so it cannot silence one:
+    // with no mark to anchor the question, only the exact key counts here.
+    assert.equal(
+      evaluateWatch(row(), at + 60_000, live, cfgProven(at + 30_000, "T")).alerts[0].deduped,
+      undefined,
+      "a proof that cannot name the card proves nothing about it",
+    );
+    // A mark for a DIFFERENT transition is judged on its own sig, and one that
+    // is not current does not defer this evaluation either.
+    assert.equal(
+      evaluateWatch(
+        row({ upStages: cutMarkFor("up100", at - 300_000) }),
+        at + 60_000,
+        live,
+        cfgProven(at + 30_000),
+      ).alerts[0].deduped,
+      true,
+      "the dead card is judged on its own proof",
+    );
+    // Still never-miss: no proof at all and the card goes out.
+    assert.equal(evaluateWatch(row(), at + 60_000, live, cfg).alerts[0].deduped, undefined);
+  });
+
+  await test("PushWatcher: a delivered card with NO mark is refused, and the rollback writes its mark back", async () => {
+    // The end-to-end half: a delivered card whose mark never landed must not be
+    // re-sent, AND the suppression has to leave a mark behind — otherwise the
+    // next pass, with the proof outside its window, sends the very duplicate
+    // the rule just prevented.
+    const base = Date.now();
+    const popeyeRow = (over = {}) =>
+      termRow({
+        peakMcap: 400_000, mcapAtPush: 100_000, upStages: null, lastLiquidity: 32_000,
+        lastChecked: base, ...over,
+      });
+    const popeyePair = (token) => ({ ...termPair(token, 32_000), marketCap: 240_000 });
+    const mkWatcher = (db, bot) =>
+      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, popeyePair(a)])), null);
+
+    // The row carries NO marks, but the audit proves the 🚀 card was already
+    // delivered inside this very check (its mark write is what went missing),
+    // and the ⚠️ sibling's send is REJECTED — so the row is rolled back.
+    const db = termDb([popeyeRow()], {
+      audit: [{ chatId: "c", token: "LOBBY", kind: "followup", sig: "up100", at: base + 1_000 }],
+    });
+    const texts1 = [];
+    const out1 = await mkWatcher(db, {
+      api: {
+        sendMessage: async (_chat, text) => {
+          texts1.push(text);
+          if (text.includes("🚀")) return { message_id: 111 };
+          throw new Error("400 Bad Request: chat not found");
+        },
+      },
+    }).runTick(base + 1_500);
+    assert.deepEqual(
+      texts1.map((t) => (t.includes("🚀") ? "rising" : "weak")),
+      ["weak"],
+      "the proven 🚀 is not sent; only the card that never landed is",
+    );
+    assert.equal(out1.deduped, 1, "and the refusal is counted");
+    assert.equal(out1.undelivered, 1, "the rejected sibling holds the row back");
+    const [, w1] = db.updated[0];
+    assert.equal(w1.lastState, null, "so the announcement is rolled back");
+    assert.match(
+      String(w1.upStages),
+      /(^|,)p:up100:/,
+      "the suppressed card leaves its mark behind: " + w1.upStages,
+    );
+
+    // Next pass: the row carries that mark, and the proof now sits TEN MINUTES
+    // after the check it is measured against — outside the no-mark window — so
+    // the mark is the only thing that can refuse the repeat. That is the whole
+    // point of writing it back.
+    const db2 = termDb(
+      [popeyeRow({ upStages: w1.upStages, lastChecked: base - 10 * 60_000 })],
+      { audit: [{ chatId: "c", token: "LOBBY", kind: "followup", sig: "up100", at: base + 1_000 }] },
+    );
+    const texts2 = [];
+    const out2 = await mkWatcher(db2, {
+      api: { sendMessage: async (_chat, text) => { texts2.push(text); return { message_id: 222 }; } },
+    }).runTick(base + 1_500);
+    assert.equal(out2.deduped, 1, "the written-back mark still refuses it");
+    assert.deepEqual(
+      texts2.map((t) => (t.includes("🚀") ? "rising" : "weak")),
+      ["weak"],
+      "and the ⚠️ card is still owed exactly once",
+    );
+  });
+
   await test("out-of-window patch: the terminal card's three-state send is all in (docs/patches/terminal-send-and-liq-prune.patch)", () => {
     const strip = (text) =>
       text

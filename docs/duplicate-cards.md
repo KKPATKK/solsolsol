@@ -64,6 +64,9 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 ## 四、「唔會漏」點保證
 
 * 冇 mark、冇 proof、proof 太舊（早過 attempt）、或者 mark 講嘅係**另一個** sig ⇒ **照送**（fail-open 方向）。
+  **2026-09-24 收窄**：冇 mark 但 audit 有**同一個 sig** 嘅 proof、而且個 proof 落喺 row 自己
+  `last_checked` 嘅分鐘桶（或下一個）之內 ⇒ 照樣公告但**唔送**（＝舊有 cut-mark 規則同一把尺，延伸到
+  「已送達」嗰種），suppress 嘅同時**補寫返 mark**。見 §十九。
 * audit ring 讀唔到（throw）⇒ `followupProofAt` 缺席 ⇒ **唔會即刻送**：該 attempt 如果仲屬於 row 最近一次 check，就延後一個 check（見 §7）；下一個 check 冇 proof 就照送。
 * proof 只係「同一 token、同一 sig、時間 ≥ 該 attempt」先算數；30 筆 ring 被 evict 之後就冇 proof，會重送（可能多一張）——同今日嘅 at-most-one-duplicate 一致，但唔會退化成靜默漏卡。
 * `p:` mark 讀取成本：只有 rotation head 真有 `p:` mark 時才讀一次 audit ring（1 trip）；一般 pass 零成本。
@@ -83,6 +86,8 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 * **仍然存在**：一條 row 若一次帶多過一張卡，row loop 只為**被切嗰張**寫 mark，所以該 pass 較早、
   已經送達嗰幾張卡仍可能重新公告（只係少數多卡 row 會撞到；§7.4 已列明修法）。
 * cut 後如果遲到嘅 request 真係失敗（reject），冇 proof ⇒ 重送，正確。
+* **已修（見 §十九）**：`fire()` 以前**只喺有 cut mark 時**才查 audit proof，所以「已送達但 mark 冇落地」
+  嘅卡會重送。
 * `p:` mark 用**分鐘**做時間桶，所以 proof 只要求「同一分鐘或之後」；同一 token 同一分鐘內兩張**唔同 sig** 嘅卡唔會互相壓抑（sig 一定要相同）。
 * 未歸因：嗰 16 個缺號當中，有幾多係 cut 之後**真係送達**、有幾多係根本冇送達——兩者 audit 都空白，要靠修後嘅補 audit 才分得開。
 
@@ -889,5 +894,36 @@ Turso 連線走 **HTTP transport**（`src/db.ts` `createRawClient`：`libsql://`
 3. **兩個 cut 幫唔到楔形，亦唔係楔形成因**（楔形起／散都無 deploy）。
 4. 未收：pass 終結寫入冇落（新形狀，tick 本身 ok）、8 秒 watchdog 對呢個形狀都唔響、
    cron 到達記錄再次凍結（§4.5 第一項）。
+
+## 十九、第三修：冇 cut mark 都查 proof，但只認「呢一次 check」（2026-09-24）
+
+仍然開住嘅一條：`fire()` **只喺有 cut mark 時**才查 audit proof。mark 係「attempt 過呢張卡」嘅記錄，
+而佢係由**做咗嗰次 send 嘅 pass 自己**寫 —— 所以一個喺寫入之前就死咗嘅 pass（rollback、isolate 被殺）
+會留低一張**送達咗但冇 mark** 嘅卡，下一次評估照樣重新推導、然後照送 ⇒ 重複。audit entry 本身就係
+時間證據，佢答得到同一個問題。
+
+* **收窄（唔係放寬）**：冇 cut mark 時**照樣**查 audit ring，但只認**同一個 sig** 嘅 exact proof
+  （`cardProofKey(token, sig)`），**唔用** token 級 fallback —— fallback 講唔出邊張卡，而呢條規則
+  冇 mark 做錨，用咗就可能壓抑一張**從來冇送過**嘅卡（唯一唔可以接受嘅方向）。
+* **同一把尺**：proof 嘅時間戳要落喺 row 自己 `last_checked` 嘅分鐘桶、或者**下一個**桶之內
+  （`proofIsCurrent`）—— 同 `attemptIsCurrent` 對 attempt 用嘅規則一模一樣（`:59` claim → `:00` 交付
+  嘅 straddle）。更舊嘅唔算：re-armed row（🔁 resume、死而復生）之後可以**合法地**再公告同一個
+  transition，舊嘅交付唔應該令新卡靜音。
+* **suppress 嘅同時補寫返 mark**：被 suppress 嘅卡帶住 `dedupedAt`（＝proof 自己嘅時間戳）出返去，
+  row loop 會將佢寫成該卡嘅 attempt mark。呢個係關鍵嘅另一半：rollback 會**推翻公告**，得 mark＋proof
+  一對先擋得住下一次推導。冇咗個 mark，proof 一離開個窗，同一張卡就會被送出去 —— 即係「壓抑一次、
+  遲啲補一張重複」，而唔係永遠壓抑。
+* **讀 proof 嘅閘要跟住放寬**（同一個 bug 嘅第二半）：proof ring 本來**只喺 head row 已經帶 cut mark
+  時**才讀（省一個 trip）。但新規則要處理嘅正正係**冇 mark** 嘅 row ⇒ 照舊閘法呢條規則係**死碼**，
+  唯有 mark 已經答過同一條問題嘅地方才讀得到 proof。所以改成「head 有人可以評估就讀」，成本係
+  **每次 pass 一個 trip**（老實講：呢個就係呢條修法嘅價錢，換嚟「送達但冇 mark」唔會重複）。
+* **測試**（`scripts/test-unit.js`；negative control 驗過：攞走個規則 ⇒ 2 條齊 fail，300 passed／2 failed）：
+  * `evaluateWatch`：冇 mark ＋ 同一個 check 桶嘅 proof ⇒ `deduped`、`dedupedAt` ＝ proof 嘅時間戳、
+    transition 照落地；proof 喺**下一個**桶（straddle）⇒ 一樣；proof 早兩個桶 ⇒ **照送**；只有 token
+    級 proof（冇 sig）⇒ **照送**；另一個 sig 嘅 mark ⇒ 唔影響（各自用自己嗰條）。
+  * `PushWatcher`：一張已送達但冇 mark 嘅 🚀 ＋ 一個被拒嘅 ⚠️ sibling ⇒ 🚀 **唔送**、rollback 寫出
+    `p:up100:<bucket>`；下一個 pass（row 帶住嗰個 mark、而 proof 已經偏離個窗 10 分鐘）⇒ 仍然擋得住，
+    只有 ⚠️ 重送一次。呢條就係「補寫返 mark」嘅端到端證明。
+* **落線 script**：`docs/patches/cut-card-proof-no-mark.apply.js`（row loop ＋ proof 讀取閘 ＋ 兩條測試）。
 
 

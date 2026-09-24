@@ -726,9 +726,9 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **300 passed, 0 failed** ✅（§4.5.3.1 新增 1 條 cold-handle test；
-  再之前 299 —— §4.5.3 嗰 3 條 pre-init arrival test；296 —— §17.6 嗰 3 條 row-span-hold test；
-  295 ＝ §4.7 嗰 1 條 grouped-telemetry test；
+* `node scripts/test-unit.js` → **302 passed, 0 failed** ✅（§十九（duplicate-cards）新增 2 條 no-mark
+  dedupe test；再之前 300 —— §4.5.3.1 嗰 1 條 cold-handle test；299 —— §4.5.3 嗰 3 條 pre-init arrival
+  test；296 —— §17.6 嗰 3 條 row-span-hold test；295 ＝ §4.7 嗰 1 條 grouped-telemetry test；
   292 —— §4.6 嗰 6 條 subrequest-counter test ＋ `cc333db` 嗰 2 條 host-split test；
   其餘見下 —— 279 → 286 係 §4.5.1 嗰 7 條 CU-ledger test
   —— 單價表、attempt 記帳、mid-write charge、parser 容錯、merge＋剪枝、today/month 分界、

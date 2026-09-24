@@ -690,6 +690,15 @@ export interface WatchAlert {
    * 🚀 POPEYE 18:36/18:39/18:43/18:46/18:49 HKT.
    */
   deduped?: boolean;
+  /**
+   * The audit proof's own stamp when `deduped` came from the NO-MARK rule (see
+   * `proofIsCurrent`): the caller writes it back as this card's attempt mark, so
+   * a pass that ROLLS THE ROW BACK still has mark+proof to refuse the repeat
+   * from. Without it the transition is re-derived, suppressed while the proof
+   * sits in its window, and SENT the moment the window moves on — the duplicate,
+   * just later.
+   */
+  dedupedAt?: number;
 }
 
 export interface WatchEval {
@@ -908,6 +917,37 @@ export function evaluateWatch(
     return exact > 0 ? exact : (proofs.get(row.token) ?? 0);
   };
   /**
+   * The EXACT (token, sig) proof, with NO token-width fallback: 0 when the ring
+   * holds none for this card.
+   *
+   * The fallback above cannot NAME the card it proves, and this value feeds a
+   * rule that has no attempt mark to anchor it — so a proof that cannot name the
+   * card could silence one that was never sent, the single direction this engine
+   * must never take.
+   */
+  const exactProofFor = (sig: string): number =>
+    cfg.followupProofAt?.get(cardProofKey(row.token, sig)) ?? 0;
+  /**
+   * Whether the audit proves a send for THIS transition landed during the check
+   * this pass is making: the proof's own stamp sits in the row's check bucket,
+   * or in the bucket right after it.
+   *
+   * The one-bucket slop is the same straddle `attemptIsCurrent` allows, for the
+   * same reason: a pass that claimed at :59 can deliver at :00, one bucket ahead
+   * of its own clock. Anything older is NOT this check's evidence — a re-armed
+   * row (🔁 resume, a resurrection) can legitimately announce the same transition
+   * again later, and an old delivery must never silence that new card.
+   */
+  const proofIsCurrent = (sig: string): number => {
+    const at = exactProofFor(sig);
+    if (at <= 0) return 0;
+    const proofBucket = Math.floor(at / CUT_MARK_BUCKET_MS);
+    const checkBucket = Math.floor(row.lastChecked / CUT_MARK_BUCKET_MS);
+    return proofBucket === checkBucket || proofBucket === checkBucket + 1
+      ? at
+      : 0;
+  };
+  /**
    * An attempt FROM THE ROW'S MOST RECENT CHECK — its stamp sits in the same
    * minute bucket as `last_checked`, which is the clock the pass that cut it
    * wrote — OR in the bucket right after it.
@@ -975,10 +1015,35 @@ export function evaluateWatch(
     // Proof is asked per CARD, so an entry for another transition of the same
     // row can never stand in for this attempt (the token-only fallback aside).
     const at = attemptAt.get(sig);
-    const deduped = at !== undefined && proofFor(sig) >= at;
+    // A mark dates the send, so any proof at or after it proves that card
+    // landed — whenever it landed, which is why this half needs no bucket.
+    const provenAgainstMark = at !== undefined && proofFor(sig) >= at;
+    // NO mark, and the audit still proves this transition is already in the
+    // chat. The mark is written by the pass that ATTEMPTED the send, so a pass
+    // that died before its write — a rollback, a killed isolate — leaves a
+    // delivered card unmarked, and re-deriving it here sends the card twice.
+    // Only THIS check's proof counts (proofIsCurrent): the same yardstick
+    // attemptIsCurrent applies to a mark, extended to the delivered case.
+    const provenNow = at === undefined ? proofIsCurrent(sig) : 0;
+    const deduped = provenAgainstMark || provenNow > 0;
     // Only ever SET, never `false`: an alert that has nothing to say about the
     // proof should compare equal to one written before this rule existed.
-    alerts.push(deduped ? { kind, text, sig, deduped } : { kind, text, sig });
+    alerts.push(
+      deduped
+        ? {
+            kind,
+            text,
+            sig,
+            deduped,
+            // The suppressed card's own attempt stamp, for the caller to write
+            // back as a mark: the rollback below re-derives this transition, and
+            // with no mark to carry it would find the proof outside its window
+            // and SEND the card (see `dedupedAt`). The marked half needs none —
+            // its stamp is already in `priorMarks`.
+            ...(provenNow > 0 ? { dedupedAt: provenNow } : {}),
+          }
+        : { kind, text, sig },
+    );
     lastAlertAt = now;
     followupsSent += 1;
   };
@@ -2299,12 +2364,16 @@ export class PushWatcher {
     const tokens = head.map((r) => r.token);
     // Published for the scanner's next pair phase (see lastHeadTokens).
     this.lastHeadTokens = tokens;
-    // Cut-card proof (see CUT_MARK_PREFIX): read ONCE per pass, and ONLY when a
-    // row in this rotation head actually carries a cut mark — a pass with
-    // nothing cut pays no round trip. The lookups inside the row loop are then
-    // free (in memory).
+    // Cut-card proof (see CUT_MARK_PREFIX): read ONCE per pass, and whenever
+    // the head can be evaluated at all. It used to be gated on a head row
+    // ALREADY carrying a cut mark, which made the no-mark rule (see
+    // proofIsCurrent) unreachable by construction: that rule exists for exactly
+    // the rows whose mark never landed, so gating the read on a mark meant the
+    // proof was only ever consulted where the mark had already answered the
+    // same question. One trip per pass, on the passes that can act on it; the
+    // lookups inside the row loop stay free (in memory).
     let followupProofAt: ReadonlyMap<string, number> | undefined;
-    if (head.some((r) => parseCutMarks(r.upStages).length > 0)) {
+    if (head.length > 0) {
       const auditRead = (this.db as Partial<Pick<Db, "getPushAudit">>)
         .getPushAudit;
       if (typeof auditRead === "function") {
@@ -2855,8 +2924,14 @@ export class PushWatcher {
           // Carry the proof's mark forward unchanged (see `attempts`): the
           // rollback below re-derives this transition, and only the
           // mark-plus-proof pair keeps it from being announced again.
-          const prior = priorMarks.get(a.sig);
-          if (prior !== undefined) attempts.push({ sig: a.sig, at: prior });
+          //
+          // A card the NO-MARK rule suppressed has no carried mark to reuse, so
+          // the proof's own stamp becomes one (`dedupedAt`): that is the write
+          // the marks back half of that rule, and it is what makes the
+          // suppression survive a rollback instead of decaying into a late
+          // duplicate once the proof leaves its window.
+          const carryAt = priorMarks.get(a.sig) ?? a.dedupedAt;
+          if (carryAt !== undefined) attempts.push({ sig: a.sig, at: carryAt });
           continue;
         }
         const sendLeft = sendBudgetEnd - Date.now();
