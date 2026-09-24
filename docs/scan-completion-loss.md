@@ -1423,3 +1423,40 @@ claim batch、pool query、token_stats、seen_tokens、deferral sync、drain、p
 呢批失敗全部係 telemetry／bookkeeping，冇一個出口會令卡唔送（唯一「唔送」出口係 `deduped`，而佢要
 exact per-card proof，見 `docs/duplicate-cards.md` §10.2）。代價係**掃描節奏嘅洞**（一個 dead tick =
 一個 rotation turn 冇咗）同埋讀數斷層，即係 operator 追緊嗰啲「唔知發生咩事」嘅來源。
+
+## 2026-09-24：flush 之前落地嘅 stage record
+
+同一形狀再出現（`/debug/scan-history?limit=200`，15:00–15:58Z，六行 `previous tick died before its
+completion flush`，`ms` 53–66s）。今次多咗兩件事睇得清：
+
+1. **`ms` 唔係壽命**。`deadTickBackfillInfo` 回傳嘅係 `now - heartbeat.at`，而後繼 tick 一定係隔
+   一個 cadence 才發現，所以每個死法都由外面睇成一樣 —— 呢點同上面 2026-09-19 嘅 60–113s 完全吻合。
+2. **`at` 反推出嚟嘅起點唔止一種**。六個裡面 4 個唔係 cron 秒（`:31.424`、`:34.117`、`:17.764`、
+   `:02.378` → HTTP fallback `maybeRunScanIfStale` 起嘅 tick），另外 2 個同一個 15ms–1.7s 內正常完成嘅
+   tick 相鄰。即係 row 連自己嘅 case 都分唔到組。
+
+所以 `worker.ts` 而家每個行到 flush 嘅 tick 都寫一行 `tick_progress`（`at / stage / t / ms /
+`payloadBytes / scanMs / preRaceMs / subreqs / cut / err`），**寫喺 flush 之前**；flush 卡住或者失敗就
+**再蓋同一行**，留低時間線：
+
+```
+postscan → flush-hung | flush-failed → flush-retry-failed
+```
+
+後繼 tick 本來就要讀一次 `worker_state`，record 搭同一句 statement（`WEDGE_READ_KEYS`）→ **零
+subrequest**；backfill row 嘅 `err` 尾多一句有界註記：
+
+```
+[prog postscan +2900ms 9526B subreqs 46 preRace 158ms]
+[prog flush-failed +3400ms 9526B subreqs 47 err:Too many subrequests …]
+[prog none: died before the pre-flush record, or its own write was lost]
+```
+
+`[prog none]` 係一個讀數，唔係空白：即係死喺 flush **之前**（scan 或前段），同 `flush-failed` 係兩個
+唔同嘅修法。`/health.tickProgress` 同 `/debug/tick` 一樣可以直接睇。
+
+**成本同界線**：每個行到 flush 嘅 tick 多一個 worker_state 寫入（= 1 個 subrequest）。佢唔准偷 flush
+嘅餘裕 —— 剩餘預算低過 `TICK_PROGRESS_AWAIT_RESERVE_MS`（2.5s）就照 fire 但**唔 await**（stage
+`postscan-late`），就算 await 都只 bound `TICK_PROGRESS_BOUND_MS`（600ms）而且一定唔會 reject。
+上面「爆預算時最後死嘅係 telemetry 寫入」正正就係呢個 record 要寫喺 flush **之前**嘅原因：事後補寫
+一定會被同一個條件拒絕。

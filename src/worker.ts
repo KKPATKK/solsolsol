@@ -1327,6 +1327,29 @@ export const SCAN_FLUSH_RESERVE_MS = 4_500;
  */
 export const FLUSH_ATTEMPT_BOUND_MS = 1_200;
 /**
+ * The tick's PRE-FLUSH progress record (TICK_PROGRESS_KEY): the ONE durable
+ * piece of evidence a tick killed while flushing can leave behind, and the
+ * only way the successor can tell "died inside the flush" from "died before
+ * the flush started" — two shapes with two different fixes (see
+ * docs/scan-completion-loss.md).
+ *
+ * WHY IT IS WRITTEN IN FRONT OF THE FLUSH: because at the subrequest ceiling
+ * the LAST write to die is the telemetry one, so a post-mortem written after
+ * the failure would be refused by the very condition it exists to report.
+ *
+ * The record is not allowed to buy that evidence with the flush's margin:
+ *
+ *   - AWAIT_RESERVE_MS — the record is AWAITED only while this much of the tick
+ *     budget is left. Below it the write is still fired, just never awaited in
+ *     front of the flush (the record's own `stage` says which half it was in):
+ *     a late tick's flush is worth more than its own post-mortem.
+ *   - BOUND_MS — even then the await is bounded, so a slow Turso cannot turn
+ *     the record into the next lost flush. A record that misses the bound is
+ *     left running (idempotent) and the flush proceeds.
+ */
+export const TICK_PROGRESS_BOUND_MS = 600;
+export const TICK_PROGRESS_AWAIT_RESERVE_MS = 2_500;
+/**
  * Where a tick's PRE-SCAN time went — the slice of the envelope nothing
  * published (2026-09-21).
  *
@@ -1471,14 +1494,45 @@ let lastHeartbeatRead: { raw: string | null; at: number } | null = null;
 let lastCronKeysRead: { map: Map<string, string> | null; at: number } | null = null;
 
 /**
+ * The tick's pre-flush progress record (see runScan's `noteProgress` and
+ * docs/patches/tick-progress-record.apply.js), written by the tick that may
+ * not survive to publish anything else.
+ *
+ * WHY (2026-09-24, live): every dead row reads `previous tick died before its
+ * completion flush` and its `ms` is `now - at` — one cron cadence (53-66s),
+ * NOT the dead tick's lifetime, and NOT where it died. Two of the six
+ * occurrences were HTTP-fallback ticks and two started within 15ms-1.7s of a
+ * tick that completed normally, so the row cannot even group its own cases.
+ * This record is the missing half: the tick stamps its stage, its flush
+ * payload size and its subrequest count BEFORE the flush, and re-stamps the
+ * reason if that flush hangs or fails.
+ */
+export const TICK_PROGRESS_KEY = "tick_progress";
+
+/**
+ * The pre-flush record read, captured by ensureInitialized's ONE statement
+ * (see WEDGE_READ_KEYS) and reused within that tick only
+ * (HEARTBEAT_REUSE_MS) — the same discipline as lastHeartbeatRead, because
+ * every read is a subrequest out of the invocation's 50. `null` means "no
+ * READING", never "no record": a timed-out read must not be reported as an
+ * absent record, so the fallback read happens on the (rare) tick that has a
+ * death to explain.
+ */
+let lastProgressRead: { raw: string | null; at: number } | null = null;
+
+/**
  * What ensureInitialized fetches in its one read: the heartbeat (three
  * consumers share it) plus the cron-arrival pair the cadence gate needs, so
- * a cron tick's front path needs no second read at all.
+ * a cron tick's front path needs no second read at all. The tick's pre-flush
+ * progress record rides the SAME statement — one more key in a statement that
+ * was already going out costs no subrequest, and the successor tick is the
+ * only witness a killed tick can have.
  */
 const WEDGE_READ_KEYS = [
   "scan_heartbeat",
   "scheduled_tick_total",
   "scheduled_tick_ring",
+  TICK_PROGRESS_KEY,
 ];
 
 /**
@@ -1669,6 +1723,153 @@ export function deadTickBackfillInfo(
   const at = typeof hb.at === "number" ? hb.at : 0;
   if (!(at > 0) || now - at < staleMs) return null;
   return { at, ms: now - at };
+}
+
+/**
+ * The pre-flush progress record (see TICK_PROGRESS_KEY): written by the tick
+ * itself before the flush it may not survive, read by the successor that has
+ * to explain the death.
+ */
+export interface TickProgressRecord {
+  /** The tick's startedAt — the SAME value its heartbeat carries as `at`. */
+  at: number;
+  /**
+   * Where the tick was when it stamped: `postscan` (scan finished, flush in
+   * front of it), `postscan-late` (same point, but too late to wait for the
+   * stamp), `flush-hung`, `flush-failed`, `flush-retry-failed`.
+   */
+  stage: string;
+  /** When this stamp was written (epoch ms). */
+  t: number;
+  /** `t - at`: how far into the tick this stamp was written. */
+  ms: number;
+  /** The completion batch's heartbeat payload, in bytes. */
+  payloadBytes: number;
+  /** Wall clock the scan had spent before the flush started. */
+  scanMs: number;
+  /** The front split (`preTick.preRaceMs`) — the cold-front reading. */
+  preRaceMs: number;
+  /** Subrequests counted so far in the invocation (see src/subreqs.ts). */
+  subreqs: number;
+  /** Whether the scan race cut this tick (`timedOut`). */
+  cut: boolean;
+  /** The scan's error, or the flush's own failure reason. */
+  err: string | null;
+}
+
+/** How much of a failure reason the record keeps (it is read, not parsed). */
+export const TICK_PROGRESS_ERR_MAX = 160;
+
+/** Build one. Time is taken here so `t`/`ms` can never disagree. */
+export function tickProgressRecord(fields: {
+  at: number;
+  stage: string;
+  payloadBytes: number;
+  scanMs: number;
+  preRaceMs: number;
+  subreqs: number;
+  cut: boolean;
+  err: string | null;
+}): string {
+  const t = Date.now();
+  const whole = (n: unknown) => {
+    const v = Number(n ?? 0);
+    return Number.isFinite(v) && v > 0 ? Math.round(v) : 0;
+  };
+  const rec: TickProgressRecord = {
+    at: whole(fields.at),
+    stage: String(fields.stage).slice(0, 32),
+    t,
+    ms: Math.max(0, t - whole(fields.at)),
+    payloadBytes: whole(fields.payloadBytes),
+    scanMs: whole(fields.scanMs),
+    preRaceMs: whole(fields.preRaceMs),
+    subreqs: whole(fields.subreqs),
+    cut: fields.cut === true,
+    err: fields.err ? String(fields.err).slice(0, TICK_PROGRESS_ERR_MAX) : null,
+  };
+  return JSON.stringify(rec);
+}
+
+/**
+ * Parse one back; null when it is not a record this code wrote. Strict on
+ * purpose: `at` + `stage` are the two fields every reading depends on, and a
+ * row that is missing either one must not be dressed up as a tick's progress.
+ */
+export function parseTickProgress(
+  raw: string | null | undefined,
+): TickProgressRecord | null {
+  if (!raw) return null;
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const rec = parsed as Record<string, unknown>;
+  const num = (x: unknown) => {
+    const v = Number(x ?? 0);
+    return Number.isFinite(v) && v > 0 ? Math.round(v) : 0;
+  };
+  const at = num(rec.at);
+  const stage = typeof rec.stage === "string" ? rec.stage : "";
+  if (at <= 0 || stage === "") return null;
+  return {
+    at,
+    stage,
+    t: num(rec.t),
+    ms: num(rec.ms),
+    payloadBytes: num(rec.payloadBytes),
+    scanMs: num(rec.scanMs),
+    preRaceMs: num(rec.preRaceMs),
+    subreqs: num(rec.subreqs),
+    cut: rec.cut === true,
+    err: typeof rec.err === "string" ? rec.err : null,
+  };
+}
+
+/**
+ * What the successor appends to the backfill row's `err`: the one sentence
+ * that turns "a tick died" into "this tick died HERE, with this batch, at this
+ * spend". Always returns something — an absent record is itself the reading
+ * `prog none`, and saying that is the difference between a bounded unknown and
+ * a blank cell a reader has to interpret.
+ *
+ * The `at` comparison is what makes it safe against ANY earlier tick's row: a
+ * record that belongs to another tick is reported as such, never credited to
+ * this death.
+ */
+export function tickProgressNote(
+  raw: string | null | undefined,
+  deadAt: number,
+  limit = 240,
+): string {
+  const none = (why: string) => ` [prog none: ${why}]`.slice(0, limit);
+  const rec = parseTickProgress(raw);
+  if (!rec) return none("died before the pre-flush record, or its own write was lost");
+  if (rec.at !== deadAt) {
+    // The record is keyed by the tick's startedAt, so an EARLIER stamp is not
+    // this tick's evidence at all — it means the dead tick never reached its
+    // own pre-flush point, which is the `prog none` reading and is reported
+    // with the reason instead of a bare "none". A NEWER stamp cannot come
+    // from a death this successor is backfilling (the successor stamps only at
+    // the end of its OWN tick), so it is named as what it is, not assumed
+    // away.
+    return rec.at < deadAt
+      ? none(`the row still holds an earlier tick's stamp (at ${rec.at})`)
+      : ` [prog other (at ${rec.at} ≠ ${deadAt})]`.slice(0, limit);
+  }
+  const bits = [
+    `prog ${rec.stage}`,
+    `+${rec.ms}ms`,
+    `${rec.payloadBytes}B`,
+    `subreqs ${rec.subreqs}`,
+    `preRace ${rec.preRaceMs}ms`,
+  ];
+  if (rec.cut) bits.push("cut");
+  if (rec.err) bits.push(`err:${rec.err}`);
+  return ` [${bits.join(" ")}]`.slice(0, limit);
 }
 
 /** How often a scan was skipped because another isolate held the scan lock. */
@@ -2041,6 +2242,12 @@ async function ensureInitialized(env: Env): Promise<void> {
       // wall clock each. Shared instead of duplicated (see lastHeartbeatRead /
       // HEARTBEAT_REUSE_MS).
       lastHeartbeatRead = { raw: prevRaw, at: now };
+      // The dead-tick evidence rides the SAME statement (see WEDGE_READ_KEYS),
+      // and only when that read actually LANDED: recording a timed-out read as
+      // "this tick has no record" would turn an unknown into a false claim.
+      if (kb) {
+        lastProgressRead = { raw: kb.get(TICK_PROGRESS_KEY) ?? null, at: now };
+      }
       const verdict = deadTickRebuildDecision(prevRaw, now, BACKFILL_STALE_MS);
       if (verdict.rebuild) {
         console.error(
@@ -2556,6 +2763,19 @@ async function runScan(
   const dead = prevHeartbeatRaw
     ? deadTickBackfillInfo(prevHeartbeatRaw, Date.now(), BACKFILL_STALE_MS)
     : null;
+  // The dead tick's own pre-flush record (TICK_PROGRESS_KEY). It rode
+  // ensureInitialized's ONE statement, so the normal path pays nothing; the
+  // fallback read happens ONLY on the tick that has a death to explain, where
+  // one round trip is cheaper than the guess it replaces (these are the ticks
+  // already paying for a rebuild and a no-completion alert).
+  let prevProgressRaw: string | null = null;
+  if (dead && db) {
+    prevProgressRaw =
+      lastProgressRead !== null &&
+      Date.now() - lastProgressRead.at <= HEARTBEAT_REUSE_MS
+        ? lastProgressRead.raw
+        : await db.getWorkerState(TICK_PROGRESS_KEY).catch(() => null);
+  }
   // Durable dead-tick streak (see DEAD_TICK_STREAK_RESET): read from the
   // heartbeat the previous tick left, escalated only when that tick is proven
   // dead, and published below in this tick's own claim heartbeat — so the next
@@ -2567,7 +2787,15 @@ async function runScan(
         at: dead.at,
         ok: false,
         ms: dead.ms,
-        err: "previous tick died before its completion flush (backfilled by next tick)",
+        // The sentence a reader actually opens. `ms` is `now - at`, i.e. ONE
+        // CRON CADENCE — not the dead tick's lifetime — so the note is what
+        // says how far it got: `prog none` = it never reached the pre-flush
+        // point (died in its scan or its front); anything else = it reached the
+        // flush, with the payload size, the spend and, when the flush then
+        // failed, the reason (see TICK_PROGRESS_KEY).
+        err:
+          "previous tick died before its completion flush (backfilled by next tick)" +
+          tickProgressNote(prevProgressRaw, dead.at),
         profiles: null,
         pool: null,
         candidates: null,
@@ -2839,9 +3067,13 @@ async function runScan(
       // src/skipcapture.ts). Read ONCE, outside the closure, so `skip` and
       // `skipAt` can never disagree about which early return they describe.
       const skipView = skipCaptureSnapshot();
-      const flushCompletion = () =>
-        db?.persistScanCompletion(
-          JSON.stringify({
+      // The completion payload is built ONCE, here, and its byte size is
+      // measured in front of the flush: a LOST flush is chased with the two
+      // numbers only this tick can see — how big the batch was and what the
+      // invocation had left to spend (see TICK_PROGRESS_KEY). The retry below
+      // re-uses the same string instead of re-serializing ~9.5KB.
+      const buildFlushPayload = () =>
+        JSON.stringify({
             at: flushedAt,
             ok: lastScanOk,
             phase: "done",
@@ -2887,7 +3119,62 @@ async function runScan(
             deferral: pushDeferralSnapshot,
             pushLedger: pushLedgerMirror,
             summary,
-          }),
+          });
+      const flushJson = buildFlushPayload();
+      // PRE-FLUSH PROGRESS RECORD (see TICK_PROGRESS_KEY). The scan is over:
+      // this is the last point at which the tick can say, durably, that it got
+      // this far. Awaited while the tick still has TICK_PROGRESS_AWAIT_
+      // RESERVE_MS of its budget left (so the evidence is in Turso BEFORE the
+      // flush it describes), fired and NOT awaited below that, bounded when it
+      // is awaited, and never allowed to reject: a lost record is not a lost
+      // tick, a delayed flush is.
+      const noteProgress = (stage: string, why?: string | null) => {
+        if (!db) return null;
+        let write: Promise<unknown>;
+        try {
+          write = db.setWorkerState(
+            TICK_PROGRESS_KEY,
+            tickProgressRecord({
+              at: startedAt,
+              stage,
+              payloadBytes: flushJson.length,
+              scanMs: flushedMs,
+              preRaceMs: preTick?.preRaceMs ?? 0,
+              subreqs: subreqView().current.total,
+              cut: timedOut,
+              err: why ?? lastScanError,
+            }),
+          );
+        } catch {
+          return null;
+        }
+        // Swallowed at the source: an unhandled rejection can take the
+        // isolate down with it, and this write is the least important thing
+        // the invocation does.
+        write.catch(() => {});
+        return write;
+      };
+      {
+        const late =
+          startedAt + SCAN_TICK_BUDGET_MS - Date.now() <
+          TICK_PROGRESS_AWAIT_RESERVE_MS;
+        const stamp = noteProgress(late ? "postscan-late" : "postscan");
+        if (stamp && !late) {
+          try {
+            await Promise.race([
+              stamp,
+              new Promise((resolve) =>
+                setTimeout(resolve, TICK_PROGRESS_BOUND_MS),
+              ),
+            ]);
+          } catch {
+            /* the flush below outranks this record */
+          }
+        }
+      }
+      const flushCompletion = () =>
+        db?.persistScanCompletion(
+          flushJson,
           {
             at: flushedAt,
             ok: lastScanOk,
@@ -2931,6 +3218,14 @@ async function runScan(
           ),
         ]);
         if (!settled && Date.now() < flushDeadline) {
+          // The tick is being lost to a write that does not settle. Stamp
+          // WHICH attempt and what the invocation had already spent: the
+          // subrequest ceiling is the standing suspect (the counter cannot see
+          // ~12 of them, see src/subreqs.ts) and only this tick can measure it.
+          noteProgress(
+            "flush-hung",
+            `attempt1 unsettled after ${Date.now() - flushStartedAt}ms`,
+          );
           console.error(
             "[worker] completion write hung — firing racing retry",
           );
@@ -2954,6 +3249,15 @@ async function runScan(
           await attempt1;
         }
       } catch (err) {
+        // THE ONE READING THIS WHOLE PATCH EXISTS FOR: until now a lost
+        // completion write left no reason anywhere — the flush's error was
+        // logged and dropped, so the successor could only say "it died". The
+        // record carries the refusal itself (a settled 4xx/5xx, a transport
+        // hard wall, or the runtime's `Too many subrequests`).
+        noteProgress(
+          "flush-failed",
+          err instanceof Error ? err.message : String(err),
+        );
         console.error("[worker] completion write failed — retrying once:", err);
         if (Date.now() >= flushDeadline) {
           console.error(
@@ -2981,6 +3285,10 @@ async function runScan(
             new Promise((resolve) => setTimeout(resolve, remainingFlushMs())),
           ]);
         } catch (err2) {
+          noteProgress(
+            "flush-retry-failed",
+            err2 instanceof Error ? err2.message : String(err2),
+          );
           console.error("[worker] completion retry failed:", err2);
         }
         }
@@ -3573,9 +3881,17 @@ export default {
     if (url.pathname === "/health") {
       let heartbeat: unknown = null;
       let lastScanGapMs: number | null = null;
+      let tickProgress: unknown = null;
       try {
-        const raw = await db?.getWorkerState("scan_heartbeat");
+        // Both rows in ONE statement (see Db.getWorkerStates): the progress
+        // record is the tick's own account of how far it got before its flush,
+        // so a stale phase=scanning heartbeat can be READ together with the
+        // reason it is stale (see TICK_PROGRESS_KEY).
+        const rows = await db?.getWorkerStates(["scan_heartbeat", TICK_PROGRESS_KEY]);
+        const raw = rows?.get("scan_heartbeat") ?? null;
         heartbeat = raw ? JSON.parse(raw) : null;
+        const progressRaw = rows?.get(TICK_PROGRESS_KEY) ?? null;
+        tickProgress = progressRaw ? JSON.parse(progressRaw) : null;
         const at = (heartbeat as { at?: number } | null)?.at;
         if (typeof at === "number") lastScanGapMs = Date.now() - at;
       } catch {
@@ -3756,6 +4072,12 @@ export default {
         crossIsolateScanSkips,
         heartbeat,
         lastScanGapMs,
+        // The tick's own last pre-flush record: its `at` matches the
+        // heartbeat's when the tick reached its flush, and its `stage` says
+        // whether that flush then failed or hung (see TICK_PROGRESS_KEY).
+        // A stale phase=scanning heartbeat with `prog none`/null here is the
+        // other shape — the death was earlier than the flush.
+        tickProgress,
         summary: scanner?.lastSummary ?? null,
         pushWatchPass,
         now: new Date().toISOString(),

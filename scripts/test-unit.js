@@ -36,7 +36,7 @@ const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
-const { tradeFingerprint, deadTickBackfillInfo } = require("../dist/worker.js");
+const { tradeFingerprint, deadTickBackfillInfo, TICK_PROGRESS_KEY, tickProgressRecord, parseTickProgress, tickProgressNote } = require("../dist/worker.js");
 const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, deliveredFollowupProofs, cardProofKey, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
@@ -11301,6 +11301,156 @@ async function main() {
       missing.length,
       0,
       `partial paste of docs/patches/tracker-subreq-headroom.apply.js — missing: ${missing.join(", ")}`,
+    );
+  });
+
+  // ---------- the tick's pre-flush progress record (worker.ts) ----------
+
+  await test("tickProgressRecord: a tick's pre-flush record round-trips, and only its own shapes are read back", () => {
+    const at = 1_700_000_000_000;
+    const raw = tickProgressRecord({
+      at,
+      stage: "postscan",
+      payloadBytes: 9526,
+      scanMs: 2900,
+      preRaceMs: 158,
+      subreqs: 46,
+      cut: false,
+      err: null,
+    });
+    const rec = parseTickProgress(raw);
+    assert.ok(rec, "its own record parses");
+    assert.equal(rec.at, at, "the record carries the tick's startedAt");
+    assert.equal(rec.stage, "postscan");
+    assert.equal(rec.payloadBytes, 9526, "the batch size a lost flush is chased with");
+    assert.equal(rec.scanMs, 2900);
+    assert.equal(rec.subreqs, 46);
+    assert.equal(rec.cut, false);
+    assert.equal(rec.err, null);
+    assert.ok(rec.ms >= 0, "ms is tick-relative");
+    // The SAME tick re-stamps the SAME row when its flush then fails: that is
+    // what makes the successor's note a timeline rather than a death notice.
+    const failed = parseTickProgress(
+      tickProgressRecord({
+        at,
+        stage: "flush-failed",
+        payloadBytes: 9526,
+        scanMs: 2900,
+        preRaceMs: 158,
+        subreqs: 47,
+        cut: false,
+        err: "Too many subrequests by single Worker invocation",
+      }),
+    );
+    assert.equal(failed.stage, "flush-failed");
+    assert.match(failed.err ?? "", /Too many subrequests/);
+    // Anything this code did not write is refused rather than guessed at: a
+    // row without `at` or `stage` is not a tick's progress.
+    assert.equal(parseTickProgress(null), null);
+    assert.equal(parseTickProgress(""), null);
+    assert.equal(parseTickProgress("not json"), null);
+    assert.equal(parseTickProgress("[]"), null, "an array is not a record");
+    assert.equal(parseTickProgress(JSON.stringify({ stage: "postscan" })), null, "no at");
+    assert.equal(parseTickProgress(JSON.stringify({ at })), null, "no stage");
+  });
+
+  await test("tickProgressNote: the backfill row names where the dead tick got to, and never credits another tick", () => {
+    const at = 1_700_000_000_000;
+    const rec = tickProgressRecord({
+      at,
+      stage: "postscan",
+      payloadBytes: 9526,
+      scanMs: 2900,
+      preRaceMs: 158,
+      subreqs: 46,
+      cut: false,
+      err: null,
+    });
+    const hit = tickProgressNote(rec, at, 240);
+    assert.match(hit, /prog postscan/, "the stage is named");
+    assert.match(hit, /9526B/, "and the batch size");
+    assert.match(hit, /subreqs 46/, "and the spend");
+    assert.match(hit, /preRace 158ms/);
+    // A flush that hung or failed leaves the later stamp on the same row.
+    assert.match(
+      tickProgressNote(
+        tickProgressRecord({ at, stage: "flush-hung", payloadBytes: 9526, scanMs: 2900, preRaceMs: 158, subreqs: 46, cut: false, err: "attempt1 unsettled after 1200ms" }),
+        at,
+      ),
+      /prog flush-hung.*attempt1 unsettled/
+    );
+    // A record from ANOTHER tick is reported as such, never as this death's
+    // progress: the row outlives the tick that wrote it.
+    // A record from ANOTHER tick is never credited to this death, and the two
+    // directions mean different things: an EARLIER stamp is the normal shape of
+    // a death that never reached its own stamp (the same reading as an absent
+    // record), while a NEWER one cannot come from this death at all.
+    const later = tickProgressNote(rec, at - 60_000);
+    assert.match(later, /prog other/, "a stamp NEWER than the death is named, not assumed");
+    const earlier = tickProgressNote(rec, at + 60_000);
+    assert.match(earlier, /prog none/, "an earlier tick's stamp means this tick never stamped");
+    assert.match(earlier, /earlier tick's stamp/);
+    // "Nothing to read" is spelled out — an absent record is a reading (the
+    // death was earlier than the flush), not a blank cell.
+    assert.match(tickProgressNote(null, at), /prog none/);
+    assert.match(tickProgressNote("garbage", at), /prog none/);
+    // Bounded: the err column is read by a human in /debug/scan-history.
+    assert.ok(tickProgressNote(rec, at).length <= 240, "the note is bounded");
+    assert.ok(tickProgressNote(null, at, 40).length <= 40);
+  });
+
+  await test("out-of-window patch: the pre-flush record is written BEFORE the flush and read by the successor (docs/patches/tick-progress-record.apply.js)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const workerSrc = read("src/worker.ts");
+    const testSrc = read("scripts/test-unit.js");
+    const before = (a, b) => {
+      const ia = workerSrc.indexOf(a);
+      const ib = workerSrc.indexOf(b);
+      return ia >= 0 && ib >= 0 && ia < ib;
+    };
+    const applied = {
+      "worker (the key exists)":
+        workerSrc.includes('exportconstTICK_PROGRESS_KEY="tick_progress";'),
+      "worker (the successor already reads it, in the same statement)":
+        workerSrc.includes('"scan_heartbeat","scheduled_tick_total","scheduled_tick_ring",TICK_PROGRESS_KEY,'),
+      "worker (build / parse / note)":
+        workerSrc.includes("exportfunctiontickProgressRecord(") &&
+        workerSrc.includes("exportfunctionparseTickProgress(") &&
+        workerSrc.includes("exportfunctiontickProgressNote("),
+      "worker (the stamp is written BEFORE the flush it describes)":
+        before('noteProgress(late?"postscan-late":"postscan")', "constflushCompletion=()=>db?.persistScanCompletion("),
+      "worker (the batch size is measured)":
+        workerSrc.includes("payloadBytes:flushJson.length,"),
+      "worker (a hang, a failure and a failed retry each re-stamp it)":
+        workerSrc.includes('noteProgress("flush-hung"') &&
+        workerSrc.includes('noteProgress("flush-failed"') &&
+        workerSrc.includes('noteProgress("flush-retry-failed"'),
+      "worker (the backfill row carries the note)":
+        workerSrc.includes("tickProgressNote(prevProgressRaw,dead.at)"),
+      "worker (/health publishes it)":
+        workerSrc.includes("tickProgress,") &&
+        workerSrc.includes('getWorkerStates(["scan_heartbeat",TICK_PROGRESS_KEY])'),
+      "tests (this guard)": testSrc.includes("tickProgressNote(rec,at"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ pre-flush progress record missing - apply docs/patches/tick-progress-record.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    // Half of this is the worst of both: a record nobody reads, or a note whose
+    // record is never written in front of the flush it is about.
+    assert.equal(
+      missing.length,
+      0,
+      `partial paste of docs/patches/tick-progress-record.apply.js — missing: ${missing.join(", ")}`,
     );
   });
 
