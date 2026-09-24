@@ -823,7 +823,7 @@ stamp 係 batch claim 一次過蓋全池（§4.2 省 trip 嘅設計），所以 
 (3) checked 10 → 17、全池一輪 2 pass ✅ 但未到 1 pass，而且 `budget-cut` **仍然出現** ❌；
 (4) subrequest 冇撞 50 上限、`cut:watchdog` 冇出現 ✅。
 
-### 4.8.2 一刀：budget gate 由「每行」搬去「每次 spend」（未上線）
+### 4.8.2 一刀：budget gate 由「每行」搬去「每次 spend」（2026-09-24，已上線）
 
 **§4.8.1 嗰句「下一刀係減每行嘅 round trip」係錯嘅診斷，要收回。** 睇返 `rows 3701/9`：
 9 個 trip **唔係** 17 行攤分（411ms／行），而係 **~3 條 alerting row** 各自嘅 claim／reservation／
@@ -859,12 +859,32 @@ bound 住 pass tail 嘅係 **send slice**（`TRACKER_SEND_CAP_MS`／`TRACKER_SEN
 send gate 嘅條件**保持原狀**（只有 slice），只係 `break` → `continue`；而家被時鐘管住嘅只剩
 `pairMiss` 嗰個 delete（佢係唯一冇自己 slice 嘅 spend）。
 
-**上線後要讀**（未做）：
+### 4.8.3 上線後讀數（2026-09-24 06:22–06:27Z）
 
-1. 慢 pass 嘅 `rows X/N`：X 應該貼近 N（30），唔再係 17；
-2. `budget-cut` **仍然要出**（alerting row 被拒時）＋ `defer-send N` 要有數 —— 呢兩樣證明
-   「唔再 break」冇把「拒絕」靜音化；
-3. `rows <ms>/<trips>` 嘅 trips 唔應該因為行多咗而上升（quiet row 依然零 trip）。
+`050e121` → Deploy Worker run **35963736602 success** ✅（1m20s，06:16:53Z push、~06:18Z 落線）。
+
+| 要讀嘅嘢 | 讀數 | 判讀 |
+| --- | --- | --- |
+| `rows X/N` | **`rows 30/30`** 連續三個 pass（06:22:39／06:25:40／06:26:39Z） | 一個 pass 掃完全池 —— **目標達到**（同日前 04:56 係 17/30，head 10 嗰時係 10/29） |
+| `rows <ms>/<trips>` | `rows 214/1`、`rows 230/1`、`rows 240/1` | **30 行一個 trip**（之前 17 行要 9 trip／3_701ms）|
+| `budget-cut` | **冇出現**（三個 pass 都冇） | 冇 spend 被拒 → 冇嘢要 cut，同預期一致 |
+| 成本 | `trackerMs 1_527–1_825`（allow 4_728–4_779）、`trips 5`、`db 1_292–1_573ms` | pass 由 6_080ms 落到 ~1.6s，trip 由 16 落到 5 |
+| `pairs N/N` | `pairs 30/30`，pair trip 0–31ms（快取命中） | §4.8 嗰條冇回退：仍然一個 request |
+| tracked 行年齡 | 29/30 行 **27s**（＋1 行 86s）＝一個堆 | 一個 pass 就刷完全池 |
+| `cut:watchdog` | **冇出現** | watchdog 前提仍然 hold |
+
+06:22:39Z 原文：
+
+```
+ok:30/0 rows 30/30 pairs 30/30 miss 0 lost 0 allow 4784
+spend[setup 364/2 heal 415/1 miss0 enrolled0 pairs 0/0 rows 214/1 holders 0/0 held0 cut4 probe0 miss0 cu-gate] trips 6 db 1348ms
+```
+
+**未證嘅一半（老實講）**：三個抽樣 pass 都係 `ok:30/0` —— **冇一條 alerting row**，所以
+「被拒嘅 card 仍然會出聲」（`defer-send N` ＋ `budget-cut`）今次 **live 抽唔到**，只由 unit test
+釘住：`a card that cannot be sent leaves its row untouched` 斷言 `defer-send 1` ＋ `budget-cut`，
+而 fix1 把 `overBudget` 由 send gate 拿返出嚟之後佢仍然綠。要等一條真 alerting row 出現，
+先可以話 live 都證實。
 
 ## 5. 驗證狀態（本地 + 上線）
 
@@ -886,6 +906,8 @@ send gate 嘅條件**保持原狀**（只有 slice），只係 `break` → `cont
 * `b6f07e0`（§十九 no-mark 第一小時紀錄）→ Deploy Worker run 35948129083 **success** ✅（1m20s）
 * `0938959`（§4.8 追蹤池 head 10 → 30）→ Deploy Worker run **35953548509 success** ✅（1m14s，
   03:56:43Z；落線讀數見 §4.8.1）
+* `050e121`（§4.8.2 spend gate）→ Deploy Worker run **35963736602 success** ✅（1m20s，
+  06:16:53Z；落線讀數見 §4.8.3）
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
   → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809
   **success**（1m16s）✅；`2b4b9fe`（§4.3 probe cap／slot）→ run 35851038091 **success**（1m20s）✅；
@@ -897,7 +919,8 @@ send gate 嘅條件**保持原狀**（只有 slice），只係 `break` → `cont
   §4.3.1（`probe1 miss0` 同 collect 回落）、§4.4.1（`probe1 miss0` → 下一個 pass `cu-gate`）、
   §4.5.2（CU 帳簿：charge 半已證、durable 半未證）、§4.6.2（subreq counter：DB 佔 63–83%）、
   §5.1（note／history 觀察）、§4.7.1（grouped telemetry：durable 半已證）、§4.8.1（head 10 → 30：
-  `pairs 30/30`、checked 10 → 17、三堆變一堆，`budget-cut` 仍在）
+  `pairs 30/30`、checked 10 → 17、三堆變一堆，`budget-cut` 仍在）、§4.8.3（spend gate：
+  `rows 30/30`、30 行一個 trip）
 * 卡片側：`/debug/push-audit` 有帶 `sig` 嘅 follow-up entry（ARGUS 嘅 `ignite`／`liqwarn`／`drain`、
   HANDLES 嘅 `ignite` 等，30 條 ring），`/debug/push-watch.issueCount` = **1**
   （DeadCatBounce，2026-09-22 嘅舊 row）
