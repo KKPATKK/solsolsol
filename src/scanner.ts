@@ -1827,6 +1827,7 @@ export class Scanner {
   async runTrackerPass(
     deadlineMs: number,
     keepAlive?: (promise: Promise<unknown>) => void,
+    subreqLeft?: () => number,
   ): Promise<string | null> {
     if (!this.pushWatcher) return null;
     const startedAt = Date.now();
@@ -1852,7 +1853,7 @@ export class Scanner {
       // held a pass open for 61s on 2026-09-23 and cost two ticks (78014ms,
       // 62197ms).
       const pw = await this.racePassWatchdog(
-        this.pushWatcher.runTick(deadlineMs, keepAlive),
+        this.pushWatcher.runTick(deadlineMs, keepAlive, subreqLeft),
         deadlineMs,
       );
       if (pw === null) {

@@ -82,6 +82,7 @@ import { FlurryAnalyzer } from "./flurry";
 import {
   beginSubreqWindow,
   countSubreq,
+  subreqRemaining,
   subreqView,
 } from "./subreqs";
 
@@ -3016,6 +3017,15 @@ async function runScan(
           await scanner.runTrackerPass(
             Date.now() + trackerBudgetMs,
             holdTick ? (p: Promise<unknown>) => holdTick(p) : undefined,
+            // The invocation's OTHER ceiling (see src/subreqs.ts). The pass
+            // runs last, so it is the residual claimant: measured on a cold
+            // isolate the front (init + scan + completion flush) had already
+            // spent 47 of the 50 Workers Free allows, and the pass's first
+            // Turso call is what the runtime then refused — killing the row loop
+            // and the deferral sync and write drain behind it. Handing the
+            // counter in lets the pass defer by name instead, and keeps its
+            // own reserve for those tail writes.
+            subreqRemaining,
           );
         } catch (err) {
           console.error(

@@ -88,6 +88,45 @@ import {
  */
 const TRACKER_TICK_BUDGET_MS = 5_000;
 /**
+ * The invocation has a SECOND ceiling, and until now this pass was bounded on
+ * only one of them.
+ *
+ * WHY (2026-09-24): Workers Free allows 50 subrequests per INVOCATION
+ * (src/subreqs.ts counts every one of them, Turso round trips included) and
+ * the tick's front pays most of that BEFORE the pass is offered one — live
+ * `heartbeat.subreqs.current` at the heartbeat write reads 18-31 on a warm
+ * tick and 47 on a cold one, whose phase ring ended `send:autobuy 46`. A pass
+ * costs `trips 5`-`8` plus one pair batch, i.e. 5-13. So on exactly the ticks
+ * where the front was fat, the pass's first Turso call threw `Too many
+ * subrequests by single Worker invocation`: the row loop died mid-flight, the
+ * durable note was left at `phase:"running"` (or carried the raw `err:`), and
+ * the two stages behind it — the deferral-counter sync and the write drain —
+ * never ran at all. Nothing warned the pass: it checked its CLOCK
+ * (TRACKER_TICK_BUDGET_MS) and never asked what was left of the invocation.
+ *
+ * The two budgets are now spent in a known order, the tail's reserve first.
+ * These two numbers are the pass's share of that order:
+ *
+ *   - FLOOR: the cheapest pass that is still a pass. Reaching the rotation
+ *     costs the cut-card proof read, the head pair batch and the ONE batched
+ *     silent-row claim (3). Below that the loop cannot start, so the pass
+ *     defers BY NAME (`deferred:subreq-budget`) instead of dying on its first
+ *     round trip.
+ *   - RESERVE: what the stages AFTER this pass must still find. The tail is
+ *     the pass's own note persist (1), the deferral-counter sync (1-2), the
+ *     write drain (2) and the observed-liquidity flush (0-1) — 5-6 subrequests
+ *     of writes a tick cannot afford to lose, since a tick that misses its
+ *     completion flush or its drain leaves a permanent hole in the
+ *     bookkeeping. A row that needs 3+ of its own (claim + send + write) is
+ *     therefore refused while that reserve is intact, and the next tick walks
+ *     the rotation again.
+ *
+ * Both are free when there is room: a healthy tick (front 18-31) reads neither,
+ * so its pass behaves exactly as it did before.
+ */
+const TRACKER_SUBREQ_FLOOR = 3;
+const TRACKER_SUBREQ_RESERVE = 6;
+/**
  * Budget reserved BEFORE a row is claimed (see the row loop). A SILENT row —
  * nothing to announce, which is nearly every row on nearly every pass — costs
  * ONE round trip now (the claim and the check write are the same UPDATE, see
@@ -1824,6 +1863,16 @@ export class PushWatcher {
    * exists so a starved tracker is visible in /health instead of reporting a
    * healthy-looking `ok:0/0`.
    *
+   * `subreqLeft` (optional) is the invocation's OTHER ceiling, taken as a
+   * function so this module never imports the counter — the caller owns the
+   * window, and a test owns a fake one. It is the same discipline as
+   * `deadlineMs`, checked at the same boundaries: between stages the pass
+   * defers by name (`deferred:subreq-budget`) once less than
+   * TRACKER_SUBREQ_FLOOR remains, and the row loop refuses a
+   * multi-round-trip row while the tail's TRACKER_SUBREQ_RESERVE is still
+   * intact (`subreq-cut N`). Omitted — the default — the pass is unbounded by
+   * subrequests, which is what every existing caller and test gets.
+   *
    * `keepAlive` is the tick's `waitUntil` hand-off, when the caller has one
    * (the worker passes `tickWaitUntil`). It exists so the two proof writes
    * this pass cannot wait for — a CUT card's late settle, and the terminal
@@ -1863,6 +1912,7 @@ export class PushWatcher {
   async runTick(
     deadlineMs?: number,
     keepAlive?: (promise: Promise<unknown>) => void,
+    subreqLeft?: () => number,
   ): Promise<{
     checked: number;
     alerted: number;
@@ -1920,6 +1970,23 @@ export class PushWatcher {
         : TRACKER_TICK_BUDGET_MS;
     const deadline = now + budgetMs;
     const past = () => Date.now() > deadline;
+    // The invocation's second ceiling (see TRACKER_SUBREQ_FLOOR / _RESERVE).
+    // No probe = unbounded, so a caller that owns no window — and every test
+    // that installs none — behaves exactly as it did before.
+    const subreqsLeft = (): number =>
+      typeof subreqLeft === "function" ? subreqLeft() : Number.POSITIVE_INFINITY;
+    const outOfSubreqs = (): boolean => subreqsLeft() < TRACKER_SUBREQ_FLOOR;
+    // WHICH ceiling stopped the pass: the note's first token, so a starved
+    // invocation never reads like a starved pass.
+    let deferReason = "tick-budget";
+    const outOfBudget = (): boolean => {
+      if (past()) return true;
+      if (outOfSubreqs()) {
+        deferReason = "subreq-budget";
+        return true;
+      }
+      return false;
+    };
     // Round-trip ledger for the pass (reported in the coverage note). Every
     // Turso call below is a full request on a pass that only holds
     // TRACKER_TICK_BUDGET_MS, so this count is the tracker's real cost driver.
@@ -2017,7 +2084,7 @@ export class PushWatcher {
       alerted: 0,
       // Read at return time, so a deferral names the stage it stopped in.
       get note() {
-        return `deferred:tick-budget ${stageNote()} trips ${trips}`;
+        return `deferred:${deferReason} ${stageNote()} trips ${trips}`;
       },
       // Both deferral returns happen BEFORE the row loop, so no card was
       // even attempted — the per-pass count is 0 and the cumulative
@@ -2118,7 +2185,7 @@ export class PushWatcher {
     // Budget gate BETWEEN stages: the recap/prune above is idempotent (a
     // recap claims its row as it sends), so bailing here costs only latency —
     // the remaining stages run on the next tick with fresh rows.
-    if (past()) return deferred;
+    if (outOfBudget()) return deferred;
     // Settle abandoned TERMINAL cards before anything else in the pass: a 💧
     // drain card whose send was abandoned KEEPS its row's terminal transition
     // and leaves a durable record (see the alert loop). Proved delivered → the
@@ -2429,7 +2496,7 @@ export class PushWatcher {
     }
     spent.heal.ms = Date.now() - healStart;
     spent.heal.trips = trips - healTrips;
-    if (past()) return deferred;
+    if (outOfBudget()) return deferred;
     // Reuse the snapshot (see the merge note at the top of the pass). Rows the
     // prune removed — everything past the window, i.e. exactly the ones the
     // recap just handled — are filtered out here; rows the self-heal enrolled
@@ -2615,6 +2682,12 @@ export class PushWatcher {
     let pairMiss = 0;
     let claimLost = 0;
     let budgetCut = false;
+    /**
+     * Rows the loop refused because the tail's subrequest reserve was still
+     * intact (see TRACKER_SUBREQ_RESERVE). Reported as `subreq-cut N` beside
+     * the clock's `budget-cut` so the two ceilings can never read alike.
+     */
+    let subreqCut = 0;
     /**
      * Cards this pass could not deliver — the send slice was spent, the send
      * timed out, or the call threw. Every one of them rolls the row's
@@ -2829,7 +2902,22 @@ export class PushWatcher {
      */
     const rowReserveMs = (): number =>
       Math.min(TRACKER_ROW_LEASH_MS, tripMs());
+    /**
+     * The subrequest gate BETWEEN rows — the second half of the pair with
+     * overBudget. It gates the row's SPEND, never the row itself: a silent
+     * row rides the ONE batched claim the pass was already paying for, and
+     * the loop's FIRST row is exempt outright, the same progress-floor rule
+     * the clock keeps, because a pass that refuses its own head has measured
+     * nothing at all (the 2026-09-17 shape). Only an ALERTING row — claim +
+     * sends + write — consults it, and refusing one is free: the row is left
+     * completely untouched, exactly as the send-slice gate leaves it, so the
+     * next tick re-derives it against a fresh budget.
+     */
+    let rowIndex = 0;
     for (const row of head) {
+      const subreqShort =
+        rowIndex > 0 && subreqsLeft() <= TRACKER_SUBREQ_RESERVE;
+      rowIndex += 1;
       // Budget check BETWEEN rows — but it gates the SPENDS, not the rows. A
       // quiet row costs no round trip of its own (its write rides the ONE
       // batched claim after the loop, see silentChecks), so charging it this
@@ -3010,6 +3098,16 @@ export class PushWatcher {
       // stays a round trip of its own. The loser's snapshot is stale: it would
       // re-fire state-machine transitions (duplicate ⚠️/🚀 cards). Skip silently
       // on a lost race.
+      if (subreqShort) {
+        // `continue`, not `break`, for the reason the send-slice gate gives:
+        // this row is left untouched and the quiet rows behind it still ride
+        // this pass's ONE batch. The pass then publishes `subreq-cut N` rather
+        // than spending the invocation's last subrequest on a claim with
+        // nothing left behind it.
+        subreqCut += 1;
+        sendDeferred += 1;
+        continue;
+      }
       trips += 1;
       if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now))) {
         claimLost += 1;
@@ -3438,7 +3536,9 @@ export class PushWatcher {
       `${terminalAbandoned > 0 ? ` abandoned ${terminalAbandoned}` : ""}` +
       `${rearmedCards > 0 ? ` rearmed ${rearmedCards}` : ""}` +
       `${recoveredThisPass > 0 ? ` recovered ${recoveredThisPass}` : ""}` +
-      `${budgetCut ? " budget-cut" : ""} ${stageNote()} trips ${trips}`;
+      `${budgetCut ? " budget-cut" : ""}` +
+      `${subreqCut > 0 ? ` subreq-cut ${subreqCut}` : ""} ` +
+      `${stageNote()} trips ${trips}`;
 
     return {
       checked,

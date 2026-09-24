@@ -247,6 +247,34 @@ export function subreqView(): SubreqView {
   };
 }
 
+/**
+ * Subrequests still spendable in this window, never below 0.
+ *
+ * WHY IT EXISTS (2026-09-24): `subreqView()` above answers "who spent the
+ * budget" AFTER the fact, which is a post-mortem. This is the pre-flight
+ * half — what a LATE stage of a tick must consult BEFORE it starts a spend
+ * that costs several subrequests, so a starved tick defers its tail by name
+ * instead of spending the invocation's last call on a `Too many subrequests
+ * by single Worker invocation` throw. Measured on the live worker: the scan +
+ * completion flush reach 47 of 50 on a cold isolate (its phase ring ending
+ * `send:autobuy 46`), and the tracker pass behind it needs 5-13 more (its own
+ * `trips` counter), so on exactly those ticks the pass died mid-flight and
+ * took the deferral sync and the write drain with it.
+ *
+ * The tail's own reserve is the caller's business — this only reports the room
+ * that is left, so the two ceilings can be spent in a known order instead of
+ * by whichever stage happened to run last. A window that has counted nothing
+ * yet reports the full budget, so a caller ahead of its first fetch (and any
+ * test that does not install the probe) sees room, never a false zero.
+ *
+ * Optional `budget` override exists for the probe seam only; the tick path
+ * spends against SUBREQ_BUDGET_FREE, which is a platform fact.
+ */
+export function subreqRemaining(budget: number = SUBREQ_BUDGET_FREE): number {
+  if (!Number.isFinite(budget)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, budget - current.total);
+}
+
 /** Test seam: forget the boot's windows (never called on the tick path). */
 export function resetSubreqWindows(): void {
   current = { at: 0, total: 0, phases: [], hosts: new Map() };

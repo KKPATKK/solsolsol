@@ -960,6 +960,51 @@ async function main() {
     assert.match(String(out.note), /abandoned 1/);
   });
 
+  // The invocation's subrequest ceiling, threaded into the pass (2026-09-24).
+  // Live: the front spent 47 of the 50 Workers Free allows on a cold isolate,
+  // and the pass behind it — which needs `trips 5`-`8` plus its pair batch —
+  // died on the runtime's `Too many subrequests by single Worker invocation`
+  // throw, taking the deferral sync and the write drain with it.
+  await test("PushWatcher: a starved INVOCATION defers the pass by name (not a starved tick)", async () => {
+    const db = termDb([termRow()]);
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    // 2 left: below TRACKER_SUBREQ_FLOOR, so the rotation cannot even start —
+    // but the pass must say WHICH ceiling stopped it, because "deferred:" alone
+    // used to mean the clock.
+    const out = await pw.runTick(Date.now() + 5_000, undefined, () => 2);
+    assert.match(String(out.note), /^deferred:subreq-budget /, "the note names the ceiling, not just that it deferred");
+    assert.equal(out.checked, 0, "no row was touched — the pass could not pay for one");
+    assert.equal(db.updated.length, 0, "and nothing was written on the way out");
+  });
+
+  await test("PushWatcher: a healthy invocation is unbounded by the probe (room reads no gate)", async () => {
+    const db = termDb([termRow()]);
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    // 50 left = the whole Workers Free allowance: the pass runs as it always did.
+    const out = await pw.runTick(Date.now() + 5_000, undefined, () => 50);
+    assert.equal(out.checked, 1, "the row is measured when there is room");
+    assert.equal(out.alerted, 1, "and its card is sent");
+    assert.doesNotMatch(String(out.note), /subreq/, "a healthy pass never mentions the subrequest gate");
+  });
+
+  await test("PushWatcher: the row loop keeps the tail's RESERVE, and still runs its first row", async () => {
+    // Two alerting rows, six subrequests left: above TRACKER_SUBREQ_FLOOR (the
+    // rotation can start) and at TRACKER_SUBREQ_RESERVE (nothing may be spent
+    // past it, because the deferral sync and the write drain come next).
+    const db = termDb([termRow(), termRow({ token: "SECOND", symbol: "SECOND" })]);
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    const out = await pw.runTick(Date.now() + 5_000, undefined, () => 6);
+    assert.equal(out.checked, 1, "the FIRST row runs regardless — the 2026-09-17 progress floor, on this ceiling too");
+    assert.equal(out.alerted, 1, "and its card still goes out");
+    assert.equal(db.updated.length, 1, "only that row was written");
+    assert.match(String(out.note), /subreq-cut 1/, "the refused row is named in the note");
+    assert.match(String(out.note), /defer-send 1/, "and counted as a card this pass could not deliver");
+    // The loop's own prefix, not `rows 0/` anywhere: stageNote()'s `spend[...]`
+    // carries the row stage's OWN ms/trips as `rows 0/1`, so a loose match
+    // would read the stage and not the rotation.
+    assert.match(String(out.note), /^rows 1\/2 /, "the loop measured its head and refused the rest — never the silent 2026-09-17 `rows 0/` shape");
+  });
+
   await test("PushWatcher: a REJECTED terminal card still rolls back (a fact, not an absence)", async () => {
     // Telegram answered "no": the card is provably not in the chat, so the row
     // must keep being watched and the 💧 card must be re-announced next tick.
@@ -10898,6 +10943,63 @@ async function main() {
       missing.length,
       0,
       `partial application is unsafe - missing: ${missing.join(", ")} (see docs/patches/preinit-arrival-stamp.apply.js)`,
+    );
+  });
+
+  await test("out-of-window patch: the pass's subrequest ceiling is wired end to end (docs/patches/tracker-subreq-budget.apply.js)", () => {
+    // Comments and whitespace stripped, so a mention of the rule in a
+    // comment can never satisfy a check: only the CODE has to carry it.
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const subreqsSrc = read("src/subreqs.ts");
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const scannerSrc = read("src/scanner.ts");
+    const workerSrc = read("src/worker.ts");
+    const applied = {
+      "subreqs (the probe exists)": subreqsSrc.includes(
+        "exportfunctionsubreqRemaining(budget:number=SUBREQ_BUDGET_FREE):number{",
+      ),
+      "pushwatch (both ceilings are named)":
+        pushwatchSrc.includes("constTRACKER_SUBREQ_FLOOR=3;") &&
+        pushwatchSrc.includes("constTRACKER_SUBREQ_RESERVE=6;"),
+      "pushwatch (runTick takes the probe)":
+        pushwatchSrc.includes("keepAlive?:(promise:Promise<unknown>)=>void,subreqLeft?:()=>number,"),
+      "pushwatch (both stage gates ask both ceilings)":
+        (pushwatchSrc.split("if(outOfBudget())returndeferred;").length - 1) === 2 &&
+        !pushwatchSrc.includes("if(past())returndeferred;"),
+      "pushwatch (the note names the ceiling)":
+        pushwatchSrc.includes("deferred:${deferReason}${stageNote()}trips${trips}"),
+      "pushwatch (the row loop keeps the tail reserve)":
+        pushwatchSrc.includes("rowIndex>0&&subreqsLeft()<=TRACKER_SUBREQ_RESERVE;") &&
+        pushwatchSrc.includes("subreqCut+=1;"),
+      "pushwatch (the cut is in the note)":
+        pushwatchSrc.includes("subreq-cut${subreqCut}"),
+      "scanner (the probe is forwarded)":
+        scannerSrc.includes("this.pushWatcher.runTick(deadlineMs,keepAlive,subreqLeft)"),
+      "worker (the tick supplies the counter)": workerSrc.includes(
+        "awaitscanner.runTrackerPass(Date.now()+trackerBudgetMs,holdTick?(p:Promise<unknown>)=>holdTick(p):undefined,subreqRemaining,);",
+      ),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ pass subrequest ceiling missing - apply docs/patches/tracker-subreq-budget.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    // A half-wired ceiling is the state this change must never be shipped in:
+    // a probe nobody supplies is dead code, while a gate whose reserve is
+    // unreachable cannot name why a pass stopped. Both directions are
+    // silent at runtime, so they are caught here instead.
+    assert.equal(
+      missing.length,
+      0,
+      `partial paste of docs/patches/tracker-subreq-budget.apply.js — missing: ${missing.join(", ")}`,
     );
   });
 
