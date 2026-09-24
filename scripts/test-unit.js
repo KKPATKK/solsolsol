@@ -36,7 +36,7 @@ const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
-const { tradeFingerprint, deadTickBackfillInfo, TICK_PROGRESS_KEY, tickProgressRecord, parseTickProgress, tickProgressNote } = require("../dist/worker.js");
+const { tradeFingerprint, deadTickBackfillInfo, TICK_PROGRESS_KEY, tickProgressRecord, parseTickProgress, tickProgressNote, tickPhaseLadder } = require("../dist/worker.js");
 const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, deliveredFollowupProofs, cardProofKey, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
@@ -11371,6 +11371,16 @@ async function main() {
     assert.match(hit, /9526B/, "and the batch size");
     assert.match(hit, /subreqs 46/, "and the spend");
     assert.match(hit, /preRace 158ms/);
+    // A PHASE stamp (the ladder that names scan/front/pair/gate) carries no
+    // batch at all, so its note must not read `0B` — the size means something
+    // only once the record describes a flush (see tickPhaseLadder).
+    const phase = tickProgressNote(
+      tickProgressRecord({ at, stage: "pair", payloadBytes: 0, scanMs: 0, preRaceMs: 158, subreqs: 12, cut: false, err: null }),
+      at,
+    );
+    assert.match(phase, /prog pair/, "a phase stamp names its phase");
+    assert.match(phase, /subreqs 12/);
+    assert.ok(!/0B/.test(phase), "and claims no batch it never had");
     // A flush that hung or failed leaves the later stamp on the same row.
     assert.match(
       tickProgressNote(
@@ -11399,6 +11409,54 @@ async function main() {
     assert.ok(tickProgressNote(null, at, 40).length <= 40);
   });
 
+  await test("tickPhaseLadder: phase stamps are strictly ordered and never awaited by the tick", async () => {
+    const seen = [];
+    let release = null;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    const ladder = tickPhaseLadder(async (json) => {
+      seen.push(JSON.parse(json).stage);
+      if (seen.length === 1) await held;
+    });
+    const fields = (stage) => ({
+      at: 7,
+      stage,
+      payloadBytes: 0,
+      scanMs: 0,
+      preRaceMs: 0,
+      subreqs: 1,
+      cut: false,
+      err: null,
+    });
+    const first = ladder.stamp(fields("scan"));
+    const second = ladder.stamp(fields("front"));
+    // The second write must not even START before the first settles: two
+    // writes to ONE row in flight at once could land out of order and let a
+    // later phase describe a tick that never got there.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(seen, ["scan"], "the second stamp waits for the first");
+    release();
+    await Promise.all([first, second]);
+    assert.deepEqual(seen, ["scan", "front"], "and then lands in order");
+    // A refused stamp is a reading, not a stopped ladder: the queue absorbs
+    // it, so the phases behind it still land (a stalled queue would leave the
+    // row describing a phase the tick had long left).
+    let attempts = 0;
+    const flaky = tickPhaseLadder(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("refused");
+    });
+    const refused = flaky.stamp(fields("pair"));
+    const after = flaky.stamp(fields("gate"));
+    await assert.rejects(refused);
+    await after;
+    // The queue absorbed the refusal: the stamp BEHIND it was still attempted
+    // and landed. A stalled queue would leave the row naming a phase the tick
+    // had long left — which is the failure this test exists to catch.
+    assert.equal(attempts, 2);
+  });
+
   await test("out-of-window patch: the pre-flush record is written BEFORE the flush and read by the successor (docs/patches/tick-progress-record.apply.js)", () => {
     const strip = (text) =>
       text
@@ -11407,7 +11465,13 @@ async function main() {
         .replace(/\s+/g, "");
     const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
     const workerSrc = read("src/worker.ts");
+    const scannerSrc = read("src/scanner.ts");
     const testSrc = read("scripts/test-unit.js");
+    const scanBefore = (a, b) => {
+      const ia = scannerSrc.indexOf(a);
+      const ib = scannerSrc.indexOf(b);
+      return ia >= 0 && ib >= 0 && ia < ib;
+    };
     const before = (a, b) => {
       const ia = workerSrc.indexOf(a);
       const ib = workerSrc.indexOf(b);
@@ -11435,6 +11499,18 @@ async function main() {
       "worker (/health publishes it)":
         workerSrc.includes("tickProgress,") &&
         workerSrc.includes('getWorkerStates(["scan_heartbeat",TICK_PROGRESS_KEY])'),
+      "worker (the phase ladder is what writes the row, so no phase stamp can overtake the record)":
+        workerSrc.includes("tickPhaseLadder(") &&
+        workerSrc.includes("ladder.stamp({"),
+      "worker (the tick queues its first stamp before the scan and unwires the hook after it)":
+        workerSrc.includes('notePhase("scan")') &&
+        workerSrc.includes("scanner.onTickPhase=notePhase;") &&
+        workerSrc.includes("scanner.onTickPhase=null;"),
+      "scanner (the hook, and the four phase names in the order the tick crosses them)":
+        scannerSrc.includes("onTickPhase:((phase:string)=>void)|null=null;") &&
+        scannerSrc.includes('this.stampPhase("front");') &&
+        scanBefore('this.stampPhase("front");', 'this.stampPhase("pair");') &&
+        scanBefore('this.stampPhase("pair");', 'this.stampPhase("gate");'),
       "tests (this guard)": testSrc.includes("tickProgressNote(rec,at"),
     };
     const done = Object.entries(applied).filter(([, v]) => v);

@@ -1460,3 +1460,43 @@ subrequest**；backfill row 嘅 `err` 尾多一句有界註記：
 `postscan-late`），就算 await 都只 bound `TICK_PROGRESS_BOUND_MS`（600ms）而且一定唔會 reject。
 上面「爆預算時最後死嘅係 telemetry 寫入」正正就係呢個 record 要寫喺 flush **之前**嘅原因：事後補寫
 一定會被同一個條件拒絕。
+
+---
+
+## 2026-09-24（補）：死喺邊個階段 —— 細分 `prog none`
+
+`tick_progress` 只寫喺 flush 之前，結果第一個上線之後嘅四次死亡，全部讀到同一句：
+
+| at | ms | err |
+|---|---|---|
+| 20:04:20.093Z | 60171 | `prog none: the row still holds an earlier tick's stamp (at 1790280200095)` |
+| 20:05:20.264Z | 59980 | 同上 |
+| 20:06:20.244Z | 63824 | 同上 |
+| 21:43:31.376Z | 96151 | 同上，held `1790286145702` |
+
+兩個 held 值（`20:03:20.095Z`、`21:42:25.702Z`）都係前一個**健康** tick 嘅 pre-flush stamp。
+即係話：四次死亡，無一次寫到自己嘅 record。record 只答到「flush 之前」，而 flush 之前就係成個 tick。
+
+## 加咗啲乜
+
+同一個 `tick_progress` row，行過每個階段邊界就再蓋一次，全部經一條嚴格排序嘅 queue，而 tick **唔等**佢：
+
+| stage | 邊個蓋 | 意思 |
+|---|---|---|
+| `scan` | worker（`scanner.runOnce()` 之前） | 已經入場：cron/gate/init/claim 過咗，scan 仲未開始 |
+| `front` | scanner（`diag.feedsMs`） | discovery feed 階段返咗 |
+| `pair` | scanner（`diag.pairs`） | pool read ＋ pair fetch（含 Jupiter fallback）返咗 |
+| `gate` | scanner（registration loop 之前） | 候選鏈入咗：registration read、eval、每 chat 嘅 gate、push |
+
+之後仍然係舊有嘅 `postscan` / `postscan-late` / `flush-hung` / `flush-failed` / `flush-retry-failed`，
+只係佢哋而家**排喺同一條 queue 尾**，所以階段 stamp 唔可能越過個 record。
+
+## 成本同界線
+
+- 每個 stamp = 一個 worker_state 寫入 = **1 個 subrequest**，冇其他。
+- **永遠唔 await**：tick 蓋完就走，成本係 0 wall clock；寫入大約 200ms 後落地，嗰時 tick 已經入咗下一階段。
+- **嚴格排序**（`tickPhaseLadder`）：同一行兩個 write 同時飛，落錯次序就會用「後一個階段」去描述一個未曾到過嗰度嘅 tick。
+  每個 stamp 排喺前一個 settle 之後，而拒絕會被 queue 食掉，所以一次被拒唔會卡死後面。
+- **只有最後落地嗰個 stamp 留低**，呢個就係要點：row 講嘅係「tick 到過、而寫入趕得及落地」嘅最後階段。
+  一個趕唔及落地嘅階段，會讀成前一階段 —— 有界嘅未知，同「冇 record」本身嘅處理一樣。
+- 死亡早過任何 stamp（連 `scan` 都落唔到）＝ 死喺 claim/init 前段，`prog none` 嗰句而家講明呢點。

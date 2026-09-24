@@ -1734,7 +1734,15 @@ export interface TickProgressRecord {
   /** The tick's startedAt — the SAME value its heartbeat carries as `at`. */
   at: number;
   /**
-   * Where the tick was when it stamped: `postscan` (scan finished, flush in
+   * Where the tick was when it stamped.
+   *
+   * THE PHASE LADDER (see tickPhaseLadder) — stamped as the tick crosses each
+   * boundary, so a death BEFORE the flush can still be attributed to a phase:
+   * `scan` (admitted, the scan not yet entered), `front` (the discovery feeds
+   * returned), `pair` (the pool read and the pair fetch returned), `gate` (the
+   * candidate chain: registration, eval, the per-chat gates, the push).
+   *
+   * THE FLUSH STAGES, stamped once the scan is over: `postscan` (flush in
    * front of it), `postscan-late` (same point, but too late to wait for the
    * stamp), `flush-hung`, `flush-failed`, `flush-retry-failed`.
    */
@@ -1760,8 +1768,12 @@ export interface TickProgressRecord {
 /** How much of a failure reason the record keeps (it is read, not parsed). */
 export const TICK_PROGRESS_ERR_MAX = 160;
 
-/** Build one. Time is taken here so `t`/`ms` can never disagree. */
-export function tickProgressRecord(fields: {
+/**
+ * What one stamp carries. `at` is the tick's startedAt — the value that keys
+ * the record to ONE tick, which is what lets the successor refuse to credit
+ * another tick's stamp to this death (see tickProgressNote).
+ */
+export interface TickProgressFields {
   at: number;
   stage: string;
   payloadBytes: number;
@@ -1770,7 +1782,10 @@ export function tickProgressRecord(fields: {
   subreqs: number;
   cut: boolean;
   err: string | null;
-}): string {
+}
+
+/** Build one. Time is taken here so `t`/`ms` can never disagree. */
+export function tickProgressRecord(fields: TickProgressFields): string {
   const t = Date.now();
   const whole = (n: unknown) => {
     const v = Number(n ?? 0);
@@ -1789,6 +1804,69 @@ export function tickProgressRecord(fields: {
     err: fields.err ? String(fields.err).slice(0, TICK_PROGRESS_ERR_MAX) : null,
   };
   return JSON.stringify(rec);
+}
+
+/**
+ * The tick's PHASE LADDER (see TICK_PROGRESS_KEY): the same one row, stamped
+ * again as the tick crosses each phase boundary, so a tick that dies BEFORE
+ * its pre-flush record can still be attributed to a phase instead of to the
+ * whole pre-flush stretch.
+ *
+ * WHY (2026-09-24, live). The pre-flush record only lands once the scan is
+ * over, and four of the first four deaths it captured (20:04-20:06Z, 21:43Z)
+ * never wrote one of their own: every note read `prog none: the row still
+ * holds an earlier tick's stamp`, i.e. the record could only say "before the
+ * flush", which is where the entire tick lives. The phases in that stretch
+ * are `scan` (admitted, scan not yet entered), `front` (the discovery feeds
+ * returned), `pair` (the pool read and the pair fetch returned) and `gate`
+ * (the candidate chain entered).
+ *
+ * THE COST MODEL, which is the only reason this is not four awaited writes:
+ *
+ *   - Each stamp is ONE worker_state write (one subrequest). Nothing else.
+ *   - The ladder NEVER awaits them: the tick queues a stamp and walks on, so a
+ *     stamp costs the tick ZERO wall clock. The write lands ~200ms later,
+ *     while the tick is already in the next phase — which matters because the
+ *     late tick is the one that dies, and this telemetry must never be the
+ *     reason.
+ *   - The queue is STRICTLY ordered: two writes to ONE row in flight at once
+ *     could land out of order and let a LATER phase describe a tick that never
+ *     got there. Each stamp chains on the previous one's settlement, and
+ *     refusals are absorbed so one refused write cannot stall the row behind
+ *     it.
+ *   - The pre-flush record rides the SAME queue, which is what keeps the row
+ *     honest: what the successor reads is the last stamp written, not a phase
+ *     stamp that overtook it.
+ *
+ * Only the last stamp to land survives, and that is the reading: the row names
+ * the last phase the tick reached AND stamped in time. A phase whose write
+ * never landed reads as the phase before it — a bounded unknown.
+ */
+export interface TickPhaseLadder {
+  /** Queue one stamp. Resolves when its own write has settled. */
+  stamp(fields: TickProgressFields): Promise<unknown>;
+  /** The queue as of this call — what the pre-flush record queues behind. */
+  tail(): Promise<unknown>;
+}
+
+export function tickPhaseLadder(
+  write: (recordJson: string) => Promise<unknown>,
+): TickPhaseLadder {
+  let tail: Promise<unknown> = Promise.resolve();
+  const stamp = (fields: TickProgressFields) => {
+    const json = tickProgressRecord(fields);
+    // `.then(run, run)`: a refused PREDECESSOR must not cancel the stamps
+    // behind it — a lost stamp is a reading, a stalled ladder is a lost row.
+    const run = () => write(json);
+    const chained = tail.then(run, run);
+    // The queue absorbs the refusal; the caller still gets the real promise.
+    tail = chained.then(
+      () => {},
+      () => {},
+    );
+    return chained;
+  };
+  return { stamp, tail: () => tail };
 }
 
 /**
@@ -1857,16 +1935,16 @@ export function tickProgressNote(
     // the end of its OWN tick), so it is named as what it is, not assumed
     // away.
     return rec.at < deadAt
-      ? none(`the row still holds an earlier tick's stamp (at ${rec.at})`)
+      ? none(
+          `the row still holds an earlier tick's stamp (at ${rec.at}): this tick never landed its own, so it died before its first phase stamp`,
+        )
       : ` [prog other (at ${rec.at} ≠ ${deadAt})]`.slice(0, limit);
   }
-  const bits = [
-    `prog ${rec.stage}`,
-    `+${rec.ms}ms`,
-    `${rec.payloadBytes}B`,
-    `subreqs ${rec.subreqs}`,
-    `preRace ${rec.preRaceMs}ms`,
-  ];
+  const bits = [`prog ${rec.stage}`, `+${rec.ms}ms`];
+  // A PHASE stamp carries no batch (payloadBytes 0): the size only means
+  // something once the record describes a flush (see tickPhaseLadder).
+  if (rec.payloadBytes > 0) bits.push(`${rec.payloadBytes}B`);
+  bits.push(`subreqs ${rec.subreqs}`, `preRace ${rec.preRaceMs}ms`);
   if (rec.cut) bits.push("cut");
   if (rec.err) bits.push(`err:${rec.err}`);
   return ` [${bits.join(" ")}]`.slice(0, limit);
@@ -2960,6 +3038,26 @@ async function runScan(
     // losing the race). The cadence gate sees a fresh `at`, so the
     // effective scan rate returns to the configured 60s and the alert only
     // fires when ticks genuinely stop.
+    // ── the phase ladder, hoisted out of the inner try (see
+    // tickPhaseLadder) ───────────────────────────────────────────────
+    // The tick's durable whereabouts, queued and never awaited. Declared
+    // HERE, outside the inner try, because the pre-flush record that rides
+    // this queue is written in that try's `finally` block — which cannot see
+    // a binding declared in the try's body (tsc caught exactly that).
+    const ladder = tickPhaseLadder((json) => {
+      const client = db;
+      if (!client) return Promise.resolve();
+      try {
+        const write = client.setWorkerState(TICK_PROGRESS_KEY, json);
+        // Swallowed at the source: an unhandled rejection can take the
+        // isolate down with it, and a phase stamp is the least important
+        // thing the invocation does.
+        write.catch(() => {});
+        return write;
+      } catch {
+        return Promise.resolve();
+      }
+    });
     try {
       // Race the scan against the tick budget. runOnce never rejects (it
       // catches its own errors), so the first to settle wins; on timeout
@@ -2994,6 +3092,27 @@ async function runScan(
         raceAt: Date.now(),
         raceMs: scanRaceMs,
       });
+      // The phase stamp the worker itself owns (see tickPhaseLadder): the
+      // tick is admitted, the scan not yet entered. The three phases INSIDE
+      // the scan are stamped through the scanner's hook below — without it
+      // the row would stop here, which is where four of four captured deaths
+      // stopped.
+      const notePhase = (phase: string) =>
+        void ladder.stamp({
+          at: startedAt,
+          stage: phase,
+          payloadBytes: 0,
+          scanMs: 0,
+          preRaceMs: preTick?.preRaceMs ?? 0,
+          subreqs: subreqView().current.total,
+          cut: false,
+          err: null,
+        });
+      if (scanner) scanner.onTickPhase = notePhase;
+      notePhase("scan");
+      // Wired only for the duration of the scan: the hook is unwired after
+      // the race, so the tail (the tracker pass) cannot stamp a phase the
+      // scan never had.
       await Promise.race([
         scanner.runOnce(),
         new Promise<void>((resolve) => {
@@ -3011,6 +3130,10 @@ async function runScan(
           }, scanRaceMs);
         }),
       ]);
+      // The scan is over: unwire the phase hook, so the tick's tail (the
+      // tracker pass) cannot stamp a phase the scan never had. The pre-flush
+      // record below takes over from here (see TICK_PROGRESS_KEY).
+      if (scanner) scanner.onTickPhase = null;
       lastScanOk = !timedOut;
       // Report the SCAN RACE window, not the whole tick budget: the race now
       // ends SCAN_FLUSH_RESERVE_MS early, so quoting the budget sent the
@@ -3128,32 +3251,21 @@ async function runScan(
       // flush it describes), fired and NOT awaited below that, bounded when it
       // is awaited, and never allowed to reject: a lost record is not a lost
       // tick, a delayed flush is.
-      const noteProgress = (stage: string, why?: string | null) => {
-        if (!db) return null;
-        let write: Promise<unknown>;
-        try {
-          write = db.setWorkerState(
-            TICK_PROGRESS_KEY,
-            tickProgressRecord({
-              at: startedAt,
-              stage,
-              payloadBytes: flushJson.length,
-              scanMs: flushedMs,
-              preRaceMs: preTick?.preRaceMs ?? 0,
-              subreqs: subreqView().current.total,
-              cut: timedOut,
-              err: why ?? lastScanError,
-            }),
-          );
-        } catch {
-          return null;
-        }
-        // Swallowed at the source: an unhandled rejection can take the
-        // isolate down with it, and this write is the least important thing
-        // the invocation does.
-        write.catch(() => {});
-        return write;
-      };
+      // The pre-flush record rides the phase ladder's queue: the row must end
+      // with THIS stamp, not with a phase stamp that overtook it (see
+      // tickPhaseLadder). Awaited only by the caller below, and only while the
+      // tick can still afford it.
+      const noteProgress = (stage: string, why?: string | null) =>
+        ladder.stamp({
+          at: startedAt,
+          stage,
+          payloadBytes: flushJson.length,
+          scanMs: flushedMs,
+          preRaceMs: preTick?.preRaceMs ?? 0,
+          subreqs: subreqView().current.total,
+          cut: timedOut,
+          err: why ?? lastScanError,
+        });
       {
         const late =
           startedAt + SCAN_TICK_BUDGET_MS - Date.now() <

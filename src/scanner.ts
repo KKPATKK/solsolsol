@@ -1453,6 +1453,29 @@ export class Scanner {
    */
   trackerPassOverrunMs = TRACKER_PASS_OVERRUN_MS;
   /**
+   * The tick's phase stamp hook (see the worker's tickPhaseLadder /
+   * TICK_PROGRESS_KEY). The worker wires it for the duration of a tick and
+   * unwires it after the scan: the front phases (feeds, pool read, pair fetch)
+   * and the gate all run INSIDE this class, so without the hook the tick's
+   * durable whereabouts would stop at "the scan started" — which is where
+   * four of four captured deaths stopped.
+   *
+   * null = no stamp wanted (a standalone Scanner, or a tick that already
+   * ended). Telemetry only: a stamp may never cost or break the scan.
+   */
+  onTickPhase: ((phase: string) => void) | null = null;
+
+  /** One phase stamp, never thrown into the scan (see onTickPhase). */
+  private stampPhase(phase: string): void {
+    const hook = this.onTickPhase;
+    if (!hook) return;
+    try {
+      hook(phase);
+    } catch {
+      /* a stamp is telemetry */
+    }
+  }
+  /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
    * without Cloudflare log access: "previous-scan-still-running",
@@ -2779,6 +2802,8 @@ export class Scanner {
           err instanceof Error ? err.message : err,
         );
       }
+      // The discovery-feed phase is behind us (see the worker's phase ladder).
+      this.stampPhase("front");
       diag.feedsMs = Date.now() - feedsStart;
       // Dedupe the feeds (mints overlap across all three); the DexScreener
       // entry wins — it carries richer profile data.
@@ -3052,6 +3077,9 @@ export class Scanner {
           );
         }
       }
+      // The pool read AND the pair fetch are behind us (Jupiter fallback
+      // included): the front window is closed.
+      this.stampPhase("pair");
       diag.pairs = pairsByToken.size;
       // Kept for the post-push tracker pass (see lastPairs).
       this.lastPairs = pairsByToken;
@@ -3085,6 +3113,9 @@ export class Scanner {
           err instanceof Error ? err.message : err,
         );
       }
+      // Past the registration read: what follows is the candidate chain — eval,
+      // the per-chat gates, the push (see the worker's phase ladder).
+      this.stampPhase("gate");
       const newStats: TokenStats[] = [];
       for (const profile of feedProfiles) {
         // Read failed → register nothing: `existingStats` missing means we
