@@ -2340,9 +2340,17 @@ async function main() {
       assert.equal(twice.emptyPages, before.emptyPages + 2, "both discovery legs count");
       assert.equal(twice.emptyPageStreak, 2, "and the streak follows");
       assert.equal(geckoFeedStats().emptyPages, twice.emptyPages, "the isolate publishes it");
-      // The other branch: a page that carries pools counts them and ends the
-      // streak (called directly - the fetch stub above cannot produce pools).
-      client.notePage(new Array(7).fill(null));
+      // NOT DELIVERED IS NOT EMPTY: the same stub answering 429 must leave
+      // emptyPages alone, or the two readings contradict each other (live
+      // 2026-09-24 23:32: `http429 2` beside `emptyPages 2`).
+      global.fetch = async () => new Response("", { status: 429 });
+      await client.fetchNewPools(1);
+      const refused = client.stats();
+      assert.equal(refused.emptyPages, twice.emptyPages, "a 429 is not an empty page");
+      assert.equal(refused.http429, twice.http429 + 1, "it is a 429, and only that");
+      // The other branch: a DELIVERED page that carries pools counts them and
+      // ends the streak (called directly - the stubs above cannot produce pools).
+      client.notePage({ data: [{}] }, () => new Array(7).fill(null));
       const fed = client.stats();
       assert.equal(fed.parsedPools, 7, "a page with pools counts them");
       assert.equal(fed.emptyPageStreak, 0, "and clears the streak");
@@ -11519,7 +11527,7 @@ async function main() {
         workerSrc.includes("scheduledTickHoleMs:healthAgeMs(Date.now(),scheduledTickAt),"),
       "gecko (a 200 with zero pools has a counter of its own)":
         geckoSrc.includes("emptyPages:number;") &&
-        geckoSrc.includes("privatenotePage(pools:NewPool[]):NewPool[]{") &&
+        geckoSrc.includes("privatenotePage(body:unknown,parse:(raw:unknown)=>NewPool[],):NewPool[]{") &&
         geckoSrc.includes("returnthis.notePage("),
     };
     const done = Object.entries(applied).filter(([, v]) => v);

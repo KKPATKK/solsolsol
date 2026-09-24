@@ -483,6 +483,121 @@ const PATCHES = [
     anchor: lines('        geckoSrc.includes("privatenotePage(pools:number):number{") &&'),
     replacement: lines('        geckoSrc.includes("privatenotePage(pools:NewPool[]):NewPool[]{") &&'),
   },
+  // ── corrections the LIVE verification found ──────────────────────────
+  // The first form counted an UNDELIVERED call as an empty page: a 429, a
+  // hard refusal or the throttle make `get()` return null, `parseNewPools(null)`
+  // returns [], and the counter moved — so the reading contradicted itself the
+  // moment it shipped (live 2026-09-24 23:32: `requests 2, ok 0, http429 2`
+  // next to `emptyPages 2`, a pair no 200 could explain). An empty page is only
+  // an empty page if a body actually arrived.
+  {
+    file: "src/geckoterminal.ts",
+    what: "an undelivered call is not an empty page",
+    marker: "if (body === null || body === undefined) return [];",
+    anchor: lines(
+      "  private notePage(pools: NewPool[]): NewPool[] {",
+      "    if (pools.length > 0) {",
+    ),
+    replacement: lines(
+      "  private notePage(",
+      "    body: unknown,",
+      "    parse: (raw: unknown) => NewPool[],",
+      "  ): NewPool[] {",
+      "    // NOT DELIVERED IS NOT EMPTY. `null` means this client never got a body —",
+      "    // a 429 backoff, a hard refusal, or the throttle (see get) — and that",
+      "    // call is already counted as http429/alt429. Counting it here as well",
+      "    // made the two readings contradict each other the moment it shipped",
+      "    // (live 2026-09-24 23:32: `requests 2, ok 0, http429 2` beside",
+      "    // `emptyPages 2` — a pair no 200 could explain).",
+      "    if (body === null || body === undefined) return [];",
+      "    const pools = parse(body);",
+      "    if (pools.length > 0) {",
+    ),
+  },
+  {
+    file: "src/geckoterminal.ts",
+    what: "the new_pools leg hands the body over, not the parse",
+    marker: "await this.get(`/networks/solana/new_pools?page=${page}`),\n      parseNewPools,",
+    anchor: lines(
+      "  async fetchNewPools(page = 1): Promise<NewPool[]> {",
+      "    return this.notePage(",
+      "      parseNewPools(await this.get(`/networks/solana/new_pools?page=${page}`)),",
+      "    );",
+      "  }",
+    ),
+    replacement: lines(
+      "  async fetchNewPools(page = 1): Promise<NewPool[]> {",
+      "    return this.notePage(",
+      "      await this.get(`/networks/solana/new_pools?page=${page}`),",
+      "      parseNewPools,",
+      "    );",
+      "  }",
+    ),
+  },
+  {
+    file: "src/geckoterminal.ts",
+    what: "and so does the trending leg",
+    marker: "          )}`,\n      ),\n      parseNewPools,",
+    anchor: lines(
+      "  async fetchTrendingPools(limit: number): Promise<NewPool[]> {",
+      "    return this.notePage(",
+      "      parseNewPools(",
+      "        await this.get(",
+      "          `/networks/solana/trending_pools?include=base_token&limit=${Math.min(",
+      "            Math.max(1, Math.floor(limit)),",
+      "            20,",
+      "          )}`,",
+      "        ),",
+      "      ),",
+      "    );",
+      "  }",
+    ),
+    replacement: lines(
+      "  async fetchTrendingPools(limit: number): Promise<NewPool[]> {",
+      "    return this.notePage(",
+      "      await this.get(",
+      "        `/networks/solana/trending_pools?include=base_token&limit=${Math.min(",
+      "          Math.max(1, Math.floor(limit)),",
+      "          20,",
+      "        )}`,",
+      "      ),",
+      "      parseNewPools,",
+      "    );",
+      "  }",
+    ),
+  },
+  {
+    file: "scripts/test-unit.js",
+    what: "the 429 case is pinned against the empty-page counter",
+    marker: "a 429 is not an empty page",
+    anchor: lines(
+      "      // The other branch: a page that carries pools counts them and ends the",
+      "      // streak (called directly - the fetch stub above cannot produce pools).",
+      "      client.notePage(new Array(7).fill(null));",
+    ),
+    replacement: lines(
+      "      // NOT DELIVERED IS NOT EMPTY: the same stub answering 429 must leave",
+      "      // emptyPages alone, or the two readings contradict each other (live",
+      "      // 2026-09-24 23:32: `http429 2` beside `emptyPages 2`).",
+      '      global.fetch = async () => new Response("", { status: 429 });',
+      "      await client.fetchNewPools(1);",
+      "      const refused = client.stats();",
+      '      assert.equal(refused.emptyPages, twice.emptyPages, "a 429 is not an empty page");',
+      '      assert.equal(refused.http429, twice.http429 + 1, "it is a 429, and only that");',
+      "      // The other branch: a DELIVERED page that carries pools counts them and",
+      "      // ends the streak (called directly - the stubs above cannot produce pools).",
+      "      client.notePage({ data: [{}] }, () => new Array(7).fill(null));",
+    ),
+  },
+  {
+    file: "scripts/test-unit.js",
+    what: "and the guard's needle moves with the signature",
+    marker: "privatenotePage(body:unknown,parse:(raw:unknown)=>NewPool[],):NewPool[]{",
+    anchor: lines('        geckoSrc.includes("privatenotePage(pools:NewPool[]):NewPool[]{") &&'),
+    replacement: lines(
+      '        geckoSrc.includes("privatenotePage(body:unknown,parse:(raw:unknown)=>NewPool[],):NewPool[]{") &&',
+    ),
+  },
 ];
 
 const buffers = new Map();

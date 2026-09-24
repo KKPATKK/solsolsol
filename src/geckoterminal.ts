@@ -733,7 +733,18 @@ export class GeckoTerminalClient {
    * counter that names "Gecko answered, and the feed was still 0" — the
    * shape that looked identical to a quiet market until it had a name.
    */
-  private notePage(pools: NewPool[]): NewPool[] {
+  private notePage(
+    body: unknown,
+    parse: (raw: unknown) => NewPool[],
+  ): NewPool[] {
+    // NOT DELIVERED IS NOT EMPTY. `null` means this client never got a body —
+    // a 429 backoff, a hard refusal, or the throttle (see get) — and that
+    // call is already counted as http429/alt429. Counting it here as well
+    // made the two readings contradict each other the moment it shipped
+    // (live 2026-09-24 23:32: `requests 2, ok 0, http429 2` beside
+    // `emptyPages 2` — a pair no 200 could explain).
+    if (body === null || body === undefined) return [];
+    const pools = parse(body);
     if (pools.length > 0) {
       this.parsedPools += pools.length;
       this.emptyPageStreak = 0;
@@ -754,7 +765,8 @@ export class GeckoTerminalClient {
 
   async fetchNewPools(page = 1): Promise<NewPool[]> {
     return this.notePage(
-      parseNewPools(await this.get(`/networks/solana/new_pools?page=${page}`)),
+      await this.get(`/networks/solana/new_pools?page=${page}`),
+      parseNewPools,
     );
   }
 
@@ -767,14 +779,13 @@ export class GeckoTerminalClient {
    */
   async fetchTrendingPools(limit: number): Promise<NewPool[]> {
     return this.notePage(
-      parseNewPools(
-        await this.get(
-          `/networks/solana/trending_pools?include=base_token&limit=${Math.min(
-            Math.max(1, Math.floor(limit)),
-            20,
-          )}`,
-        ),
+      await this.get(
+        `/networks/solana/trending_pools?include=base_token&limit=${Math.min(
+          Math.max(1, Math.floor(limit)),
+          20,
+        )}`,
       ),
+      parseNewPools,
     );
   }
 }
