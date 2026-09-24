@@ -880,11 +880,22 @@ ok:30/0 rows 30/30 pairs 30/30 miss 0 lost 0 allow 4784
 spend[setup 364/2 heal 415/1 miss0 enrolled0 pairs 0/0 rows 214/1 holders 0/0 held0 cut4 probe0 miss0 cu-gate] trips 6 db 1348ms
 ```
 
-**未證嘅一半（老實講）**：三個抽樣 pass 都係 `ok:30/0` —— **冇一條 alerting row**，所以
-「被拒嘅 card 仍然會出聲」（`defer-send N` ＋ `budget-cut`）今次 **live 抽唔到**，只由 unit test
-釘住：`a card that cannot be sent leaves its row untouched` 斷言 `defer-send 1` ＋ `budget-cut`，
-而 fix1 把 `overBudget` 由 send gate 拿返出嚟之後佢仍然綠。要等一條真 alerting row 出現，
-先可以話 live 都證實。
+**06:31:41Z 補充 —— 抽到一條 alerting row，而個尾冇斷**：
+
+```
+ok:30/1 rows 30/30 pairs 30/30 miss 0 lost 0 allow 4783
+spend[setup 791/2 heal 389/1 miss0 enrolled0 pairs 33/0 rows 1931/5 holders 0/0 held0 cut4 probe0 miss0 cu-gate] trips 9 db 3011ms
+```
+
+`ok:30/1` ＝ 30 行 checked、1 條出咗 card；`rows 1931/5` ＝ 5 個 trip（batch 1 ＋ 嗰行嘅
+claim／reservation／final write）。**alerting row 在場都一樣 `rows 30/30`、冇 `budget-cut`、
+`trackerMs 3_567` 仍在 `allow 4_783` 之内** —— 即係「alerting row 會唔會再切尾」呢個問題 live
+答咗：唔會（以前 3 條 alerting row 就已經令 pass 停喺 17/30）。
+
+**未證嘅只剩「被拒」嗰半（老實講）**：抽樣期間冇一條 card 因為唔夠 slice 而被拒，所以
+`defer-send N` ＋ `budget-cut` 今次 **live 抽唔到**，只由 unit test 釘住：
+`a card that cannot be sent leaves its row untouched` 斷言 `defer-send 1` ＋ `budget-cut`，
+而 fix1 把 `overBudget` 由 send gate 拿返出嚟之後佢仍然綠。
 
 ## 5. 驗證狀態（本地 + 上線）
 
