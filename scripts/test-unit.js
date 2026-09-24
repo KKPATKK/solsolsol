@@ -10367,6 +10367,30 @@ async function main() {
     assert.equal(second.get("scheduled_arrival_at"), "1700000060000");
     await t.cleanup();
   });
+  await test("Db.stampScheduledArrival: lands on a handle that NEVER ran init (the cold isolate)", async () => {
+    const t = tmpDb();
+    // The schema and the reader come from an initialized handle...
+    const seeded = new Db("file:injected", undefined, t.client);
+    await seeded.init();
+    // ...while the writer is a SECOND handle that never ran init, which is
+    // exactly what the worker's cold-isolate fallback builds: `db === null`
+    // before ensureInitialized, so it constructs a raw `new Db(url, token)` and
+    // stamps through that. get() throws "Database is not initialized" on such a
+    // handle, and the worker's own catch swallows it — live 2026-09-24 the cron
+    // trigger delivered every minute (the ring's newest entry and
+    // scheduled_tick_at both advanced) while scheduled_arrival_total stayed
+    // ABSENT after a deploy. The write must go through the lazy connect(), the
+    // same primitive bumpScheduledTickLegacy relies on.
+    const cold = new Db("file:injected", undefined, t.client);
+    await cold.stampScheduledArrival(1_700_000_000_000);
+    const read = await seeded.getWorkerStates([
+      "scheduled_arrival_total",
+      "scheduled_arrival_at",
+    ]);
+    assert.equal(read.get("scheduled_arrival_total"), "1");
+    assert.equal(read.get("scheduled_arrival_at"), "1700000000000");
+    await t.cleanup();
+  });
 
   await test("worker: the pre-init stamp fires only for an arrival whose predecessor never returned", () => {
     const { shouldStampArrival, SCHEDULED_ARRIVAL_SUSPECT_GAP_MS } = require("../dist/worker.js");

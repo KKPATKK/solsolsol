@@ -512,13 +512,44 @@ call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable
   自己入賬）。兩邊嘅 state read 順手合成一個（`/health` 2→1；`/debug/scan-history` 5→1）。
 * **測試**：`test-unit.js` 加 3 條 —— Db stamp 一 trip 零 read（counting client 度到
   `executes 0 / batch 1 / statements 3`）、`shouldStampArrival` 規則（含「單一 lost arrival 都要
-  捉到」嘅 < 120s 關係）、out-of-window patch guard（半套貼上係危險狀態）。296 → **299 passed, 0 failed**。
+  捉到」嘅 < 120s 關係）、out-of-window patch guard（半套貼上係危險狀態）。296 → **299 passed, 0 failed**；
+  §4.5.3.1 再落一條 cold-handle test ⇒ **300 passed, 0 failed**。
 * **落線 script**：`docs/patches/preinit-arrival-stamp.apply.js`（`db.ts` ＋ `worker.ts`）＋
   `…fix1.apply.js`（export `SCHEDULED_ARRIVAL_SUSPECT_GAP_MS`）＋ `…-tests.apply.js` /
   `…-tests.fix1.apply.js`。
 
+### 4.5.3.1 cold isolate 個 stamp 係 no-op：`get()` 對未 init 嘅 handle 會 throw（2026-09-24，已修）
+
+落線後第一個鐘嘅讀數直接推翻 §4.5.3 嘅 cold-isolate 假設 —— 而且係喺**冇 wedge** 嘅情況下推翻。
+
+* **現場**（01:43–01:51Z，deploy 之後）：`scheduledTickAt` 每分鐘 :02 前進、ring 最新一格
+  01:51:05、scan row 照落 —— 即係 cron **每一分鐘都投遞、而且贏咗 claim**（`cronTick` 只有 scheduled
+  handler 會傳入 `runScan`，所以 `scheduled_tick_at`／ring 前進本身就係投遞證據，唔關 HTTP monitor 事）。
+  但 `scheduledArrivalTotal` 由頭到尾都係 **null**（key 根本唔存在）＝ cold isolate 一次都冇 stamp 成功。
+  ⚠️ ring 係**新到舊**排（`tickRing[0]` 最新），所以睇 ring 尾幾個會誤以為「凍結」—— 睇 ring 要睇頭。
+* **原因**：`Db.stampScheduledArrival` 用 `this.get()` 落筆，而 `get()` 喺 `client === null` 時 **throw
+  "Database is not initialized"**；cold isolate 個 fallback 正正係一個**未 init 過**嘅 raw
+  `new Db(url, token)`（同 `bumpScheduledTickLegacy` 同形 —— 分別係後者用 `this.connect()`，所以 legacy
+  bump 一直冇事）。寫入 throw，worker 個 catch 靜靜食咗（只有 console.error，冇 reader）。即係 stamp 喺
+  **唯一為佢而設**嘅路徑（冷 isolate／死喺 init 之前）上完全冇作用，只有「warm db handle ＋ stale flag」
+  呢個罕見組合會真寫入。
+* **修法**：改用 `this.connect()`（lazy、唔需要 init —— 同 `bumpScheduledTick` 一樣嘅 primitive），1 行。
+  另加一條**回歸測試**：一個 init 過嘅 handle 建 schema ＋ 讀，另一個**冇 init** 嘅 handle 落 stamp，
+  斷言讀得到 `1` 同時間戳。呢條測試釘住「stamp 必須喺未 init 嘅 handle 上生效」，所以 `get()` 版本會 fail。
+* **點解原本 3 條測試捉唔到**：第一條 test 開頭就 `await db.init()`（即係已經係 warm handle），patch
+  guard 只看原始碼有冇接線。**「warm handle 寫得到」同「cold handle 寫得到」係兩件事**，而 stamp 只喺
+  cold／死亡路徑開火 —— 呢個就係測試同 production 嘅縫。
+* **教訓**：`/health` 上「新 key 一直係 null」唔可以當「冇事發生」—— idle 同 broken 長得一模一樣。
+  一個「沉默即健康」嘅儀器，落線第一件事係證明佢**開得著**（逼一個 arrival stamp，或者睇 error log），
+  唔係等 wedge 嚟驗。
+* **落線 script**：`docs/patches/preinit-arrival-cold-client.apply.js`（`db.ts` ＋ 測試 ＋ 本節）。
+
 **落線點驗**（deploy 後第一個鐘）：
 
+0. **cold isolate 一定要 stamp 一次**：deploy 之後任何一個 isolate 都係新嘅 ⇒ 佢收到嘅第一個 cron
+   arrival 個 flag 係 0 ⇒ 必定 stamp。修好之後 deploy 後第一個鐘就**應該**見到
+   `scheduledArrivalTotal ≥ 1`；若果仍然係 null 而 ring／`scheduledTickAt` 照前進，即係 stamp 仲係死嘅
+   （呢個就係 §4.5.3.1 嗰個狀態，唔好再當佢係「健康所以唔動」）。
 1. 健康 warm isolate **唔應該**令 `scheduledArrivalTotal` 動 —— 佢一動就代表嗰個 arrival 嘅前人 tick
    冇返（stamp 只喺呢種 arrival 上開火）。
 2. ring 有洞而 `scheduledArrivalTotal` **同時**上升 ⇒「cron 有投遞、tick 死喺 claim 之前」，兩個原因
@@ -682,8 +713,9 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **299 passed, 0 failed** ✅（§4.5.3 新增 3 條 pre-init arrival test；
-  再之前係 296 —— §17.6 嗰 3 條 row-span-hold test；295 ＝ §4.7 嗰 1 條 grouped-telemetry test；
+* `node scripts/test-unit.js` → **300 passed, 0 failed** ✅（§4.5.3.1 新增 1 條 cold-handle test；
+  再之前 299 —— §4.5.3 嗰 3 條 pre-init arrival test；296 —— §17.6 嗰 3 條 row-span-hold test；
+  295 ＝ §4.7 嗰 1 條 grouped-telemetry test；
   292 —— §4.6 嗰 6 條 subrequest-counter test ＋ `cc333db` 嗰 2 條 host-split test；
   其餘見下 —— 279 → 286 係 §4.5.1 嗰 7 條 CU-ledger test
   —— 單價表、attempt 記帳、mid-write charge、parser 容錯、merge＋剪枝、today/month 分界、

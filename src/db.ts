@@ -647,7 +647,19 @@ export class Db {
    * isolate pays nothing for it.
    */
   async stampScheduledArrival(at: number): Promise<void> {
-    await this.get().batch(
+    // connect(), NOT get(). This write runs BEFORE ensureInitialized, on the
+    // arrivals whose front is already suspect — and get() throws "Database is
+    // not initialized" on a handle whose init has not run. The worker's
+    // cold-isolate fallback is exactly such a handle (a raw `new Db(...)` that
+    // never calls init, the same shape bumpScheduledTickLegacy builds), so
+    // get() here made the stamp a silent no-op on the one path it exists for:
+    // live 2026-09-24 the cron trigger was delivering every minute (the ring's
+    // newest entry and scheduled_tick_at both advanced, and the front was
+    // healthy) while scheduled_arrival_total stayed ABSENT after a deploy —
+    // because the cold handle's stamp threw straight into the worker's catch.
+    // The unit test below pins the never-initialized handle so this cannot
+    // regress back to a write that only works once something else has connected.
+    await this.connect().batch(
       [
         {
           sql: "INSERT OR IGNORE INTO worker_state (key, value) VALUES ('scheduled_arrival_total', '0')",
