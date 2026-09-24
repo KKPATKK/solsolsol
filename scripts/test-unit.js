@@ -23,7 +23,7 @@ const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquid
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
-const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS } = require("../dist/worker.js");
+const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
@@ -10609,6 +10609,26 @@ async function main() {
     assert.equal(read.get("scheduled_arrival_total"), "1");
     assert.equal(read.get("scheduled_arrival_at"), "1700000000000");
     await t.cleanup();
+  });
+
+  await test("worker: the cron gate reads nothing when init already fetched its keys", () => {
+    // The merge this pins: ensureInitialized's ONE statement fetches the
+    // heartbeat AND the cron-arrival keys, so a normal cron tick's gate has
+    // nothing left to read — no round trip, i.e. no subrequest out of the
+    // invocation's 50 and ~190ms of front path back (live 2026-09-24:
+    // `init 187 gate 189 claim 245`).
+    assert.deepEqual(cronGateLoad(true, true), [], "both caches warm ⇒ the gate reads nothing");
+    assert.deepEqual(cronGateLoad(false, true), ["scan_heartbeat"], "a stale heartbeat is the gate to fetch");
+    assert.deepEqual(
+      cronGateLoad(true, false),
+      ["scheduled_tick_total", "scheduled_tick_ring"],
+      "no captured cron keys ⇒ it fetches exactly those",
+    );
+    assert.deepEqual(
+      cronGateLoad(false, false),
+      ["scan_heartbeat", "scheduled_tick_total", "scheduled_tick_ring"],
+      "nothing captured ⇒ the old three-key read, unchanged",
+    );
   });
 
   await test("worker: the pre-init stamp fires only for an arrival whose predecessor never returned", () => {

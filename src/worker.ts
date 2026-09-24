@@ -1457,6 +1457,43 @@ let preTickEntryAt = 0;
 let lastHeartbeatRead: { raw: string | null; at: number } | null = null;
 
 /**
+ * The CRON-ARRIVAL keys the cadence gate needs (`scheduled_tick_total` /
+ * `scheduled_tick_ring`), captured by the SAME statement as the heartbeat
+ * when that read landed. `null` = not captured (the read timed out), and the
+ * gate then fetches them itself — the shape every tick used to pay: its own
+ * round trip, i.e. one more subrequest out of the invocation's 50 plus
+ * ~190ms of the tick's front path (live 2026-09-24: `init 187 gate 189`).
+ * Reused within one tick only (HEARTBEAT_REUSE_MS), never across ticks: a
+ * stale ring would drop arrivals from what the claim batch writes.
+ */
+let lastCronKeysRead: { map: Map<string, string> | null; at: number } | null = null;
+
+/**
+ * What ensureInitialized fetches in its one read: the heartbeat (three
+ * consumers share it) plus the cron-arrival pair the cadence gate needs, so
+ * a cron tick's front path needs no second read at all.
+ */
+const WEDGE_READ_KEYS = [
+  "scan_heartbeat",
+  "scheduled_tick_total",
+  "scheduled_tick_ring",
+];
+
+/**
+ * What the cadence gate still has to fetch itself, given what the tick's
+ * first DB contact already captured. Pure and exported so the merge is
+ * unit-tested instead of only observed live: an EMPTY list is the merged
+ * shape — the gate pays NO round trip, which is one subrequest out of the
+ * invocation's 50 and ~190ms of the tick's front path.
+ */
+export function cronGateLoad(heartbeatFresh: boolean, cronFresh: boolean): string[] {
+  const keys: string[] = [];
+  if (!heartbeatFresh) keys.push("scan_heartbeat");
+  if (!cronFresh) keys.push("scheduled_tick_total", "scheduled_tick_ring");
+  return keys;
+}
+
+/**
  * How long the shared heartbeat read above stays reusable. Wide enough to cover
  * the few hundred ms between ensureInitialized and the gate in the same tick,
  * short enough that the next tick (or a /health request a second later) always
@@ -1981,13 +2018,21 @@ async function ensureInitialized(env: Env): Promise<void> {
   // very thing it exists to fix (a tick that outlives its window).
   if (db && dbReady) {
     try {
-      const prevRaw = await Promise.race([
-        db.getWorkerState("scan_heartbeat"),
+      const kb = await Promise.race([
+        db.getWorkerStates(WEDGE_READ_KEYS),
         new Promise<null>((resolve) =>
           setTimeout(() => resolve(null), WEDGE_CHECK_BOUND_MS),
         ),
       ]);
+      const prevRaw = kb?.get("scan_heartbeat") ?? null;
       const now = Date.now();
+      // ...and the SAME statement carries the cron-arrival keys, so a cron
+      // tick's front path needs no second read (see lastCronKeysRead /
+      // cronGateLoad). `kb` stays null when this read TIMED OUT, and that
+      // null is what tells the gate to fetch them itself — a timeout here
+      // must not be read as "the ring is empty", or the claim batch would
+      // write a one-entry ring and drop the history.
+      lastCronKeysRead = { map: kb, at: now };
       // This IS the tick's heartbeat read: the cadence gate below and the HTTP
       // fallback's own gate would each re-read the SAME row — one subrequest
       // apiece out of a 50-subrequest invocation budget, plus ~110-265ms of
@@ -5307,9 +5352,22 @@ export default {
         Date.now() - lastHeartbeatRead.at <= HEARTBEAT_REUSE_MS
           ? lastHeartbeatRead.raw
           : undefined;
-      const keys = ["scheduled_tick_total", "scheduled_tick_ring"];
-      if (cachedHb === undefined) keys.push("scan_heartbeat");
-      const kb = await db?.getWorkerStates(keys);
+      const cachedCron =
+        lastCronKeysRead !== null &&
+        Date.now() - lastCronKeysRead.at <= HEARTBEAT_REUSE_MS
+          ? lastCronKeysRead.map
+          : null;
+      // The plan, pure and unit-tested (see cronGateLoad): with both caches
+      // warm — the normal cron shape, because init just paid for all three
+      // keys in ONE statement — the gate reads NOTHING. Whatever it still
+      // has to fetch is merged OVER the cached rows, so the ring handed to
+      // the claim is never the cached half of a mixed pair.
+      const keys = cronGateLoad(cachedHb !== undefined, cachedCron !== null);
+      let kb: Map<string, string> | null = cachedCron;
+      if (keys.length > 0) {
+        const fresh = await db?.getWorkerStates(keys);
+        kb = kb !== null ? new Map([...kb, ...(fresh ?? [])]) : fresh ?? null;
+      }
       hbRaw =
         cachedHb !== undefined ? cachedHb : (kb?.get("scan_heartbeat") ?? null);
       const at = hbRaw
