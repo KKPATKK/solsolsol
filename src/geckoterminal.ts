@@ -234,6 +234,19 @@ export interface GeckoFeedStats {
   requests: number;
   /** Responses that parsed as OK. */
   ok: number;
+  /**
+   * Pages that parsed as OK and carried ZERO pools — the "Gecko returned 0
+   * with `http429: 0`" shape, live 2026-09-24: `ok: 1` while `summary.geo`
+   * stayed 0 and every failure counter was flat. `ok` counts the HTTP 200,
+   * so without this the empty feed had no cause on any surface.
+   */
+  emptyPages: number;
+  /** Consecutive empty pages (0 after a page that carried pools). */
+  emptyPageStreak: number;
+  /** Pools every discovery page has parsed, since this isolate booted. */
+  parsedPools: number;
+  /** Epoch of the newest empty page (0 = none yet). */
+  lastEmptyAt: number;
   /** 429s seen since the isolate booted. */
   http429: number;
   /** 429s in the current streak — the escalation input (0 after a success). */
@@ -414,6 +427,10 @@ export function geckoFeedStats(): GeckoFeedStats {
       keyed: false,
       requests: 0,
       ok: 0,
+      emptyPages: 0,
+      emptyPageStreak: 0,
+      parsedPools: 0,
+      lastEmptyAt: 0,
       http429: 0,
       consecutive429: 0,
       cacheHits: 0,
@@ -454,6 +471,11 @@ export class GeckoTerminalClient {
   /** Telemetry (see GeckoFeedStats) — never read by any decision. */
   private requests = 0;
   private ok = 0;
+  /** See GeckoFeedStats.emptyPages — the 200-with-zero-pools reading. */
+  private emptyPages = 0;
+  private emptyPageStreak = 0;
+  private parsedPools = 0;
+  private lastEmptyAt = 0;
   private http429 = 0;
   private consecutive429 = 0;
   private cacheHits = 0;
@@ -494,6 +516,10 @@ export class GeckoTerminalClient {
       keyed: this.apiKey !== null,
       requests: this.requests,
       ok: this.ok,
+      emptyPages: this.emptyPages,
+      emptyPageStreak: this.emptyPageStreak,
+      parsedPools: this.parsedPools,
+      lastEmptyAt: this.lastEmptyAt,
       http429: this.http429,
       consecutive429: this.consecutive429,
       cacheHits: this.cacheHits,
@@ -701,8 +727,35 @@ export class GeckoTerminalClient {
     return parseTokenSnapshot(await this.get(`/networks/solana/tokens/${mint}`));
   }
 
+  /**
+   * Count one parsed discovery page (see GeckoFeedStats.emptyPages). A 200
+   * whose pool list is empty is counted as a SUCCESS by `ok`, so this is the
+   * counter that names "Gecko answered, and the feed was still 0" — the
+   * shape that looked identical to a quiet market until it had a name.
+   */
+  private notePage(pools: NewPool[]): NewPool[] {
+    if (pools.length > 0) {
+      this.parsedPools += pools.length;
+      this.emptyPageStreak = 0;
+      return pools;
+    }
+    this.emptyPages += 1;
+    this.emptyPageStreak += 1;
+    this.lastEmptyAt = Date.now();
+    // Once per streak, not once per page: a blocked/edge-empty feed would
+    // otherwise warn on every tick for hours.
+    if (this.emptyPageStreak === 1) {
+      console.warn(
+        "[gecko] discovery page parsed OK with ZERO pools — this is NOT a 429: the API answered 200 with an empty page (see GeckoFeedStats.emptyPages)",
+      );
+    }
+    return pools;
+  }
+
   async fetchNewPools(page = 1): Promise<NewPool[]> {
-    return parseNewPools(await this.get(`/networks/solana/new_pools?page=${page}`));
+    return this.notePage(
+      parseNewPools(await this.get(`/networks/solana/new_pools?page=${page}`)),
+    );
   }
 
   /**
@@ -713,12 +766,14 @@ export class GeckoTerminalClient {
    * 20 pools per call.
    */
   async fetchTrendingPools(limit: number): Promise<NewPool[]> {
-    return parseNewPools(
-      await this.get(
-        `/networks/solana/trending_pools?include=base_token&limit=${Math.min(
-          Math.max(1, Math.floor(limit)),
-          20,
-        )}`,
+    return this.notePage(
+      parseNewPools(
+        await this.get(
+          `/networks/solana/trending_pools?include=base_token&limit=${Math.min(
+            Math.max(1, Math.floor(limit)),
+            20,
+          )}`,
+        ),
       ),
     );
   }

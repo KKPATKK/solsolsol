@@ -36,7 +36,7 @@ const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
-const { tradeFingerprint, deadTickBackfillInfo, TICK_PROGRESS_KEY, tickProgressRecord, parseTickProgress, tickProgressNote, tickPhaseLadder } = require("../dist/worker.js");
+const { tradeFingerprint, deadTickBackfillInfo, TICK_PROGRESS_KEY, tickProgressRecord, parseTickProgress, tickProgressNote, tickPhaseLadder, healthAgeMs } = require("../dist/worker.js");
 const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, deliveredFollowupProofs, cardProofKey, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
@@ -2312,6 +2312,41 @@ async function main() {
       assert.equal(stats.ok, 1, "a cached 200 counts as an OK response");
       assert.equal(stats.cacheHits, 1, "and the HIT is counted (this is how the fix is verified live)");
       assert.equal(geckoFeedStats().cacheHits, 1, "the isolate publishes this client's state");
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("GeckoTerminalClient: a 200 page with zero pools is an EMPTY PAGE, not a quiet market", async () => {
+    const origFetch = global.fetch;
+    global.fetch = async () =>
+      new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const client = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+      const before = client.stats();
+      await client.fetchNewPools(1);
+      const once = client.stats();
+      assert.equal(once.ok, before.ok + 1, "the HTTP 200 still counts as an OK response");
+      assert.equal(once.http429, before.http429, "and it is NOT a 429 - which is why the feed looked fine");
+      assert.equal(once.emptyPages, before.emptyPages + 1, "the zero-pool page is the reading that names the anomaly");
+      assert.equal(once.emptyPageStreak, 1);
+      assert.equal(once.parsedPools, before.parsedPools, "nothing was parsed");
+      assert.ok(once.lastEmptyAt > 0, "and the newest empty page is stamped");
+      await client.fetchTrendingPools(20);
+      const twice = client.stats();
+      assert.equal(twice.emptyPages, before.emptyPages + 2, "both discovery legs count");
+      assert.equal(twice.emptyPageStreak, 2, "and the streak follows");
+      assert.equal(geckoFeedStats().emptyPages, twice.emptyPages, "the isolate publishes it");
+      // The other branch: a page that carries pools counts them and ends the
+      // streak (called directly - the fetch stub above cannot produce pools).
+      client.notePage(new Array(7).fill(null));
+      const fed = client.stats();
+      assert.equal(fed.parsedPools, 7, "a page with pools counts them");
+      assert.equal(fed.emptyPageStreak, 0, "and clears the streak");
+      assert.equal(fed.emptyPages, twice.emptyPages, "without touching the empty count");
     } finally {
       global.fetch = origFetch;
     }
@@ -11455,6 +11490,47 @@ async function main() {
     // and landed. A stalled queue would leave the row naming a phase the tick
     // had long left — which is the failure this test exists to catch.
     assert.equal(attempts, 2);
+  });
+
+  await test("healthAgeMs: a frozen reading reports its age, and a missing row is not the epoch", () => {
+    assert.equal(healthAgeMs(1000, null), null, "no row = no reading");
+    assert.equal(healthAgeMs(1000, undefined), null);
+    assert.equal(healthAgeMs(1000, 0), null, "0 is the 'never written' sentinel, not 1970");
+    assert.equal(healthAgeMs(1000, Number.NaN), null);
+    assert.equal(healthAgeMs(2000, 1500), 500);
+    assert.equal(healthAgeMs(1000, 5000), 0, "clock skew never reports a negative age");
+  });
+
+  await test("out-of-window patch: the two frozen readings publish their age (docs/patches/unexplained-readings-2026-09-24.apply.js)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const workerSrc = read("src/worker.ts");
+    const geckoSrc = read("src/geckoterminal.ts");
+    const applied = {
+      "worker (the age helper exists)": workerSrc.includes("exportfunctionhealthAgeMs("),
+      "worker (the drain record publishes its age, next to the record)":
+        workerSrc.includes("writeDrainErrorAgeMs:healthAgeMs(") &&
+        workerSrc.includes("writeDrainError===null?null:writeDrainError.at,"),
+      "worker (and the cron ring hole is a number)":
+        workerSrc.includes("scheduledTickHoleMs:healthAgeMs(Date.now(),scheduledTickAt),"),
+      "gecko (a 200 with zero pools has a counter of its own)":
+        geckoSrc.includes("emptyPages:number;") &&
+        geckoSrc.includes("privatenotePage(pools:NewPool[]):NewPool[]{") &&
+        geckoSrc.includes("returnthis.notePage("),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  \u2139 the frozen-reading patch is missing - apply docs/patches/unexplained-readings-2026-09-24.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
   });
 
   await test("out-of-window patch: the pre-flush record is written BEFORE the flush and read by the successor (docs/patches/tick-progress-record.apply.js)", () => {

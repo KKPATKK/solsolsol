@@ -1870,6 +1870,32 @@ export function tickPhaseLadder(
 }
 
 /**
+ * `now - at` for a durable epoch read by /health, or null when there is no
+ * reading at all (a missing row is NOT a row written at the epoch).
+ *
+ * WHY AN AGE AND NOT JUST THE TIMESTAMP (2026-09-24): two of /health's
+ * readings are snapshots that stay put BY DESIGN, and a bare timestamp next
+ * to counters that DO move is what let them read as live:
+ *
+ *   - `writeDrainError.pending` is the queue size AT the failure — a clean
+ *     drain never rewrites the row (see persistDrainError), so it sat at 15
+ *     from 11:58 all day while the SQL it named had been fixed 41 seconds
+ *     before that stamp was written.
+ *   - `scheduledTickAt` frozen for 2h35m is a cron ring hole (deliveries
+ *     arriving, every tick dying inside init, scans still landing from the
+ *     HTTP fallback), and the heartbeat cannot show it because the fallback
+ *     keeps the heartbeat green.
+ *
+ * An age is what a monitor can alert on. A timestamp is what a human reads.
+ */
+export function healthAgeMs(now: number, at: number | null | undefined): number | null {
+  if (at === null || at === undefined) return null;
+  const value = Number(at);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.max(0, Math.round(now - value));
+}
+
+/**
  * Parse one back; null when it is not a record this code wrote. Strict on
  * purpose: `at` + `stage` are the two fields every reading depends on, and a
  * row that is missing either one must not be dressed up as a tick's progress.
@@ -4151,6 +4177,14 @@ export default {
         scheduledArrivalUnaccounted:
           scheduledArrivalAt !== null &&
           (scheduledTickAt === null || scheduledArrivalAt > scheduledTickAt),
+        // The number behind that boolean, and the one a monitor can alert
+        // on: how long since a cron tick last CLAIMED. A healthy 60s
+        // cadence reads ~60-120s; the 2h35m it read on 2026-09-24
+        // (20:06:20 → 22:41:20) was a ring hole — cron deliveries arriving,
+        // every tick dying inside init, scans still landing from the HTTP
+        // fallback, so the heartbeat stayed green and NOTHING flagged it
+        // (see shouldStampArrival's own note on the 2026-09-23 holes).
+        scheduledTickHoleMs: healthAgeMs(Date.now(), scheduledTickAt),
         enabledChats,
         tokenStatsCount,
         pushedTotal,
@@ -4162,6 +4196,17 @@ export default {
         // mirror (`heartbeat.summary.writeDrain.lastError`) still reports the
         // same thing, but only for an isolate that has drained since.
         writeDrainError,
+        // HOW OLD that record is (see healthAgeMs). `pending` inside it is
+        // the queue size AT the failure, never the backlog now: a clean
+        // drain writes nothing, so the row keeps the last failure's numbers
+        // for as long as the bot stays healthy. Live 2026-09-24: it read
+        // `pending 15` all day while its own `at` (11:58:37.643Z) sat 41
+        // seconds BEFORE the commit that ended those failures — the age is
+        // the one reading that says so.
+        writeDrainErrorAgeMs: healthAgeMs(
+          Date.now(),
+          writeDrainError === null ? null : writeDrainError.at,
+        ),
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         // Cross-isolate single-flight: how often this isolate skipped a

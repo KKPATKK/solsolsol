@@ -1500,3 +1500,44 @@ subrequest**；backfill row 嘅 `err` 尾多一句有界註記：
 - **只有最後落地嗰個 stamp 留低**，呢個就係要點：row 講嘅係「tick 到過、而寫入趕得及落地」嘅最後階段。
   一個趕唔及落地嘅階段，會讀成前一階段 —— 有界嘅未知，同「冇 record」本身嘅處理一樣。
 - 死亡早過任何 stamp（連 `scan` 都落唔到）＝ 死喺 claim/init 前段，`prog none` 嗰句而家講明呢點。
+
+---
+
+## 2026-09-24（補）：三個讀數嘅結論
+
+### 1. `writeDrainError {pending 15}` —— 唔係卡住嘅隊列
+
+`252b720`（liquidity CASE 少個逗號）**11:57:56Z** commit，而個 record 嘅 `at` 係
+**11:58:37.643Z** —— 遲 41 秒，即係**舊 build 最後一次失敗**，啱啱撞正 fix 部署落地。
+個 row 係故意唔會清（`persistDrainError`：最後錯過嘅嘢就係證據），所以 `pending 15` ＝
+**嗰次失敗時**嘅隊列長度，唔係而家。擺喺一堆會郁嘅計數器隔籬，凍住嘅數字就會讀成即時。
+
+修正：`/health.writeDrainErrorAgeMs`（record 有幾舊）。呢個就係分開「幾個鐘前嘅記錄」同
+「而家積壓」嘅讀數。
+
+### 2. Gecko「回 0 而 http429 = 0」—— 兩個形狀，一個係真空白
+
+**(a) 唔存在「唔見咗一個 request」**：`requests` 連 alternate host 嘅嘗試都計，但 `ok` / `http429`
+只計 primary。live 22:59：`requests 3, ok 0, http429 2`，同時 `altAttempts 1` —— 3 = 2 + 1，完全對得上。
+
+**(b) 真嘅空白**：一個 **200 但零個 pool** 嘅頁。`ok` 計嘅係 HTTP 成功，所以 feed 空、而所有失敗計數器
+都係平 —— live 2026-09-24：`ok 1` 而 `summary.geo` 一直 0，冇任何 429。
+修正：`emptyPages` / `emptyPageStreak` / `lastEmptyAt` / `parsedPools`（只計 discovery page），
+同每個空 streak 一次 warn。
+
+### 3. `scheduledArrivalUnaccounted: true` —— 真陽性
+
+意思係：有個 arrival 喺 pre-init 蓋咗（即佢前一個冇返嚟），而之後**冇任何 cron tick claim 過**。
+今日 cron tick ring 有兩個洞：
+
+| 洞 | 長度 | 點收 |
+|---|---|---|
+| 17:16:20 → 19:29:20 | 2h13m | 自己收（冇 deploy） |
+| 20:06:20 → 22:41:20 | 2h35m | 22:39:52 個 deploy |
+
+兩個洞期間掃描都照落（HTTP fallback 驅動），所以 heartbeat 一直綠 —— 呢個正是
+`shouldStampArrival` 註解本身記錄過嘅形狀（「a 19-minute ring hole and a 2h42m one, with scans
+still landing from the HTTP monitor」）。剩低嘅缺口係**冇嘢可以報警**：個 flag 係 boolean，
+而 heartbeat 睇唔到。
+
+修正：`/health.scheduledTickHoleMs` —— 距離上一次 cron tick claim 幾久，一個有 threshold 嘅數字（健康 60s 節奏讀 60–120s）。
