@@ -544,6 +544,19 @@ call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable
   唔係等 wedge 嚟驗。
 * **落線 script**：`docs/patches/preinit-arrival-cold-client.apply.js`（`db.ts` ＋ 測試 ＋ 本節）。
 
+**落線讀數**（2026-09-24；`edbd57d` 見到 stamp 冇開火 → `a9711fd` 修好後驗證）：
+
+* **修之前**（01:43–01:51Z，`edbd57d`）：`scheduledTickAt` 每分鐘 :02 前進、ring 最新一格 01:51:05、
+  scan row 照落，但 `scheduledArrivalTotal` **一直係 null**（＝cold isolate 一次都冇 stamp 成功）——
+  就係 §4.5.3.1 嗰個診斷。**呢個係「沉默即健康」儀器最危險嘅一刻**：個 key 冇出現，睇落好似
+  「冇事發生」，實際上係儀器死咗。
+* **修之後**（`a9711fd` deploy 完成後，02:00–02:01Z）：`scheduledArrivalTotal` = **1**、
+  `scheduledArrivalAt` = **01:59:02.941Z** —— 即係 deploy 後**第一個** cron arrival（新 isolate 嘅
+  flag 係 0 ⇒ 必定 stamp）—— 之後 tick 繼續每分鐘照行（`scheduledTickAt` 02:00:02.887Z）而個 counter
+  **停在 1**。兩個設計目標（cold isolate stamp 一次／warm isolate 零成本）**同時**照住預期出現。
+  `scheduledArrivalUnaccounted` = false（`arrivalAt` 01:59:02 ≤ `tickAt` 02:00:02 ⇒ 最新投遞自己入咗賬）。
+* **落線點驗第 0 點已證**：deploy 之後個數字**開得著**，所以之後「唔動」先至真係代表「健康」。
+
 **落線點驗**（deploy 後第一個鐘）：
 
 0. **cold isolate 一定要 stamp 一次**：deploy 之後任何一個 isolate 都係新嘅 ⇒ 佢收到嘅第一個 cron
@@ -721,6 +734,8 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
   —— 單價表、attempt 記帳、mid-write charge、parser 容錯、merge＋剪枝、today/month 分界、
   sync 落地＋失敗 re-offer；§4.4 嗰條 CU-gate test 與 `trips` invariant 仍然釘住）
 * `node scripts/test-deferred-priority.js` ✅、`node scripts/test-tick-path.js` ✅
+* `edbd57d`（§4.5.3 pre-init arrival stamp）→ Deploy Worker run 35944044690 **success** ✅；
+  `a9711fd`（§4.5.3.1 cold-handle fix）→ run 35945163059 **success** ✅（落線讀數見 §4.5.3.1）
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
   → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809
   **success**（1m16s）✅；`2b4b9fe`（§4.3 probe cap／slot）→ run 35851038091 **success**（1m20s）✅；
