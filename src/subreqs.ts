@@ -57,6 +57,39 @@
  * exceeding it throws mid-tick, wherever the next call happens to be.
  */
 export const SUBREQ_BUDGET_FREE = 50;
+/**
+ * Subrequests this counter CANNOT see, reserved out of every reading.
+ *
+ * WHY, measured (2026-09-24): the live occurrence at 14:54:56Z read
+ *
+ *     err:Too many subrequests by single Worker invocation … [rows subreq 12]
+ *
+ * — the pass's own diagnostic (PushWatcher.passDiag) reporting 12 still
+ * unspent at the moment the runtime refused the invocation. The refused call
+ * is inside that count, because countSubreq runs before the request is
+ * issued, so the counter had seen 38 when the platform stopped at 50: about
+ * twelve subrequests went out through a seam this wrapper does not cover.
+ * The gates were not at fault — at 12 unspent the row gate (≤6) and the
+ * stage gates (<3) correctly read that there was room.
+ *
+ * RULED OUT before reserving anything, so this is a size, not a theory: no
+ * transport bypasses fetch in the Worker (the deployed bundle contains no
+ * WebSocket at all, and Turso goes through @libsql/client/web over https, so
+ * the db closure resolves this same wrapped global); the reading was not
+ * stale (seconds old, with the durable row beside it still reading
+ * `running`); and the placement was not wrong (the death is in `rows`,
+ * which the entry gate guards against a different case on purpose).
+ *
+ * WHAT IS STILL UNKNOWN is the SHAPE of the gap, not its size. Reserving it
+ * is the conservative direction: a tick that spends only inside what the
+ * counter can see cannot overrun what it cannot see, and being wrong costs
+ * a pass that defers a tick early and is retried — never a lost write.
+ *
+ * ONE constant, moved by measurement: every occurrence now reports its own
+ * number in the err note, so the next one re-sizes this without any further
+ * instrumentation.
+ */
+export const SUBREQ_UNSEEN_ALLOWANCE = 12;
 
 /**
  * Phase points kept per window. The interesting window is the one that DIED,
@@ -124,6 +157,19 @@ export interface SubreqWindowView {
 export interface SubreqView {
   /** The allowance every window is spent against (SUBREQ_BUDGET_FREE). */
   budget: number;
+  /**
+   * Subrequests the counter cannot see (SUBREQ_UNSEEN_ALLOWANCE), reserved
+   * out of every reading.
+   */
+  unseenAllowance: number;
+  /**
+   * `budget - unseenAllowance`: the ceiling a tick may actually spend
+   * against. Published beside `budget` so the reservation is visible in
+   * /health rather than buried in the arithmetic — a reader comparing a
+   * window's `total` against 50 would otherwise be reading against a number
+   * the tick never spends to.
+   */
+  usable: number;
   /** The window being spent right now (this invocation). */
   current: SubreqWindowView;
   /**
@@ -241,6 +287,8 @@ export function subreqView(): SubreqView {
   });
   return {
     budget: SUBREQ_BUDGET_FREE,
+    unseenAllowance: SUBREQ_UNSEEN_ALLOWANCE,
+    usable: Math.max(0, SUBREQ_BUDGET_FREE - SUBREQ_UNSEEN_ALLOWANCE),
     current: flat(current),
     recent: recent.map(flat),
     windows,
@@ -253,6 +301,13 @@ export function subreqView(): SubreqView {
  * WHY IT EXISTS (2026-09-24): `subreqView()` above answers "who spent the
  * budget" AFTER the fact, which is a post-mortem. This is the pre-flight
  * half — what a LATE stage of a tick must consult BEFORE it starts a spend
+ *
+ * SPENDABLE, not raw: the unseen reserve (SUBREQ_UNSEEN_ALLOWANCE, sized from
+ * the live 14:54:56Z `rows subreq 12` occurrence) comes off first, because a
+ * caller acting on this number is deciding whether it can afford a round
+ * trip, and the round trips the counter cannot see are real ones. A window
+ * that has counted nothing reports the usable ceiling, so a caller ahead of
+ * its first fetch sees room rather than a false zero.
  * that costs several subrequests, so a starved tick defers its tail by name
  * instead of spending the invocation's last call on a `Too many subrequests
  * by single Worker invocation` throw. Measured on the live worker: the scan +
@@ -272,7 +327,7 @@ export function subreqView(): SubreqView {
  */
 export function subreqRemaining(budget: number = SUBREQ_BUDGET_FREE): number {
   if (!Number.isFinite(budget)) return Number.POSITIVE_INFINITY;
-  return Math.max(0, budget - current.total);
+  return Math.max(0, budget - SUBREQ_UNSEEN_ALLOWANCE - current.total);
 }
 
 /** Test seam: forget the boot's windows (never called on the tick path). */

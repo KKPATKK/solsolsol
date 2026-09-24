@@ -25,7 +25,7 @@ const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRI
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
-const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
+const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -1066,6 +1066,51 @@ async function main() {
     const pwPlain = termWatcher(plain, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
     await assert.rejects(() => pwPlain.runTick(Date.now() + 5_000));
     assert.equal(pwPlain.passDiag(), "rows subreq n/a", "`n/a`, not a fabricated count");
+  });
+
+  await test("Scanner.runTrackerPass: the err note is durable from the next tick's own write", async () => {
+    // The live shape (2026-09-24 14:54:56Z): the diagnostic reached
+    // /debug/tick's summary while /health's `pushWatchPass` row still read
+    // `running`, because at the wall the note's own fetch is the call the
+    // runtime refuses. So the note has to be published to the field the NEXT
+    // scan copies into its summary — a write the tick makes anyway — rather
+    // than depending on the one it cannot make.
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    let rowWrites = 0;
+    const scanner = new Scanner(
+      { setWorkerState: async () => { rowWrites += 1; } },
+      { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      passDiag: () => "rows subreq 0",
+      runTick: async () => {
+        throw new Error("Too many subrequests by single Worker invocation");
+      },
+    };
+    scanner.lastSummary = {};
+    const note = await scanner.runTrackerPass(Date.now() + 2_500);
+    assert.equal(note, null);
+    assert.equal(
+      scanner.pushWatchNote,
+      "err:Too many subrequests by single Worker invocation [rows subreq 0]",
+      "published to the field the next tick persists — the guarantee does not depend on a write",
+    );
+    assert.equal(rowWrites, 2, "the row is still attempted immediately (running stamp + the note), so the common case stays instant");
+
+    // And the same note survives a database that refuses the write entirely,
+    // which is the shape the live occurrence had.
+    const offline = new Scanner(
+      { setWorkerState: async () => { throw new Error("Too many subrequests"); } },
+      { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    offline.pushWatcher = scanner.pushWatcher;
+    offline.lastSummary = {};
+    const failed = await offline.runTrackerPass(Date.now() + 2_500);
+    assert.equal(failed, null, "a refused write does not turn a pass failure into a tick failure");
+    assert.match(String(offline.pushWatchNote), /\[rows subreq 0\]$/, "and the diagnostic is still carried");
   });
 
   await test("PushWatcher: passDiag is silent before any pass has run", () => {
@@ -10782,6 +10827,37 @@ async function main() {
     assert.equal(view.windows, 1, "counting never opens a window");
   });
 
+  await test("subreqs: the unseen reserve comes off every reading", () => {
+    // Sized from the one measurement that exists (2026-09-24 14:54:56Z):
+    // `err:Too many subrequests … [rows subreq 12]` means the counter had seen
+    // 38 when the platform stopped at 50, so ~12 went out uncounted. The
+    // pass spends against what is LEFT after that reserve, never the raw
+    // headroom — a tick that spends only inside what the counter can see
+    // cannot overrun what it cannot see.
+    const { SUBREQ_UNSEEN_ALLOWANCE } = require("../dist/subreqs.js");
+    assert.equal(SUBREQ_UNSEEN_ALLOWANCE, 12, "the measured gap, as one movable constant");
+    resetSubreqWindows();
+    beginSubreqWindow(1_000);
+    const view = subreqView();
+    assert.equal(view.budget, 50, "the platform fact is still published as-is");
+    assert.equal(view.unseenAllowance, 12, "and so is the reserve, so the arithmetic is auditable");
+    assert.equal(view.usable, 38, "the ceiling a tick actually spends against");
+    assert.equal(
+      subreqRemaining(),
+      38,
+      "a fresh window reports the USABLE ceiling, not 50 — a caller must not believe it has 12 more than it does",
+    );
+    for (let i = 0; i < 30; i += 1) countSubreq();
+    assert.equal(subreqRemaining(), 8, "spendable room falls with the counted calls");
+    // The exact tick that died: 38 counted, 12 the counter still believed were
+    // free. With the reserve it is 0, which is what the row and stage gates
+    // needed to see.
+    for (let i = 30; i < 38; i += 1) countSubreq();
+    assert.equal(subreqView().current.total, 38, "the counted total is unchanged — only the ceiling moved");
+    assert.equal(subreqRemaining(), 0, "so the pass would have been refused before it could overrun");
+    resetSubreqWindows();
+  });
+
   await test("subreqs: a phase point is the running total at that stamp", async () => {
     resetSubreqWindows();
     beginSubreqWindow(1_000);
@@ -11184,6 +11260,47 @@ async function main() {
       missing.length,
       0,
       `partial paste of docs/patches/tracker-pass-err-diag.apply.js — missing: ${missing.join(", ")}`,
+    );
+  });
+
+  await test("out-of-window patch: the subrequest reserve and the note's carry land together (docs/patches/tracker-subreq-headroom.apply.js)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const subreqsSrc = read("src/subreqs.ts");
+    const scannerSrc = read("src/scanner.ts");
+    const applied = {
+      "subreqs (the reserve is one constant)":
+        subreqsSrc.includes("exportconstSUBREQ_UNSEEN_ALLOWANCE=12;"),
+      "subreqs (it comes off the spendable number)":
+        subreqsSrc.includes("returnMath.max(0,budget-SUBREQ_UNSEEN_ALLOWANCE-current.total);"),
+      "subreqs (the view publishes both)":
+        subreqsSrc.includes("unseenAllowance:SUBREQ_UNSEEN_ALLOWANCE,") &&
+        subreqsSrc.includes("usable:Math.max(0,SUBREQ_BUDGET_FREE-SUBREQ_UNSEEN_ALLOWANCE),"),
+      "subreqs (the raw headroom is gone)":
+        !subreqsSrc.includes("returnMath.max(0,budget-current.total);"),
+      "scanner (the note is published to memory)":
+        scannerSrc.includes("this.pushWatchNote=errNote;"),
+      "scanner (and still published to the summary)":
+        scannerSrc.includes("this.lastSummary.pushWatch=errNote;"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ subrequest reserve missing - apply docs/patches/tracker-subreq-headroom.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    // Half of this is the worst of both: a reserve with no way to see it, or
+    // a carried note whose reserve still lets the pass overrun.
+    assert.equal(
+      missing.length,
+      0,
+      `partial paste of docs/patches/tracker-subreq-headroom.apply.js — missing: ${missing.join(", ")}`,
     );
   });
 

@@ -1909,6 +1909,21 @@ export class Scanner {
       // gate placement fixes the second case.
       const diag = this.pushWatcher.passDiag?.() ?? null;
       const errNote = `err:${msg.slice(0, 120)}${diag ? ` [${diag}]` : ""}`;
+      // PUBLISH TO MEMORY FIRST, then try the row. Why (2026-09-24, measured):
+      // the 14:54:56Z occurrence surfaced in /debug/tick's summary while
+      // /health's durable `pushWatchPass` row still read `running` — not a bug
+      // in the write, but the write being unaffordable: persistPassNote swallows
+      // its own failure by design, and at the wall the note's own `fetch` is
+      // the call that gets refused. So the best diagnostic the system produced
+      // was the one it could not keep, and only on the isolate that served the
+      // request that happened to ask.
+      //
+      // `pushWatchNote` is the field the NEXT scan copies into its own summary,
+      // and the scan's heartbeat write is one the tick makes anyway — so the
+      // note becomes durable one tick later from a write that was always going
+      // to happen, instead of depending on one that cannot. The row write is
+      // still attempted, so the common case stays immediate.
+      this.pushWatchNote = errNote;
       if (this.lastSummary) {
         this.lastSummary.pushWatch = errNote;
       }
