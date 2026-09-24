@@ -697,6 +697,39 @@ async function main() {
     );
   });
 
+  await test("revival-base patch: the guard and the repair's second trigger land together", () => {
+    // Same all-or-none rule as the other out-of-window artifacts. These two
+    // edits are one change: the guard stops the loop that OVERWRITES a row's
+    // evidence with non-readings, and the second trigger is what repairs a row
+    // that regained a reading anyway. The behavioural half of the guard is
+    // pinned by the evaluateWatch cases above; this is the wiring half (the
+    // trigger has no unit seam — it lives in PushWatcher.runTick).
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const dbSrc = read("src/db.ts");
+    const applied = {
+      "guard (the base is chosen, not assumed)": pushwatchSrc.includes(
+        "const troughBase = row.deadTroughMcap ?? row.mcapAtPush;",
+      ),
+      "guard (a 0 target never resurrects)": pushwatchSrc.includes(
+        "if (target > 0 && live.mcap >= target) {",
+      ),
+      "trigger (the listing can re-arm the repair)": pushwatchSrc.includes(
+        "rows.some((r) => r.mcapAtPush <= 0 && r.peakMcap > 0)",
+      ),
+      "trigger (the once-per-isolate attempt survives)":
+        pushwatchSrc.includes("!baselineRepairDone ||"),
+      "statement (still table-wide, still guarded)": dbSrc.includes(
+        "async repairPushWatchBaselines()",
+      ),
+    };
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.ok(
+      missing.length === 0 || missing.length === Object.keys(applied).length,
+      `partial paste of docs/patches/revival-needs-a-base.apply.js — missing: ${missing.join(", ")}`,
+    );
+  });
+
   await test("Db.restampTerminalCompletion: writes back the lost half of a drain row, and only that shape", async () => {
     // The live 2026-09-21 rows (TIGRINO / Apu / SCAT): the reserve wrote
     // last_state='rug' + last_alert_at=now in the same pass as the claim, and
@@ -7363,6 +7396,45 @@ async function main() {
     const legacy = evaluateWatch(row({ deadTroughMcap: null }), 1000, { mcap: 52_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 }, cfg);
     assert.equal(legacy.alerts.length, 0);
     assert.equal(legacy.lastState, "dead");
+
+    // A row with NO base at all: a trough of 0 AND a baseline that is not a
+    // reading (the heal's old 0-mcap enrollment). `(deadTroughMcap ??
+    // mcapAtPush) x 1.5` is then 0, and `live.mcap >= 0` is true for EVERY
+    // reading — another 0 included — so the old comparison resurrected the row
+    // on every single pass. That is not merely a wrong card: the resurrection
+    // returns `peakMcap: live.mcap` and `resetBaselineMcap: live.mcap`, so it
+    // wrote the non-reading back into BOTH columns and thereby kept its own
+    // target at 0. Live 2026-09-24 (玉兔, mcap_at_push 0, followupsSent 9): the
+    // loop overwrote a $70.9K peak with 0, which is also why the baseline
+    // repair's `peak_mcap > 0` guard then had to refuse the row.
+    const zeroBase = row({ mcapAtPush: 0, peakMcap: 0, deadTroughMcap: 0 });
+    // The live LIQUIDITY is held at the row's last reading throughout these
+    // cases on purpose: the 💧 crash rule runs BEFORE the dead-state
+    // absorption, so a $0 reading here fires a drain card (and can terminalise
+    // the row) that has nothing to do with what is being pinned.
+    const dead0 = evaluateWatch(zeroBase, 1000, { mcap: 0, liquidity: 20_000, chg5m: 0, vol5m: 0, buysH1: 0, sellsH1: 0 }, cfg);
+    assert.deepEqual(dead0.alerts, [], "no revival card off a $0 target");
+    assert.equal(dead0.lastState, "dead", "the row stays dead");
+    assert.equal(dead0.resetBaselineMcap, undefined, "and no non-reading is written into the baseline");
+    // The same row WITH a live reading: still no revival — there is no base to
+    // beat — and no reset, while the measurement itself still lands.
+    const zeroBaseLive = evaluateWatch(zeroBase, 1000, { mcap: 5_000, liquidity: 20_000, chg5m: 3, vol5m: 500, buysH1: 5, sellsH1: 2 }, cfg);
+    assert.deepEqual(zeroBaseLive.alerts, [], "a live reading with no base is not a revival");
+    assert.equal(zeroBaseLive.lastState, "dead");
+    assert.equal(zeroBaseLive.resetBaselineMcap, undefined, "nothing is reset off a 0 target");
+    assert.equal(zeroBaseLive.peakMcap, 5_000, "while the measurement still lands");
+
+    // A stored trough of 0 IS a reading (a corpse's $0 LP) but still not a
+    // usable base, so the baseline is the fallback there: 50K x 1.5 = 75K.
+    // Without that fallback a coin that went all the way to zero could never
+    // come back at all.
+    const zeroTrough = row({ deadTroughMcap: 0 });
+    const belowBase = evaluateWatch(zeroTrough, 1000, { mcap: 60_000, liquidity: 30_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 }, cfg);
+    assert.deepEqual(belowBase.alerts, [], "60K is below the baseline-derived 75K floor");
+    assert.equal(belowBase.lastState, "dead");
+    const aboveBase = evaluateWatch(zeroTrough, 1000, { mcap: 80_000, liquidity: 30_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 }, cfg);
+    assert.equal(aboveBase.resetBaselineMcap, 80_000, "a real recovery off a 0 trough still revives");
+    assert.match(aboveBase.alerts[0].text, /死而復生 X/);
 
     // Fresh row that never died still fires 💀 normally (once), and the
     // alert names the trough × 1.5 recovery target.

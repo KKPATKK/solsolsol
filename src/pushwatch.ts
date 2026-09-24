@@ -1181,8 +1181,31 @@ export function evaluateWatch(
   // this absorption the stale-peak math would keep firing weak/ignition on
   // every bounce below the target.
   if (row.lastState === "dead") {
-    const target = (row.deadTroughMcap ?? row.mcapAtPush) * RESURRECTION_MULT;
-    if (live.mcap >= target) {
+    // The revival target needs a real BASE, and `deadTroughMcap ?? mcapAtPush`
+    // is not one for a row whose trough hit 0 AND whose baseline was never a
+    // reading: the product is 0, and `live.mcap >= 0` is true for EVERY
+    // reading — another 0 included. That shape is not hypothetical, it is
+    // exactly what the heal's old 0-baseline enrollment produced, and the loop
+    // it feeds is self-perpetuating: the resurrection below returns
+    // `peakMcap: live.mcap` and `resetBaselineMcap: live.mcap`, i.e. a
+    // NON-reading written back into both columns, which is what keeps the
+    // target at 0 for the next pass.
+    //
+    // Live 2026-09-24 (玉兔, mcap_at_push 0, followupsSent 9): the row
+    // resurrected repeatedly and its $70.9K peak was overwritten with 0 — so
+    // the baseline repair could not touch it either, its `peak_mcap > 0`
+    // guard being the thing that must never invent a number.
+    //
+    // A trough of 0 IS a reading (a corpse's $0 LP — see the drain rules
+    // below), but it is still not a base, so the baseline is the fallback
+    // there: the coin has to regain 1.5 × what it was PUSHED at, not 1.5 ×
+    // nothing. When neither is a reading there is no target at all, and the
+    // row stays dead and silent — the fail-quiet direction, which is the same
+    // "missing data never judges" rule the liquidity guards use.
+    const troughBase = row.deadTroughMcap ?? row.mcapAtPush;
+    const target =
+      (troughBase > 0 ? troughBase : row.mcapAtPush) * RESURRECTION_MULT;
+    if (target > 0 && live.mcap >= target) {
       fire(
         "rising",
         `🟢 死而復生 ${symbol} | 從低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），重置基準繼續追蹤`,
@@ -1977,11 +2000,14 @@ export class PushWatcher {
       ` holders ${spent.holders.ms}/${spent.holders.trips}` +
       ` held${holdersHeld} cut${holdersCut}` +
       ` probe${holderProbeStarted} miss${holderProbeMisses}` +
-      // Only when there WAS one: the repair is a one-off backlog fix, and a
-      // permanent `repair 0/0 fixed0` would be one more number to read on
-      // every line of every note forever.
+      // Only on the pass that RAN it: the repair is attempted once per
+      // isolate, so this is one line on a fresh isolate's first pass and
+      // absent forever after — never a permanent `repair 0/0 fixed0`. That is
+      // also what makes it a live check that the stage is wired at all, since
+      // the healthy reading is `fixed0`: the statement can only find rows left
+      // behind by pre-guard code, and there are none to find once it has run.
       `${
-        repairedBaselines > 0
+        spent.repair.trips > 0
           ? ` repair ${spent.repair.ms}/${spent.repair.trips} fixed${repairedBaselines}`
           : ""
       }` +
@@ -2416,17 +2442,31 @@ export class PushWatcher {
     // A stored baseline that is not a READING is not a missing value but a
     // POISONED one (live 2026-09-24: two rows carried mcap_at_push 0 — see
     // docs/patches/pushwatch-zero-mcap-baseline.apply.js for what it poisons).
-    // The heal's guard stops new ones and this fixes the old ones, once per
-    // isolate, with ONE statement against the whole table.
+    // ONE statement repairs them (Db.repairPushWatchBaselines), issued on two
+    // triggers that between them cover both shapes the pool can be in:
     //
-    // NOT driven by `rows` above, which is the tempting source (it is already
-    // in hand): it is capped at cfg.maxTracked with active rows first, so the
-    // live listing reads `rows 30/30` — every slot active and the row that
-    // needs the repair absent, because the shape a 0 baseline produces ends up
-    // terminal (a drained 💧 row), and terminal rows sort last. The rotation
-    // below cannot reach it either, for the same reason: it evaluates
-    // activeRows only.
-    if (!baselineRepairDone) {
+    //   - `!baselineRepairDone`: once per isolate, and that is the only way to
+    //     reach a row the listing cannot SHOW. It is capped at cfg.maxTracked
+    //     with active rows first, and the other shape a 0 baseline takes is a
+    //     row in the 💧 drain path, which ends up terminal — and terminal rows
+    //     sort last. The rotation below cannot see it either: it evaluates
+    //     activeRows only.
+    //   - `rows`: a 0-baseline row that IS in the listing and carries a real
+    //     peak right now. This is what the one-shot alone misses — the
+    //     statement's own `peak_mcap > 0` guard needs the reading to exist at
+    //     the moment it runs, so an isolate that spent its one shot before the
+    //     reading arrived would leave the row poisoned for the rest of its
+    //     window. That is not cosmetic while the row is ACTIVE: with a baseline
+    //     of 0, chgSincePush divides against max(0, 1), so a phantom
+    //     +499,900% can drive the ⚡ divergence card.
+    //
+    // Both triggers are free once the pool is clean (a boolean and a listing
+    // that is already in hand), so the only cost is the statement itself, and
+    // it goes out only when one of them says there is something to fix.
+    const needsBaselineRepair =
+      !baselineRepairDone ||
+      rows.some((r) => r.mcapAtPush <= 0 && r.peakMcap > 0);
+    if (needsBaselineRepair) {
       baselineRepairDone = true;
       trips += 1;
       spent.repair.trips += 1;
