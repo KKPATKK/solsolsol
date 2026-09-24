@@ -103,6 +103,8 @@ const TRACKER_TICK_BUDGET_MS = 5_000;
  * rotation measured in tens of minutes (live 2026-09-21).
  */
 const TRACKER_ROW_MIN_MS = 300;
+// NOTE: 300ms is the expected cost of one silent row (see above); the revive
+// floor below is unrelated to it.
 /**
  * Ceiling on the room the row loop must leave before it starts another row
  * (see rowReserveMs in runTick).
@@ -672,7 +674,7 @@ const SELL_DOM_PACE_MS = 60 * 60_000;
  * is happening. Legacy rows without a recorded trough fall back to the
  * push baseline × the same multiple.
  */
-const RESURRECTION_MULT = 1.5;
+const RESURRECTION_MULT = 1.5; // revival floor = trough (or push baseline) x this
 
 export interface PushWatchRow {
   token: string;
@@ -2286,7 +2288,25 @@ export class PushWatcher {
           // (2026-09-19 audit). Only a push older than the ledger falls back
           // to the current value.
           const known = findLedgerEntry(ledger, m.token);
-          const healedMcap = known?.mcapAtPush ?? pair.marketCap;
+          // The fallback (a push older than the ledger) is the pair's CURRENT
+          // market cap, which is 0 for a pair the source carries no price for
+          // — and a 0 baseline poisons every derived number: the recap's
+          // "推送 $0", chgSincePush against max(0,1), and a dead-state
+          // resurrection floor of 0. Live 2026-09-24: exactly two rows (💲,
+          // 玉兔) carried mcap_at_push 0 this way. Prefer a positive market
+          // cap, fall back to the FDV when that is all the leg had (the same
+          // substitution the dexscreener leg records via `mcapFromFdv`), and
+          // SKIP this enrollment when neither exists — a pair with no
+          // valuation is untrackable, and it re-heals on a later pass once a
+          // reading lands.
+          const fallbackMcap =
+            Number.isFinite(pair.marketCap) && pair.marketCap > 0
+              ? pair.marketCap
+              : Number.isFinite(pair.fdvUsd) && (pair.fdvUsd ?? 0) > 0
+                ? (pair.fdvUsd as number)
+                : 0;
+          const healedMcap = known?.mcapAtPush ?? fallbackMcap;
+          if (healedMcap <= 0) continue;
           healEnrolledTotal += 1;
           healLastAt = Date.now();
           if (known) healFromLedgerTotal += 1;

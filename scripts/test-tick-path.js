@@ -367,10 +367,18 @@ installTickProbe(fakeScanner, {
   assert.equal(failed.totals.failures, 1, "and rolled into the totals");
   assert.equal(failed.pending, 1, "and it stays queued instead of being dropped");
   assert.equal(deferredWriteCount(), 1, "the queue still holds it");
+  // The REASON rides the view: /health reported pending/failures but never the
+  // error text, so the one number that decides the fix was unreadable outside
+  // `wrangler tail` (live 2026-09-24: pending 47, 38 failures). The batch stops
+  // at the first failure, so this names the entry that stalled it.
+  assert.equal(failed.lastError?.message, "turso 522", "the failure's reason is reported");
+  assert.equal(failed.lastError?.name, "Error", "with the error's name");
+  assert.equal(typeof failed.lastError?.at, "number", "and when it happened");
   // The retry lands on the next drain, without the tick that queued it.
   const retried = await drainDeferredWrites();
   assert.equal(retried.calls, 1, "the next drain retries the same call");
   assert.equal(retried.failures, 0, "and this time it lands");
+  assert.equal(retried.lastError, null, "a clean drain reports no error");
   assert.equal(flakyAttempts, 2, "the real write ran a second time");
   assert.equal(retried.pending, 0, "the queue drains clean");
 
@@ -761,6 +769,56 @@ installTickProbe(fakeScanner, {
     noteDuplicateCards(["", null, undefined, "ZZZZ"]);
     assert.equal(deliveryDuplicatesView().count, 1);
     console.log("duplicate-card counter (audit ring → heartbeat): pass");
+  }
+
+  // ---------- out-of-window guard: the zero-mcap push baseline ----------
+  //
+  // The self-heal's baseline fallback sits ~2290 lines into src/pushwatch.ts,
+  // past the file-tool window, so it ships as
+  // docs/patches/pushwatch-zero-mcap-baseline.apply.js and is applied in the
+  // tree (the marker check lives HERE because scripts/test-unit.js is itself
+  // past the window). A pair with no price reading used to seed `mcap_at_push
+  // 0` (live 2026-09-24: exactly two rows, 💲 and 玉兔), which poisons
+  // chgSincePush and collapses the dead-state resurrection floor to 0. Partial
+  // application is the dangerous state, so every marker must agree.
+  {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const src = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src/pushwatch.ts"), "utf8"),
+    );
+    const markers = {
+      "fallback prefers a positive reading": src.includes("constfallbackMcap="),
+      "uses the FDV when the market cap is 0": src.includes("pair.fdvUsd"),
+      "skips the enrollment when neither exists": src.includes(
+        "if(healedMcap<=0)continue;",
+      ),
+      "the guard is the only baseline source": src.includes(
+        "consthealedMcap=known?.mcapAtPush??fallbackMcap;",
+      ),
+    };
+    const missing = Object.entries(markers)
+      .filter(([, v]) => !v)
+      .map(([k]) => k);
+    if (missing.length === 4) {
+      console.log(
+        "  ℹ zero-mcap baseline guard missing - apply docs/patches/pushwatch-zero-mcap-baseline.apply.js",
+      );
+    } else {
+      assert.equal(
+        missing.length,
+        0,
+        `partial application is unsafe - missing: ${missing.join(", ")} (see docs/patches/pushwatch-zero-mcap-baseline.apply.js)`,
+      );
+      console.log(
+        "  ℹ zero-mcap baseline guard present - the heal cannot seed a 0 baseline",
+      );
+    }
   }
 
   console.log("tick probe + mode read + feed view + db seam: pass");

@@ -125,6 +125,36 @@ PUMPFUN_FALLBACK_LIMIT = "20"
 # look-alike `poolSortField` is silently ignored), Orca's pools carry no
 # creation field. One request when reached. See src/meteora.ts.
 METEORA_FALLBACK_LIMIT = "20"
+# GMGN trending discovery feed size per scan (code default 30 when unset).
+# DISABLED (2026-09-24): GMGN's edge 429s a Cloudflare Worker's shared egress
+# IP at the IP level, so the leg can never deliver a coin — live /health
+# .gmgnFeed read `requests 9 / http429 9 / consecutive429 9 / lastStatus 429`
+# with `gmgn 0` on every scan, and /debug/gmgn answered `ok true, count 0`.
+# It is not a per-tick cost (the client self-pauses 5 min after each 429 —
+# see GMGN_RATE_LIMIT_BACKOFF_MS), but one doomed request per 5-min window
+# plus the per-candidate /token/info probe sharing that backoff is still
+# pure waste.
+# 0 = the leg is off. Restore a positive value only after /debug/gmgn proves
+# the block is gone. This switch does NOT cover the candidate-enrichment path
+# (smart-money count / wash-trading flag, and with it the
+# GMGN_BLOCK_WASH_TRADING gate): GMGN_ENABLED = "0" removes the whole client
+# in one move, which is the AXIOM_ENABLED-style choice if the block persists.
+GMGN_TRENDING_LIMIT = "0"
+# Crime-wallet blocklist (community list — see src/crimewallets.ts).
+# DISABLED (2026-09-24): the gate it feeds is display-only
+# (CRIME_WALLETS_BLOCK=false) and, live, never judges — /debug/crime-wallets
+# answered `size 0, loadedAt null, loadedFrom null` while the client still
+# cost the cold-isolate hydrate (two worker_state reads of the ~216KB list on
+# the isolates that recycle every tick) plus, whenever a copy did land, two
+# Helius RPC calls per candidate (getTokenLargestAccounts + getMultipleAccounts).
+# 0 = the client is never built: no list fetch/hydrate, no holder RPC, no
+# crime flag on the card. The scanner already fail-opens with an empty result
+# when `crimeWallets` is null (see scanner.ts's `crimeClient ? … : null`), and
+# the wallet analysis it fed resolves to the creator-only path — the same
+# shape the live worker showed while the list was not loading, so this is
+# behaviour-neutral for pushes. Restore "true" (and set CRIME_WALLETS_BLOCK)
+# only after /debug/crime-wallets proves the list loads AND you want the flag.
+CRIME_WALLETS_ENABLED = "false"
 # 2026-09-08: halved from 1000 — Jupiter-recent pacing (20 coins × interval)
 # was consuming ~5s of the 5.5s feed cap every tick, so feedsMs+evalMs+overhead
 # blew the 11s tick budget on ~2/3 of ticks (timeout rows in scan-history).

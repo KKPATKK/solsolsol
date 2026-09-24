@@ -165,6 +165,21 @@ export interface WriteDrainView {
   /** Deferred calls whose real write threw. */
   failures: number;
   /**
+   * The most recent failed deferred write — which method it was, the error
+   * text, and when it happened — or null while nothing has failed since this
+   * isolate booted.
+   *
+   * WHY it is on the wire: /health's `writeDrain` reports `pending` and
+   * `failures` but never the REASON, which only ever reached `wrangler tail`.
+   * Live 2026-09-24: `pending 47`, `totals {calls 57, ms 17759, failures
+   * 38}` — a backlog of 47 writes with 67% of attempts failing — and no public
+   * surface could say WHY (a transport abort, a Turso 5xx, a write too large,
+   * a conflict), so the one number that decides the fix was unreadable outside
+   * the dashboard. The drain stops its batch at the first failure (see
+   * drainDeferredWrites), so this names the entry that stalled it.
+   */
+  lastError: { name: string; message: string; at: number } | null;
+  /**
    * Calls still waiting after this drain (0 = the queue is empty). A failed
    * write is NOT dropped: it stays at the head of the queue and is retried by
    * the next drain, so `failures > 0` with `pending > 0` reads as "the last
@@ -260,6 +275,7 @@ let drain: WriteDrainView = {
   ms: 0,
   at: 0,
   failures: 0,
+  lastError: null,
   pending: 0,
   totals: { calls: 0, ms: 0, failures: 0 },
 };
@@ -386,6 +402,10 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
   const startedAt = dbClock();
   let calls = 0;
   let failures = 0;
+  // The most recent failed entry of THIS drain (see WriteDrainView.lastError).
+  // The batch stops at the first failure, so this names the entry that stalled
+  // it — the reason /health could never surface before.
+  let lastError: WriteDrainView["lastError"] = null;
   try {
     if (queue.length === 0) {
       // Nothing was queued: report the empty batch without erasing the last
@@ -416,6 +436,11 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
         failures += 1;
         call.attempts += 1;
         const message = err instanceof Error ? err.message : err;
+        lastError = {
+          name: err instanceof Error ? err.name : "Error",
+          message: typeof message === "string" ? message : String(message),
+          at: dbClock(),
+        };
         if (call.attempts >= DEFERRED_WRITE_MAX_ATTEMPTS) {
           queue.shift();
           console.error(
@@ -442,6 +467,7 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
     ms,
     at: dbClock(),
     failures,
+    lastError,
     pending: queue.length,
     totals: {
       calls: drain.totals.calls + calls,
@@ -466,6 +492,7 @@ export function resetTickProbe(): void {
     ms: 0,
     at: 0,
     failures: 0,
+    lastError: null,
     pending: 0,
     totals: { calls: 0, ms: 0, failures: 0 },
   };
