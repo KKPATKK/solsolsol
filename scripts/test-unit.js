@@ -668,6 +668,35 @@ async function main() {
     );
   });
 
+  await test("drain-error + baseline-repair patch: probe, db method, endpoint and pass land together", () => {
+    // Same rule as the other out-of-window artifact: all of it, or none of it.
+    // The two halves are useless apart — a durable record nobody reads is dead
+    // weight, and an /health field with no writer reads null forever — and a
+    // half-applied pass would count a repair it never issues.
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const probeSrc = read("src/tickprobe.ts");
+    const dbSrc = read("src/db.ts");
+    const workerSrc = read("src/worker.ts");
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const applied = {
+      "probe (durable key)": probeSrc.includes("export const WRITE_DRAIN_ERROR_KEY"),
+      "probe (record type)": probeSrc.includes("export type WriteDrainErrorRecord"),
+      "probe (which method threw)": probeSrc.includes("method: call.name,"),
+      "probe (the durable copy)": probeSrc.includes("persistDrainError(lastError, queue.length)"),
+      "db (repairPushWatchBaselines)": dbSrc.includes("async repairPushWatchBaselines()"),
+      "db (the peak guard)": dbSrc.includes("AND peak_mcap > 0"),
+      "worker (reads the row)": workerSrc.includes('"write_drain_error",'),
+      "worker (exposes it)": workerSrc.includes("writeDrainError,"),
+      "pass (one-shot flag)": pushwatchSrc.includes("let baselineRepairDone = false;"),
+      "pass (the call)": pushwatchSrc.includes("this.db.repairPushWatchBaselines()"),
+    };
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.ok(
+      missing.length === 0 || missing.length === Object.keys(applied).length,
+      `partial paste of docs/patches/drain-error-and-baseline-repair.apply.js — missing: ${missing.join(", ")}`,
+    );
+  });
+
   await test("Db.restampTerminalCompletion: writes back the lost half of a drain row, and only that shape", async () => {
     // The live 2026-09-21 rows (TIGRINO / Apu / SCAT): the reserve wrote
     // last_state='rug' + last_alert_at=now in the same pass as the claim, and
@@ -722,6 +751,70 @@ async function main() {
       await db.upsertPushWatch({ token: unarmed, chatId: "c", symbol: "UNARMED1", pushedAt: Date.now() - 60_000, mcapAtPush: 100_000, liquidityUsd: 50_000 });
       await db.setPushWatchState(unarmed, "rug");
       assert.equal(await db.restampTerminalCompletion(unarmed), false, "an unarmed clock belongs to the other repair");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("Db.repairPushWatchBaselines: a baseline that is not a reading is repaired from the row's own peak", async () => {
+    // The live shape (2026-09-24, /debug/push-watch): the self-heal enrolled
+    // 玉兔 from a pair whose source carried no price, so mcap_at_push landed as
+    // 0 while the tracker's own later reads raised peak_mcap to $70.9K. A 0
+    // baseline is not a missing value but a POISONED one — the recap prints
+    // 推送 $0, chgSincePush divides against max(baseline, 1), and the
+    // dead-state resurrection floor (dead_trough ?? mcap_at_push) × 1.5
+    // collapses to 0, so any later reading "revives" the row.
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "ZERO1", chatId: "c", symbol: "玉兔",
+        pushedAt: Date.now() - 60_000, mcapAtPush: 0, liquidityUsd: 0.09,
+      });
+      // upsertPushWatch seeds peak_mcap from mcapAtPush, so the peak the
+      // tracker recorded LATER is what has to be written separately.
+      await db.updatePushWatchCheck("ZERO1", { peakMcap: 70_921, lastLiquidity: 0.09 });
+      const poisoned = (await db.listPushWatch(10)).find((r) => r.token === "ZERO1");
+      assert.equal(poisoned.mcapAtPush, 0, "the row starts with a baseline that is not a reading");
+      assert.equal(poisoned.peakMcap, 70_921, "while its own recorded peak is a real one");
+
+      // A row with no positive reading ANYWHERE, and a row whose baseline is
+      // genuinely fine: both pin the guards.
+      await db.upsertPushWatch({
+        token: "ZERO2", chatId: "c", symbol: "NOPRICE",
+        pushedAt: Date.now() - 60_000, mcapAtPush: 0, liquidityUsd: null,
+      });
+      await db.upsertPushWatch({
+        token: "LIVE1", chatId: "c", symbol: "LIVE1",
+        pushedAt: Date.now() - 60_000, mcapAtPush: 100_000, liquidityUsd: 50_000,
+      });
+
+      // ONE statement over the WHOLE table, not a caller's token list, and that
+      // is the design rather than a shortcut: neither row source a pass holds
+      // can see the row that needs this — the rotation evaluates active rows
+      // only, and the listing is capped at maxTracked with active rows first, so
+      // the terminal row a 0 baseline produces is invisible to both (see
+      // Db.repairPushWatchBaselines). The caller's answer to that is running it
+      // once per isolate.
+      assert.equal(await db.repairPushWatchBaselines(), 1, "exactly the row that was not a reading");
+      const rowsAfter = await db.listPushWatch(10);
+      const fixed = rowsAfter.find((r) => r.token === "ZERO1");
+      assert.equal(fixed.mcapAtPush, 70_921, "the peak becomes the baseline");
+      const noReading = rowsAfter.find((r) => r.token === "ZERO2");
+      assert.equal(noReading.mcapAtPush, 0, "an invented baseline is worse than the hole");
+      const liveRow = rowsAfter.find((r) => r.token === "LIVE1");
+      assert.equal(liveRow.mcapAtPush, 100_000, "a real baseline is never rewritten");
+
+      // Once repaired the row can never be repaired again: the WHERE's
+      // `mcap_at_push <= 0` is what makes the statement self-limiting (and would
+      // also refuse to overwrite a fresh baseline written concurrently).
+      assert.equal(await db.repairPushWatchBaselines(), 0, "a second run finds nothing");
+      assert.equal(
+        (await db.listPushWatch(10)).find((r) => r.token === "ZERO1").mcapAtPush,
+        70_921,
+        "and cannot walk the baseline back",
+      );
     } finally {
       await t.cleanup();
     }

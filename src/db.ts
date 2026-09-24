@@ -3239,6 +3239,65 @@ export class Db {
    * Returns false when another isolate claimed the row (or it vanished) —
    * precisely when the two-step claim + write would have skipped it.
    */
+  /**
+   * Repair rows whose stored push baseline is not a READING.
+   *
+   * `mcap_at_push` is the denominator of every derived number on a row: the
+   * recap's 推送 line, `chgSincePush` (against `max(baseline, 1)`, src/
+   * pushwatch.ts), and the dead-state resurrection floor (`(dead_trough_mcap
+   * ?? mcap_at_push) * RESURRECTION_MULT`). A row carrying 0 there therefore
+   * reports a seven-figure percentage move and re-arms a resurrection on ANY
+   * later reading. Live 2026-09-24 (/debug/push-watch): two rows (💲, 玉兔)
+   * were in that state — enrolled by the tracker's self-heal from a pair whose
+   * source had no price. The heal's own guard refuses to seed another one (see
+   * docs/patches/pushwatch-zero-mcap-baseline.apply.js), but a guard cannot
+   * rewrite what is already stored, which is this method's whole job.
+   *
+   * The substitute is the row's OWN `peak_mcap`: the highest real reading the
+   * tracker took for that coin, i.e. the only valuation evidence left once the
+   * push-time one never existed. The push ledger cannot help by construction —
+   * these rows have no `initial` entry to copy from (that is what
+   * /debug/push-audit shows for both), which is exactly why the heal had to
+   * fall back to a live price in the first place.
+   *
+   * Deliberately NOT the live market cap, which is the obvious-looking choice:
+   * for a row with no recorded trough the floor above is built from this
+   * column, so repairing a corpse's baseline to its current price re-arms the
+   * very false resurrection this repair exists to stop (1.5 × a dead coin's
+   * price is a number it can reach again by accident). A peak-based floor asks
+   * the coin to regain 1.5 × what it once reached, which is what "revived"
+   * should mean.
+   *
+   * Both WHERE terms are guards, not filters: `mcap_at_push <= 0` re-asserts
+   * the defect ON the write, so a concurrent isolate that already repaired the
+   * row — or a genuinely fresh baseline — can never be overwritten, and
+   * `peak_mcap > 0` is the honesty guard: a row with no positive reading
+   * anywhere is left alone rather than handed an invented number.
+   *
+   * Deliberately UNPARAMETERISED — the whole table rather than a token list
+   * from the caller. A list would be easier to justify but cannot work: the
+   * two row sources a pass holds are the rotation (which drops terminal rows,
+   * and a drained coin IS terminal) and the listing (capped at
+   * PUSH_WATCH_MAX_TRACKED with active rows first, so at 30 active rows it is
+   * exactly the live `rows 30/30` shape — full, and holding only active rows).
+   * The caller therefore runs this once per isolate; see the baseline-repair
+   * stage in PushWatcher.runTick.
+   *
+   * Returns how many rows changed, so the caller can report it: 0 on every
+   * attempt after the backlog is fixed, which is what keeps the caller's cost
+   * bounded rather than recurring.
+   */
+  async repairPushWatchBaselines(): Promise<number> {
+    const res = await this.get().execute({
+      sql: `UPDATE push_watch
+              SET mcap_at_push = peak_mcap
+            WHERE mcap_at_push <= 0
+              AND peak_mcap > 0`,
+      args: [],
+    });
+    return Number(res.rowsAffected ?? 0);
+  }
+
   async claimPushWatchCheck(
     token: string,
     expectedLastChecked: number,

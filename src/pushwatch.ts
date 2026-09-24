@@ -487,6 +487,21 @@ let healEnrolledTotal = 0;
 let healFromLedgerTotal = 0;
 let healFromCurrentMcapTotal = 0;
 let healLastAt: number | null = null;
+/**
+ * The baseline repair (see the stage in runTick) is attempted ONCE per
+ * ISOLATE, which is why the flag lives here next to the other module-scope
+ * healer state and not inside the pass.
+ *
+ * Once is enough by construction: only code from before the heal's own
+ * baseline guard could have written a row for it to find (see
+ * docs/patches/pushwatch-zero-mcap-baseline.apply.js), so there is no stream
+ * of new ones to chase. And once is all the pass can afford — the pass's
+ * allowance is 1.2-1.6s against ~110-200ms round trips, and this statement
+ * can only find rows on the very first pass after a deploy that carries it.
+ * The trade is stated rather than hidden: an isolate whose pool is already
+ * clean still pays this ONE round trip, on its first pass, and never again.
+ */
+let baselineRepairDone = false;
 
 /** Read-only view for the heartbeat mirror (the worker reports it on /health). */
 export function pushWatchHealStats(): {
@@ -1901,6 +1916,10 @@ export class PushWatcher {
       pairs: { ms: 0, trips: 0 }, // the head pair batch (one request)
       rows: { ms: 0, trips: 0 }, // the row loop: claim, reserve, send, write
       holders: { ms: 0, trips: 0 }, // Birdeye holder probes (additive; see TRACKER_HOLDER_CAP_MS)
+      // Baseline repair (see Db.repairPushWatchBaselines): ONE guarded UPDATE
+      // against the whole push_watch table, attempted once per isolate — so it
+      // reads as a trip on the first pass after a deploy and 0/0 forever after.
+      repair: { ms: 0, trips: 0 },
     };
     // Self-heal OUTCOME, next to its clock: the trips count alone cannot tell
     // a chronic heal (the same missing pushes re-read every tick) from a
@@ -1912,6 +1931,14 @@ export class PushWatcher {
     let healEnrolled = 0;
     let healCut = false;
     let healSkipped = false;
+    /**
+     * Rows this pass REPAIRED (see the baseline-repair stage). Declared next to
+     * the heal counters and BEFORE stageNote(), which reads it: the early
+     * returns below call stageNote() too, and a `let` declared further down
+     * would put them in its temporal dead zone (the same trap the holder-probe
+     * counters document).
+     */
+    let repairedBaselines = 0;
     // Holder-stage visibility, next to its clock: `holders 1200/1` alone
     // cannot tell "one probe landed" from "four probes timed out and one row
     // is parked", because the trips count only counts a probe that actually
@@ -1950,6 +1977,14 @@ export class PushWatcher {
       ` holders ${spent.holders.ms}/${spent.holders.trips}` +
       ` held${holdersHeld} cut${holdersCut}` +
       ` probe${holderProbeStarted} miss${holderProbeMisses}` +
+      // Only when there WAS one: the repair is a one-off backlog fix, and a
+      // permanent `repair 0/0 fixed0` would be one more number to read on
+      // every line of every note forever.
+      `${
+        repairedBaselines > 0
+          ? ` repair ${spent.repair.ms}/${spent.repair.trips} fixed${repairedBaselines}`
+          : ""
+      }` +
       `${holderGateBlocked ? " cu-gate" : ""}]`;
     const deferred = {
       checked: 0,
@@ -2378,6 +2413,34 @@ export class PushWatcher {
       snapshot !== null
         ? snapshot.filter((r) => r.pushedAt >= windowCutoff)
         : ((trips += 1), await this.db.listPushWatch(cfg.maxTracked));
+    // A stored baseline that is not a READING is not a missing value but a
+    // POISONED one (live 2026-09-24: two rows carried mcap_at_push 0 — see
+    // docs/patches/pushwatch-zero-mcap-baseline.apply.js for what it poisons).
+    // The heal's guard stops new ones and this fixes the old ones, once per
+    // isolate, with ONE statement against the whole table.
+    //
+    // NOT driven by `rows` above, which is the tempting source (it is already
+    // in hand): it is capped at cfg.maxTracked with active rows first, so the
+    // live listing reads `rows 30/30` — every slot active and the row that
+    // needs the repair absent, because the shape a 0 baseline produces ends up
+    // terminal (a drained 💧 row), and terminal rows sort last. The rotation
+    // below cannot reach it either, for the same reason: it evaluates
+    // activeRows only.
+    if (!baselineRepairDone) {
+      baselineRepairDone = true;
+      trips += 1;
+      spent.repair.trips += 1;
+      const repairStarted = Date.now();
+      try {
+        repairedBaselines = await this.db.repairPushWatchBaselines();
+      } catch {
+        // Best-effort, like the rest of the pass's bookkeeping: the rows keep
+        // their 0 baseline and the NEXT isolate's first pass tries again. The
+        // flag stays set on purpose — a database that is down must not turn
+        // this into a per-pass cost.
+      }
+      spent.repair.ms += Date.now() - repairStarted;
+    }
     // Only rug (drained LP) rows are terminal: kept so the self-heal does
     // not re-enroll them, and skipped here. Dead rows stay ACTIVE but the
     // rules engine keeps them silent until a resurrection.

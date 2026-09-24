@@ -26,6 +26,7 @@ const {
   cardSendView,
   noteDuplicateCards,
   deliveryDuplicatesView,
+  WRITE_DRAIN_ERROR_KEY,
 } = require("../dist/tickprobe.js");
 const { TradeService } = require("../dist/jupiter.js");
 const { resetFeedMakeup, noteProfileFeed, feedMakeupView } = require("../dist/deferredmakeup.js");
@@ -344,12 +345,21 @@ installTickProbe(fakeScanner, {
   // permanent data gap.
   clock = 20_000;
   let flakyAttempts = 0;
+  // The drain's DURABLE copy of its own failure (see WRITE_DRAIN_ERROR_KEY):
+  // the module-scope mirror is invisible exactly when it matters, because the
+  // isolate holding the backlog is not the one answering /health — the live
+  // read that motivated the field (`pending 47`) came from a pristine isolate
+  // reporting `writeDrain {at 0}`.
+  const drainErrorRows = [];
   const flakyDb = {
     async updateTokenMaxMcaps() {
       flakyAttempts += 1;
       clock += 40;
       // Fails exactly once, the way a cancelled invocation's write does.
       if (flakyAttempts === 1) throw new Error("turso 522");
+    },
+    async setWorkerState(key, value) {
+      drainErrorRows.push({ key, value });
     },
   };
   const flakyTick = {
@@ -374,11 +384,39 @@ installTickProbe(fakeScanner, {
   assert.equal(failed.lastError?.message, "turso 522", "the failure's reason is reported");
   assert.equal(failed.lastError?.name, "Error", "with the error's name");
   assert.equal(typeof failed.lastError?.at, "number", "and when it happened");
+  assert.equal(
+    failed.lastError?.method,
+    "updateTokenMaxMcaps",
+    "and WHICH write threw — both deferred methods share one table and one client, so the error text alone cannot say which fix applies",
+  );
+  // ...and the record is DURABLE, not just local. One row per failed drain
+  // (never one per entry), written only on the failure path, so a healthy tick
+  // pays nothing for it.
+  assert.equal(drainErrorRows.length, 1, "the failure is copied to its durable row");
+  assert.equal(
+    drainErrorRows[0].key,
+    WRITE_DRAIN_ERROR_KEY,
+    "under the key /health reads (no second spelling to drift)",
+  );
+  const persistedDrainError = JSON.parse(drainErrorRows[0].value);
+  assert.equal(persistedDrainError.method, "updateTokenMaxMcaps", "with the method");
+  assert.equal(persistedDrainError.message, "turso 522", "the error text");
+  assert.equal(typeof persistedDrainError.at, "number", "when it happened");
+  assert.equal(
+    persistedDrainError.pending,
+    1,
+    "and the backlog it stalled — the number that separates a blip from the live incident",
+  );
   // The retry lands on the next drain, without the tick that queued it.
   const retried = await drainDeferredWrites();
   assert.equal(retried.calls, 1, "the next drain retries the same call");
   assert.equal(retried.failures, 0, "and this time it lands");
   assert.equal(retried.lastError, null, "a clean drain reports no error");
+  assert.equal(
+    drainErrorRows.length,
+    1,
+    "a clean drain writes nothing — the last failure stays readable rather than being erased",
+  );
   assert.equal(flakyAttempts, 2, "the real write ran a second time");
   assert.equal(retried.pending, 0, "the queue drains clean");
 

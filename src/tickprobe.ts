@@ -118,6 +118,12 @@ export interface TickProbeDb {
   getTokenStatsMany?: (...args: never[]) => Promise<unknown>;
   recordTokenStatsMany?: (...args: never[]) => Promise<unknown>;
   updateTokenMaxMcaps?: (...args: never[]) => Promise<unknown>;
+  /**
+   * The durable-row writer, wrapped for exactly ONE purpose: publishing a
+   * failed drain (see WRITE_DRAIN_ERROR_KEY and persistDrainError). Optional —
+   * the probe works without it, and the offline tests' fake handles omit it.
+   */
+  setWorkerState?: (key: string, value: string) => Promise<unknown>;
 }
 
 /** Per-tick hooks for the caller (the worker owns what they attach). */
@@ -165,9 +171,9 @@ export interface WriteDrainView {
   /** Deferred calls whose real write threw. */
   failures: number;
   /**
-   * The most recent failed deferred write — which method it was, the error
-   * text, and when it happened — or null while nothing has failed since this
-   * isolate booted.
+   * The most recent failed deferred write — which METHOD threw, the error's
+   * name and text, and when it happened — or null while nothing has failed
+   * since this isolate booted.
    *
    * WHY it is on the wire: /health's `writeDrain` reports `pending` and
    * `failures` but never the REASON, which only ever reached `wrangler tail`.
@@ -177,8 +183,32 @@ export interface WriteDrainView {
    * a conflict), so the one number that decides the fix was unreadable outside
    * the dashboard. The drain stops its batch at the first failure (see
    * drainDeferredWrites), so this names the entry that stalled it.
+   *
+   * WHY THE METHOD, not just the text: both deferred methods write the SAME
+   * table through the same client, so "turso 522" alone does not say whether
+   * the registration INSERT or the max-mcap UPDATE is the one that cannot
+   * land — and those two have different fixes (batch size vs. a raise-only
+   * statement). The name is the queue entry's own, i.e. the real Db method.
+   *
+   * WHY IT ALSO GOES DURABLE (2026-09-24, later): this mirror is MODULE
+   * state, and the isolate holding the backlog is not the one answering
+   * /health — the live read that motivated the field (`pending 47`) came from
+   * a poll landing on a pristine isolate (`writeDrain {at 0}`), which is why
+   * the mirror alone could never show the reason. Every failing drain
+   * therefore ALSO copies this record to a worker_state row
+   * (WRITE_DRAIN_ERROR_KEY) that any isolate can read back; see
+   * persistDrainError.
    */
-  lastError: { name: string; message: string; at: number } | null;
+  lastError: {
+    /** The deferred Db method that threw (e.g. recordTokenStatsMany). */
+    method: string;
+    /** The error's own name — "Error" for a plain thrown Error. */
+    name: string;
+    /** The error's message, verbatim (never a tombstone). */
+    message: string;
+    /** Epoch of the failure (the probe's injected dbClock). */
+    at: number;
+  } | null;
   /**
    * Calls still waiting after this drain (0 = the queue is empty). A failed
    * write is NOT dropped: it stays at the head of the queue and is retried by
@@ -197,6 +227,31 @@ export interface WriteDrainView {
  * grow the in-memory queue without limit.
  */
 export const DEFERRED_WRITE_MAX_ATTEMPTS = 3;
+
+/**
+ * Durable worker_state key holding the last FAILED drain (see
+ * WriteDrainView.lastError and persistDrainError). Named here, next to the
+ * drain that writes it, so the /health reader (worker.ts) and any debug route
+ * share ONE spelling — the row's payload is the probe's own record, i.e.
+ * `{ method, name, message, at, pending }`, and it is left in place until a
+ * later failure overwrites it (a clean drain does NOT clear it: the last thing
+ * that went wrong is evidence, and a reader has to be able to see it after the
+ * isolate that hit it is gone).
+ */
+export const WRITE_DRAIN_ERROR_KEY = "write_drain_error";
+
+/**
+ * What that row holds: the failed drain's own record (see
+ * WriteDrainView.lastError) plus `pending` — the size of the queue the failure
+ * stalled, which is the number that separates a blip from an outage.
+ *
+ * Exported so the /health reader (worker.ts) names the same shape rather than
+ * re-declaring it, and so a schema change here cannot leave the reader parsing
+ * a shape that no longer exists.
+ */
+export type WriteDrainErrorRecord = NonNullable<WriteDrainView["lastError"]> & {
+  pending: number;
+};
 
 /**
  * What the tick did with the card its chain reached — the counter this whole
@@ -268,6 +323,12 @@ interface DeferredCall {
 let queue: DeferredCall[] = [];
 /** One drain at a time — the queue is walked in place (see drainDeferredWrites). */
 let draining = false;
+/**
+ * The wrapped handle's durable-row writer, captured in installTickProbe. Only
+ * a FAILED drain uses it (see persistDrainError), so an isolate that never
+ * fails a deferred write pays nothing for it.
+ */
+let stateWriter: ((key: string, value: string) => Promise<unknown>) | null = null;
 /** Cumulative per-method timing for this isolate. */
 const steps = new Map<string, DbStepView>();
 let drain: WriteDrainView = {
@@ -437,6 +498,7 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
         call.attempts += 1;
         const message = err instanceof Error ? err.message : err;
         lastError = {
+          method: call.name,
           name: err instanceof Error ? err.name : "Error",
           message: typeof message === "string" ? message : String(message),
           at: dbClock(),
@@ -475,7 +537,46 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
       failures: drain.totals.failures + failures,
     },
   };
+  // AWAITED, on purpose: this runs in the invocation's tail (the worker hands
+  // the whole drain to waitUntil), and a floating write started here would be
+  // cancelled the moment the invocation ended — the exact failure mode this
+  // record exists to describe. It is also why the copy happens ONLY on a
+  // failure: a drain that landed (`lastError === null`) writes nothing, so a
+  // healthy tick pays nothing for this.
+  if (lastError !== null) await persistDrainError(lastError, queue.length);
   return writeDrainView();
+}
+
+/**
+ * Copy a failed drain onto its durable worker_state row (see
+ * WRITE_DRAIN_ERROR_KEY), so the reason outlives the isolate that hit it.
+ *
+ * Best-effort, and deliberately so: the write that just failed may well have
+ * failed because the database is unreachable, in which case this one throws
+ * too and the record stays on this isolate's view for whoever reads it — which
+ * is strictly more than the pre-2026-09-24 behaviour, where nothing left the
+ * isolate at all. An over-strict version ("persist or fail the drain") would
+ * turn a READABLE backlog into a broken tick, and the backlog is already
+ * visible as `pending`.
+ *
+ * `pending` rides along because it is what separates a blip from the live
+ * incident: one failed write with an empty tail is noise, the same reason with
+ * 47 waiting behind it is the shape that motivated this field.
+ *
+ * A clean drain never clears the row. The last thing that went wrong is
+ * evidence, and after a real outage the operator is reading /health hours
+ * later, on a different isolate.
+ */
+async function persistDrainError(
+  error: NonNullable<WriteDrainView["lastError"]>,
+  pending: number,
+): Promise<void> {
+  if (stateWriter === null) return;
+  try {
+    await stateWriter(WRITE_DRAIN_ERROR_KEY, JSON.stringify({ ...error, pending }));
+  } catch {
+    // See above: a record that cannot be written must not cost the tail.
+  }
 }
 
 /** Test seam: the probe is module state, like the scanner's own mirrors. */
@@ -487,6 +588,7 @@ export function resetTickProbe(): void {
   steps.clear();
   dbClock = () => Date.now();
   draining = false;
+  stateWriter = null;
   drain = {
     calls: 0,
     ms: 0,
@@ -557,6 +659,9 @@ function wrapDb(db: TickProbeDb, deferWrites: boolean): void {
   // Writes: registration + raise-only bookkeeping, neither read by the gates.
   wrapDbMethod(target, "recordTokenStatsMany", deferWrites);
   wrapDbMethod(target, "updateTokenMaxMcaps", deferWrites);
+  // `setWorkerState` is deliberately NOT wrapped: it is the channel a FAILED
+  // drain uses to publish its own reason (see persistDrainError), so deferring
+  // it would push that record back onto the very queue that just failed.
 }
 
 /**
@@ -572,6 +677,14 @@ export function installTickProbe(
   if (hooks.db) {
     dbClock = now;
     wrapDb(hooks.db, hooks.deferWrites === true);
+    // The durable-row writer, captured here because this is where the handle
+    // is in scope (see TickProbeDb.setWorkerState). A handle without one (every
+    // offline test's fake) leaves this null and the failure record stays local.
+    const writer = (hooks.db as TickProbeDb).setWorkerState;
+    stateWriter =
+      typeof writer === "function"
+        ? (key, value) => writer.call(hooks.db, key, value)
+        : null;
   }
   const target = seam as TickProbeTarget;
   const marker =

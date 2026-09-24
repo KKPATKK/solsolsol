@@ -37,6 +37,7 @@ import {
   writeDrainView,
   drainDeferredWrites,
   noteDuplicateCards,
+  type WriteDrainErrorRecord,
 } from "./tickprobe";
 import {
   PUSH_DEFERRAL_STATE_KEY,
@@ -3603,6 +3604,13 @@ export default {
       let enabledChats: number | null = null;
       let tokenStatsCount: number | null = null;
       let pushedTotal: number | null = null;
+      // The drain's own record of its last failure, read from its durable row
+      // (see WRITE_DRAIN_ERROR_KEY in src/tickprobe.ts) rather than from this
+      // isolate's mirror: the isolate that accumulates a backlog is not the one
+      // answering this request — live 2026-09-24, a poll landing on a pristine
+      // isolate reported `writeDrain {at 0}` while 47 writes waited elsewhere,
+      // so the reason has to be readable from ANY isolate.
+      let writeDrainError: WriteDrainErrorRecord | null = null;
       // Birdeye CU accounting (see the ledger above): the free tier is
       // 30_000 CU a MONTH for the whole bot, and §4.4.2's table was an
       // estimate until this existed. Read from Turso, not from an isolate
@@ -3625,6 +3633,10 @@ export default {
           "scheduled_tick_at",
           "scheduled_arrival_total",
           "scheduled_arrival_at",
+          // The failed drain's record rides THIS read (the handler already
+          // batches these keys into one request, so it costs no extra round
+          // trip) — see WRITE_DRAIN_ERROR_KEY in src/tickprobe.ts.
+          "write_drain_error",
         ]);
         const rawTotal = tickState?.get("scheduled_tick_total") ?? null;
         const rawAt = tickState?.get("scheduled_tick_at") ?? null;
@@ -3634,6 +3646,18 @@ export default {
         scheduledTickAt = rawAt ? parseInt(rawAt, 10) || 0 : null;
         scheduledArrivalTotal = rawArrivalTotal ? parseInt(rawArrivalTotal, 10) || 0 : null;
         scheduledArrivalAt = rawArrivalAt ? parseInt(rawArrivalAt, 10) || 0 : null;
+        // A malformed or absent row reads as "no record" rather than failing
+        // the page: this is forensics, and an unreadable row must never cost
+        // the health read an operator is using to diagnose exactly that kind of
+        // breakage.
+        const rawDrainError = tickState?.get("write_drain_error") ?? null;
+        if (rawDrainError !== null) {
+          try {
+            writeDrainError = JSON.parse(rawDrainError) as WriteDrainErrorRecord;
+          } catch {
+            writeDrainError = null;
+          }
+        }
         enabledChats = (await db?.listEnabledChats())?.length ?? null;
         tokenStatsCount = (await db?.countTokenStats()) ?? null;
         pushedTotal = (await db?.countSeenTokens()) ?? null;
@@ -3693,6 +3717,13 @@ export default {
         tokenStatsCount,
         pushedTotal,
         birdeyeCu,
+        // WHY the last deferred write failed (method + error + when + how many
+        // were waiting). This is the answer the field's absence asked for: live
+        // 2026-09-24, `writeDrain {pending 47, totals {calls 57, ms 17759,
+        // failures 38}}` with no cause on any public surface. The in-memory
+        // mirror (`heartbeat.summary.writeDrain.lastError`) still reports the
+        // same thing, but only for an isolate that has drained since.
+        writeDrainError,
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         // Cross-isolate single-flight: how often this isolate skipped a
