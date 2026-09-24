@@ -385,11 +385,12 @@ probe），所以上表除咗 probe 一項之外都係由卡片數推算 —— 
 
 ### 4.5 未做
 
-* **durable cron 到達記錄會停**（2026-09-23 13:46:27Z 起 ≥ 30 分鐘，見 §5.1 第 3 點）：
-  `scheduled_tick_total` / `scheduled_tick_at` / ring 尾一齊凍結，而 scan row 照落。要一個**唔經
-  claim batch** 嘅到達標記（或者直接睇 Cloudflare 嘅 cron 指標）才分得開「cron 冇投遞」同
-  「cron 死喺 init」；而後者係 §1 搬走 pre-init 寫入之後新開嘅盲點（舊 code 喺 init **之前**寫到達
-  記錄，正正係為咗呢件事）。fix 之前唔應該再加任何「到達記錄搭去第二個 write」嘅優化。
+* ~~**durable cron 到達記錄會停**（2026-09-23 13:46:27Z 起 ≥ 30 分鐘，見 §5.1 第 3 點）~~ →
+  **已修，見 §4.5.3**。原本：`scheduled_tick_total` / `scheduled_tick_at` / ring 尾一齊凍結，而
+  scan row 照落；要一個**唔經 claim batch** 嘅到達標記（或者睇 Cloudflare 嘅 cron 指標）才分得開
+  「cron 冇投遞」同「cron 死喺 init」，而後者係 §1 搬走 pre-init 寫入之後新開嘅盲點（舊 code 喺
+  init **之前**寫到達記錄，正正係為咗呢件事）。**呢句仍然成立**：fix 之前唔應該再加任何「到達記錄
+  搭去第二個 write」嘅優化 —— 新 stamp 亦冇打破佢（佢係唯一一個唔搭 claim、又唔屬正常 path 嘅寫入）。
 * pair 階段嘅重複讀。今日嘅讀數（§4.2.1 第 4 點）話正常 pass 係 `pairs 179/0`——由 `lastPairs`
   服務，即喺同一個 tick 内並冇重複嘅 HTTP。但仍然有一條唔清楚嘅：10:29:19 嗰個
   `pairs 601/0 pairs 1/10 miss 9`，即係 head 全 miss 嘅一次真 request（一個 subrequest 加
@@ -481,6 +482,49 @@ call 計數器。呢刀就係補呢一項：**客戶端記帳 ＋ 每日 durable
    冇被今次改動影響（`pairs 490/0`、`rows 35/1` 呢種單 trip pass 照樣出現）。
 6. **冇新增 push-watch issue**：`/debug/push-watch.issueCount` = 2，兩條都係舊嘅
    `lost_completion_write`（01:41Z APECAT、04:17Z REALLY），同今次 deploy 無關。
+
+### 4.5.3 cron 到達盲點：pre-init arrival stamp（2026-09-24，已修）
+
+§5.1 第 3 點／§4.5 第一項：到達記錄搭喺 claim batch，令「cron 死喺 init」同「cron 冇投遞」喺
+`/health` 上長得一模一樣。
+
+* **形狀**：每一個到達記錄都只喺 `ensureInitialized` **之後**才 reachable —— 正常路徑搭 claim
+  batch（`Db.scheduledTickStatements`），到唔到 claim 嘅路徑各自寫自己嗰份 —— 所以**死喺 init 嘅
+  tick 一個字都冇寫**。樣本（2026-09-23 21:41–00:07Z）：ring 凍 19 分鐘
+  （23:43:26 → 00:02:26Z）、再凍 2h42m（20:21:26 → 23:03:26Z），期間 scan row 每 ~70s 照落
+  （HTTP monitor 兜住）；durable counter 54_546（13:46Z）→ 54_846（23:56Z）十個鐘 ⇒ **約一半 beat
+  冇記錄**。successor-tick recovery 只證明「到達去到 heartbeat read」，證明唔到「投遞本身」。
+* **修法**：`Db.stampScheduledArrival(at)`（**一個 batch、三個 statement、零 read**，counter 喺 SQL
+  加）＋ worker 喺 `ensureInitialized` **之前**呼叫，條件係純函數
+  `shouldStampArrival(scheduledTickFinishedAt, cronAt)`。
+* **點解唔係每個 tick 都寫**：`scheduledTickFinishedAt` ＝ 本 isolate 最近一個**返到**嘅 scheduled
+  tick。冷 isolate（0）或前人 tick 冇返到（gap > `SCHEDULED_ARRIVAL_SUSPECT_GAP_MS` = 90s）才
+  stamp ⇒ 健康 warm isolate **零成本**；瀕死 isolate 就「每個收到嘅 arrival 都 stamp」（flag 冇得
+  前進，正正令 wedge 嘅投遞**可數**而唔係隱形）。
+* **成本／界**：1 個 subrequest、0 read。`PRE_INIT_ARRIVAL_BOUND_MS` = 1_500 用 `recoveryAwait`
+  兜住 —— stamp 唔可以食咗佢自己存在嘅目的（envelope）；被 bound 走就繼續跑（寫入 idempotent），
+  tick 唔付。
+* **cold-isolate fallback**：`db === null` 時起一個 raw `new Db(...)`（同 `bumpScheduledTickLegacy` 同形）。
+* **flag 設定位**：legacy bump return、cadence-gate skip return、正常 tick 尾（**故意最後**設 ——
+  死喺前面就留住舊值，嗰個 stale 值就係證人）。
+* **讀數**：`/health` 同 `/debug/scan-history` 都出 `scheduledArrivalTotal` / `scheduledArrivalAt` /
+  `scheduledArrivalUnaccounted`（`scheduledArrivalAt > scheduledTickAt` ⇒ 最新一個 cron 投遞未為
+  自己入賬）。兩邊嘅 state read 順手合成一個（`/health` 2→1；`/debug/scan-history` 5→1）。
+* **測試**：`test-unit.js` 加 3 條 —— Db stamp 一 trip 零 read（counting client 度到
+  `executes 0 / batch 1 / statements 3`）、`shouldStampArrival` 規則（含「單一 lost arrival 都要
+  捉到」嘅 < 120s 關係）、out-of-window patch guard（半套貼上係危險狀態）。296 → **299 passed, 0 failed**。
+* **落線 script**：`docs/patches/preinit-arrival-stamp.apply.js`（`db.ts` ＋ `worker.ts`）＋
+  `…fix1.apply.js`（export `SCHEDULED_ARRIVAL_SUSPECT_GAP_MS`）＋ `…-tests.apply.js` /
+  `…-tests.fix1.apply.js`。
+
+**落線點驗**（deploy 後第一個鐘）：
+
+1. 健康 warm isolate **唔應該**令 `scheduledArrivalTotal` 動 —— 佢一動就代表嗰個 arrival 嘅前人 tick
+   冇返（stamp 只喺呢種 arrival 上開火）。
+2. ring 有洞而 `scheduledArrivalTotal` **同時**上升 ⇒「cron 有投遞、tick 死喺 claim 之前」，兩個原因
+   唔再分唔開。
+3. `scheduledArrivalUnaccounted === true` 持續 ⇒ 最新投遞未入賬（＝仲有死亡路徑喺 init 之前）。
+4. 若 `scheduledArrivalAt` 都唔動而 scan row 照落 ⇒ 真係 cron 冇投遞（HTTP monitor 兜緊）。
 
 ### 4.6 invocation 預算：先量度，才切（2026-09-23，已修，已 deploy `43c6f2c` @ 15:30Z＋`cc333db` @ 16:09Z）
 
@@ -638,8 +682,9 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **295 passed, 0 failed** ✅（§4.7 新增 1 條 grouped-telemetry test；
-  再之前係 292 —— §4.6 嗰 6 條 subrequest-counter test ＋ `cc333db` 嗰 2 條 host-split test；
+* `node scripts/test-unit.js` → **299 passed, 0 failed** ✅（§4.5.3 新增 3 條 pre-init arrival test；
+  再之前係 296 —— §17.6 嗰 3 條 row-span-hold test；295 ＝ §4.7 嗰 1 條 grouped-telemetry test；
+  292 —— §4.6 嗰 6 條 subrequest-counter test ＋ `cc333db` 嗰 2 條 host-split test；
   其餘見下 —— 279 → 286 係 §4.5.1 嗰 7 條 CU-ledger test
   —— 單價表、attempt 記帳、mid-write charge、parser 容錯、merge＋剪枝、today/month 分界、
   sync 落地＋失敗 re-offer；§4.4 嗰條 CU-gate test 與 `trips` invariant 仍然釘住）
@@ -702,6 +747,7 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
    ⇒ 分開呢兩者要一個**唔經 claim batch** 嘅到達標記（或睇 Cloudflare 嘅 cron 指標）：抽樣期間
    `/health.scheduledTicks`（module counter）喺我打到嘅樣本全部係 0，但嗰啲 isolate 亦可能根本唔
    收 cron，所以**唔算證據**，唔應該當結論。呢條列入 §4.5 未做第一項。
+   **2026-09-24 已修**：見 §4.5.3（pre-init arrival stamp —— 到達記錄唔再只喺 claim batch 上出現）。
 4. **掃描冇斷**（呢點要講清楚，否則上面嘅讀數會被誤讀成「bot 死咗」）：抽樣期間 scan row 每 ~60s
    落一條、heartbeat `phase:"done"`、`lastScanError` null、`initError` null、`issueCount` 冇升 ——
    即係 push 檢查／卡片路徑照跑，問題集中喺「invocation 預算」同「cron 到達信號」。

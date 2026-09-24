@@ -622,6 +622,51 @@ export class Db {
   }
 
   /**
+   * The PRE-INIT cron-arrival stamp: one write and NO read, issued BEFORE
+   * ensureInitialized, so an arrival still leaves a trace when the tick dies
+   * inside init.
+   *
+   * WHY (2026-09-24, live): the arrival bookkeeping rides the scan-lock claim
+   * (see scheduledTickStatements) and every path that cannot reach a claim
+   * writes it on its own — but ALL of them are reachable only AFTER init. A
+   * tick killed inside init therefore records nothing, and a stretch of them
+   * reads exactly like "the Cron Trigger stopped delivering": the sampled ring
+   * froze for 19 minutes (2026-09-23 23:43:26 -> 00:02:26Z) and again for 2h42m
+   * (20:21:26 -> 23:03:26Z) while scans kept landing every ~70s (the HTTP
+   * monitor's fallback), and the durable counter moved 54_546 (13:46Z) ->
+   * 54_846 (23:56Z) over a 10h window — about HALF of the expected beats were
+   * never recorded. The successor-tick recovery can only prove an arrival
+   * reached the heartbeat read; nothing could prove the delivery itself.
+   *
+   * Cost: ONE subrequest (Workers Free counts Turso's HTTP requests) and NO
+   * read — the counter increments in SQL and the timestamp is the caller's
+   * clock, which is exactly the shape the 2026-09-23 §1 cut removed from the
+   * normal path (a fresh raw client's read AND write per tick, `bump
+   * 564-2211ms` live). The worker calls it only for an arrival whose
+   * predecessor never returned (see shouldStampArrival), so a healthy warm
+   * isolate pays nothing for it.
+   */
+  async stampScheduledArrival(at: number): Promise<void> {
+    await this.get().batch(
+      [
+        {
+          sql: "INSERT OR IGNORE INTO worker_state (key, value) VALUES ('scheduled_arrival_total', '0')",
+          args: [],
+        },
+        {
+          sql: "UPDATE worker_state SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'scheduled_arrival_total'",
+          args: [],
+        },
+        {
+          sql: "INSERT INTO worker_state (key, value) VALUES ('scheduled_arrival_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          args: [String(at)],
+        },
+      ],
+      "write",
+    );
+  }
+
+  /**
    * The tracker pass's setup writes in ONE round trip: the 🏁 recap claims for
    * the rows leaving the tracking window, plus the prune that deletes exactly
    * those rows. Statement order is the caller's (claims first, then the
