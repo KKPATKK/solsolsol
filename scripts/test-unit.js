@@ -965,8 +965,23 @@ async function main() {
   // and the pass behind it — which needs `trips 5`-`8` plus its pair batch —
   // died on the runtime's `Too many subrequests by single Worker invocation`
   // throw, taking the deferral sync and the write drain with it.
+  // A counter on the listing, because the two gates below are told apart by
+  // WHERE the pass stops: the entry gate must fire before the setup's own
+  // first read, the between-stage gate after it. Both defer by the same
+  // name, so without this the suite could not say which one it had proved.
+  const countListings = (db) => {
+    const listing = db.listPushWatch;
+    const state = { listings: 0 };
+    db.listPushWatch = async (...args) => {
+      state.listings += 1;
+      return listing(...args);
+    };
+    return state;
+  };
+
   await test("PushWatcher: a starved INVOCATION defers the pass by name (not a starved tick)", async () => {
     const db = termDb([termRow()]);
+    const reads = countListings(db);
     const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
     // 2 left: below TRACKER_SUBREQ_FLOOR, so the rotation cannot even start —
     // but the pass must say WHICH ceiling stopped it, because "deferred:" alone
@@ -975,6 +990,23 @@ async function main() {
     assert.match(String(out.note), /^deferred:subreq-budget /, "the note names the ceiling, not just that it deferred");
     assert.equal(out.checked, 0, "no row was touched — the pass could not pay for one");
     assert.equal(db.updated.length, 0, "and nothing was written on the way out");
+    assert.equal(reads.listings, 0, "the setup never started — the pass is refused at the door, not inside its first read (the 14:19Z live shape)");
+  });
+
+  await test("PushWatcher: a pass that runs out MID-pass defers at a stage gate, not inside a stage", async () => {
+    const db = termDb([termRow()]);
+    const reads = countListings(db);
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    // Room at the door, gone by the first between-stage gate: the setup HAS
+    // run (and its reading is what the real invocation would have spent),
+    // so this is the between-stage gate's job — the entry gate must not have
+    // swallowed it, and a pass that starts a stage it cannot pay for is the
+    // exact throw this change set out to remove.
+    let probe = 0;
+    const out = await pw.runTick(Date.now() + 5_000, undefined, () => (probe++ === 0 ? 50 : 2));
+    assert.match(String(out.note), /^deferred:subreq-budget /, "the ceiling names itself here too");
+    assert.equal(reads.listings, 1, "the setup ran — so this is the between-stage gate, not the door");
+    assert.equal(out.checked, 0, "and the row loop was never entered");
   });
 
   await test("PushWatcher: a healthy invocation is unbounded by the probe (room reads no gate)", async () => {
@@ -10969,7 +11001,10 @@ async function main() {
       "pushwatch (runTick takes the probe)":
         pushwatchSrc.includes("keepAlive?:(promise:Promise<unknown>)=>void,subreqLeft?:()=>number,"),
       "pushwatch (both stage gates ask both ceilings)":
-        (pushwatchSrc.split("if(outOfBudget())returndeferred;").length - 1) === 2 &&
+        // ENTRY, between-stage, between-stage — all three, or the door is open
+        // and a starved pass dies inside its own first read (the 14:19Z live
+        // shape). Counting the GATE, not the comment that describes it.
+        (pushwatchSrc.split("if(outOfBudget())returndeferred;").length - 1) === 3 &&
         !pushwatchSrc.includes("if(past())returndeferred;"),
       "pushwatch (the note names the ceiling)":
         pushwatchSrc.includes("deferred:${deferReason}${stageNote()}trips${trips}"),

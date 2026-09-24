@@ -2098,6 +2098,24 @@ export class PushWatcher {
         return trips;
       },
     };
+    // ENTRY gate — the one this pass did not have until 2026-09-24, and
+    // the one the live `err:Too many subrequests` runs proved it needed.
+    // The other two sit BETWEEN stages, which protects what follows a
+    // stage but not entry into it: a pass handed less room than a stage's
+    // own first read costs throws INSIDE that stage, and the setup listing
+    // is one read. Measured after the first delivery of these two
+    // ceilings (commit 159af44): the row gate worked (`subreq-cut 4` at
+    // 14:19:53Z) while 5 ticks in the same window still died — a cold
+    // isolate's front can be at 45 before the pass is offered anything
+    // (`heartbeat.subreqs.current` read 47, ring ending `send:autobuy 46`),
+    // which makes the pass's first listing the call the runtime refuses.
+    //
+    // The clock is asked here too, deliberately: it makes this the pass's
+    // single entry condition, so a caller cannot start a pass that was
+    // already over its deadline on the wall. A deferral here costs one
+    // durable note write and no measurement — strictly better than dying
+    // having measured nothing.
+    if (outOfBudget()) return deferred;
     // Case-closed recaps: every coin leaving the window gets ONE summary
     // card before the bulk prune deletes it. Best-effort send — a failed
     // delivery must never keep a dead row alive forever.
