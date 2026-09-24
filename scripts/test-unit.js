@@ -5255,6 +5255,44 @@ async function main() {
     }
   });
 
+  await test("updateTokenMaxMcaps: a batch with NO comparable liquidity still parses", async () => {
+    // The shape above never exercises this: every one of its entries passes
+    // `liquidityUsd`. Live 2026-09-24 the OTHER shape is what ran — a tick
+    // whose coins all came from a leg whose liquidity metric is not
+    // comparable, so the column is omitted for every entry and the liquidity
+    // CASE comes out empty. The statement then ended `... max_mcap_observed
+    // END,` straight into WHERE (a trailing comma), libsql refused to parse
+    // it, and the whole batch's raises were lost — three attempts, then the
+    // entry is dropped (this is the queue /health showed as `pending`, whose
+    // named cause only became readable once the drain record went durable:
+    // `{method: updateTokenMaxMcaps, message: "...near WHERE...", pending
+    // 11}`).
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const H = 3600e3;
+      const now = 50 * 300e3;
+      await t.client.execute({
+        sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed) VALUES ('NOLIQ1', ?, 0, ?, ?, 5000, 8000)",
+        args: [now - 6 * H, now - 6 * H],
+      });
+      // No `liquidityUsd` KEY at all (not a $0: an absent reading), which is
+      // what the scanner sends when the leg's metric is not comparable.
+      await db.updateTokenMaxMcaps([{ token: "NOLIQ1", mcapUsd: 90_000 }]);
+      const stats = await db.getTokenStatsMany(["NOLIQ1"]);
+      const row = stats.get("NOLIQ1");
+      assert.equal(row.maxMcapObserved, 90_000, "the mcap raise lands");
+      assert.equal(
+        row.maxLiquidityObserved,
+        8_000,
+        "and the unjudgeable liquidity column is left exactly as it was",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("getReevalPool: chat-aware seen exclusion keeps coins for chats that missed the push", async () => {
     const t = tmpDb();
     try {

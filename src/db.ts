@@ -3680,11 +3680,22 @@ export class Db {
       const liq = Math.max(0, e.liquidityUsd!);
       liqArgs.push(e.token, liq, liq);
     }
+    // The comma after the mcap CASE belongs to the LIQUIDITY clause, not to
+    // the statement. Emitted unconditionally it produced `... END,` followed
+    // by `WHERE` whenever a batch carried no comparable liquidity reading at
+    // all (every coin that tick served by the Jupiter/Gecko legs — see
+    // liquidityIsComparable), and libsql rejects the whole statement:
+    // `SQL string could not be parsed: near WHERE, "None": syntax error at
+    // (3, 18)`. Not a partial failure — that tick's mcap raises never landed,
+    // and the deferred entry was retried twice more before being dropped,
+    // which is the backlog `writeDrain.pending` showed for days (2026-09-24:
+    // pending 47, and the named cause once the drain record was made
+    // durable: updateTokenMaxMcaps, pending 11).
     await this.get().execute({
       sql: `UPDATE token_stats SET
-              max_mcap_observed = CASE ${mcapCases} ELSE max_mcap_observed END,${
+              max_mcap_observed = CASE ${mcapCases} ELSE max_mcap_observed END${
                 liqCases
-                  ? `
+                  ? `,
               max_liquidity_observed = CASE ${liqCases} ELSE max_liquidity_observed END`
                   : ""
               }
