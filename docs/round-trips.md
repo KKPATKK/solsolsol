@@ -705,6 +705,14 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
 4. **掃描冇斷**（呢點要講清楚，否則上面嘅讀數會被誤讀成「bot 死咗」）：抽樣期間 scan row 每 ~60s
    落一條、heartbeat `phase:"done"`、`lastScanError` null、`initError` null、`issueCount` 冇升 ——
    即係 push 檢查／卡片路徑照跑，問題集中喺「invocation 預算」同「cron 到達信號」。
+### 5.2 dead-tick 形狀重取樣（2026-09-23 21:14–23:56Z，讀數喺 `docs/duplicate-cards.md` §18.5）
+
+§4.7／§17.6 落線之後最乾淨嘅一個靜默窗（151 分鐘、120 行 ring）：**慢滴由 5.4–8.7/h 跌到 2.3/h**
+（21:14→23:26，5 條），**6 位數偵測延遲 0 條**（baseline 每窗 1–3 條）；但 23:26:27 起有一個
+**17 分鐘楔形**（17 條 dead、零成功掃描），佢**無 deploy 喺附近、自己散**，同切唔切冇因果。
+生還 tick 嘅 subrequest 窗係 total 30（turso 18）—— 亦即「正常一輪離 50 上限仲有 20 條」。
+詳見 §18.5。
+
 
 ## 6. 點解要一個 script 落呢個改動
 
