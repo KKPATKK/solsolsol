@@ -723,7 +723,7 @@ batch 嘅第一刀」。三個 sync 各自係「一次讀（ledger 嗰個係四�
    request」呢句**只由 unit test 釘住**（一個 counting client 度到整個讀係 1 個 call、寫係 1 個 call），
    live 冇獨立證據。要 live 量就要喺 window 入面加一個 telemetry 讀數（下一刀）。
 
-## 4.8 追蹤池 head：10 → 30，一個 pass 掃完全池（2026-09-24，未上線）
+## 4.8 追蹤池 head：10 → 30，一個 pass 掃完全池（2026-09-24，已上線）
 
 **問題唔喺「掃唔掃到」，而喺「幾時掃到」。** `/debug/push-watch?limit=500`（03:46:28Z）
 顯示表 46 行 ＝ **31 active ＋ 15 terminal**（`rug` / `unwatched`，故意唔掃）。但 active 行嘅
@@ -774,19 +774,105 @@ TRACKER_ROW_MIN_MS)`，即由 1_200 變 **1_800** —— 一個只淨 ~2.5s 嘅 
 **active 31 > cap 30**：listing 嘅 `LIMIT ?` ＝ 30，排序係 active 行最舊先，所以多出嚟嗰行
 係**最新檢查**嗰行；下一 pass 佢就係最舊，自然回到隊列 —— 唔會餓死，只係快取／慢取之分。
 
+### 4.8.1 上線後讀數（2026-09-24 04:31–05:05Z）
+
+`0938959` → Deploy Worker run **35953548509 success** ✅（03:56:43Z push、1m14s、~03:58Z 落線）。
+
+| 要讀嘅嘢 | 讀數 | 判讀 |
+| --- | --- | --- |
+| `pairs N/N` | `pairs 30/30`（04:33:14Z、04:56:13Z 兩個 pass） | head 已係全池：**一個 request 食 30 個 address**，同 10 個嗰時一樣一條 subrequest |
+| `rows X/N` | `rows 3/30`（04:33，慢 DB）→ **`rows 17/30`**（04:56） | 一個 pass 由 checked **10 → 17 行**；N ＝ `activeRows.length`（pool 30），所以 17/30 ＝ 一個 pass 行咗 17 行 |
+| tracked 行年齡 | 30 行（`dead` 9／`null` 15／`weak` 4／`up200` 1／`ignite` 1）**全部 52–55s**；`rug` 13／`unwatched` 1 照樣幾個鐘頭唔掃 | **三堆變一堆**，達到目標（比「最舊 < 3 分鐘」更好） |
+| `budget-cut` | **照樣出現**（兩個 pass 都有） | 同預測相反 —— 見下 |
+| `cut:watchdog` | **冇出現** | watchdog 前提仍然 hold（新嘅 8_600 冇咬） |
+| subrequest 窗 | `/health.heartbeat.subreqs.recent` 最高 **37／50**；DB 佔 29–30 條／窗 | 冇撞上限，DB 仍然係大頭（同 §4.6） |
+| scan pair phase | ring `ms === 5000`（race cut）由 02:40–03:56 嘅 76 分鐘 **2 條**，變 03:58–04:52 嘅 52 分鐘 **4 條** | 多出嗰兩條落喺 04:30 桶（同時 `db 4462ms`）→ 睇唔到 head 直接造成，但**唔算「冇變」**，要再抽一段乾淨時段才算證 |
+
+**`budget-cut` 冇消失，而原因唔係 head**（04:56:13Z）：
+
+```
+ok:17/2 rows 17/30 pairs 30/30 miss 0 lost 0 budget-cut allow 4521
+spend[setup 521/2 heal 498/1 miss0 enrolled0 pairs 0/0 rows 3701/9 holders 284/1 held0 cut3 probe1 miss0] trips 16 db 5163ms
+trackerMs 6080
+```
+
+`rows 3701/9` ＝ row loop **每行 ~411ms**（pair batch 反而 0ms —— 180s 快取命中）。30 行 × 411ms ≈
+**12.3s**，而 row loop 嘅預算係 `allow − reserve ≈ 4.5s − 0.6s`。即 head 由 10 升到 30 之後，瓶頸
+仍然係「每行嘅 Turso 成本」而唔係 head：cut 咗嗰 13 行留喺隊列（`last_checked` 最舊先），下一個
+pass 接手。所以**一個 pass 掃 17 行、全池一輪 ≈ 2 個 pass（~2 分鐘）**，未做到預期嘅 1 個 pass，
+但已經由「3 個 pass／5–8 分鐘」收到「2 個 pass／~2 分鐘」。
+
+**更正（見 §4.8.2）**：`rows 3701/9` **唔係**「411ms／行」。嗰 9 個 trip 係 ~3 條 alerting
+row 嘅（claim ＋ reservation ＋ final write），而 quiet row 本身 **零 trip**（一次過 batch 寫）。
+即個 pass 唔係唔夠 round trip，係喺 loop 頂 `break` 走出輪替，剩低 13 條 quiet row 明明可以
+搭同一個 batch **免費**寫埋。所以下一刀唔係「減每行 trip」（冇嘢好減），而係把 gate 由每行搬去
+每次 spend —— 見 §4.8.2。
+
+**一個讀數陷阱（raise head 之後新出現）**：`rows X/N` 嘅 X 係 `checked`（真係行過嘅行），但隊列
+stamp 係 batch claim 一次過蓋全池（§4.2 省 trip 嘅設計），所以 30 行一齊 52–55s **只證明 claim 蓋咗
+章**，唔證明 30 行都重新評估過 —— 每 pass 有 30 − 17 ＝ **13 行「蓋咗章、冇重新評估」**，而佢哋
+照樣排去隊尾（以前 head 10 ＝ checked 10，冇剩呢個形狀）。要盯：抽兩次相隔幾分鐘嘅表，睇
+`lastMcap`／`chgSincePushPct` 有冇真係更新，唔可以只睇年齡。
+
+**另一個失敗形狀（同 head 無關）**：Turso 一慢，tracker 會被整個 defer —— 04:34:13Z／04:35:12Z
+兩個 pass 係 `deferred:tick-budget allow 0`／`allow 308`、`rows 0/0`，同一時間 `db 4462ms`、
+`setup 2003/2`（正常係 `db 1056ms`、`setup 346/3`）。呢個就係中間一度見到 tracked 行企到 13–19
+分鐘嘅原因：**抽讀數一定要連 `deferral` 一齊睇**，單睇一兩個 pass 會誤判成 regression。
+
+**四點結論**：(1) head 30 落線、`pairs 30/30` 一條 request ✅；(2) 年齡三堆變一堆 ✅；
+(3) checked 10 → 17、全池一輪 2 pass ✅ 但未到 1 pass，而且 `budget-cut` **仍然出現** ❌；
+(4) subrequest 冇撞 50 上限、`cut:watchdog` 冇出現 ✅。
+
+### 4.8.2 一刀：budget gate 由「每行」搬去「每次 spend」（未上線）
+
+**§4.8.1 嗰句「下一刀係減每行嘅 round trip」係錯嘅診斷，要收回。** 睇返 `rows 3701/9`：
+9 個 trip **唔係** 17 行攤分（411ms／行），而係 **~3 條 alerting row** 各自嘅 claim／reservation／
+final write（3 trip／條）。其餘 ~14 條 quiet row **一個 trip 都唔使** —— 佢哋排隊，由 loop 之後
+嗰一個 `claimPushWatchChecksMany` 一次過寫（§4.2 嘅 batching 成果）。
+
+即 04:56:13Z 嗰個 pass **唔係唔夠 round trip**：佢喺 loop 頂嗰道 gate
+`if (!firstRow && Date.now() + rowReserveMs() > deadline) { budgetCut = true; break; }`
+**跳出咗成個輪替**，剩低 13 條 quiet row 明明可以搭同一個 batch **免費**寫埋。
+
+| 位 | 前 | 後 |
+| --- | --- | --- |
+| loop 頂嘅 gate | 每行之前檢查，超時 `break`（跳走其餘輪替） | 只計一個 `overBudget` flag，唔 break |
+| `pairMiss` 嘅 delete | 無條件 `await deletePushWatch`（呢個 branch 唯一嘅 trip） | `!overBudget` 才做 |
+| alerting row 嘅 send gate | 唔夠 slice → `break`（跳走其餘輪替） | 唔夠 slice → `continue`（該行完全唔碰，其餘照行落去） |
+
+**唔變嘅嘢**：at-most-once 嘅機器一模一樣 —— claim 同 reservation 仍然係兩個獨立 CAS、
+reservation 仍然喺 send 之前落地、refused 嘅 row 仍然「完全唔碰」（`last_checked` 都唔寫），
+所以下一個 tick 用新 budget 喺隊頭再試。改動只係「唔再因為一個唔夠錢嘅 spend，放棄其餘免費嘅行」。
+
+**單元測試**：舊嗰條「the row loop always evaluates a row, even when the pair batch ate the
+budget」（2 條 quiet row、100ms budget 對 250ms batch）斷言 `checked === 1` ＋ `budget-cut`，
+即係**釘住舊嘅 break 行為**，已改成 `checked === 2`、`rows 2/2`、**冇** `budget-cut`；另加一條新
+test：30 行、pair batch 食晒 allowance，仍然 `rows 30/30`，而 `claimPushWatchChecksMany` 只叫
+**一次**（30 行一個 trip）。
+
+**第一刀錯咗，已修（`row-loop-spend-gate.fix1.apply.js`）**：第一版把 `overBudget` 都加落
+send gate —— 即「過咗 deadline 就唔准開新嘅 alerting row」。兩條既有 test 即刻紅：
+`a row that starts after the deadline sends inside the pass tail` 同 `a held-back card is
+re-announced on the next pass`。一條 row 嘅池裡面，嗰條 row **就係** progress floor，而真正
+bound 住 pass tail 嘅係 **send slice**（`TRACKER_SEND_CAP_MS`／`TRACKER_SEND_FLOOR_MS`），唔係
+個 reserve —— live 有個 tick 喺 ~4_840ms race window 嘅 4_857ms 才完，成個 flush 都輸埋。所以
+send gate 嘅條件**保持原狀**（只有 slice），只係 `break` → `continue`；而家被時鐘管住嘅只剩
+`pairMiss` 嗰個 delete（佢係唯一冇自己 slice 嘅 spend）。
+
 **上線後要讀**（未做）：
 
-1. `rows X/N` 嘅 X 由 10 升到貼近 N，`pairs N/N`；
-2. active 行嘅年齡由**三堆變一堆**（最舊 < 3 分鐘）；
-3. `allow` 同 `trackerMs` 嘅差距縮返，但唔可以出現 `budget-cut` 或 `cut:watchdog`；
-4. subrequest 窗：掃描 pair phase 而家連 head（最多 30 個 address）一齊 ask，而且 append 喺
-   最後（超 budget 只會剪走 tracker 嘅 pre-fetch），正常 tick 最多多 1 條，要盯住 50 上限
-   （§4.6 量到嘅生還 tick 窗 ≈ 30）。
+1. 慢 pass 嘅 `rows X/N`：X 應該貼近 N（30），唔再係 17；
+2. `budget-cut` **仍然要出**（alerting row 被拒時）＋ `defer-send N` 要有數 —— 呢兩樣證明
+   「唔再 break」冇把「拒絕」靜音化；
+3. `rows <ms>/<trips>` 嘅 trips 唔應該因為行多咗而上升（quiet row 依然零 trip）。
 
 ## 5. 驗證狀態（本地 + 上線）
 
 * `npm run build`（tsc）✅
-* `node scripts/test-unit.js` → **302 passed, 0 failed** ✅（§十九（duplicate-cards）新增 2 條 no-mark
+* `node scripts/test-unit.js` → **304 passed, 0 failed** ✅（§4.8.2 換走嗰條釘住舊 `break` 行為嘅
+  「always evaluates a row」test ＋ 加 1 條「30 行一個 batch trip」test；§4.8 加 1 條「pair batch
+  問全池」test ＋ 改寫 1 條 strict-subset test 成 40 行 fixture；再之前 302 ＝ §十九（duplicate-cards）
+  嗰 2 條 no-mark
   dedupe test；再之前 300 —— §4.5.3.1 嗰 1 條 cold-handle test；299 —— §4.5.3 嗰 3 條 pre-init arrival
   test；296 —— §17.6 嗰 3 條 row-span-hold test；295 ＝ §4.7 嗰 1 條 grouped-telemetry test；
   292 —— §4.6 嗰 6 條 subrequest-counter test ＋ `cc333db` 嗰 2 條 host-split test；
@@ -797,6 +883,9 @@ TRACKER_ROW_MIN_MS)`，即由 1_200 變 **1_800** —— 一個只淨 ~2.5s 嘅 
 * `edbd57d`（§4.5.3 pre-init arrival stamp）→ Deploy Worker run 35944044690 **success** ✅；
   `a9711fd`（§4.5.3.1 cold-handle fix）→ run 35945163059 **success** ✅（落線讀數見 §4.5.3.1）
 * `4021c35`（duplicate-cards §十九 no-mark dedupe）→ Deploy Worker run 35947790374 **success** ✅
+* `b6f07e0`（§十九 no-mark 第一小時紀錄）→ Deploy Worker run 35948129083 **success** ✅（1m20s）
+* `0938959`（§4.8 追蹤池 head 10 → 30）→ Deploy Worker run **35953548509 success** ✅（1m14s，
+  03:56:43Z；落線讀數見 §4.8.1）
 * push `bba1312` → Deploy Worker to Cloudflare **success**（1m9s）✅；`21521eb`（§4.2 row loop）
   → run 35837821096 **success**（1m27s）✅；`ae269d4`（§4.1 holder gate）→ run 35845665809
   **success**（1m16s）✅；`2b4b9fe`（§4.3 probe cap／slot）→ run 35851038091 **success**（1m20s）✅；
@@ -807,7 +896,8 @@ TRACKER_ROW_MIN_MS)`，即由 1_200 變 **1_800** —— 一個只淨 ~2.5s 嘅 
 * 上線後讀數：§3.1（第一刀）、§4.1.1（holder 由飢餓救返）、§4.2.1（row loop 一個 head 一個 trip）、
   §4.3.1（`probe1 miss0` 同 collect 回落）、§4.4.1（`probe1 miss0` → 下一個 pass `cu-gate`）、
   §4.5.2（CU 帳簿：charge 半已證、durable 半未證）、§4.6.2（subreq counter：DB 佔 63–83%）、
-  §5.1（note／history 觀察）、§4.7.1（grouped telemetry：durable 半已證）
+  §5.1（note／history 觀察）、§4.7.1（grouped telemetry：durable 半已證）、§4.8.1（head 10 → 30：
+  `pairs 30/30`、checked 10 → 17、三堆變一堆，`budget-cut` 仍在）
 * 卡片側：`/debug/push-audit` 有帶 `sig` 嘅 follow-up entry（ARGUS 嘅 `ignite`／`liqwarn`／`drain`、
   HANDLES 嘅 `ignite` 等，30 條 ring），`/debug/push-watch.issueCount` = **1**
   （DeadCatBounce，2026-09-22 嘅舊 row）

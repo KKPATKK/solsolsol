@@ -5735,7 +5735,7 @@ async function main() {
   });
   const watchBot = { api: { sendMessage: async () => ({ message_id: 1 }) } };
 
-  await test("PushWatcher: the row loop always evaluates a row, even when the pair batch ate the budget", async () => {
+  await test("PushWatcher: a late pass still queues the WHOLE pool in one trip", async () => {
     const rows = [watchRow("AAA"), watchRow("BBB")];
     const updated = [];
     const deadlines = [];
@@ -5748,16 +5748,55 @@ async function main() {
       watchDb(rows, updated), watchBot, null, loadConfig({}), pairsFor, null,
     );
     // 100ms budget against a 250ms batch: the pass is past its deadline
-    // before the loop even starts — the live shape. The first row must run.
+    // before the loop even starts — the live shape. A quiet row spends no
+    // round trip of its own, so BOTH rows must still be queued: this used to
+    // assert `checked === 1` plus `budget-cut`, i.e. it pinned the `break`
+    // that left the live rotation at `rows 17/30` while thirteen quiet rows
+    // could have ridden the batch for free.
     const out = await pw.runTick(Date.now() + 100);
-    assert.equal(out.checked, 1, "one row must be evaluated however late the pass is");
-    assert.equal(updated.length, 1);
-    assert.match(String(out.note), /budget-cut/);
+    assert.equal(out.checked, 2, `the whole pool must be queued: ${out.note}`);
+    assert.equal(updated.length, 2, "and it is paid for in the SAME single trip");
+    assert.match(String(out.note), /rows 2\/2/);
+    assert.doesNotMatch(
+      String(out.note),
+      /budget-cut/,
+      "no spend was refused, so nothing may be reported as cut",
+    );
     assert.equal(
       typeof deadlines[0],
       "number",
       "the batch gets a caller deadline so it cannot overrun the pass",
     );
+  });
+
+  await test("PushWatcher: one late pass covers all 30 tracked rows in a single batch trip", async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => watchRow(`POOL${i}`));
+    const updated = [];
+    let batchCalls = 0;
+    const db = watchDb(rows, updated);
+    const innerBatch = db.claimPushWatchChecksMany;
+    db.claimPushWatchChecksMany = async (batch) => {
+      batchCalls += 1;
+      return innerBatch(batch);
+    };
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      null,
+      loadConfig({}),
+      async (addrs) => {
+        // The pair batch eats the whole allowance, the live shape that used
+        // to cut the rotation short on every slow tick.
+        await new Promise((r) => setTimeout(r, 250));
+        return new Map(addrs.map((a) => [a, watchPair(a)]));
+      },
+      null,
+    );
+    const out = await pw.runTick(Date.now() + 120);
+    assert.equal(out.checked, 30, `the whole rotation must be queued: ${out.note}`);
+    assert.match(String(out.note), /rows 30\/30/, `the note must say so: ${out.note}`);
+    assert.equal(batchCalls, 1, "thirty rows, one round trip");
+    assert.equal(updated.length, 30);
   });
 
   await test("PushWatcher: the pair batch's deadline is measured from the CALL, not the pass start", async () => {

@@ -2686,7 +2686,6 @@ export class PushWatcher {
       backfill: boolean;
       v: Parameters<Db["claimPushWatchChecksMany"]>[0][number]["v"];
     }> = [];
-    let firstRow = true;
     const rowsStart = Date.now();
     const rowsTrips = trips;
     /**
@@ -2700,24 +2699,35 @@ export class PushWatcher {
         TRACKER_ROW_MIN_MS,
         (Date.now() - rowsStart) / Math.max(1, trips - rowsTrips),
       );
-    /** Room ANOTHER row needs: one observed trip is its first call. */
+    /**
+     * Room a SPEND needs before it may START — the pairMiss delete, which is
+     * the one spend with no send slice of its own to bound it. Refusing it is
+     * free: the row stays listed and the next pass re-finds it.
+     */
     const rowReserveMs = (): number =>
       Math.min(TRACKER_ROW_LEASH_MS, tripMs());
     for (const row of head) {
-      // Budget check BETWEEN rows: the claim and the alert reservation for a
-      // row both happen after this point, so leaving a row to the next tick
-      // can never drop an alert (it is re-claimed and re-evaluated then).
-      // The FIRST row is never skipped: when the front stages (recap/prune,
-      // self-heal, pair batch) run long, breaking here is what silently
-      // stopped all post-push monitoring — the pass reported `ok:0/0` with no
-      // note while 28 active rows went unrefreshed (2026-09-17). One row per
-      // tick is the floor that keeps the tracker moving no matter what
-      // DexScreener or Turso are doing.
-      if (!firstRow && Date.now() + rowReserveMs() > deadline) {
-        budgetCut = true;
-        break;
-      }
-      firstRow = false;
+      // Budget check BETWEEN rows — but it gates the SPENDS, not the rows. A
+      // quiet row costs no round trip of its own (its write rides the ONE
+      // batched claim after the loop, see silentChecks), so charging it this
+      // pass's clock bought nothing and cost plenty: live 2026-09-24
+      // 04:56:13Z the loop spent 3_701ms on three alerting rows' claim/
+      // reservation/write trips and then `break`-ed out with `rows 17/30` —
+      // thirteen QUIET rows that would have joined the very batch the pass
+      // was already paying for went unmeasured, and the next pass paid
+      // another batch to pick them up.
+      //
+      // What is LEFT of the clock check is the pairMiss delete below: a row's
+      // only spend with no slice of its own. The alerting path keeps the rule
+      // it was built with (its own send slice — see the send gate further
+      // down), because that slice is what bounds the pass tail: a live tick
+      // finished 4_857ms into a ~4_840ms race window and lost its flush
+      // entirely. The 2026-09-17 incident this gate descends from (front
+      // stages ate the budget, the loop `break`-ed, 28 rows went unrefreshed
+      // while the note read `ok:0/0`) is answered harder than before: no
+      // quiet row is ever left behind, and a refused card still says so
+      // (`budget-cut` plus `defer-send N`).
+      const overBudget = Date.now() + rowReserveMs() > deadline;
       const pair = pairs.get(row.token);
       if (!pair) {
         // Delisted/unfindable: drop after a grace period so stale rows don't
@@ -2739,7 +2749,11 @@ export class PushWatcher {
         // real clock again.
         pairMiss += 1;
         const lastSeen = Math.max(row.pushedAt, row.lastChecked);
-        if (row.lastChecked > 0 && now - lastSeen > 2 * 3_600_000) {
+        // The delete is this branch's ONLY round trip, so it is the only
+        // thing the pass's clock has to refuse (see overBudget above).
+        // Skipping it is free: the row stays listed, and the next pass
+        // re-finds it either way.
+        if (!overBudget && row.lastChecked > 0 && now - lastSeen > 2 * 3_600_000) {
           trips += 1;
           await this.db.deletePushWatch(row.token);
         }
@@ -2789,10 +2803,20 @@ export class PushWatcher {
           TRACKER_SEND_CAP_MS,
           TRACKER_SEND_MIN_MS * evalResult.alerts.length,
         );
+        // `continue`, not `break`: a refused row is left COMPLETELY
+        // untouched (no claim, no write — see the alerting path below), so
+        // the rest of the rotation is still worth walking — the quiet rows
+        // behind it ride the pass's ONE batch for free. Breaking here is what
+        // turned a short pass into an unmeasured tail of quiet rows.
+        //
+        // The send SLICE alone decides (not the loop's clock): in a one-row
+        // pool this is still the progress floor's row, and the slice — not the
+        // per-row cap — is what bounds the pass tail (see the live tick cited
+        // at the top of the loop).
         if (sendBudgetEnd - Date.now() < needMs) {
           sendDeferred += 1;
           budgetCut = true;
-          break;
+          continue;
         }
       }
       // The check write's columns, in ONE place: the silent path below binds
