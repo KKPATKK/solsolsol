@@ -665,3 +665,32 @@ tick 時發）。
 修正：`pushwatch.ts` 新增 `comparableLiquidity()`（非 DexScreener 來源一律當「資料不明，唔判斷」）
 ＋ 三條腿各自標 `PairInfo.feedSource`；深層 hunk 以 `docs/patches/liq-source-guard.patch` 落地。
 量度表、代價同驗收點全部喺 `docs/liquidity-provenance.md`。
+
+---
+
+## 第十一補：一次檢查跨過幾關，張卡要講明
+
+2026-09-25 06:49 HKT 收到 `🚀 續漲 parafactual | 推送時 $115.2K → $660.58K (+473%) … 已達最高里程碑`，
+而之前冇任何 +200% / +400% 通知。查完：**冇漏發**。
+
+| 讀數 | 值 |
+|---|---|
+| `mcapAtPush` → `peakMcap` | 115,199 → 921,235 |
+| `upStages` | `up50,up100,up200,up400,w35` |
+| `lastState` | `up400` |
+| audit ring 內該 token 嘅卡 | 只有 `sig up400 @ 22:49:58` |
+| `deadTroughMcap` | 71,254（低過推送價） |
+
+`RISING_STAGES = [50,100,200,400]`，stage machine 發**最高而未公佈**嗰關，然後把 ≤ 該關嘅全部 mark 死
+（`for j <= i`）—— 呢個係刻意嘅（舊行為係一次大行情倒序發四張：+400%、+200%、+100%，POPEYE 事件）。
+所以**一次檢查內跨過成個梯級，就只會有一張卡**；row 入面嗰三個 up mark 係同一張卡自己 fold 出嚟，唔係三次失蹤。
+該幣當時跌到 71K（低於推送價），下一次被睇到就已經係 +473%。
+
+不過用戶嘅困惑係啱嘅：張卡只寫「已達最高里程碑」，冇講佢吞咗邊幾關，所以讀者分唔清「+200% 漏發」同
+「價位停在 +100% 同 +200% 之間嗰段時間根本冇檢查過」。
+
+**修正**：跨過多過一關時，卡會列出全部關口：`| 一次檢查內跨越 +50%/+100%/+200%/+400% | 已達最高里程碑`。
+
+**另一個真缺口**（令呢個問題由外面查唔到）：唯一持久嘅逐卡證據係 `push_audit`，一個**上限 30 筆、全 chat 共用**嘅
+ring —— 繁忙時只覆蓋幾分鐘；deferral ledger 只有計數同 pending token 名單，`followupsSent` 只係一個數。
+改為 200 筆，並為 `/debug/push-audit` 加 `?token=` / `?since=` / `?limit=`，下次一條 request 就答得到。

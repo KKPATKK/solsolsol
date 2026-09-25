@@ -438,6 +438,36 @@ const TRACKER_UNDELIVERED_MAX = 200;
 const STALE_BACKFILL_MS = 45 * 60_000;
 /** Rising-stage thresholds (%) above the push-time mcap → state suffix. */
 const RISING_STAGES = [50, 100, 200, 400] as const;
+
+/**
+ * The stages a card at `stage` is the FIRST announcement for: everything at
+ * or below it that the row does not carry a mark for yet.
+ *
+ * MORE THAN ONE means the move was only OBSERVED once — the tracker never
+ * saw the price while it sat between those bands — and that is a reading the
+ * card has to state (see risingCardTail).
+ */
+export function newlyCrossedStages(
+  stage: number,
+  already: ReadonlySet<string>,
+): number[] {
+  return RISING_STAGES.filter((s) => s <= stage && !already.has(`up${s}`));
+}
+
+/**
+ * The 🚀 card's tail. It names EVERY stage this one card swallowed (live
+ * 2026-09-25 06:49 HKT: parafactual landed as a single up400 card reading
+ * +473%, with up50/up100/up200 folded in unannounced), then the stage still
+ * ahead — so a reader can tell "the +200% notice was lost" from "there was
+ * never a check while the price was between +100% and +200%". A card that
+ * crossed exactly one stage reads exactly as it always did.
+ */
+export function risingCardTail(crossed: readonly number[], nextStage: number | null): string {
+  const parts: string[] = [];
+  if (crossed.length > 1) parts.push(`一次檢查內跨越 +${crossed.join("%/+")}%`);
+  parts.push(nextStage !== null ? `下一關 +${nextStage}%` : "已達最高里程碑");
+  return ` | ${parts.join(" | ")}`;
+}
 /**
  * Grace window for the self-heal's first-card resend: a claim newer than
  * this without an initial-audit entry is treated as "isolate died before
@@ -1364,10 +1394,17 @@ export function evaluateWatch(
             ? `${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1`
             : "—";
         const nextStage = i + 1 < RISING_STAGES.length ? RISING_STAGES[i + 1] : null;
+        // Which stages THIS card is the first announcement for. More than one
+        // = the ladder was crossed between two checks, and the card says so
+        // (see risingCardTail): the mark loop below would otherwise fold them
+        // in silently, which reads from the chat as "the +200% notice was
+        // lost". Live 2026-09-25 06:49 HKT: parafactual was pushed at
+        // 115_199, troughed at 71_254, and was next seen at +473%.
+        const crossed = newlyCrossedStages(stage, firedStages);
         fire(
           "rising",
           `🚀 續漲 ${symbol} | 推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
-            (nextStage ? ` | 下一關 +${nextStage}%` : " | 已達最高里程碑"),
+            risingCardTail(crossed, nextStage),
           state,
         );
         // EVERY crossed stage is marked, not just this one. The memory walk

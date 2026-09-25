@@ -5216,8 +5216,27 @@ export default {
     // Telegram's message_id — answers "was the card actually sent?" with
     // hard evidence instead of inference (XST / GLITCH reports).
     if (url.pathname === "/debug/push-audit") {
+      // ?token= (mint or a prefix), ?since= (epoch ms) and ?limit= turn the
+      // ring into the ONE answer a "I never got the +200% notice" report
+      // needs: WHICH of this coin's cards went out, and when. Read whole it
+      // was minutes of history shared by every chat — live 2026-09-25,
+      // parafactual's up400 card was its only surviving entry (see
+      // PUSH_AUDIT_MAX in src/db.ts, raised to 200 by the same change).
       const rows = (await db?.getPushAudit()) ?? [];
-      return Response.json({ ok: true, count: rows.length, rows });
+      const token = url.searchParams.get("token");
+      const since = Number(url.searchParams.get("since") ?? 0) || 0;
+      const limit = Number(url.searchParams.get("limit") ?? 0) || 0;
+      const matching = rows.filter(
+        (r) =>
+          (!token || r.token === token || r.token.startsWith(token)) &&
+          (since === 0 || r.at >= since),
+      );
+      return Response.json({
+        ok: true,
+        count: limit > 0 ? Math.min(limit, matching.length) : matching.length,
+        total: rows.length,
+        rows: limit > 0 ? matching.slice(-limit) : matching,
+      });
     }
 
     // Push history — read-only distribution of seen_tokens for diagnosing

@@ -428,6 +428,13 @@ export interface ScheduledTickEntry {
 }
 
 export class Db {
+  /**
+   * Entries kept in the shared delivery ring (see recordPushDelivery).
+   * Bounded by what a worker_state JSON value can carry comfortably (~30KB)
+   * and by the hours a "which of this coin's cards went out?" question
+   * spans.
+   */
+  private static readonly PUSH_AUDIT_MAX = 200;
   private client: Client | null = null;
   private readonly url: string;
   private readonly authToken?: string;
@@ -2474,7 +2481,14 @@ export class Db {
       list = [];
     }
     list.push({ ...entry, at: Date.now() });
-    if (list.length > 30) list = list.slice(-30);
+    // 200, not 30: this ONE row is shared by every chat and every card kind,
+    // so on a busy day a 30-entry ring covered minutes — and the question it
+    // exists to answer ("did coin X get its +200% card an hour ago?") spans
+    // hours. Live 2026-09-25: parafactual's up400 card was the ring's only
+    // entry for the token, with its earlier stages long rolled out. The
+    // readers that only need INITIAL cards (hasInitialPushAudit /
+    // getInitialPushAuditTokens) are strictly better off with a wider window.
+    if (list.length > Db.PUSH_AUDIT_MAX) list = list.slice(-Db.PUSH_AUDIT_MAX);
     await this.setWorkerState("push_audit", JSON.stringify(list));
   }
 

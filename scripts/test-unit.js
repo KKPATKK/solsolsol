@@ -19,7 +19,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
@@ -7356,6 +7356,39 @@ async function main() {
     assert.match(r3.alerts[0].text, /續漲 GOAT/);
     assert.match(r3.alerts[0].text, /\+120%/);
     assert.equal(r3.lastState, "up100");
+
+    // THE PARAFACTUAL CASE (live 2026-09-25 06:49 HKT): pushed at 115_199,
+    // troughed at 71_254 (under the push price), and next SEEN at +473% — so
+    // the whole ladder was crossed between two checks. ONE card is correct
+    // (four cards for one move was the old POPEYE bug), but it has to name
+    // what it swallowed, or the +200%/+400% notices read as lost.
+    const gap = evaluateWatch(row(), 3600_000, live(286_500), cfg);
+    assert.equal(gap.alerts.length, 1, "one card per crossing, however many stages it spans");
+    assert.equal(gap.alerts[0].sig, "up400");
+    assert.match(
+      gap.alerts[0].text,
+      /一次檢查內跨越 \+50%\/\+100%\/\+200%\/\+400%/,
+      "the card names every stage it crossed",
+    );
+    assert.match(gap.alerts[0].text, /已達最高里程碑/);
+    // The marks still fold (that is what stops the descending re-announce),
+    // and the card is what tells the reader they were crossed together.
+    assert.equal(gap.announcedUpStages, "up100,up200,up400,up50");
+  });
+
+  await test("risingCardTail: one stage crossed reads exactly as before; several are named", () => {
+    assert.equal(risingCardTail([400], null), " | 已達最高里程碑");
+    assert.equal(risingCardTail([100], 200), " | 下一關 +200%");
+    assert.equal(
+      risingCardTail([50, 100, 200, 400], null),
+      " | 一次檢查內跨越 +50%/+100%/+200%/+400% | 已達最高里程碑",
+    );
+    assert.equal(risingCardTail([50, 100], 200), " | 一次檢查內跨越 +50%/+100% | 下一關 +200%");
+    // Only stages the row does NOT already mark are "crossed": a marked stage
+    // is history, not a swallow.
+    assert.deepEqual(newlyCrossedStages(400, new Set(["up50", "up100"])), [200, 400]);
+    assert.deepEqual(newlyCrossedStages(200, new Set(["up50", "up100", "up200"])), []);
+    assert.deepEqual(newlyCrossedStages(50, new Set(["w35", "up400"])), [50]);
   });
 
   await test("evaluateWatch: weak, dead stops tracking, liquidity crash, holder growth", () => {
@@ -9690,7 +9723,7 @@ async function main() {
     } finally { t.cleanup(); }
   });
 
-  await test("push delivery audit ring records message_id and caps at 30", async () => {
+  await test("push delivery audit ring records message_id and caps at PUSH_AUDIT_MAX (200)", async () => {
     const t = tmpDb();
     try {
       const db = new Db(t.p, undefined, t.client);
@@ -9703,14 +9736,17 @@ async function main() {
       assert.equal(audit[0].messageId, 111);
       assert.equal(audit[1].messageId, 222);
       assert.equal(audit[1].symbol, "GLITCH");
-      // Ring cap: oldest entries fall off, newest survive.
-      for (let i = 0; i < 35; i++) {
+      // Ring cap: oldest entries fall off, newest survive. 205 pushes past a
+      // 200-entry window the way a busy day does.
+      for (let i = 0; i < 205; i++) {
         await db.recordPushDelivery({ chatId: "c1", token: `M${i}`, symbol: null, messageId: i });
       }
       audit = await db.getPushAudit();
-      assert.equal(audit.length, 30);
-      assert.equal(audit[audit.length - 1].token, "M34");
+      assert.equal(audit.length, 200);
+      assert.equal(audit[audit.length - 1].token, "M204");
       assert.ok(!audit.some((r) => r.token === "XSTMINT"), "oldest entry evicted");
+      assert.ok(!audit.some((r) => r.token === "GLITCHMINT"), "so is the second");
+      assert.equal(audit[0].token, "M5", "the window is the LAST 200, not the first");
     } finally { t.cleanup(); }
   });
 
