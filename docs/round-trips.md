@@ -1036,3 +1036,30 @@ settled", pending 20}`），而 starvation 散嗰刻 `summary.writeDrain.pending
 UPDATE ⇒ 一次 ~30）令個 tick 貼住 50，drain 只係最尖、最冇產品價值嗰段。要再收窄就要
 **減 round trip**：把 row loop 嘅 claim/check 合併成一個 `batch()`（30 → 1–2），或者喺
 scan 側先留配額（scanner 現時完全唔讀 `subreqRemaining`）。
+
+### 4.10 被拒嘅 note：pass 自己嘅讀數要留在記憶體（2026-09-25）
+
+**Live（02:56–03:0xZ，第二次同類事件）**：`pushWatchPass {phase:"running", note:"running",
+trackerMs:0}` 卡住 60s+（下一個 tick 又開一個新 pass，所以個 record 永遠停在 running），
+row 新鮮度 `fresh 0/31 → 1/30`（輪替真係停咗，唔係慢）。但個 tick 本身健康：
+`tickProgress {stage postscan, ms 2530, subreqs 10}`、心跳 `done`、`dex http429 0`、
+`subreqs current 10–16`；drain 亦冇新失敗（`writeDrainErrorAgeMin 172`）⇒ 唔係 §4.9 嘅
+subrequest 撞頂，又唔係 feed —— 最可能係 Turso 3,000ms hard wall 落喺 pass 自己嘅 stage。
+
+**點解完全冇證據**：pass 開頭寫 `running`、**最後一步**才寫最終 note，所以被殺 = 永遠
+`running`；而 pass 內部每個 DB stage 都已經係「失敗就算」（listing、recap claim、
+silent batch），失敗只會變成 `claimLost` 一個數字，而嗰個數字只喺最後嗰個 note 度出現
+—— 即係喺**寫唔入**嗰個寫入度。
+
+**修正**（`docs/patches/tracker-pass-pulse.apply.js`）：`trackerPassPulse()`
+（pushwatch.ts，module memory，**零 DB 寫入**）記住最後一個 pass 嘅
+`{at, doneAt, stage, checked, alerted, claimLost, note}`：pass 開頭、row loop 之後、pass
+結尾三個時點更新，而 `stage` 跟住 pass 自己嘅標籤**每個** stage 都更新（所以死喺邊個
+stage 一定報得到）。worker 每個 tick 嘅 heartbeat summary 加
+`pushWatchLive`（讀數）同 `pushWatchFail`（worker 自己 catch 到嘅 throw，連 message 同
+當時嘅讀數）⇒ 一條 `/health` 就答得到「pass 有冇行完（`doneAt`）、停喺邊個 stage、
+checked／claimLost 幾多」，即使 DB 嗰刻寫唔入任何嘢。
+
+**留心兩點**：pulse 喺**下一個** tick 才上 heartbeat（summary 係 pass 之前砌），即係最多
+遲一個 tick；而 row loop 嘅計數係 loop **返嚟**才發佈，所以喺 loop 中途被殺嘅 pass 只會報
+`stage: rows / doneAt: null / checked: 0` —— 輪替行到幾遠，睇 durable row 嘅 `fresh` 就夠。

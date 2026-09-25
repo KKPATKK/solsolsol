@@ -415,6 +415,72 @@ const TRACKER_PAIRS_BUDGET_MS = 1_200;
  * single probe slot can go to.
  */
 export const TRACKER_PAIR_HEAD = 30;
+
+/**
+ * The LAST pass's own account of itself, kept in MODULE MEMORY and nowhere
+ * else (see trackerPassPulse).
+ *
+ * WHY memory: a pass that is killed mid-flight leaves its durable coverage row
+ * (PUSH_WATCH_PASS_KEY) reading `running` — the row is written at the pass's
+ * start and only overwritten at its very end — and every failure INSIDE the pass
+ * is already swallowed by a stage-local catch (the listing, the recap claim and
+ * the silent-row batch all fail soft). So during a database episode the durable
+ * record cannot say what happened: the reason travels as a count (`claimLost`)
+ * that only ever lands in the final note, i.e. in the write that just failed.
+ * Live 2026-09-25: 60s+ of `phase: running` with rows going stale while the tick
+ * itself was healthy (`postscan 2530ms`, 10 subrequests, no feed 429s).
+ *
+ * WHY these fields: they are the three questions the durable row could not
+ * answer — did the pass FINISH (`doneAt`), WHERE did it stop (`stage`), and did
+ * the rotation actually move (`checked`, `claimLost`). Read by the worker's
+ * heartbeat summary as `pushWatchLive`, so one /health request carries it.
+ */
+export interface TrackerPassPulse {
+  /** When the pass started (epoch ms). */
+  at: number;
+  /** When it returned, or null while it is in flight (or was killed). */
+  doneAt: number | null;
+  /** The pass's stage name: entry / setup / settle / heal / rows / holders. */
+  stage: string;
+  /** Rows evaluated so far (final once doneAt is set). */
+  checked: number;
+  /** Rows whose transition produced a card (final once doneAt is set). */
+  alerted: number;
+  /**
+   * Rows the claim batch did NOT win — a cross-isolate race OR a batch that
+   * failed outright. A pass that ends with `checked 0` and a large `claimLost`
+   * is a database refusing its writes, not a rotation with nothing to do.
+   */
+  claimLost: number;
+  /** The coverage note, once the pass returns (null while in flight). */
+  note: string | null;
+}
+
+let passPulse: TrackerPassPulse | null = null;
+
+/** The last pass's pulse, or null before this isolate has run one. */
+export function trackerPassPulse(): TrackerPassPulse | null {
+  return passPulse === null ? null : { ...passPulse };
+}
+
+/** Start a pulse (the pass's first act, next to `passStage = "entry"`). */
+function beginPassPulse(at: number): void {
+  passPulse = {
+    at,
+    doneAt: null,
+    stage: "entry",
+    checked: 0,
+    alerted: 0,
+    claimLost: 0,
+    note: null,
+  };
+}
+
+/** Update the pulse in place; a no-op when no pass has started. */
+function notePassPulse(fields: Partial<TrackerPassPulse>): void {
+  if (passPulse === null) return;
+  passPulse = { ...passPulse, ...fields };
+}
 /**
  * Age past which a row the tracker has NEVER evaluated is treated as a
  * BACKFILL instead of a live follow-up: its push is older than the alert
@@ -2124,6 +2190,9 @@ export class PushWatcher {
     this.subreqProbe = typeof subreqLeft === "function" ? subreqLeft : null;
     const cfg = this.config.pushWatch;
     const now = Date.now();
+    // Open the pulse the worker reads (trackerPassPulse) on the same clock the
+    // pass itself runs on: it survives a database that cannot take the note.
+    beginPassPulse(now);
     const budgetMs =
       typeof deadlineMs === "number" && Number.isFinite(deadlineMs)
         ? Math.max(0, Math.min(TRACKER_TICK_BUDGET_MS, deadlineMs - now))
@@ -2277,6 +2346,7 @@ export class PushWatcher {
     // having measured nothing.
     if (outOfBudget()) return deferred;
     this.passStage = "setup";
+    notePassPulse({ stage: "setup" });
     // Case-closed recaps: every coin leaving the window gets ONE summary
     // card before the bulk prune deletes it. Best-effort send — a failed
     // delivery must never keep a dead row alive forever.
@@ -2375,6 +2445,7 @@ export class PushWatcher {
     // Early in the pass on purpose: the re-armed row has its last_checked
     // zeroed, so it takes the front of the next rotation.
     this.passStage = "settle";
+    notePassPulse({ stage: "settle" });
     const settle = await this.settleUnconfirmedCards(now);
     trips += settle.trips;
     const rearmedCards = settle.rearmed;
@@ -2389,6 +2460,7 @@ export class PushWatcher {
     // "from tracking start". Extra DexScreener call only when something is
     // actually missing; a no-pair coin retries on the next tick.
     this.passStage = "heal";
+    notePassPulse({ stage: "heal" });
     const healStart = Date.now();
     const healTrips = trips;
     // The heal's slice: its own cap, and never past the rotation's reserve
@@ -2684,6 +2756,7 @@ export class PushWatcher {
     // this tick simply join the rotation on the next one. The table is read
     // again ONLY when the listing failed (nothing to reuse).
     this.passStage = "rows";
+    notePassPulse({ stage: "rows" });
     const rows: PushWatchRow[] =
       snapshot !== null
         ? snapshot.filter((r) => r.pushedAt >= windowCutoff)
@@ -3622,6 +3695,7 @@ export class PushWatcher {
         if (s.backfill) backfilled += 1;
       });
     }
+    notePassPulse({ stage: "rows", checked, alerted, claimLost });
     spent.rows.ms = Date.now() - rowsStart;
     spent.rows.trips = trips - rowsTrips;
 
@@ -3649,6 +3723,7 @@ export class PushWatcher {
     // due rows this pass got no count out of (no room to start their probe, or —
     // only when the timers were starved — a probe still in flight).
     this.passStage = "holders";
+    notePassPulse({ stage: "holders" });
     const holdersStart = Date.now();
     const holdersTrips = trips;
     if (holderProbePending.length > 0) {
@@ -3723,6 +3798,16 @@ export class PushWatcher {
       `${subreqCut > 0 ? ` subreq-cut ${subreqCut}` : ""} ` +
       `${stageNote()} trips ${trips}`;
 
+    // The pulse closes with the same numbers the note carries, but without a
+    // round trip: this is the reading a database episode cannot take away.
+    notePassPulse({
+      doneAt: Date.now(),
+      stage: this.passStage ?? "done",
+      checked,
+      alerted,
+      claimLost,
+      note,
+    });
     return {
       checked,
       alerted,

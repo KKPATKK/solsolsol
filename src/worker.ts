@@ -69,6 +69,7 @@ import {
   pushWatchHealStats,
   revivedBaseline,
   terminalRowIssues,
+  trackerPassPulse,
   terminalRowRepair,
 } from "./pushwatch";
 import { JupTokensClient } from "./jupfeeds";
@@ -1224,6 +1225,25 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * room for a new tail stage — the tail IS what is left after the flush.
  */
 export const SCAN_TICK_BUDGET_MS = 9_500;
+
+/**
+ * The last tracker pass that THREW, with the isolate's own pulse of what it
+ * had managed to do (see trackerPassPulse in pushwatch.ts).
+ *
+ * WHY it is module state and not a durable row: the pass writes its coverage
+ * row twice — `running` at the start, the note at the very end — so a pass
+ * that is killed mid-flight (or whose final write the database refuses) leaves
+ * a durable record that says `running` forever. Live 2026-09-25: 60s+ of
+ * `phase: running` with the rotation stalled while the tick itself was healthy.
+ * The heartbeat summary carries this on the NEXT tick (the summary is built
+ * before the pass runs), which is enough for a single /health read to name the
+ * stage and the counters instead of a bare `running`.
+ */
+let trackerPassFailure: {
+  at: number;
+  message: string;
+  live: ReturnType<typeof trackerPassPulse>;
+} | null = null;
 /**
  * Wall-clock slice, taken at the END of a tick, for ONE post-push tracker
  * pass (see Scanner.runTrackerPass and pushwatch.TRACKER_TICK_BUDGET_MS).
@@ -2751,6 +2771,13 @@ async function ensureInitialized(env: Env): Promise<void> {
             // Describes the drain that ran after the PREVIOUS tick: the
             // summary is serialized before this tick's own drain starts.
             view.writeDrain = writeDrainView();
+            // The tracker's own account of its last pass, and the last failure
+            // the worker itself caught. Both are MODULE state on purpose: the
+            // pass's durable coverage row reads `running` for a pass that was
+            // killed, and the write that would have said why is the one the
+            // database just refused (live 2026-09-25).
+            view.pushWatchLive = trackerPassPulse();
+            view.pushWatchFail = trackerPassFailure;
             // Fire the drain WITHOUT awaiting it: the tick's budget is done
             // with these writes (that is the whole point of deferring them),
             // so the invocation tail must not pay for them either. The queue
@@ -3474,11 +3501,19 @@ async function runScan(
             // own reserve for those tail writes.
             subreqRemaining,
           );
+          // The pass returned: its rotation ran, so the last failure is history.
+          trackerPassFailure = null;
         } catch (err) {
-          console.error(
-            "[worker] tracker pass failed:",
-            err instanceof Error ? err.message : err,
-          );
+          // A pass can also be killed mid-flight (no catch ever runs), which is
+          // why the pulse below rides EVERY heartbeat: it carries the stage and
+          // the counters of whatever the last attempt managed to do.
+          const message = err instanceof Error ? err.message : String(err);
+          trackerPassFailure = {
+            at: Date.now(),
+            message: message.slice(0, 200),
+            live: trackerPassPulse(),
+          };
+          console.error("[worker] tracker pass failed:", message);
         }
       } else if (scanner) {
         // No room for a pass this tick (a cut tick spends its whole envelope

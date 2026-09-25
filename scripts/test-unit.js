@@ -19,7 +19,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, baseMarkFor, revivedBaseline } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
@@ -1111,6 +1111,63 @@ async function main() {
     const failed = await offline.runTrackerPass(Date.now() + 2_500);
     assert.equal(failed, null, "a refused write does not turn a pass failure into a tick failure");
     assert.match(String(offline.pushWatchNote), /\[rows subreq 0\]$/, "and the diagnostic is still carried");
+  });
+
+  await test("PushWatcher: the pass publishes its own pulse, without a trip to the note row", async () => {
+    // WHY (live 2026-09-25 02:56Z): /health's durable pass row read `phase:
+    // running` for 60s+ while the rotation stalled (`fresh 0/31 -> 1/30`) and the
+    // tick itself was healthy — `postscan 2530ms`, 10 subrequests, no 429s, no new
+    // drain error. The row is written at the pass's START and overwritten only at
+    // its very END, and every failure INSIDE the pass is already swallowed (the
+    // listing, the recap claim and the silent-row batch all fail soft), so during a
+    // database episode the one record that could have said what happened is the
+    // write that just failed. The pulse is that reading: module memory, no round
+    // trip, published on every heartbeat.
+    const db = termDb([termRow({ token: "PULSE", symbol: "PULSE" })]);
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    // The suite has run passes before this one, so the pulse is compared with
+    // the PREVIOUS pass rather than with null: what matters is that this pass
+    // opened its own, not that the module started empty (module state is
+    // isolate state, and this file is one isolate).
+    const before = trackerPassPulse();
+    assert.ok(before === null || typeof before.at === "number", "whatever was there came from an earlier pass");
+    const out = await pw.runTick(Date.now() + 5_000);
+    const live = trackerPassPulse();
+    assert.ok(before === null || live.at >= before.at, "the pass opens its own pulse instead of amending the last one");
+    assert.equal(typeof live.at, "number", "the pass is stamped with the clock it ran on");
+    assert.equal(typeof live.doneAt, "number", "doneAt is the field that separates a pass which RETURNED from a killed one");
+    assert.ok(live.doneAt >= live.at, "and it cannot precede the pass");
+    assert.match(live.stage, /^(entry|setup|settle|heal|rows|holders)$/, "the stage is one the pass really names");
+    assert.equal(live.note, out.note, "the pulse carries the same note the durable row was handed");
+    assert.equal(live.checked, out.checked, "and the counters the note reads back");
+    assert.equal(live.alerted, out.alerted);
+    assert.equal(live.claimLost, 0, "a healthy claim batch loses nothing");
+    // A copy, not the module's own object: the reader is the worker's heartbeat,
+    // and no reader may be able to write the next pass's state.
+    live.checked = 999;
+    assert.equal(trackerPassPulse().checked, out.checked, "reader mutations never reach the pulse");
+  });
+
+  await test("PushWatcher: a pass that DIES leaves its pulse open, naming the stage it died in", async () => {
+    // The killed-pass shape: `doneAt` null (it never returned) with the stage it
+    // died in — the two readings the durable row cannot give, because the row's
+    // `running` stamp is written before the pass does any work and the note is the
+    // write the database just refused. The worker's own catch adds the message
+    // (pushWatchFail); this half is the pass's account of itself.
+    const db = termDb([termRow()]);
+    db.claimPushWatch = async () => {
+      throw new Error("Too many subrequests by single Worker invocation");
+    };
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    await assert.rejects(() => pw.runTick(Date.now() + 5_000), /Too many subrequests/);
+    const live = trackerPassPulse();
+    assert.equal(live.doneAt, null, "no doneAt: the pass was killed, it did not finish");
+    assert.equal(live.stage, "rows", "the stage it died in is the last one the pass named");
+    assert.equal(live.note, null, "and the note never landed — which is exactly why the pulse exists");
+    // The row counters are published when the LOOP RETURNS, so a death inside the
+    // loop honestly reports zero: how far the rotation got is the durable row's own
+    // `fresh` count, not this.
+    assert.equal(live.checked, 0);
   });
 
   await test("PushWatcher: passDiag is silent before any pass has run", () => {
@@ -11463,6 +11520,44 @@ async function main() {
       missing.length,
       0,
       `partial paste of docs/patches/tracker-subreq-budget.apply.js — missing: ${missing.join(", ")}`,
+    );
+  });
+
+  await test("out-of-window patch: the tracker's pulse survives a refused note write (docs/patches/tracker-pass-pulse.apply.js)", async () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const workerSrc = read("src/worker.ts");
+    const applied = {
+      "pushwatch (the pulse exists)": pushwatchSrc.includes("exportfunctiontrackerPassPulse():TrackerPassPulse|null{"),
+      "pushwatch (a pass opens its own pulse)": pushwatchSrc.split("beginPassPulse(now);").length - 1 === 1,
+      "pushwatch (the row loop reports what it managed)": pushwatchSrc.includes('notePassPulse({stage:"rows",checked,alerted,claimLost});spent.rows.ms=Date.now()-rowsStart;'),
+      "pushwatch (and the pass closes it with its note)": pushwatchSrc.includes('notePassPulse({doneAt:Date.now(),stage:this.passStage??"done",'),
+      "worker (the pulse is importable)": workerSrc.includes("terminalRowIssues,trackerPassPulse,"),
+      "worker (the failure carries the pulse's last reading)": workerSrc.includes("live:trackerPassPulse(),"),
+      "worker (a returned pass clears the last failure)": workerSrc.includes("trackerPassFailure=null;"),
+      "worker (the heartbeat carries both)": workerSrc.includes(
+        "view.pushWatchLive=trackerPassPulse();view.pushWatchFail=trackerPassFailure;",
+      ),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  ℹ tracker pass pulse missing - apply docs/patches/tracker-pass-pulse.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    // A half-wired pulse reads as a healthy pass: the heartbeat would publish a
+    // reading nobody updates, and the failure record a message with no stage.
+    assert.equal(
+      missing.length,
+      0,
+      `partial paste of docs/patches/tracker-pass-pulse.apply.js — missing: ${missing.join(", ")}`,
     );
   });
 
