@@ -263,17 +263,17 @@ export interface TokenStats {
   /** Sniper buy share of supply in percent from Birdeye (null = unknown). */
   birdeyeSniperPct: number | null;
   /**
-   * Holder count from Birdeye's token_overview — the card's holders line —
-   * and when it was READ (epoch ms). A SHARED cache, not a card-side field:
-   * both places that buy this coin's reading write it here — the card path
-   * (Scanner.resolveHolderCount, because a tick that defers a card or a gate
-   * that rejects it again re-enters the enrich batch and used to buy the same
-   * number over and over) and the tracker's holder probe
-   * (Db.setPushWatchHoldersMany, because a coin is tracked right after it was
-   * pushed, i.e. moments after the card path bought it). Readers reuse a
-   * reading inside BIRDEYE_HOLDER_CACHE_MIN (see docs/round-trips.md §4.15 /
-   * §4.16). Null = never read; `holderCountAt` 0/null means the same thing as
-   * `holderCount` null.
+   * Holder count from Birdeye's token_overview and when it was READ (epoch
+   * ms). §4.15/§4.16 added these as a SHARED cache: both buyers of a coin's
+   * reading — the card path's enrich batch and the tracker's holder probe —
+   * wrote it here and a reader reused one inside BIRDEYE_HOLDER_CACHE_MIN.
+   *
+   * §4.17 (2026-09-25) retired both ends: the card's holders line is gone (its
+   * number already rides the free Axiom summary), so nothing buys or reads
+   * this cache any more. The columns stay declared — a stale row must not turn
+   * into a schema question — and the tracker keeps its own per-row reading in
+   * `push_watch` (holders_at_push / holders_last). Null = never read;
+   * `holderCountAt` 0/null means the same thing as `holderCount` null.
    */
   holderCount?: number | null;
   holderCountAt?: number | null;
@@ -957,17 +957,15 @@ export class Db {
    * (see the holder stage in src/pushwatch.ts), the same state a row whose own
    * write failed used to reach.
    *
-   * The SAME reading also lands in the shared holder cache (token_stats.
-   * holder_count / holder_count_at — the row the card path reads, see
-   * BIRDEYE_HOLDER_CACHE_MIN), and in the SAME request. The two writers of
-   * that cache (this one and Scanner.resolveHolderCount) are the two places
-   * the same coin's `/defi/token_overview` is bought, so a coin tracked right
-   * after it was pushed was paying for one reading twice; with the probe's
-   * count in the cache the card side reuses it instead (docs/round-trips.md
-   * §4.16). Riding this batch is deliberate, not incidental: the row's own
-   * holder field and the shared cache can then never disagree about what was
-   * read — a rejected request wrote NEITHER — and the round-trip count this
-   * method exists to keep at one is unchanged.
+   * 2026-09-25 (§4.17): this batch ALSO wrote the shared holder cache
+   * (token_stats.holder_count / holder_count_at) so the card side could reuse
+   * the probe's reading instead of buying its own (§4.16). That reader is gone
+   * — the card's holders line was removed, and with it the only
+   * `/defi/token_overview` the card path ever bought — so the statements went
+   * with it. A cache nobody reads must not keep a second UPDATE per row inside
+   * the one request this method exists to keep at one; the row's own
+   * `holders_at_push` / `holders_last` (what the growth and divergence alerts
+   * are computed from) is unchanged.
    */
   async setPushWatchHoldersMany(
     updates: Array<{ token: string; holders: number; at: number }>,
@@ -981,10 +979,6 @@ export class Db {
                   holders_last = ?, holders_checked_at = ?
                 WHERE token = ?`,
           args: [u.holders, u.holders, u.at, u.token],
-        })),
-        ...updates.map((u) => ({
-          sql: "UPDATE token_stats SET holder_count = ?, holder_count_at = ? WHERE token = ?",
-          args: [u.holders, u.at, u.token],
         })),
       ],
       "write",
@@ -1625,17 +1619,14 @@ export class Db {
     // Feed attribution: which discovery feed first registered each coin
     // (per-feed quality stats). Unconditional — idempotent.
     await this.addColumnIfMissing("token_stats", "discovered_via", "TEXT");
-    // Durable holder-count cache (2026-09-25): the last count BOUGHT from
-    // Birdeye's token_overview, plus when it was read. Both buyers of a
-    // coin's reading write it — the card path (whose enrich batch the same
-    // coin re-enters on every tick it is neither pushed nor rejected, buying
-    // the same 20 CU request over and over) and the tracker's holder probe (a
-    // coin is tracked moments after it was pushed, i.e. right after the card
-    // path paid for that very reading). These two columns let either one
-    // reuse the reading for BIRDEYE_HOLDER_CACHE_MIN instead (see
-    // docs/round-trips.md §4.15 / §4.16). They ride the pool read
-    // (`SELECT *`), so a cache hit costs no round trip of its own.
-    // Unconditional — idempotent.
+    // Holder-count cache columns (2026-09-25): the last count BOUGHT from
+    // Birdeye's token_overview and when it was read. §4.15/§4.16 added them
+    // for a SHARED cache (the card's enrich and the tracker's holder probe
+    // both wrote it, reused inside BIRDEYE_HOLDER_CACHE_MIN); §4.17 retired
+    // BOTH ends together with the card's holders line, so nothing reads or
+    // writes them today. The columns stay declared — a stale row must not
+    // become a schema question — and the tracker keeps its own reading in
+    // `push_watch`. Unconditional — idempotent.
     await this.addColumnIfMissing("token_stats", "holder_count", "INTEGER");
     await this.addColumnIfMissing("token_stats", "holder_count_at", "INTEGER");
     // v4: min_1h_chg_pct — the compound momentum gate's 1-hour leg (chat
@@ -4145,28 +4136,6 @@ export class Db {
     await this.get().execute({
       sql: "UPDATE token_stats SET birdeye_sniper_pct = ? WHERE token = ?",
       args: [sniperPct, token],
-    });
-  }
-
-  /**
-   * Remember the holder count the card path just bought (see TokenStats.
-   * holderCount), so the same coin's next enrichment can reuse it inside
-   * BIRDEYE_HOLDER_CACHE_MIN instead of paying another 20 CU for it.
-   *
-   * ONE round trip, and only after a request that actually returned a count —
-   * a cache miss with no write behind it would re-buy on the very next tick.
-   * The caller (Scanner.resolveHolderCount) treats a failed write as a lost
-   * cache entry, never as a lost reading: an extra request later is cheap, a
-   * card that shows "—" because the bookkeeping threw is not.
-   */
-  async updateTokenHolderCount(
-    token: string,
-    holderCount: number,
-    at: number,
-  ): Promise<void> {
-    await this.get().execute({
-      sql: "UPDATE token_stats SET holder_count = ?, holder_count_at = ? WHERE token = ?",
-      args: [holderCount, at, token],
     });
   }
 

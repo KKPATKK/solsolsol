@@ -30,7 +30,7 @@ const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUser
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
-const { parseTokenOverview, BIRDEYE_CU_PRICES, BIRDEYE_CU_LEDGER_DAYS, birdeyeUtcDay, chargeBirdeyeCu, peekBirdeyeCuDelta, consumeBirdeyeCuDelta, peekBirdeyeCuByDay, consumeBirdeyeCuByDay, holderCountCacheHit } = require("../dist/birdeye.js");
+const { parseTokenOverview, BIRDEYE_CU_PRICES, BIRDEYE_CU_LEDGER_DAYS, birdeyeUtcDay, chargeBirdeyeCu, peekBirdeyeCuDelta, consumeBirdeyeCuDelta, peekBirdeyeCuByDay, consumeBirdeyeCuByDay } = require("../dist/birdeye.js");
 const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
 const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
@@ -11585,92 +11585,21 @@ async function main() {
       "newest first, and the limit is a limit",
     );
   });
-  // ---------- the card side stops re-buying its holder count (birdeye + db) ----------
+  // ---------- the card path stops buying Birdeye outright (§4.17) ----------
   //
-  // §4.14's measurement: the card path (`resolveHolderCount` → one
-  // /defi/token_overview, 20 CU) was ≥60% of a 46K CU/month run rate while the
-  // holder probe was ≤21-36% — which is why the probe gap could not be narrowed
-  // before this. The repeat is not per card, it is per ENRICH: the same coin
-  // re-enters the enrich batch on every tick it is neither pushed nor finally
-  // rejected (a card send deferred by the tick cut, a gate that rejects this
-  // tick and passes the next), and each entry used to buy the same reading
-  // again. The rule is a durable per-coin reading (token_stats.holder_count /
-  // holder_count_at) reused for BIRDEYE_HOLDER_CACHE_MIN.
-  await test("birdeye: the holder cache reuses a reading inside its TTL and never invents one", () => {
-    const now = 1_000_000_000;
-    const ttl = 30 * 60_000;
-    assert.equal(holderCountCacheHit(622, now - ttl + 1, now, ttl), true, "one ms inside the window");
-    // The boundary is a MISS: an expired reading must be re-bought, never kept
-    // for one more tick by an off-by-one.
-    assert.equal(holderCountCacheHit(622, now - ttl, now, ttl), false, "the TTL is exclusive");
-    assert.equal(holderCountCacheHit(622, now + 5_000, now, ttl), true, "clock skew never expires a fresh reading");
-    assert.equal(holderCountCacheHit(622, now - 1, now, 0), false, "0 = the knob off: always read");
-    // UNKNOWN is not a reading: a row nobody has read must not be reused as if
-    // it were one, and 0 on the stamp is the 'never written' sentinel rather
-    // than 1970 (the rule healthAgeMs follows for the frozen readings).
-    assert.equal(holderCountCacheHit(null, now - 1, now, ttl), false, "no count = no hit");
-    assert.equal(holderCountCacheHit(622, null, now, ttl), false, "no stamp = no hit");
-    assert.equal(holderCountCacheHit(622, 0, now, ttl), false, "0 is never-written, not the epoch");
-  });
-
-  await test("db: the holder cache is ONE write, and a coin nobody read stays unknown", async () => {
-    const t = tmpDb();
-    const at = Date.UTC(2026, 8, 25, 9, 30, 0);
-    try {
-      const db = new Db(t.p, undefined, t.client);
-      await db.init();
-      await db.recordTokenStatsMany([
-        {
-          token: "HOLDER1",
-          firstSeenAt: at,
-          firstM5Vol: 0,
-          firstSeenAgeMin: 200,
-          launchMs: at - 200 * 60_000,
-          birdeye1mVol: null,
-          rugcheckBundlerPct: null,
-          rugcheckTop10Pct: null,
-          birdeyeProTraders: null,
-          birdeyeSniperPct: null,
-          minMcapObserved: null,
-          supplyFlowJson: null,
-          supplyFlowAt: null,
-          discoveredVia: "dex",
-        },
-      ]);
-      // A fresh database carries both columns from CREATE TABLE, so this needs
-      // no ALTER — and a coin nobody has read reports UNKNOWN, not 0 holders:
-      // an invented 0 would be a claim the card never earned.
-      const cold = await db.getTokenStats("HOLDER1");
-      assert.equal(cold.holderCount, null);
-      assert.equal(cold.holderCountAt, null);
-      let executes = 0;
-      const counting = {
-        execute: (a) => {
-          executes += 1;
-          return t.client.execute(a);
-        },
-        batch: (a, m) => t.client.batch(a, m),
-        close: () => t.client.close(),
-      };
-      const cdb = new Db(t.p, undefined, counting);
-      await cdb.init();
-      executes = 0;
-      await cdb.updateTokenHolderCount("HOLDER1", 622, at);
-      assert.equal(executes, 1, "the count and its stamp land in ONE write");
-      const warm = await cdb.getTokenStats("HOLDER1");
-      assert.equal(warm.holderCount, 622);
-      assert.equal(warm.holderCountAt, at, "the stamp is the reading's own, not now()");
-      // A later reading overwrites the old one (this is a cache, not a log).
-      await cdb.updateTokenHolderCount("HOLDER1", 651, at + 60_000);
-      const next = await cdb.getTokenStats("HOLDER1");
-      assert.equal(next.holderCount, 651);
-      assert.equal(next.holderCountAt, at + 60_000);
-    } finally {
-      await t.cleanup();
-    }
-  });
-
-  await test("out-of-window patch: the card path reads the holder cache BEFORE it buys (docs/patches/holder-cache.apply.js)", () => {
+  // 2026-09-25. §4.14 measured the card path as ≥60% of a 46K CU/month Birdeye
+  // run rate against a 30K free tier; §4.15/§4.16 tried to make the repeat
+  // cheaper (a durable holder cache the tracker's probe could share). The
+  // operator then asked the cruder question — is the LINE worth the endpoint at
+  // all — and the answer was no: the Axiom summary already prints 狙擊 and
+  // 持有人 for free. So both paid card lines are gone, and with them the card
+  // path's only callers of the two endpoints. The endpoints themselves stay
+  // (the tracker's holder probe and /debug/birdeye-overview still buy
+  // token_overview; scripts/test-filters.js still buys top_traders) — what must
+  // never come back is a CARD that pays. The guard reads STRIPPED sources, so
+  // the tombstones this change leaves behind (which name the removed symbols in
+  // comments) cannot satisfy it.
+  await test("out-of-window patch: the card stops buying Birdeye (docs/patches/drop-card-birdeye-lines.apply.js)", () => {
     const strip = (text) =>
       text
         .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -11678,53 +11607,65 @@ async function main() {
         .replace(/\s+/g, "");
     const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
     const scannerSrc = read("src/scanner.ts");
+    const renderSrc = read("src/render.ts");
+    const birdeyeSrc = read("src/birdeye.ts");
     const dbSrc = read("src/db.ts");
-    const testSrc = read("scripts/test-unit.js");
-    const before = (hay, a, b) => {
-      const ia = hay.indexOf(a);
-      const ib = hay.indexOf(b);
-      return ia >= 0 && ib >= 0 && ia < ib;
-    };
+    const configSrc = read("src/config.ts");
+    const testSrc = strip(fs.readFileSync(__filename, "utf8"));
     const applied = {
-      "scanner (the cache decision runs BEFORE the getTokenOverview call)":
-        before(
-          scannerSrc,
-          "holderCountCacheHit(stats.holderCount??null,stats.holderCountAt??null,Date.now(),this.config.birdeyeHolderCacheMs,",
-          "constinfo=awaitthis.birdeye.getTokenOverview(mint);",
-        ),
-      "scanner (a hit returns the cached count, and only a FETCHED one is written back)":
-        scannerSrc.includes("return{holderCount:stats.holderCount??null};") &&
-        scannerSrc.includes("awaitthis.db.updateTokenHolderCount(stats.token,info.holderCount,at);"),
-      // A type-only import would compile and then crash on the first cache hit
-      // (holderCountCacheHit would be undefined) — the one half-paste of this
-      // seam the compiler cannot catch.
-      "scanner (holderCountCacheHit is a VALUE import, not a type import)":
-        scannerSrc.includes('import{holderCountCacheHit,typeBirdeyeClient}from"./birdeye";'),
-      "db (both columns are declared, read and written)":
-        dbSrc.includes("asyncupdateTokenHolderCount(") &&
-        dbSrc.includes("holderCountAt:holderCountAt===null||holderCountAt===undefined?null:Number(holderCountAt),") &&
-        dbSrc.includes('awaitthis.addColumnIfMissing("token_stats","holder_count_at","INTEGER");'),
-      "tests (this guard)": testSrc.includes("holderCountCacheHit(622,now-ttl,now,ttl)"),
+      "scanner (no card-side caller of either paid endpoint is left)":
+        !scannerSrc.includes("resolveTraderData") &&
+        !scannerSrc.includes("resolveHolderCount") &&
+        !scannerSrc.includes("getTraderInfo(") &&
+        !scannerSrc.includes("getTokenOverview("),
+      "scanner (and no reader of the §4.15 cache: its import and dial went too)":
+        !scannerSrc.includes("holderCountCacheHit") &&
+        !scannerSrc.includes("birdeyeHolderCacheMs"),
+      "scanner (the enrich batch is down to the three display-only slots)":
+        scannerSrc.includes("const[gmgn,arkham,organic]=awaitdisplayBatch;") &&
+        scannerSrc.includes("()=>this.resolveGmgnInfo(coin),") &&
+        !scannerSrc.includes("proTraders:coin.stats.birdeyeProTraders,"),
+      "render (the card has no sniper/holders line left to fill)":
+        !renderSrc.includes("sniperLine") &&
+        !renderSrc.includes("holdersLine") &&
+        !renderSrc.includes("Sniper買入") &&
+        !renderSrc.includes("👥Holders:"),
+      "render (the signature dropped both values; the group is Bundler/Top10/flow)":
+        renderSrc.includes("[bundlerLine,top10Line,flowLine]") &&
+        renderSrc.includes("top10Pct:number|null,supplyFlowClean:boolean,creator:string|null,") &&
+        !renderSrc.includes("sniperPct:number|null,") &&
+        !renderSrc.includes("holderCount:number|null,"),
+      "birdeye (the TTL rule is gone; the endpoints are not)":
+        !birdeyeSrc.includes("holderCountCacheHit") &&
+        birdeyeSrc.includes("asyncgetTokenOverview(") &&
+        birdeyeSrc.includes("asyncgetTraderInfo("),
+      "db (the cache's only writer is gone, the probe's own row fields are not)":
+        !dbSrc.includes("asyncupdateTokenHolderCount(") &&
+        !dbSrc.includes("UPDATEtoken_statsSETholder_count=") &&
+        dbSrc.includes("holders_last=?") &&
+        dbSrc.includes("holders_at_push=COALESCE(holders_at_push,?)"),
+      "config (the dial went with the cache it tuned)":
+        !configSrc.includes("birdeyeHolderCacheMs"),
+      "tests (this guard)": testSrc.includes("thecardstopsbuyingBirdeye"),
     };
     const done = Object.entries(applied).filter(([, v]) => v);
     if (done.length === 0) {
       console.log(
-        "  \u2139 the holder-cache patch is missing - apply docs/patches/holder-cache.apply.js",
+        "  \u2139 the card-line removal patch is missing - apply docs/patches/drop-card-birdeye-lines.apply.js",
       );
       return;
     }
     const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
     assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
   });
-  // The other writer: the tracker's holder probe (Db.setPushWatchHoldersMany).
-  //
-  // A coin is tracked moments after it was pushed, and the card path bought its
-  // token_overview at push time — so the probe's first pass for that row used to
-  // buy the same reading again. The probe now writes the reading into the same
-  // durable cache (token_stats.holder_count / holder_count_at) that the card
-  // path reads, IN THE SAME request as the row's own field, so the two can
-  // never disagree about what was read and the round trip count is unchanged.
-  await test("db: the tracker's holder probe shares its reading with the card path, in ONE write", async () => {
+
+  // The behaviour behind that guard: the probe's batch (the one writer of the
+  // per-row holder reading left) is still ONE request and still writes exactly
+  // its own row. §4.16's second half — the token_stats statement that carried
+  // the probe's count into the card-side cache — must NOT be riding along: its
+  // reader is gone, and a statement nobody reads inside a request this method
+  // exists to keep at one is pure weight.
+  await test("db: the holder probe writes its own row and nothing else, in ONE write", async () => {
     const t = tmpDb();
     const at = Date.UTC(2026, 8, 25, 10, 0, 0);
     try {
@@ -11755,57 +11696,34 @@ async function main() {
       const before = (await db.listPushWatch())[0];
       assert.equal(before.holdersLast, null, "the row carries no reading yet");
       let writes = 0;
+      let statements = 0;
       const counting = {
         execute: (a) => t.client.execute(a),
-        batch: (a, m) => { if (m === "write") writes += 1; return t.client.batch(a, m); },
+        batch: (a, m) => { if (m === "write") { writes += 1; statements += a.length; } return t.client.batch(a, m); },
         close: () => t.client.close(),
       };
       const cdb = new Db(t.p, undefined, counting);
       await cdb.init();
       writes = 0;
+      statements = 0;
       await cdb.setPushWatchHoldersMany([{ token: "SHARED1", holders: 700, at }]);
-      assert.equal(writes, 1, "the row and the shared cache land in ONE write");
+      assert.equal(writes, 1, "the probe's counts land in ONE request");
+      assert.equal(statements, 1, "one UPDATE per probed row — §4.16's token_stats statement is gone");
       const probed = (await cdb.listPushWatch())[0];
       assert.equal(probed.holdersLast, 700);
       assert.equal(probed.holdersCheckedAt, at);
       assert.equal(probed.holdersAtPush, 700, "the first probe still seeds the rolling baseline");
-      // The same row the card path reads (Scanner.resolveHolderCount): the
-      // probe's reading is now what a card-side re-enrich reuses.
+      // The §4.15 cache is UNWRITTEN: nothing reads it any more, so the probe
+      // must not keep paying for a second statement on its behalf.
       const shared = await cdb.getTokenStats("SHARED1");
-      assert.equal(shared.holderCount, 700);
-      assert.equal(shared.holderCountAt, at);
-      assert.equal(
-        holderCountCacheHit(shared.holderCount, shared.holderCountAt, at + 60_000, 30 * 60_000),
-        true,
-        "a card-side enrich a minute later reuses it instead of buying",
-      );
-      // A refused REQUEST wrote neither — which is why the two share one
-      // batch: the row's field and the shared cache cannot disagree.
-      const down = new Db(t.p, undefined, {
-        execute: (a) => t.client.execute(a),
-        batch: (a, m) => {
-          if (m === "write" && a.some((s) => String(s.sql).includes("UPDATE push_watch"))) {
-            throw new Error("write down");
-          }
-          return t.client.batch(a, m);
-        },
-        close: () => t.client.close(),
-      });
-      await down.init();
-      await down
-        .setPushWatchHoldersMany([{ token: "SHARED1", holders: 999, at: at + 60_000 }])
-        .then(() => assert.fail("the refused batch is supposed to reject"), () => {});
-      const after = (await db.listPushWatch())[0];
-      assert.equal(after.holdersLast, 700, "the row is untouched by the refused batch");
-      assert.equal(after.holdersCheckedAt, at);
-      const sharedAfter = await db.getTokenStats("SHARED1");
-      assert.equal(sharedAfter.holderCount, 700, "and so is the shared cache — they cannot disagree");
-      assert.equal(sharedAfter.holderCountAt, at);
-      // A later probe overwrites BOTH halves, in one write again.
+      assert.equal(shared.holderCount, null, "the retired cache is not written");
+      assert.equal(shared.holderCountAt, null);
+      // A later probe moves the row's own field — and the BASELINE (the value
+      // the growth alert compares against) is still the first reading.
       await cdb.setPushWatchHoldersMany([{ token: "SHARED1", holders: 744, at: at + 30 * 60_000 }]);
-      const grown = await db.getTokenStats("SHARED1");
-      assert.equal(grown.holderCount, 744);
-      assert.equal(grown.holderCountAt, at + 30 * 60_000);
+      const grown = (await cdb.listPushWatch())[0];
+      assert.equal(grown.holdersLast, 744);
+      assert.equal(grown.holdersAtPush, 700, "COALESCE keeps the first reading as the baseline");
     } finally {
       await t.cleanup();
     }

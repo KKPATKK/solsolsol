@@ -23,8 +23,8 @@ function flurryTierLabel(tier: FlurryReport["tier"]): string {
 
 /**
  * Axiom /token-info summary line — one compact pipe-separated strip that
- * replaces the five legacy enrichment lines (Bundler/Top10/供應流/Sniper/
- * Holders) when the payload resolves. Format (operator spec):
+ * replaces the legacy enrichment lines (Bundler/Top10/供應流) when the payload
+ * resolves. Format (operator spec):
  *   Top 10 22% | 持有人 356 | Pro 238 | Dev 0% | 內部 22.1% | 捆綁 0.1% |
  *   狙擊 0% | 已付Dex | Creator 已收 184 SOL
  * 內部 ≥15% / 捆綁 ≥13% / 狙擊 ≥5% get a 🔴 flag; missing identity fields
@@ -70,18 +70,25 @@ export function renderAxiomSummaryLine(
 
 /**
  * Renders the Telegram push card for a qualifying coin. Pure (no I/O), so
- * the growing enrichment line list — Bundler / Top10 / supply flow / sniper
- * / holders / creator / GMGN / Arkham / crime-wallets — stays trivially
- * testable without instantiating a scanner. Extracted from scanner.ts when
- * the crime-wallet line joined the card.
+ * the growing enrichment line list — Bundler / Top10 / supply flow / creator
+ * / GMGN / Arkham / crime-wallets — stays trivially testable without
+ * instantiating a scanner. Extracted from scanner.ts when the crime-wallet
+ * line joined the card.
+ *
+ * 2026-09-25 (§4.17): the two Birdeye-bought lines are gone. `🎯 Sniper 買入`
+ * came from /defi/v2/tokens/top_traders and `👥 Holders` from
+ * /defi/token_overview (20 CU), both ON TOP of the Axiom line below — which
+ * already prints 狙擊 / 持有人 for free. Measured against the free tier's
+ * 30K CU/month (see docs/round-trips.md §4.17), the pair was the card path's
+ * whole bill, so the parameters and the lines were removed rather than left
+ * reading null: a card is now never missing the two numbers because a PAID
+ * call was not made, and the Axiom summary remains the single place they show.
  */
 export function renderMessage(
   coin: QualifyingCoin,
   bundlerPct: number | null,
   top10Pct: number | null,
-  sniperPct: number | null,
   supplyFlowClean: boolean,
-  holderCount: number | null,
   creator: string | null,
   gmgn: GmgnTokenInfo | null,
   arkham: ArkhamTokenHolders | null,
@@ -125,14 +132,6 @@ export function renderMessage(
   const flowLine = supplyFlowClean
     ? "🕸 供應流: ✅ 无集中出货（链上检查通过）"
     : "🕸 供應流: —（未分析）";
-  const sniperLine =
-    sniperPct === null
-      ? "🎯 Sniper 買入: —（未檢測）"
-      : `🎯 Sniper 買入: ${sniperPct.toFixed(1)}%（佔供應）`;
-  const holdersLine =
-    holderCount === null
-      ? "👥 Holders: —（未检测）"
-      : `👥 Holders: ${holderCount.toLocaleString("en-US")}`;
   const creatorShort =
     creator === null ? "—（未检测）" : `${creator.slice(0, 6)}…${creator.slice(-4)}`;
   // Creator wallet depth (feature A): age from the oldest signature plus a
@@ -231,7 +230,7 @@ export function renderMessage(
     `📊 5m 量: ${fmtUsd(pair.volume.m5)}`,
     ...(axiomSummary
       ? [axiomSummary]
-      : [bundlerLine, top10Line, flowLine, sniperLine, holdersLine]),
+      : [bundlerLine, top10Line, flowLine]),
     ...(organicLine ? [organicLine] : []),
     creatorLine,
     ...(gmgnLine ? [gmgnLine] : []),

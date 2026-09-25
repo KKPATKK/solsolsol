@@ -1462,3 +1462,81 @@ pass 就會 probe 佢 —— 即係同一個讀數啱啱先買完，轉頭又買
 **測試**（`scripts/test-unit.js`）：`db: the tracker's holder probe shares its reading with the card path,
 in ONE write`（真 DB：一次 write 同時落 push_watch 同 token_stats；`holders_at_push` 由第一次 probe seed；
 卡片側 `holderCountCacheHit` 對 probe 嗰個讀數為 true；rejected batch 兩邊都冇寫；之後嘅 probe 覆寫兩邊）。
+
+---
+
+## 4.17 卡片側兩條付費線直接刪（Sniper / Holders）：Axiom 免費行已經有嗰兩個數（2026-09-25）
+
+Operator 嘅問題（承接 §4.15 / §4.16）：「**唔要卡片 holders 行同 Sniper 行，可以省幾多 CU？**」
+答案：兩條線嘅 endpoint 直接歸零 —— 而呢個係唯一一種**唔會令卡面數字變差**嘅刪法。
+
+### 1. 為咩刪得：嗰兩個數已經由免費來源印
+
+| 卡面行 | 來源 | 價 | 刪完之後 |
+|---|---|---|---|
+| `🎯 Sniper 買入` | Birdeye `/defi/v2/tokens/top_traders`（`getTraderInfo`） | 帳簿記 0 CU（vendor 實價未知，見 §4.14） | 冇咗；`狙擊 0%` 已經喺 Axiom 行 |
+| `👥 Holders` | Birdeye `/defi/token_overview`（`getTokenOverview`） | **20 CU／次** | 冇咗；`持有人 356` 已經喺 Axiom 行 |
+
+`renderAxiomSummaryLine` 喺 Axiom payload 解得開嘅時候**已經**印 `持有人`（`numHolders`）同
+`狙擊`（`snipersHoldPercent`），所以刪走嘅係「Axiom 解唔到 → fallback 行」嗰份複製品，
+唔係卡面資訊本身。Axiom session 死嗰陣卡片少兩行（唔係顯示 `—`）——同 GMGN / Arkham /
+crime 一樣嘅「冇就唔出」立場。
+
+兩條線都**唔餵任何 gate**（sniper filter 早就拆咗，holder 數一直只係卡面），所以呢一刀嘅
+代價完全喺卡面，push 覆蓋率零影響。
+
+### 2. 其餘 caller（刪完之後仲喺度，所以 endpoint 冇死）
+
+* `getTokenOverview`：tracker 嘅 holder probe（`pushwatch.ts`，gap 60 分鐘制）＋ `/debug/birdeye-overview`；
+* `getTraderInfo`：`scripts/test-filters.js`（手動測試腳本）。
+
+即係話刪嘅係**卡片側**嘅 caller，唔係 endpoint 本身；probe 同 §4.16 之前一模一樣照跑。
+
+### 3. 連帶清走嘅死碼
+
+* `Scanner.resolveTraderData` / `Scanner.resolveHolderCount`（兩個係卡側唯一 caller）；
+* `holderCountCacheHit`（`birdeye.ts`）—— §4.15 個 TTL 規則，唯一 reader 就係 `resolveHolderCount`；
+* `Db.updateTokenHolderCount`—— §4.15 個 cache 寫入，唯一 caller 亦係 `resolveHolderCount`；
+* `Db.setPushWatchHoldersMany` 入面 N 條 `token_stats` statement（§4.16 嘅 shared-cache 寫入）——
+  probe 自己嗰行（`holders_at_push` / `holders_last` / `holders_checked_at`）**照寫**，仍然係 1 個 batch；
+* `BIRDEYE_HOLDER_CACHE_MIN` 同 `AppConfig.birdeyeHolderCacheMs`——冇 cache 就冇嘢好 tune。
+
+`token_stats.holder_count` / `holder_count_at` 兩條 column **留返喺 schema**（唔為咗刪一個規則
+去刪資料；`CREATE TABLE` 同 `addColumnIfMissing` 都唔動）。§4.15 / §4.16 兩節保留做歷史記錄。
+
+### 4. CU 算術：為咩非砍 ~49% 不可
+
+Operator 嘅 Birdeye dashboard：period **2026-09-20 → 10-20**，額度 30,000，**已用 8,470 CU**。
+`/health.birdeyeCu` 自己嗰個月 3,160 CU 係 counter 上線（2026-09-23 12:54Z）之後 44.4 小時嘅
+讀數 —— 兩個來源都 ≈ **1,700 CU／日**。
+
+* 剩 21,530 CU ÷ 25 日 ⇒ 上限 **861 CU／日**；
+* 照原本速度 ~12.7 日燒完 ⇒ **10 月 7–8 日見底**；
+* 整個 period 需要 ~50,800 CU ⇒ **要砍 ~49%**。
+
+砍喺邊：§4.14 量到卡片側係 ≥60%（≤ ~1,000 CU／日），而嗰 60% 嘅全部就係呢兩條線之一
+（`token_overview` 20 CU 係大頭）。所以呢一刀嘅目標係**令卡片側歸零**，剩返嘅只有
+probe（≤480 CU／日）、backfill（160 CU／日）同 `/debug/*`。
+
+### 5. 落線點驗
+
+1. `/health.birdeyeCu.byEndpoint.month.tokenOverview.calls` **唔應該再跟 pushes 上升** —— 只應該
+   跟 `pushWatch`（probe）上升，即 ≈ 1 次／60 分鐘／被追蹤嘅幣。
+2. `…byEndpoint.month.topTraders.calls` **停止增長**（= 0）。vendor 嗰邊嘅真價仍然要用 dashboard
+   同日 delta ÷ calls 去推 —— 帳簿記 0，唔可以用帳簿證明省幾多。
+3. 卡面：Axiom 行照有 `持有人` / `狙擊`；Axiom 解唔到嘅卡少兩行（預期行為）。
+4. 追蹤警報 `📈 持倉增長`（+10%）同 `⚡ 背離` **照響** —— 佢哋讀 `push_watch.holders_last` /
+   `holders_at_push`，同卡面嗰兩行無關（probe 保留就係為咗呢個）。
+5. `/debug/birdeye-overview` 照樣買得到 `token_overview`（probe 路徑未死）。
+
+### 6. 已知代價
+
+* Axiom session 死嗰陣卡片少兩行（唔係差數字）；
+* `token_stats` 兩條 column 變成純歷史資料；
+* CI 只係 typecheck ＋ unit test ＋ deploy，所以 #1 要等落線後至少一個 probe 週期（60 分鐘）
+  才睇得到 —— `byEndpoint` 喺新 isolate 打過 Birdeye 之前會係空嘅，唔係 bug。
+
+**測試**（`scripts/test-unit.js`）：`out-of-window patch: the card stops buying Birdeye`（掃描
+stripped 源碼：卡側冇 caller、冇 cache reader、render 冇兩行、batch 只剩三個 slot、endpoint 仍然
+存在）＋ `db: the holder probe writes its own row and nothing else, in ONE write`（真 DB：1 個
+request、N 條 statement＝每行一條、`holders_at_push` 由第一次 probe seed、token_stats 冇被寫）。

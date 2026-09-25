@@ -176,35 +176,16 @@ export function consumeBirdeyeCuByDay(
 export const BIRDEYE_CU_LEDGER_DAYS = 32;
 
 /**
- * Is a persisted holder count still worth reusing, or must the card path buy
- * another `/defi/token_overview` (20 CU)?
- *
- * The card's holders line is the only thing that request pays for, and it is
- * bought inside the enrich batch — which the SAME coin re-enters on every tick
- * it is neither pushed nor finally rejected (a card send deferred by the tick
- * cut; a gate that rejects this tick and passes the next). Before this rule
- * each of those entries paid for the same reading again, which is the card-side
- * share §4.14 measured (docs/round-trips.md).
- *
- * `ttlMs <= 0` is the knob turned OFF — always read, the pre-2026-09-25
- * behaviour (BIRDEYE_HOLDER_CACHE_MIN = 0), and the escape hatch if the call
- * ever becomes free or the count must be live on every attempt.
- * `cachedAt <= 0` is the "never written" SENTINEL, not 1970 — the same rule
- * healthAgeMs follows for the frozen readings (worker.ts): a row whose stamp
- * was never set must not be mistaken for a fresh reading.
+ * §4.17 (2026-09-25): `holderCountCacheHit` lived here — the TTL rule for the
+ * durable holder-count cache (token_stats.holder_count / holder_count_at) that
+ * §4.15 added and §4.16 shared with the tracker's holder probe. The card's
+ * holders line was that cache's ONLY reader, and the line is gone (the number
+ * it showed already rides the free Axiom summary), so the rule went with it. A
+ * TTL with no caller is a paid call waiting to be re-wired; the endpoints stay
+ * where they are used — `/defi/token_overview` by the tracker's holder probe
+ * and /debug/birdeye-overview, `/defi/v2/tokens/top_traders` by
+ * scripts/test-filters.js. See docs/round-trips.md §4.17.
  */
-export function holderCountCacheHit(
-  cached: number | null,
-  cachedAt: number | null,
-  now: number,
-  ttlMs: number,
-): boolean {
-  if (ttlMs <= 0) return false;
-  if (cached === null || cachedAt === null) return false;
-  if (cachedAt <= 0) return false;
-  return now - cachedAt < ttlMs;
-}
-
 export class BirdeyeClient {
   private readonly throttle: Throttle;
   private readonly apiKey: string;

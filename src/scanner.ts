@@ -1,6 +1,6 @@
 import type { Bot } from "grammy";
 import { tradeKeyboard } from "./bot";
-import { holderCountCacheHit, type BirdeyeClient } from "./birdeye";
+import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import {
   SCAN_FRONT_GATE_KEYS,
@@ -3542,7 +3542,7 @@ export class Scanner {
         // crime check and the Axiom token-info that follow — instead of being
         // awaited one call at a time later in the chain. Two measured
         // reasons:
-        //  - Serially the batch cost the SUM of five upstream round trips
+        //  - Serially the batch cost the SUM of its upstream round trips
         //    (~1-2.5s) while racing a single shared deadline, so whatever sat
         //    at the back of the queue started with an empty window and
         //    silently dropped off the card. Live report 2026-09-17: the
@@ -3558,22 +3558,21 @@ export class Scanner {
         // Nothing in the batch gates anything — GMGN's wash-trading flag is
         // judged where the batch is awaited, and each slot that misses its
         // deadline degrades to exactly the value the old code used.
+        //
+        // 2026-09-25 (§4.17): the batch used to hold FIVE slots, two of them
+        // Birdeye's paid card lines — `resolveTraderData`
+        // (/defi/v2/tokens/top_traders) and `resolveHolderCount`
+        // (/defi/token_overview, 20 CU). Both numbers already ride the FREE
+        // Axiom summary line when it resolves, and both lines were
+        // display-only (that endpoint's own numbers feed no gate — the sniper
+        // FILTER was removed long ago), so the pair was pure cost: §4.14
+        // measured the card path as ≥60% of a 46K CU/month run rate against a
+        // 30K free tier. They are gone, endpoints included — see
+        // docs/round-trips.md §4.17 for the arithmetic and for exactly what
+        // the card loses when the Axiom session is down.
         const jupiterOrganic = this.jupiter;
         this.markPhase(diag, "enrich-dispatch", startedAt);
         const displayBatch = Promise.all([
-          this.bestEffort(
-            () => this.resolveTraderData(coin),
-            enrichDeadline,
-            {
-              proTraders: coin.stats.birdeyeProTraders,
-              sniperPct: coin.stats.birdeyeSniperPct,
-            },
-          ),
-          this.bestEffort(
-            () => this.resolveHolderCount(coin),
-            enrichDeadline,
-            { holderCount: null },
-          ),
           this.bestEffort(
             () => this.resolveGmgnInfo(coin),
             enrichDeadline,
@@ -3672,11 +3671,12 @@ export class Scanner {
         }
         // Await the display batch dispatched above (it has been running
         // concurrently with the crime check and the Axiom token-info), then
-        // judge the one thing in it that can block a push. Trader data is
-        // display-only (the sniper filter was removed): a coin pushes even
-        // when the data is not ready and the card shows 未检测/—.
+        // judge the one thing in it that can block a push. Every slot left is
+        // display-only, so a coin pushes even when one is missing and the card
+        // simply omits its line (§4.17 — the two Birdeye slots, and with them
+        // their lines, were removed outright).
         this.markPhase(diag, "enrich-await", startedAt);
-        const [trader, holders, gmgn, arkham, organic] = await displayBatch;
+        const [gmgn, arkham, organic] = await displayBatch;
         if (arkham) diag.arkham++;
         if (organic) diag.organic++;
         if (
@@ -3806,9 +3806,7 @@ export class Scanner {
           coin,
           rugcheck.bundlerPct,
           rugcheck.top10Pct,
-          trader.sniperPct,
           flow.status === "clean",
-          holders.holderCount,
           rugcheck.creator,
           gmgn,
           arkham,
@@ -4399,120 +4397,18 @@ export class Scanner {
     });
   }
 
-  /** Pro-trader count + sniper buy share: cached → single Birdeye fetch → unknown. */
-  private async resolveTraderData(coin: QualifyingCoin): Promise<{
-    proTraders: number | null;
-    sniperPct: number | null;
-  }> {
-    const stats = coin.stats;
-    // Both metrics come from the same fetch; only trust the cache when both
-    // are known, so a partially-fetched result never locks in a null.
-    if (stats.birdeyeProTraders !== null && stats.birdeyeSniperPct !== null) {
-      return {
-        proTraders: stats.birdeyeProTraders,
-        sniperPct: stats.birdeyeSniperPct,
-      };
-    }
-    if (this.birdeye && !this.dataNegativeCached(stats.token)) {
-      try {
-        const info = await this.birdeye.getTraderInfo(
-          stats.token,
-          coin.pair.marketCap,
-          coin.pair.priceUsd,
-        );
-        if (info.proTraders !== null && info.sniperPct !== null) {
-          this.dataFailedAt.delete(stats.token);
-          await this.db.updateTokenProTraders(stats.token, info.proTraders);
-          await this.db.updateTokenSniperPct(stats.token, info.sniperPct);
-          stats.birdeyeProTraders = info.proTraders;
-          stats.birdeyeSniperPct = info.sniperPct;
-        } else {
-          // Trader data not available yet: back off instead of re-querying
-          // the same coin on every scan.
-          this.dataFailedAt.set(stats.token, Date.now());
-        }
-        return info;
-      } catch (err) {
-        this.dataFailedAt.set(stats.token, Date.now());
-        console.error(
-          `[scanner] Birdeye trader lookup failed for ${stats.token}:`,
-          err instanceof Error ? err.message : err,
-        );
-      }
-    }
-    return { proTraders: null, sniperPct: null };
-  }
-
   /**
-   * Holder count (Birdeye token overview) — the card's holders line.
-   * Best-effort with the same 5-min negative cache: a failure degrades to
-   * "—" on the card, never blocks or slows the push.
-   *
-   * The reading is cached DURABLY (see BIRDEYE_HOLDER_CACHE_MIN /
-   * docs/round-trips.md §4.15). §4.14 measured this call as the card path's
-   * whole CU bill — and this method is not called once per card, it is called
-   * once per ENRICH: the same coin re-enters the batch on every tick it is
-   * neither pushed nor finally rejected (a deferred card send, a gate that
-   * flips back), and each entry used to buy the same 20 CU reading again.
-   * A fresh coin has no cached reading, so the number a card FIRST shows is
-   * always a live one; only a coin still hopping in and out of the batch
-   * reuses its reading, and only for `birdeyeHolderCacheMs`.
+   * §4.17 (2026-09-25): `resolveTraderData` (Birdeye /defi/v2/tokens/
+   * top_traders) and `resolveHolderCount` (Birdeye /defi/token_overview,
+   * 20 CU) lived here. Both fed card lines that the free Axiom summary line
+   * already prints (狙擊 / 持有人), so the pair — and the §4.15 durable
+   * holder cache whose only reader was `resolveHolderCount` — was removed to
+   * stop buying them. Deleted rather than kept behind a switch on purpose: a
+   * dormant copy of a paid call is how a card path silently re-acquires a CU
+   * bill. The endpoints stay where they are genuinely used — `getTokenOverview`
+   * by the tracker's holder probe and /debug/birdeye-overview, `getTraderInfo`
+   * by scripts/test-filters.js. See docs/round-trips.md §4.17.
    */
-  private async resolveHolderCount(coin: QualifyingCoin): Promise<{
-    holderCount: number | null;
-  }> {
-    const stats = coin.stats;
-    const mint = coin.pair.baseToken.address;
-    // `stats` came back with the pool read (`SELECT *`), so a cache hit costs
-    // no request, no CU and no round trip at all.
-    if (
-      holderCountCacheHit(
-        stats.holderCount ?? null,
-        stats.holderCountAt ?? null,
-        Date.now(),
-        this.config.birdeyeHolderCacheMs,
-      )
-    ) {
-      return { holderCount: stats.holderCount ?? null };
-    }
-    if (!this.birdeye || this.dataNegativeCached(mint)) {
-      return { holderCount: null };
-    }
-    try {
-      const info = await this.birdeye.getTokenOverview(mint);
-      if (info.holderCount === null) {
-        // No holder data back — back off instead of re-querying the same
-        // coin on every scan.
-        this.dataFailedAt.set(mint, Date.now());
-      } else {
-        this.dataFailedAt.delete(mint);
-        // Persist the reading so the NEXT enrichment can reuse it. The write
-        // goes by `stats.token` — the token_stats primary key, i.e. the same
-        // mint `mint` names — so it lands on the row that carries the cache.
-        // A failed write is a lost cache entry, never a lost reading: the
-        // count in hand is what the card shows either way.
-        try {
-          const at = Date.now();
-          await this.db.updateTokenHolderCount(stats.token, info.holderCount, at);
-          stats.holderCount = info.holderCount;
-          stats.holderCountAt = at;
-        } catch (err) {
-          console.error(
-            `[scanner] Birdeye holder cache write failed for ${mint}:`,
-            err instanceof Error ? err.message : err,
-          );
-        }
-      }
-      return { holderCount: info.holderCount };
-    } catch (err) {
-      this.dataFailedAt.set(mint, Date.now());
-      console.error(
-        `[scanner] Birdeye overview lookup failed for ${mint}:`,
-        err instanceof Error ? err.message : err,
-      );
-      return { holderCount: null };
-    }
-  }
 
   /**
    * Re-eval pool with an in-memory TTL cache (see config.reevalPoolCacheMs):

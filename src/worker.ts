@@ -4291,13 +4291,13 @@ export default {
         },
         stats: { token: pairAddr },
       } as unknown as QualifyingCoin;
+      // §4.17: the card takes no sniper/holder value any more — those two
+      // Birdeye-bought lines are gone (the free Axiom line prints both).
       const message = renderMessage(
         mockCoin,
         null,
         null,
-        null,
         true,
-        null,
         null,
         null,
         null,

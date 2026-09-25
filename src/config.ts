@@ -417,26 +417,6 @@ export interface AppConfig {
    */
   birdeyeMonthlyCuMax: number;
   /**
-   * How long a persisted holder count may be reused before the card path buys
-   * another `/defi/token_overview` (BIRDEYE_HOLDER_CACHE_MIN, default 30,
-   * 0 = always read, i.e. the pre-2026-09-25 behaviour).
-   *
-   * The card's holders line is the ONLY thing this pays for, and it is bought
-   * inside the enrich batch — which the SAME coin re-enters on every tick it
-   * is neither pushed nor finally rejected (a card send deferred by the tick
-   * cut; a gate that rejects this tick and passes the next). Freshly
-   * discovered coins are unaffected: the first enrich for a coin has no cached
-   * reading, so the number a card first shows is always a live one — the TTL
-   * only decides how often a coin still hopping in and out of the batch is
-   * re-bought.
-   *
-   * The tracker's holder probe writes the SAME cache
-   * (Db.setPushWatchHoldersMany), so a coin tracked moments after it was
-   * pushed is not bought twice either — the probe's reading is what the next
-   * card-side enrich reuses. See docs/round-trips.md §4.15 / §4.16.
-   */
-  birdeyeHolderCacheMs: number;
-  /**
    * GMGN trending feed size per scan (GMGN_TRENDING_LIMIT, default 30,
    * 0 = discovery feed disabled). Candidates come momentum-ranked.
    */
@@ -747,10 +727,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     birdeyeMonthlyCuMax: Number.isFinite(Number(env.BIRDEYE_MONTHLY_CU_MAX ?? 30000))
       ? Math.max(0, Math.floor(Number(env.BIRDEYE_MONTHLY_CU_MAX ?? 30000)))
       : 30000,
-    birdeyeHolderCacheMs:
-      (Number.isFinite(Number(env.BIRDEYE_HOLDER_CACHE_MIN ?? 30))
-        ? Math.max(0, Math.min(Math.floor(Number(env.BIRDEYE_HOLDER_CACHE_MIN ?? 30)), 1440))
-        : 30) * 60_000,
     gmgnTrendingLimit: Number.isFinite(Number(env.GMGN_TRENDING_LIMIT ?? 30))
       ? Math.max(0, Math.min(Math.floor(Number(env.GMGN_TRENDING_LIMIT ?? 30)), 100))
       : 30,
