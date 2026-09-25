@@ -250,6 +250,29 @@ PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
 # calls to refuse once the ceiling is reached is deliberately NOT wired —
 # dropping one changes what the card shows (docs/round-trips.md §4.4.2 / §4.5.1).
 BIRDEYE_MONTHLY_CU_MAX = "30000"
+# Birdeye holder cache TTL, MINUTES (code default 30; 0 = always read, i.e.
+# the pre-2026-09-25 behaviour). The card's holders line is the only thing
+# `/defi/token_overview` (20 CU) pays for, and it is bought inside the ENRICH
+# batch — which the same coin re-enters on every tick it is neither pushed nor
+# finally rejected (a card send deferred by the tick cut; a gate that rejects
+# this tick and passes the next). Measured 2026-09-25 (docs/round-trips.md
+# §4.14): with a 46K CU/month run rate the card path was ≥60% of the bill
+# while the holder probe was ≤21–36% — so the gap could not be narrowed until
+# this repeat buying stopped. The reading is persisted on token_stats
+# (holder_count / holder_count_at), so a cache hit costs no request, no CU and
+# no round trip, and it rides the pool read the scan already pays for.
+# The tracker's holder probe (PUSH_WATCH_HOLDER_MIN_GAP_MIN above) WRITES the
+# same cache — it is the other place this coin's reading is bought, and a coin
+# is tracked moments after it was pushed — so the two can share one reading
+# instead of buying the same token_overview twice (docs/round-trips.md §4.16).
+# A coin's FIRST enrich always buys a live reading (nothing is cached yet), so
+# the number a card first shows is unaffected; the TTL only decides how often a
+# coin still hopping in and out of the batch is re-bought. 30 minutes is ~2
+# buys/hour per coin at the very worst (a 1-min tick that keeps deferring) vs
+# ~60 today. GMGN's free `holder_count` was the other option and is NOT used:
+# it is a different metric for the card face, and GMGN's edge 429s the Worker's
+# shared egress at the IP level (see GMGN_TRENDING_LIMIT above).
+BIRDEYE_HOLDER_CACHE_MIN = "30"
 # Insider self-pump gate: rejects pushes where newWallets/checked top-holder
 # wallets exceeds WALLET_NEW_RATIO_MAX (the Cheems shape — 8/8 profiled
 # holders were brand-new wallets). Only judges once at least

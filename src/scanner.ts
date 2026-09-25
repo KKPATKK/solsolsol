@@ -1,6 +1,6 @@
 import type { Bot } from "grammy";
 import { tradeKeyboard } from "./bot";
-import type { BirdeyeClient } from "./birdeye";
+import { holderCountCacheHit, type BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import {
   SCAN_FRONT_GATE_KEYS,
@@ -4446,14 +4446,35 @@ export class Scanner {
   /**
    * Holder count (Birdeye token overview) — the card's holders line.
    * Best-effort with the same 5-min negative cache: a failure degrades to
-   * "—" on the card, never blocks or slows the push. Only fetched for
-   * qualifying candidates, so the 20 CU/request cost is negligible at the
-   * current push volume.
+   * "—" on the card, never blocks or slows the push.
+   *
+   * The reading is cached DURABLY (see BIRDEYE_HOLDER_CACHE_MIN /
+   * docs/round-trips.md §4.15). §4.14 measured this call as the card path's
+   * whole CU bill — and this method is not called once per card, it is called
+   * once per ENRICH: the same coin re-enters the batch on every tick it is
+   * neither pushed nor finally rejected (a deferred card send, a gate that
+   * flips back), and each entry used to buy the same 20 CU reading again.
+   * A fresh coin has no cached reading, so the number a card FIRST shows is
+   * always a live one; only a coin still hopping in and out of the batch
+   * reuses its reading, and only for `birdeyeHolderCacheMs`.
    */
   private async resolveHolderCount(coin: QualifyingCoin): Promise<{
     holderCount: number | null;
   }> {
+    const stats = coin.stats;
     const mint = coin.pair.baseToken.address;
+    // `stats` came back with the pool read (`SELECT *`), so a cache hit costs
+    // no request, no CU and no round trip at all.
+    if (
+      holderCountCacheHit(
+        stats.holderCount ?? null,
+        stats.holderCountAt ?? null,
+        Date.now(),
+        this.config.birdeyeHolderCacheMs,
+      )
+    ) {
+      return { holderCount: stats.holderCount ?? null };
+    }
     if (!this.birdeye || this.dataNegativeCached(mint)) {
       return { holderCount: null };
     }
@@ -4465,6 +4486,22 @@ export class Scanner {
         this.dataFailedAt.set(mint, Date.now());
       } else {
         this.dataFailedAt.delete(mint);
+        // Persist the reading so the NEXT enrichment can reuse it. The write
+        // goes by `stats.token` — the token_stats primary key, i.e. the same
+        // mint `mint` names — so it lands on the row that carries the cache.
+        // A failed write is a lost cache entry, never a lost reading: the
+        // count in hand is what the card shows either way.
+        try {
+          const at = Date.now();
+          await this.db.updateTokenHolderCount(stats.token, info.holderCount, at);
+          stats.holderCount = info.holderCount;
+          stats.holderCountAt = at;
+        } catch (err) {
+          console.error(
+            `[scanner] Birdeye holder cache write failed for ${mint}:`,
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
       return { holderCount: info.holderCount };
     } catch (err) {

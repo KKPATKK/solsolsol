@@ -1256,3 +1256,209 @@ resume 嘅完成旗係**排隊**而唔係自己寫；`writeScanFront` = 1 個 wr
 `scanner: a due prune rides the front's ONE write, counter and stamp together`
 （到期 prune：deletes 照跑、讀數 0；counter（ADD）＋ interval stamp 入同一個 batch，
 counter 剛好減咗 deleted；空 buffer 唔算一個 request）。
+
+---
+
+## 4.14 Birdeye CU：由一個總數到「邊個花嘅」，同取樣下限嘅答案（2026-09-25）
+
+Operator 問：用 `birdeyeCu` 嘅真實月用量重新評估 holder probe gap 同卡片側 CU 預算，
+睇可唔可以收窄取樣下限？——**答案係唔收窄**，但答得成之前先要修好個讀數，因為 §4.5.1
+嗰個 counter 只答得到「幾多」，答唔到「邊個」。
+
+### 1. 量到嘅數（live，2026-09-25 08:03Z）
+
+```
+birdeyeCu { day "2026-09-25", today 780, monthCu 2740, pendingCu 0, monthlyMax 30000 }
+```
+
+* 計數器**2026-09-23 12:54Z 才上線**（§4.5.1 嘅 deploy），所以 `monthCu` 2740 係
+  **43.2 小時**嘅總和，唔係一個月 ⇒ 63 CU/h ≈ **1,522 CU/日 ≈ 46K CU/月**。
+  而今日自己係 96.7 CU/h（≈70K/月），不過入面有大約 **340 CU 係我自己嘅診斷**：
+  一個 `/debug/backfill` 就係 `chunkCount 7` × 40 CU ≈ 280 CU（＋new_listing probe 40）
+  —— 即係**一次診斷等於一日 probe 預算嘅 2/3**。
+* 三個消費者同佢哋嘅**上限**（config 推出嚟，唔係估）：
+
+  | 消費者 | 單價 | 次數/日 | CU/日 | 佔比 |
+  | --- | --- | --- | --- | --- |
+  | holder probe（`PUSH_WATCH_HOLDER_MIN_GAP_MIN = 60`） | 20 CU | ≤24 | **≤480** | ≤21–36% |
+  | periodic backfill（`BIRDEYE_BACKFILL_INTERVAL_MIN = 360`，lookback 360 ⇒ 1 chunk） | 40 CU | 4 | **160** | ~11% |
+  | 卡片側 `resolveHolderCount`（每次 enrich 一次 `token_overview`） | 20 CU | 每次 unseen candidate 入 enrich | **其餘 ≥60%** | — |
+  | 卡片側 `resolveTraderData`（`top_traders`，**冇記錄單價** ⇒ charge 0） | 0 CU | 同上（同一次 enrich） | 唔入賬 | 未知 |
+
+  `getFirstMinuteVolume` / `getMinMarketCapUsd`（ohlcv 35 CU）喺 repo 內**冇任何 call site**
+  ⇒ §4.4.2 表入面「首分鐘量、最低市值」嗰兩項已經係死 code，唔再係消費者。
+* 一個重要嘅誠實邊界：上表加起來 46K/月 > 30K free tier，但 Birdeye **冇**頂 —— 實測
+  `/debug/birdeye-overview?address=…` 597ms 正常回 `holderCount 622`，冇 429。所以一係
+  account 已經係 paid，一係 `token_overview = 20 CU` 高估咗 ≥33%，一係 `top_traders` 嘅
+  未記錄單價令實況更差。**任何以 CU 為單位嘅決定都要先答呢條**，而答佢需要 calls 對數。
+
+### 2. 做咗嘅：`byEndpoint` ＋ `recentDays`（純讀數，唔改任何決定）
+
+* `chargeBirdeyeCu` 除咗總數，再記每個 endpoint 嘅 `{ calls, cu }`（**0 CU 都數呼叫**：
+  `top_traders` 係 vendor 真收費、repo 冇單價嘅嗰隻，佢嘅呼叫數就係 `monthCu` 嘅窿）。
+  同一個 isolate scope、同一條 drain 紀律：read 無條件、**landed 之後才清 delta**、
+  寫入途中到達嘅 charge 留在 pending（逐格驗）。
+* 新 durable row `birdeye_cu_by_v1`，行 shape `{ v: 1, days: { "YYYY-MM-DD": { endpoint: { calls, cu } } } }`。
+  **`birdeye_cu_v1` 一個 byte 都唔改** —— 歷史日子冇拆分就係「冇讀數」，唔會扮 0。
+  兩條 row 喺 tail 嘅**同一個 read**（`TAIL_STATE_KEYS`）同**同一個 batch**寫入
+  ⇒ 零額外 round trip，總數同拆分唔可能對唔上。
+* `/health.birdeyeCu` 加 `recentDays`（逐日總數，新到舊，7 日）同 `byEndpoint { today, month }`；
+  兩條 CU row 併入 /health 本來就有嘅 `getWorkerStates` 批次，順手收埋原本嗰個獨立讀（−1 subrequest）。
+
+### 3. 答案：唔收窄（而且唔係「暫時」）
+
+1. **全機已經超支**：46K CU/月 vs 30K tier。
+2. **probe 唔係大頭**：≤480 CU/日（≤21–36%），而其餘 ≥60% 係卡片側。
+3. **收窄買到嘅嘢比想像中少**：gap 60 → 30 令 probe 由 480 → 960 CU/日（**+14.4K/月**），
+   而因為「一個 pass 一個 probe」（§4.3），每行嘅持有人數刷新由 **~31 小時** 縮到 **~15 小時**
+   —— 唔改變任何 gate、發卡條件或者卡片語意，純粹係卡面個持有人數幾新。
+4. **要收窄，先要卡片側唔再重複買**：一張卡嘅 `token_overview`（20 CU）而家係**每次 enrich**
+   都買一次，而 enrich 唔止發卡嗰次（defer／重評都會再入 enrich）。省到嗰邊，gap 60 → 30
+   甚至 20 就有預算（30 分鐘 = 28.8K/月，20 分鐘 = 43.2K/月 —— 仍然要同卡片側分）。
+   §4.4.2 已經記低兩個唔使錢嘅方向（durable holder cache、GMGN 免費 `holder_count`），
+   兩者都會改卡面數字嘅新鮮度／來源，所以係一個要明講嘅決定，唔應該夾埋喺讀數刀做。
+
+### 4. 落線點驗（下一個鐘）
+
+1. `curl /health | jq .birdeyeCu.recentDays` 有 ≥2 日、新到舊。
+2. `curl /health | jq .birdeyeCu.byEndpoint.month` 有 `tokenOverview` / `newListing`
+   （`ohlcv` 應該**完全唔出現**，因為冇 call site），而 `topTraders.calls` > 0 即係確認
+   「repo 個 CU 總數低估咗 vendor 嘅收費」。
+3. `byEndpoint.month.tokenOverview.calls` = 卡片 enrich 次數 ＋ probe 次數；probe 嘅次數由
+   pass note 嘅 `probe<N>`（§4.4.1）數得到，所以**卡片側 = calls − probes** ——
+   呢個就係下一步「卡片側值唔值得買」嘅數。
+4. 同 Birdeye dashboard 嘅當日用量對數：如果 vendor 讀數係 repo 讀數嘅 1/20，咁 20 CU/次
+   就係高估，全盤預算決定（包括 gap）都要重算。
+
+**測試**（`scripts/test-unit.js`）：`birdeye: the split ledger counts calls per endpoint, priced or not`
+（calls/CU 分開、0 CU 都數、空 endpoint 冇格、mid-write 逐格）＋ `birdeye: the split parser, merge and stats
+follow the totals' window`（unknown endpoint／junk day／bad number／空日全 drop、合併、剪枝同 totals 同一個窗、
+today vs month、`recentDays` 排序）＋ 舊 `worker: syncBirdeyeCu …` 測試擴充（同一個 batch 寫兩條 row、
+rejected batch 兩邊 delta 一齊 re-offer；write-down stub 改成連 batch 都失敗）。
+
+---
+
+## 4.15 卡片側嘅持有人數：由「每次 enrich 都買」變成「一個 durable 讀數」（2026-09-25）
+
+Operator 嘅決定（§4.14 §3.4 嘅下一步）：**要收窄 gap，先要卡片側唔再每次 enrich 都買一次
+`token_overview`。** 兩個方向之中揀咗 **durable holder cache**，唔用 GMGN 免費 `holder_count`。
+
+### 1. 點解係 cache 而唔係 GMGN
+
+* GMGN 個 `holder_count` 係**另一把尺**（換源＝換卡面數字，正正係 §4.14 §3.4 講嘅「要明講嘅決定」）；
+* 而且佢個 edge 以 IP 級 429 封咗 Worker 嘅共用 egress（2026-09-24 實測 `requests 9 / http429 9 /
+  consecutive429 9 / lastStatus 429`，leg 已經關咗），即係呢條路今日**行唔通**。
+
+Cache 保住同一個數字、同一個來源、同一個 metric，只係唔再重複買。
+
+### 2. 慳喺邊：重複唔係「每張卡」，係「每次 enrich」
+
+`resolveHolderCount` 唔係每次發卡叫一次 —— 係每次 **enrich** 叫一次，而同一個幣會重入 enrich：
+
+* 卡片送出被 tick cut 延後（deferral）→ 下一個 tick 再 enrich；
+* 某個 gate 今個 tick 拒、下個 tick 放（mcap/vol 喺邊界浮動）→ 再 enrich。
+
+`isTokenSeen` 只喺**成功送出之後**才寫，所以呢條路冇 dedupe：每次重入都係 20 CU
+（`getJson` 逐個 attempt 收費，失敗重試最多 3 次 = 60 CU）。基線係 §4.14：46K CU/月，
+卡片側 ≥60%。
+
+### 3. 做咗嘅：`token_stats.holder_count` / `holder_count_at` ＋ TTL
+
+* 兩條新 column。CREATE TABLE 有（fresh DB 唔使 ALTER），legacy DB 由 `addColumnIfMissing` 補
+  （idempotent，同 `max_mcap_observed` 一條路）。讀側係 `SELECT *`，所以兩條 column **順便帶返嚟**
+  ⇒ **cache hit = 0 request、0 CU、0 round trip**。
+* `holderCountCacheHit()`（`src/birdeye.ts`，exported 做測試）：
+  * 界線係 miss（TTL exclusive）—— 過期一定要重新買，唔可以靠 off-by-one 多食一個 tick；
+  * `ttlMs <= 0` = 關（＝ pre-2026-09-25 行為，逃生門）；
+  * `cachedAt <= 0` = 「從未寫過」嘅 sentinel，唔係 1970（同 `healthAgeMs` 同一條規矩）；
+  * `null` count = 冇讀數，唔會當 0（發明一個 0 = 卡面聲稱 0 個持有人）。
+* 寫入：**只有真正拿到 count 才寫**（一次 UPDATE，`stats.token` = token_stats PK）。寫入失敗
+  ＝失去一個 cache entry，**唔會**失去個讀數（卡照出嗰個數），下一次再買返。
+* 新 dial `BIRDEYE_HOLDER_CACHE_MIN = 30`（code default 30，0 = 關）。
+* **新幣完全唔受影響**：第一次 enrich 冇 cache，所以卡第一次出嘅數字永遠係即時買嘅。TTL 只決定
+  「一個仲喺 enrich 出入緊嘅幣」幾久重買一次 —— 最壞 30 分鐘一次（≈2 次/鐘），而 deferral 每 tick
+  重試嘅話本來係 ≈60 次/鐘。
+
+### 4. 落線點驗
+
+1. `byEndpoint.month.tokenOverview.calls` 對 `pushes`（`/debug/pushes`）：本來 `calls ≫ pushes`
+   （enrich 重入），之後應該收窄到 ≈「每個（coin, 30 分鐘窗）一次」。呢個就係本次改動嘅收據。
+2. 有值嘅 row：`holder_count_at` 係讀取時間（唔係 0），而且 re-enrich 喺 TTL 內**唔會**改動佢。
+3. 卡面持有人數唔會跌到 `—`（第一次一定 live）。
+4. 回退驗證：`BIRDEYE_HOLDER_CACHE_MIN = 0` 要即時回復舊行為（唔使 redeploy code，wrangler.toml
+   改完再 deploy 即可）。
+
+### 5. 咁 gap 呢？（刻意唔喺呢一刀改）
+
+* 卡片側落返之後先計得準：以 §4.14 嘅數，卡片側 ≥60%（≈28K/月）係最大變數，cache 之後跌幾多
+  要睇上面 #1 嘅 calls 對數。
+* gap 60 → 30 = probe 480 → 960 CU/日（**+14.4K/月**）；60 → 20 = **+28.8K/月**。
+* 所以次序係：deploy → 睇 calls/pushes 比 → 才決定 gap。收窄 gap 會改卡面數字嘅刷新率（每行
+  ~31 小時 → ~15 小時），係一個要明講嘅 dial 決定，唔應該夾埋喺「令卡片側唔再重複買」呢一刀。
+
+**測試**（`scripts/test-unit.js`）：`birdeye: the holder cache reuses a reading inside its TTL and never
+invents one`（界線係 miss、時鐘偏差、`0` = 關、`null`/`0` 唔算讀數）＋ `db: the holder cache is ONE write,
+and a coin nobody read stays unknown`（真 DB：fresh schema 帶兩條 column、未讀過 = null 唔係 0、
+一次 write、覆寫舊讀數）＋ `out-of-window patch: the card path reads the holder cache BEFORE it buys`
+（順序、`holderCountCacheHit` 必須係 value import 唔可以變 type import、半貼即紅）。
+
+---
+
+## 4.16 Tracker probe 同卡片側共用同一個持有人讀數（2026-09-25）
+
+Operator 要求：probe 嘅持有人數都寫入 §4.15 嗰個 durable cache，令 probe 同卡片側共用同一個讀數。
+
+### 1. 兩個買家，同一個幣
+
+`/defi/token_overview`（20 CU）喺 repo 只有兩個買家：
+
+* 卡片側 `Scanner.resolveHolderCount`（§4.15 加咗 cache）；
+* tracker probe（`PushWatcher` 嘅 holder stage，每個 pass 一個、隔 `PUSH_WATCH_HOLDER_MIN_GAP_MIN`）。
+
+而一個幣係**被推嘅下一秒就被追蹤**：`push_watch` 第一行嘅 `holders_checked_at` 係 NULL，所以下一個
+pass 就會 probe 佢 —— 即係同一個讀數啱啱先買完，轉頭又買多次。呢個就係今次接埋嘅窿。
+
+### 2. 做咗嘅
+
+* `Db.setPushWatchHoldersMany`（probe 嘅唯一寫入點，一個 batch ＝ 一個 round trip）除咗寫 push_watch
+  嘅 `holders_last` / `holders_checked_at` / `holders_at_push`，再加 N 條
+  `UPDATE token_stats SET holder_count, holder_count_at`。
+* **特登同一個 batch**：row 自己個數同共用 cache 唔可能對唔上（一個 rejected request 兩邊都冇寫），
+  而 trips 數目完全不變（`spent.holders.trips`）。
+* 卡片側唔使改：`resolveHolderCount` 已經讀 token_stats（§4.15）。
+
+### 3. 買到咗幾多（誠實量度）
+
+唔係大錢，講清楚：
+
+* probe 一 pass 一個、gap 60 分鐘 ⇒ 上限 24 次/日 ＝ 480 CU/日（§4.14）；
+* 主要受益位係「一個新幣被推之後嗰個 pass」：40–52 卡/月 ⇒ **800–1040 CU/月**；
+* 其餘情況係「同一個幣喺 30 分鐘窗內有人買過」—— 例如第二個 chat 嘅卡被 defer 之後重試。
+
+所以呢一刀買到嘅係**一致性**（兩邊講同一個數）＋一個細但實嘅 CU 位，唔係第二個 28K。
+
+### 4. 刻意冇做：probe 讀 cache
+
+即係「probe 見到 cache 新鮮就唔買」。慳嘅係上面 §3 嗰 800–1040 CU/月，但代價係：
+
+* probe note 要加一個新 counter（唔係 probe 就唔可以報 `probe1`）—— 即係改 `probe/miss/cut` 嘅讀數
+  格式，而呢個 repo 對「讀數唔准講大話」嘅要求高過 20 CU；
+* 若果 TTL 大過 tracker 嘅持有人刷新窗，probe 就會永遠唔買，tracker 嘅持有人數會**凍結**
+  （退化唔明顯，但係真嘅）；
+* 要安全就要多一條規則：只喺 `cachedAt > 該行自己嘅 holders_checked_at` 時重用（即「別人已經讀過，
+  而且比我手上嘅新」），咁 probe 就永遠唔會令自己嗰行變舊。
+
+呢個係一個獨立、要明講嘅改動，應該配自己嘅 note counter，所以留返下一步。
+
+### 5. 落線點驗
+
+1. 一個新 push 之後嘅第一個 tracker pass：`probe` 照舊（probe 冇變），而 `token_stats.holder_count_at`
+   會等於 probe 嗰個 `at`。
+2. `spent.holders.trips` 唔應該上升（同一個 batch 多咗 N 條 statement，但 request 冇多）。
+3. 反向：如果第二個 chat 嘅卡被 defer，佢下一次 enrich 唔應該再買（`tokenOverview.calls` 冇升，而卡面
+   持有人數仍然有值）。
+4. 一致性：同一個幣，`push_watch.holders_last` 同 `token_stats.holder_count` 喺 probe 之後應該逐字一樣。
+
+**測試**（`scripts/test-unit.js`）：`db: the tracker's holder probe shares its reading with the card path,
+in ONE write`（真 DB：一次 write 同時落 push_watch 同 token_stats；`holders_at_push` 由第一次 probe seed；
+卡片側 `holderCountCacheHit` 對 probe 嗰個讀數為 true；rejected batch 兩邊都冇寫；之後嘅 probe 覆寫兩邊）。

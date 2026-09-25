@@ -60,6 +60,32 @@ export function birdeyeUtcDay(at = Date.now()): string {
 const cuPending = new Map<string, number>();
 
 /**
+ * One endpoint's day cell: how many requests were BILLED (`calls`) and what
+ * they cost (`cu`). The CU half is the budget unit; the CALL half is the only
+ * figure that can be checked against Birdeye's own dashboard, which is what
+ * calibrates the price table above — and it keeps the unpriced endpoint
+ * (`topTraders`, charged 0 for want of a published price) visible instead of
+ * silently absent from a CU-only breakdown.
+ */
+export interface BirdeyeCuCell {
+  calls: number;
+  cu: number;
+}
+
+/** Per endpoint, per day (a missing endpoint means "not called that day"). */
+export type BirdeyeCuCounts = Partial<Record<BirdeyeEndpoint, BirdeyeCuCell>>;
+
+/**
+ * The same pending deltas as `cuPending`, split by endpoint. Same isolate
+ * scope, same drain: the totals answer "how much of the month is gone", this
+ * answers "who spent it" — the question every tuning decision in
+ * docs/round-trips.md §4.4 is actually denominated in (the holder probe, the
+ * card path and the periodic backfill are three different callers sharing one
+ * endpoint and one quota).
+ */
+const cuPendingBy = new Map<string, BirdeyeCuCounts>();
+
+/**
  * Charge one request ATTEMPT (`BIRDEYE_CU_PRICES`) — drain-free and never
  * throwing, so it can sit in the client's hot path.
  */
@@ -68,9 +94,15 @@ export function chargeBirdeyeCu(
   at = Date.now(),
 ): void {
   const cu = BIRDEYE_CU_PRICES[endpoint];
-  if (cu <= 0) return;
   const day = birdeyeUtcDay(at);
-  cuPending.set(day, (cuPending.get(day) ?? 0) + cu);
+  // The CU half keeps the early exit an unpriced endpoint has always had: a
+  // call with no recorded price contributes no spend, and an invented number
+  // must never drive a budget decision. Its CALL is still counted below.
+  if (cu > 0) cuPending.set(day, (cuPending.get(day) ?? 0) + cu);
+  const byDay = cuPendingBy.get(day) ?? {};
+  const cell = byDay[endpoint] ?? { calls: 0, cu: 0 };
+  byDay[endpoint] = { calls: cell.calls + 1, cu: cell.cu + cu };
+  cuPendingBy.set(day, byDay);
 }
 
 /** A copy of this isolate's unpersisted CU deltas (day → CU). */
@@ -95,8 +127,83 @@ export function consumeBirdeyeCuDelta(
   }
 }
 
+/** A copy of this isolate's unpersisted per-endpoint deltas (day → counts). */
+export function peekBirdeyeCuByDay(): Map<string, BirdeyeCuCounts> {
+  const out = new Map<string, BirdeyeCuCounts>();
+  for (const [day, counts] of cuPendingBy) {
+    const copy: Record<string, BirdeyeCuCell> = {};
+    for (const [endpoint, cell] of Object.entries(
+      counts as Record<string, BirdeyeCuCell | undefined>,
+    )) {
+      if (cell) copy[endpoint] = { ...cell };
+    }
+    out.set(day, copy as BirdeyeCuCounts);
+  }
+  return out;
+}
+
+/**
+ * Drop the per-endpoint deltas a LANDED write persisted — the exact mirror of
+ * consumeBirdeyeCuDelta, cell by cell, so a charge that arrived while the
+ * write was in flight stays pending on both halves.
+ */
+export function consumeBirdeyeCuByDay(
+  persisted: Map<string, BirdeyeCuCounts>,
+): void {
+  for (const [day, counts] of persisted) {
+    const live = cuPendingBy.get(day);
+    if (!live) continue;
+    const liveRec = live as Record<string, BirdeyeCuCell | undefined>;
+    for (const [endpoint, cell] of Object.entries(
+      counts as Record<string, BirdeyeCuCell | undefined>,
+    )) {
+      if (!cell) continue;
+      const own = liveRec[endpoint];
+      if (!own) continue;
+      const calls = own.calls - cell.calls;
+      const cu = own.cu - cell.cu;
+      if (calls > 0 || cu > 0) {
+        liveRec[endpoint] = { calls: Math.max(0, calls), cu: Math.max(0, cu) };
+      } else {
+        delete liveRec[endpoint];
+      }
+    }
+    if (Object.keys(liveRec).length === 0) cuPendingBy.delete(day);
+  }
+}
+
 /** Pure helper for the durable ledger's day map: the days kept before pruning. */
 export const BIRDEYE_CU_LEDGER_DAYS = 32;
+
+/**
+ * Is a persisted holder count still worth reusing, or must the card path buy
+ * another `/defi/token_overview` (20 CU)?
+ *
+ * The card's holders line is the only thing that request pays for, and it is
+ * bought inside the enrich batch — which the SAME coin re-enters on every tick
+ * it is neither pushed nor finally rejected (a card send deferred by the tick
+ * cut; a gate that rejects this tick and passes the next). Before this rule
+ * each of those entries paid for the same reading again, which is the card-side
+ * share §4.14 measured (docs/round-trips.md).
+ *
+ * `ttlMs <= 0` is the knob turned OFF — always read, the pre-2026-09-25
+ * behaviour (BIRDEYE_HOLDER_CACHE_MIN = 0), and the escape hatch if the call
+ * ever becomes free or the count must be live on every attempt.
+ * `cachedAt <= 0` is the "never written" SENTINEL, not 1970 — the same rule
+ * healthAgeMs follows for the frozen readings (worker.ts): a row whose stamp
+ * was never set must not be mistaken for a fresh reading.
+ */
+export function holderCountCacheHit(
+  cached: number | null,
+  cachedAt: number | null,
+  now: number,
+  ttlMs: number,
+): boolean {
+  if (ttlMs <= 0) return false;
+  if (cached === null || cachedAt === null) return false;
+  if (cachedAt <= 0) return false;
+  return now - cachedAt < ttlMs;
+}
 
 export class BirdeyeClient {
   private readonly throttle: Throttle;

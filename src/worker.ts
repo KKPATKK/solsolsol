@@ -2,9 +2,13 @@ import { webhookCallback, type Bot } from "grammy";
 import {
   BirdeyeClient,
   BIRDEYE_CU_LEDGER_DAYS,
+  BIRDEYE_CU_PRICES,
   birdeyeUtcDay,
+  consumeBirdeyeCuByDay,
   consumeBirdeyeCuDelta,
+  peekBirdeyeCuByDay,
   peekBirdeyeCuDelta,
+  type BirdeyeCuCounts,
 } from "./birdeye";
 import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
@@ -427,6 +431,17 @@ let skipCaptureSyncedAt = 0;
 const BIRDEYE_CU_STATE_KEY = "birdeye_cu_v1";
 
 /**
+ * The same accounting, split by endpoint (see planBirdeyeCuBySync). A SECOND
+ * key rather than a second shape in the first one: `birdeye_cu_v1` is already
+ * durable, already read by /health and already carries the days that predate
+ * this breakdown, and a day total with no split is not the same reading as a
+ * day total whose split is zero. The two rows are written in the SAME batch
+ * and read in the SAME request, so the split costs no round trip — only
+ * payload.
+ */
+const BIRDEYE_CU_BY_STATE_KEY = "birdeye_cu_by_v1";
+
+/**
  * Every durable row the tick tail owns, read in ONE request
  * (Db.readPostScanTelemetry) at the top of syncPushDeferralCounters:
  *
@@ -451,6 +466,7 @@ const TAIL_STATE_KEYS = [
   PUSH_AUDIT_STATE_KEY,
   SKIP_CAPTURE_STATE_KEY,
   BIRDEYE_CU_STATE_KEY,
+  BIRDEYE_CU_BY_STATE_KEY,
 ] as const;
 
 /**
@@ -538,6 +554,124 @@ function birdeyeCuPendingTotal(): number {
 }
 
 /**
+ * Pure parser for the per-endpoint ledger (`{ v: 1, days: { day: counts } }`).
+ * As defensive as the total ledger's: an unknown endpoint name, a negative or
+ * non-finite number and a malformed day key are all dropped, so a hand-edited
+ * or older row degrades to "no reading" instead of feeding a budget decision a
+ * number nobody spent.
+ */
+export function parseBirdeyeCuByLedger(raw: string | null): Record<string, BirdeyeCuCounts> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as { days?: unknown };
+    const days = parsed?.days;
+    if (!days || typeof days !== "object") return {};
+    const known = Object.keys(BIRDEYE_CU_PRICES) as Array<keyof typeof BIRDEYE_CU_PRICES>;
+    const out: Record<string, BirdeyeCuCounts> = {};
+    for (const [day, counts] of Object.entries(days as Record<string, unknown>)) {
+      if (!isBirdeyeDayKey(day) || !counts || typeof counts !== "object") continue;
+      const cells: BirdeyeCuCounts = {};
+      for (const endpoint of known) {
+        const cell = (counts as Record<string, unknown>)[endpoint];
+        if (!cell || typeof cell !== "object") continue;
+        const calls = Number((cell as Record<string, unknown>).calls);
+        const cu = Number((cell as Record<string, unknown>).cu);
+        if (!Number.isFinite(calls) || !Number.isFinite(cu)) continue;
+        if (calls < 0 || cu < 0) continue;
+        if (calls === 0 && cu === 0) continue; // nothing billed here
+        cells[endpoint] = { calls, cu };
+      }
+      if (Object.keys(cells).length > 0) out[day] = cells;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Pure merge for the split ledger: add this isolate's cells to the durable
+ * ones, then apply the SAME retention window the total ledger uses — the two
+ * rows must never disagree about which days exist, or /health would print a
+ * month total whose breakdown is missing the days it covers.
+ */
+export function mergeBirdeyeCuByLedger(
+  durable: Record<string, BirdeyeCuCounts>,
+  delta: Map<string, BirdeyeCuCounts>,
+  now = Date.now(),
+): Record<string, BirdeyeCuCounts> {
+  const next: Record<string, BirdeyeCuCounts> = {};
+  for (const [day, counts] of Object.entries(durable)) {
+    const copy: BirdeyeCuCounts = {};
+    for (const [endpoint, cell] of Object.entries(
+      counts as Record<string, { calls: number; cu: number } | undefined>,
+    )) {
+      if (cell) (copy as Record<string, { calls: number; cu: number }>)[endpoint] = { ...cell };
+    }
+    next[day] = copy;
+  }
+  for (const [day, counts] of delta) {
+    const target =
+      next[day] ?? (next[day] = {} as BirdeyeCuCounts);
+    for (const [endpoint, cell] of Object.entries(
+      counts as Record<string, { calls: number; cu: number } | undefined>,
+    )) {
+      if (!cell) continue;
+      const rec = target as Record<string, { calls: number; cu: number }>;
+      const own = rec[endpoint] ?? { calls: 0, cu: 0 };
+      rec[endpoint] = { calls: own.calls + cell.calls, cu: own.cu + cell.cu };
+    }
+  }
+  const cutoff = birdeyeUtcDay(now - BIRDEYE_CU_LEDGER_DAYS * 86_400_000);
+  for (const day of Object.keys(next)) {
+    if (day < cutoff) delete next[day];
+  }
+  return next;
+}
+
+/** Pure reader for the split ledger: today's cells, plus the month's. */
+export function birdeyeCuByStats(
+  days: Record<string, BirdeyeCuCounts>,
+  now = Date.now(),
+): { today: BirdeyeCuCounts; month: BirdeyeCuCounts } {
+  const day = birdeyeUtcDay(now);
+  const month = day.slice(0, 7);
+  const today: BirdeyeCuCounts = {};
+  const monthCells: BirdeyeCuCounts = {};
+  const add = (target: BirdeyeCuCounts, counts: BirdeyeCuCounts): void => {
+    for (const [endpoint, cell] of Object.entries(
+      counts as Record<string, { calls: number; cu: number } | undefined>,
+    )) {
+      if (!cell) continue;
+      const rec = target as Record<string, { calls: number; cu: number }>;
+      const own = rec[endpoint] ?? { calls: 0, cu: 0 };
+      rec[endpoint] = { calls: own.calls + cell.calls, cu: own.cu + cell.cu };
+    }
+  };
+  for (const [d, counts] of Object.entries(days)) {
+    if (!d.startsWith(month)) continue;
+    add(monthCells, counts);
+    if (d === day) add(today, counts);
+  }
+  return { today, month: monthCells };
+}
+
+/**
+ * The day totals, newest first — what turns `monthCu` (one number whose window
+ * starts wherever the counter was deployed) into a rate an operator can divide
+ * by the days it covers. Reporting only, like every other reader here.
+ */
+export function birdeyeCuRecentDays(
+  days: Record<string, number>,
+  limit = 7,
+): Array<{ day: string; cu: number }> {
+  return Object.entries(days)
+    .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+    .slice(0, Math.max(0, limit))
+    .map(([day, cu]) => ({ day, cu }));
+}
+
+/**
  * Persist this isolate's Birdeye CU delta (see the ledger above). Same
  * discipline as the push-ledger and skip-capture syncs: the READ is
  * unconditional, and the in-memory delta is only cleared after a write that
@@ -552,11 +686,40 @@ export async function syncBirdeyeCu(
   database: Db | null = db,
 ): Promise<void> {
   if (!database) return;
-  const raw = await database.getWorkerState(BIRDEYE_CU_STATE_KEY);
-  const { delta, next } = planBirdeyeCuSync(raw, now);
-  if (!next) return;
-  await database.setWorkerState(BIRDEYE_CU_STATE_KEY, next);
-  consumeBirdeyeCuDelta(delta);
+  // Both rows, ONE read and ONE write — the same shape the tick tail uses
+  // (planPostScanTelemetry), so this seam prices what production pays. The
+  // split's delta is cleared only after the batch that carried it landed,
+  // exactly like the total's.
+  const { delta, next, byDelta, byNext } = planBirdeyeCuSyncGrouped(
+    await database.getWorkerStates([BIRDEYE_CU_STATE_KEY, BIRDEYE_CU_BY_STATE_KEY]),
+    now,
+  );
+  if (!next && !byNext) return;
+  const writes: Array<{ key: string; value: string }> = [];
+  if (next) writes.push({ key: BIRDEYE_CU_STATE_KEY, value: next });
+  if (byNext) writes.push({ key: BIRDEYE_CU_BY_STATE_KEY, value: byNext });
+  await database.setWorkerStatesMany(writes);
+  if (next) consumeBirdeyeCuDelta(delta);
+  if (byNext) consumeBirdeyeCuByDay(byDelta);
+}
+
+/**
+ * Both ledgers planned against the tail's ONE read: the day totals, and the
+ * per-endpoint split that answers WHICH caller spent them. Each half keeps its
+ * own delta so a rejected batch re-offers both instead of clearing either.
+ */
+function planBirdeyeCuSyncGrouped(
+  states: Map<string, string>,
+  now: number,
+): {
+  delta: Map<string, number>;
+  next: string | null;
+  byDelta: Map<string, BirdeyeCuCounts>;
+  byNext: string | null;
+} {
+  const total = planBirdeyeCuSync(states.get(BIRDEYE_CU_STATE_KEY) ?? null, now);
+  const by = planBirdeyeCuBySync(states.get(BIRDEYE_CU_BY_STATE_KEY) ?? null, now);
+  return { ...total, ...by };
 }
 
 /**
@@ -573,6 +736,17 @@ function planBirdeyeCuSync(
   if (delta.size === 0) return { delta, next: null };
   const days = mergeBirdeyeCuLedger(parseBirdeyeCuLedger(raw), delta, now);
   return { delta, next: JSON.stringify({ v: 1, days }) };
+}
+
+/** Same planner for the per-endpoint ledger (see BIRDEYE_CU_BY_STATE_KEY). */
+function planBirdeyeCuBySync(
+  raw: string | null,
+  now: number,
+): { byDelta: Map<string, BirdeyeCuCounts>; byNext: string | null } {
+  const byDelta = peekBirdeyeCuByDay();
+  if (byDelta.size === 0) return { byDelta, byNext: null };
+  const days = mergeBirdeyeCuByLedger(parseBirdeyeCuByLedger(raw), byDelta, now);
+  return { byDelta, byNext: JSON.stringify({ v: 1, days }) };
 }
 
 /**
@@ -902,6 +1076,7 @@ export async function syncPushDeferralCounters(
       );
     }
     if (telemetry.birdeyeDelta) consumeBirdeyeCuDelta(telemetry.birdeyeDelta);
+    if (telemetry.birdeyeByDelta) consumeBirdeyeCuByDay(telemetry.birdeyeByDelta);
     if (telemetry.ledgerMirror) pushLedgerMirror = telemetry.ledgerMirror;
     if (telemetry.skipMirror) skipCaptureMirror = telemetry.skipMirror;
   }
@@ -1119,6 +1294,7 @@ function planPostScanTelemetry(
   skipDelta: SkipDelta | null;
   skipMerged: SkipCaptureState | null;
   birdeyeDelta: Map<string, number> | null;
+  birdeyeByDelta: Map<string, BirdeyeCuCounts> | null;
 } {
   const { states, pushWatch, chats } = tail;
   const writes: Array<{ key: string; value: string }> = [];
@@ -1127,6 +1303,7 @@ function planPostScanTelemetry(
   let skipDelta: SkipDelta | null = null;
   let skipMerged: SkipCaptureState | null = null;
   let birdeyeDelta: Map<string, number> | null = null;
+  let birdeyeByDelta: Map<string, BirdeyeCuCounts> | null = null;
   if (dues.ledger) {
     const raw = states.get(PUSH_LEDGER_STATE_KEY) ?? null;
     const plan = planPushLedgerSync(
@@ -1157,15 +1334,30 @@ function planPostScanTelemetry(
     }
   }
   if (dues.birdeye) {
-    const plan = planBirdeyeCuSync(states.get(BIRDEYE_CU_STATE_KEY) ?? null, now);
+    // Both CU rows from THIS read: the totals and the per-endpoint split that
+    // says which caller spent them (docs/round-trips.md §4.14). One read, one
+    // batch — the split adds payload, never a round trip.
+    const plan = planBirdeyeCuSyncGrouped(states, now);
     if (plan.next) {
       writes.push({ key: BIRDEYE_CU_STATE_KEY, value: plan.next });
       birdeyeDelta = plan.delta;
     }
+    if (plan.byNext) {
+      writes.push({ key: BIRDEYE_CU_BY_STATE_KEY, value: plan.byNext });
+      birdeyeByDelta = plan.byDelta;
+    }
   }
   // Nothing is landed here: the caller owns the one batch and applies these
   // only after it resolves (a rejected batch leaves every delta pending).
-  return { writes, ledgerMirror, skipMirror, skipDelta, skipMerged, birdeyeDelta };
+  return {
+    writes,
+    ledgerMirror,
+    skipMirror,
+    skipDelta,
+    skipMerged,
+    birdeyeDelta,
+    birdeyeByDelta,
+  };
 }
 
 /**
@@ -4195,6 +4387,10 @@ export default {
         monthCu: number;
         pendingCu: number;
         monthlyMax: number;
+        /** Day totals, newest first: `monthCu` as a rate (see the helper). */
+        recentDays: Array<{ day: string; cu: number }>;
+        /** WHICH endpoint spent it, today and month-to-date (§4.14). */
+        byEndpoint: { today: BirdeyeCuCounts; month: BirdeyeCuCounts };
       } | null = null;
       try {
         // The two arrival records in ONE read (was two): the claim-riding
@@ -4211,6 +4407,11 @@ export default {
           // batches these keys into one request, so it costs no extra round
           // trip) — see WRITE_DRAIN_ERROR_KEY in src/tickprobe.ts.
           "write_drain_error",
+          // Both CU ledgers ride this batch too: /health used to read the
+          // total on its own round trip, and the per-endpoint split would
+          // have been a third. Same request, so the breakdown is free.
+          BIRDEYE_CU_STATE_KEY,
+          BIRDEYE_CU_BY_STATE_KEY,
         ]);
         const rawTotal = tickState?.get("scheduled_tick_total") ?? null;
         const rawAt = tickState?.get("scheduled_tick_at") ?? null;
@@ -4235,14 +4436,25 @@ export default {
         enabledChats = (await db?.listEnabledChats())?.length ?? null;
         tokenStatsCount = (await db?.countTokenStats()) ?? null;
         pushedTotal = (await db?.countSeenTokens()) ?? null;
-        const rawCu = await db?.getWorkerState(BIRDEYE_CU_STATE_KEY);
+        const cuDays = parseBirdeyeCuLedger(
+          tickState?.get(BIRDEYE_CU_STATE_KEY) ?? null,
+        );
         birdeyeCu = {
-          ...birdeyeCuStats(parseBirdeyeCuLedger(rawCu ?? null)),
+          ...birdeyeCuStats(cuDays),
           // This isolate's unpersisted spend is real spend too: the durable
           // row only moves when the throttled sync lands, so the stored
           // total alone under-reads for up to one sync gap.
           pendingCu: birdeyeCuPendingTotal(),
           monthlyMax: cfg?.birdeyeMonthlyCuMax ?? BIRDEYE_MONTHLY_CU_DEFAULT,
+          // The month total alone cannot say whether 46K CU of spend is the
+          // holder probe, the card path or a debug endpoint — and the probe
+          // and the card share `/defi/token_overview`, so only the CALL
+          // count (calibratable against Birdeye's own dashboard) plus the
+          // pass note's `probe<N>` can separate them.
+          recentDays: birdeyeCuRecentDays(cuDays),
+          byEndpoint: birdeyeCuByStats(
+            parseBirdeyeCuByLedger(tickState?.get(BIRDEYE_CU_BY_STATE_KEY) ?? null),
+          ),
         };
       } catch {
         // telemetry only — never fail /health over the reads
