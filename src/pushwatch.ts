@@ -1414,6 +1414,85 @@ export function evaluateWatch(
     );
   }
 
+  // ── The 🚀 ladder is NOT paced ──────────────────────────────────────────
+  // The cooldown below is a PACING rule: it exists so a card that can REPEAT
+  // cannot repeat inside the window (the same ⚠️ depth re-arming, an ignition
+  // re-firing on every bounce). A first-time 🚀 stage is not a repeat, and its
+  // once-only guarantee is the PERSISTENT up_stages mark, not the clock — that
+  // mark is exactly what replaced the lastState memory which produced three 🚀
+  // JEFFERY cards in an hour. Gating a milestone on the clock therefore bought
+  // nothing and cost the thing the row exists to report: a band crossed while
+  // the row was still cooling was neither announced NOR marked, so a coin that
+  // never traded above that band again never announced it at all — the first
+  // card the reader saw named every stage ABOVE it (live 2026-09-25: ALCHEMY
+  // `推送時 $142.44K → $476.12K (+234%)` and parafactual +473%, one card each).
+  // Same reasoning as the 🩸 card above, which already runs outside this gate;
+  // there the streak plus SELL_DOM_PACE_MS keep it quiet, here the mark is
+  // enough. Everything else inside the gate below is unchanged.
+  // Rising stages: fire the highest crossed stage not yet announced.
+  // Memory lives in the PERSISTENT up_stages column — lastState is shared
+  // with ⚠️/🔥 and gets wiped by them, which re-announced the same
+  // milestone (three 🚀 JEFFERY cards in one hour). The card also names
+  // the NEXT milestone so every card carries forward-looking info.
+  // The SAME set the drain confirmation maintains above (it started as a
+  // copy of this column), so a disarm written by that rule is never re-added
+  // by a stage write here.
+  const firedStages = marks;
+  if (lastState?.startsWith("up")) firedStages.add(lastState);
+  const preFireStages = [...firedStages].sort().join(",");
+  // `mcap_at_push` is the base every % on the cards below is measured from,
+  // and it has THREE writers (docs/push-baseline-ledger.md): the scanner's
+  // gate value and the self-heal's re-seed from the ledger — both the
+  // push-time mcap — plus the revival reset, which is NOT (it is the mcap
+  // observed at the revival). Calling all three 推送時 is how a revived row
+  // came to be quoted at "推送時 $325.23K" hours after its own 🟢 card had
+  // named the ×1.5 floor ($97.12K) as the thing being reset — live
+  // 2026-09-25, GETF. The revival leaves a `base:` mark, so the label can
+  // say which base this is.
+  const baseLabel = revivedBaseline(firedStages, row.mcapAtPush)
+    ? "復活基準"
+    : "推送時";
+  for (let i = RISING_STAGES.length - 1; i >= 0; i--) {
+    const stage = RISING_STAGES[i];
+    const state = `up${stage}`;
+    if (chgSincePush >= stage && !firedStages.has(state)) {
+      const bs =
+        live.buysH1 + live.sellsH1 > 0
+          ? `${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1`
+          : "—";
+      const nextStage = i + 1 < RISING_STAGES.length ? RISING_STAGES[i + 1] : null;
+      // Which stages THIS card is the first announcement for. More than one
+      // = the ladder was crossed between two checks, and the card says so
+      // (see risingCardTail): the mark loop below would otherwise fold them
+      // in silently, which reads from the chat as "the +200% notice was
+      // lost". Live 2026-09-25 06:49 HKT: parafactual was pushed at
+      // 115_199, troughed at 71_254, and was next seen at +473%.
+      const crossed = newlyCrossedStages(stage, firedStages);
+      fire(
+        "rising",
+        `🚀 續漲 ${symbol} | ${baseLabel} ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
+          risingCardTail(crossed, nextStage),
+        state,
+      );
+      // EVERY crossed stage is marked, not just this one. The memory walk
+      // used to advance ONE milestone per cooldown window, highest first, so
+      // a coin that gapped several stages in one tick (POPEYE: push → +230%)
+      // produced a card per window in DESCENDING order — "下一關 +400%", then
+      // "+200%", then "+100%" — each reporting the same move. A milestone
+      // already sailed past is history, and every card names the next one
+      // above it, so announcing the crossing once loses nothing.
+      for (let j = 0; j <= i; j++) firedStages.add(`up${RISING_STAGES[j]}`);
+      lastState = state;
+      break; // one card per crossing, however many stages it spans
+    }
+  }
+  {
+    const csv = [...firedStages].sort().join(",");
+    if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
+      announcedUpStages = csv;
+    }
+  }
+
   if (cooledDown) {
     // Volume ignition (early-warning, pre-🚀 only): dormant tape suddenly
     // prints a big 5m volume bar.
@@ -1429,70 +1508,6 @@ export function evaluateWatch(
         "ignite",
       );
       lastState = "ignite";
-    }
-
-    // Rising stages: fire the highest crossed stage not yet announced.
-    // Memory lives in the PERSISTENT up_stages column — lastState is shared
-    // with ⚠️/🔥 and gets wiped by them, which re-announced the same
-    // milestone (three 🚀 JEFFERY cards in one hour). The card also names
-    // the NEXT milestone so every card carries forward-looking info.
-    // The SAME set the drain confirmation maintains above (it started as a
-    // copy of this column), so a disarm written by that rule is never re-added
-    // by a stage write here.
-    const firedStages = marks;
-    if (lastState?.startsWith("up")) firedStages.add(lastState);
-    const preFireStages = [...firedStages].sort().join(",");
-    // `mcap_at_push` is the base every % on the cards below is measured from,
-    // and it has THREE writers (docs/push-baseline-ledger.md): the scanner's
-    // gate value and the self-heal's re-seed from the ledger — both the
-    // push-time mcap — plus the revival reset, which is NOT (it is the mcap
-    // observed at the revival). Calling all three 推送時 is how a revived row
-    // came to be quoted at "推送時 $325.23K" hours after its own 🟢 card had
-    // named the ×1.5 floor ($97.12K) as the thing being reset — live
-    // 2026-09-25, GETF. The revival leaves a `base:` mark, so the label can
-    // say which base this is.
-    const baseLabel = revivedBaseline(firedStages, row.mcapAtPush)
-      ? "復活基準"
-      : "推送時";
-    for (let i = RISING_STAGES.length - 1; i >= 0; i--) {
-      const stage = RISING_STAGES[i];
-      const state = `up${stage}`;
-      if (chgSincePush >= stage && !firedStages.has(state)) {
-        const bs =
-          live.buysH1 + live.sellsH1 > 0
-            ? `${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1`
-            : "—";
-        const nextStage = i + 1 < RISING_STAGES.length ? RISING_STAGES[i + 1] : null;
-        // Which stages THIS card is the first announcement for. More than one
-        // = the ladder was crossed between two checks, and the card says so
-        // (see risingCardTail): the mark loop below would otherwise fold them
-        // in silently, which reads from the chat as "the +200% notice was
-        // lost". Live 2026-09-25 06:49 HKT: parafactual was pushed at
-        // 115_199, troughed at 71_254, and was next seen at +473%.
-        const crossed = newlyCrossedStages(stage, firedStages);
-        fire(
-          "rising",
-          `🚀 續漲 ${symbol} | ${baseLabel} ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
-            risingCardTail(crossed, nextStage),
-          state,
-        );
-        // EVERY crossed stage is marked, not just this one. The memory walk
-        // used to advance ONE milestone per cooldown window, highest first, so
-        // a coin that gapped several stages in one tick (POPEYE: push → +230%)
-        // produced a card per window in DESCENDING order — "下一關 +400%", then
-        // "+200%", then "+100%" — each reporting the same move. A milestone
-        // already sailed past is history, and every card names the next one
-        // above it, so announcing the crossing once loses nothing.
-        for (let j = 0; j <= i; j++) firedStages.add(`up${RISING_STAGES[j]}`);
-        lastState = state;
-        break; // one card per crossing, however many stages it spans
-      }
-    }
-    {
-      const csv = [...firedStages].sort().join(",");
-      if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
-        announcedUpStages = csv;
-      }
     }
 
     // Weak: meaningful runup then ≥35% off the peak. Depth-staged with

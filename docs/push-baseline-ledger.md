@@ -724,3 +724,55 @@ Operator 報告（2026-09-25）：02:57 HKT 收到
 唔會被 `addCutMarks` 清走（佢只剝自己嘅 `p:` mark）、`terminalRowIssues` 亦完全唔讀 mark。
 比對係**值**而唔係淨係「有冇 mark」：若果之後有另一個 writer 移動過基準（self-heal 由帳本
 re-seed 返真推送值），標籤會自動跌返 `推送時` —— 咁樣先至啱。
+
+---
+
+## 第十三補：梯級唔應該被 pacing 吞
+
+Operator 報告（2026-09-25）：07:59 HKT 收到
+`🚀 續漲 ALCHEMY | 推送時 $142.44K → $476.12K (+234%) | … | 下一關 +400%`，
+但之前**冇**收過「死而復生」，亦冇任何低一級嘅「續漲」。06:49 HKT 嘅 parafactual
+（`+473%`）同一個形狀。
+
+**呢個唔係漏發，係兩個獨立嘅洞。**
+
+### 1. Pacing 吞咗梯級（已修）
+
+`cooledDown = now - row.lastAlertAt >= cooldownMs`（預設 30 分鐘）開喺
+`if (cooledDown) {`，而**整個 🚀 梯級**（`RISING_STAGES = [50,100,200,400]`）就住喺
+嗰個 block 入面。結果：冷卻期內被觀察到嘅新關卡**唔發卡、亦唔寫 mark**；
+若果價位冇再上返嗰一關，嗰個里程碑**永遠唔會公佈**，而下一張卡（冷卻過後）就係
+「最高里程碑」。ALCHEMY 就係咁：`23:05:04Z` 🩸 卡武裝冷卻 → `23:35` 解封，
+而 `23:59:59.859Z` 嗰張卡嘅 `crossed` 係 `+50%/+100%/+200%` 三關。
+
+**但呢兩個洞唔一定係同一個，唔好混為一談。** ALCHEMY 嗰張卡自己報 `5m +116%`，
+即係五分鐘前價已經 ≈ +54%（早就跨過 +50% 關）；如果 23:35–23:59 之間任何一次檢查
+睇到嗰個價，舊碼會吞（§1），但條 row 好可能**根本冇被評估過**（§2）—— 兩件事都真，
+要分開講：呢個 patch 只收得死 §1。
+
+Cooldown 係 **pacing** 規則：佢防「可以重複嘅卡」喺窗口內重複（同一個 ⚠️ 深度
+re-arm、🔥 ignition 每次反彈 re-fire）。第一次跨關卡**唔係重複**，佢嘅 once-only
+保證係 **`up_stages` 嗰個持久 mark** —— 正正就係取代 `lastState` 記憶、收掉
+「三張 🚀 JEFFERY 一小時」嗰件工具。🩸 sell-pressure 卡早就用同一理由行喺 gate
+外面（`SELL_DOM_PACE_MS`）；🚀 嘅 pace 就係 mark 本身。
+
+**修正**（`docs/patches/bands-not-paced.apply.js`）：梯級搬出 gate，其餘規則
+（🔥 ignition、⚠️ weak、持倉、divergence、drain/disarm）一律留在 gate 內。
+相對次序不變（梯級同 🔥 互斥：🔥 要求 `chgSincePush < RISING_STAGES[0]`），
+`dead` / `revive` 兩條 path 都喺之前 `return`，所以屍體唔會發 🚀。
+
+### 2. 取樣下限同觀察缺口（未修，講清楚）
+
+Tracker 每個 tick 為 head 30 行攞一次價（live `rows 30/30 pairs 30/30`），
+31 條 active row ⇒ 每行 **~1.03 ticks ≈ 60s**，而 cron 下限本身就係一分鐘。
+所以一次檢查之內跨完嘅梯級，**冇**任何 live 取樣捕捉得到；再加 `pairs-empty`
+（DexScreener 429）、`deferred:subreq-budget`、tick 死亡，條 row 可以幾分鐘
+完全冇被評估。呢類個案仍然係「一張卡講明跨咗邊幾關」（第十一補）——
+唯一可以再進一步嘅方向係用 1m K 線重建兩次檢查之間嘅價格路徑（未做）。
+
+### 驗證
+
+新測試 `evaluateWatch: a band crossed while the row is paced still fires`：
+同一行喺 pacing 之內 `+60%` → 出 `up50` 卡（`下一關 +100%`）；一分鐘後 `+120%`
+→ 出 `up100` 卡；同一關再見到（已 mark）→ 0 張；🔥 ignition 喺窗口內仍然 0 張、
+窗口過後 1 張。

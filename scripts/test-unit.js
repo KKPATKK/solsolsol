@@ -7326,7 +7326,7 @@ async function main() {
     assert.equal(out.alerted, 0);
   });
 
-  await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {
+  await test("evaluateWatch: rising stages fire once each; the mark suppresses, not the clock", () => {
     const row = (over = {}) => ({
       token: "T", chatId: "c", symbol: "GOAT", pushedAt: 0,
       mcapAtPush: 50_000, peakMcap: 50_000, lastLiquidity: 30_000,
@@ -7344,7 +7344,10 @@ async function main() {
     assert.match(r1.alerts[0].text, /續漲 GOAT/);
     assert.equal(r1.lastState, "up50");
 
-    // Same stage again within cooldown → no alert, but bookkeeping updates.
+    // Same stage again while the row is still paced → no alert, but
+    // bookkeeping updates. Note WHICH thing silences it: the mark (`up50` is
+    // in `lastState` here), not the clock — the clock used to swallow the
+    // crossing TOO, which is what the pacing test below pins down.
     const r2 = evaluateWatch(row({ lastState: "up50", lastAlertAt: 3600_000 }), 3600_000 + 60_000, live(85_000), cfg);
     assert.equal(r2.alerts.length, 0);
     assert.equal(r2.peakMcap, 85_000);
@@ -7389,6 +7392,73 @@ async function main() {
     assert.deepEqual(newlyCrossedStages(400, new Set(["up50", "up100"])), [200, 400]);
     assert.deepEqual(newlyCrossedStages(200, new Set(["up50", "up100", "up200"])), []);
     assert.deepEqual(newlyCrossedStages(50, new Set(["w35", "up400"])), [50]);
+  });
+
+  await test("evaluateWatch: a band crossed while the row is paced still fires", () => {
+    // The cooldown is PACING, not memory. It exists so a card that can REPEAT
+    // cannot repeat inside the window; a first-time 🚀 stage is not a repeat,
+    // and the PERSISTENT up_stages mark — not the clock — is what keeps it
+    // once-only. Gating the ladder on the clock bought nothing and cost the
+    // milestone itself: live 2026-09-25 the first ALCHEMY card the operator
+    // saw was `推送時 $142.44K → $476.12K (+234%)` with +50/+100/+200 named
+    // as crossed, because the bands were crossed while the row was cooling.
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "GOAT", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 50_000, lastLiquidity: 30_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const live = (mcap) => ({ mcap, liquidity: 30_000, chg5m: 5, buysH1: 200, sellsH1: 100 });
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const now = 3600_000;
+
+    // A ⚠️/🩸 card fired a minute ago, so the row is paced for another 29 min.
+    const r1 = evaluateWatch(row({ lastAlertAt: now - 60_000 }), now, live(80_000), cfg);
+    assert.equal(r1.alerts.length, 1, "a first-time band is announced when it is seen");
+    assert.equal(r1.alerts[0].sig, "up50");
+    assert.match(r1.alerts[0].text, /下一關 \+100%/, "and still names the next one");
+
+    // One check later the +100% band gets its OWN card instead of being folded
+    // into a later +200%/+400% card, which is the whole point of the fix.
+    const r2 = evaluateWatch(
+      row({ lastState: "up50", lastAlertAt: now, upStages: "up50" }),
+      now + 60_000,
+      live(110_000),
+      cfg,
+    );
+    assert.equal(r2.alerts.length, 1);
+    assert.equal(r2.alerts[0].sig, "up100");
+
+    // The mark, not the clock, keeps it once-only: the same stage seen again
+    // while the row is still paced stays silent.
+    const r3 = evaluateWatch(
+      row({ lastState: "up100", lastAlertAt: now + 60_000, upStages: "up50,up100" }),
+      now + 120_000,
+      live(112_000),
+      cfg,
+    );
+    assert.equal(r3.alerts.length, 0, "an announced stage does not repeat inside the window");
+
+    // Everything else in the gate is still paced: a dormant tape printing its
+    // first big 5m volume bar inside the window fires nothing …
+    const vol = { mcap: 52_000, liquidity: 30_000, chg5m: 5, vol5m: 40_000, buysH1: 200, sellsH1: 100 };
+    const ignitionHeld = evaluateWatch(
+      row({ lastAlertAt: now - 60_000, lastVol5m: 5_000 }),
+      now,
+      vol,
+      cfg,
+    );
+    assert.equal(ignitionHeld.alerts.length, 0, "ignition is still paced by the cooldown");
+    // … and fires once the window has passed.
+    const ignitionDue = evaluateWatch(
+      row({ lastAlertAt: now - 31 * 60_000, lastVol5m: 5_000 }),
+      now,
+      vol,
+      cfg,
+    );
+    assert.equal(ignitionDue.alerts.length, 1);
+    assert.equal(ignitionDue.alerts[0].sig, "ignite");
   });
 
   await test("evaluateWatch: weak, dead stops tracking, liquidity crash, holder growth", () => {
@@ -7492,6 +7562,12 @@ async function main() {
       mcapAtPush: 50_000, peakMcap: 126_000, lastLiquidity: 12_000,
       holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
       lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0, lastState: "up100",
+      // The ladder's memory, COMPLETE for a row that peaked at +152% (the
+      // same lesson the 🚨 drain rule teaches: a state column is not a mark.
+      // Without it these fixtures report the bands the row never announced —
+      // the one-time backfill the JEFFERY test covers — and pick up a 🚀 card
+      // that has nothing to do with the 💧/rug question being asked here.
+      upStages: "up50,up100,up200",
       ...over,
     });
     const cfg = { cooldownMs: 0 };
@@ -7504,7 +7580,12 @@ async function main() {
     assert.match(r.alerts[0].text, /下一次檢查仍低於地板就會停止追蹤/);
     assert.equal(r.lastState, "up100", "a warning is not a state change");
     assert.equal(r.stopTracking, false);
-    assert.equal(r.announcedUpStages, DRAIN_CONFIRM_MARK);
+    // The arm writes the confirm mark TOGETHER with the row's stage marks —
+    // one column carries both, which is what keeps a 💧-warning row's ladder
+    // memory alive (replacing it would re-announce every band it already
+    // announced). It reads as `DRAIN_CONFIRM_MARK` alone only for a row whose
+    // column held nothing else.
+    assert.equal(r.announcedUpStages, "liq1,up100,up200,up50");
 
     // The SAME row one reading later, still under the floor → terminal, with
     // no rising card even though mcap shows +300% (that number is the zombie).
