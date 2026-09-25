@@ -427,6 +427,61 @@ export interface ScheduledTickEntry {
   ring: number[];
 }
 
+/**
+ * The scan front's ONE read (2026-09-25, docs/round-trips.md §4.13): the
+ * `worker_state` rows the front's maintenance legs gate on, plus the enabled
+ * chats — one libsql `batch`, so the row set is exactly what it was and only the
+ * round trips are gone.
+ *
+ * Before this every leg paid its own single-row lookup on EVERY tick:
+ *
+ *   - the enabled-chats listing (the scan's first read);
+ *   - the launch_ms migration's completion flag (Db.resumeLaunchBackfill);
+ *   - the token_stats prune's interval stamp (Db.pruneOldTokenStats);
+ *   - the Birdeye new-listing backfill's interval stamp
+ *     (Scanner.runPeriodicBackfill).
+ *
+ * Four subrequests out of the invocation's 50, for one `worker_state` lookup
+ * with a chat row beside it — the same shape the tick tail already pays
+ * (Db.readPostScanTelemetry, §4.12). The writing half is Db.writeScanFront.
+ *
+ * A key that is ABSENT from `gates` is a row that was never written, which is a
+ * different reading from "not read at all": a caller that passes a front must
+ * treat a missing key as null and must NOT re-read (see Db.gateOf).
+ */
+export interface ScanFront {
+  /** `worker_state` rows by key, as of this read (absent = never written). */
+  gates: Map<string, string>;
+  /** Same projection and ordering as listEnabledChats. */
+  chats: ChatSettings[];
+  /** Bookkeeping the front's legs queue for its ONE write (Db.writeScanFront). */
+  writes: ScanFrontWrite[];
+}
+
+/** One queued front bookkeeping row (see Db.writeScanFront). */
+export interface ScanFrontWrite {
+  key: string;
+  value: string;
+  /**
+   * ADD the value to the row's INTEGER cast instead of replacing it — the
+   * telemetry-counter shape (Db.bumpTelemetryCounter). The SQL is that
+   * method's, verbatim.
+   */
+  add?: boolean;
+}
+
+/**
+ * The front's gate keys, in one place so the read and the legs cannot drift:
+ * the launch_ms migration flag, the token_stats prune stamp and the Birdeye
+ * backfill stamp. Every one of them is a "when did this job last run" row,
+ * read once per tick.
+ */
+export const SCAN_FRONT_GATE_KEYS = [
+  "schema_alter_v2_done",
+  "token_stats_last_prune",
+  "birdeye_backfill_at",
+] as const;
+
 export class Db {
   /**
    * Entries kept in the shared delivery ring (see recordPushDelivery).
@@ -586,6 +641,111 @@ export class Db {
       })),
       "write",
     );
+  }
+
+  /**
+   * The scan front in ONE read request: the gate rows above plus the enabled
+   * chats. Read with a `batch` rather than two awaits for the reason the tail's
+   * grouped read exists — the invocation's 50 subrequests are the binding
+   * constraint and Turso round trips are 63-83% of them.
+   *
+   * `stateKeys` is non-empty by contract (the scan passes SCAN_FRONT_GATE_KEYS);
+   * an empty array falls back to the chats-only read, so a caller with nothing to
+   * gate on still pays one request and not a throw.
+   */
+  async readScanFront(
+    stateKeys: readonly string[] = SCAN_FRONT_GATE_KEYS,
+  ): Promise<ScanFront> {
+    const chats = {
+      sql: "SELECT * FROM chat_settings WHERE enabled = 1",
+      args: [] as Array<string | number | null>,
+    };
+    const state = {
+      sql: `SELECT key, value FROM worker_state WHERE key IN (${stateKeys
+        .map(() => "?")
+        .join(",")})`,
+      args: [...stateKeys] as Array<string | number | null>,
+    };
+    const res = await this.get().batch(
+      stateKeys.length === 0 ? [chats] : [state, chats],
+      "read",
+    );
+    const gates = new Map<string, string>();
+    if (stateKeys.length > 0) {
+      for (const row of res[0]?.rows ?? []) {
+        const r = row as Record<string, unknown>;
+        gates.set(String(r.key), String(r.value));
+      }
+    }
+    const chatRows = res[stateKeys.length === 0 ? 0 : 1]?.rows ?? [];
+    return {
+      gates,
+      chats: chatRows.map((row) => this.mapRow(row as Record<string, unknown>)),
+      writes: [],
+    };
+  }
+
+  /**
+   * The front's ONE write: every bookkeeping row its legs queued, in one request.
+   * A rejected batch leaves all of them unwritten, which is exactly what the
+   * separate writes reached — each row answers "when did this job last run", so
+   * the next tick re-derives it (see Scanner.flushScanFront).
+   */
+  async writeScanFront(entries: readonly ScanFrontWrite[]): Promise<void> {
+    if (entries.length === 0) return;
+    await this.get().batch(
+      entries.map((e) =>
+        e.add
+          ? {
+              sql: "INSERT INTO worker_state (key, value) VALUES (?, ?)" +
+                " ON CONFLICT(key) DO UPDATE SET" +
+                " value = CAST(value AS INTEGER) + excluded.value",
+              args: [e.key, e.value],
+            }
+          : {
+              sql: "INSERT INTO worker_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+              args: [e.key, e.value],
+            },
+      ),
+      "write",
+    );
+  }
+
+  /**
+   * One front gate: the value the front's single read carried, or a read of its
+   * own when the caller has no front (a command handler, a diagnostic, a test).
+   * A key missing from the map is the row being absent — presence in the map is
+   * what says the read happened, so this never turns "not read" into "no row".
+   */
+  private async gateOf(
+    front: ScanFront | null | undefined,
+    key: string,
+  ): Promise<string | null> {
+    if (front) return front.gates.get(key) ?? null;
+    return this.getWorkerState(key);
+  }
+
+  /**
+   * Queue one front bookkeeping row on the front's single batch, or write it on
+   * its own when there is no front. A zero ADD delta is not queued at all — the
+   * same no-op bumpTelemetryCounter makes (see writeScanFront).
+   */
+  private async frontStamp(
+    front: ScanFront | null | undefined,
+    key: string,
+    value: string,
+    add = false,
+  ): Promise<void> {
+    if (front) {
+      if (add && Number(value) === 0) return;
+      front.writes.push({ key, value, add });
+      return;
+    }
+    if (add) {
+      await this.bumpTelemetryCounter(key, Number(value));
+      return;
+    }
+    await this.setWorkerState(key, value);
   }
 
   /**
@@ -1705,13 +1865,20 @@ export class Db {
    * only set once no NULL rows remain (a chunk < 5000 means the subquery's
    * LIMIT didn't cap — there are no NULL rows left to collect).
    */
-  async resumeLaunchBackfill(budgetMs: number): Promise<boolean> {
-    if (await this.getWorkerState("schema_alter_v2_done")) return true;
+  async resumeLaunchBackfill(
+    budgetMs: number,
+    front?: ScanFront | null,
+  ): Promise<boolean> {
+    // The gate rides the front's ONE read on a tick (see readScanFront): this
+    // is a per-tick single-row lookup until the flag is set.
+    if (await this.gateOf(front, "schema_alter_v2_done")) return true;
     const deadline = Date.now() + budgetMs;
     for (let i = 0; i < 4 && Date.now() < deadline; i++) {
       const updated = await this.backfillLaunchChunk();
       if (updated < 5000) {
-        await this.setWorkerState("schema_alter_v2_done", "1");
+        // Queued on the front's ONE batch when a tick is driving (see
+        // writeScanFront); a standalone caller writes it here as before.
+        await this.frontStamp(front, "schema_alter_v2_done", "1");
         console.log("[db] launch_ms backfill complete");
         return true;
       }
@@ -3857,8 +4024,13 @@ export class Db {
    * idx_token_stats_first_seen and stops at LIMIT; NOT EXISTS probes the
    * seen_tokens index per candidate.
    */
-  async pruneOldTokenStats(olderThanMs: number): Promise<number> {
-    const lastPrune = await this.getWorkerState("token_stats_last_prune");
+  async pruneOldTokenStats(
+    olderThanMs: number,
+    front?: ScanFront | null,
+  ): Promise<number> {
+    // The interval gate rides the front's ONE read on a tick (see
+    // readScanFront): it is asked on EVERY tick, due or not.
+    const lastPrune = await this.gateOf(front, "token_stats_last_prune");
     if (lastPrune !== null && Date.now() - Number(lastPrune) < TOKEN_STATS_PRUNE_INTERVAL_MS) {
       return 0; // not due yet — the table can hold 10 min of extra rows safely
     }
@@ -3878,8 +4050,11 @@ export class Db {
     }
     // Keep the /health count fresh (NOT EXISTS probes the seen_tokens index
     // per candidate instead of materializing the whole table like NOT IN did).
-    await this.bumpTelemetryCounter("telemetry_token_stats_count", -deleted);
-    await this.setWorkerState("token_stats_last_prune", String(Date.now()));
+    // The prune's two bookkeeping rows go on the front's ONE batch (see
+    // writeScanFront), so a due prune costs the deletes plus no extra round trip
+    // for the counter and the stamp. No front = the old two writes, verbatim.
+    await this.frontStamp(front, "telemetry_token_stats_count", String(-deleted), true);
+    await this.frontStamp(front, "token_stats_last_prune", String(Date.now()));
     return deleted;
   }
 

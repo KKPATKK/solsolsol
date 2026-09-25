@@ -780,6 +780,12 @@ const CENSUS_METHODS = [
   "claimScanLock",
   "releaseScanLock",
   "getReevalPool",
+  // The scan front's ONE read + ONE write (src/db.ts, docs/round-trips.md §4.13):
+  // in the census because the merge's whole promise is a ROUND TRIP count — the
+  // rows it carries used to arrive as `getWorkerState` ×3 + `listEnabledChats`,
+  // and a batching decision has to be readable from the same census that made it.
+  "readScanFront",
+  "writeScanFront",
   "isTokenSeen",
   "listSeenTokens",
   "getTokenStats",

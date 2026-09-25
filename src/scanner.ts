@@ -2,7 +2,12 @@ import type { Bot } from "grammy";
 import { tradeKeyboard } from "./bot";
 import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
-import type { Db, TokenStats } from "./db";
+import {
+  SCAN_FRONT_GATE_KEYS,
+  type Db,
+  type ScanFront,
+  type TokenStats,
+} from "./db";
 import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreener";
 import { fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
@@ -1533,6 +1538,46 @@ export class Scanner {
       /* a stamp is telemetry */
     }
   }
+
+  /**
+   * Land the front's queued bookkeeping in ONE write request (see
+   * Db.writeScanFront). Idempotent: an empty buffer is a no-op, so the normal
+   * path (after the pool phase) and the scan's `finally` (every early return)
+   * can both call it and only ever pay for one batch. A rejected batch is logged
+   * and swallowed — each row answers "when did this maintenance job last run",
+   * which the next tick re-derives, and the scan must never fail over
+   * bookkeeping.
+   */
+  private async flushScanFront(): Promise<void> {
+    const front = this.scanFront;
+    if (!front || front.writes.length === 0) return;
+    // Emptied BEFORE the write: a rejected batch must not be re-offered, or the
+    // prune's counter would be added twice.
+    const writes = front.writes;
+    front.writes = [];
+    try {
+      await this.db.writeScanFront(writes);
+    } catch (err) {
+      console.error(
+        "[scanner] scan-front bookkeeping write failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
+   * Queue one front bookkeeping row on the tick's single write, or write it on
+   * its own when there is no front (a standalone Scanner).
+   */
+  private async stampFront(key: string, value: string): Promise<void> {
+    const front = this.scanFront;
+    if (front) {
+      front.writes.push({ key, value });
+      return;
+    }
+    await this.db.setWorkerState(key, value);
+  }
+
   /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
@@ -1555,6 +1600,14 @@ export class Scanner {
    * soon as the flag is set — no extra DB reads forever after.
    */
   private launchBackfillDone = false;
+  /**
+   * The tick's front read (see Db.readScanFront): the enabled chats and the
+   * three maintenance gate rows, in ONE request, plus the write buffer the
+   * front's legs queue their bookkeeping on (Db.writeScanFront). Null outside a
+   * tick — a standalone Scanner — where each leg falls back to its own
+   * single-row read, exactly as it did before this existed.
+   */
+  private scanFront: ScanFront | null = null;
   /**
    * Start offset of the current tick's pool rotation slice (see
    * RE_EVAL_PER_TICK_MAX). Advances by the slice length each tick and wraps,
@@ -2484,7 +2537,17 @@ export class Scanner {
       }
     }, SCAN_TIMEOUT_MS);
     try {
-      const chats = await this.db.listEnabledChats();
+      // THE FRONT'S ONE READ (see Db.readScanFront): the enabled chats and the
+      // three `worker_state` gate rows the front's maintenance legs consult
+      // (schema_alter_v2_done / token_stats_last_prune / birdeye_backfill_at),
+      // in ONE request. Each of those legs used to pay its own single-row lookup
+      // on EVERY tick — four subrequests out of the invocation's 50 for what is
+      // one `worker_state` lookup with a chat row beside it (docs/round-trips.md
+      // §4.13). The projection and ordering of the chats half are unchanged
+      // (Db.readScanFront issues the same SELECT listEnabledChats does).
+      const front = await this.db.readScanFront(SCAN_FRONT_GATE_KEYS);
+      this.scanFront = front;
+      const chats = front.chats;
       if (chats.length === 0) {
         console.log("[scanner] no chats with push enabled, skipping");
         this.lastSkip = "no-chats-enabled";
@@ -2992,7 +3055,7 @@ export class Scanner {
       if (!this.launchBackfillDone) {
         if (this.shouldStopEarly()) return;
         try {
-          this.launchBackfillDone = await this.db.resumeLaunchBackfill(4_000);
+          this.launchBackfillDone = await this.db.resumeLaunchBackfill(4_000, this.scanFront);
         } catch (err) {
           console.error(
             "[scanner] launch_ms backfill resume failed:",
@@ -3082,7 +3145,7 @@ export class Scanner {
       // keep their rows so /flow and cached verdicts still work.
       try {
         await this.fetchFeedCapped(
-          () => this.db.pruneOldTokenStats(now - RE_EVAL_WINDOW_MS),
+          () => this.db.pruneOldTokenStats(now - RE_EVAL_WINDOW_MS, this.scanFront),
           undefined,
           poolDeadline,
         );
@@ -3092,6 +3155,11 @@ export class Scanner {
           err instanceof Error ? err.message : err,
         );
       }
+      // ...and the front's ONE write (see Db.writeScanFront): the launch_ms
+      // migration flag, the Birdeye backfill stamp and the prune's counter +
+      // stamp, in one request instead of up to four. Idempotent — the scan's
+      // `finally` calls this again for the paths that return earlier.
+      await this.flushScanFront();
       if (feedProfiles.length === 0 && recentStats.length === 0) {
         console.log("[scanner] no Solana profiles or re-eval candidates returned");
         this.lastSkip = "empty-feed-and-pool";
@@ -3982,6 +4050,13 @@ export class Scanner {
         err instanceof Error ? err.message : err,
       );
     } finally {
+      // A path that left the scan early (a subrequest floor cut, a stop check,
+      // an empty pool) still owes the front's queued bookkeeping — the normal
+      // path already landed it right after the pool phase, so this is a no-op
+      // then (see flushScanFront).
+      await this.flushScanFront();
+      // The front is tick-scoped: a later tick must never read a stale gate.
+      this.scanFront = null;
       clearTimeout(watchdog);
       // Ends the tick-scoped cap and yields the round trips' wall time.
       const scanDbMs = this.db.exitScanMode();
@@ -4012,7 +4087,14 @@ export class Scanner {
     const birdeye = this.birdeye;
     if (!birdeye || !this.config.birdeyeBackfillEnabled) return 0;
     const cfg = this.config;
-    const lastRaw = await this.db.getWorkerState("birdeye_backfill_at");
+    // The interval gate is asked on EVERY tick, due or not, so on a tick it
+    // rides the front's ONE read (see Db.readScanFront). A key that is MISSING
+    // from the map is a row that was never written, not a read that was
+    // skipped — hence `?? null` and no fallback read.
+    const lastRaw =
+      this.scanFront !== null
+        ? this.scanFront.gates.get("birdeye_backfill_at") ?? null
+        : await this.db.getWorkerState("birdeye_backfill_at");
     const lastRunAt = lastRaw ? Number(lastRaw) : 0;
     const now = Date.now();
     if (Number.isFinite(lastRunAt) && now - lastRunAt < cfg.birdeyeBackfillIntervalMs) {
@@ -4049,7 +4131,7 @@ export class Scanner {
     if (found.length === 0) {
       // Still mark the run so a permanently-empty feed doesn't re-trigger
       // every scan (and burn CU retrying).
-      await this.db.setWorkerState("birdeye_backfill_at", String(now));
+      await this.stampFront("birdeye_backfill_at", String(now));
       return 0;
     }
     const stats = found.map((it) => ({
@@ -4068,7 +4150,7 @@ export class Scanner {
       supplyFlowAt: null,
     }));
     await this.db.recordTokenStatsMany(stats);
-    await this.db.setWorkerState("birdeye_backfill_at", String(now));
+    await this.stampFront("birdeye_backfill_at", String(now));
     return stats.length;
   }
 

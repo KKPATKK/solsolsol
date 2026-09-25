@@ -9,7 +9,7 @@ const { createClient } = require("@libsql/client");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS } = require("../dist/db.js");
+const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS } = require("../dist/db.js");
 const { parseFilterArgs, tradeKeyboard } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
@@ -12139,6 +12139,142 @@ async function main() {
       0,
       `partial paste of docs/patches/tick-progress-record.apply.js — missing: ${missing.join(", ")}`,
     );
+  });
+
+  // ---------- the scan front: ONE read, ONE write (src/db.ts + src/scanner.ts) ----------
+  //
+  // §4.11's measurement: a tick's Turso is ~20 DISTINCT one-shot statements, not
+  // one fat loop. §4.12 took the tail (six round trips -> two). The front's own
+  // maintenance legs were the rest of it: the enabled-chats listing, the
+  // launch_ms migration's completion flag, the token_stats prune's interval stamp
+  // and the Birdeye backfill's stamp were FOUR single-row lookups paid on EVERY
+  // tick, for one `worker_state` read with a chat row beside it. These two cases
+  // drive the real methods against a counting client.
+  await test("scanner: the scan front is ONE read, and its legs pay no reads of their own", async () => {
+    const t = tmpDb();
+    const now = Date.now();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({ chatId: "c", ...DEFAULT_SETTINGS, enabled: true });
+      await db.saveChatSettings({ chatId: "d", ...DEFAULT_SETTINGS, enabled: true });
+      await db.saveChatSettings({ chatId: "off", ...DEFAULT_SETTINGS, enabled: false });
+      // Two gates whose interval has NOT elapsed, so their legs return without
+      // touching the database at all — which is what makes the read count below
+      // the front's own. `schema_alter_v2_done` is deliberately ABSENT: a row
+      // that was never written has to stay indistinguishable from one that is
+      // not there, not from a read that did not happen.
+      await db.setWorkerState("token_stats_last_prune", String(now));
+      await db.setWorkerState("birdeye_backfill_at", String(now));
+      let reads = 0;
+      let writes = 0;
+      let executes = 0;
+      const counting = {
+        execute: (a) => { executes += 1; return t.client.execute(a); },
+        batch: (a, m) => { if (m === "read") reads += 1; else writes += 1; return t.client.batch(a, m); },
+        close: () => t.client.close(),
+      };
+      const fdb = new Db(t.p, undefined, counting);
+      await fdb.init();
+      reads = 0;
+      writes = 0;
+      executes = 0;
+      // ORDER MATTERS: Db.init() runs the launch_ms migration itself (db.ts),
+      // which WRITES schema_alter_v2_done on its way up. The row is deleted
+      // AFTER init — this case is about a gate that was never written, and it
+      // has to stay absent from the map instead of being invented by the reader.
+      await t.client.execute({
+        sql: "DELETE FROM worker_state WHERE key = 'schema_alter_v2_done'",
+        args: [],
+      });
+      const front = await fdb.readScanFront(SCAN_FRONT_GATE_KEYS);
+      assert.equal(reads, 1, "the whole front read is ONE request");
+      assert.equal(executes, 0, "...and one batch, not an execute");
+      assert.equal(front.chats.length, 2, "only the enabled chats come back");
+      assert.equal(front.gates.get("token_stats_last_prune"), String(now));
+      assert.ok(
+        !front.gates.has("schema_alter_v2_done"),
+        "a row that was never written is absent from the map, not invented",
+      );
+      assert.equal(front.writes.length, 0, "nothing is written until the front is flushed");
+      // The prune's interval gate: not due, so no DELETE and — the point — no
+      // read of its own.
+      assert.equal(await fdb.pruneOldTokenStats(now - 60_000, front), 0);
+      assert.equal(reads, 1, "the prune's gate rode the front's read");
+      assert.equal(executes, 0, "a prune that is not due costs nothing at all");
+      // The launch_ms migration: the flag is absent, so this is the one tick
+      // that runs it. On an empty token_stats the first chunk collects nothing,
+      // which is the migration's own completion condition.
+      assert.equal(await fdb.resumeLaunchBackfill(4_000, front), true);
+      assert.equal(reads, 1, "the resume's gate rode the front's read too");
+      assert.deepEqual(
+        front.writes.map((w) => w.key),
+        ["schema_alter_v2_done"],
+        "its completion flag is queued on the front, not written on its own",
+      );
+      assert.equal(writes, 0, "...so nothing has been written yet");
+      await fdb.writeScanFront(front.writes);
+      assert.equal(writes, 1, "the front's bookkeeping lands in ONE write");
+      assert.equal(await fdb.getWorkerState("schema_alter_v2_done"), "1");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("scanner: a due prune rides the front's ONE write, counter and stamp together", async () => {
+    const t = tmpDb();
+    const now = Date.now();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({ chatId: "c", ...DEFAULT_SETTINGS, enabled: true });
+      await db.setWorkerState("token_stats_last_prune", "1"); // long overdue
+      await db.setWorkerState("telemetry_token_stats_count", "10");
+      // One stale, never-pushed row: older than the re-eval window and absent
+      // from seen_tokens, which is exactly what the prune may delete.
+      await t.client.execute({
+        sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms) VALUES (?, ?, ?, ?, ?)",
+        args: ["OLD1", now - 40 * 3_600_000, 0, 2400, now - 40 * 3_600_000],
+      });
+      let reads = 0;
+      let writes = 0;
+      const counting = {
+        execute: (a) => t.client.execute(a),
+        batch: (a, m) => { if (m === "read") reads += 1; else writes += 1; return t.client.batch(a, m); },
+        close: () => t.client.close(),
+      };
+      const fdb = new Db(t.p, undefined, counting);
+      await fdb.init();
+      reads = 0;
+      writes = 0;
+      const front = await fdb.readScanFront(SCAN_FRONT_GATE_KEYS);
+      assert.equal(reads, 1, "the front read is one request");
+      reads = 0;
+      // The re-eval window is the prune's cutoff in production (scanner's
+      // RE_EVAL_WINDOW_MS = 30h), which the stale row above is past.
+      const deleted = await fdb.pruneOldTokenStats(now - 30 * 60 * 60_000, front);
+      assert.ok(deleted >= 1, "the due prune deleted the stale row");
+      assert.equal(reads, 0, "...without a read of its own: the gate was in the front");
+      assert.deepEqual(
+        front.writes.map((w) => w.key),
+        ["telemetry_token_stats_count", "token_stats_last_prune"],
+        "both bookkeeping rows are queued on the front",
+      );
+      assert.equal(front.writes[0].add, true, "the counter is an ADD, never an overwrite");
+      assert.equal(writes, 0, "nothing written yet");
+      await fdb.writeScanFront(front.writes);
+      assert.equal(writes, 1, "counter + stamp land in ONE write, not two");
+      assert.equal(
+        Number(await fdb.getWorkerState("telemetry_token_stats_count")),
+        10 - deleted,
+        "the counter moved by exactly what was deleted",
+      );
+      assert.ok(Number(await fdb.getWorkerState("token_stats_last_prune")) > 0);
+      await fdb.writeScanFront([]);
+      assert.equal(writes, 1, "an empty buffer is not a request at all");
+    } finally {
+      await t.cleanup();
+    }
   });
 
   console.log("\n===== UNIT TESTS =====");
