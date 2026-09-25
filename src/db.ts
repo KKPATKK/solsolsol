@@ -485,11 +485,14 @@ export class Db {
   }
 
   /**
-   * The whole post-scan telemetry block in ONE read request: the four
-   * `worker_state` rows the three 5-minute syncs reconcile (push-baseline
-   * ledger, delivery audit ring, skip-capture counters, Birdeye CU ledger) plus
-   * the two live listings the ledger sync needs to detect a rewritten baseline
-   * (`push_watch`'s current baselines and the enabled chats' band).
+   * The whole tick tail in ONE read request: the `worker_state` rows the tail
+   * reconciles (deferral snapshot, push-baseline ledger, delivery audit ring,
+   * skip-capture counters, Birdeye CU ledger) plus the two live listings the
+   * duplicate guard and the ledger sync read (the pushed rows and the enabled
+   * chats' band). The key set is the CALLER's (worker.ts TAIL_STATE_KEYS), so
+   * a row that moves into the tail costs bytes rather than a round trip — which
+   * is how the deferral snapshot and the duplicate guard's three proof sources
+   * stopped paying their own reads.
    *
    * Why one request and not six: the tick's binding constraint is the
    * 50-subrequest invocation budget (docs/round-trips.md §1), the measured host
@@ -507,10 +510,7 @@ export class Db {
    * equivalence and the single-request shape.
    */
   async readPostScanTelemetry(
-    ledgerKey: string,
-    auditKey: string,
-    skipKey: string,
-    birdeyeKey: string,
+    stateKeys: readonly string[],
     pushWatchLimit = 60,
   ): Promise<{
     states: Map<string, string>;
@@ -520,8 +520,12 @@ export class Db {
     const res = await this.get().batch(
       [
         {
-          sql: "SELECT key, value FROM worker_state WHERE key IN (?, ?, ?, ?)",
-          args: [ledgerKey, auditKey, skipKey, birdeyeKey],
+          // Non-empty by contract (the tick tail passes its five rows); N keys,
+          // one statement — the same shape as getWorkerStates above.
+          sql: `SELECT key, value FROM worker_state WHERE key IN (${stateKeys
+            .map(() => "?")
+            .join(",")})`,
+          args: [...stateKeys],
         },
         {
           // Same set as listPushWatch(pushWatchLimit): active rows claim their
@@ -569,7 +573,7 @@ export class Db {
    * the write half of the grouped post-scan telemetry read above. A rejected
    * batch leaves every row unwritten, which is exactly the state three failed
    * single-key writes reached: the caller's in-memory deltas are only cleared
-   * after this resolves (see syncPostScanTelemetry in src/worker.ts).
+   * after this resolves (see syncPushDeferralCounters in src/worker.ts).
    */
   async setWorkerStatesMany(
     entries: Array<{ key: string; value: string }>,

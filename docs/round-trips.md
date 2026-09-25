@@ -1121,6 +1121,70 @@ discovery 腿，同埋**卡片 enrichment**（arkham／axiom／gmgn／flurry／w
 flush（1 batch）＋ drain 嘅 tracker 切片 = 12 個**可見** subrequest —— 同
 `DRAIN_TRACKER_RESERVE = 14` 同一套算術，只係寫入側 vs 讀取側。
 
-**下一步（未做）**：把 tail 嗰幾條一次性 state op（deferral sync 嘅讀／寫、grouped
+**下一步（已做，見 §4.12）**：把 tail 嗰幾條一次性 state op（deferral sync 嘅讀／寫、grouped
 telemetry）合併成一個讀 ＋ 一個 batch 寫。要保留「duplicate guard 先行」嘅次序同
 「landed 之後才清 delta」嘅紀律（§4.9、deferrallog），所以先要 `dbTickSteps` 嘅實數。
+
+---
+
+## 4.12 tick tail：一個讀 + 一個寫（2026-09-25）
+
+§4.11 留低嘅下一刀：把 tail 嗰幾條一次性 state op 合併。做咗。
+
+**之前**（一個「全部到期」嘅 tick）
+
+| # | 動作 | round trip |
+|---|---|---|
+| 1 | `getWorkerState(push_deferral)` | 1 讀 |
+| 2 | duplicate guard：`getPushAudit()`；有 pending 時再加 `push_ledger` ＋ `listPushWatch(60)` | 1–3 讀 |
+| 3 | 有 deliver-proof 就寫 shrunken row | 1 寫 |
+| 4 | `syncPostScanTelemetry()`：`readPostScanTelemetry(4 keys)` ＋ 有嘢變就 `setWorkerStatesMany` | 1 讀 ＋ 1 寫 |
+| 5 | delta 落地 | 1 寫 |
+
+合計 **最多 6 個 Turso round trip**。
+
+**現在**
+
+- `Db.readPostScanTelemetry(stateKeys, limit)`：key set 由 caller 決定（worker 嘅
+  `TAIL_STATE_KEYS` = `push_deferral` / `push_ledger` / `push_audit` /
+  `skip_capture` / `birdeye_cu_v1`），SQL 用 `IN (?, …)` —— 同上面
+  `getWorkerStates(keys)` 一模一樣。兩個 listing（`push_watch` 60 行、enabled
+  chats）照舊，ORDER BY … LIMIT 不變。
+- `syncPushDeferralCounters(summary)` 變成整個 tail：**一個讀**（全部 row 一次）
+  → duplicate guard（純函數，唔再 await 自己嘅讀）→ shrink、三個 telemetry
+  merge、delta **一個 batch 寫**（`setWorkerStatesMany`）。
+- `syncPostScanTelemetry` / `runPostScanTelemetry` 退役。讀已經喺 tail 開頭
+  發生，所以 throttle 判斷搬入 tail，merge 本身變成 pure planner
+  `planPostScanTelemetry`（read 入；writes ＋ landed 之後才套嘅 side effect 出）。
+  三個 `*_SYNC_BOUND_MS` 跟住退役：一個讀一個寫唔需要三段 900ms race，tail 由
+  call site 一個 `DEFERRAL_SYNC_BOUND_MS` 包住。
+
+**紀律冇變**（呢個係合併，唔係簡化）
+
+- duplicate guard 依然第一個跑，in-memory drop 即刻應用 —— 同 §4.9 一樣：真正
+  阻止重複卡嘅係 in-memory 嗰半，寫入只係阻止日後 recycle 再 seed 返。
+- 所有 in-memory 前進（`pushDeferralBaseline`、`stalledUnflushed`、mirrors、三個
+  delta 嘅清除）**只在 batch landed 之後**。一個被拒嘅 batch 等於三條失敗嘅
+  單獨寫：乜都冇動，下個 tick 原封不動再試。shrink 亦因此唔會「自己一個落地」
+  而 delta 冇。
+- telemetry throttle 照舊「試過就前進」（best-effort；delta 未清就係 re-offer
+  機制）。
+- 同一條 row 兩次寫（shrink ＋ delta）嘅次序不變：後面嗰個 supersede 前面嗰個，
+  最終 row 同兩次獨立寫 byte-identical。
+
+**價錢**：每個 tick 都讀 5 條 row ＋ 60 行 watch ＋ chats（以前 idle tick 只讀
+2 條 row）。仍然係**一個** request；多咗約 35 行 rows-read/tick（≈50K/日，同 pool
+query 唔同量級）。換到：idle tick 2 讀 → 1 讀；全部到期嘅 tick 6 → **2** 個
+round trip。
+
+**量度**：`heartbeat.summary.dbTickSteps` 會顯示 `readPostScanTelemetry` 1 call
+（以前 `getWorkerState` ×2–3 ＋ `getPushAudit` ＋ `listPushWatch` ＋
+`readPostScanTelemetry`）同 `setWorkerStatesMany` ≤1 call（以前最多 3 個
+`setWorkerState`）。
+
+**測試**（`scripts/test-unit.js`）：`worker: the whole tick tail is ONE read and ONE write`
+（真 client、數 round trip：2；drop ＋ ledger merge ＋ 寫入同一 batch）同
+`worker: a rejected tail batch lands nothing and re-offers the delta`（write 被拒 ⇒
+連 shrink 都唔會自己一個落地；retry 原封不動再試、唔會 double count；之後閒嘅 tick
+只讀唔寫）。多謝 registry 係 module state：兩個測試自己 seed 自己清（`forgetDeferredTokens`），
+唔會影響同一個 process 之後嘅測試。

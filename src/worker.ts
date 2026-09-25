@@ -379,15 +379,17 @@ let pushLedgerMirror: PushLedgerView | null = null;
  * the per-minute path instead of running every tick.
  */
 const PUSH_LEDGER_SYNC_MIN_GAP_MS = 5 * 60_000;
-/** How long a reconciliation may take before the tick moves on (see below). */
-const PUSH_LEDGER_SYNC_BOUND_MS = 900;
+// PUSH_LEDGER_SYNC_BOUND_MS retired: the reconciliation rides the deferral
+// tail's one read + one write now (syncPushDeferralCounters), which the call
+// site bounds once. Stacked per-sync bounds were three 900ms races around
+// round trips that no longer exist.
 let pushLedgerSyncedAt = 0;
 
 /**
  * The delivery audit ring's `worker_state` key. Db.getPushAudit() reads this
- * same row; the grouped post-scan telemetry read
- * (Db.readPostScanTelemetry) fetches it alongside the ledger/skip/Birdeye rows
- * so the ledger reconciliation costs no extra round trip.
+ * same row; the tick tail's read (TAIL_STATE_KEYS) fetches it alongside the
+ * deferral/ledger/skip/Birdeye rows, so neither the ledger reconciliation nor
+ * the duplicate guard's proof costs an extra round trip.
  */
 const PUSH_AUDIT_STATE_KEY = "push_audit";
 
@@ -400,7 +402,7 @@ const PUSH_AUDIT_STATE_KEY = "push_audit";
 let skipCaptureMirror: SkipCaptureState = emptySkipCaptureState();
 /** Same throttle/bound rationale as the ledger sync: telemetry off the tick path. */
 const SKIP_CAPTURE_SYNC_MIN_GAP_MS = 5 * 60_000;
-const SKIP_CAPTURE_SYNC_BOUND_MS = 900;
+// SKIP_CAPTURE_SYNC_BOUND_MS retired: same one read + one write as the ledger.
 let skipCaptureSyncedAt = 0;
 
 /**
@@ -423,9 +425,43 @@ let skipCaptureSyncedAt = 0;
  * starting from zero and under-reporting the month.
  */
 const BIRDEYE_CU_STATE_KEY = "birdeye_cu_v1";
+
+/**
+ * Every durable row the tick tail owns, read in ONE request
+ * (Db.readPostScanTelemetry) at the top of syncPushDeferralCounters:
+ *
+ *  - `push_deferral` — the snapshot the duplicate guard trims and the counters
+ *    are folded into;
+ *  - `push_ledger` / `push_audit` — the ledger reconciliation's two sources,
+ *    which are also the duplicate guard's hardest proof of delivery;
+ *  - `skip_capture` / `birdeye_cu_v1` — the other two throttled 5-minute rows.
+ *
+ * Before this the tail read them separately — the deferral row, then the audit
+ * ring (plus the ledger row and the watch listing whenever something was
+ * pending), then a second four-row batch for the telemetry — so a tick with
+ * everything due spent SIX round trips deciding what to write. Each one is a
+ * subrequest out of the invocation's 50 and the tracker pass spends the same
+ * budget LAST (docs/round-trips.md §4.9), so they are one request now. The row
+ * set is unchanged: readPostScanTelemetry's ORDER BY ... LIMIT is byte-for-byte
+ * listPushWatch's.
+ */
+const TAIL_STATE_KEYS = [
+  PUSH_DEFERRAL_STATE_KEY,
+  PUSH_LEDGER_STATE_KEY,
+  PUSH_AUDIT_STATE_KEY,
+  SKIP_CAPTURE_STATE_KEY,
+  BIRDEYE_CU_STATE_KEY,
+] as const;
+
+/**
+ * What that one read hands back: the raw rows (a missing key is a row that was
+ * never written) plus the watch listing and the enabled chat band, which the
+ * duplicate guard's proofs and the ledger merge read.
+ */
+type TailReadout = Awaited<ReturnType<Db["readPostScanTelemetry"]>>;
 /** Same telemetry throttle/bound rationale as the ledger and skip syncs. */
 const BIRDEYE_CU_SYNC_MIN_GAP_MS = 5 * 60_000;
-const BIRDEYE_CU_SYNC_BOUND_MS = 900;
+// BIRDEYE_CU_SYNC_BOUND_MS retired: same one read + one write as the ledger.
 let birdeyeCuSyncedAt = 0;
 
 /** Birdeye's free-tier allowance, reported when config does not override it. */
@@ -506,6 +542,10 @@ function birdeyeCuPendingTotal(): number {
  * discipline as the push-ledger and skip-capture syncs: the READ is
  * unconditional, and the in-memory delta is only cleared after a write that
  * actually landed, so a failed write re-offers it instead of dropping it.
+ *
+ * No production caller any more: the tick tail calls planBirdeyeCuSync inside
+ * its one read + one write, and this single-key form survives as that
+ * planner's test seam (scripts/test-unit.js).
  */
 export async function syncBirdeyeCu(
   now = Date.now(),
@@ -586,54 +626,40 @@ async function flushObservedLiquidity(): Promise<void> {
  * rule is deliveredDeferredTokens; the duplicate it fixes is 2026-09-20 00:47Z
  * GROYPER — a card, then the same card again two minutes later).
  *
- * Two deliberate choices:
+ * Three deliberate choices:
  *  - FRESH read, not the module mirror: the duplicate lands on the very next
  *    tick, which is inside the push-ledger sync's 5-minute throttle, so a
- *    reused copy would be exactly the copy that cannot see the push yet. This
- *    runs after the completion flush, where one extra round trip cannot cost a
- *    card or the flush window.
- *  - Best-effort: a failed read returns "nothing proved delivered", i.e. the
- *    pending list is left exactly as it was. The cost of that is the duplicate
- *    we already had, never a forgotten obligation.
+ *    reused copy would be exactly the copy that cannot see the push yet. The
+ *    read rides the tail's ONE request (TAIL_STATE_KEYS) and happens after the
+ *    completion flush, where a round trip cannot cost a card or the flush
+ *    window.
+ *  - Best-effort: a read that fails leaves the pending list exactly as it was
+ *    (the caller re-offers the whole tail on the next tick). The cost of that
+ *    is the duplicate we already had, never a forgotten obligation.
  *  - THREE proof sources, because the ring alone is too short-lived: the audit
  *    ring holds ~30 deliveries of ALL kinds (initial, resend, follow-up, heal),
  *    and live 2026-09-20 it rolled two of the four stale tokens out of its
  *    window inside 13 minutes. The durable push ledger carries `initial`
  *    provenance for 7 days / 240 pushes, and `push_watch` rows (written right
  *    after a successful push) cover the `resend`-only deliveries the ledger by
- *    design does not record. All three are read in parallel and folded into one
- *    proof set; only the kind whitelist in deliveredDeferredTokens decides.
+ *    design does not record. All three travel in that one read and are folded
+ *    into one proof set; only the kind whitelist in deliveredDeferredTokens
+ *    decides.
+ *
+ * Pure apart from the shared registry drop (the caller does every read), so it
+ * cannot quietly grow a round trip: the tail's read is the only read this rule
+ * has.
  */
-async function dropDeliveredPendings(
-  database: Db,
-  pending: readonly string[],
-): Promise<string[]> {
+function dropDeliveredPendings(tail: TailReadout, pending: readonly string[]): string[] {
   // The audit ring is read on EVERY tick, not only when something is pending:
   // it is also where the duplicate count comes from (noteDuplicateCards), and
   // without that number on the heartbeat neither the operator's report nor any
-  // fix can be measured. The two other proof sources (durable ledger, watch
-  // rows) are only fetched when they can actually be used, so a tick with
-  // nothing pending pays one read instead of three.
-  let audit: Awaited<ReturnType<Db["getPushAudit"]>>;
-  let ledgerRaw: string | null = null;
-  let watchRows: Awaited<ReturnType<Db["listPushWatch"]>> = [];
-  try {
-    if (pending.length === 0) {
-      audit = await database.getPushAudit();
-    } else {
-      [audit, ledgerRaw, watchRows] = await Promise.all([
-        database.getPushAudit(),
-        database.getWorkerState(PUSH_LEDGER_STATE_KEY),
-        database.listPushWatch(60),
-      ]);
-    }
-  } catch (err) {
-    console.warn(
-      "[worker] delivery-proof read failed (deferral duplicate guard skipped):",
-      err instanceof Error ? err.message : err,
-    );
-    return [];
-  }
+  // fix can be measured. It and the two other proof sources (durable ledger,
+  // watch rows) ride the tail's one request unconditionally now — the count is
+  // free, and the proof sources cost their rows, not a round trip.
+  const audit = parsePushAuditState(tail.states.get(PUSH_AUDIT_STATE_KEY) ?? null);
+  const ledgerRaw = tail.states.get(PUSH_LEDGER_STATE_KEY) ?? null;
+  const watchRows = tail.pushWatch;
   // Duplicate telemetry rides the read that is already here. It is taken BEFORE
   // the early return below, because a token pushed twice has nothing to do with
   // whether anything is currently owed — and it only ever COUNTS: the one
@@ -681,21 +707,31 @@ async function dropDeliveredPendings(
  * backwards, or the first make-up push would be hidden behind a stale null,
  * on exactly the milestone the counters exist to prove.
  */
-async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<void> {
+export async function syncPushDeferralCounters(
+  summary: ScanSummary | null,
+  database: Db | null = db,
+  now = Date.now(),
+): Promise<void> {
   // Called after the completion flush; keep the expensive telemetry reads here
   // rather than on the scan's pre-race path.
   //
   // ORDER MATTERS, and the duplicate guard is why. This function is raced on
   // the tick's tail with `min(DEFERRAL_SYNC_BOUND_MS, remainingFlushMs())`, and
-  // syncPostScanTelemetry's throttled ledger sync is itself bounded at 900ms —
-  // so when the duplicate guard sat AFTER it, a tick where that throttle fired
-  // never reached the guard at all: live 2026-09-20 the two delivered-but-owed
-  // tokens `DFQHUegJW…` / `BmnGRH8N1…` stayed pending across two deploys and
-  // four minutes of ticks even though the rule matches them (verified by replaying
-  // the live pending list against the live watch rows offline). The guard now
-  // runs FIRST (one parallel round trip), applies its in-memory effect
-  // immediately, and persists the shrink before the telemetry that starved it.
-  if (!db) return;
+  // its telemetry half used to be a separate block with its own 900ms bound
+  // that ran FIRST — so a tick where that throttle fired never reached the
+  // guard at all: live 2026-09-20 the two delivered-but-owed tokens
+  // `DFQHUegJW…` / `BmnGRH8N1…` stayed pending across two deploys and four
+  // minutes of ticks even though the rule matches them (verified by replaying
+  // the live pending list against the live watch rows offline). The guard runs
+  // FIRST now, and since the whole tail is ONE read + ONE batch there is
+  // nothing left for the telemetry to starve: an in-memory drop is applied the
+  // moment it is proved, and the row that persists it shares its transaction
+  // with the telemetry that used to starve it.
+  //
+  // The optional `database` / `now` are the unit-test seam, the same shape
+  // syncPushLedger / syncSkipCaptureState / syncBirdeyeCu carry; production
+  // calls this with the summary alone.
+  if (!database) return;
   // Held-back candidates: the tick's own gap, counted once per completed
   // summary (see heldBackCandidates — the derivation, and why it is a lower
   // bound on chain-stage deferrals, live with it and its unit tests).
@@ -711,14 +747,30 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
     recovered: summary?.deferRecovered ?? 0,
     stalled: stalledCandidatesTotal,
   };
-  const raw = await db.getWorkerState(PUSH_DEFERRAL_STATE_KEY);
+  const ledgerDue = now - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS;
+  const skipDue = now - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS;
+  const birdeyeDue = now - birdeyeCuSyncedAt >= BIRDEYE_CU_SYNC_MIN_GAP_MS;
+  // ONE read for the whole tail (see TAIL_STATE_KEYS): the duplicate guard's
+  // three proof sources, the deferral row it trims, and the three telemetry
+  // rows. A failed read re-offers all of it next tick and writes nothing.
+  let tail: TailReadout;
+  try {
+    tail = await database.readPostScanTelemetry(TAIL_STATE_KEYS);
+  } catch (err) {
+    console.warn(
+      "[worker] tick tail read failed (deferral counters and telemetry re-offered next tick):",
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+  const raw = tail.states.get(PUSH_DEFERRAL_STATE_KEY) ?? null;
   const durable = parsePushDeferralSnapshot(raw);
   // Duplicate guard: a delivered coin must not stay "owed". The push and the
   // pending-list write ride the same completion flush, so a lost flush leaves
   // it pending and the make-up pass pushes the card again (see
   // dropDeliveredPendings). Seeding happens AFTER the drop, so neither the
   // registry nor the published gauge can resurrect it.
-  const stale = await dropDeliveredPendings(db, durable?.pendingTokens ?? []);
+  const stale = dropDeliveredPendings(tail, durable?.pendingTokens ?? []);
   const owedPending = durable
     ? durable.pendingTokens.filter((token) => !stale.includes(token))
     : [];
@@ -739,28 +791,34 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
   // (that in-memory half is what actually stops the duplicate push — the write
   // only stops a later RECYCLE from re-seeding it).
   refreshMirror();
+  // What the whole tail writes, in ONE batch at the end (see the landing point
+  // below): the duplicate guard's shrink first — a later write to the same row
+  // supersedes it, exactly the order the two round trips kept — then the
+  // telemetry merges, then the deferral delta.
+  const writes: Array<{ key: string; value: string }> = [];
+  let shrunk: PushDeferralSnapshot | null = null;
   if (stale.length > 0) {
     // Persist the shrunken pending list before any other round trip on this
-    // tail. Zero deltas on purpose: this write carries the drop, not counters,
-    // and the normal delta path below may still follow with its own.
-    try {
-      const shrunk = nextPushDeferralSnapshot(
-        raw,
-        { deferred: 0, recovered: 0, stalled: 0, pending: owedPending.length },
-        Date.now(),
-        { owner: SCAN_LOCK_OWNER, ...totals },
-        owedPending,
-      );
-      await db.setWorkerState(PUSH_DEFERRAL_STATE_KEY, JSON.stringify(shrunk));
-      pushDeferralSnapshot = shrunk;
-    } catch (err) {
-      console.warn(
-        "[worker] deferral shrink write failed (next tick re-offers it):",
-        err instanceof Error ? err.message : err,
-      );
-    }
+    // tail. Zero deltas on purpose: this row carries the drop, not counters,
+    // and the delta row below supersedes it when both are planned.
+    shrunk = nextPushDeferralSnapshot(
+      raw,
+      { deferred: 0, recovered: 0, stalled: 0, pending: owedPending.length },
+      now,
+      { owner: SCAN_LOCK_OWNER, ...totals },
+      owedPending,
+    );
+    writes.push({ key: PUSH_DEFERRAL_STATE_KEY, value: JSON.stringify(shrunk) });
   }
-  await syncPostScanTelemetry();
+  // The three throttled telemetry merges ride the SAME read and land in the
+  // SAME batch: they used to be a second read plus a second write, each with
+  // its own 900ms bound.
+  const telemetry = planPostScanTelemetry(
+    now,
+    { ledger: ledgerDue, skip: skipDue, birdeye: birdeyeDue },
+    tail,
+  );
+  writes.push(...telemetry.writes);
   const cursorDelta = pushDeferralDelta(pushDeferralBaseline, totals);
   // The held-back half rides its own pending delta (see stalledUnflushed), and
   // that is what makes a chain-deferral-only tick persist at all: cursorDelta
@@ -775,54 +833,103 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
   // `stale.length > 0` keeps the write path open for a drop-only tick: the
   // durable row has to lose those tokens too, or a recycled isolate re-seeds
   // them from storage (see the seed call site) and pushes the same card again.
+  let next: PushDeferralSnapshot | null = null;
+  let acked = false;
   if (
     delta.deferred <= 0 &&
     delta.recovered <= 0 &&
     delta.stalled <= 0 &&
     stale.length === 0
   ) {
-    refreshMirror();
-    return;
-  }
-  if (stale.length === 0 && pushDeferralAlreadyApplied(durable, SCAN_LOCK_OWNER, totals)) {
+    // Nothing new for the deferral row; the telemetry half of the batch (if
+    // anything is due) still lands below.
+  } else if (stale.length === 0 && pushDeferralAlreadyApplied(durable, SCAN_LOCK_OWNER, totals)) {
     // A previous attempt of this very write committed while its response was
     // lost (hard wall, invocation kill). The row already carries it — ACK
     // rather than add it a second time.
+    acked = true;
+  } else {
+    next = nextPushDeferralSnapshot(
+      raw,
+      {
+        ...delta,
+        // NOT the gauge any more: the snapshot derives `pending` from the list
+        // below (see nextPushDeferralSnapshot), because the two must be one
+        // fact. This value is the scanner's scan-time count (`deferPending`),
+        // taken before the duplicate guard trimmed the list, and publishing it
+        // is what made /health read "pending 7" next to a 5-token list on
+        // 2026-09-20. It still travels: it is the fallback gauge for a caller
+        // that passes no list at all.
+        pending: summary?.deferPending ?? 0,
+      },
+      now,
+      { owner: SCAN_LOCK_OWNER, ...totals },
+      deferredPushTokens(),
+    );
+    writes.push({ key: PUSH_DEFERRAL_STATE_KEY, value: JSON.stringify(next) });
+  }
+  // ONE write for the whole tail: the guard's shrink, the three telemetry
+  // merges and the deferral delta land together or not at all. A rejected batch
+  // leaves every in-memory delta pending and the baseline where it was — the
+  // discipline the separate writes kept, now the transaction's own property.
+  let landed = writes.length === 0;
+  if (writes.length > 0) {
+    try {
+      await database.setWorkerStatesMany(writes);
+      landed = true;
+    } catch (err) {
+      console.error(
+        "[worker] tick tail write failed (deferral counters and telemetry re-offered next tick):",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  // The telemetry throttle advances whether or not the batch landed: those rows
+  // are best-effort telemetry, a failed write is already re-offered through the
+  // un-cleared deltas, and the next attempt waits out the same gap.
+  const settledAt = Date.now();
+  if (ledgerDue) pushLedgerSyncedAt = settledAt;
+  if (skipDue) skipCaptureSyncedAt = settledAt;
+  if (birdeyeDue) birdeyeCuSyncedAt = settledAt;
+  if (landed) {
+    // Telemetry side effects only AFTER the batch lands, in the order the
+    // standalone syncs applied them: a landed write is the only thing that
+    // clears a delta or refreshes a mirror.
+    if (telemetry.skipDelta && telemetry.skipMerged) {
+      markSkipCaptureSynced();
+      console.log(
+        `[worker] skip capture persisted: +${telemetry.skipDelta.total} early return(s) (fleet total ${telemetry.skipMerged.total}, last "${telemetry.skipMerged.lastReason ?? "unknown"}")`,
+      );
+    }
+    if (telemetry.birdeyeDelta) consumeBirdeyeCuDelta(telemetry.birdeyeDelta);
+    if (telemetry.ledgerMirror) pushLedgerMirror = telemetry.ledgerMirror;
+    if (telemetry.skipMirror) skipCaptureMirror = telemetry.skipMirror;
+  }
+  if (acked) {
     pushDeferralBaseline = totals;
     stalledUnflushed = 0;
-    refreshMirror();
-    return;
   }
-  const next = nextPushDeferralSnapshot(
-    raw,
-    {
-      ...delta,
-      // NOT the gauge any more: the snapshot derives `pending` from the list
-      // below (see nextPushDeferralSnapshot), because the two must be one
-      // fact. This value is the scanner's scan-time count (`deferPending`),
-      // taken before the duplicate guard trimmed the list, and publishing it
-      // is what made /health read "pending 7" next to a 5-token list on
-      // 2026-09-20. It still travels: it is the fallback gauge for a caller
-      // that passes no list at all.
-      pending: summary?.deferPending ?? 0,
-    },
-    Date.now(),
-    { owner: SCAN_LOCK_OWNER, ...totals },
-    deferredPushTokens(),
-  );
-  await db.setWorkerState(PUSH_DEFERRAL_STATE_KEY, JSON.stringify(next));
-  pushDeferralSnapshot = next;
-  // Baseline advances ONLY here. A write that threw (or was killed past the
-  // invocation's wall clock) leaves it untouched, so the next tick re-offers
-  // the same delta — and the applied marker above stops that re-offer from
-  // double-counting a write that did land.
-  pushDeferralBaseline = totals;
-  // The held-back delta clears here and nowhere else — one shared landing
-  // point with the cursor above, so a lost write re-offers both together.
-  stalledUnflushed = 0;
-  console.log(
-    `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered / +${delta.stalled} held back (totals ${next.deferredTotal}/${next.recoveredTotal}/${next.stalledTotal})`,
-  );
+  if (next && landed) {
+    pushDeferralSnapshot = next;
+    // Baseline advances ONLY here. A write that threw (or was killed past the
+    // invocation's wall clock) leaves it untouched, so the next tick re-offers
+    // the same delta — and the applied marker above stops that re-offer from
+    // double-counting a write that did land.
+    pushDeferralBaseline = totals;
+    // The held-back delta clears here and nowhere else — one shared landing
+    // point with the cursor above, so a lost write re-offers both together.
+    stalledUnflushed = 0;
+    console.log(
+      `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered / +${delta.stalled} held back (totals ${next.deferredTotal}/${next.recoveredTotal}/${next.stalledTotal})`,
+    );
+  } else if (shrunk && landed) {
+    pushDeferralSnapshot = shrunk;
+  } else {
+    // Nothing was planned for the row, or nothing landed: republish what the
+    // read found (the cross-isolate refresh — /health serves whichever
+    // heartbeat was written last, so a stale mirror goes visibly backwards).
+    refreshMirror();
+  }
 }
 
 /**
@@ -834,10 +941,14 @@ async function syncPushDeferralCounters(summary: ScanSummary | null): Promise<vo
  * alongside, so "was this push inside the band?" stays answerable after the
  * operator retunes the filter.
  *
- * The WRITE is skipped when nothing changed (the common case), so a steady
- * tick costs three reads and no write. Called off the pre-race path under a
- * throttle and a race bound: telemetry may never extend the invocation, and a
- * pass that is bounded away is simply re-offered on the next tick it is due.
+ * The WRITE is skipped when nothing changed, and the pass itself is off the
+ * tick's own path: telemetry may never extend the invocation, and a pass that
+ * is bounded away is simply re-offered on the next tick it is due.
+ *
+ * No production caller any more: the tick tail calls this file's PLANNER (see
+ * planPushLedgerSync / planSkipCaptureSync / planBirdeyeCuSync) inside its one
+ * read + one write, and this single-key form survives as that planner's test
+ * seam (scripts/test-unit.js) — the shape it had before §4.12 grouped the tail.
  */
 export async function syncPushLedger(
   now = Date.now(),
@@ -935,6 +1046,10 @@ function planPushLedgerSync(
  * recycled isolate must republish the fleet total rather than its own zero) and
  * the persist baseline advances only after a write that actually landed, so a
  * failed write re-offers its delta instead of dropping it.
+ *
+ * No production caller any more: the tick tail calls this file's PLANNER (see
+ * planSkipCaptureSync) inside its one read + one write, and this single-key
+ * form survives as that planner's test seam (scripts/test-unit.js).
  */
 export async function syncSkipCaptureState(
   now = Date.now(),
@@ -977,78 +1092,42 @@ function planSkipCaptureSync(
 }
 
 /**
- * Persist non-critical telemetry after the scan completion batch. Keeping
- * these reads off the pre-race path protects the candidate send window.
- *
- * The three syncs used to run back to back, each paying its own read — and its
- * own write when something changed — so a tick where all three came due (the
- * common 5-minute shape) spent SIX Turso round trips. They are grouped here
- * into ONE read request and ONE batched write (Db.readPostScanTelemetry /
- * Db.setWorkerStatesMany): the measured host split put 63-83% of a tick's
- * subrequests into Turso round trips, and every one of these is a subrequest
- * out of the invocation's 50 (docs/round-trips.md §4.6.2). The throttles,
- * guards and per-sync merges are unchanged — the same rows are skipped when
- * nothing changed — and the writes land as one batch, so a rejected batch
- * leaves exactly the state three failed single writes did: every in-memory
- * delta still pending for the next attempt.
+ * (`syncPostScanTelemetry`'s throttled block lives in syncPushDeferralCounters
+ * now: the tail pays ONE read before the throttles are even consulted, so the
+ * dues are computed there and the merges below are planned in the same breath.
+ * There is no second read left to race a bound around.)
  */
-async function syncPostScanTelemetry(now = Date.now()): Promise<void> {
-  if (!db) return;
-  const ledgerDue = now - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS;
-  const skipDue = now - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS;
-  const birdeyeDue = now - birdeyeCuSyncedAt >= BIRDEYE_CU_SYNC_MIN_GAP_MS;
-  if (!ledgerDue && !skipDue && !birdeyeDue) return;
-  try {
-    await Promise.race([
-      runPostScanTelemetry(now, ledgerDue, skipDue, birdeyeDue),
-      new Promise((resolve) =>
-        setTimeout(
-          resolve,
-          Math.max(
-            PUSH_LEDGER_SYNC_BOUND_MS,
-            SKIP_CAPTURE_SYNC_BOUND_MS,
-            BIRDEYE_CU_SYNC_BOUND_MS,
-          ),
-        ),
-      ),
-    ]);
-  } catch (err) {
-    console.warn("[worker] post-scan telemetry sync failed:", err);
-  }
-  // The throttle advances whether or not the batch landed. These rows are
-  // best-effort telemetry, and a failed write is already re-offered through the
-  // un-cleared deltas, so the next attempt waits out the same gap.
-  if (ledgerDue) pushLedgerSyncedAt = Date.now();
-  if (skipDue) skipCaptureSyncedAt = Date.now();
-  if (birdeyeDue) birdeyeCuSyncedAt = Date.now();
-}
 
 /**
- * The grouped body of syncPostScanTelemetry: one read, the three merges, one
- * batch write. Split out of the caller so a SINGLE bound covers the whole
- * block, where the old shape stacked three sequential 900ms bounds.
+ * The three throttled telemetry merges as a PURE plan: the tail's read in,
+ * the rows to write and the side effects to apply once they land, out.
+ *
+ * It used to be an async body that paid its own read and its own batch
+ * (syncPostScanTelemetry's grouped half, which is where the round trips went).
+ * The caller now hands it the tail's single read and lands every write in the
+ * tail's single batch, so the merges keep their exact shapes and lose only the
+ * round trips.
  */
-async function runPostScanTelemetry(
+function planPostScanTelemetry(
   now: number,
-  ledgerDue: boolean,
-  skipDue: boolean,
-  birdeyeDue: boolean,
-): Promise<void> {
-  const database = db;
-  if (!database) return;
-  const { states, pushWatch, chats } = await database.readPostScanTelemetry(
-    PUSH_LEDGER_STATE_KEY,
-    PUSH_AUDIT_STATE_KEY,
-    SKIP_CAPTURE_STATE_KEY,
-    BIRDEYE_CU_STATE_KEY,
-  );
+  dues: { ledger: boolean; skip: boolean; birdeye: boolean },
+  tail: TailReadout,
+): {
+  writes: Array<{ key: string; value: string }>;
+  ledgerMirror: PushLedgerView | null;
+  skipMirror: SkipCaptureState | null;
+  skipDelta: SkipDelta | null;
+  skipMerged: SkipCaptureState | null;
+  birdeyeDelta: Map<string, number> | null;
+} {
+  const { states, pushWatch, chats } = tail;
   const writes: Array<{ key: string; value: string }> = [];
   let ledgerMirror: PushLedgerView | null = null;
   let skipMirror: SkipCaptureState | null = null;
   let skipDelta: SkipDelta | null = null;
   let skipMerged: SkipCaptureState | null = null;
   let birdeyeDelta: Map<string, number> | null = null;
-  if (ledgerDue) {
+  if (dues.ledger) {
     const raw = states.get(PUSH_LEDGER_STATE_KEY) ?? null;
     const plan = planPushLedgerSync(
       raw,
@@ -1062,7 +1141,7 @@ async function runPostScanTelemetry(
     }
     ledgerMirror = plan.mirror;
   }
-  if (skipDue) {
+  if (dues.skip) {
     const plan = planSkipCaptureSync(
       states.get(SKIP_CAPTURE_STATE_KEY) ?? null,
       now,
@@ -1077,25 +1156,16 @@ async function runPostScanTelemetry(
       skipMerged = plan.next;
     }
   }
-  if (birdeyeDue) {
+  if (dues.birdeye) {
     const plan = planBirdeyeCuSync(states.get(BIRDEYE_CU_STATE_KEY) ?? null, now);
     if (plan.next) {
       writes.push({ key: BIRDEYE_CU_STATE_KEY, value: plan.next });
       birdeyeDelta = plan.delta;
     }
   }
-  if (writes.length > 0) await database.setWorkerStatesMany(writes);
-  // Side effects only AFTER the batch lands: a rejected batch leaves every
-  // in-memory delta pending (the same discipline the single syncs kept).
-  if (skipDelta && skipMerged) {
-    markSkipCaptureSynced();
-    console.log(
-      `[worker] skip capture persisted: +${skipDelta.total} early return(s) (fleet total ${skipMerged.total}, last "${skipMerged.lastReason ?? "unknown"}")`,
-    );
-  }
-  if (birdeyeDelta) consumeBirdeyeCuDelta(birdeyeDelta);
-  if (ledgerMirror) pushLedgerMirror = ledgerMirror;
-  if (skipMirror) skipCaptureMirror = skipMirror;
+  // Nothing is landed here: the caller owns the one batch and applies these
+  // only after it resolves (a rejected batch leaves every delta pending).
+  return { writes, ledgerMirror, skipMirror, skipDelta, skipMerged, birdeyeDelta };
 }
 
 /**

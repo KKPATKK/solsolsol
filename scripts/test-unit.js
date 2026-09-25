@@ -3913,6 +3913,7 @@ async function main() {
       ]));
       await db.setWorkerState("skip_capture", "not json");
       await db.setWorkerState("birdeye_cu_v1", '{"v":1,"days":{"2026-09-23":20}}');
+      await db.setWorkerState("push_deferral", '{"pendingTokens":["P"],"deferredTotal":3}');
 
       // A counting client: the claim is ROUND TRIPS, so count client calls
       // rather than statements.
@@ -3927,10 +3928,10 @@ async function main() {
       // so reset the counter after it and measure only the read under test.
       await led.init();
       batchCalls = 0;
-      const grouped = await led.readPostScanTelemetry(
-        "push_ledger", "push_audit", "skip_capture", "birdeye_cu_v1",
-      );
-      assert.equal(batchCalls, 1, "all four state rows + both listings ride ONE request");
+      const grouped = await led.readPostScanTelemetry([
+        "push_ledger", "push_audit", "skip_capture", "birdeye_cu_v1", "push_deferral",
+      ]);
+      assert.equal(batchCalls, 1, "all FIVE state rows + both listings ride ONE request");
 
       // Same rows as the originals (same ORDER BY ... LIMIT for the watch set).
       const rows = await db.listPushWatch(60);
@@ -3950,7 +3951,12 @@ async function main() {
       assert.equal(grouped.states.get("push_ledger"), '{"entries":[],"updatedAt":0}');
       assert.equal(grouped.states.get("birdeye_cu_v1"), '{"v":1,"days":{"2026-09-23":20}}');
       assert.equal(grouped.states.get("skip_capture"), "not json");
-      assert.equal(grouped.states.size, 4);
+      assert.equal(
+        grouped.states.get("push_deferral"),
+        '{"pendingTokens":["P"],"deferredTotal":3}',
+        "the deferral snapshot the duplicate guard trims rides the same request",
+      );
+      assert.equal(grouped.states.size, 5);
 
       // The write half is one request for N keys too.
       let writes = 0;
@@ -3969,6 +3975,191 @@ async function main() {
       assert.equal(writes, 1, "N keys, ONE write request");
       assert.equal(await db.getWorkerState("a"), "1");
       assert.equal(await db.getWorkerState("b"), "2");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("worker: the whole tick tail is ONE read and ONE write", async () => {
+    // Live 2026-09-25: the tail read its rows separately (the deferral row,
+    // then the audit ring + ledger row + watch listing, then a second
+    // four-row telemetry batch) and wrote separately (shrink, telemetry,
+    // deferral delta), so a tick with everything due spent SIX Turso round
+    // trips deciding what to write — every one of them a subrequest out of
+    // the invocation's 50, with the tracker pass spending the same budget
+    // LAST. This drives the real function against a counting client.
+    const t = tmpDb();
+    const now = Date.now();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({
+        chatId: "c", ...DEFAULT_SETTINGS,
+        minMarketCapUsd: 40_000, maxMarketCapUsd: 380_000, enabled: true,
+      });
+      // Two pending obligations: one the audit ring proves delivered (the
+      // duplicate the guard exists to forget), one genuinely still owed.
+      await db.setWorkerState("push_deferral", JSON.stringify({
+        deferredTotal: 5, recoveredTotal: 1, stalledTotal: 0,
+        pending: 2, pendingTokens: ["STALE1", "OWED1"], events: [],
+      }));
+      await db.setWorkerState("push_audit", JSON.stringify([
+        { chatId: "c", token: "STALE1", symbol: "S", messageId: 1, kind: "initial", at: now - 30_000 },
+      ]));
+      await db.setWorkerState("push_ledger", '{"entries":[],"updatedAt":0}');
+      await db.upsertPushWatch({
+        token: "W1", chatId: "c", symbol: "W1",
+        pushedAt: now - 60_000, mcapAtPush: 67_056, liquidityUsd: 50_000,
+      });
+      // The coin still owed is in the SHARED registry, as it is in production
+      // (the tail's own refreshMirror seeds it from the row it just read), and
+      // any delta this process accumulated earlier is drained — so the
+      // round-trip count below is the tail's own.
+      new DeferredPushLedger().defer("OWED1", now - 60_000);
+      require("../dist/skipcapture.js").resetSkipCapture();
+      const birdeye = require("../dist/birdeye.js");
+      birdeye.consumeBirdeyeCuDelta(birdeye.peekBirdeyeCuDelta());
+      let roundTrips = 0;
+      const counting = {
+        execute: (a) => t.client.execute(a),
+        batch: (a, m) => { roundTrips += 1; return t.client.batch(a, m); },
+        close: () => t.client.close(),
+      };
+      const taildb = new Db(t.p, undefined, counting);
+      await taildb.init();
+      roundTrips = 0;
+      const { syncPushDeferralCounters } = require("../dist/worker.js");
+      // No counter movement on purpose: the only deferral write due is the
+      // duplicate guard's shrink, which is the half that used to pay its own
+      // round trips before the telemetry even ran.
+      await syncPushDeferralCounters(
+        { pushPhase: "done", candidates: 0, pushed: 0, cardSendDeferred: 0, deferPending: 1 },
+        taildb,
+        now,
+      );
+      assert.equal(roundTrips, 2, "the whole tail: ONE read, ONE write");
+      const row = JSON.parse(await db.getWorkerState("push_deferral"));
+      assert.ok(
+        !row.pendingTokens.includes("STALE1"),
+        "the delivered obligation is dropped in the same transaction",
+      );
+      assert.ok(
+        row.pendingTokens.includes("OWED1"),
+        "and the one still owed is still owed",
+      );
+      assert.equal(
+        row.pending,
+        row.pendingTokens.length,
+        "the gauge is the list it publishes",
+      );
+      assert.equal(row.deferredTotal, 5, "no counters moved, so none were added");
+      // The ledger merge rides the same read (the audit entry and the watch
+      // row are what it reconciles) and lands in the same write.
+      const ledger = JSON.parse(await db.getWorkerState("push_ledger"));
+      assert.ok(
+        ledger.entries.some((e) => e.token === "W1"),
+        "the ledger reconciliation landed in the same batch",
+      );
+      // The seed lives in the SHARED registry (deferredTokenList), which
+      // later tests in this file assert exact counts against: put it back.
+      require("../dist/scanner.js").forgetDeferredTokens(["OWED1"]);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("worker: a rejected tail batch lands nothing and re-offers the delta", async () => {
+    // The one-batch shape is only safe if a failure is all-or-nothing: no
+    // shrink without its delta, no telemetry without the row it belongs to.
+    // The held-back counter drives this DELIBERATELY (it is independent of
+    // the cursor baseline, which is module state shared with the test above).
+    const t = tmpDb();
+    const now = Date.now();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.setWorkerState("push_deferral", JSON.stringify({
+        deferredTotal: 5, recoveredTotal: 1, stalledTotal: 0,
+        pending: 2, pendingTokens: ["STALE1", "OWED1"], events: [],
+      }));
+      await db.setWorkerState("push_audit", JSON.stringify([
+        { chatId: "c", token: "STALE1", symbol: "S", messageId: 1, kind: "initial", at: now - 30_000 },
+      ]));
+      // The coin still owed rides the SHARED registry here too: without it
+      // the delta write has no list to publish and keeps the old one (see
+      // nextPushDeferralSnapshot), which would hide the guard's drop.
+      new DeferredPushLedger().defer("OWED1", now - 60_000);
+      let failWrites = false;
+      const flaky = {
+        execute: (a) => t.client.execute(a),
+        batch: (a, m) => {
+          if (m === "write" && failWrites) throw new Error("Too many subrequests");
+          return t.client.batch(a, m);
+        },
+        close: () => t.client.close(),
+      };
+      const taildb = new Db(t.p, undefined, flaky);
+      await taildb.init();
+      failWrites = true;
+      const { syncPushDeferralCounters } = require("../dist/worker.js");
+      // Three qualifying candidates, no card, nothing refused a claim: the
+      // held-back delta (see heldBackCandidates) is 3 and must be persisted.
+      await syncPushDeferralCounters(
+        { pushPhase: "done", candidates: 3, pushed: 0, cardSendDeferred: 0, deferPending: 2 },
+        taildb,
+        now,
+      );
+      const frozen = JSON.parse(await db.getWorkerState("push_deferral"));
+      assert.equal(frozen.stalledTotal, 0, "a rejected batch is not a partial application");
+      assert.equal(frozen.deferredTotal, 5);
+      assert.deepEqual(
+        frozen.pendingTokens,
+        ["STALE1", "OWED1"],
+        "not even the shrink landed on its own",
+      );
+      // The retry: same held-back amount (this tick has no new ones), now
+      // past the telemetry throttle — it must land ONCE.
+      failWrites = false;
+      const later = now + 6 * 60_000;
+      await syncPushDeferralCounters(
+        { pushPhase: "done", candidates: 0, pushed: 0, cardSendDeferred: 0, deferPending: 2 },
+        taildb,
+        later,
+      );
+      const row = JSON.parse(await db.getWorkerState("push_deferral"));
+      assert.equal(row.stalledTotal, 3, "the re-offered held-back delta lands");
+      assert.equal(row.deferredTotal, 5, "and the cursor delta is not invented");
+      assert.ok(!row.pendingTokens.includes("STALE1"), "the drop lands with it");
+      // The gauge is the list it publishes — one assertion, not two.
+      assert.equal(
+        row.pending,
+        row.pendingTokens.length,
+        "and the gauge is the list it publishes",
+      );
+      // A third tick with nothing new: the deltas were cleared, so the tail
+      // reads (one request) and writes nothing at all.
+      // Drained once more: this call must read and write nothing of its own.
+      require("../dist/skipcapture.js").resetSkipCapture();
+      consumeBirdeyeCuDelta(peekBirdeyeCuDelta());
+      let roundTrips = 0;
+      const counting = {
+        execute: (a) => t.client.execute(a),
+        batch: (a, m) => { roundTrips += 1; return t.client.batch(a, m); },
+        close: () => t.client.close(),
+      };
+      const idle = new Db(t.p, undefined, counting);
+      await idle.init();
+      roundTrips = 0;
+      await syncPushDeferralCounters(
+        { pushPhase: "done", candidates: 0, pushed: 0, cardSendDeferred: 0, deferPending: 0 },
+        idle,
+        later + 60_000,
+      );
+      assert.equal(roundTrips, 1, "an idle tail is ONE read and no write");
+      const settled = JSON.parse(await db.getWorkerState("push_deferral"));
+      assert.equal(settled.stalledTotal, 3, "and nothing is double-counted");
+      // Same cleanup as the test above: this seed is shared module state.
+      require("../dist/scanner.js").forgetDeferredTokens(["OWED1"]);
     } finally {
       await t.cleanup();
     }
