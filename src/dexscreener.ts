@@ -158,6 +158,14 @@ const RETRY_MIN_ATTEMPT_MS = 250;
 export const PROFILE_FEED_REUSE_MS = 10 * 60_000;
 
 /**
+ * Self-budget for the boosted-token feed (/token-boosts/latest/v1), the same
+ * shape as the profiles feed's budget: one request, no retry chain worth
+ * waiting for. It is an OPTIONAL leg in the scanner (dropOptionalLeg), so a
+ * 429 here costs one list, not the tick.
+ */
+export const BOOST_FEED_SELF_BUDGET_MS = 480;
+
+/**
  * Should this tick evaluate the previous profile list instead of the one it
  * just fetched? Pure and exported so the rule is unit-tested rather than only
  * observed (scripts/test-deferred-priority.js).
@@ -521,6 +529,42 @@ export class DexScreenerClient {
       : new Error("DexScreener request failed");
   }
 
+  /**
+   * The Solana mints in a /token-boosts/latest/v1 body, newest slots first:
+   * paid promotion slots, so a fresh mint that bought a DexScreener boost.
+   *
+   * Measured 2026-09-25: 30 rows, 19 Solana. Rows carry `url, chainId,
+   * tokenAddress, description, icon, header, openGraph, totalAmount, amount`
+   * — NO metrics and NO timestamps, exactly like a profile row — so the age
+   * comes from the pair the next batch fetches (and a boost mint with no pair
+   * is skipped, not mis-aged, see the stats loop in scanner.ts).
+   */
+  async fetchBoostedTokens(limit: number): Promise<TokenProfile[]> {
+    // Off by default (DEXSCREENER_BOOSTS_LIMIT = 0) — the leg must cost
+    // nothing when disabled, not even a request.
+    if (!(limit > 0)) return [];
+    const deadline = Date.now() + BOOST_FEED_SELF_BUDGET_MS;
+    let data: unknown = null;
+    try {
+      data = await this.getJson("/token-boosts/latest/v1", deadline);
+    } catch (err) {
+      // Optional leg: a failure here is [] and the tick continues.
+      console.error(
+        "[dex] boosts feed failed:",
+        err instanceof Error ? err.message : err,
+      );
+      return [];
+    }
+    const rows = Array.isArray(data) ? (data as Array<Record<string, unknown>>) : [];
+    const out: TokenProfile[] = [];
+    for (const item of rows) {
+      if (item.chainId !== "solana") continue;
+      const tokenAddress = String(item.tokenAddress ?? "");
+      if (!tokenAddress) continue;
+      out.push({ tokenAddress });
+    }
+    return out.slice(0, limit);
+  }
   /**
    * Newest token profiles first. Returns only Solana profiles so the scanner
    * never inspects other chains.

@@ -266,6 +266,16 @@ export interface AppConfig {
   /** How many of the newest token profiles to inspect per scan. */
   scanProfileLimit: number;
   /**
+   * DexScreener boosted-token feed size per scan (DEXSCREENER_BOOSTS_LIMIT,
+   * max 30, default 0 = disabled). Paid-promotion slots: fresh mints that
+   * bought a DexScreener boost, which is the one discovery list that is both
+   * keyless and disjoint from /token-profiles/latest/v1 (measured 2026-09-25:
+   * 19 Solana rows, ZERO overlap with the 16 the profiles feed returned in the
+   * same minute, same host so no new rate-limit bucket). Rows carry no metrics
+   * and no timestamps — the age comes from the pair the next batch fetches.
+   */
+  dexscreenerBoostsLimit: number;
+  /**
    * Re-evaluation pool cap: how many never-pushed tokens nearing/inside the
    * qualifying age window to keep tracking (RE_EVAL_POOL_SIZE). Pool rows
    * are ordered by distance to the window entry, so the most relevant coins
@@ -628,6 +638,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     port: Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 3000,
     scanProfileLimit:
       Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 40,
+    // Off by default: the boosts leg is an OPTIONAL feed (it is dropped first
+    // when the tick runs low on subrequests or on time), so enabling it is a
+    // measurement, not a guess — wrangler.toml starts at "0".
+    dexscreenerBoostsLimit: Number.isFinite(Number(env.DEXSCREENER_BOOSTS_LIMIT ?? 0))
+      ? Math.max(0, Math.min(Math.floor(Number(env.DEXSCREENER_BOOSTS_LIMIT ?? 0)), 30))
+      : 0,
     reevalPoolSize:
       Number.isFinite(rawReevalPool) && rawReevalPool > 0
         ? Math.min(Math.floor(rawReevalPool), 1000)

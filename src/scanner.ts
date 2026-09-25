@@ -1026,6 +1026,12 @@ export interface RejectionEntry {
 /** Rejection reasons from the last completed scan (surfaced via /health). */
 export interface ScanSummary {
   profiles: number;
+  /**
+   * DexScreener boosted-token feed size this scan (paid promotion slots,
+   * 0 when disabled/blocked). Optional leg — a drop is named in
+   * `subreqSkip`.
+   */
+  boosts: number;
   /** pump.fun discovery feed size this scan (0 when blocked/unconfigured). */
   pump: number;
   /**
@@ -1109,8 +1115,8 @@ export interface ScanSummary {
   subreqFloor?: number;
   /**
    * The OPTIONAL legs this tick dropped to protect the tick's tail, by name
-   * (`meteora`, `geoTrend`, `gmgn`, `axiom`, `jupTrend`, `backfill`,
-   * `crime-refresh`). Present only alongside `subreqFloor`.
+   * (`meteora`, `geoTrend`, `boosts`, `gmgn`, `axiom`, `jupTrend`,
+   * `backfill`, `crime-refresh`). Present only alongside `subreqFloor`.
    */
   subreqSkip?: string[];
   /**
@@ -2454,6 +2460,7 @@ export class Scanner {
       pushWatchUndeliveredTotal: this.pushWatchUndeliveredTotal,
       pushWatchRecovered: this.pushWatchRecovered,
       profiles: 0,
+      boosts: 0,
       pump: 0,
       meteora: 0,
       geo: 0,
@@ -2783,6 +2790,38 @@ export class Scanner {
             }),
         );
       }
+      // DexScreener boosted tokens — the newest PAID promotion slots. The
+      // one discovery list that is keyless AND disjoint from the profiles
+      // feed (2026-09-25: 19 Solana rows, zero overlap with the profiles
+      // feed's 16 in the same minute), on the same host so it shares that
+      // rate-limit bucket instead of opening a new one. Rows carry no
+      // metrics and no timestamps: the age comes from the pair.
+      // Sized by DEXSCREENER_BOOSTS_LIMIT (0 = disabled); best-effort — a
+      // failure is [] and the tick continues.
+      let boostProfiles: TokenProfile[] = [];
+      if (
+        this.dex &&
+        this.config.dexscreenerBoostsLimit > 0 &&
+        !dropOptionalLeg("boosts")
+      ) {
+        feedJobs.push(
+          this.fetchFeedCapped(
+            async () => this.dex!.fetchBoostedTokens(this.config.dexscreenerBoostsLimit),
+            [],
+            feedDeadline,
+          )
+            .then((p) => {
+              boostProfiles = p;
+              diag.boosts = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] dexscreener boosts feed failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
+      }
       // GMGN trending discovery — momentum-ranked candidates with GMGN's
       // smart-money/wash-trading-aware filters already applied server-side
       // (best-effort — failures return [] and the scan continues). Sized by
@@ -2965,6 +3004,7 @@ export class Scanner {
       const geckoMints = new Set(geckoProfiles.map((p) => p.tokenAddress));
       const meteoraMints = new Set(meteoraProfiles.map((p) => p.tokenAddress));
       const geoTrendMints = new Set(geoTrendProfiles.map((p) => p.tokenAddress));
+      const boostMints = new Set(boostProfiles.map((p) => p.tokenAddress));
       const gmgnMints = new Set(gmgnProfiles.map((p) => p.tokenAddress));
       const axiomMints = new Set(axiomProfiles.map((p) => p.tokenAddress));
       const jupMints = new Set(jupProfiles.map((p) => p.tokenAddress));
@@ -2979,6 +3019,7 @@ export class Scanner {
         ...pumpProfiles.map((p) => [p.tokenAddress, "pump"] as const),
         ...geckoProfiles.map((p) => [p.tokenAddress, "gecko"] as const),
         ...geoTrendProfiles.map((p) => [p.tokenAddress, "geoTrend"] as const),
+        ...boostProfiles.map((p) => [p.tokenAddress, "boosts"] as const),
         ...gmgnProfiles.map((p) => [p.tokenAddress, "gmgn"] as const),
         ...axiomProfiles.map((p) => [p.tokenAddress, "axiom"] as const),
         ...jupProfiles.map((p) => [p.tokenAddress, "jup"] as const),
@@ -3000,12 +3041,20 @@ export class Scanner {
             !pumpMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress),
         ),
-        ...gmgnProfiles.filter(
+        ...boostProfiles.filter(
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress),
+        ),
+        ...gmgnProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) &&
+            !pumpMints.has(p.tokenAddress) &&
+            !geckoMints.has(p.tokenAddress) &&
+            !geoTrendMints.has(p.tokenAddress) &&
+            !boostMints.has(p.tokenAddress),
         ),
         ...axiomProfiles.filter(
           (p) =>
@@ -3021,6 +3070,7 @@ export class Scanner {
             !pumpMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
+            !boostMints.has(p.tokenAddress) &&
             !gmgnMints.has(p.tokenAddress) &&
             !axiomMints.has(p.tokenAddress),
         ),
@@ -3030,6 +3080,7 @@ export class Scanner {
             !pumpMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
+            !boostMints.has(p.tokenAddress) &&
             !gmgnMints.has(p.tokenAddress) &&
             !axiomMints.has(p.tokenAddress) &&
             !jupMints.has(p.tokenAddress),
@@ -3040,6 +3091,7 @@ export class Scanner {
             !pumpMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
+            !boostMints.has(p.tokenAddress) &&
             !gmgnMints.has(p.tokenAddress) &&
             !axiomMints.has(p.tokenAddress) &&
             !jupMints.has(p.tokenAddress) &&

@@ -38,6 +38,26 @@ SCAN_INTERVAL_SECONDS = "60"
 # (the code caps this at 100). Deferred candidates stay in the re-eval
 # pool, so nothing is lost when a tick runs out of budget.
 SCAN_PROFILE_LIMIT = "100"
+# DexScreener /token-boosts/latest/v1 feed size per scan (code default 0 =
+# disabled, max 30 — the upstream list is 30 rows).
+# The newest PAID promotion slots: measured 2026-09-25 from the sandbox and
+# from the Worker's own egress, 200 with 30 rows of which 19 are Solana, and
+# ZERO overlap with the 16 Solana mints /token-profiles/latest/v1 returned in
+# the same minute ⇒ +19 net-new mints per tick for one extra subrequest plus
+# one pair batch, on the SAME host as the profiles feed (so it shares that
+# rate-limit bucket instead of opening a new one). Rows carry no metrics and
+# no timestamps, so the age comes from the pair the next batch fetches.
+# The leg is OPTIONAL (dropOptionalLeg("boosts") in scanner.ts) and the
+# dedupe is total — a boost mint already carried by dex/pump/gecko/geoTrend
+# is dropped, and jup/jupTrend/meteora now skip boost mints too.
+# STARTS AT 20 (2026-09-25): the tick races the scan against a ~5s window
+# (9,500ms tick budget − 4,500ms flush reserve) and the scan's own feed
+# deadline is 4.2s against a p50 scan of 2,627ms — the extra pair batch is
+# ~0.5s, which fits, and the leg is the first thing dropOptionalLeg("boosts")
+# gives up when it does not. Watch /health heartbeat.summary.boosts together
+# with scanMs and subreqSkip; set this back to "0" if scanMs climbs or the leg
+# starts appearing in subreqSkip.
+DEXSCREENER_BOOSTS_LIMIT = "20"
 # Re-evaluation pool: never-pushed coins nearing/inside the qualifying age
 # window that the bot keeps tracking until they qualify (code default 40,
 # max 1000). Ordered by relevance, so the closest-to-qualifying coins are
