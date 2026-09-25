@@ -7509,6 +7509,44 @@ async function main() {
     resetTickProbe();
   });
 
+  await test("tickprobe: the census names what a tick's scan paid, per method", async () => {
+    // WHY (2026-09-25): a tick's window reads `turso 29` and nothing in the
+    // repo could say WHICH calls those were — `dbSteps` covers three methods
+    // cumulatively since boot. The census is the whole map's difference against
+    // the snapshot taken at tick start, i.e. per-tick AND per-method.
+    const { installTickProbe, resetTickProbe, dbTickStepView, dbStepView } = require("../dist/tickprobe.js");
+    let clock = 1_000;
+    const db = {
+      getWorkerState: async () => { clock += 7; return null; },
+      setWorkerState: async () => { clock += 3; },
+      getTokenStatsMany: async () => { clock += 1; return []; },
+    };
+    resetTickProbe();
+    const seam = {
+      runOnce: async () => {
+        await db.getWorkerState("k");
+        await db.setWorkerState("k", "v");
+      },
+    };
+    installTickProbe(seam, { db }, () => clock);
+    // A call OUTSIDE the tick belongs to no tick's census: the worker's
+    // /health handlers share this same handle.
+    await db.getWorkerState("outside");
+    await seam.runOnce();
+    const census = dbTickStepView();
+    assert.deepEqual(Object.keys(census).sort(), ["getWorkerState", "setWorkerState"], "exactly the methods the tick called");
+    assert.equal(census.getWorkerState.calls, 1, "a delta, not a cumulative — the call before the tick is not this tick's");
+    assert.equal(census.getWorkerState.ms, 7, "and the ms are the tick's own");
+    assert.equal(census.setWorkerState.calls, 1);
+    assert.equal(census.setWorkerState.ms, 3);
+    assert.equal(census.getTokenStatsMany, undefined, "a method the tick never touched is omitted, so the census is a list of what cost something");
+    // The cumulative view is still the whole isolate's: together the two
+    // readings say "this tick" AND "since boot".
+    const cumulative = dbStepView();
+    assert.equal(cumulative.getWorkerState.calls, 2, "the outside call is still in the isolate view");
+    resetTickProbe();
+  });
+
   await test("evaluateWatch: a band crossed while the row is paced still fires", () => {
     // The cooldown is PACING, not memory. It exists so a card that can REPEAT
     // cannot repeat inside the window; a first-time 🚀 stage is not a repeat,

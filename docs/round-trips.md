@@ -1037,6 +1037,13 @@ UPDATE ⇒ 一次 ~30）令個 tick 貼住 50，drain 只係最尖、最冇產�
 **減 round trip**：把 row loop 嘅 claim/check 合併成一個 `batch()`（30 → 1–2），或者喺
 scan 側先留配額（scanner 現時完全唔讀 `subreqRemaining`）。
 
+> **2026-09-25 更正（見 §4.11）**：上面「一行一個 claim/check UPDATE ⇒ 一次 ~30」係
+> **舊**事實。`claimPushWatchChecksMany` 已經把靜默行嘅 CAS 全部 pipeline 成**一個**
+> HTTP request（libsql 嘅 `batch()` 係一次 `/v2/pipeline`：open stream → execute →
+> close），live pass note 讀 `spend[… rows 282/1 …] trips 5` —— 28 行輪替 = **1 個**
+> subrequest。所以「30/50 嘅大頭」唔喺 row loop，而係散喺 front／tail 十幾條一次性
+> statement 度。量度同下一步見 §4.11。
+
 ### 4.10 被拒嘅 note：pass 自己嘅讀數要留在記憶體（2026-09-25）
 
 **Live（02:56–03:0xZ，第二次同類事件）**：`pushWatchPass {phase:"running", note:"running",
@@ -1063,3 +1070,57 @@ checked／claimLost 幾多」，即使 DB 嗰刻寫唔入任何嘢。
 **留心兩點**：pulse 喺**下一個** tick 才上 heartbeat（summary 係 pass 之前砌），即係最多
 遲一個 tick；而 row loop 嘅計數係 loop **返嚟**才發佈，所以喺 loop 中途被殺嘅 pass 只會報
 `stage: rows / doneAt: null / checked: 0` —— 輪替行到幾遠，睇 durable row 嘅 `fresh` 就夠。
+
+---
+
+## 4.11 一個 tick 嘅 subrequest 到底去咗邊（2026-09-25）＋ scan 側地板
+
+**量度**（live `/health` → `heartbeat.subreqs`，2026-09-25 03:30–03:50Z）
+
+| window | total | 去咗邊 |
+|---|---|---|
+| 有 scan 嘅 tick（最重嗰個） | 32 | turso 29、lite-api 2、api 1 |
+| 另一個 tick | 24 | turso 23、api 1 |
+| `/health` 自觸發嘅 invocation | 23 | turso 12、dexscreener 6、gecko 2、jup 2、pump 1 |
+| 跳過 scan 嘅 tick | 11 / 16 | **全部 turso** |
+
+**結論一：row loop 已經唔係大頭。** `claimPushWatchChecksMany` 一次 `batch()` = 一個
+HTTP request，所以 28 行輪替 = 1 個 subrequest（pass note `rows 282/1`）。一行一個
+claim 嘅年代已經過去，§4.9 嗰句已更正。
+
+**結論二：大頭係「散」。** 一個 tick 嘅 Turso 係 ~20 條**一次性** statement：front
+（lock／heartbeat claim／pool／seen／token_stats ×2／counters）＋ completion flush
+（`persistScanCompletion` 本身已經係一個 batch）＋ tail（pass 5 個 trip、deferral sync
+3–5、grouped telemetry 1 讀 1 寫、drain）。冇一條「30 → 1」可以 cut；要 cut 就係合併
+啲一次性 state op —— 即係 §4.6.2 做過嘅同一招（三個 sync 由 6 個 round trip 收成
+1 讀 1 寫）。
+
+**`summary.dbTickSteps`（今次新增）**：逐個 Db method 嘅 calls／ms，**只計呢個 scan
+window** 嘅差額（`dbTickStepView()`：37 個 method 計時、**永不 defer**）。`subreqView`
+嘅 host split 只講得出「29 個去咗 turso」，呢個講得出係邊幾條。留意同 `phases` 一樣
+係一個 tick 之前嘅讀數。
+
+**scan 側地板 `SCAN_SUBREQ_FLOOR = 12`**：scan 係唯一有可選工作嘅階段，所以由佢讓路。
+`subreqRemaining() <= 12` 時放棄：
+
+| 放棄嘅 leg | 點解可以放棄 |
+|---|---|
+| `meteora`（最後手段 launch 腿） | 前面有 gecko new_pools ＋ pump.fun；少一次只係少一個 tick 嘅覆蓋 |
+| `geoTrend` / `jupTrend`（momentum） | 唔係主要 discovery：池會保留隻幣，有 room 嗰個 tick 再掃 |
+| `gmgn` / `axiom` trending | 同上（axiom 仲有 session 讀 = 額外 Turso） |
+| `backfill`（Birdeye 定期回補） | 唯一會**寫 DB** 嘅可選腿；interval gate 不變，夠鐘嗰個 tick 補做 |
+| `crime-refresh`（黑名單刷新） | 有 TTL 快取；少一次刷新唔改變判斷 |
+
+**唔會放棄**：DexScreener profiles、gecko new_pools、pump.fun、Jupiter recent 四個**主**
+discovery 腿，同埋**卡片 enrichment**（arkham／axiom／gmgn／flurry／wallet）——後者係刻意
+嘅：cut 一個付費 call 會改卡片顯示（§4.4.2／§4.5.1），寧願讓 discovery 廣度。每個被放棄
+嘅腿都會**點名**落 `summary.subreqSkip`（＋ `summary.subreqFloor`），所以「momentum feed
+靜」永遠唔會同「上游出事」混淆。
+
+**12 呢個數**：tail 需要 pass 嘅 reserve（6）＋ grouped telemetry（1 讀 1 寫）＋ completion
+flush（1 batch）＋ drain 嘅 tracker 切片 = 12 個**可見** subrequest —— 同
+`DRAIN_TRACKER_RESERVE = 14` 同一套算術，只係寫入側 vs 讀取側。
+
+**下一步（未做）**：把 tail 嗰幾條一次性 state op（deferral sync 嘅讀／寫、grouped
+telemetry）合併成一個讀 ＋ 一個 batch 寫。要保留「duplicate guard 先行」嘅次序同
+「landed 之後才清 delta」嘅紀律（§4.9、deferrallog），所以先要 `dbTickSteps` 嘅實數。

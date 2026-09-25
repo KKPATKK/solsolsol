@@ -100,7 +100,14 @@ export const TICK_PROBE_MAX_PHASES = 12;
  * below, which is the whole point of a runtime seam (see the header).
  */
 export interface TickProbeSeam {
-  runOnce: () => Promise<unknown>;
+  /**
+   * The tick's scan. The optional probe is the invocation's remaining
+   * subrequest allowance (see SCAN_SUBREQ_FLOOR in src/scanner.ts); the
+   * wrapper FORWARDS it instead of swallowing it. A scanner that takes no
+   * argument (every earlier shape, and every test double) still satisfies
+   * this: fewer parameters is assignable.
+   */
+  runOnce: (subreqLeft?: () => number) => Promise<unknown>;
 }
 
 /** What the cast inside installTickProbe needs from the wrapped object. */
@@ -364,6 +371,13 @@ let draining = false;
 let stateWriter: ((key: string, value: string) => Promise<unknown>) | null = null;
 /** Cumulative per-method timing for this isolate. */
 const steps = new Map<string, DbStepView>();
+/**
+ * Cumulative `steps` as it stood at the START of the tick (see
+ * dbTickStepView): the per-tick census is the difference. A whole-map copy
+ * rather than a counter per method, because the map is bounded by the census
+ * list below and the tick boundary is the one place a snapshot is free.
+ */
+let stepsAtTickStart = new Map<string, DbStepView>();
 let drain: WriteDrainView = {
   calls: 0,
   ms: 0,
@@ -467,6 +481,36 @@ export function deliveryDuplicatesView(): DeliveryDuplicatesView {
 export function dbStepView(): Record<string, DbStepView> {
   const out: Record<string, DbStepView> = {};
   for (const [name, s] of steps) out[name] = { ...s };
+  return out;
+}
+
+/**
+ * The DB census of the tick that just finished: per method, the CALLS (and
+ * ms) it paid inside the probe's tick window — the difference against the
+ * snapshot taken at tick start.
+ *
+ * WHY IT EXISTS (2026-09-25): the invocation's 50 subrequests are shared, and
+ * the host split can only say that N of them went to `…turso.io`, never which
+ * calls they were. `dbSteps` times three wrapped methods cumulatively since
+ * boot — enough to prove a single candidate path, but it cannot answer "what
+ * owns the ~20 Turso round trips a tick spends", so every earlier cut in that
+ * direction was reasoned from a stage split instead of from a census. This is
+ * the reading that decides what to batch next (docs/round-trips.md §4.11).
+ *
+ * The SCAN's window, not the whole tick: the tracker pass and the write drain
+ * publish their own `trips` / `calls` counts, and the tail's writes are the
+ * ones this probe must never defer (the drain's failure channel rides
+ * `setWorkerState`). Methods that were not called this tick are omitted, so
+ * the census stays a list of what actually cost something.
+ */
+export function dbTickStepView(): Record<string, DbStepView> {
+  const out: Record<string, DbStepView> = {};
+  for (const [name, s] of steps) {
+    const base = stepsAtTickStart.get(name);
+    const calls = s.calls - (base?.calls ?? 0);
+    if (calls <= 0) continue;
+    out[name] = { calls, ms: s.ms - (base?.ms ?? 0) };
+  }
   return out;
 }
 
@@ -641,6 +685,9 @@ export function resetTickProbe(): void {
   stamps = [];
   queue = [];
   steps.clear();
+  // The census baseline goes with the cumulative map it was copied from:
+  // a stale snapshot would subtract another run's calls from this one's.
+  stepsAtTickStart = new Map();
   dbClock = () => Date.now();
   draining = false;
   stateWriter = null;
@@ -705,7 +752,67 @@ function wrapDbMethod(
   };
 }
 
-/** Wrap the three DB methods the tick uses around its gates (see the header). */
+/**
+ * The bounds the census wraps: every Db method a tick's scan is known to call,
+ * timed (never deferred) so `summary.dbTickSteps` can name what the
+ * subrequest split only attributes to Turso as a total.
+ *
+ * WHY THESE: measured live 2026-09-25 — a cron tick's window read `total 32`
+ * with `turso 29`, and the tick's DB work is ~20 DISTINCT one-shot calls
+ * rather than one fat loop (the tracker row loop is already a single batch:
+ * `claimPushWatchChecksMany` pipelines ~28 CAS statements into one request,
+ * and the pass note reads `rows 282/1`). A census is the only way to see
+ * which of them still deserve to be merged into that same shape.
+ *
+ * A method that does not exist on the handle is skipped by wrapDbMethod, and
+ * the three wrapped above are excluded (a second wrap would count every call
+ * twice in noteStep).
+ */
+const CENSUS_METHODS = [
+  "getWorkerState",
+  "getWorkerStates",
+  "setWorkerState",
+  "setWorkerStatesMany",
+  "listEnabledChats",
+  "listPushWatch",
+  "getPushAudit",
+  "readPostScanTelemetry",
+  "claimScanLock",
+  "releaseScanLock",
+  "getReevalPool",
+  "isTokenSeen",
+  "listSeenTokens",
+  "getTokenStats",
+  "getTokenPushedInfo",
+  "resumeLaunchBackfill",
+  "pruneOldTokenStats",
+  "recordObservedLiquidity",
+  "persistScanCompletion",
+  "writeScheduledTick",
+  "stampScheduledArrival",
+  "recordTokenStats",
+  "updateTokenSupplyFlow",
+  "updateTokenRugcheckData",
+  "updateTokenProTraders",
+  "updateTokenSniperPct",
+  "recordPushDelivery",
+  "claimRecapsAndPrune",
+  "findUntrackedPushesAndLedger",
+  "repairPushWatchBaselines",
+  "claimPushWatch",
+  "claimPushWatchChecksMany",
+  "reservePushWatchAlert",
+  "updatePushWatchCheck",
+  "upsertPushWatchMany",
+  "setPushWatchHoldersMany",
+  "rearmPushWatchAlert",
+];
+
+/**
+ * Wrap the tick's DB methods: the three the gates use (one read, two
+ * deferrable writes — see the header) plus the census list, which is only ever
+ * TIMED.
+ */
 function wrapDb(db: TickProbeDb, deferWrites: boolean): void {
   if (wrapped.has(db as object)) return;
   wrapped.add(db as object);
@@ -715,9 +822,21 @@ function wrapDb(db: TickProbeDb, deferWrites: boolean): void {
   // Writes: registration + raise-only bookkeeping, neither read by the gates.
   wrapDbMethod(target, "recordTokenStatsMany", deferWrites);
   wrapDbMethod(target, "updateTokenMaxMcaps", deferWrites);
-  // `setWorkerState` is deliberately NOT wrapped: it is the channel a FAILED
-  // drain uses to publish its own reason (see persistDrainError), so deferring
-  // it would push that record back onto the very queue that just failed.
+  // The census: timed, never deferred (see CENSUS_METHODS). `setWorkerState`
+  // is in it on purpose — the header's warning is about DEFERRING it (it is
+  // the channel a failed drain publishes its own reason through), and a timed
+  // wrapper keeps that record immediate while making the channel visible.
+  //
+  // `deferWrites` is deliberately NOT consulted here: a deferred write moves
+  // the cost to a different tick, which would make the census a lie about the
+  // tick it is measuring.
+  for (const name of CENSUS_METHODS) {
+    if (name === "getTokenStatsMany" || name === "recordTokenStatsMany") {
+      continue; // wrapped above — a second wrap would double-count in noteStep
+    }
+    if (name === "updateTokenMaxMcaps") continue; // wrapped above
+    wrapDbMethod(target, name, false);
+  }
 }
 
 /**
@@ -760,18 +879,25 @@ export function installTickProbe(
       markSubreqPhase(name, now());
     };
   }
-  target.runOnce = async (): Promise<unknown> => {
+  // The probe is forwarded, not dropped: the wrapper owns the worker's call
+  // site (`scanner.runOnce(subreqRemaining)`), and a scanner that silently
+  // fell back to the module counter would make the floor's seam dead in
+  // production while every test still passed.
+  target.runOnce = async (subreqLeft?: () => number): Promise<unknown> => {
     tickStartedAt = now();
     stamps = [];
     view = null;
     tickActive = true;
+    // The census' zero point: everything the scan pays from here is THIS
+    // tick's (see dbTickStepView).
+    stepsAtTickStart = new Map([...steps].map(([name, s]) => [name, { ...s }]));
     try {
       hooks.onTickStart?.();
     } catch {
       // A prefetch is an optimisation; it may never cost the tick.
     }
     try {
-      return await runOnce();
+      return await runOnce(subreqLeft);
     } finally {
       // Tick over: a straggler write from here on is awaited by its caller
       // again (the queue keeps only what the tick itself queued).
@@ -820,6 +946,10 @@ export function installTickProbe(
         // paused (and for how long) is the difference between "GMGN is
         // blocked" and "GMGN is being re-probed every tick for nothing".
         summary.gmgnFeed = gmgnFeedStats();
+        // The census of THIS tick's scan window (see dbTickStepView). The
+        // subrequest host split says how much went to Turso; this says which
+        // calls it was, which is what a batching decision needs.
+        summary.dbTickSteps = dbTickStepView();
         if (marker !== null && captured.length > 0) {
           summary.phases = captured;
           // Published here rather than by the worker's onTickEnd hook: this

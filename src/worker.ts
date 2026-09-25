@@ -3168,7 +3168,11 @@ async function runScan(
       // the race, so the tail (the tracker pass) cannot stamp a phase the
       // scan never had.
       await Promise.race([
-        scanner.runOnce(),
+        // The scan is handed the invocation's remaining allowance so its
+        // OPTIONAL legs can yield before they starve the tail (see
+        // SCAN_SUBREQ_FLOOR): the tracker pass runs after this scan and is
+        // the residual claimant of the same 50.
+        scanner.runOnce(subreqRemaining),
         new Promise<void>((resolve) => {
           setTimeout(() => {
             timedOut = true;

@@ -14,6 +14,10 @@ import type { MeteoraClient } from "./meteora";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTokenInfo, AxiomTrendingToken } from "./axiom";
 import { parseAxiomTokenInfo } from "./axiom";
+// The invocation's shared subrequest allowance (see SCAN_SUBREQ_FLOOR).
+// The scan is the only phase with OPTIONAL work, so it is the one that
+// yields it — the tracker pass cannot claw back what the front spent.
+import { subreqRemaining } from "./subreqs";
 import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
 import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
 import { trendBandFromChats, type JupTokensClient } from "./jupfeeds";
@@ -127,6 +131,39 @@ const SCAN_TIMEOUT_MS = 25_000;
  * gates always reaches the send.
  */
 export const SCAN_TICK_DEADLINE_MS = 4_200;
+/**
+ * Subrequests the scan refuses to spend on OPTIONAL work, so the tick's tail
+ * still fits (`SCAN_SUBREQ_FLOOR`).
+ *
+ * WHY A SCAN-SIDE FLOOR (2026-09-25): the invocation's allowance is shared,
+ * and the tracker pass is its residual claimant — it runs LAST, it defers by
+ * name (`deferred:subreq-budget`) when the front has already spent the
+ * allowance, and on a cold isolate its first Turso call is the one the
+ * runtime refuses (`err:Too many subrequests … [rows subreq 12]`). The pass
+ * carries its own reserve (TRACKER_SUBREQ_FLOOR / _RESERVE) but it cannot CLAW
+ * BACK what the scan already spent, and the scan is the only phase with work
+ * that is genuinely optional: momentum feeds and the last-resort launch legs.
+ *
+ * WHAT IT DROPS, in the order the legs would have run: the Meteora
+ * last-resort launch leg, the GeckoTerminal and Jupiter momentum trending
+ * legs, the GMGN and Axiom trending legs, the periodic Birdeye backfill and
+ * the crime-wallet list refresh. Each is one subrequest, and each is a leg
+ * whose absence costs coverage for ONE tick — the re-eval pool keeps the coin
+ * and the clients keep their TTL — never a card, and never a primary feed:
+ * DexScreener's profiles, gecko's new_pools, pump.fun and Jupiter's recent
+ * launches keep running whatever the counter says. Card enrichment is
+ * deliberately NOT gated (see docs/round-trips.md §4.4.2: dropping a paid card
+ * call changes what the card SHOWS), so the floor protects alerts by yielding
+ * discovery breadth instead.
+ *
+ * The number: the tail needs the pass's own tail reserve (6) plus the grouped
+ * post-scan telemetry (one read + one batch write), the completion flush (one
+ * batch) and the write drain's tracker slice — 12 VISIBLE subrequests, the
+ * same arithmetic DRAIN_TRACKER_RESERVE (14) encodes on the write side. Every
+ * leg it drops is NAMED in the summary (`subreqSkip`), so a quiet momentum
+ * feed can never be mistaken for an upstream outage.
+ */
+export const SCAN_SUBREQ_FLOOR = 12;
 /**
  * Wall-clock slice of the tick RESERVED for the gate/push phase — the ONLY
  * phase that can actually push a coin. The three front phases (discovery
@@ -1058,6 +1095,27 @@ export interface ScanSummary {
    * post-gate persistence. Cumulative, so the averages are readable live.
    */
   dbSteps?: Record<string, { calls: number; ms: number }>;
+  /**
+   * Set only on a tick that applied the scan-side subrequest floor
+   * (`SCAN_SUBREQ_FLOOR`): the allowance it refused to spend, so /health can
+   * tell "the momentum feeds ran and found nothing" from "they were never
+   * asked". The legs themselves are named in `subreqSkip`.
+   */
+  subreqFloor?: number;
+  /**
+   * The OPTIONAL legs this tick dropped to protect the tick's tail, by name
+   * (`meteora`, `geoTrend`, `gmgn`, `axiom`, `jupTrend`, `backfill`,
+   * `crime-refresh`). Present only alongside `subreqFloor`.
+   */
+  subreqSkip?: string[];
+  /**
+   * The per-method DB census of this scan's window (see tickprobe.ts:
+   * dbTickStepView) — calls + ms per Db method, as a delta of the isolate's
+   * cumulative `dbSteps`. This is the reading that says what a tick's ~20
+   * Turso round trips are actually made of, since the subrequest host split
+   * can only attribute them to `…turso.io` as a total.
+   */
+  dbTickSteps?: Record<string, { calls: number; ms: number }>;
   /**
    * The write batch the tick probe kept OFF the scan's critical path: how many
    * calls waited, how long the worker's drain took, and the failures it saw
@@ -2280,7 +2338,7 @@ export class Scanner {
   }
 
   /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
-  async runOnce(): Promise<void> {
+  async runOnce(subreqLeft: () => number = subreqRemaining): Promise<void> {
     if (this.running) {
       // A scan held longer than the budget is wedged: on Workers, the
       // watchdog timer below never fires while the isolate is frozen (it
@@ -2384,6 +2442,25 @@ export class Scanner {
       deferPending: this.deferredPushes.pendingCount,
       rejects: [],
     };
+    // LOW-WATER GATE (see SCAN_SUBREQ_FLOOR). The invocation's allowance is
+    // shared with the tick's tail, and the scan is the only phase whose work is
+    // optional — so the optional legs below ask this first. A dropped leg is
+    // NAMED in the summary, so a quiet feed is never read as an outage.
+    //
+    // `subreqLeft` is injectable for the same reason the tracker pass takes
+    // one: a caller that owns a different window — and every test — can say
+    // what "no room left" means. No probe = unbounded, i.e. a scanner driven
+    // without the worker behaves exactly as it did before this floor existed.
+    const subreqsLeft = (): number => {
+      const left = subreqLeft();
+      return Number.isFinite(left) ? left : Number.POSITIVE_INFINITY;
+    };
+    const dropOptionalLeg = (leg: string): boolean => {
+      if (subreqsLeft() > SCAN_SUBREQ_FLOOR) return false;
+      diag.subreqFloor = SCAN_SUBREQ_FLOOR;
+      diag.subreqSkip = [...(diag.subreqSkip ?? []), leg];
+      return true;
+    };
     // abort() publishes this snapshot if the tick's race trips mid-scan
     // (see inflightSummary — timeout rows otherwise flush summary:null).
     this.inflightSummary = diag;
@@ -2420,7 +2497,7 @@ export class Scanner {
       // previous list and records lastError; the scan never waits more than
       // the client's fetch timeout on the very first load.
       if (this.shouldStopEarly()) return;
-      if (this.crimeWallets) {
+      if (this.crimeWallets && !dropOptionalLeg("crime-refresh")) {
         try {
           await this.crimeWallets.refreshIfStale();
         } catch (err) {
@@ -2585,7 +2662,7 @@ export class Scanner {
       // off, and an independent provider is what keeps the slot filled when it
       // does. Sized by METEORA_FALLBACK_LIMIT (0 = off).
       let meteoraProfiles: TokenProfile[] = [];
-      if (this.meteora && this.config.meteoraFallbackLimit > 0) {
+      if (this.meteora && this.config.meteoraFallbackLimit > 0 && !dropOptionalLeg("meteora")) {
         feedJobs.push(
           (async () => {
             if (pumpJob !== null) await pumpJob;
@@ -2614,7 +2691,7 @@ export class Scanner {
       // egress with 429). Sized by GECKOTERMINAL_TRENDING_LIMIT (0 =
       // disabled); best-effort — failures return [] and the scan continues.
       let geoTrendProfiles: TokenProfile[] = [];
-      if (this.gecko && this.config.geckoterminalTrendingLimit > 0) {
+      if (this.gecko && this.config.geckoterminalTrendingLimit > 0 && !dropOptionalLeg("geoTrend")) {
         feedJobs.push(
           this.fetchFeedCapped(
             async () => {
@@ -2648,7 +2725,7 @@ export class Scanner {
       // (best-effort — failures return [] and the scan continues). Sized by
       // GMGN_TRENDING_LIMIT (0 = disabled).
       let gmgnProfiles: TokenProfile[] = [];
-      if (this.gmgn && this.config.gmgnTrendingLimit > 0) {
+      if (this.gmgn && this.config.gmgnTrendingLimit > 0 && !dropOptionalLeg("gmgn")) {
         feedJobs.push(
           this.fetchFeedCapped(
             async () => {
@@ -2685,7 +2762,7 @@ export class Scanner {
       // (0 = disabled); best-effort — failures return [] and the scan
       // continues.
       let axiomProfiles: TokenProfile[] = [];
-      if (this.axiom && this.config.axiomTrendingLimit > 0) {
+      if (this.axiom && this.config.axiomTrendingLimit > 0 && !dropOptionalLeg("axiom")) {
         feedJobs.push(
           this.fetchFeedCapped(
             async () => {
@@ -2744,7 +2821,7 @@ export class Scanner {
       // resurging mints. Sized by JUPITER_TRENDING_LIMIT (0 = disabled);
       // best-effort — failures return [] and the scan continues.
       let jupTrendProfiles: TokenProfile[] = [];
-      if (this.jupiter && this.config.jupiterTrendLimit > 0) {
+      if (this.jupiter && this.config.jupiterTrendLimit > 0 && !dropOptionalLeg("jupTrend")) {
         // The page is ranked by 24h organic score, so its HEAD is blue chips
         // and the qualifying band only appears deep in it — measured
         // 2026-09-21: 0 of the top 15 entries fitted an $60K–$230K / 80min–26h
@@ -2790,17 +2867,30 @@ export class Scanner {
       // request per run. Idempotent (INSERT OR IGNORE); last-run persisted
       // in worker_state so isolates don't re-run it on every recycle.
       if (this.shouldStopEarly()) return;
-      try {
-        diag.backfill = await this.fetchFeedCapped(
-          () => this.runPeriodicBackfill(),
-          0,
-          feedDeadline,
-        );
-      } catch (err) {
-        console.error(
-          "[scanner] periodic backfill failed:",
-          err instanceof Error ? err.message : err,
-        );
+      // The backfill is the safety net for discovery GAPS (it re-seeds coins
+      // the feeds rolled past), and it pays a Birdeye call AND a DB write — so
+      // it is the first thing to yield when the invocation is low (see
+      // SCAN_SUBREQ_FLOOR). Its interval gate is unchanged: the next tick with
+      // room runs it.
+      // Only an ARMED backfill can be *dropped*: with no Birdeye client, or
+      // with the interval gate disabled, the leg was never going to run — and
+      // a skip name in the summary must never report a decision the floor did
+      // not actually make (see dropOptionalLeg).
+      const backfillArmed =
+        this.birdeye !== null && this.config.birdeyeBackfillEnabled;
+      if (!(backfillArmed && dropOptionalLeg("backfill"))) {
+        try {
+          diag.backfill = await this.fetchFeedCapped(
+            () => this.runPeriodicBackfill(),
+            0,
+            feedDeadline,
+          );
+        } catch (err) {
+          console.error(
+            "[scanner] periodic backfill failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
       // The discovery-feed phase is behind us (see the worker's phase ladder).
       this.stampPhase("front");

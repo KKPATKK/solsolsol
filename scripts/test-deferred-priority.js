@@ -466,6 +466,125 @@ async function tickMakeupTest() {
   }
 }
 
+// ---------- the scan-side subrequest floor (see SCAN_SUBREQ_FLOOR) --------
+// The invocation's 50 subrequests are SHARED, and the tracker pass runs LAST:
+// it carries its own reserve but it cannot claw back what the scan already
+// spent (live 2026-09-25: a cron tick's window read `total 32 | turso 29`).
+// The scan is the only phase with optional work, so this drives a real tick
+// twice — room, then at the floor — and asserts WHICH legs were asked.
+async function subreqFloorTest() {
+  const { Db } = require("../dist/db.js");
+  const { Scanner, SCAN_SUBREQ_FLOOR } = require("../dist/scanner.js");
+  const { createClient } = require("@libsql/client");
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const p = path.join(os.tmpdir(), `subreq-floor-${process.pid}-${Date.now()}.db`);
+  const client = createClient({ url: `file:${p}` });
+  const stubFeed = (body) => {
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+  };
+  try {
+    assert.equal(
+      SCAN_SUBREQ_FLOOR,
+      12,
+      "the floor is the tail's arithmetic as one movable constant (pass reserve 6 + grouped telemetry + flush + drain slice)",
+    );
+    const db = new Db(p, undefined, client);
+    await db.init();
+    // Every OPTIONAL leg armed (the live worker sets the same vars in
+    // wrangler.toml), and the pump.fun fallback off so the launch chain is
+    // exactly gecko → meteora in this test.
+    const cfg = loadConfig({
+      METEORA_FALLBACK_LIMIT: "20",
+      GECKOTERMINAL_TRENDING_LIMIT: "20",
+      JUPITER_TRENDING_LIMIT: "100",
+      PUMPFUN_PROFILE_LIMIT: "0",
+      PUMPFUN_FALLBACK_LIMIT: "0",
+    });
+    await db.saveChatSettings({
+      chatId: "chat-floor",
+      minLiquidityUsd: 0, minVolume24hUsd: 0, minMarketCapUsd: 0,
+      maxMarketCapUsd: 10_000_000, minAgeMinutes: 0, maxAgeMinutes: 100_000,
+      min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+      enabled: true,
+    });
+    const dex = new DexScreenerClient(cfg);
+    dex.fetchPairsForTokens = async () => new Map();
+    // The tick driver: fresh fakes per tick, so the asked-legs list cannot
+    // leak between the two runs.
+    const runTick = async (probe) => {
+      const asked = [];
+      const gecko = {
+        fetchNewPools: async () => { asked.push("geo"); return []; },
+        fetchTrendingPools: async () => { asked.push("geoTrend"); return []; },
+      };
+      const jupiter = {
+        fetchRecentTokens: async () => { asked.push("jup"); return []; },
+        fetchTrendingTokens: async () => { asked.push("jupTrend"); return []; },
+      };
+      const meteora = {
+        fetchNewestPools: async () => { asked.push("meteora"); return []; },
+      };
+      const crimeWallets = {
+        refreshIfStale: async () => { asked.push("crime-refresh"); },
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null,
+        gecko, jupiter, null, null, null, crimeWallets, null, null, meteora,
+      );
+      await scanner.runOnce(probe);
+      return { scanner, asked: [...new Set(asked)].sort() };
+    };
+
+    // ROOM: every optional leg is asked, exactly as before this change.
+    stubFeed([{ chainId: "solana", tokenAddress: "FLOOR_ROOM", symbol: "R" }]);
+    const room = await runTick(() => 30);
+    assert.deepEqual(
+      room.asked,
+      ["crime-refresh", "geo", "geoTrend", "jup", "jupTrend", "meteora"],
+      "with room, every optional leg still runs",
+    );
+    assert.equal(room.scanner.lastSummary.subreqFloor, undefined, "and the summary claims no floor it did not apply");
+    assert.equal(room.scanner.lastSummary.subreqSkip, undefined);
+
+    // THE FLOOR: the optional legs yield, the PRIMARY feeds do not.
+    stubFeed([{ chainId: "solana", tokenAddress: "FLOOR_LOW", symbol: "L" }]);
+    const low = await runTick(() => SCAN_SUBREQ_FLOOR - 8);
+    assert.deepEqual(
+      low.asked,
+      ["geo", "jup"],
+      "the floor yields the optional legs and nothing else — DexScreener profiles, gecko new_pools and Jupiter recent launches still run",
+    );
+    assert.equal(low.scanner.lastSummary.subreqFloor, SCAN_SUBREQ_FLOOR);
+    assert.deepEqual(
+      low.scanner.lastSummary.subreqSkip.slice().sort(),
+      ["crime-refresh", "geoTrend", "jupTrend", "meteora"],
+      "and every dropped leg is NAMED, so a quiet momentum feed cannot be read as an upstream outage",
+    );
+
+    // NO PROBE = no floor: a scanner driven without the worker (every test
+    // that predates this, and the local runner) owns no invocation window and
+    // must behave exactly as it did before.
+    stubFeed([]);
+    const unbounded = await runTick(undefined);
+    assert.ok(unbounded.asked.includes("meteora"), "an unbounded caller drops nothing at all");
+    assert.equal(unbounded.scanner.lastSummary.subreqFloor, undefined);
+  } finally {
+    await client.close();
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 // ---------- the durable snapshot the worker writes after the flush ----------
 const durable = nextPushDeferralSnapshot(
   null,
@@ -479,6 +598,7 @@ assert.deepEqual(reloaded.pendingTokens, ["DURABLE_TOKEN"]);
 
 feedTests()
   .then(tickMakeupTest)
+  .then(subreqFloorTest)
   .then(() => {
     // Cleanup: the registry is module state; leave nothing behind for the
     // next suite that loads this build.
