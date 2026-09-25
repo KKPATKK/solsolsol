@@ -370,3 +370,115 @@ gecko: coins 1575, pushed 21
   —— 純規則：加倍、封頂、硬上限、秒數／HTTP-date 兩種 `Retry-After`。
 
 （第一批 219 條之中有一條係 writeDrain 嘅窗口外 patch 防半貼 pin，見 `docs/scan-completion-loss.md`。）
+
+---
+
+## 第四輪（2026-09-25 14:33–15:00Z）：量到配額實數，成因定案
+
+前三輪證明咗「係 IP 級」、「UA 必要」、「alt 由 403 變 429」。呢輪補最關鍵嗰條：
+**keyless 每個 IP 到底有幾多次。**
+
+### 一、實測：每個來源 IP **5 次／分鐘**，60 秒完全重置
+
+乾淨主機，同一 URL、同一 UA，每次加隨機 `cb=` 迫 MISS（唔食快取）：
+
+| 次序 | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| 第一次 trending | 200 | 200 | 200 | 200 | **429** | 429 |
+| 隔 68 秒後 new_pools | 200 | 200 | 200 | 200 | 200 | **429** |
+
+⇒ 窗口 60 秒、額度 5 次，68 秒後補滿。**唔係每日額度，唔係永久封鎖。**
+官方 FAQ 寫 public API 30 calls/min；量到 5/min 係因為乾淨主機本身都係 NAT 共享出口，
+5/min 係「嗰個 IP 剩返幾多」，唔係帳號級數字。429 係 app-level（272 bytes JSON）而且飛快
+（0.05s vs 200 嘅 0.7s）⇒ 喺 edge 擋，唔會去 origin。 ### 二、同一分鐘兩個方向（今日重測）
+
+| 方向 | `api.geckoterminal.com/api/v2` | `api.coingecko.com/api/v3/onchain` |
+|---|---|---|
+| Worker egress | **429**（`You've exceeded the Rate Limit…`） | 有 UA **429**、冇 UA 403 |
+| 乾淨主機 | **200 MISS → 隨後 HIT**（37.7KB） | 唔再係出路 |
+
+### 三、定案：我哋**只係快取嘅讀者，永遠做唔到寫者**
+
+`/health.heartbeat.summary.gecko`（14:50Z）：
+
+```
+requests 11  ok 4  cacheHits 4  http429 4
+lastStatus 429  lastCacheStatus BYPASS  backoffMs 306462  keyed false
+altAttempts 3  altOk 0  alt429 3  altFailures 3  altLastStatus 429
+```
+
+**`ok 4` 同 `cacheHits 4` 完全相等**（14:58Z 再讀：req 17 / ok 8 / cacheHits 8，一樣）。
+⇒ 呢個 isolate 開機以來 gecko **一次 origin 都冇成功過**，每個 200 都係 edge HIT。
+而 `cacheTtlByStatus["400-599"] = 0` 故意唔畀 429 入 cache，所以：
+
+```
+我哋 → origin 429 → 唔入 cache → 下一 tick 照 MISS → 照 429 ⟹ 永遠冇我哋自己嘅 200
+```
+
+之前講「快取係主刀」要補一句：**主刀只喺「有其他用家幫手暖咗個 DC 嘅 edge」時成立**。
+上游 `s-maxage=60`，我哋 `cacheTtl: 300` 只延長**我哋自己** store 落去嘅對象——而我哋 store 唔到。 ### 四、實驗：外部暖 cache ⇒ `geo` 即刻回 20
+
+14:58Z 由乾淨主機各打 3 次（`new_pools` 已經 `HIT`，`trending_pools` 先 `MISS` 再 `HIT`）：
+
+```
+14:58:49Z  geo 0   geoTrend 0
+14:59:49Z  geo 20  geoTrend 0     ← 有對象，Worker 讀到
+```
+
+⇒ `geo 0 / geoTrend 0` **唔係我哋 code 有 bug**，而係「呢 60 秒內個 DC 冇人 store 過」。
+`geoTrend` 較韌：trending 個 URL 帶 `include=base_token&limit=20`，edge 對象少人問。
+
+### 五、損失量（`/debug/feed-stats` 累計）
+
+| feed | coins | pushed |
+|---|---|---|
+| jup | 20,140 | 119 |
+| pump | 5,210 | 11 |
+| **gecko** | **2,083** | **33** |
+| dex | 554 | 270 |
+| jupTrend | 10 | 9 |
+
+gecko 係**次要** discovery 源，兩個槽位都有人頂：launch slot 已經係 `pump 20 + pumpFallback true`
+（pump.fun v3，1 個 keyless 請求，Worker egress 實測 200，而且**更新鮮——秒級 vs gecko 嘅分鐘級**），
+momentum slot 係 `jupTrend`。tracker／push 兩邊都有 Dex／Jupiter fail-open ⇒ **唔會漏推**。 ### 六、出路：Demo 免費 key 係唯一真正離開 IP 限流嘅方法
+
+官方條款（`coingecko.com/en/api/pricing`）：**Demo 免費 plan = 100 calls/min、10,000 calls/月**，
+quota 記喺 **key** 度 ⇒ 共用 egress IP 唔再係問題。Code 全部接好
+（`COINGECKO_API_KEY` + `COINGECKO_API_PLAN=demo` → `x-cg-demo-api-key` 每個 request 都帶，
+`/health.gecko.keyed` 係讀數）⇒ **加 secret 就通，唔使改一行 code**。
+
+**但預算要重算。** 每 tick 最多 4 次（新_pools 1 ＋ trending 1 ＋ tracker 快照
+`TRACKER_GECKO_LOOKUPS=2`）＝ 43,200 tick/月 × 4 ＝ **172,800/月＝超額 17 倍**：
+
+| 方案 | calls/月 | 結論 |
+|---|---|---|
+| 現狀（4/tick） | 172,800 | ❌ 17× |
+| 熄 tracker 快照（2/tick） | 86,400 | ❌ 8.6× |
+| 熄 trending（1/tick） | 43,200 | ❌ 4.3× |
+| **一條腿、每 5 分鐘一次** | **8,640** | ✅ 用 86%，餘 1,360 |
+
+最後一行唔可以靠 cache 自動省（上游 `s-maxage=60`），要喺 **code 層**加「gecko origin 呼叫
+最短隔 300 秒」嘅閘，`cacheTtl: 300` 當後備而唔當保證。配 `GECKOTERMINAL_TRENDING_LIMIT=0`
+（momentum 交畀 `jupTrend`）＋ `TRACKER_GECKO_LOOKUPS=0`（tracker 已有 Dex／Jupiter）就啱。
+
+**未驗的一格**：Demo key 會唔會被 v2 host 認（而唔止 v3）。加咗 key 一行就分曉：
+`keyed true` ＋ `lastStatus 200` ⇒ 認；`keyed true` ＋ `lastStatus 429` ⇒ v2 唔認，
+咁就把 `BASE_URL` 換 v3（`parseNewPools` 已食同一 payload，09-21 乾淨主機 20/20 全中）。 ### 七、不加 key 嘅兩個選擇
+
+1. **熄咗佢，承認降級**（推薦）：`GECKOTERMINAL_TRENDING_LIMIT=0` ＋（如可）pool pages 歸 0。
+   慳每 tick 1–4 個 subrequest（啱啱做完 subreq 預算修正，呢度最平），代價係第五節嗰層冗餘，
+   而家由 pump.fun／Meteora／jupTrend 補緊。
+2. **外部 pinger 幫手暖 cache**（實測有效、但冇 SLA）：任何**非 Worker 出口**（本機、
+   1 U$ VPS、GH Actions cron）每 <60s 打一次嗰兩條 URL，Worker 嘅 `cacheEverything` 就持續 HIT，
+   `geo` 唔會長期 0。1 次/分鐘遠低於 5/min 所以合法，但 (a) 要同一個 DC 先中，
+   (b) 上游一改 `s-maxage` 就失效 ⇒ **只可當過渡，唔可以當長線方案**。
+
+### 八、驗收點（將來加咗 key）
+
+```bash
+curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko: .gecko.keyed}'
+# 期望：keyed true、lastStatus 200、requests/日 ≈ 288（一條腿每 5 分鐘）
+```
+
+若果 `keyed true` 但 `lastStatus 429` 兼 `requests` 每 tick 照加 ⇒ v2 host 唔認 key，轉 v3
+（或者確認 Demo quota 係咪只計 v3，咁就要將 gecko 整條腿搬去 alt host）。

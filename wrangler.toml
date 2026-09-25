@@ -17,9 +17,12 @@ crons = ["* * * * *"]
 # Settings > Variables and Secrets) or via `wrangler secret put <NAME>`.
 # COINGECKO_API_KEY (optional, with COINGECKO_API_PLAN=demo|pro) moves the
 # GeckoTerminal/CoinGecko rate limit from the shared Worker egress IP onto the
-# key — see docs/gecko-429.md. It is a fallback amplifier, not a replacement for
-# the free path: the demo plan's 10K calls/month is under this bot's ~86K/month
-# of gecko calls.
+# key — see docs/gecko-429.md. Measured 2026-09-25: keyless is ~5 req/min per
+# source IP and the Worker's shared IP never gets them, so the key is the ONLY
+# route back to gecko. It is quota-bound, not rate-bound: the demo plan is
+# 100 calls/min + 10K calls/month, and this bot's new_pools leg alone at one
+# call per tick is ~43K/month, so a key only pays off with the discovery leg
+# throttled to one call per ~5 min (8,640/month) — trending is off below.
 [vars]
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one finished less
@@ -125,6 +128,20 @@ PUMPFUN_FALLBACK_LIMIT = "20"
 # look-alike `poolSortField` is silently ignored), Orca's pools carry no
 # creation field. One request when reached. See src/meteora.ts.
 METEORA_FALLBACK_LIMIT = "20"
+# GeckoTerminal trending-pools feed size per scan (code default 20 when unset;
+# 0 = the leg is off — scanner.ts only builds it while this is > 0).
+# DISABLED (2026-09-25): the keyless quota is ~5 requests/minute PER SOURCE IP
+# with a 60s window — measured from a clean host (5x200 then 429, full again 68s
+# later) — and a Cloudflare Worker's egress IP is shared fleet-wide, so the
+# bucket is gone within seconds. The client can then only READ the edge cache,
+# never fill it: live /health.gecko read `ok == cacheHits` (4/4, then 8/8) with
+# zero successful origin requests, because 429s are deliberately not cached and
+# upstream s-maxage is 60. So this leg paid 1 doomed request + 1 gecko throttle
+# slot per tick for a `geoTrend 0` reading. Momentum coverage is already carried
+# by JUPITER_TRENDING_LIMIT (one request, keyless, no shared-IP 429).
+# Restore a positive value only together with COINGECKO_API_KEY (demo plan: quota
+# per key — 100 calls/min + 10K/month). See docs/gecko-429.md.
+GECKOTERMINAL_TRENDING_LIMIT = "0"
 # GMGN trending discovery feed size per scan (code default 30 when unset).
 # DISABLED (2026-09-24): GMGN's edge 429s a Cloudflare Worker's shared egress
 # IP at the IP level, so the leg can never deliver a coin — live /health
