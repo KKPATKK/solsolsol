@@ -4,7 +4,7 @@ import { gmgnFeedStats } from "./gmgn";
 // place that sees EVERY phase the scanner marks (see src/subreqs.ts): the
 // scanner itself is past the file-sync window, and the probe already
 // intercepts its marker.
-import { markSubreqPhase } from "./subreqs";
+import { markSubreqPhase, subreqRemaining } from "./subreqs";
 
 /*
  * Per-tick probe for the scan (2026-09-19).
@@ -216,6 +216,14 @@ export interface WriteDrainView {
    * tick's batch did not land yet", not "lost".
    */
   pending: number;
+  /**
+   * Entries this drain did NOT touch because the tracker pass behind it still
+   * needed the invocation's subrequest allowance (see DRAIN_TRACKER_RESERVE).
+   * Deliberately separate from `pending`, which also counts a batch stopped by
+   * a failure: `pending 3 failures 0` is a held batch, `pending 3 failures 1` is
+   * a database that just refused a write. Neither drops anything.
+   */
+  heldForTracker: number;
   /** Cumulative since the isolate booted, so the effect is readable either way. */
   totals: { calls: number; ms: number; failures: number };
 }
@@ -227,6 +235,31 @@ export interface WriteDrainView {
  * grow the in-memory queue without limit.
  */
 export const DEFERRED_WRITE_MAX_ATTEMPTS = 3;
+
+/**
+ * Subrequests the write drain leaves for the TRACKER PASS behind it.
+ *
+ * WHY A FLOOR (live 2026-09-25, ~41 minutes of starvation): the drain is fired
+ * from the worker's `onTickEnd` — i.e. as soon as the scan ends, which is
+ * BEFORE the tracker pass in that invocation's tail — and it walks its queue
+ * with no ceiling at all: `while (queue.length > 0)`. Its cost is therefore
+ * "however long the backlog is", and a 20-entry backlog is 20 Turso round trips
+ * spent in front of the one stage that runs LAST and is explicitly the residual
+ * claimant of the platform's 50-subrequest allowance (see worker.ts's note on
+ * `subreqRemaining`). The tracker is the only stage that defers by name
+ * (`deferred:subreq-budget`), so a backlog can starve the whole row rotation
+ * without ever failing anything: rows went unchecked for 41 minutes while every
+ * completed pass read `rows 0/0`, and the rotation came back the moment the
+ * backlog cleared (`summary.writeDrain.pending` 20 → 0).
+ *
+ * THE NUMBER: what a pass needs to be WORTH STARTING — its tail writes
+ * (TRACKER_SUBREQ_RESERVE = 6, see pushwatch.ts) plus a few rows of the rotation
+ * (one claim/check UPDATE each). 8 + 6 = 14, i.e. about eight rows rather than
+ * the fifteen the rotation wants on a roomy tick. Held entries are NOT failures:
+ * the queue is built to keep an entry until it lands, so the next tick's drain
+ * (or this one, after the pass) takes them — see WriteDrainView.heldForTracker.
+ */
+export const DRAIN_TRACKER_RESERVE = 14;
 
 /**
  * Durable worker_state key holding the last FAILED drain (see
@@ -338,6 +371,7 @@ let drain: WriteDrainView = {
   failures: 0,
   lastError: null,
   pending: 0,
+  heldForTracker: 0,
   totals: { calls: 0, ms: 0, failures: 0 },
 };
 /** DB handles already wrapped (double wrapping would double every write). */
@@ -454,7 +488,15 @@ export function deferredWriteCount(): number {
  * scanner logs its own write failures, and a deferred write has nobody left
  * to catch for it.
  */
-export async function drainDeferredWrites(): Promise<WriteDrainView> {
+/**
+ * `subreqLeft` is the invocation's remaining allowance (src/subreqs.ts),
+ * injectable for the same reason the tracker pass takes one: so a caller that
+ * owns a different window — and every test — can say what "no room left"
+ * means. The default reads the live counter.
+ */
+export async function drainDeferredWrites(
+  subreqLeft: () => number = subreqRemaining,
+): Promise<WriteDrainView> {
   // One drain at a time. The queue is now edited IN PLACE (see below) rather
   // than swapped out, so a second caller — a slow drain that overlaps the next
   // tick's — must not walk the same entries; it gets the current view instead.
@@ -467,12 +509,14 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
   // The batch stops at the first failure, so this names the entry that stalled
   // it — the reason /health could never surface before.
   let lastError: WriteDrainView["lastError"] = null;
+  // Entries this drain walked past to keep the tracker pass's slice intact.
+  let heldForTracker = 0;
   try {
     if (queue.length === 0) {
       // Nothing was queued: report the empty batch without erasing the last
       // real drain's stamp, so a reader can tell "nothing to do" from "never
       // drained".
-      drain = { ...drain, calls: 0, ms: 0, failures: 0, pending: 0 };
+      drain = { ...drain, calls: 0, ms: 0, failures: 0, pending: 0, heldForTracker: 0 };
       return writeDrainView();
     }
     // Call order matters (the scanner registers a coin before it raises its max
@@ -488,6 +532,16 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
     // entry on the next drain turns that permanent data gap into one tick of
     // latency (writeDrain.pending keeps it visible while it waits).
     while (queue.length > 0) {
+      // The tracker pass runs BEHIND this drain in the same invocation (the
+      // worker fires the drain from onTickEnd and calls runTrackerPass in its
+      // tail), and it is the stage that both needs the most round trips and has
+      // no reservation of its own — it defers by name instead. So the drain
+      // yields: a held entry is not lost, it just waits (see the queue's own
+      // "an entry leaves it only once it has landed").
+      if (subreqLeft() <= DRAIN_TRACKER_RESERVE) {
+        heldForTracker = queue.length;
+        break;
+      }
       const call = queue[0];
       calls += 1;
       try {
@@ -531,6 +585,7 @@ export async function drainDeferredWrites(): Promise<WriteDrainView> {
     failures,
     lastError,
     pending: queue.length,
+    heldForTracker,
     totals: {
       calls: drain.totals.calls + calls,
       ms: drain.totals.ms + ms,
@@ -596,6 +651,7 @@ export function resetTickProbe(): void {
     failures: 0,
     lastError: null,
     pending: 0,
+    heldForTracker: 0,
     totals: { calls: 0, ms: 0, failures: 0 },
   };
   cardSend = { sent: 0, cut: 0, deferred: 0, lastCutAt: 0, lastCutMs: 0 };

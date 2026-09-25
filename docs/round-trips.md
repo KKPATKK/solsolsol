@@ -1003,3 +1003,36 @@ claim／reservation／final write）。**alerting row 在場都一樣 `rows 30/3
 * 記錄留底喺 `docs/patches/`（同 `poolfallback.ts`、`getReevalPoolBatched` 一樣，
   呢個 repo 一直有呢類「deep call site 要繞路」嘅處理）。
 * 落完之後用 `git diff` + `tsc` + 三個 test suite 驗，唔靠腳本自己講。
+
+---
+
+### 4.9 write drain 唔可以食 tracker 嘅 subrequest 配額（2026-09-25）
+
+**Live：41 分鐘冇任何 row 被 evaluate。** 31 條 active row 全部 stale
+2312s → 2558s；每一個完成嘅 pass 都係 `ok:0/0 deferred:subreq-budget … rows 0/0`；
+`tickProgress.stage` 停喺 `front`／`postscan`，`scanCount 0`；02:36:51Z 自己恢復，
+下一個 pass 即刻 `rows 26/30`。
+
+**原因：個 tick 長期住喺平台 50 個 subrequest 嘅 43–45。** `summary.subreqs` 顯示一個
+完成嘅 tick `total 43–45`，其中 Turso 35（`budget 50 / unseenAllowance 12 / usable 38`）。
+tracker pass 係最後一個跑嘅階段，而且係明文嘅 residual claimant（worker.ts 自己寫：冷
+isolate 上 front 已經用咗 47/50，pass 第一個 Turso call 就係俾 runtime 拒嗰個）。
+
+**最尖嗰一段係 write drain**：佢由 `onTickEnd` fire，即係喺 tracker **之前**，而
+`while (queue.length > 0)` 冇任何 ceiling —— backlog 幾長就食幾多個 round trip。
+Durable record 正正係一條 20 條嘅 backlog（`writeDrainError {method
+updateTokenMaxMcaps, "db execute hit the 3000ms hard wall — libsql retry loop never
+settled", pending 20}`），而 starvation 散嗰刻 `summary.writeDrain.pending` 係 0。
+
+**修正**（`docs/patches/drain-yields-tracker.apply.js`）：
+
+| | 之前 | 之後 |
+|---|---|---|
+| drain 嘅上限 | 冇（backlog 幾長食幾長） | `subreqLeft() <= DRAIN_TRACKER_RESERVE`（14）就停 |
+| 停咗嘅 entry | — | 留在 queue（「landed 才離開」），下一 tick／pass 之後再落 |
+| 讀數 | `pending` | `pending` ＋ `heldForTracker`（held **唔係** failure：唔計 `failures`、唔寫 durable 錯、唔消耗 3 次重試） |
+
+**未修**：scan 自己嘅 ~17–20（多數係 Turso）＋ tracker 行輪替（一行一個 claim/check
+UPDATE ⇒ 一次 ~30）令個 tick 貼住 50，drain 只係最尖、最冇產品價值嗰段。要再收窄就要
+**減 round trip**：把 row loop 嘅 claim/check 合併成一個 `batch()`（30 → 1–2），或者喺
+scan 側先留配額（scanner 現時完全唔讀 `subreqRemaining`）。

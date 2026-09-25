@@ -7394,6 +7394,64 @@ async function main() {
     assert.deepEqual(newlyCrossedStages(50, new Set(["w35", "up400"])), [50]);
   });
 
+  await test("tickprobe: the write drain yields the tracker's slice instead of spending it", async () => {
+    // Live 2026-09-25: 41 minutes with no row evaluated. The tick sits at 43–45
+    // of the platform's 50 subrequests, the tracker pass runs LAST as the
+    // residual claimant, and the write drain ahead of it had no ceiling at all
+    // — so a 20-entry backlog was 20 Turso round trips spent in front of the one
+    // stage that cannot run without them.
+    const { installTickProbe, drainDeferredWrites, resetTickProbe, writeDrainView, deferredWriteCount, DRAIN_TRACKER_RESERVE } = require("../dist/tickprobe.js");
+    const mkDb = () => ({
+      landed: [],
+      recordTokenStatsMany: async (tokens) => { mkDb.count += tokens.length; },
+      updateTokenMaxMcaps: async () => {},
+      getTokenStatsMany: async () => [],
+    });
+    const runTick = async (db, n) => {
+      const seam = {
+        runOnce: async () => {
+          for (let i = 0; i < n; i++) await db.recordTokenStatsMany([`T${i}`]);
+        },
+      };
+      installTickProbe(seam, { db, deferWrites: true });
+      await seam.runOnce();
+    };
+    const landedOf = (db) => db.landed.length;
+    resetTickProbe();
+    const db = mkDb();
+    // The fake records the writes it actually ran.
+    db.recordTokenStatsMany = async (tokens) => { db.landed.push(tokens.length); };
+    await runTick(db, 3);
+    assert.equal(landedOf(db), 0, "a deferred write does not land inside the tick");
+    assert.equal(deferredWriteCount(), 3, "it waits in the queue");
+
+    // (a) With the allowance roomy, the drain lands the whole batch — the
+    //     behaviour a healthy tick has always had.
+    await drainDeferredWrites(() => 50);
+    assert.equal(landedOf(db), 3);
+    assert.equal(writeDrainView().pending, 0);
+    assert.equal(writeDrainView().heldForTracker, 0, "nothing was held");
+
+    // (b) With only the tracker's reserve left, the batch is HELD — and held is
+    //     not failed: nothing lands, nothing is dropped, nothing is counted
+    //     against the durable write-drain error.
+    await runTick(db, 3);
+    const before = landedOf(db);
+    await drainDeferredWrites(() => DRAIN_TRACKER_RESERVE);
+    assert.equal(landedOf(db), before, "the tracker's slice is not spent");
+    const held = writeDrainView();
+    assert.equal(held.heldForTracker, 3, "the view names why the batch stopped");
+    assert.equal(held.pending, 3, "the entries stay queued");
+    assert.equal(held.failures, 0, "held is not failed");
+    assert.equal(held.lastError, null, "and it is not a write-drain error");
+
+    // (c) The next drain takes them once the allowance is back.
+    await drainDeferredWrites(() => 40);
+    assert.equal(landedOf(db), before + 3);
+    assert.equal(writeDrainView().pending, 0);
+    resetTickProbe();
+  });
+
   await test("evaluateWatch: a band crossed while the row is paced still fires", () => {
     // The cooldown is PACING, not memory. It exists so a card that can REPEAT
     // cannot repeat inside the window; a first-time 🚀 stage is not a repeat,
