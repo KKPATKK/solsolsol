@@ -81,19 +81,29 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * tick was the retry-chain-expiry path (already rescued); the HANGING upstream
  * was still the old behavior.
  *
- * 320 IS A MEASUREMENT, NOT A THEOREM — and it is now the number the whole
+ * 480 IS A MEASUREMENT, NOT A THEOREM — and it is now the number the whole
  * call rests on: the call has to be DONE (make-up included) before the race
- * fires, i.e. `budget < window remaining`. At 320 that holds because a normal
- * tick reaches this call ~140ms into the 600ms window, leaving ~460ms. What it
- * is NOT is a bound on the window: a tick whose front phases spend more than
- * ~280ms before the feed leaves less than this budget, and on those ticks the
- * race wins again. Closing that last case needs the caller's remaining window
- * AT the call site (scanner.ts:1792, past this repo's ~55KB file-edit window)
- * — the paste-ready wiring is in docs/push-baseline-ledger.md.
+ * fires, i.e. `budget < window remaining`. The window is FEED_DEADLINE_MS
+ * (900ms) called from the tick's own start, and this call is dispatched there
+ * (the profiles fetch is kicked off FIRST — see scanner.runOnce), so a normal
+ * front leaves it most of that window; 480 also stays under the throttle gap
+ * plus the retry floor (250 + 250), which is what keeps a 5xx on THIS leg a
+ * fail-fast instead of a doomed second attempt.
+ *
+ * WHY IT ROSE FROM 320 (2026-09-25): the live reading was `raw 0` tick after
+ * tick with the make-up lane filling the list — i.e. the fetch was being
+ * ABORTED, not refused (a 429 answers in ~350ms and is counted as `failed`,
+ * not as an empty feed). Two causes, both fixed here: the abort window was
+ * measured BEFORE the throttle queue rather than at dispatch (see getJson),
+ * and 320ms was too tight for the shared-egress latency of the 900ms window.
+ * The retry arithmetic below is unchanged: at 480 a second attempt still
+ * cannot fit inside the throttle gap + RETRY_MIN_ATTEMPT_MS, so the leg still
+ * answers within one attempt.
  *
  * Why the chain has to be bounded at all: the scanner races this one call
- * against the tick's feed window — 600ms from the tick's start
- * (FEED_DEADLINE_MS) — and keeps the race's `[]` when the window closes first,
+ * against the tick's feed window — FEED_DEADLINE_MS from the tick's start
+ * (600ms when this was written, 900ms now) — and keeps the race's `[]` when
+ * the window closes first,
  * so anything returned late is thrown away, make-up list included. The call
  * used to be made with NO deadline, so a single 429 (shared worker egress:
  * http429 12 in one isolate) started the 3-attempt chain with its 2s/4s backoff
@@ -104,13 +114,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  *
  * With the chain bounded, a 429 resolves in ~budget ms (attempt 1 fails fast,
  * the capped backoff spends the rest, attempt 2 finds the budget gone and
- * returns null) — i.e. well inside the scanner's 600ms window, so the make-up
+ * returns null) — i.e. well inside the scanner's feed window, so the make-up
  * list this call returns on failure is what the tick actually evaluates.
  * Live after the change: `feedsMs 320, profiles 5, failedTotal 1,
  * lastRawProfiles 0, emptyFeedTotal 0` — the first failed fetch that did NOT
  * cost the backlog its lane.
  */
-export const PROFILE_FEED_SELF_BUDGET_MS = 320;
+export const PROFILE_FEED_SELF_BUDGET_MS = 480;
 
 /**
  * What a budgeted caller must have left before a retry is worth starting (see
@@ -438,22 +448,37 @@ export class DexScreenerClient {
         deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
       if (remaining <= 0) return null; // budget exhausted — stop trying
       try {
-        const res = await this.throttle.run(() =>
-          fetch(`${BASE_URL}${path}`, {
+        const res = await this.throttle.run(async () => {
+          // COUNT THE THROTTLE WAIT AGAINST THE CALLER'S DEADLINE (2026-09-25).
+          // `remaining` above was computed BEFORE the queue, and the throttle
+          // can hold this attempt far longer than that — the request was then
+          // issued with an abort window that had already expired (or with a
+          // 1ms one), i.e. a bounded caller could outlive the budget it was
+          // handed AND spend a doomed request doing it. Measured live: the
+          // profiles feed read `raw 0` tick after tick while the make-up lane
+          // quietly filled the list (the fetch was aborted before it could
+          // answer). The wait is now paid out of the same window: a spent
+          // budget ends the attempt here instead of sending it.
+          if (deadline !== undefined && Date.now() >= deadline) return null;
+          // A BOUNDED caller gets its deadline enforced on every attempt,
+          // attempt 1 included. The old 1000ms floor was longer than the
+          // 600ms window the profiles feed is handed, so the feed outlived
+          // its caller's race and the race threw the make-up list away with
+          // the body (see PROFILE_FEED_SELF_BUDGET_MS). An unbounded caller
+          // keeps the full 15s.
+          const left =
+            deadline === undefined
+              ? 15_000
+              : Math.max(1, Math.min(15_000, deadline - Date.now()));
+          return fetch(`${BASE_URL}${path}`, {
             headers: { Accept: "application/json" },
-            // A BOUNDED caller gets its deadline enforced on every attempt,
-            // attempt 1 included. The old 1000ms floor was longer than the
-            // 600ms window the profiles feed is handed, so the feed outlived
-            // its caller's race and the race threw the make-up list away with
-            // the body (see PROFILE_FEED_SELF_BUDGET_MS). An unbounded caller
-            // keeps the full 15s.
-            signal: AbortSignal.timeout(
-              deadline === undefined
-                ? 15_000
-                : Math.max(1, Math.min(15_000, remaining)),
-            ),
-          }),
-        );
+            signal: AbortSignal.timeout(left),
+          });
+        });
+        // A throttled-away attempt (the window closed while it queued) is a
+        // budget answer, not a failure: the caller already owns its own
+        // fallback, and retrying would only spend the caller's window.
+        if (res === null) return null;
         if (res.status === 429) this.note429();
         if (res.status === 429 || res.status >= 500) {
           throw new Error(`DexScreener HTTP ${res.status}`);

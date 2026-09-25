@@ -41,6 +41,7 @@ import {
   writeDrainView,
   drainDeferredWrites,
   noteDuplicateCards,
+  WRITE_DRAIN_ERROR_STALE_MS,
   type WriteDrainErrorRecord,
 } from "./tickprobe";
 import {
@@ -1543,6 +1544,38 @@ let trackerPassFailure: {
  */
 const TRACKER_PASS_BUDGET_MS = 5_000;
 /**
+ * Subrequests held back from the SCAN for the post-flush tracker pass.
+ *
+ * WHY (live 2026-09-25): the pass is the LAST stage of the tick and the only
+ * one that defers by name, so it is the residual claimant of the
+ * invocation's 50-subrequest allowance — and the scan, which runs first, had
+ * no reservation for it at all. The result was
+ * `ok:0/0 deferred:subreq-budget` pass after pass while the rotation stalled
+ * (rows went unchecked for 41 minutes), i.e. the coverage loss was visible
+ * only in the pass note. The drain already yields (DRAIN_TRACKER_RESERVE);
+ * this is the same discipline one stage earlier: the scan's OPTIONAL legs
+ * are the only work in a tick that can be dropped, and they now stand down
+ * while the pass's slice is intact.
+ *
+ * THE NUMBER is the pass's own arithmetic (pushwatch.TRACKER_SUBREQ_FLOOR 3
+ * entry + TRACKER_SUBREQ_RESERVE 6 tail writes = 9), so this names exactly
+ * what the pass needs to be worth starting rather than a round number.
+ * `scanSubreqLeft` applies it; the scan's other gating is unchanged.
+ */
+export const TRACKER_PASS_SUBREQ_RESERVE = 9;
+/**
+ * The scan's view of the invocation's remaining subrequests: the counter
+ * with the tracker pass's slice already taken off (see
+ * TRACKER_PASS_SUBREQ_RESERVE). Pure and exported so the arithmetic is
+ * pinned by a test rather than by the call site's comment. Negative is a
+ * valid answer ("the pass's slice is already gone"); a caller must not
+ * clamp it to 0, which would read as "exactly at the reserve" and hide the
+ * overspend.
+ */
+export function scanSubreqLeft(remaining: number): number {
+  return remaining - TRACKER_PASS_SUBREQ_RESERVE;
+}
+/**
  * Tick tail kept clear after the tracker pass for the tick's own bookkeeping
  * (streak counters, an isolate rebuild's re-init, the scan-lock safety
  * release). The pass is clamped by what is left of this, so a long scan simply
@@ -1731,14 +1764,31 @@ export function buildPreTickSplit(input: {
  * `SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS` is what a tick with a free
  * pre-race phase gets; every further millisecond comes straight out of the
  * scan, and behind the scan, out of the candidate chain — the only phase that
- * can push a coin. The 2_500ms floor stops a very slow pre-race from erasing
- * the scan entirely (a tick AT the floor is the alarm, not the fix: see
- * PreTickView and the two live witnesses below).
+ * can push a coin.
+ *
+ * WHY THERE IS NO FLOOR (2026-09-25, docs/scan-completion-loss.md Patch 1):
+ * the old `Math.max(2_500, ...)` broke the very invariant this calculation
+ * exists to hold. `preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS` only
+ * held while the floor did not bind: at preRace 7s the sum is
+ * 7 + 2.5 + 4.5 = 14s, i.e. the slow-front tick the clamp exists to protect
+ * was exactly the tick it killed before its completion flush — and a
+ * recovering successor is a slow-front tick BY CONSTRUCTION (rebuild +
+ * re-init, sometimes a cold list fetch), which is how one death became a
+ * chain (live 2026-09-25: deaths climbing in the gate/front stage again, no
+ * completed cron tick for 26 minutes). Clamping to [0, budget - reserve]
+ * means a tick that cannot afford a scan spends its envelope on the
+ * COMPLETION instead: `scanRaceMs === 0` fires the timeout branch at once,
+ * `scanner.abort()` stops the scan at its next phase boundary, and the row
+ * that lands says so. A completed 0s scan (candidate deferred, re-offered
+ * next tick) beats a dead tick that evaluates nothing.
  */
 export function scanRaceWindowMs(preRaceSpendMs: number): number {
   return Math.max(
-    2_500,
-    SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRaceSpendMs,
+    0,
+    Math.min(
+      SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS,
+      SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRaceSpendMs,
+    ),
   );
 }
 
@@ -1858,6 +1908,21 @@ export const SCHEDULED_ARRIVAL_SUSPECT_GAP_MS = 90_000;
  * left running (the write is idempotent) and costs the tick nothing.
  */
 const PRE_INIT_ARRIVAL_BOUND_MS = 1_500;
+/**
+ * Bound on the tick's front INIT (see `scheduled`). The cron handler's front
+ * is the one stage that runs before any bookkeeping: `ensureInitialized`
+ * pays the schema DDL on a cold isolate, the dead-tick recovery read on a
+ * warm one, and the Turso handshake — and until now it was awaited
+ * UNBOUNDED. A wedged init therefore died inside the invocation before the
+ * gate could record the arrival: live 2026-09-25 `scheduled_tick_at` stood
+ * still for 26 minutes while the HTTP fallback kept landing scans, i.e. cron
+ * looked dead for a reason nothing published. Bounding it turns that into a
+ * tick that RECORDS its arrival and returns (the path a missing scanner
+ * already takes), so the next delivery — or the fallback — retries against
+ * a fresh promise. 3_500 leaves the scan a real window: the race clamp above
+ * absorbs anything slower, and it is ~3x the live warm-isolate Turso init.
+ */
+export const FRONT_INIT_BOUND_MS = 3_500;
 
 /**
  * Whether this arrival must be stamped before init: true when this isolate has
@@ -3434,7 +3499,11 @@ async function runScan(
         // OPTIONAL legs can yield before they starve the tail (see
         // SCAN_SUBREQ_FLOOR): the tracker pass runs after this scan and is
         // the residual claimant of the same 50.
-        scanner.runOnce(subreqRemaining),
+        // The scan's counter carries the tracker pass's slice (see
+        // TRACKER_PASS_SUBREQ_RESERVE): optional legs stand down while the
+        // pass's tail is intact, instead of the scan spending it and the pass
+        // deferring by name.
+        scanner.runOnce(() => scanSubreqLeft(subreqRemaining())),
         new Promise<void>((resolve) => {
           setTimeout(() => {
             timedOut = true;
@@ -4529,6 +4598,17 @@ export default {
           Date.now(),
           writeDrainError === null ? null : writeDrainError.at,
         ),
+        // ...and whether that record still describes an ACTIVE failure. The
+        // row is a snapshot only a FAILURE rewrites, so after a recovery it
+        // sat there for hours (live 2026-09-25: 8.4h, `pending 15`) and read
+        // as live. The drain clears it on its own recovery (see
+        // clearPersistedDrainError); this flag covers the cross-isolate case —
+        // the isolate answering /health is not necessarily the one that
+        // failed — so a stale record can never be read as a current one.
+        writeDrainErrorStale:
+          writeDrainError === null || !(writeDrainError.at > 0)
+            ? null
+            : Date.now() - writeDrainError.at > WRITE_DRAIN_ERROR_STALE_MS,
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         // Cross-isolate single-flight: how often this isolate skipped a
@@ -6182,7 +6262,14 @@ export default {
       }
     }
     const initAt = Date.now();
-    await ensureInitialized(env);
+    // BOUNDED (see FRONT_INIT_BOUND_MS): the init in front of this tick's
+    // gate was the last UNBOUNDED front await, and a wedged one died before
+    // the arrival could be written — which is how a cron hole read like a
+    // dead trigger while the HTTP fallback kept scanning. A timed-out init
+    // falls through to the `!scanner` guard below, which records the arrival
+    // with the standalone raw client and returns; the pending initPromise is
+    // picked up by the next delivery.
+    await recoveryAwait(ensureInitialized(env), FRONT_INIT_BOUND_MS, "init");
     preTick.steps.init = Date.now() - initAt;
     if (!scanner) {
       preTick.steps.bump = await bumpScheduledTickLegacy(env);

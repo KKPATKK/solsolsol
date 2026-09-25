@@ -281,6 +281,18 @@ export const DRAIN_TRACKER_RESERVE = 14;
 export const WRITE_DRAIN_ERROR_KEY = "write_drain_error";
 
 /**
+ * How long a durable drain-failure record stays "live" before /health calls
+ * it stale (see worker.healthAgeMs). The row is written on a FAILURE and only
+ * then (see persistDrainError), so a healthy bot leaves the last one in place
+ * forever — live 2026-09-25 it read `took 8.4h ago` while every drain behind
+ * it had landed, i.e. it described an incident nobody could act on. The age
+ * was already published; this is the threshold that makes it actionable
+ * instead of a bare number, and the clearing in drainDeferredWrites removes
+ * the row outright once THIS isolate proves the drain recovered.
+ */
+export const WRITE_DRAIN_ERROR_STALE_MS = 10 * 60_000;
+
+/**
  * What that row holds: the failed drain's own record (see
  * WriteDrainView.lastError) plus `pending` — the size of the queue the failure
  * stalled, which is the number that separates a blip from an outage.
@@ -369,6 +381,13 @@ let draining = false;
  * fails a deferred write pays nothing for it.
  */
 let stateWriter: ((key: string, value: string) => Promise<unknown>) | null = null;
+/**
+ * Whether THIS isolate has a durable drain-failure row of its own out there
+ * (see persistDrainError / clearPersistedDrainError). Module state, like the
+ * drain view: it is what makes the RECOVERY cheap — a clean drain only clears
+ * the row when there is one it wrote, so a healthy tick pays no extra write.
+ */
+let drainErrorPersisted = false;
 /** Cumulative per-method timing for this isolate. */
 const steps = new Map<string, DbStepView>();
 /**
@@ -561,6 +580,9 @@ export async function drainDeferredWrites(
       // real drain's stamp, so a reader can tell "nothing to do" from "never
       // drained".
       drain = { ...drain, calls: 0, ms: 0, failures: 0, pending: 0, heldForTracker: 0 };
+      // An empty queue is also the DRY half of a recovery: if this isolate left
+      // a failure row behind, it now describes an incident that is over.
+      await clearPersistedDrainError();
       return writeDrainView();
     }
     // Call order matters (the scanner registers a coin before it raises its max
@@ -642,7 +664,17 @@ export async function drainDeferredWrites(
   // record exists to describe. It is also why the copy happens ONLY on a
   // failure: a drain that landed (`lastError === null`) writes nothing, so a
   // healthy tick pays nothing for this.
-  if (lastError !== null) await persistDrainError(lastError, queue.length);
+  if (lastError !== null) {
+    await persistDrainError(lastError, queue.length);
+  } else {
+    // THE RECOVERY HALF (2026-09-25): the row is only ever rewritten by a
+    // FAILURE, so without this a single bad minute left it standing forever —
+    // live, /health read `writeDrainError` 8.4 hours old (`pending 15`) while
+    // every drain behind it had landed, i.e. the field described an incident
+    // nobody could act on. A clean drain that had work to do clears it; the
+    // flag keeps that from costing a healthy isolate one write per tick.
+    await clearPersistedDrainError();
+  }
   return writeDrainView();
 }
 
@@ -662,9 +694,13 @@ export async function drainDeferredWrites(
  * incident: one failed write with an empty tail is noise, the same reason with
  * 47 waiting behind it is the shape that motivated this field.
  *
- * A clean drain never clears the row. The last thing that went wrong is
- * evidence, and after a real outage the operator is reading /health hours
- * later, on a different isolate.
+ * A clean drain DOES clear the row now (2026-09-25, see
+ * clearPersistedDrainError): the record is meant to be an ACTIVE failure, and
+ * live it read 8.4h old while every drain behind it had landed. Evidence of a
+ * past incident is still readable — /health publishes `writeDrainErrorStale`
+ * and the age beside the record — but it can no longer be mistaken for a
+ * current one. The clear costs nothing on a healthy isolate: it only runs when
+ * THIS one has a row it wrote itself.
  */
 async function persistDrainError(
   error: NonNullable<WriteDrainView["lastError"]>,
@@ -673,8 +709,35 @@ async function persistDrainError(
   if (stateWriter === null) return;
   try {
     await stateWriter(WRITE_DRAIN_ERROR_KEY, JSON.stringify({ ...error, pending }));
+    drainErrorPersisted = true;
   } catch {
     // See above: a record that cannot be written must not cost the tail.
+  }
+}
+
+/**
+ * Clear the durable failed-drain row once the drain has recovered — the mirror
+ * of persistDrainError, and the fix for a field that stayed `live` for hours
+ * after the incident ended (live 2026-09-25: `writeDrainError` 8.4h old with
+ * `pending 15`, on a bot whose drains had all landed since).
+ *
+ * Guarded by `drainErrorPersisted` so a healthy isolate pays NOTHING: only the
+ * isolate that wrote the row clears it, and only once. The write is an empty
+ * string rather than a DELETE because /health already reads a missing row as
+ * `null` — and so it reads an empty one (its parse throws and is caught), which
+ * keeps the row's absence and its clearing indistinguishable to every reader
+ * while avoiding a new Db method. Best-effort: a refused clear keeps the flag
+ * set, so the next clean drain retries it, and `writeDrainErrorStale` still
+ * names the record as history in the meantime.
+ */
+async function clearPersistedDrainError(): Promise<void> {
+  if (stateWriter === null || !drainErrorPersisted) return;
+  try {
+    await stateWriter(WRITE_DRAIN_ERROR_KEY, "");
+    drainErrorPersisted = false;
+  } catch {
+    // Keep the flag: the row is still out there, and the next clean drain is
+    // the retry. A failed clear must never cost the drain's own tail.
   }
 }
 
@@ -691,6 +754,7 @@ export function resetTickProbe(): void {
   dbClock = () => Date.now();
   draining = false;
   stateWriter = null;
+  drainErrorPersisted = false;
   drain = {
     calls: 0,
     ms: 0,

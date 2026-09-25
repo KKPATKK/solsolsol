@@ -193,10 +193,10 @@ async function feedTests() {
 
   // A 5xx is NOT a 429 — it keeps its retry while the budget can hold one, so
   // fail-fast does not quietly delete the retry path for transient outages.
-  // (The profiles budget cannot hold one: PROFILE_FEED_SELF_BUDGET_MS 320 is
-  // below the throttle gap + attempt floor, so a 5xx on the profiles call also
-  // fails fast — the pair path, with its 1000ms budget, is where the retry
-  // still fits.)
+  // (The profiles budget cannot hold one either: PROFILE_FEED_SELF_BUDGET_MS
+  // 480 is still below the throttle gap + attempt floor, 250 + 250, so a 5xx
+  // on the profiles call also fails fast — the pair path, with its 1000ms
+  // budget, is where the retry still fits.)
   let serverErrorCalls = 0;
   globalThis.fetch = async () => {
     serverErrorCalls += 1;
@@ -209,6 +209,39 @@ async function feedTests() {
     `a 5xx still retries when the budget can hold it (saw ${serverErrorCalls} request(s))`,
   );
   assert.equal(emptyPairs.size, 0, "a failing endpoint contributes no pair data");
+
+  // ---------- the caller's deadline is measured AT DISPATCH ----------------
+  // A bounded call used to compute its abort window BEFORE the shared throttle
+  // queue, so an attempt could be issued with a window that had already
+  // expired (or a 1ms one): a doomed request that ALSO ran the caller past the
+  // budget it was given. Live shape: the profiles feed read `raw 0` tick after
+  // tick with the make-up lane filling the list — the fetch was being aborted,
+  // not refused. The wait is now paid out of the same window, so a spent
+  // budget ends the attempt instead of sending it.
+  let deadlineFetchCalls = 0;
+  globalThis.fetch = async () => {
+    deadlineFetchCalls += 1;
+    return new Response(JSON.stringify({ pairs: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  const slowDex = new DexScreenerClient(
+    loadConfig({ DEX_REQUEST_INTERVAL_MS: "400" }),
+  );
+  // Warm the throttle: this call owns the wire for the next `interval` ms.
+  await slowDex.fetchPairsForTokens(["WARM"], Date.now() + 5_000);
+  const warmCalls = deadlineFetchCalls;
+  assert.ok(warmCalls >= 1, "the warm-up call owns the throttle");
+  // A 60ms budget cannot survive the 400ms spacing. Charged for the wait, the
+  // attempt is dropped; before the fix it queued a request with a 1ms abort.
+  const spent = await slowDex.fetchPairsForTokens(["SPENT"], Date.now() + 60);
+  assert.equal(spent.size, 0, "a spent budget yields no pairs");
+  assert.equal(
+    deadlineFetchCalls,
+    warmCalls,
+    "no doomed request is issued once the wait has eaten the caller's window",
+  );
 
   // A deterministic client error (404/HTML) is the same story.
   resetFeedMakeup();

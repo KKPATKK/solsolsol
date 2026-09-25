@@ -1557,3 +1557,95 @@ refresh-token endpoint 被 Cloudflare Bot Management 418 擋死，session 冇法
 呢個係今次改動**已知、要明講嘅交易**：卡片側 Birdeye 花費 → 0（≈ −49% 總量），換嚟卡面少兩個
 數據點。兩個數會喺 Axiom 復活（`docs/axiom-refresher.md`）之後自動返嚟，唔使再改 code；
 追蹤嘅 `📈 持倉增長` / `⚡ 背離` 警報**不受影響**（佢哋讀 `push_watch` 自己嘅讀數）。
+
+
+---
+
+## 4.18 The 2026-09-25 audit's five findings (scan envelope, tracker slice, cron front, stale drain error, profiles abort)
+
+Operator ran the five-finding audit against the live worker and said "fix 1-5". Each finding,
+its cause, and what landed:
+
+### 1. Scan ticks dying again after 12:00Z, in the gate/front stage (red)
+
+**Cause**: `scanRaceWindowMs` floored the race window at 2_500ms, which broke its own
+invariant - `preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS`. At preRace 7s the sum is 14s,
+so the slow-front tick the clamp existed to protect was the one killed before its completion
+flush, and a recovering successor is a slow-front tick BY CONSTRUCTION (rebuild + re-init).
+This is `docs/scan-completion-loss.md`'s Patch 1, written but never applied.
+
+**Fix** (`src/worker.ts`): the window drains 1:1 to 0 and is capped at `budget - reserve`.
+`scanRaceMs === 0` fires the timeout branch at once, `scanner.abort()` stops the scan at its
+next phase boundary, and the tick still writes a completion row (`ok:false`, reason naming the
+0ms window). Cost: that one tick evaluates nothing - its candidates stay in the re-eval pool.
+A completed 0s scan beats a dead tick that evaluates nothing.
+
+### 2. Tracker pass `ok:0/0` - the scan ate the subrequest residual (red)
+
+**Cause**: the pass runs LAST and defers by name, so it is the residual claimant of the
+invocation's 50 subrequests - and the scan, which runs first, had no reservation for it.
+Live: `ok:0/0 deferred:subreq-budget` pass after pass while the rotation stalled.
+
+**Fix** (`src/worker.ts`): `TRACKER_PASS_SUBREQ_RESERVE = 9` (the pass's own
+`TRACKER_SUBREQ_FLOOR` 3 + `TRACKER_SUBREQ_RESERVE` 6) plus a pure `scanSubreqLeft` helper; the
+worker now hands `scanner.runOnce(() => scanSubreqLeft(subreqRemaining()))`. The scan's OPTIONAL
+legs (meteora / geoTrend / jupTrend / gmgn / axiom / backfill / crime-refresh) stand down while
+the pass's slice is intact. Nothing mandatory changes: DexScreener profiles, gecko new_pools,
+pump.fun, Jupiter recent and the card-enrichment path are untouched.
+
+### 3. No COMPLETED cron tick for 26 minutes, held up by the HTTP fallback (amber)
+
+**Cause**: the cron handler's `ensureInitialized` was the last UNBOUNDED front await. A wedged
+init (cold-isolate DDL, a stalled Turso handshake) died inside the invocation BEFORE the gate
+could record the arrival, so `scheduled_tick_at` froze while the fallback kept scanning - a cron
+hole that reads exactly like a dead trigger.
+
+**Fix** (`src/worker.ts`): `FRONT_INIT_BOUND_MS = 3_500`, and the scheduled handler awaits
+`recoveryAwait(ensureInitialized(env), FRONT_INIT_BOUND_MS, "init")`. A timed-out init falls
+through to the existing `!scanner` guard, which records the arrival with the standalone raw
+client (`bumpScheduledTickLegacy`) and returns; the pending `initPromise` is picked up by the
+next delivery. The pre-tick split still publishes `steps.init`.
+
+### 4. `writeDrainError` frozen at 8.4h and reading as live (amber)
+
+**Cause**: the durable row is written only on a FAILURE and never rewritten on success, so after
+a recovery it described an incident that was over while `/health` presented it beside counters
+that do move.
+
+**Fix** (two halves):
+
+- `src/tickprobe.ts`: `drainDeferredWrites` clears the row once a drain lands clean (and on an
+  empty queue), guarded by a module flag so only the isolate that wrote it clears it, and only
+  once - a healthy isolate pays NO extra write.
+- `src/worker.ts`: `/health` publishes `writeDrainErrorStale` (age > `WRITE_DRAIN_ERROR_STALE_MS`
+  = 10 min) beside the existing age, covering the cross-isolate case where the reader is not the
+  isolate that failed.
+
+### 5. `profiles` raw empty, carried by the make-up lane (yellow)
+
+**Cause**: the bounded profiles fetch measured its abort window BEFORE the shared DexScreener
+throttle queue, so an attempt could be issued with an expired window (or a 1ms one) - a doomed
+request that also ran the caller past its budget. Live: `raw 0` tick after tick with the make-up
+list filling `profiles` (a 429 reads as `failedTotal`, not as an empty feed).
+
+**Fix** (`src/dexscreener.ts`): the throttle wait is charged to the caller's deadline (the
+attempt is dropped, not sent, once the window is spent), and `PROFILE_FEED_SELF_BUDGET_MS` rose
+320 -> 480. 480 still sits under the throttle gap plus `RETRY_MIN_ATTEMPT_MS` (250 + 250), so the
+leg's single-attempt / fail-fast arithmetic is unchanged; the window is 900ms (FEED_DEADLINE_MS),
+not the 600ms this budget was originally measured against.
+
+### Verification
+
+- `npm run typecheck` clean.
+- `npm run test:unit` 348 passed / 0 failed (was 346): the race-window test now pins
+  `scanRaceWindowMs(5_000) === 0` and `scanRaceWindowMs(9_000) === 0`; two new worker tests cover
+  the reserve arithmetic + call site and the bounded init + its split; a test-tick-path case
+  proves the drain-error clear is ONE write and then nothing; a defer-priority case proves no
+  request is issued once the throttle wait has eaten the caller's window.
+- Live verification still required after deploy: `scheduledTickHoleMs` / `scheduledTickAt` should
+  stop freezing; `pushWatchPass.note` should read `rows N/...` instead of
+  `ok:0/0 deferred:subreq-budget`; `/health.writeDrainErrorStale` should never be `false` beside
+  an old record; `summary.feedMakeup.lastRawProfiles` should climb off 0.
+
+Landed by `docs/patches/scan-front-and-tail-reserve.apply.js` (worker.ts and test-unit.js are far
+past the file tool's edit window).

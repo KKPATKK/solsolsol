@@ -23,7 +23,7 @@ const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquid
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
-const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad } = require("../dist/worker.js");
+const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS } = require("../dist/worker.js");
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
@@ -111,7 +111,7 @@ async function main() {
   // live rows from 2026-09-21 pin the relationship, and until this change
   // nothing published the pre-race split at all (`dbSteps` / `modeRead` both
   // measure work INSIDE the scan).
-  await test("race window: the pre-race phase is paid for out of the scan's window, 1:1 until the floor", () => {
+  await test("race window: the pre-race phase is paid for out of the scan's window, 1:1 to zero (no floor)", () => {
     // A tick whose pre-race phase was free still only gets budget - reserve;
     // the reserve is the flush's, never the scan's.
     assert.equal(scanRaceWindowMs(0), SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS);
@@ -122,12 +122,20 @@ async function main() {
     assert.equal(SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 614, 4386);
     // 1:1 in between, i.e. the pre-race phase cannot hide in a rounding step.
     assert.equal(scanRaceWindowMs(1_000), SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 1_000);
-    // The floor: 10:53:10Z quotes "scan exceeded its 2500ms race window" (and
-    // that tick went on to run 11.5s, losing its flush) — everything from
-    // 2500ms of pre-race upward gets the same clamped window, which is why a
-    // floored tick is a signal rather than a graceful degradation.
+    // NO FLOOR (2026-09-25): 10:53:10Z quotes "scan exceeded its 2500ms race
+    // window" (and that tick went on to run 11.5s, losing its flush) — the
+    // floor it was clamped to was itself the cause (preRace + 2500 + 4500 >
+    // 9500). The window now drains 1:1 to zero, so a slow front costs the
+    // SCAN and never the completion flush.
     assert.equal(scanRaceWindowMs(2_500), 2_500);
-    assert.equal(scanRaceWindowMs(9_000), 2_500);
+    assert.equal(scanRaceWindowMs(5_000), 0);
+    assert.equal(scanRaceWindowMs(9_000), 0);
+    // A negative pre-race spend (clock skew, a bogus caller value) cannot
+    // inflate the window past the unencumbered one.
+    assert.equal(
+      scanRaceWindowMs(-1_000),
+      SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS,
+    );
     // The scan's own deadline (SCAN_TICK_DEADLINE_MS) is what a healthy tick
     // is actually bounded by, so the headroom between the two is the pre-race
     // budget: 800ms today. Past that, the race — not the scan's deadline —
@@ -135,6 +143,59 @@ async function main() {
     assert.equal(
       SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - SCAN_TICK_DEADLINE_MS,
       800,
+    );
+  });
+
+  // ---------- the scan yields the tracker pass its subrequests -------------
+  //
+  // The pass runs LAST and is the residual claimant of the invocation's 50;
+  // the scan runs FIRST and had no reservation for it (live 2026-09-25:
+  // `ok:0/0 deferred:subreq-budget` pass after pass while the rotation
+  // stalled). The scan is the only phase with optional work, so the counter
+  // it consults carries the pass's slice.
+  await test("subreq reserve: the scan is handed its budget minus the tracker pass's slice", () => {
+    // The pass's own arithmetic: entry floor 3 + tail reserve 6.
+    assert.equal(TRACKER_PASS_SUBREQ_RESERVE, 9);
+    assert.equal(scanSubreqLeft(30), 21);
+    assert.equal(scanSubreqLeft(TRACKER_PASS_SUBREQ_RESERVE), 0);
+    // Negative is a real answer — clamping it to 0 would read as "exactly at
+    // the reserve" and hide that the slice is already spent.
+    assert.equal(scanSubreqLeft(2), -7);
+    const workerSrc = fs.readFileSync(
+      path.join(__dirname, "..", "src", "worker.ts"),
+      "utf8",
+    );
+    assert.ok(
+      workerSrc.includes("scanner.runOnce(() => scanSubreqLeft(subreqRemaining()))"),
+      "the scan's counter must carry the reserve",
+    );
+  });
+
+  // ---------- the cron front's init is bounded ------------------------------
+  //
+  // Until 2026-09-25 the front init was awaited unbounded, so a wedged one
+  // died before the gate could record the arrival: `scheduled_tick_at` stood
+  // still for 26 minutes while the HTTP fallback kept scanning (a cron hole
+  // that read like a dead trigger). A bounded init falls through to the
+  // `!scanner` guard, which records the arrival with the standalone client.
+  await test("front init: the cron handler's init is bounded, and its split still lands", () => {
+    const workerSrc = fs.readFileSync(
+      path.join(__dirname, "..", "src", "worker.ts"),
+      "utf8",
+    );
+    assert.ok(
+      workerSrc.includes(
+        'recoveryAwait(ensureInitialized(env), FRONT_INIT_BOUND_MS, "init")',
+      ),
+      "the scheduled handler's init must be bounded",
+    );
+    assert.ok(
+      workerSrc.includes("preTick.steps.init = Date.now() - initAt;"),
+      "the pre-tick split must still be published for a bounded init",
+    );
+    assert.ok(
+      FRONT_INIT_BOUND_MS > 0 && FRONT_INIT_BOUND_MS < SCAN_TICK_BUDGET_MS,
+      "the bound has to leave the tick a real scan window",
     );
   });
 
@@ -12060,7 +12121,11 @@ async function main() {
     // the call into `if(shouldStampArrival(...)){`, so a condition that is
     // present but neutralised (or moved out of the gate) still fails here.
     const stampCall = workerSrc.indexOf("if(shouldStampArrival(scheduledTickFinishedAt,cronAt)){");
-    const scheduledInit = workerSrc.indexOf("constinitAt=Date.now();awaitensureInitialized(env);");
+    // The init this stamp must precede is BOUNDED now (see
+    // FRONT_INIT_BOUND_MS), so the anchor follows the recoveryAwait call.
+    const scheduledInit = workerSrc.indexOf(
+      'constinitAt=Date.now();awaitrecoveryAwait(ensureInitialized(env),FRONT_INIT_BOUND_MS,"init");',
+    );
     const flagSets = workerSrc.split("scheduledTickFinishedAt=Date.now()").length - 1;
     const applied = {
       "db (stampScheduledArrival)": dbSrc.includes("asyncstampScheduledArrival(at:number):Promise<void>{"),

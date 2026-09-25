@@ -412,10 +412,28 @@ installTickProbe(fakeScanner, {
   assert.equal(retried.calls, 1, "the next drain retries the same call");
   assert.equal(retried.failures, 0, "and this time it lands");
   assert.equal(retried.lastError, null, "a clean drain reports no error");
+  // ...and the RECOVERY clears the durable row (2026-09-25). The row is only
+  // ever rewritten by a FAILURE, so without this it stood there forever: live
+  // /health read `writeDrainError` 8.4h old with `pending 15` while every
+  // drain behind it had landed — a reader chasing an incident that was over.
+  // `""` rather than a DELETE: /health already reads a missing row as null and
+  // parses an empty one to null too (its JSON.parse throws into the same
+  // catch), so nothing else has to change and no new Db method is needed.
   assert.equal(
     drainErrorRows.length,
-    1,
-    "a clean drain writes nothing — the last failure stays readable rather than being erased",
+    2,
+    "the recovery clears the row this isolate wrote",
+  );
+  assert.equal(drainErrorRows[1].key, WRITE_DRAIN_ERROR_KEY, "under the same key");
+  assert.equal(drainErrorRows[1].value, "", "cleared, not rewritten");
+  // The guard makes that cost ONE write, once: the next drain (and every idle
+  // one) writes nothing at all, so a healthy isolate pays nothing.
+  const afterClear = await drainDeferredWrites();
+  assert.equal(afterClear.calls, 0, "the queue is empty again");
+  assert.equal(
+    drainErrorRows.length,
+    2,
+    "a healthy isolate never pays for the clear again",
   );
   assert.equal(flakyAttempts, 2, "the real write ran a second time");
   assert.equal(retried.pending, 0, "the queue drains clean");
