@@ -768,7 +768,8 @@ Tracker 每個 tick 為 head 30 行攞一次價（live `rows 30/30 pairs 30/30`�
 所以一次檢查之內跨完嘅梯級，**冇**任何 live 取樣捕捉得到；再加 `pairs-empty`
 （DexScreener 429）、`deferred:subreq-budget`、tick 死亡，條 row 可以幾分鐘
 完全冇被評估。呢類個案仍然係「一張卡講明跨咗邊幾關」（第十一補）——
-唯一可以再進一步嘅方向係用 1m K 線重建兩次檢查之間嘅價格路徑（未做）。
+唯一可以再進一步嘅方向係用 1m K 線重建兩次檢查之間嘅價格路徑 —— **2026-09-25 評估完**：
+K 線路線付唔起，改為讀樣本自己嘅 5 分鐘點（見第十四補）。
 
 ### 驗證
 
@@ -776,3 +777,72 @@ Tracker 每個 tick 為 head 30 行攞一次價（live `rows 30/30 pairs 30/30`�
 同一行喺 pacing 之內 `+60%` → 出 `up50` 卡（`下一關 +100%`）；一分鐘後 `+120%`
 → 出 `up100` 卡；同一關再見到（已 mark）→ 0 張；🔥 ignition 喺窗口內仍然 0 張、
 窗口過後 1 張。
+
+---
+
+## 第十四補：(a) 1m K 線 定 (b) 第二個價格來源？
+
+Operator 問（2026-09-25）：盲窗要點補 —— **(a)** 用 1m K 線重建兩次檢查之間嘅
+價格路徑，定 **(b)** 提高覆蓋率（第二個價格來源頂 DexScreener 429）？
+
+答案係：**(b) 已經喺 repo 內，唔係一條待建嘅路；(a) 嘅 K 線形式付唔起** ——
+兩者都唔係路，但 (a) 有一個免費嘅半邊，呢個 patch 就係做嗰半邊。
+
+### 1. (b) 已經落地（所以唔係選項）
+
+Tracker 嘅 pair 一直有三條腿，最後兩條就係為 DexScreener 429 而設：
+
+| 腿 | 位置 | 服務對象 |
+| --- | --- | --- |
+| `lastPairs`（本 tick scan 前排已付過嘅批次） | `Scanner.lastPairs` | head 冇變位時**零** HTTP |
+| DexScreener `fetchPairsForTokens` | `Scanner.pairsForTracker` | 主來源 |
+| Jupiter `fetchTokenDataBatch` | 同上（`missing` 仍未答到時） | 429 期間嘅主力 |
+| GeckoTerminal `fetchTokenSnapshot` | 同上（`TRACKER_GECKO_LOOKUPS` 上限） | 前兩條都交白卷時 |
+
+另外 front pair phase 自己亦有 Jupiter fallback（`pairsByToken.size < addresses.length * 0.5`）。
+2026-09-18 嗰次實測（wrangler.toml `DEX_REQUEST_INTERVAL_MS` 註釋、docs/gecko-429.md）：
+DexScreener 429 嘅整段窗口都由 Jupiter 腿**撐住 130/130 pairs**。即係「第二個價格來源」
+唔止有，係已經證明過。再建第三個來源只能覆蓋「三個都唔識」嘅幣 —— 而呢個 population
+冇量到過（`/debug/push-watch` 冇呢個讀數，亦冇卡片因佢而唔推）。
+
+### 2. (a) 嘅 K 線形式：兩邊預算都爆（算術，唔係感覺）
+
+* **CU**：`BIRDEYE_CU_PRICES.ohlcv = 35` CU/次（`src/birdeye.ts`），free tier 30_000 CU/**月**；
+  而 docs/round-trips.md §4.4.2／§4.5.1 已經記住：**卡片路徑單獨（`token_overview` 20 CU × 40–52
+  張/日）就可以食光整個月**。要覆蓋每個 gap：31 條 active row × 1440 次/日 ≈ **44_640 次/日**
+  ＝ **~1.56M CU/日** ⇒ 一日燒 **~52 個月**嘅 free tier。就算只做「已吞關卡」嘅行，
+  都要先逐行攞 K 線才知道有冇吞 —— 冇一個免費嘅篩。
+* **Subrequest**：每 row 每次檢查 +1 → 一個 pass +30（head 30），而一個 invocation 只有
+  **50**，tick 本身已經用 **10–16**（`/health.subreqs`）。即係 K 線路線唔止貴，係**爆預算**。
+* **覆蓋率亦唔係瓶頸**：31 條 row ÷ head 30 ≈ 每行 **~60s** 一次，即 cron 自己嘅下限；
+  所以「兩次檢查之間」嘅盲窗本身只有一分鐘，而 429／`deferred:subreq-budget`／tick 死亡
+  先係把它拉長到幾分鐘嘅原因（第十三補 §2）—— 呢個係 tick 預算問題，唔係價格來源問題。
+
+### 3. 做咗嘅：樣本自己嘅 5 分鐘點（零 CU、零 subrequest）
+
+`priceChange.m5` 係 DexScreener 自己發佈嘅「5 分鐘前 → 現在」變化；mcap = 價 × 固定
+supply，所以 `mcapAt5m = mcap / (1 + m5/100)`。當**上次檢查距今 > 5 分鐘**，呢一點就落在
+盲窗之內 —— 即係免費得到盲窗中段嘅一個價格讀數，唔使任何新來源。
+
+* `blindWindowPoint()`（`src/pushwatch.ts`，純函數）：`gap ≤ 5 分鐘`、未檢查過（`lastChecked 0`）、
+  `m5 ≤ 0`（Gecko 腿冇呢個欄位，`0` ＝ 冇讀數，唔係平盤）、base 唔可用 ⇒ 一律 `null`。
+* 🚀 卡尾（`risingCardTail` 第三個參數）：吞咗多過一關時，多報一句
+  `（距上次檢查 12 分鐘；5 分鐘前 $220.43K＝+55%：+50% 已跨過）` —— 即係話俾讀者知
+  邊幾關喺盲窗**前半**已經跨過（`≤ pctAt5m` 嘅關卡），邊幾關係最近 5 分鐘嘅事；若果點數
+  低過所有吞咗嘅關卡，就反過來講 `整段爬升都喺最近 5 分鐘內`。
+* **唔變嘅保證**：正常一分鐘一次嘅檢查（gap ≤ 5 分鐘）讀數**逐字不變**；冇新 call、冇新來源、
+  冇改任何 gate／發卡條件；卡只係把已經有嘅 `5m` 欄位換成一個可讀嘅位置。
+
+**老實講清界線**：`m5` 係**一點**，唔係一條路徑。盲窗內「急升到某關再完全回落」呢個形狀，
+樣本同 `m5` 都捕捉唔到（row 自己嘅 `peak_mcap` 高水位都證明唔到：取樣未見過嘅關卡就係
+證明唔到嘅關卡）。要答嗰個形狀就真係要 K 線 —— 而上面嘅算術就係佢付唔起嘅原因。
+
+### 4. 驗證
+
+* `test-unit.js` 加 3 條：`blindWindowPoint` 嘅六個 null 出口＋ALCHEMY 形狀（476_120 / 2.16
+  ＝ $220_426、+54.8%）；`risingCardTail` 嘅三個分支（已跨過／整段喺 5 分鐘內／冇讀數時逐字
+  不變）；`evaluateWatch` 嘅 12 分鐘 gap（卡帶 `距上次檢查 12 分鐘`）同 60 秒 gap（卡**冇**
+  `距上次檢查`、冇 `5 分鐘前`）。
+* 落線睇：`/health.pushWatchPass.note` 唔應該因呢刀而變；下次出現 `pairs-empty`／
+  `deferred:subreq-budget`／tick 死亡之後嘅 🚀 卡，尾段應該帶 `距上次檢查 N 分鐘`，
+  而 `N` 對得上嗰個盲窗。

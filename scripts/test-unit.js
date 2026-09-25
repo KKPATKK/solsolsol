@@ -19,7 +19,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
@@ -7803,6 +7803,126 @@ async function main() {
     );
     assert.equal(ignitionDue.alerts.length, 1);
     assert.equal(ignitionDue.alerts[0].sig, "ignite");
+  });
+
+  await test("blindWindowPoint: only a window longer than its own 5-minute reach is read", () => {
+    // The point exists only when the previous check is further back than the
+    // sample's own m5 reach: a row checked a minute ago already sampled
+    // everything newer than the point, so naming it would tell the reader
+    // nothing the card's own `5m` field does not.
+    assert.equal(
+      blindWindowPoint({ mcap: 476_120, chg5m: 116, baseMcap: 142_440, gapMs: 60_000 }),
+      null,
+      "a once-a-minute check has no window to describe",
+    );
+    assert.equal(BLIND_WINDOW_MS, 5 * 60_000);
+    assert.equal(
+      blindWindowPoint({ mcap: 476_120, chg5m: 116, baseMcap: 142_440, gapMs: 0 }),
+      null,
+      "a row that was never checked has no gap to describe",
+    );
+    // m5 <= 0 is NOT "flat": the GeckoTerminal leg carries 0 for a field it
+    // does not publish (see Scanner.pairsForTracker), and a level derived from
+    // a number that means "no reading" is exactly what this repo refuses to
+    // put on a card.
+    assert.equal(
+      blindWindowPoint({ mcap: 476_120, chg5m: 0, baseMcap: 142_440, gapMs: 12 * 60_000 }),
+      null,
+      "a zero m5 is a missing reading, not a flat tape",
+    );
+    assert.equal(
+      blindWindowPoint({ mcap: 476_120, chg5m: -20, baseMcap: 142_440, gapMs: 12 * 60_000 }),
+      null,
+      "a falling 5m cannot describe a climb",
+    );
+    assert.equal(
+      blindWindowPoint({ mcap: 476_120, chg5m: 116, baseMcap: 0, gapMs: 12 * 60_000 }),
+      null,
+      "no usable base, no % to report",
+    );
+    // The ALCHEMY shape, to the dollar: `推送時 $142.44K → $476.12K (+234%)`
+    // with `5m +116%` puts the price at 476_120 / 2.16 = $220_426, i.e. +54.8%
+    // from the push-time base — the +50% band, five minutes early.
+    const p = blindWindowPoint({
+      mcap: 476_120,
+      chg5m: 116,
+      baseMcap: 142_440,
+      gapMs: 12.4 * 60_000,
+    });
+    assert.ok(p, "the ALCHEMY shape is readable");
+    assert.ok(Math.abs(p.mcapAt5m - 220_426) < 2, `mcap 5m ago ≈ $220.43K (got ${p.mcapAt5m})`);
+    assert.ok(p.pctAt5m > 54 && p.pctAt5m < 56, `and ≈ +55% from base (got ${p.pctAt5m})`);
+    assert.equal(p.gapMs, 12.4 * 60_000);
+  });
+
+  await test("risingCardTail: a blind window's own point dates the bands it swallowed", () => {
+    // ALCHEMY: +50/+100/+200 crossed while nothing sampled the row. The +50%
+    // band is provably EARLY — the price was already +54.8% five minutes
+    // before the sample — so the card dates it instead of leaving the reader
+    // to guess whether all three bands happened inside the last minute.
+    const blind = { gapMs: 12.4 * 60_000, mcapAt5m: 220_426, pctAt5m: 54.8 };
+    const text = risingCardTail([50, 100, 200], 400, blind);
+    assert.match(text, /一次檢查內跨越 \+50%\/\+100%\/\+200%/);
+    assert.match(text, /距上次檢查 12 分鐘/);
+    assert.match(text, /5 分鐘前 \$220\.43K＝\+55%/);
+    assert.match(text, /\+50% 已跨過/);
+    assert.match(text, /下一關 \+400%/);
+    // A point BELOW every swallowed band is the opposite reading: the whole
+    // climb is inside the sample's own five minutes.
+    const fresh = risingCardTail([50, 100, 200], 400, {
+      gapMs: 12.4 * 60_000,
+      mcapAt5m: 150_000,
+      pctAt5m: 5.3,
+    });
+    assert.match(fresh, /整段爬升都喺最近 5 分鐘內/);
+    assert.doesNotMatch(fresh, /已跨過/);
+    // And with no reading at all the tail is byte-for-byte what it was (that
+    // is the ordinary once-a-minute check, and the pinned strings above).
+    assert.equal(risingCardTail([50, 100], 200), " | 一次檢查內跨越 +50%/+100% | 下一關 +200%");
+  });
+
+  await test("evaluateWatch: a blind window's own point rides the card that swallowed the bands", () => {
+    // The two halves meet here: the ladder fires outside the pacing gate (see
+    // the test above) and the WINDOW is what the card now also reports. Live
+    // 2026-09-25 ALCHEMY: one card at +234% naming +50/+100/+200, with the
+    // row un-evaluated for 24 of the previous minutes.
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "ALCHEMY", pushedAt: 0,
+      mcapAtPush: 142_440, peakMcap: 142_440, lastLiquidity: 30_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      ...over,
+    });
+    const live = (mcap, chg5m) => ({ mcap, liquidity: 30_000, chg5m, buysH1: 200, sellsH1: 100 });
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const now = 10_000_000;
+
+    // A warning card fired a minute ago (the row is paced for another 29
+    // minutes) AND the previous check is 12 minutes back.
+    const blind = evaluateWatch(
+      row({ lastChecked: now - 12.4 * 60_000, lastAlertAt: now - 60_000 }),
+      now,
+      live(476_120, 116),
+      cfg,
+    );
+    assert.equal(blind.alerts.length, 1);
+    assert.equal(blind.alerts[0].sig, "up200", "the highest crossed band is the card");
+    assert.match(blind.alerts[0].text, /距上次檢查 12 分鐘/);
+    assert.match(blind.alerts[0].text, /5 分鐘前 \$220\.43K＝\+55%/);
+    assert.match(blind.alerts[0].text, /一次檢查內跨越 \+50%\/\+100%\/\+200%/);
+
+    // The SAME evaluation on time (a 60s gap) must read exactly as before:
+    // the point is not new information, so it is not claimed.
+    const timely = evaluateWatch(
+      row({ lastChecked: now - 60_000, lastAlertAt: now - 60_000 }),
+      now,
+      live(476_120, 116),
+      cfg,
+    );
+    assert.equal(timely.alerts.length, 1);
+    assert.match(timely.alerts[0].text, /一次檢查內跨越 \+50%\/\+100%\/\+200%/);
+    assert.doesNotMatch(timely.alerts[0].text, /距上次檢查/);
+    assert.doesNotMatch(timely.alerts[0].text, /5 分鐘前/);
   });
 
   await test("evaluateWatch: weak, dead stops tracking, liquidity crash, holder growth", () => {

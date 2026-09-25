@@ -521,16 +521,120 @@ export function newlyCrossedStages(
 }
 
 /**
+ * The width of the sample's own backward reach: `priceChange.m5` describes
+ * where the price was five minutes before the sample, so a check gap LONGER
+ * than this is the only case where that point lands inside the window the
+ * previous check never covered (see blindWindowPoint).
+ */
+export const BLIND_WINDOW_MS = 5 * 60_000;
+
+/**
+ * One point of the price path the tracker never sampled, read off the sample
+ * it already has. See blindWindowPoint for what may and may not be said with
+ * it.
+ */
+export interface BlindWindowPoint {
+  /** `now - row.lastChecked` at this evaluation (the window's width, ms). */
+  gapMs: number;
+  /** Where the price was 5 minutes before the sample (USD mcap). */
+  mcapAt5m: number;
+  /** That price as a % from the row's base (mcapAtPush). */
+  pctAt5m: number;
+}
+
+/**
+ * The ONE point inside a blind window that costs nothing to know — the price
+ * five minutes before this sample, divided back out of the sample's own
+ * `priceChange.m5` (mcap is price × a fixed supply, so the two move together:
+ * `mcap / (1 + m5/100)`).
+ *
+ * WHY this and not candles (2026-09-25): reconstructing the path with 1-minute
+ * OHLCV candles would cost 35 CU per call (Birdeye's price for `/defi/ohlcv`,
+ * `BIRDEYE_CU_PRICES`) against a 30_000 CU/MONTH free tier that the CARD path
+ * alone can exhaust, plus one subrequest per row per check inside a 50-
+ * subrequest invocation — 30 head rows a pass is 30 subrequests, i.e. the
+ * whole tick's budget. The same question is answered here for free: the leg
+ * that answered the pair already published where the price was 5 minutes ago.
+ *
+ * WHAT IT MAY SAY: the price AT that instant. Because `m5 > 0` means the price
+ * five minutes ago was LOWER than now, every band at or below `pctAt5m` was
+ * therefore already crossed by then — a fact about the blind window, not an
+ * extrapolation (this is exactly the ALCHEMY shape: the card read +234% with
+ * `5m +116%`, so the price was ≈ +54% five minutes earlier and the +50% band
+ * was provably crossed inside the 23:35–23:59 window, while the +100%/+200%
+ * were not).
+ *
+ * WHAT IT MAY NOT SAY: anything about a spike that rose AND fell back inside
+ * the window — `m5` is a single point, not a path, so a band touched and fully
+ * reverted between two samples still leaves no trace here (the row's durable
+ * `peak_mcap` high-water mark is not consulted either: a band the samples never
+ * saw is exactly the case this cannot prove). That residue is the honest
+ * boundary of the free reading, and the reason candles stay documented as
+ * unaffordable rather than merely unwired.
+ *
+ * Returns null — stay silent — unless the reading is genuinely new
+ * information: the gap must be longer than the 5-minute reach (a row checked a
+ * minute ago already sampled everything newer than the point), the row must
+ * have been checked at all (gapMs 0 ⇒ never checked ⇒ the backfill path, which
+ * sends nothing), and both the base and `chg5m` must be usable. `chg5m <= 0` is
+ * NOT "flat": the GeckoTerminal leg carries 0 for a field it does not publish
+ * (see Scanner.pairsForTracker), and a card must never derive a level from a
+ * number that means "no reading".
+ */
+export function blindWindowPoint(fields: {
+  /** The sample's own mcap reading. */
+  mcap: number;
+  /** The sample's 5-minute price change, % (DexScreener's priceChange.m5). */
+  chg5m: number;
+  /** The base every % on this row's cards is measured from (mcapAtPush). */
+  baseMcap: number;
+  /** `now - row.lastChecked`; 0 when the row has never been checked. */
+  gapMs: number;
+}): BlindWindowPoint | null {
+  const { mcap, chg5m, baseMcap, gapMs } = fields;
+  if (!Number.isFinite(mcap) || mcap <= 0) return null;
+  if (!Number.isFinite(baseMcap) || baseMcap <= 0) return null;
+  if (!Number.isFinite(gapMs) || gapMs <= BLIND_WINDOW_MS) return null;
+  if (!Number.isFinite(chg5m) || chg5m <= 0) return null;
+  const mcapAt5m = mcap / (1 + chg5m / 100);
+  if (!Number.isFinite(mcapAt5m) || mcapAt5m <= 0) return null;
+  return { gapMs, mcapAt5m, pctAt5m: (mcapAt5m / baseMcap - 1) * 100 };
+}
+
+/**
  * The 🚀 card's tail. It names EVERY stage this one card swallowed (live
  * 2026-09-25 06:49 HKT: parafactual landed as a single up400 card reading
  * +473%, with up50/up100/up200 folded in unannounced), then the stage still
  * ahead — so a reader can tell "the +200% notice was lost" from "there was
  * never a check while the price was between +100% and +200%". A card that
  * crossed exactly one stage reads exactly as it always did.
+ *
+ * With a `blind` reading (see blindWindowPoint) the swallow is DATED instead of
+ * merely admitted: the tail names where the price was five minutes before the
+ * sample and which of the swallowed bands that point already proves were
+ * crossed — the closest a free sample gets to the path between two checks.
+ * `blind` is null unless the window is longer than its own 5-minute reach, so
+ * the ordinary once-a-minute check reads byte-for-byte as it always did.
  */
-export function risingCardTail(crossed: readonly number[], nextStage: number | null): string {
+export function risingCardTail(
+  crossed: readonly number[],
+  nextStage: number | null,
+  blind: BlindWindowPoint | null = null,
+): string {
   const parts: string[] = [];
-  if (crossed.length > 1) parts.push(`一次檢查內跨越 +${crossed.join("%/+")}%`);
+  if (crossed.length > 1) {
+    let clause = `一次檢查內跨越 +${crossed.join("%/+")}%`;
+    if (blind !== null) {
+      const dated = crossed.filter((s) => s <= blind.pctAt5m);
+      const where = `5 分鐘前 ${fmtUsd(blind.mcapAt5m)}＝${pct(blind.pctAt5m)}`;
+      const gapMin = Math.round(blind.gapMs / 60_000);
+      clause +=
+        dated.length > 0
+          ? `（距上次檢查 ${gapMin} 分鐘；${where}：+${dated.join("%/+")}% 已跨過）`
+          : `（距上次檢查 ${gapMin} 分鐘；${where}：整段爬升都喺最近 5 分鐘內）`;
+    }
+    parts.push(clause);
+  }
   parts.push(nextStage !== null ? `下一關 +${nextStage}%` : "已達最高里程碑");
   return ` | ${parts.join(" | ")}`;
 }
@@ -1534,10 +1638,21 @@ export function evaluateWatch(
       // lost". Live 2026-09-25 06:49 HKT: parafactual was pushed at
       // 115_199, troughed at 71_254, and was next seen at +473%.
       const crossed = newlyCrossedStages(stage, firedStages);
+      // The sample's own 5-minute reach, when the previous check is further
+      // back than that (see blindWindowPoint): the only free reading of the
+      // window between two checks. Computed per crossing rather than per pass
+      // — the gap is a property of THIS row at THIS moment, and it is null
+      // for the ordinary once-a-minute check.
+      const blind = blindWindowPoint({
+        mcap: live.mcap,
+        chg5m: live.chg5m,
+        baseMcap: row.mcapAtPush,
+        gapMs: row.lastChecked > 0 ? now - row.lastChecked : 0,
+      });
       fire(
         "rising",
         `🚀 續漲 ${symbol} | ${baseLabel} ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
-          risingCardTail(crossed, nextStage),
+          risingCardTail(crossed, nextStage, blind),
         state,
       );
       // EVERY crossed stage is marked, not just this one. The memory walk
