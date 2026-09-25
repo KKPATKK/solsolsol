@@ -3568,8 +3568,11 @@ export class Scanner {
         // FILTER was removed long ago), so the pair was pure cost: §4.14
         // measured the card path as ≥60% of a 46K CU/month run rate against a
         // 30K free tier. They are gone, endpoints included — see
-        // docs/round-trips.md §4.17 for the arithmetic and for exactly what
-        // the card loses when the Axiom session is down.
+        // docs/round-trips.md §4.17 for the arithmetic and for exactly what the
+        // card loses. Be plain about that last part: AXIOM_ENABLED is 0 (since
+        // 2026-09-19), so the Axiom line does NOT resolve today and no card
+        // prints 狙擊 / 持有人 any more. The pair comes back for free the day
+        // Axiom is revived; the saving is real either way.
         const jupiterOrganic = this.jupiter;
         this.markPhase(diag, "enrich-dispatch", startedAt);
         const displayBatch = Promise.all([

@@ -74,6 +74,22 @@ const S_NOTE_REPLACEMENT = lines(
   "        // the card loses when the Axiom session is down.",
 );
 
+const S_DISHONEST_LINE = lines(
+  "        // 30K free tier. They are gone, endpoints included — see",
+  "        // docs/round-trips.md §4.17 for the arithmetic and for exactly what",
+  "        // the card loses when the Axiom session is down.",
+);
+const S_HONEST_MARKER =
+  "        // card loses. Be plain about that last part: AXIOM_ENABLED is 0";
+const S_HONEST_LINE = lines(
+  "        // 30K free tier. They are gone, endpoints included — see",
+  "        // docs/round-trips.md §4.17 for the arithmetic and for exactly what the",
+  "        // card loses. Be plain about that last part: AXIOM_ENABLED is 0 (since",
+  "        // 2026-09-19), so the Axiom line does NOT resolve today and no card",
+  "        // prints 狙擊 / 持有人 any more. The pair comes back for free the day",
+  "        // Axiom is revived; the saving is real either way.",
+);
+
 const S_AWAIT_MARKER = "        const [gmgn, arkham, organic] = await displayBatch;";
 const S_AWAIT_ANCHOR = lines(
   "        // Await the display batch dispatched above (it has been running",
@@ -359,6 +375,36 @@ const T_BLOCK = lines(
 
 // ── docs/round-trips.md ────────────────────────────────────────────────────
 const R = "docs/round-trips.md";
+/**
+ * §4.17 first shipped claiming the two numbers "already ride the free Axiom
+ * line". That is true only while the Axiom session RESOLVES — and
+ * `AXIOM_ENABLED` has been "0" since 2026-09-19 (its refresh endpoint is 418'd
+ * by Bot Management; /health reads `axiomConfigured: false`), so
+ * `renderAxiomSummaryLine()` returns null on every card and both rows are simply
+ * gone. The section's own table and §5 #3 read as if nothing were lost, so the
+ * record gets a correction rather than a quiet edit: the marker below is ASCII,
+ * which is what makes this block re-runnable.
+ */
+const R_CORRECTION_MARK = "<!-- 4.17-correction -->";
+const R_CORRECTION = lines(
+  "",
+  R_CORRECTION_MARK,
+  "",
+  "### 更正（落線後查證，2026-09-25）：Axiom 行今日係熄嘅，卡面真係少咗嘅兩個數",
+  "",
+  "上面寫「兩條線嘅數字已經由免費嘅 Axiom 行印」——**呢句係指 Axiom 行著嘅時候**，唔係今日。",
+  "Axiom 自 **2026-09-19** 起全域關咗：`wrangler.toml` 嘅 `AXIOM_ENABLED = \"0\"`，因為",
+  "refresh-token endpoint 被 Cloudflare Bot Management 418 擋死，session 冇法由 Worker 續期。",
+  "所以 `/health` 讀到 `axiomConfigured: false`，`renderAxiomSummaryLine()` **每一次都回 `null`**，",
+  "卡面一直行嘅係 legacy fallback group。",
+  "",
+  "即係話：**今日嘅卡片係真係冇咗狙擊同持有人數嘅** —— 唔係顯示 `—`，係整行冇咗。上面 §1 嘅表格",
+  "同 §5 第 3 點要照呢點讀（「已經嘅 Axiom 行」＝復活 Axiom 之後先會發生）。",
+  "",
+  "呢個係今次改動**已知、要明講嘅交易**：卡片側 Birdeye 花費 → 0（≈ −49% 總量），換嚟卡面少兩個",
+  "數據點。兩個數會嘅 Axiom 復活（`docs/axiom-refresher.md`）之後自動返嚟，唔使再改 code；",
+  "追蹤嘅 `📈 持倉增長` / `⚡ 背離` 警報**不受影響**（佢哋讀 `push_watch` 自己嘅讀數）。",
+);
 const R_HEADING =
   "## 4.17 卡片側兩條付費線直接刪（Sniper / Holders）：Axiom 免費行已經有嗰兩個數（2026-09-25）";
 const R_SECTION = lines(
@@ -533,6 +579,17 @@ patchOne(
   "the batch comment stops counting what it dropped",
 );
 patch(S, S_NOTE_MARKER, S_NOTE_ANCHOR, S_NOTE_REPLACEMENT, "and says why the two went");
+// The note has to be TRUE today, not just true in principle: AXIOM_ENABLED is 0
+// (2026-09-19), so the free Axiom line does not resolve and the two numbers are
+// simply gone from the card face. Saying "they already ride the Axiom line"
+// without that would read as "nothing was lost".
+patch(
+  S,
+  S_HONEST_MARKER,
+  S_DISHONEST_LINE,
+  S_HONEST_LINE,
+  "the note names the state the card is actually in",
+);
 patch(S, S_AWAIT_MARKER, S_AWAIT_ANCHOR, S_AWAIT_REPLACEMENT, "the await only destructures what is left");
 patch(S, S_CALL_MARKER, S_CALL_ANCHOR, S_CALL_REPLACEMENT, "the card call passes no sniper/holder value");
 cutRange(S, S_RES_START, S_RES_KEEP, S_RES_TOMBSTONE, S_RES_TOMBSTONE.split("\n")[1], "both paid resolvers are deleted");
@@ -590,13 +647,52 @@ patch(
 
 {
   const text = bufferOf(R);
-  if (text.includes(R_HEADING)) {
+  let live = text;
+  if (live.includes(R_HEADING)) {
     console.log(`already   ${R}: the removal is documented`);
   } else {
-    buffers.set(R, `${text.trimEnd()}\n${R_SECTION}\n`);
+    live = `${live.trimEnd()}\n${R_SECTION}\n`;
     console.log(`ok        ${R}: the removal is documented`);
   }
+  // The correction is a SECOND append, not an edit of the section above it: the
+  // text it corrects is already on disk on the tree this ran against, and an
+  // ASCII marker is the one thing that can be matched without transcribing CJK
+  // anchors. It lands inside §4.17 because that section is the file's last one.
+  if (live.includes(R_CORRECTION_MARK)) {
+    console.log(`already   ${R}: the correction is recorded`);
+  } else {
+    live = `${live.trimEnd()}\n${R_CORRECTION}\n`;
+    console.log(`ok        ${R}: the correction is recorded`);
+  }
+  buffers.set(R, live);
 }
+
+// Two particles in the correction came out as 嘅 where 喺 was meant, which reads
+// as a different word. `fixText` is the same contract as `patch` (final text is
+// the marker), applied to the buffer the block above just finished building, so
+// it converges on a fresh run and on this tree alike.
+function fixText(file, from, to, what) {
+  const text = bufferOf(file);
+  if (text.includes(to)) {
+    console.log(`already   ${file}: ${what}`);
+    return;
+  }
+  if (once(text, from) !== 1) {
+    console.error(`MISS/AMBIGUOUS ${file}: ${what}`);
+    failed = true;
+    return;
+  }
+  buffers.set(file, text.split(from).join(to));
+  console.log(`ok        ${file}: ${what}`);
+}
+
+fixText(R, "「已經嘅 Axiom 行」", "「已經喺 Axiom 行」", "the correction's first fix-up is readable");
+fixText(
+  R,
+  "數據點。兩個數會嘅 Axiom 復活",
+  "數據點。兩個數會喺 Axiom 復活",
+  "and so is its last sentence",
+);
 
 if (failed) {
   console.error("\nrefusing to leave the tree half-patched — fix the anchor above");

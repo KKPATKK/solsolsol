@@ -1540,3 +1540,20 @@ probe（≤480 CU／日）、backfill（160 CU／日）同 `/debug/*`。
 stripped 源碼：卡側冇 caller、冇 cache reader、render 冇兩行、batch 只剩三個 slot、endpoint 仍然
 存在）＋ `db: the holder probe writes its own row and nothing else, in ONE write`（真 DB：1 個
 request、N 條 statement＝每行一條、`holders_at_push` 由第一次 probe seed、token_stats 冇被寫）。
+
+<!-- 4.17-correction -->
+
+### 更正（落線後查證，2026-09-25）：Axiom 行今日係熄嘅，卡面真係少咗嘅兩個數
+
+上面寫「兩條線嘅數字已經由免費嘅 Axiom 行印」——**呢句係指 Axiom 行著嘅時候**，唔係今日。
+Axiom 自 **2026-09-19** 起全域關咗：`wrangler.toml` 嘅 `AXIOM_ENABLED = "0"`，因為
+refresh-token endpoint 被 Cloudflare Bot Management 418 擋死，session 冇法由 Worker 續期。
+所以 `/health` 讀到 `axiomConfigured: false`，`renderAxiomSummaryLine()` **每一次都回 `null`**，
+卡面一直行嘅係 legacy fallback group。
+
+即係話：**今日嘅卡片係真係冇咗狙擊同持有人數嘅** —— 唔係顯示 `—`，係整行冇咗。上面 §1 嘅表格
+同 §5 第 3 點要照呢點讀（「已經喺 Axiom 行」＝復活 Axiom 之後先會發生）。
+
+呢個係今次改動**已知、要明講嘅交易**：卡片側 Birdeye 花費 → 0（≈ −49% 總量），換嚟卡面少兩個
+數據點。兩個數會喺 Axiom 復活（`docs/axiom-refresher.md`）之後自動返嚟，唔使再改 code；
+追蹤嘅 `📈 持倉增長` / `⚡ 背離` 警報**不受影響**（佢哋讀 `push_watch` 自己嘅讀數）。

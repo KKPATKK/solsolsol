@@ -78,11 +78,18 @@ export function renderAxiomSummaryLine(
  * 2026-09-25 (§4.17): the two Birdeye-bought lines are gone. `🎯 Sniper 買入`
  * came from /defi/v2/tokens/top_traders and `👥 Holders` from
  * /defi/token_overview (20 CU), both ON TOP of the Axiom line below — which
- * already prints 狙擊 / 持有人 for free. Measured against the free tier's
- * 30K CU/month (see docs/round-trips.md §4.17), the pair was the card path's
- * whole bill, so the parameters and the lines were removed rather than left
- * reading null: a card is now never missing the two numbers because a PAID
- * call was not made, and the Axiom summary remains the single place they show.
+ * prints 狙擊 / 持有人 for free whenever it resolves. Measured against the
+ * free tier's 30K CU/month (see docs/round-trips.md §4.17), the pair was the
+ * card path's whole bill, so the parameters and the lines were removed rather
+ * than left reading null.
+ *
+ * WHAT THE CARD ACTUALLY SHOWS TODAY, stated plainly: AXIOM_ENABLED = 0 since
+ * 2026-09-19 (its refresh endpoint is 418'd by Bot Management), so the Axiom
+ * line does NOT resolve and no card prints those two numbers any more — the
+ * 狙擊 / 持有人 rows are simply absent, not "—". They come back, free, the day
+ * Axiom is revived (docs/axiom-refresher.md). That is the deliberate price of
+ * taking the card path off Birdeye altogether, and it is the same "no data, no
+ * line" stance GMGN / Arkham / crime already take.
  */
 export function renderMessage(
   coin: QualifyingCoin,
