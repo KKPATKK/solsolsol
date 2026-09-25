@@ -507,7 +507,7 @@ async function tickMakeupTest() {
 // twice — room, then at the floor — and asserts WHICH legs were asked.
 async function subreqFloorTest() {
   const { Db } = require("../dist/db.js");
-  const { Scanner, SCAN_SUBREQ_FLOOR } = require("../dist/scanner.js");
+  const { Scanner, SCAN_SUBREQ_FLOOR, CHAIN_SUBREQ_FLOOR } = require("../dist/scanner.js");
   const { createClient } = require("@libsql/client");
   const fs = require("node:fs");
   const os = require("node:os");
@@ -608,6 +608,60 @@ async function subreqFloorTest() {
     const unbounded = await runTick(undefined);
     assert.ok(unbounded.asked.includes("meteora"), "an unbounded caller drops nothing at all");
     assert.equal(unbounded.scanner.lastSummary.subreqFloor, undefined);
+
+    // ---------- the CANDIDATE CHAIN's own fence (CHAIN_SUBREQ_FLOOR) --------
+    // Live 2026-09-25: 15 of 32 dead ticks had the phase ladder frozen at
+    // `gate` — the chain's entrance — with a LOW count (10-30 of the usable
+    // 38), i.e. the chain spent the tail on upstream work and the runtime
+    // refused the completion batch behind it. The chain is the only unfenced
+    // spend in the scan (the optional front legs stand down at
+    // SCAN_SUBREQ_FLOOR, the tracker pass carries its own reserve), so this
+    // drives a real candidate through it twice: fenced, then with room.
+    assert.equal(
+      CHAIN_SUBREQ_FLOOR,
+      3,
+      "the chain's floor is the completion flush's whole retry ladder (attempt + racing retry + backoff retry)",
+    );
+    const coinPair = {
+      chainId: "solana",
+      url: "https://dexscreener.com/solana/CHAINPAIR",
+      pairAddress: "CHAINPAIR",
+      baseToken: { address: "CHAIN_COIN", name: "Chain Coin", symbol: "CHAIN" },
+      priceUsd: "0.001",
+      marketCap: 100_000,
+      volume: { h24: 500_000, h1: 60_000, m5: 9_000 },
+      priceChange: { m5: 40, h1: 60 },
+      txns: { m5Buys: 80, m5Sells: 60, h1Buys: 900, h1Sells: 700 },
+      liquidity: { usd: 20_000 },
+      pairCreatedAt: Date.now() - 60 * 60_000,
+    };
+    dex.fetchPairsForTokens = async () => new Map([["CHAIN_COIN", coinPair]]);
+    const chainFeed = [{ chainId: "solana", tokenAddress: "CHAIN_COIN", symbol: "CHAIN" }];
+
+    // FENCED FIRST (nothing is pushed, so the room run below starts clean):
+    // one subrequest below the flush's ladder, a real candidate in hand — the
+    // chain defers the COIN instead of spending the completion write.
+    stubFeed(chainFeed);
+    const chainLow = await runTick(() => CHAIN_SUBREQ_FLOOR);
+    const lowSummary = chainLow.scanner.lastSummary;
+    assert.equal(lowSummary.chainFloor, CHAIN_SUBREQ_FLOOR, "the fence names the allowance it refused to spend");
+    assert.ok(lowSummary.subreqSkip.includes("chain"), "and the summary points at the CHAIN, not at a quiet feed");
+    assert.equal(lowSummary.chainDeferred, 1, "the coin it refused to start is counted");
+    assert.equal(lowSummary.candidates, 1, "...and it WAS a candidate — the fence only ever fires on real work");
+    assert.equal(lowSummary.pushed, 0, "nothing was sent, so nothing can be lost: the re-eval pool re-offers it");
+
+    // ROOM: the same coin, the same tick, and the chain runs it end to end.
+    stubFeed(chainFeed);
+    const chainRoom = await runTick(() => 30);
+    const roomSummary = chainRoom.scanner.lastSummary;
+    assert.equal(roomSummary.chainFloor, undefined, "with room the fence claims nothing");
+    assert.ok(
+      !(roomSummary.subreqSkip ?? []).includes("chain"),
+      "and the chain is never named as skipped when it ran",
+    );
+    assert.equal(roomSummary.chainDeferred, undefined, "no candidate was deferred");
+    assert.equal(roomSummary.candidates, 1, "the candidate still reached the chain");
+    dex.fetchPairsForTokens = async () => new Map();
   } finally {
     await client.close();
     try {
@@ -616,6 +670,101 @@ async function subreqFloorTest() {
       /* best-effort */
     }
   }
+}
+
+// ---------- the list feeds ride the colo edge cache (LIST_FEED_CACHE_TTL_S) --
+// The profiles lane is the tick's biggest discovery lane and it came back EMPTY
+// on 133 of 464 live ticks (27%). The cause is not this client's arithmetic:
+// the endpoint is rate-limited per SOURCE IP and a Worker's egress IP is shared
+// fleet-wide, so our one request per tick is what strangers' traffic 429s (the
+// durable ring measured 17 429s/hour — one per tick-failure). What this client
+// CAN decide is whether the request reaches the origin at all, which is what
+// the GeckoTerminal leg has done since 2026-09-21. These cases pin both halves:
+// the two LIST feeds are asked through the cache, the pair batch never is, and
+// an attempt the throttle queue holds past the caller's window is COUNTED as a
+// drop rather than read as an upstream refusal.
+async function dexListCacheTest() {
+  const {
+    DexScreenerClient,
+    LIST_FEED_CACHE_TTL_S,
+    PROFILE_FEED_SELF_BUDGET_MS,
+  } = require("../dist/dexscreener.js");
+  const json = (body, headers = {}) =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json", ...headers },
+    });
+  assert.equal(
+    LIST_FEED_CACHE_TTL_S,
+    60,
+    "the list TTL is one tick's cadence — a HIT is always fresher than the 10-minute reuse lane it backstops",
+  );
+
+  // (a) The profiles list asks THROUGH the edge cache, and a HIT is published.
+  let init = null;
+  globalThis.fetch = async (_url, opts = {}) => {
+    init = opts;
+    return json([{ chainId: "solana", tokenAddress: "EDGE_A" }], {
+      "cf-cache-status": "HIT",
+    });
+  };
+  let dex = new DexScreenerClient(loadConfig({}));
+  const out = await dex.fetchLatestSolanaProfiles();
+  assert.deepEqual(out.map((p) => p.tokenAddress), ["EDGE_A"]);
+  assert.equal(init.cf && init.cf.cacheEverything, true, "the profiles list is asked through the colo cache");
+  assert.equal(init.cf.cacheTtl, LIST_FEED_CACHE_TTL_S);
+  assert.deepEqual(
+    init.cf.cacheTtlByStatus,
+    { "200-299": LIST_FEED_CACHE_TTL_S, "300-399": 0, "400-599": 0 },
+    "a 429/5xx is kept OUT of the cache — a refused minute can never be served to the next tick as a fresh feed",
+  );
+  const hitStats = dex.getStats();
+  assert.equal(hitStats.listCacheHits, 1, "the HIT is counted — this is the reading that proves the fix worked");
+  assert.equal(hitStats.lastListCacheStatus, "HIT");
+  assert.equal(hitStats.budgetDrops, 0, "and a dispatched attempt is never counted as a drop");
+
+  // (b) The boosts list rides the same cache (same host, same bucket).
+  init = null;
+  dex = new DexScreenerClient(loadConfig({}));
+  await dex.fetchBoostedTokens(20);
+  assert.equal(init.cf && init.cf.cacheEverything, true, "the boosts list rides the same cache");
+
+  // (c) The PAIR batch must NOT be cached: those are the metrics the gates and
+  // the tracker judge (5m volume/change, liquidity), keyed by this tick's
+  // address set, and the client already has its own pair cache for them.
+  let pairInit = null;
+  globalThis.fetch = async (_url, opts = {}) => {
+    pairInit = opts;
+    return json({ pairs: [] });
+  };
+  dex = new DexScreenerClient(loadConfig({}));
+  await dex.fetchPairsForTokens(["EDGE_A"]);
+  assert.equal(pairInit.cf, undefined, "the pair batch is never edge-cached");
+
+  // (d) A dropped attempt is its own reading. The throttle gap is set wider
+  // than the profiles self-budget, which is exactly the live shape the counters
+  // could not name before: the request is never dispatched, so nothing arrives
+  // and the tick reads `raw 0` with `http429` flat — "never asked" and
+  // "refused" looked identical.
+  globalThis.fetch = async () => json([{ chainId: "solana", tokenAddress: "EDGE_B" }]);
+  dex = new DexScreenerClient(
+    loadConfig({ DEX_REQUEST_INTERVAL_MS: String(PROFILE_FEED_SELF_BUDGET_MS * 2) }),
+  );
+  await dex.fetchLatestSolanaProfiles();
+  const second = await dex.fetchLatestSolanaProfiles();
+  const dropStats = dex.getStats();
+  assert.equal(
+    dropStats.budgetDrops,
+    1,
+    "an attempt the throttle queue holds past the caller's window is a DROP, counted apart from a 429",
+  );
+  assert.ok(dropStats.lastDroppedAt !== null, "and it is stamped");
+  assert.equal(dropStats.http429, 0, "no 429 was ever seen — the two outages are not the same outage");
+  assert.deepEqual(
+    second.map((p) => p.tokenAddress),
+    ["EDGE_B"],
+    "a dropped fetch still evaluates the list the tick already had (the reuse lane), never nothing",
+  );
 }
 
 // ---------- the durable snapshot the worker writes after the flush ----------
@@ -632,6 +781,7 @@ assert.deepEqual(reloaded.pendingTokens, ["DURABLE_TOKEN"]);
 feedTests()
   .then(tickMakeupTest)
   .then(subreqFloorTest)
+  .then(dexListCacheTest)
   .then(() => {
     // Cleanup: the registry is module state; leave nothing behind for the
     // next suite that loads this build.

@@ -166,6 +166,56 @@ export const PROFILE_FEED_REUSE_MS = 10 * 60_000;
 export const BOOST_FEED_SELF_BUDGET_MS = 480;
 
 /**
+ * Edge-cache TTL for the two LIST feeds (`/token-profiles/latest/v1`,
+ * `/token-boosts/latest/v1`) — the requests that go through `cf` below.
+ *
+ * WHY THE LIST FEEDS ARE EDGE-CACHED AND THE PAIR BATCHES ARE NOT
+ * (2026-09-25, live): the profiles list is the tick's biggest discovery lane
+ * and the one reading the operator watches, and it was coming back EMPTY on
+ * 133 of 464 ticks (27%). The cause is not this client's arithmetic: the
+ * endpoint is rate-limited per SOURCE IP — ~5 requests/minute — and a
+ * Cloudflare Worker's egress IP is shared fleet-wide, so the bucket is spent
+ * by strangers and our single request per tick gets 429'd (the durable ring
+ * measured 17 429s/hour; every one of them costs that tick its raw list, since
+ * a 429 answers fast and is counted as a failure, never retried for a budgeted
+ * caller).
+ *
+ * Nothing we do to our own spacing can refill a bucket we do not own; what
+ * this DOES own is whether the request reaches the origin at all. The same
+ * discipline the GeckoTerminal client has used since 2026-09-21 (see
+ * geckoterminal.ts `requestInit`): ask through the colo's edge cache with
+ * `cacheEverything` + `cacheTtl`, and keep non-2xx responses OUT of the cache
+ * (`cacheTtlByStatus`), so a 429 can never be served to the next tick as if it
+ * were a fresh feed. A HIT costs the invocation the same one subrequest but
+ * never touches the origin: no 429, and a latency of ~10ms instead of the
+ * shared egress's 300-800ms.
+ *
+ * 60 SECONDS because the list is a discovery list: the endpoint is a slowly
+ * rotating set of "latest" profiles, the tick runs every 60s, and this client
+ * ALREADY accepts a 10-minute-old list on a failed fetch (see
+ * PROFILE_FEED_REUSE_MS) — so a 60s-old HIT is strictly fresher than what the
+ * tick would otherwise evaluate. It is deliberately NOT applied to
+ * `/latest/dex/tokens` (the pair batch): those are the metrics the gate and
+ * the tracker judge (5m volume/change, liquidity), they are keyed by the
+ * address set this tick happens to hold, and the client already has its own
+ * short-lived pair cache for them.
+ */
+export const LIST_FEED_CACHE_TTL_S = 60;
+
+/**
+ * The Cloudflare-specific fetch options this client asks for (see
+ * LIST_FEED_CACHE_TTL_S). Declared locally, like the GeckoTerminal client's
+ * identical one, because `RequestInit` does not carry `cf`.
+ */
+interface CloudflareFetchInit extends RequestInit {
+  cf?: {
+    cacheEverything?: boolean;
+    cacheTtl?: number;
+    cacheTtlByStatus?: Record<string, number>;
+  };
+}
+
+/**
  * Should this tick evaluate the previous profile list instead of the one it
  * just fetched? Pure and exported so the rule is unit-tested rather than only
  * observed (scripts/test-deferred-priority.js).
@@ -372,6 +422,27 @@ export class DexScreenerClient {
   /** Epoch of the most recent 429 response, or null if never. */
   private last429At: number | null = null;
   /**
+   * Edge-cache readings for the list feeds (see LIST_FEED_CACHE_TTL_S): how
+   * many profile/boost responses came from the colo cache (`cf-cache-status`
+   * HIT/REVALIDATED) and what the LAST one said. This is the reading that
+   * proves the 429-driven `raw 0` ticks were cured by the cache rather than by
+   * the upstream getting kinder: `cacheHits` climbing with `http429` flat means
+   * the origin was never asked.
+   */
+  private listCacheHits = 0;
+  private lastListCacheStatus: string | null = null;
+  /**
+   * Attempts this client NEVER SENT because the caller's deadline was already
+   * spent (the throttle queue held them past it — see getJson). Counted apart
+   * from `http429` because the two outages have different fixes: a 429 is the
+   * upstream refusing, a drop is our own window being too small. Live 2026-09-25
+   * the counters could not tell them apart, which is how `raw 0` read as
+   * "DexScreener is blocking us" while the fetch may simply never have been
+   * dispatched.
+   */
+  private budgetDrops = 0;
+  private lastDroppedAt: number | null = null;
+  /**
    * The last profile fetch that returned coins, and when (see
    * PROFILE_FEED_REUSE_MS): what a rate-limited tick evaluates instead of
    * nothing. In-memory by design — the scanner hands this list to the tick, so
@@ -399,6 +470,17 @@ export class DexScreenerClient {
     last429At: number | null;
     blockedForMs: number;
     cacheSize: number;
+    /** List-feed responses served from the colo edge cache (see
+     * LIST_FEED_CACHE_TTL_S) — climbing = the origin was never asked. */
+    listCacheHits: number;
+    /** The LAST list-feed `cf-cache-status` (HIT / MISS / BYPASS / DYNAMIC…), or
+     * null when the leg has not run in this isolate. */
+    lastListCacheStatus: string | null;
+    /** Attempts never SENT because the caller's window was already spent (the
+     * throttle queue ate it) — the reading that separates "refused" from
+     * "never asked". */
+    budgetDrops: number;
+    lastDroppedAt: number | null;
   } {
     return {
       intervalMs: this.config.dexRequestIntervalMs,
@@ -406,6 +488,10 @@ export class DexScreenerClient {
       last429At: this.last429At,
       blockedForMs: Math.max(0, this.batchBlockedUntil - Date.now()),
       cacheSize: this.pairCache.size,
+      listCacheHits: this.listCacheHits,
+      lastListCacheStatus: this.lastListCacheStatus,
+      budgetDrops: this.budgetDrops,
+      lastDroppedAt: this.lastDroppedAt,
     };
   }
 
@@ -448,8 +534,20 @@ export class DexScreenerClient {
    * deadline it was handed), the backoff sleeps only as long as the budget
    * allows, and once it is exhausted the call returns null instead of
    * throwing.
+   *
+   * `listCacheTtlS` (optional, seconds) asks for the Cloudflare EDGE CACHE on
+   * this request — passed by the two LIST feeds only (see
+   * LIST_FEED_CACHE_TTL_S), never by the pair batches: those are keyed by this
+   * tick's address set and carry the metrics the gates judge, so they must
+   * reach the origin. With the TTL set, a 429 stops costing the tick its list:
+   * a HIT never leaves the colo, and a refused 400/500 is kept out of the cache
+   * by `cacheTtlByStatus`, so nothing bad can be served as if it were fresh.
    */
-  private async getJson(path: string, deadline?: number): Promise<unknown> {
+  private async getJson(
+    path: string,
+    deadline?: number,
+    listCacheTtlS?: number,
+  ): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
       const remaining =
@@ -467,7 +565,14 @@ export class DexScreenerClient {
           // quietly filled the list (the fetch was aborted before it could
           // answer). The wait is now paid out of the same window: a spent
           // budget ends the attempt here instead of sending it.
-          if (deadline !== undefined && Date.now() >= deadline) return null;
+          if (deadline !== undefined && Date.now() >= deadline) {
+            // NEVER SENT (see budgetDrops): the queue held this attempt past
+            // the caller's window. Counting it apart from a 429 is the whole
+            // reason the field exists — the two have different fixes.
+            this.budgetDrops += 1;
+            this.lastDroppedAt = Date.now();
+            return null;
+          }
           // A BOUNDED caller gets its deadline enforced on every attempt,
           // attempt 1 included. The old 1000ms floor was longer than the
           // 600ms window the profiles feed is handed, so the feed outlived
@@ -478,15 +583,36 @@ export class DexScreenerClient {
             deadline === undefined
               ? 15_000
               : Math.max(1, Math.min(15_000, deadline - Date.now()));
-          return fetch(`${BASE_URL}${path}`, {
+          const init: CloudflareFetchInit = {
             headers: { Accept: "application/json" },
             signal: AbortSignal.timeout(left),
-          });
+          };
+          if (listCacheTtlS !== undefined && listCacheTtlS > 0) {
+            // See LIST_FEED_CACHE_TTL_S. Non-2xx stays OUT of the cache: a 429
+            // must never be served to the next tick as a fresh feed.
+            init.cf = {
+              cacheEverything: true,
+              cacheTtl: listCacheTtlS,
+              cacheTtlByStatus: {
+                "200-299": listCacheTtlS,
+                "300-399": 0,
+                "400-599": 0,
+              },
+            };
+          }
+          return fetch(`${BASE_URL}${path}`, init);
         });
         // A throttled-away attempt (the window closed while it queued) is a
         // budget answer, not a failure: the caller already owns its own
         // fallback, and retrying would only spend the caller's window.
         if (res === null) return null;
+        if (listCacheTtlS !== undefined) {
+          const cacheStatus = res.headers.get("cf-cache-status");
+          this.lastListCacheStatus = cacheStatus;
+          if (cacheStatus !== null && /^(HIT|REVALIDATED)$/i.test(cacheStatus)) {
+            this.listCacheHits += 1;
+          }
+        }
         if (res.status === 429) this.note429();
         if (res.status === 429 || res.status >= 500) {
           throw new Error(`DexScreener HTTP ${res.status}`);
@@ -546,7 +672,10 @@ export class DexScreenerClient {
     const deadline = Date.now() + BOOST_FEED_SELF_BUDGET_MS;
     let data: unknown = null;
     try {
-      data = await this.getJson("/token-boosts/latest/v1", deadline);
+      // Same edge-cache discipline as the profiles list (see
+      // LIST_FEED_CACHE_TTL_S): same host, same shared-IP bucket, same
+      // "latest" list semantics.
+      data = await this.getJson("/token-boosts/latest/v1", deadline, LIST_FEED_CACHE_TTL_S);
     } catch (err) {
       // Optional leg: a failure here is [] and the tick continues.
       console.error(
@@ -588,7 +717,10 @@ export class DexScreenerClient {
     // the make-up with it.
     const deadline = Date.now() + PROFILE_FEED_SELF_BUDGET_MS;
     try {
-      data = await this.getJson("/token-profiles/latest/v1", deadline);
+      // Edge-cached (see LIST_FEED_CACHE_TTL_S): the one lane whose 429s the
+      // operator sees as `raw 0`, and whose freshness bar is the loosest (this
+      // method already re-evaluates a 10-minute-old list on a failed fetch).
+      data = await this.getJson("/token-profiles/latest/v1", deadline, LIST_FEED_CACHE_TTL_S);
     } catch (err) {
       failed = true;
       console.error(

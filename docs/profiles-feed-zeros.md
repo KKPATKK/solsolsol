@@ -225,3 +225,20 @@ PUMP@10510h/$2092M  ZCAT@515h/$112M   GP@321h/$10M     JUP@20064h/$1019M
   summary `jupTrend`（預期由 0 變 8–25）同 `byFeed.jupTrend`。
 - 8 個 band 內幣喺取樣嗰刻全部 5m 變動係負（−1% 至 −26%），所以佢們嘅價值係「入
   re-eval pool 等下一次機會」，唔係即時推播 —— 呢點同 feed 原本嘅用途一致。
+
+---
+
+# 後續（2026-09-25）：`raw 0` 嘅 27% 係共用 egress IP 嘅 429，用 colo edge cache 收
+
+上一節嘅修法（tick 開頭就 dispatch profiles call）解決咗「窗口被前段偷走」，但 live 仍然有
+133/464 tick（27%）`lastRawProfiles 0`，只靠 8 條 make-up。今次度到：`/debug/dex429` 嘅
+durable ring 係 **17 次/鐘**，同 27% × 60 tick ≈ 16 幾乎一樣 ⇒ 每個 429 就係嗰個 tick 嘅
+空白。DexScreener 係逐來源 IP 限流，Worker 嘅 egress IP 係全 fleet 共用，所以**我哋自己
+點樣 spacing 都補唔返人哋花咗嘅桶**；改得到嘅係「個 request 有冇去到 origin」。
+
+所以兩個 list feed 改用 gecko leg 一直用嘅 edge-cache 寫法（`cacheEverything` ＋
+`cacheTtl 60` ＋ `cacheTtlByStatus` 唔 cache 4xx/5xx），pair batch 刻意唔套（gate/tracker 判嘅
+metrics 要新鮮）。順手加咗 `listCacheHits` / `lastListCacheStatus` / `budgetDrops`：之前
+「被 429 拒」同「窗口用完、request 根本冇發出」喺 counter 上分唔開。
+
+驗收同代價：`docs/tick-spend-and-profiles-2026-09-25.md`。

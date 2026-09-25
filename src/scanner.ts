@@ -170,6 +170,36 @@ export const SCAN_TICK_DEADLINE_MS = 4_200;
  */
 export const SCAN_SUBREQ_FLOOR = 12;
 /**
+ * Subrequests the CANDIDATE CHAIN refuses to start a coin without, so the
+ * invocation can always afford its completion flush.
+ *
+ * WHY THE CHAIN NEEDS ITS OWN FLOOR (2026-09-25, live). The scan-side floor
+ * above only gates the OPTIONAL front legs; the chain — registration, the
+ * per-candidate gates, the enrichment legs, the send — was unfenced, and it is
+ * where the invocation's 50 subrequests are actually blown. The shape on
+ * /debug/scan-history: a tick stamps `gate` (the chain entered) and then never
+ * writes anything again — not its postscan record, not the history row — so
+ * the successor backfills `previous tick died before its completion flush`
+ * with the stage frozen at the chain's entrance. The last landed stamp's
+ * count is LOW (10-30 of the usable 38) because every write after it was
+ * refused too: the chain spent the tail on upstream calls (each enrichment is
+ * a fetch, and each deferred Turso write inside the chain is a subrequest),
+ * the completion batch was the next call, and the runtime refused it.
+ *
+ * THE ARITHMETIC IS THE CONSTANT: the only call after the chain that the tick
+ * cannot lose is the completion flush, and its whole retry ladder — first
+ * attempt, the racing retry, the backoff retry (see FLUSH_ATTEMPT_BOUND_MS and
+ * the flush block in worker.ts) — is 3 subrequests. Stopping the chain at 3
+ * left therefore stops starting work the tick cannot AFFORD, and the coin it
+ * does not start is deferred, not lost: exactly the trade the chain's own
+ * deadline break below already makes (a coin that is not processed this tick
+ * is re-evaluated from the re-eval pool — one tick of latency, never a lost
+ * push). The alternative this replaces is the whole tick dying, which costs a
+ * full cadence hole AND the tracker pass AND (measured live) the scan rows the
+ * operator reads.
+ */
+export const CHAIN_SUBREQ_FLOOR = 3;
+/**
  * Wall-clock slice of the tick RESERVED for the gate/push phase — the ONLY
  * phase that can actually push a coin. The three front phases (discovery
  * feeds, re-eval pool read, DexScreener pair fetch) get the window
@@ -1116,9 +1146,24 @@ export interface ScanSummary {
   /**
    * The OPTIONAL legs this tick dropped to protect the tick's tail, by name
    * (`meteora`, `geoTrend`, `boosts`, `gmgn`, `axiom`, `jupTrend`,
-   * `backfill`, `crime-refresh`). Present only alongside `subreqFloor`.
+   * `backfill`, `crime-refresh`), plus `chain` when the CANDIDATE CHAIN
+   * itself stood down (see CHAIN_SUBREQ_FLOOR). Present only alongside
+   * `subreqFloor`.
    */
   subreqSkip?: string[];
+  /**
+   * Set only on a tick whose candidate chain stopped at the subrequest fence
+   * (`CHAIN_SUBREQ_FLOOR`): the allowance it refused to START another coin
+   * without — `subreqSkip` then names `chain`.
+   */
+  chainFloor?: number;
+  /**
+   * Candidates (coins, not per-chat cards) this tick's chain fence deferred to
+   * the next scan; absent = every candidate that reached the chain was
+   * processed. This is the reading that separates "the fence is buying the
+   * flush back" from "the fence is silently eating candidates every tick".
+   */
+  chainDeferred?: number;
   /**
    * The per-method DB census of this scan's window (see tickprobe.ts:
    * dbTickStepView) — calls + ms per Db method, as a delta of the isolate's
@@ -3518,6 +3563,27 @@ export class Scanner {
         // starting a coin with less than that left only guaranteed a
         // half-processed coin cut off by the worker's race (2026-09-16:
         // `candidates: 1, pushed: 0` on every such tick).
+        // SUBREQUEST FENCE (see CHAIN_SUBREQ_FLOOR): the chain is the last
+        // stage of the scan that can spend the invocation's allowance, and
+        // the completion flush behind it is the one call the tick cannot
+        // lose. Stop STARTING coins once only that flush's own retry ladder
+        // is left, and name both the fence and the coins it deferred — the
+        // re-eval pool re-offers them next scan, the same trade the deadline
+        // break below already makes (a tick of latency, never a lost push).
+        // Without this, a heavy chain spent the tail and the runtime refused
+        // the completion batch instead: the successor then backfilled
+        // `previous tick died before its completion flush` with the phase
+        // ladder frozen at `gate` — the chain's own entrance.
+        if (subreqsLeft() <= CHAIN_SUBREQ_FLOOR) {
+          this.markPhase(diag, "deferred", startedAt);
+          diag.chainFloor = CHAIN_SUBREQ_FLOOR;
+          diag.subreqSkip = [...(diag.subreqSkip ?? []), "chain"];
+          diag.chainDeferred = candidates.length - processedCandidates;
+          console.warn(
+            `[scanner] subrequest floor reached with ${subreqsLeft()} left — deferring ${candidates.length - processedCandidates} candidate(s) to next tick`,
+          );
+          break;
+        }
         if (this.abortRequested || Date.now() > chainDeadline) {
           this.markPhase(diag, "deferred", startedAt);
           console.log(

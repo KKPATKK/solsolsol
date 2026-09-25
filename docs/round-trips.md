@@ -1649,3 +1649,21 @@ not the 600ms this budget was originally measured against.
 
 Landed by `docs/patches/scan-front-and-tail-reserve.apply.js` (worker.ts and test-unit.js are far
 past the file tool's edit window).
+
+---
+
+## 4.19 死 tick 嘅收費閘：candidate chain 自己一個 floor（2026-09-25）
+
+500 行 scan-history 裡 32 個 `previous tick died before its completion flush`，15 個嘅階段 stamp
+停喺 `gate`（chain 入口）而 count 偏低（10–30 / 可用 38）—— 即係爆嘅係 invocation 嘅 50
+subrequest，而 stamp 自己都係 subrequest，所以連證據都寫唔入。scan 側一直只有可選腿嘅
+`SCAN_SUBREQ_FLOOR` 同 tracker pass 嘅 reserve，**chain 完全冇閘**。
+
+落咗：`CHAIN_SUBREQ_FLOOR = 3`（＝ completion flush 整條重試梯：attempt 1 ＋ racing retry ＋
+backoff retry）—— chain 開始每個 coin 之前問一次，唔夠就 defer＋點名（`summary.chainFloor` /
+`chainDeferred` / `subreqSkip` 多一個 `chain`），取捨同隔籬嗰個 deadline break 一樣（coin 留喺
+re-eval pool，一次延遲，唔係漏推）。同時 list feed（profiles / boosts）改用 colo edge cache
+（`cacheEverything` ＋ `cacheTtl 60` ＋ `cacheTtlByStatus` 把 4xx/5xx 拒之門外），因為
+`raw 0` 嘅 27% 對得上 `/debug/dex429` 嘅 17 次/鐘 —— 共用 egress IP 嘅 429，唔係我哋嘅 spacing。
+
+全部細節、代價同驗收步驟：`docs/tick-spend-and-profiles-2026-09-25.md`。
