@@ -110,6 +110,43 @@ cf: {
    candidate：fence 住時 `chainDeferred 1 / pushed 0`，有錢時同一個 coin 照推到）同 list feed 嘅
    edge cache（兩個 list feed 有 `cf`、pair batch 冇、HIT 計數、窗口用完算 drop）。
 
+## 落線讀數（2026-09-25 23:37Z deploy `68daea1`，Action run 36201667560 success）
+
+`/health` 連環取樣（每個 tick 一個 `heartbeat.summary`）：
+
+| 時間（Z） | `dex.listCacheHits` | `lastListCacheStatus` | `dex.budgetDrops` | `dex.http429` | `feedMakeup.lastRawProfiles` | tracker pass |
+|---|---|---|---|---|---|---|
+| 23:42:07 | 0（新 isolate） | null | 0 | 0 | 23 | — |
+| 23:42:58 | **2** | **HIT** | 2 | 0 | 22 | — |
+| 23:43:47 | **4** | **HIT** | 3 | 0 | 22 | — |
+| 23:46:59 | **8** | **HIT** | 3 | 0 | 21 | `rows 22/27 pairs 27/27 miss 0 lost 0` |
+| 23:47:52 | **10** | **HIT** | 6 | 0 | 21 | `rows 21/27 pairs 27/27 miss 0 lost 0` |
+
+即係每個 tick 兩個 list feed（profiles ＋ boosts）都係 **colo cache HIT**，origin 冇被問過；同一時間
+`http429` 由改前嘅 17 次/鐘跌到 0（呢個 isolate），`lastRawProfiles` 22 → 21 → 23（唔再係 0）。
+對照之下 gecko leg 同一個機制讀 `lastCacheStatus BYPASS`——同 gecko 一直無 HIT 嘅紀錄一致（同一個 egress
+bucket 問題，唔屬今次範圍）。
+
+`/debug/scan-history?rows=200`：
+
+| 窗口 | 行數 | ok | `died before its completion flush` | race cut | ms p50 | max |
+|---|---|---|---|---|---|---|
+| 22:00Z–23:37Z（改前） | 88 | 85 | **3** | 0 | 2594 | 82054 |
+| 23:37Z–23:47Z（改後） | 7 | 7 | **0** | 0 | 2454 | 3363 |
+
+⚠️ **7 個 tick 唔夠斷 6–7% 嘅死亡率**：今次只證明到「改後冇死」同「機制照跑」，統計上嘅結論要等
+**一個鐘**之後再讀同一條查詢（`rows=500`：32 → 對比）。同一時間 `deadTickStreak 0`、
+`wedgedStateResets 0`、`scheduledTickHoleMs ~35s`、`tickProgress postscan` 全部正常。
+
+`chainFloor` / `chainDeferred` 喺呢個窗口**冇出現**——因為嗰幾個 tick 都係 `candidates 0`（fence 只會
+喺真有 candidate 嘅 tick 觸發）。佢嘅行為由單元測試釘住（`scripts/test-deferred-priority.js`：同一個
+coin，fence 住 = `chainDeferred 1 / pushed 0`，有錢 = 照推到），live 要等一個 candidate tick 才見得到。
+
+順帶一個**新讀數**：`budgetDrops` 每個 tick 2–3（`allow 4289` 嗰個 cold isolate 仲高）。即係有 request
+**根本冇發出**（throttle queue 食晒 caller 個 480ms 窗口），而唔係被 429 拒——呢個係改前就存在、只係
+counter 分唔開嘅形狀；`lastRawProfiles` 證明唔係 profiles 腿（`failedTotal 0`），大約係 boosts / pair
+批次。要收就跟手做「list feed 喺 throttle queue 有優先權」或者關掉 boosts。
+
 ## 回退槓桿
 
 | 想收回 | 做法 |
