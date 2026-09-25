@@ -19,7 +19,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, baseMarkFor, revivedBaseline } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
@@ -7732,6 +7732,34 @@ async function main() {
     assert.equal(r.peakMcap, 46_000);
     assert.equal(r.lastState, null);
     assert.equal(r.deadTroughMcap, null);
+
+    // The 🟢 card now NAMES the baseline it sets. Without the number the
+    // reader has only the ×1.5 floor it crossed ($45.00K here; $97.12K live)
+    // and every later card's base looks invented — live 2026-09-25, GETF:
+    // revived past $97.12K, next quoted as 推送時 $325.23K, which was the mcap
+    // the tracker OBSERVED at the revival, not the level it had crossed.
+    assert.match(r.alerts[0].text, /以現價 \$46\.00K 為新基準/);
+    assert.equal(r.announcedUpStages, baseMarkFor(46_000), "the baseline move is remembered");
+    assert.ok(revivedBaseline(String(r.announcedUpStages).split(","), 46_000));
+    assert.ok(!revivedBaseline(String(r.announcedUpStages).split(","), 50_000), "and only for the value it actually set");
+
+    // ... which is what lets the NEXT 🚀 card be honest about its base. The
+    // same row, baseline moved to 46K, now read at 100K:
+    const afterRevive = evaluateWatch(
+      row({ lastState: null, deadTroughMcap: null, mcapAtPush: 46_000, peakMcap: 46_000, lastAlertAt: 1_000, upStages: r.announcedUpStages }),
+      2_000,
+      { mcap: 100_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 },
+      cfg,
+    );
+    assert.match(afterRevive.alerts[0].text, /復活基準 \$46\.00K → \$100\.00K/);
+    // A row whose baseline was never moved still reads exactly as before.
+    const unmoved = evaluateWatch(
+      row({ lastState: null, deadTroughMcap: null, mcapAtPush: 50_000, peakMcap: 50_000, lastAlertAt: 1_000 }),
+      2_000,
+      { mcap: 100_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 },
+      cfg,
+    );
+    assert.match(unmoved.alerts[0].text, /推送時 \$50\.00K → \$100\.00K/, "an unmoved baseline still reads 推送時");
 
     // Legacy dead row without a recorded trough falls back to the push
     // baseline × 1.5 (75K) — 52K does NOT resurrect.

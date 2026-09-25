@@ -67,6 +67,7 @@ import { GeckoTerminalClient, GECKO_ALT_BASE_URL, GECKO_CACHE_TTL_S, GECKO_USER_
 // answer "did the self-heal reuse the push-time baseline, and how often".
 import {
   pushWatchHealStats,
+  revivedBaseline,
   terminalRowIssues,
   terminalRowRepair,
 } from "./pushwatch";
@@ -5176,13 +5177,20 @@ export default {
         row.mcapAtPush > 0 ? (pair.marketCap / row.mcapAtPush - 1) * 100 : null;
       const peakPct =
         row.mcapAtPush > 0 ? (row.peakMcap / row.mcapAtPush - 1) * 100 : null;
+      // This card quotes `mcap_at_push` as 推送時. That column has three
+      // writers (docs/push-baseline-ledger.md) and a revival is NOT the
+      // push-time value, so a re-delivered card for a revived row must not
+      // claim it is (see revivedBaseline).
+      const baseLabel = revivedBaseline(String(row.upStages ?? "").split(","), row.mcapAtPush)
+        ? "復活基準"
+        : "推送時";
       const ageMin = Math.max(
         0,
         Math.round((Date.now() - pair.pairCreatedAt) / 60_000),
       );
       const text =
         `📤 補發推送 ${pair.baseToken.symbol}（${row.symbol ?? pair.baseToken.symbol}）\n` +
-        `💰 市值 ${usd(pair.marketCap)}（推送時 ${usd(row.mcapAtPush)}${chg === null ? "" : "，" + pctStr(chg)}）\n` +
+        `💰 市值 ${usd(pair.marketCap)}（${baseLabel} ${usd(row.mcapAtPush)}${chg === null ? "" : "，" + pctStr(chg)}）\n` +
         `📈 推送後峰值 ${pctStr(peakPct ?? 0)}\n` +
         `💧 流動性 ${usd(pair.liquidity.usd)} | ⏱ 年齡 ${ageMin} 分鐘\n` +
         `📊 5m量 ${usd(pair.volume.m5)} | 5m ${pctStr(pair.priceChange.m5)}\n` +

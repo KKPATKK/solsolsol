@@ -11,7 +11,7 @@
 |---|---|---|---|
 | 1 | `scanner.ts` `onPush(c.pair.marketCap)` | 過閘嘅同一個 frozen pair 值 | ✅ |
 | 2 | `pushwatch.ts` self-heal 補掛 | **heal 嗰一刻**嘅市值 | ❌（$45K 推、插水後補掛 → $12K baseline） |
-| 3 | `pushwatch.ts` 死而復生重置 | 復活嗰一刻嘅 live mcap | ❌ |
+| 3 | `pushwatch.ts` 死而復生重置 | 復活嗰一刻嘅 live mcap（🟢 卡而家會寫明，見第十二補） | ❌ |
 
 再加兩樣：
 
@@ -694,3 +694,33 @@ tick 時發）。
 **另一個真缺口**（令呢個問題由外面查唔到）：唯一持久嘅逐卡證據係 `push_audit`，一個**上限 30 筆、全 chat 共用**嘅
 ring —— 繁忙時只覆蓋幾分鐘；deferral ledger 只有計數同 pending token 名單，`followupsSent` 只係一個數。
 改為 200 筆，並為 `/debug/push-audit` 加 `?token=` / `?since=` / `?limit=`，下次一條 request 就答得到。
+
+---
+
+## 第十二補：復活基準要講出嚟
+
+Operator 報告（2026-09-25）：02:57 HKT 收到
+`🟢 死而復生 GETF | 從低點 $64.75K 反彈越過 $97.12K（×1.5），重置基準繼續追蹤`，
+03:38 收到 `🚀 續漲 GETF | 推送時 $325.23K → $622.35K (+91%) … 下一關 +100%`，
+問：既然「重置基準」，點解下一張卡寫「推送時 $325.23K」而唔係 $97.12K？
+
+**答案：張 🟢 卡冇講佢實際把基準設成幾多。** 上表 writer #3 寫入嘅係**復活嗰一刻嘅 live mcap**
+（`resetBaselineMcap: live.mcap`），唔係嗰個 ×1.5 關口。追蹤器由 💀 靜默到下一次睇到 GETF 時，
+價已經係 $325.23K，所以新基準 = $325.23K，而卡只印咗「越過 $97.12K」。
+
+即係 $97.12K 係**觸發門檻**、$325.23K 係**復活時實際觀察值**。用門檻做基準會變成替一段
+冇人睇過嘅行情（$97K → $325K）補發 +541%，同 parafactual（第十一補）同一類問題，
+所以基準維持觀察值 —— 要改嘅係卡片講清楚。
+
+**修正**（`docs/patches/revive-baseline-named.apply.js`）：
+
+| 位置 | 之前 | 之後 |
+|---|---|---|
+| 🟢 卡 | `…（×1.5），重置基準繼續追蹤` | `…（×1.5），以現價 $325.23K 為新基準繼續追蹤` |
+| row mark | `up_stages = ""` | `up_stages = "base:325230"`（復活設過嘅基準值） |
+| 🚀 / ⚡ 卡 | `推送時 $X` | 基準係嗰個 mark → `復活基準 $X`；唔係 → 照舊 `推送時 $X` |
+
+`base:` mark 唔會被 `RISING_STAGES` 當 stage（`newlyCrossedStages` 只認 `up*`）、
+唔會被 `addCutMarks` 清走（佢只剝自己嘅 `p:` mark）、`terminalRowIssues` 亦完全唔讀 mark。
+比對係**值**而唔係淨係「有冇 mark」：若果之後有另一個 writer 移動過基準（self-heal 由帳本
+re-seed 返真推送值），標籤會自動跌返 `推送時` —— 咁樣先至啱。

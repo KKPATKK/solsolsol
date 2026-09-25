@@ -468,6 +468,56 @@ export function risingCardTail(crossed: readonly number[], nextStage: number | n
   parts.push(nextStage !== null ? `下一關 +${nextStage}%` : "已達最高里程碑");
   return ` | ${parts.join(" | ")}`;
 }
+
+/**
+ * Persistent mark: the baseline a 🟢 REVIVAL moved the row to (`base:<mcap>`).
+ *
+ * The revival resets `mcap_at_push` to the mcap it OBSERVED at that moment —
+ * the third of that column's three writers, and the only one that is not the
+ * push-time value (docs/push-baseline-ledger.md). A card that quotes the
+ * column as 推送時 is therefore lying about every revived row's base, which
+ * is exactly how GETF came to be quoted at "推送時 $325.23K" hours after its
+ * own 🟢 card had named the ×1.5 floor ($97.12K) as the thing being reset.
+ * The value goes where the stage marks live, because the revival already owns
+ * this column (it clears every stage mark: the ladder restarts from the new
+ * base). `base:` is invisible to every STAGE reader — newlyCrossedStages
+ * accepts only `up*` — is kept by addCutMarks (which strips only its own
+ * `p:` marks), and terminalRowIssues reads no marks at all.
+ */
+export const BASE_MARK_PREFIX = "base:";
+
+/** The mark a revival leaves: the baseline it set, to the dollar. */
+export function baseMarkFor(mcap: number): string {
+  return `${BASE_MARK_PREFIX}${Math.round(mcap)}`;
+}
+
+/**
+ * Whether `baseline` is the value a REVIVAL set — i.e. whether a card quoting
+ * the row's base may still call it 推送時. It may not: that base is the mcap
+ * observed at the revival, not the mcap the coin was pushed at.
+ *
+ * The VALUE is compared, not merely the mark's presence: another writer can
+ * move the baseline afterwards (the self-heal re-seeds a row from the ledger's
+ * push-time value), and then 推送時 is the correct label again. A mark left
+ * over from an earlier push of the same token, whose value no longer matches
+ * the current base, reads the same way — the fail-quiet direction, where a
+ * wrong 推送時 needs the two values to collide exactly.
+ */
+export function revivedBaseline(
+  marks: Iterable<string>,
+  baseline: number,
+): boolean {
+  const want = String(Math.round(baseline));
+  for (const m of marks) {
+    if (
+      m.startsWith(BASE_MARK_PREFIX) &&
+      m.slice(BASE_MARK_PREFIX.length) === want
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 /**
  * Grace window for the self-heal's first-card resend: a claim newer than
  * this without an initial-audit entry is treated as "isolate died before
@@ -1275,9 +1325,13 @@ export function evaluateWatch(
     const target =
       (troughBase > 0 ? troughBase : row.mcapAtPush) * RESURRECTION_MULT;
     if (target > 0 && live.mcap >= target) {
+      // Name the base, not just the floor that was crossed: the two are the
+      // same number only when the tracker happened to look while the coin sat
+      // between them. The reset below writes `live.mcap` (see BASE_MARK_PREFIX),
+      // so THAT is the number every later card measures +% from.
       fire(
         "rising",
-        `🟢 死而復生 ${symbol} | 從低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），重置基準繼續追蹤`,
+        `🟢 死而復生 ${symbol} | 從低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），以現價 ${fmtUsd(live.mcap)} 為新基準繼續追蹤`,
         "revive",
       );
       return {
@@ -1290,7 +1344,10 @@ export function evaluateWatch(
         resetBaselineMcap: live.mcap,
         deadTroughMcap: null,
         sellDomStreak: 0,
-        announcedUpStages: "",
+        // The cleared column is what the stage marks are cleared THROUGH (the
+        // ladder restarts from the new base), so the value rides the same
+        // write instead of costing a column of its own. See BASE_MARK_PREFIX.
+        announcedUpStages: baseMarkFor(live.mcap),
       };
     }
     const trough = Math.min(row.deadTroughMcap ?? live.mcap, live.mcap);
@@ -1385,6 +1442,18 @@ export function evaluateWatch(
     const firedStages = marks;
     if (lastState?.startsWith("up")) firedStages.add(lastState);
     const preFireStages = [...firedStages].sort().join(",");
+    // `mcap_at_push` is the base every % on the cards below is measured from,
+    // and it has THREE writers (docs/push-baseline-ledger.md): the scanner's
+    // gate value and the self-heal's re-seed from the ledger — both the
+    // push-time mcap — plus the revival reset, which is NOT (it is the mcap
+    // observed at the revival). Calling all three 推送時 is how a revived row
+    // came to be quoted at "推送時 $325.23K" hours after its own 🟢 card had
+    // named the ×1.5 floor ($97.12K) as the thing being reset — live
+    // 2026-09-25, GETF. The revival leaves a `base:` mark, so the label can
+    // say which base this is.
+    const baseLabel = revivedBaseline(firedStages, row.mcapAtPush)
+      ? "復活基準"
+      : "推送時";
     for (let i = RISING_STAGES.length - 1; i >= 0; i--) {
       const stage = RISING_STAGES[i];
       const state = `up${stage}`;
@@ -1403,7 +1472,7 @@ export function evaluateWatch(
         const crossed = newlyCrossedStages(stage, firedStages);
         fire(
           "rising",
-          `🚀 續漲 ${symbol} | 推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
+          `🚀 續漲 ${symbol} | ${baseLabel} ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)} (${pct(chgSincePush)}) | 峰值回撤 ${pct(drawdownFromPeak)} | 5m ${pct(live.chg5m)} | 買賣比 ${bs}(h1)` +
             risingCardTail(crossed, nextStage),
           state,
         );
@@ -1518,7 +1587,7 @@ export function evaluateWatch(
       ) {
         fire(
           "divergence",
-          `⚡ 籌碼集中 ${symbol} | 價 ${pct(chgSincePush)}（推送時 ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)}）| 持倉 ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (${pct((holderRatio - 1) * 100)})— 價漲人跌：漲幅由越來越少的錢包推動，回撤會又快又深`,
+          `⚡ 籌碼集中 ${symbol} | 價 ${pct(chgSincePush)}（${baseLabel} ${fmtUsd(row.mcapAtPush)} → ${fmtUsd(live.mcap)}）| 持倉 ${row.holdersAtPush.toLocaleString()} → ${row.holdersLast.toLocaleString()} (${pct((holderRatio - 1) * 100)})— 價漲人跌：漲幅由越來越少的錢包推動，回撤會又快又深`,
           "div",
         );
         firedStages.add("div");
