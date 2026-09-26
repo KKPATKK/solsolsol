@@ -55,22 +55,26 @@ if (!(HOURS > 0) || HOURS > 24) {
 const datetimeLE = new Date().toISOString();
 const datetimeGE = new Date(Date.now() - HOURS * 3600_000).toISOString();
 
-const QUERY = `
-query ($accountTag: String!, $filter: WorkersInvocationsAdaptiveGroupsFilter!) {
-  viewer {
-    accounts(filter: {accountTag: $accountTag}) {
-      workersInvocationsAdaptive(
-        filter: $filter
-        limit: 10000
-        orderBy: [datetime_DESC]
-      ) {
-        sum { requests errors subrequests }
-        dimensions { status datetime scriptName }
-        quantiles0 { durationP50 durationP95 durationP99 cpuTimeP99 }
-      }
-    }
+async function graphql(query, variables) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = await res.text();
+  let json;
+  try {
+    json = JSON.parse(body);
+  } catch {
+    console.error(`Cloudflare returned non-JSON (HTTP ${res.status}):`);
+    console.error(body.slice(0, 800));
+    process.exit(2);
   }
-}`;
+  return json;
+}
 
 function say(line) {
   console.log(line);
@@ -84,34 +88,113 @@ function say(line) {
   }
 }
 
-const res = await fetch(ENDPOINT, {
-  method: "POST",
-  headers: {
-    authorization: `Bearer ${TOKEN}`,
-    "content-type": "application/json",
-  },
-  body: JSON.stringify({
-    query: QUERY,
-    variables: {
-      accountTag: ACCOUNT,
-      filter: {
-        datetime_GE: datetimeGE,
-        datetime_LE: datetimeLE,
-        scriptName: WORKER,
-      },
-    },
-  }),
-});
+/**
+ * The dataset's argument and dimension names are NOT guessable: this API has
+ * used both `datetime_geq`/`date_geq` and both `quantiles0`/`quantiles` across
+ * its datasets, and a wrong guess is a hard error rather than an empty result
+ * (the first version of this script learned that the expensive way). So ask
+ * the schema instead of assuming, and print what it said — a future rename
+ * then reads as a name list, not as silence.
+ */
+const INTROSPECTION = `
+query {
+  filterType: __type(name: "WorkersInvocationsAdaptiveGroupsFilter") {
+    inputFields { name }
+  }
+  groupType: __type(name: "WorkersInvocationsAdaptiveGroups") {
+    fields {
+      name
+      type { name kind ofType { name kind ofType { name } } }
+    }
+  }
+  dimType: __type(name: "WorkersInvocationsAdaptiveDimensions") {
+    fields { name }
+  }
+}`;
 
-const body = await res.text();
-let json;
-try {
-  json = JSON.parse(body);
-} catch {
-  console.error(`Cloudflare returned non-JSON (HTTP ${res.status}):`);
-  console.error(body.slice(0, 800));
+const intro = await graphql(INTROSPECTION, {});
+if (intro.errors?.length) {
+  console.error("Introspection failed — the token likely cannot read this schema:");
+  console.error(JSON.stringify(intro.errors, null, 2).slice(0, 1500));
   process.exit(2);
 }
+const introData = intro?.data ?? {};
+const filterArgs = (introData.filterType?.inputFields ?? []).map((f) => f.name);
+const dimFields = (introData.dimType?.fields ?? []).map((f) => f.name);
+const groupFields = introData.groupType?.fields ?? [];
+
+// The filter's time bounds: the dataset carries whichever pair its vintage
+// uses. Both are accepted here, named first so the schema's own spelling wins.
+const pickTimeArg = (suffix) =>
+  [`datetime_${suffix}`, `date_${suffix}`].find((n) => filterArgs.includes(n));
+const geArg = filterArgs.includes("datetime_GE")
+  ? "datetime_GE"
+  : (pickTimeArg("geq") ?? pickTimeArg("gte") ?? pickTimeArg("gt"));
+const leArg = filterArgs.includes("datetime_LE")
+  ? "datetime_LE"
+  : (pickTimeArg("leq") ?? pickTimeArg("lte") ?? pickTimeArg("lt"));
+const timeDim = ["datetime", "date"].find((n) => dimFields.includes(n));
+const hasStatus = dimFields.includes("status");
+// Quantile fields live in their own group field, named either way.
+const quantFieldName = groupFields.some((f) => f.name === "quantiles0")
+  ? "quantiles0"
+  : groupFields.some((f) => f.name === "quantiles")
+    ? "quantiles"
+    : null;
+
+if (!geArg || !leArg || !timeDim) {
+  console.error("Could not find the dataset's time filter/dimension in the schema.");
+  console.error(`filter inputFields: ${filterArgs.join(", ")}`);
+  console.error(`dimension fields:   ${dimFields.join(", ")}`);
+  // A renamed dataset type reads as "no such type" and would otherwise leave
+  // nothing to act on. List what the schema does call a Workers invocation
+  // type, so the fix is a rename rather than a search.
+  const names = await graphql(
+    `query { __schema { types { name } } }`,
+    {},
+  );
+  const all = (names?.data?.__schema?.types ?? [])
+    .map((t) => t.name)
+    .filter((n) => /Worker.*Invoc/i.test(n));
+  console.error(`schema types matching /Worker.*Invoc/: ${all.join(", ") || "(none)"}`);
+  process.exit(2);
+}
+
+const dimSelection = [timeDim, hasStatus ? "status" : null, "scriptName"]
+  .filter(Boolean)
+  .join(" ");
+const quantSelection = quantFieldName
+  ? `${quantFieldName} { durationP50 durationP95 durationP99 }`
+  : "";
+
+const QUERY = `
+query ($accountTag: String!, $filter: WorkersInvocationsAdaptiveGroupsFilter!) {
+  viewer {
+    accounts(filter: {accountTag: $accountTag}) {
+      workersInvocationsAdaptive(filter: $filter, limit: 10000) {
+        sum { requests errors subrequests }
+        dimensions { ${dimSelection} }
+        ${quantSelection}
+      }
+    }
+  }
+}`;
+
+const json = await graphql(QUERY, {
+  accountTag: ACCOUNT,
+  filter: {
+    [geArg]: datetimeGE,
+    [leArg]: datetimeLE,
+    scriptName: WORKER,
+  },
+});
+
+say(
+  `Schema read: time filter \`${geArg}\`/\`${leArg}\`, time dimension ` +
+    `\`${timeDim}\`, status dimension ${hasStatus ? "present" : "ABSENT"}, ` +
+    `quantiles field ${quantFieldName ?? "absent"}.`,
+);
+say("");
 
 if (json.errors?.length) {
   console.error("Cloudflare GraphQL errors:");
@@ -144,8 +227,8 @@ const byMinute = new Map();
 for (const g of groups) {
   const dims = g?.dimensions ?? {};
   const sum = g?.sum ?? {};
-  const minute = String(dims.datetime ?? "").slice(0, 16);
-  const status = String(dims.status ?? "?");
+  const minute = String(dims[timeDim] ?? "").slice(0, 16);
+  const status = hasStatus ? String(dims.status ?? "?") : "ok*";
   if (!minute) continue;
   let row = byMinute.get(minute);
   if (!row) {
@@ -157,7 +240,7 @@ for (const g of groups) {
   row.requests += Number(sum.requests ?? 0);
   row.errors += Number(sum.errors ?? 0);
   row.subrequests += Number(sum.subrequests ?? 0);
-  const q0 = g?.quantiles0 ?? {};
+  const q0 = (quantFieldName ? g?.[quantFieldName] : null) ?? {};
   row.p99.push(Number(q0.durationP99 ?? 0));
 }
 
