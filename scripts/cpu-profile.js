@@ -21,19 +21,25 @@
  * a phase that is 4% of the CPU here is not the phase to optimise, whatever
  * its wall clock says.
  *
- * READ-ONLY BY CONSTRUCTION. The only database call is
- * `Db.getReevalPool`, which is three banded SELECTs and writes nothing (see
- * its body in src/db.ts) — the pool gates that WOULD write ride the caller's
- * front batch, and this script passes no front. The feed fetches are plain
- * GETs to public endpoints. Nothing here touches worker_state, so no rotation
- * slot, prune stamp or counter can move because this ran.
+ * READ-ONLY BY CONSTRUCTION, and it has to STAY that way — the reason the
+ * numbers below can be taken against the production database at all. Every
+ * database call here is a read: `Db.init` (idempotent CREATE ... IF NOT
+ * EXISTS plus the batched pragma column probe), `getWorkerState(s)`,
+ * `Db.getReevalPool` (three banded SELECTs — the pool gates that WOULD write
+ * ride the caller's front batch, and this script passes no front) and one
+ * hand-built pragma batch. The feed fetches are plain GETs to public
+ * endpoints. Nothing here touches worker_state, so no rotation slot, prune
+ * stamp or counter can move because this ran. A "measure the old path" leg
+ * that re-attempted the per-column ALTERs was considered and REJECTED for
+ * exactly this reason: it would have made a write attempt part of a script
+ * whose value is that it can run against production.
  *
  * Run: node scripts/cpu-profile.js      (needs the .env.local Turso creds)
  */
 "use strict";
 
 const { loadConfig } = require("../dist/config.js");
-const { Db } = require("../dist/db.js");
+const { Db, COLUMN_PROBE_TABLES } = require("../dist/db.js");
 const { parseJupTrendTokens } = require("../dist/jupfeeds.js");
 const { parseNewPools } = require("../dist/geckoterminal.js");
 const { parseMeteoraPools } = require("../dist/meteora.js");
@@ -112,6 +118,24 @@ function record(label, bytes, wall0, cpu0, note) {
   });
 }
 
+/**
+ * Values in a libsql /v2/pipeline reply.
+ *
+ * The real shape, printed rather than guessed (2026-09-26):
+ *   {"results":[{"type":"ok","response":{"type":"execute","result":{
+ *      "cols":[{"name":"name","decltype":null}],
+ *      "rows":[[{"type":"text","value":"chat_id"}], ...]}}}]}
+ * i.e. rows are positional JSON ARRAYS with no row marker, and the column's
+ * name appears once in `cols` per statement — never once per row. Two earlier
+ * versions of this counter were wrong for exactly those reasons (one counted
+ * `"name"` and reported 2 per statement, the next counted a `"type":"row"`
+ * marker that does not exist). What a one-column SELECT returns is one
+ * tagged `text` value per row, so that is what is counted.
+ */
+function countPipelineRows(body) {
+  return (body.match(/\{\s*"type"\s*:\s*"text"/g) ?? []).length;
+}
+
 /** Bytes of a response body without keeping it: the parse is measured separately. */
 async function fetchText(url) {
   const res = await fetch(url, {
@@ -142,10 +166,103 @@ async function main() {
 
   // Twice: the first call pays whatever is one-time in the process (undici's
   // first TLS, the SQL strings being compiled once), and a tick on a cold
-  // isolate is the only place that cost would land anyway.
+  // isolate is the only place that cost would land anyway. The SECOND call is
+  // now the interesting one: since
+  // docs/patches/round5-schema-ddl-gate-2026-09-26.apply.js the DDL batch is
+  // behind a fingerprint, so #2 is what a recycled isolate actually pays —
+  // compare it against #1 to see the gate working.
   await phaseRepeat("front: db.init (cold isolate DDL)", 0, 2, async () => {
     await db.init();
     return "18 DDL statements";
+  });
+
+  // THE COLUMN PROBE (2026-09-26). The other half of init's schema work, and
+  // the only part of either change that speaks DIFFERENT SQL to the server:
+  // one batched pragma read replacing ~12 ALTER attempts (the old
+  // addColumnIfMissing asked one column at a time and read "duplicate column
+  // name" as the answer). Measured against the production database because a
+  // local `file:` client passing is not evidence that Turso's HTTP protocol
+  // accepts a bound argument inside a table-valued pragma — if it does not,
+  // the read throws, the cache degrades to the old per-column path, and this
+  // row is where that shows up (rows 0 / a FAILED note) rather than in
+  // production.
+  //
+  // Sent over the RAW pipeline rather than through the client on purpose: the
+  // question is whether TURSO accepts a bound argument inside a table-valued
+  // pragma, and going through the client would answer a slightly different one
+  // ("does libsql's encoder plus Turso accept it") while hiding the raw reply
+  // that says which. db.get() is private and stays untouched.
+  await phase("db: column probe (1 raw pipeline, 3 tables)", 0, async () => {
+    const httpBase = config.tursoUrl.replace(/^libsql:/, "https:");
+    const res = await fetch(`${httpBase}/v2/pipeline`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.tursoAuthToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        requests: COLUMN_PROBE_TABLES.map((table) => ({
+          type: "execute",
+          // The pipeline's `Value` is an internally tagged enum, so a bare
+          // JSON string is rejected: `invalid type: string "chat_settings",
+          // expected internally tagged enum Value`. The libsql client encodes
+          // this for you, which is exactly why this leg exists — it fails ONCE
+          // here, loudly, instead of in production.
+          stmt: {
+            sql: "SELECT name FROM pragma_table_info(?)",
+            args: [{ type: "text", value: table }],
+          },
+        })),
+      }),
+    });
+    const body = await res.text();
+    // ROWS, not `"name"`: the pipeline reply carries the column NAME in its
+    // per-request `cols` metadata, so counting that string counts requests
+    // (twice over) rather than the columns the pragma found — the mistake this
+    // comment exists to stop being made again. A row is the structural marker.
+    const columns = countPipelineRows(body);
+    if (columns === 0 || /"error"/.test(body)) {
+      throw new Error(
+        `Turso did not answer the pragma (${columns} row(s), http ` +
+          `${res.status}) — the probe would fall back to a round trip per ` +
+          `column, see readColumnNames in src/db.ts: ${body.slice(0, 160)}`,
+      );
+    }
+    return `${columns} columns, ${body.length} B`;
+  });
+
+  // The CONTROL for the leg above, and it is not optional: a bound argument in
+  // a table-valued pragma is a narrower shape than the same pragma given a
+  // LITERAL, and this schema's answer must be the full column list, not merely
+  // "no error". A bound probe that returns too FEW columns is the quiet
+  // failure — every missing column becomes an ALTER attempt again, so the
+  // round trips come back with nothing to show for it. Counted the same way
+  // (the literal's own reply, over the same wire) so the two numbers are
+  // directly comparable: they must MATCH.
+  await phase("db: pragma, literal arg (control)", 0, async () => {
+    const httpBase = config.tursoUrl.replace(/^libsql:/, "https:");
+    const res = await fetch(`${httpBase}/v2/pipeline`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.tursoAuthToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        requests: COLUMN_PROBE_TABLES.map((table) => ({
+          type: "execute",
+          stmt: {
+            sql: `SELECT name FROM pragma_table_info('${table}')`,
+            args: [],
+          },
+        })),
+      }),
+    });
+    const body = await res.text();
+    const columns = countPipelineRows(body);
+    if (columns === 0) {
+      throw new Error(`the literal form found nothing either: ${body.slice(0, 160)}`);
+    }
+    return `${columns} columns (compare with the row above)`;
   });
 
   // The per-CALL overhead of a libsql round trip, which is what a tick pays

@@ -199,6 +199,24 @@ export const BOOST_FEED_SELF_BUDGET_MS = 480;
  * the tracker judge (5m volume/change, liquidity), they are keyed by the
  * address set this tick happens to hold, and the client already has its own
  * short-lived pair cache for them.
+ *
+ * OPEN QUESTION (2026-09-26, deliberately NOT changed here). A TTL that equals
+ * the tick period is a boundary: an entry minted at T is HIT-able to T+60, and
+ * the next tick arrives at ~T+60 + jitter, so whether the tick's own fetch is a
+ * HIT or a MISS is decided by that jitter — and the MISS is the one that pays
+ * origin latency (300-800ms on the shared egress) against FEED_DEADLINE_MS 900,
+ * which is the shape of the ticks that evaluate no profiles at all. Raising this
+ * to 180 would keep the entry alive across two ticks and stay inside what the
+ * client already tolerates (a FAILED fetch serves a list up to
+ * PROFILE_FEED_REUSE_MS old), i.e. it satisfies the invariant the guard in
+ * scripts/test-deferred-priority.js pins. It is not done because the reading
+ * that would settle it — listCacheHits / lastListCacheStatus — is CLIENT
+ * module state, so an isolate recycled every tick reports `0 / null` however
+ * well the cache is working (live 2026-09-26T14:01Z: listCacheHits 0,
+ * lastListCacheStatus null, http429 0, budgetDrops 0 on a tick that read
+ * `profiles: 2`). Make that reading durable first (the dex429 ring is the
+ * existing pattern) — then the hit:miss ratio decides this number with data
+ * instead of a theory.
  */
 export const LIST_FEED_CACHE_TTL_S = 60;
 
