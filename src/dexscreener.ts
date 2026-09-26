@@ -353,6 +353,68 @@ export const DEX_LIST_CACHE_MISSES_KEY = "dex_list_cache_misses";
 export const DEX_LIST_CACHE_LAST_KEY = "dex_list_cache_last";
 
 /**
+ * The last-good PROFILE LIST, in a form that outlives the isolate that fetched
+ * it (see PROFILE_FEED_REUSE_MS above and DEX_PROFILES_LAST_KEY in db.ts).
+ *
+ * WHY (live 2026-09-26): the shared egress IP is 429'd 17-20 times an hour on
+ * the profiles lane, and every one of those ticks fell back to the make-up
+ * list alone — measured on the scan ring, 52 of 120 rows read `profiles: 2`
+ * (the deferred make-up size) with the 429 ring's timestamps matching them one
+ * for one. The client ALREADY has the fix for a rate-limited tick (a failed
+ * fetch serves its last good list for up to PROFILE_FEED_REUSE_MS), but that
+ * list was instance state and the isolate is recycled every tick, so the lane
+ * only ever served a warm tick. Journaled into worker_state on the tick's
+ * EXISTING front read and write (Scanner.seedProfileFeed /
+ * Scanner.stampProfileFeedSnapshot) it costs no round trip, and the 429 tick
+ * evaluates a minutes-old list instead of two make-up coins.
+ *
+ * The bound is a read guard, not a policy: the feed is a ~24-slot rotation, so
+ * anything past this is not a list this client produced.
+ */
+export const PROFILE_FEED_LAST_MAX = 64;
+
+/** What the journal row holds: the raw feed list and when it was fetched. */
+export interface ProfileFeedSnapshot {
+  /** Epoch ms of the successful fetch (the stamp the reuse window measures). */
+  at: number;
+  tokens: string[];
+}
+
+/**
+ * Parse the journaled row (see ProfileFeedSnapshot). Null on anything that is
+ * not a usable snapshot — an absent row, a half-written one, a shape from a
+ * build that never wrote it — and the caller then behaves exactly as it did
+ * before the journal existed (the make-up lane alone). Never throws: this runs
+ * ahead of the tick's feed work, which must not be breakable by a row.
+ */
+export function parseProfileFeedSnapshot(
+  raw: string | null | undefined,
+): ProfileFeedSnapshot | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const rec = parsed as { at?: unknown; tokens?: unknown };
+  const at =
+    typeof rec.at === "number" && Number.isFinite(rec.at) && rec.at > 0
+      ? rec.at
+      : null;
+  if (at === null || !Array.isArray(rec.tokens)) return null;
+  const tokens: string[] = [];
+  for (const token of rec.tokens) {
+    if (typeof token !== "string" || token.length === 0) continue;
+    tokens.push(token);
+    if (tokens.length >= PROFILE_FEED_LAST_MAX) break;
+  }
+  if (tokens.length === 0) return null;
+  return { at, tokens };
+}
+
+/**
  * The Cloudflare-specific fetch options this client asks for (see
  * LIST_FEED_CACHE_TTL_S). Declared locally, like the GeckoTerminal client's
  * identical one, because `RequestInit` does not carry `cf`.
@@ -664,8 +726,11 @@ export class DexScreenerClient {
   /**
    * The last profile fetch that returned coins, and when (see
    * PROFILE_FEED_REUSE_MS): what a rate-limited tick evaluates instead of
-   * nothing. In-memory by design — the scanner hands this list to the tick, so
-   * a recycled isolate simply starts without it.
+   * nothing. Instance state — but no longer isolate state: the scanner seeds
+   * it from the durable journal at tick entry and journals it back on a
+   * successful fetch (see DEX_PROFILES_LAST_KEY), so a recycled isolate
+   * starts with the same list a warm one kept. A list fetched IN this isolate
+   * is always the fresher of the two (`at` is the fetch stamp).
    */
   private lastGoodProfiles: { at: number; list: TokenProfile[] } | null = null;
 
@@ -727,6 +792,33 @@ export class DexScreenerClient {
       dropsByLeg: { ...this.dropsByLeg },
       lastDropLeg: this.lastDropLeg,
     };
+  }
+
+  /**
+   * Seed the reuse lane from the durable journal (see DEX_PROFILES_LAST_KEY),
+   * so a recycled isolate starts with the same last-good list a warm one kept.
+   * The freshest list wins: a fetch this isolate just made is newer than any
+   * row that predates it, and an older row must never displace it.
+   */
+  seedLastGoodProfiles(view: ProfileFeedSnapshot | null): void {
+    if (view === null) return;
+    const current = this.lastGoodProfiles;
+    if (current !== null && current.at >= view.at) return;
+    this.lastGoodProfiles = {
+      at: view.at,
+      list: view.tokens.map((tokenAddress) => ({ tokenAddress })),
+    };
+  }
+
+  /**
+   * What the tick journals (see Scanner.stampProfileFeedSnapshot): the list a
+   * failed fetch would reuse, and the stamp that decides the reuse window.
+   * Null when this isolate has fetched nothing yet (and no row was seeded).
+   */
+  lastGoodProfilesSnapshot(): ProfileFeedSnapshot | null {
+    const good = this.lastGoodProfiles;
+    if (good === null) return null;
+    return { at: good.at, tokens: good.list.map((p) => p.tokenAddress) };
   }
 
   /**

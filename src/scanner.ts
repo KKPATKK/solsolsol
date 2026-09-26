@@ -3,6 +3,7 @@ import { tradeKeyboard } from "./bot";
 import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import {
+  DEX_PROFILES_LAST_KEY,
   SCAN_FRONT_GATE_KEYS,
   type Db,
   type ScanFront,
@@ -11,6 +12,7 @@ import {
 import {
   DexScreenerClient,
   consumeListCacheDelta,
+  parseProfileFeedSnapshot,
   peekListCacheDelta,
   DEX_LIST_CACHE_HITS_KEY,
   DEX_LIST_CACHE_LAST_KEY,
@@ -1763,6 +1765,28 @@ export class Scanner {
   }
 
   /**
+   * Journal the last-good PROFILE LIST (see DEX_PROFILES_LAST_KEY), so the
+   * reuse lane survives the isolate that fetched it: the tick that reads it
+   * back is usually a different isolate, and the 429 ring runs at 17-20 an
+   * hour. A REPLACE, not an accumulator — the row is a snapshot — and the
+   * write only goes out when this tick's list is NEWER than the stamp the
+   * front read carried, so a reused list does not re-write itself.
+   *
+   * Best-effort like the ledger journal: a failed write is superseded by the
+   * next successful fetch, and telemetry may never break the scan.
+   */
+  async stampProfileFeedSnapshot(): Promise<void> {
+    const snap = this.dex.lastGoodProfilesSnapshot();
+    if (snap === null || snap.at === this.profileFeedStampedAt) return;
+    try {
+      await this.stampFront(DEX_PROFILES_LAST_KEY, JSON.stringify(snap), false);
+      this.profileFeedStampedAt = snap.at;
+    } catch (err) {
+      console.warn("[scanner] profile-feed snapshot write failed:", err);
+    }
+  }
+
+  /**
    * Why the last runOnce returned without a summary (early-return reason),
    * surfaced via /health so a silently-skipping scanner is diagnosable
    * without Cloudflare log access: "previous-scan-still-running",
@@ -1792,6 +1816,15 @@ export class Scanner {
    * single-row read, exactly as it did before this existed.
    */
   private scanFront: ScanFront | null = null;
+  /**
+   * The `at` stamp of the last-good profile list this tick already put in the
+   * durable journal (see DEX_PROFILES_LAST_KEY /
+   * DexScreenerClient.lastGoodProfilesSnapshot). Seeded from the front read,
+   * so a REUSED list — which carries the stamp the row already has — never
+   * re-writes itself, and only a fetch that actually produced a newer list
+   * does.
+   */
+  private profileFeedStampedAt: number | null = null;
   /**
    * Start offset of the current tick's pool rotation slice (see
    * RE_EVAL_PER_TICK_MAX). Advances by the slice length each tick and wraps,
@@ -2694,6 +2727,22 @@ export class Scanner {
       // (Db.readScanFront issues the same SELECT listEnabledChats does).
       const front = await this.db.readScanFront(SCAN_FRONT_GATE_KEYS);
       this.scanFront = front;
+      // The last-good profile list rides that same read (see
+      // DEX_PROFILES_LAST_KEY): seeding it HERE is what lets a 429 tick reuse
+      // a minutes-old list instead of the make-up coins alone, and this is the
+      // earliest point in the tick that already has the row in hand. The stamp
+      // is kept beside the seed so a reused list never re-writes itself.
+      //
+      // One honest caveat: the profiles fetch is dispatched ABOVE this read
+      // (see profilesCall), so a refusal that lands before this point returns
+      // sees no seed and falls back to the make-up lane — exactly the old
+      // behaviour, never worse. Measured, a 429 on the shared egress answers in
+      // 200-500ms while the front read settles in ~90-110ms, so the seed wins
+      // that race on the common tick.
+      this.dex.seedLastGoodProfiles(
+        parseProfileFeedSnapshot(front.gates.get(DEX_PROFILES_LAST_KEY) ?? null),
+      );
+      this.profileFeedStampedAt = this.dex.lastGoodProfilesSnapshot()?.at ?? null;
       const chats = front.chats;
       if (chats.length === 0) {
         console.log("[scanner] no chats with push enabled, skipping");
@@ -3361,6 +3410,10 @@ export class Scanner {
       // fetches answer, so every COLD isolate — which is most ticks —
       // journaled an empty delta and lost its window with the isolate.
       await this.stampListCacheDelta();
+      // The list the NEXT 429 tick falls back on, journaled beside it (see
+      // DEX_PROFILES_LAST_KEY): a REPLACE, and only when this tick's fetch
+      // produced a list newer than the one the front read carried.
+      await this.stampProfileFeedSnapshot();
       // ...and the front's ONE write (see Db.writeScanFront): the launch_ms
       // migration flag, the Birdeye backfill stamp, the prune's counter +
       // stamp and now the cache ledger, in one request instead of up to

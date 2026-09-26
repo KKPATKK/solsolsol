@@ -534,15 +534,31 @@ export function telemetryCounterUsable(value: number | null): value is number {
 }
 
 /**
+ * The durable home of the client's last-good profile list (see
+ * ProfileFeedSnapshot in src/dexscreener.ts).
+ *
+ * It rides the front READ because the seed has to be in the client before the
+ * feed fan-out decides what to evaluate, and it rides the front WRITE because
+ * the journal must not cost a request of its own — the same discipline the
+ * list-cache ledger follows one row over. REPLACED, never ADDed: the row is a
+ * snapshot (a stamp plus the tokens), not a counter, and the scanner only
+ * writes it when this tick's list is newer than the one it seeded from (see
+ * Scanner.stampProfileFeedSnapshot).
+ */
+export const DEX_PROFILES_LAST_KEY = "dex_profiles_last";
+
+/**
  * The front's gate keys, in one place so the read and the legs cannot drift:
- * the launch_ms migration flag, the token_stats prune stamp and the Birdeye
- * backfill stamp. Every one of them is a "when did this job last run" row,
- * read once per tick.
+ * the launch_ms migration flag, the token_stats prune stamp, the Birdeye
+ * backfill stamp and the last-good profile list (see DEX_PROFILES_LAST_KEY —
+ * read, not gated on). Every one of them is a row the front's own work needs
+ * once per tick, read in ONE statement.
  */
 export const SCAN_FRONT_GATE_KEYS = [
   "schema_alter_v2_done",
   "token_stats_last_prune",
   "birdeye_backfill_at",
+  DEX_PROFILES_LAST_KEY,
 ] as const;
 
 /**
