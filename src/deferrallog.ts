@@ -1027,18 +1027,24 @@ export function nextPushDeferralSnapshot(
   // number, whatever the caller's counters say.
   //
   // A list is OPTIONAL, and the two absences mean different things:
-  //   * no list at all (legacy callers, projections) → `delta.pending` stands
-  //     as the gauge, exactly as before;
-  //   * an empty list from a caller that DID read its store → nothing is owed.
-  //     It still does not wipe `pendingTokens`: an isolate whose scanner is not
-  //     ready yet holds no registry but must not erase obligations it simply
-  //     has not read. The gauge then follows the list that is kept, which keeps
-  //     the invariant (gauge === list length) true in every branch.
+  //   * NO list (`undefined`) → the caller has never read its store (a cold
+  //     isolate with no scanner yet, a projection). It is not authoritative:
+  //     the stored list is kept and the gauge follows it.
+  //   * a list, INCLUDING AN EMPTY ONE → the caller HAS read its store, so the
+  //     list is authoritative: the gauge is its length, and 0 means nothing is
+  //     owed. Empty has to be a real answer, because the prune rule retires
+  //     obligations (2026-09-26): on the tick that retires the LAST one, "keep
+  //     the stored list" would leave the row holding tokens no isolate believes
+  //     in any more — re-seeded into every later isolate, re-observed,
+  //     re-retired, forever, with a pending gauge that never reaches 0.
+  //     The distinction existed in the data all along; what was missing was a
+  //     caller able to make it (see deferredPushTokens in the registry's own
+  //     module, which answers `undefined` until that isolate has hydrated from
+  //     this very row).
   const hasList = pendingTokens !== undefined;
-  const catalogued =
-    hasList && pendingTokens.length > 0
-      ? [...new Set(pendingTokens)].slice(-500)
-      : prev.pendingTokens;
+  const catalogued = hasList
+    ? [...new Set(pendingTokens)].slice(-500)
+    : prev.pendingTokens;
   const next: PushDeferralSnapshot = {
     deferredTotal: prev.deferredTotal + deferred,
     recoveredTotal: prev.recoveredTotal + recovered,

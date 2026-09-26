@@ -27,6 +27,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
+const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
 const { parseAxiomTokenInfo } = require("../dist/axiom.js");
@@ -2709,27 +2710,30 @@ async function main() {
     );
     assert.equal(dupes.pending, 2);
     assert.deepEqual(dupes.pendingTokens, ["AAA", "BBB"]);
-    // An EMPTY list from a caller that read its store still never wipes it — a
-    // lost obligation is a missed card, an extra one is a duplicate, and only
-    // one of those is recoverable. The gauge follows the list that is KEPT, so
-    // the two stay one fact in this branch too.
-    const empty = nextPushDeferralSnapshot(
+    // An EMPTY list from a caller that HAS read its store is AUTHORITATIVE
+    // (2026-09-26): "0 owed" is a real answer, and the prune rule needs it —
+    // on the tick that retires the last obligation, keeping the stored list
+    // would leave the row carrying tokens no isolate believes in any more,
+    // re-seeded into every later isolate forever.
+    const cleared = nextPushDeferralSnapshot(
       JSON.stringify(dupes),
       { deferred: 0, recovered: 0, stalled: 0, pending: 4 },
       3_000,
       null,
       [],
     );
-    assert.deepEqual(empty.pendingTokens, ["AAA", "BBB"], "an empty list never wipes the store");
-    assert.equal(empty.pending, 2, "and the gauge still matches the list that was kept");
-    // No list at all keeps the legacy contract: the caller's count is the gauge.
+    assert.deepEqual(cleared.pendingTokens, [], "an authoritative empty list clears the store");
+    assert.equal(cleared.pending, 0, "and the gauge is its length");
+    // NO list at all keeps the legacy contract — that caller has NOT read its
+    // store (a cold isolate with no scanner), so it may not clear anything
+    // and the caller's count stands as the gauge.
     const legacy = nextPushDeferralSnapshot(
-      JSON.stringify(empty),
+      JSON.stringify(cleared),
       { deferred: 0, recovered: 0, stalled: 0, pending: 3 },
       4_000,
     );
     assert.equal(legacy.pending, 3, "no list → the caller's count stands");
-    assert.deepEqual(legacy.pendingTokens, ["AAA", "BBB"], "and the stored list is untouched");
+    assert.deepEqual(legacy.pendingTokens, [], "and the stored list is untouched");
   });
 
   await test("nextPushDeferralSnapshot: ring capped and TTL-pruned, totals survive both", () => {
@@ -4162,11 +4166,12 @@ async function main() {
         token: "W1", chatId: "c", symbol: "W1",
         pushedAt: now - 60_000, mcapAtPush: 67_056, liquidityUsd: 50_000,
       });
-      // The coin still owed is in the SHARED registry, as it is in production
-      // (the tail's own refreshMirror seeds it from the row it just read), and
-      // any delta this process accumulated earlier is drained — so the
+      // The coin still owed is hydrated into the SHARED registry from the row
+      // this tick just read — production's own seed path (see
+      // hydrateDeferredTokens), and what makes the registry fit to publish at
+      // all. Any delta this process accumulated earlier is drained, so the
       // round-trip count below is the tail's own.
-      new DeferredPushLedger().defer("OWED1", now - 60_000);
+      hydrateDeferredTokens(["OWED1"], now - 60_000);
       require("../dist/skipcapture.js").resetSkipCapture();
       const birdeye = require("../dist/birdeye.js");
       birdeye.consumeBirdeyeCuDelta(birdeye.peekBirdeyeCuDelta());
@@ -4236,10 +4241,11 @@ async function main() {
       await db.setWorkerState("push_audit", JSON.stringify([
         { chatId: "c", token: "STALE1", symbol: "S", messageId: 1, kind: "initial", at: now - 30_000 },
       ]));
-      // The coin still owed rides the SHARED registry here too: without it
-      // the delta write has no list to publish and keeps the old one (see
-      // nextPushDeferralSnapshot), which would hide the guard's drop.
-      new DeferredPushLedger().defer("OWED1", now - 60_000);
+      // The coin still owed is hydrated from the row here too: without a
+      // registry that has READ it the delta write has no list to publish and
+      // keeps the old one (see nextPushDeferralSnapshot), which would hide
+      // the guard's drop.
+      hydrateDeferredTokens(["OWED1"], now - 60_000);
       let failWrites = false;
       const flaky = {
         execute: (a) => t.client.execute(a),
@@ -13429,7 +13435,66 @@ async function main() {
     assert.equal(view.lastPruned[0].ageMin, 167 * 60, "and the age it was judged at");
     assert.equal(view.firstPruneAt, 2_000);
     assert.equal(view.lastPruneAt, 2_000);
+    assert.equal(view.retireMemory, 2, "and it remembers what it retired (see below)");
+
+    // The SEED path may not undo a retirement while the row write is still in
+    // flight (2026-09-26, second bug of that day): the tick tail re-seeds from
+    // the row BEFORE the write that shrinks it, so without this memory a whole
+    // tick's work is undone inside one invocation — live, prunedTotal rose
+    // while pending stayed at 21.
+    dm.addDeferredToken("ZOMBIE2", 1_000);
+    assert.equal(
+      dm.noteDeferredCoin("ZOMBIE2", { ageMs: OLD, windowMaxAgeMs: WINDOW }, 2_000),
+      true,
+    );
+    assert.equal(
+      dm.seedDeferredToken("ZOMBIE2", 1_000, dm.DEFERRED_REGISTRY_MAX, 2_500),
+      false,
+      "a seed of a just-retired coin is refused while the row still lists it",
+    );
+    assert.equal(dm.isDeferredToken("ZOMBIE2"), false);
+    assert.equal(
+      dm.seedDeferredToken(
+        "ZOMBIE2",
+        1_000,
+        dm.DEFERRED_REGISTRY_MAX,
+        2_500 + dm.DEFERRED_RETIRE_MEMORY_MS,
+      ),
+      true,
+      "past the memory window the row may re-seed it (re-observed, re-retired — never a duplicate card)",
+    );
+    dm.dropDeferredToken("ZOMBIE2");
+
+    // …and the write-side half of the gate: the registry may only stand in
+    // for a row it has READ (see deferredPushTokens / hydrateDeferredTokens).
+    // Until then its emptiness is ignorance, so the answer is NO LIST rather
+    // than an empty one — while a hydrated empty list is the authoritative
+    // "nothing is owed" the last retirement wave needs to be able to write.
+    assert.equal(dm.deferralRegistryView(2_000).hydrated, false);
+    assert.equal(dm.deferredPushTokens(), undefined, "an unread row is not this registry's to publish");
+    dm.addDeferredToken("ZOMBIE3", 1_000);
+    assert.equal(
+      dm.noteDeferredCoin("ZOMBIE3", { ageMs: OLD, windowMaxAgeMs: WINDOW }, 2_000),
+      true,
+      "(a fresh zombie: the ZOMBIE2 memory was already aged out above ON PURPOSE)",
+    );
+    dm.hydrateDeferredTokens(["LIVE", "ZOMBIE3", "ROW_EXTRA"], 2_000, dm.DEFERRED_REGISTRY_MAX, 2_500);
+    assert.deepEqual(
+      dm.deferredPushTokens(),
+      ["LIVE", "FRESH", "ROW_EXTRA"],
+      "hydration MERGES the row in — and still refuses a coin just retired",
+    );
+    assert.equal(dm.deferralRegistryView(2_500).hydrated, true, "the isolate now has an opinion");
+    dm.dropDeferredToken("LIVE");
+    dm.dropDeferredToken("FRESH");
+    dm.dropDeferredToken("ROW_EXTRA");
+    assert.deepEqual(dm.deferredPushTokens(), [], "a hydrated empty list IS the answer \"nothing is owed\"");
     dm.resetDeferredRegistry();
+    assert.equal(
+      dm.deferredPushTokens(),
+      undefined,
+      "reset returns the registry to un-read (no suite inherits the flag)",
+    );
   });
 
   await test("push deferral snapshot: retirements accumulate, stamp, and survive a legacy row", () => {
@@ -13522,6 +13587,8 @@ async function main() {
     const count = (hay, needle) => hay.split(needle).length - 1;
     const scannerSrc = read("src/scanner.ts");
     const workerSrc = read("src/worker.ts");
+    const logSrc = read("src/deferrallog.ts");
+    const dmSrc = read("src/deferredmakeup.ts");
     const dm = require(path.join(__dirname, "..", "dist", "deferredmakeup.js"));
     const hookAt = scannerSrc.indexOf("this.deferredPushes.noteCoinAge(");
     const skipAt = scannerSrc.indexOf("if(!pair)continue;", hookAt);
@@ -13568,7 +13635,32 @@ async function main() {
         workerSrc.includes("durable:loadPushDeferralSnapshot(raw??null),") &&
         workerSrc.includes("isolate:deferralRegistryView(),"),
       "the rule's slack is published with the module":
-        dm.DEFERRED_PRUNE_ATTEMPTS === 3 && typeof dm.noteDeferredCoin === "function",
+        dm.DEFERRED_PRUNE_ATTEMPTS === 3 &&
+        dm.DEFERRED_RETIRE_MEMORY_MS > 0 &&
+        typeof dm.noteDeferredCoin === "function" &&
+        typeof dm.seedDeferredToken === "function",
+      "deferredmakeup (the registry owns its own readiness, and a retirement survives a hydrate)":
+        dmSrc.includes("letregistryHydrated=false;") &&
+        dmSrc.includes("registryHydrated=true;") &&
+        dmSrc.includes(
+          "returnregistryHydrated?deferredTokenList():undefined;",
+        ) &&
+        typeof dm.hydrateDeferredTokens === "function" &&
+        typeof dm.deferredPushTokens === "function",
+      "scanner (it hydrates through that one path and keeps no flag of its own)":
+        scannerSrc.includes("hydrateDeferredTokens(tokens,Date.now());") &&
+        !scannerSrc.includes("deferredRegistryLive"),
+      "worker (the cold-init seed is gated on the row having been READ)":
+        workerSrc.includes(
+          "if(pushDeferralSnapshot){scanner.seedDeferredTokens(pushDeferralSnapshot.pendingTokens);}",
+        ) &&
+        workerSrc.includes(
+          'import{deferralRegistryView,deferredPushTokens,feedMakeupView}from"./deferredmakeup";',
+        ),
+      "the writer (an authoritative empty list is an answer, not a no-op)":
+        logSrc.includes(
+          "constcatalogued=hasList?[...newSet(pendingTokens)].slice(-500):prev.pendingTokens;",
+        ),
     };
     const done = Object.entries(applied).filter(([, v]) => v);
     if (done.length === 0) {

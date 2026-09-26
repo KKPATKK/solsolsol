@@ -38,8 +38,8 @@ import {
 import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
-import { Scanner, deferredPushTokens, forgetDeferredTokens } from "./scanner";
-import { deferralRegistryView, feedMakeupView } from "./deferredmakeup";
+import { Scanner, forgetDeferredTokens } from "./scanner";
+import { deferralRegistryView, deferredPushTokens, feedMakeupView } from "./deferredmakeup";
 import {
   installTickProbe,
   dbStepView,
@@ -3240,8 +3240,14 @@ async function ensureInitialized(env: Env): Promise<void> {
           deferWrites: true,
         });
         // Hydrate durable deferred-card identities before the first scan in
-        // this isolate; counters alone cannot guarantee a make-up push.
-        scanner.seedDeferredTokens(pushDeferralSnapshot?.pendingTokens ?? []);
+        // this isolate; counters alone cannot guarantee a make-up push. Gated
+        // on the row having been READ: hydrating ALSO marks the registry
+        // authoritative for the tick-tail write (see deferredPushTokens in
+        // the registry's own module), and an isolate that never read this
+        // row must not be able to clear it.
+        if (pushDeferralSnapshot) {
+          scanner.seedDeferredTokens(pushDeferralSnapshot.pendingTokens);
+        }
         scannerReady = true;
       }
     }

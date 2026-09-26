@@ -34,6 +34,7 @@ import {
   addDeferredToken,
   deferredTokenList,
   dropDeferredToken,
+  hydrateDeferredTokens,
   isDeferredToken,
   missingDeferredTokens,
   noteDeferredCoin,
@@ -519,10 +520,13 @@ export function boundClaim(
  * tick instead of whenever the coin's band comes around (see the module).
  */
 
-/** Pending deferred-card identities for the worker's post-flush persistence. */
-export function deferredPushTokens(): string[] {
-  return deferredTokenList();
-}
+/**
+ * Deferred-card identities are the REGISTRY's state (src/deferredmakeup.ts),
+ * including whether this isolate has read the durable row into it: the worker
+ * reads that answer from the module the registry lives in (see
+ * deferredPushTokens there) rather than from a flag kept here, so a scanner
+ * rebuilt mid-isolate cannot leave two answers behind.
+ */
 
 /**
  * Forget deferred-card obligations that were ALREADY DELIVERED (2026-09-20
@@ -1546,13 +1550,15 @@ function describePushError(err: unknown): PushErrorInfo {
 }
 
 export class Scanner {
-  /** Hydrate durable deferred-card obligations when an isolate is recycled. */
+  /**
+   * Hydrate durable deferred-card obligations when an isolate is recycled
+   * (see hydrateDeferredTokens). This is also what makes the registry fit
+   * to stand in for the row it was read from — EMPTY ROW INCLUDED, which
+   * is the answer the write path needs on the tick that retires the last
+   * obligation.
+   */
   seedDeferredTokens(tokens: string[]): void {
-    for (const token of tokens.slice(-500)) {
-      if (typeof token === "string" && token.length > 0) {
-        this.deferredPushes.defer(token, Date.now());
-      }
-    }
+    hydrateDeferredTokens(tokens, Date.now());
   }
 
   /** Current deferred-card identities for the durable post-flush ledger. */

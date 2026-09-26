@@ -1910,7 +1910,22 @@ durable cursor 測試（累加、首末時間戳、applied marker、legacy row �
 同一條 out-of-window wiring guard；三條舊測試（`pushDeferralDelta` ×2、`loadPushDeferralSnapshot`）照新形狀 re-point。
 `npx wrangler deploy --dry-run` 過（1562.41 KiB）。
 
-**落線後第一個 bug（同日修）：counter 一定要喺同一 tick refresh。** 第一次 deploy 之後，規則明明行緊
+****落線後第二個 bug（同日修）：tick 尾嘅 re-seed 會喺同一 tick 內 undo 退場。** 修好 refresh 之後，live 讀數係
+`deferObserved 9 deferPruned 4`、`prunedTotal 38 → 41` —— 規則真係行緊，但 `pending` 企喺 21 唔跌。
+原因係 tick 尾嘅次序：`refreshMirror()` 會由 durable row **re-seed** 落 registry（呢個 seed 係刻意放喺寫入之前 ——
+佢就係「寫入失敗都唔會重覆推卡」嘅一半），所以 `matchCoins` 啱啱退咗嘅 token 即刻由未更新嘅 row 加返，
+而同一 tick 嘅寫入又將佢哋 publish 出去 —— **一個退場捱唔過自己嗰個 tick**。
+
+兩半，一個形狀：
+
+1. **registry 會記住**：退場嘅 token 喺 `DEFERRED_RETIRE_MEMORY_MS`（15 分鐘）之內畀 seed 路徑拒收 ——
+   但**唔會**擋真正嘅 `defer()`（佢只會喺卡片 send 被拒、而閘門已經放行之後發生，係更新鮮嘅「live」證據）；
+   記憶過期之後 row 又可以贏返：失敗模式係「多一次觀測」，唔會係重覆卡。
+2. **最後一波需要「空清單」有意義**：退到最後一條嗰 tick registry 係空，而寫入器原本「空清單唔會 wipe」嘅規矩
+   （訂立嗰陣冇 caller 分得到「冇欠單」同「未讀過 row」）會令佢永遠清唔到。
+   而家 readiness 係明示嘅：`deferredPushTokens()` 喺本 isolate 未 hydrate 過 row 之前答 `undefined`，
+   而寫入器將任何**清單（包括空）**當權威 —— 空 = 真係冇欠單。
+落線後第一個 bug（同日修）：counter 一定要喺同一 tick refresh。** 第一次 deploy 之後，規則明明行緊
 （`/health`：`profiles 8` ＝ `lastRawProfiles 0` ＋ `injectedTotal 8`，`agedEval 10` 證明評估有行），
 但 `durable.prunedTotal` 一直 0、探針 `windowMaxAgeMin` 一直 null。原因唔係 hook，而係 **summary 嘅 counter 幾時影快相**：
 diag 係 tick 開頭建好（`deferPruned` 係嗰一刻嘅值），而 durable 寫入係 tick 尾讀 summary ⇒ 呢個 tick 退嘅 obligation
@@ -1926,3 +1941,10 @@ row 繼續揸住成張 pending list，而下一個冷 isolate 又會由 row re-s
 落線紀錄：`docs/patches/deferred-prune-2026-09-26.apply.js`（src/scanner.ts ＋ src/worker.ts）、
 `docs/patches/deferred-prune-tests-2026-09-26.apply.js`、`docs/patches/deferred-prune-tests-fixes-2026-09-26.apply.js`、
 `docs/patches/deferred-prune-cursor-fix-2026-09-26.apply.js`（deferredmakeup.ts / deferrallog.ts 用普通 edit）。
+
+落線紀錄（同日下午，readiness 由 scanner 搬返 registry 自己嗰個 module）：`docs/patches/deferred-prune-hydration-move-2026-09-26.apply.js`。
+`deferredPushTokens()` 而家同 registry 一齊住喺 `src/deferredmakeup.ts`，而 `hydrateDeferredTokens()` 係唯一 seed 路徑 ——
+因為「呢個 isolate 讀過 row 未」係 registry 自己嘅事實：擺喺 scanner 度，一個 mid-isolate rebuilt 嘅 scanner 會留低兩個答案。
+副作用係好事：條 gate 而家有行為測試（未 hydrate → `undefined`；hydrate 一個空 row → `[]`；退場嘅 token 連 hydrate 都唔收），
+而 wiring guard 唔使再靠 scanner 嘅 flag 字串。三條尾段測試亦改為經 `hydrateDeferredTokens()` 建 registry —— 生產本來就係嗰條路。
+

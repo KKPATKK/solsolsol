@@ -8,13 +8,15 @@
  *   node scripts/test-deferred-priority.js
  */
 const assert = require("node:assert/strict");
-const { DeferredPushLedger, deferredPushTokens, slicePoolRotation } = require("../dist/scanner.js");
+const { DeferredPushLedger, slicePoolRotation } = require("../dist/scanner.js");
 const { loadPushDeferralSnapshot, nextPushDeferralSnapshot } = require("../dist/deferrallog.js");
 const {
   DexScreenerClient,
   PROFILE_FEED_SELF_BUDGET_MS,
 } = require("../dist/dexscreener.js");
 const {
+  deferredPushTokens,
+  hydrateDeferredTokens,
   isDeferredToken,
   missingDeferredTokens,
   DEFERRED_MAKEUP_MAX,
@@ -44,6 +46,11 @@ assert.equal(ledger.pendingCount, 0);
 assert.equal(isDeferredToken("PRIORITY"), false, "a make-up push clears the registry too");
 
 // ---------- the shared registry: one list, bounded, oldest first ----------
+// …and it is only fit to stand in for the durable row once a tick has READ
+// that row into it (see deferredPushTokens): the write path must be able to
+// tell "nothing is owed" (an authoritative list, empty included) from "no
+// list at all". The suite hydrates the way Scanner.seedDeferredTokens does.
+hydrateDeferredTokens([], 0);
 const reg = new DeferredPushLedger();
 reg.defer("REG_A", 1);
 reg.defer("REG_B", 2);

@@ -74,6 +74,33 @@ export const DEFERRED_PRUNE_ATTEMPTS = 3;
  */
 export const DEFERRED_PRUNE_RING_MAX = 12;
 
+/**
+ * How long a retirement is remembered, so the SEED path cannot undo it.
+ *
+ * The retirement drops the token from the registry, but the durable row keeps
+ * listing it until a write lands — and that write is planned in the very same
+ * tail that re-seeds the registry from the row (`refreshMirror` runs BEFORE the
+ * write, by design: the seed is what stops a duplicate push on a tick whose
+ * write never happens). Without this memory, one tick's work is undone inside
+ * the same invocation: live 2026-09-26, the first deploy's ticks retired 8
+ * coins each (`deferPruned` 4→7, `prunedTotal` 38→41) while `pending` stayed at
+ * 21, because the tail's seed put all eight straight back and the write then
+ * published them again.
+ *
+ * Fifteen minutes is many ticks of slack for the write to land (the write is
+ * re-offered every tick it is due), and it is deliberately NOT forever: if the
+ * row write stays broken for longer than this, the token simply becomes
+ * seedable again and is observed and re-retired on the next opportunity — the
+ * failure mode is a wasted observation, never a duplicate card.
+ */
+export const DEFERRED_RETIRE_MEMORY_MS = 15 * 60_000;
+/**
+ * Cap on the retirement memory, oldest first. Sized well above any plausible
+ * wave (the make-up lane retires at most DEFERRED_MAKEUP_MAX per tick), so an
+ * isolate can always remember the retirements its own writes still owe.
+ */
+export const DEFERRED_RETIRE_MEMORY_MAX = 256;
+
 /** Why an obligation stopped being owed (see noteDeferredCoin). */
 export type DeferredRetireReason =
   /** The coin aged past every enabled chat's max age: no chat can accept it. */
@@ -133,6 +160,20 @@ export interface DeferralRegistryView {
   attempts: number;
   /** The widest enabled chat's max age the last observation judged against. */
   windowMaxAgeMin: number | null;
+  /**
+   * Retirements still remembered as "do not re-seed" (see
+   * DEFERRED_RETIRE_MEMORY_MS). A non-zero reading beside a durable list that
+   * still carries those tokens is the row write lagging, not a bug: the seed
+   * path is holding the retirement until the write lands.
+   */
+  retireMemory: number;
+  /**
+   * Whether the registry has hydrated from the durable row in this isolate
+   * (see hydrateDeferredTokens). False means the reading below describes what
+   * THIS isolate happens to hold, not what the fleet owes — and that the write
+   * path is deliberately refusing to publish it.
+   */
+  hydrated: boolean;
 }
 
 /** token → the obligation's state. Map iteration order = oldest first. */
@@ -156,6 +197,40 @@ let lastPruneAt: number | null = null;
 const prunedRing: DeferredPruneEntry[] = [];
 /** Widest enabled chat's max age, as last seen by noteDeferredCoin. */
 let observedWindowMaxAgeMin: number | null = null;
+/** token → when it was retired; the seed path refuses these (see the const). */
+const retiredTokens = new Map<string, number>();
+/**
+ * Whether this isolate has read the durable row into the registry (see
+ * hydrateDeferredTokens). Until it has, the registry's emptiness is ignorance
+ * rather than information, and `deferredPushTokens` refuses to stand in for
+ * the row — an isolate that never read it must not be able to clear it.
+ */
+let registryHydrated = false;
+
+/** Remember a retirement long enough for the row write that persists it. */
+function rememberRetired(token: string, at: number): void {
+  retiredTokens.set(token, at);
+  const cutoff = at - DEFERRED_RETIRE_MEMORY_MS;
+  for (const [t, when] of retiredTokens) {
+    if (when < cutoff) retiredTokens.delete(t);
+  }
+  while (retiredTokens.size > DEFERRED_RETIRE_MEMORY_MAX) {
+    const oldest = retiredTokens.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    retiredTokens.delete(oldest);
+  }
+}
+
+/** Whether `token` was retired too recently for a re-seed to be believed. */
+function recentlyRetired(token: string, now: number): boolean {
+  const at = retiredTokens.get(token);
+  if (at === undefined) return false;
+  if (now - at >= DEFERRED_RETIRE_MEMORY_MS) {
+    retiredTokens.delete(token);
+    return false;
+  }
+  return true;
+}
 
 /**
  * Record that `token` was refused a card. Idempotent per token, so the many
@@ -225,6 +300,7 @@ function retireDeferred(
   windowMaxAgeMs: number | null,
 ): boolean {
   if (!pendingTokens.delete(token)) return false;
+  rememberRetired(token, at);
   prunedTotal += 1;
   if (firstPruneAt === null) firstPruneAt = at;
   lastPruneAt = at;
@@ -292,6 +368,74 @@ export function noteDeferredCoin(
 }
 
 /**
+ * Re-hydrate one owed coin from the durable row — the SEED path.
+ *
+ * Distinct from addDeferredToken on purpose: this is a re-hydrate, so a coin
+ * this isolate has just RETIRED must not be readmitted by the row that has not
+ * been written yet (see DEFERRED_RETIRE_MEMORY_MS — without it a retirement is
+ * undone inside the same tick). A plain `addDeferredToken` — a REAL deferral —
+ * is deliberately not filtered: `defer()` is only reached when a card send was
+ * refused a claim slice, which means the gates just accepted the coin, so that
+ * signal outranks an earlier retirement.
+ *
+ * `now` is the unit-test seam (the memory is a wall-clock window).
+ */
+export function seedDeferredToken(
+  token: string,
+  at: number,
+  maxEntries = DEFERRED_REGISTRY_MAX,
+  now = Date.now(),
+): boolean {
+  if (typeof token !== "string" || token.length === 0) return false;
+  if (recentlyRetired(token, now)) return false;
+  addDeferredToken(token, at, maxEntries);
+  return true;
+}
+
+/**
+ * Hydrate the registry from the durable row — the ONE seed path, and what
+ * makes this isolate's list fit to stand in for that row (see
+ * deferredPushTokens).
+ *
+ * Sets the flag even when `tokens` is EMPTY, which is the half that matters:
+ * "the row says nothing is owed" is the answer the write path needs on the
+ * tick that retires the LAST obligation — without it the row would keep the
+ * dead tokens forever and every cold isolate would re-seed, re-observe and
+ * re-retire them (the loop the tombstone only breaks inside one isolate).
+ *
+ * Hydration is a MERGE, not a replacement: coins this isolate already deferred
+ * itself (a real deferral, which outranks an earlier retirement) survive it,
+ * and retired ones are refused per token (see seedDeferredToken).
+ */
+export function hydrateDeferredTokens(
+  tokens: readonly string[],
+  at: number,
+  maxEntries = DEFERRED_REGISTRY_MAX,
+  now = Date.now(),
+): void {
+  for (const token of tokens.slice(-500)) {
+    seedDeferredToken(token, at, maxEntries, now);
+  }
+  registryHydrated = true;
+}
+
+/**
+ * Pending deferred-card identities for the worker's post-flush persistence —
+ * or `undefined` when no scanner in this isolate has hydrated the registry
+ * from the durable row (see hydrateDeferredTokens).
+ *
+ * The distinction is what makes an authoritative EMPTY list possible (see
+ * nextPushDeferralSnapshot): the prune rule's last wave needs to be able to
+ * write "nothing is owed", while an isolate that never read the row must say
+ * "I have no list", never "nothing is owed" (live 2026-09-26: retired tokens
+ * came straight back on the tail's own re-seed and the same write published
+ * them again, `prunedTotal` rising while `pending` stayed put).
+ */
+export function deferredPushTokens(): string[] | undefined {
+  return registryHydrated ? deferredTokenList() : undefined;
+}
+
+/**
  * This isolate's registry view (see DeferralRegistryView). Read-only, so the
  * `/debug/deferral` probe can be polled while diagnosing.
  */
@@ -314,6 +458,8 @@ export function deferralRegistryView(now = Date.now()): DeferralRegistryView {
     lastPruned: prunedRing.slice(),
     attempts: DEFERRED_PRUNE_ATTEMPTS,
     windowMaxAgeMin: observedWindowMaxAgeMin,
+    retireMemory: retiredTokens.size,
+    hydrated: registryHydrated,
   };
 }
 
@@ -329,6 +475,10 @@ export function resetDeferredRegistry(): void {
   lastPruneAt = null;
   prunedRing.length = 0;
   observedWindowMaxAgeMin = null;
+  retiredTokens.clear();
+  // Test seam, and deliberately not just the tokens: leaving the flag set
+  // would let the suite (and this isolate) publish a list it never read.
+  registryHydrated = false;
 }
 
 /**
