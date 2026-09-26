@@ -716,6 +716,10 @@ async function dexListCacheTest() {
     });
   };
   let dex = new DexScreenerClient(loadConfig({}));
+  // Since Round 5e the edge-cache ledger is MODULE state, not client state
+  // (that is what lets the scanner journal it once per tick), so the reading is
+  // compared against the baseline this case started from rather than against 1.
+  const hitsBefore = dex.getStats().listCacheHits;
   const out = await dex.fetchLatestSolanaProfiles();
   assert.deepEqual(out.map((p) => p.tokenAddress), ["EDGE_A"]);
   assert.equal(init.cf && init.cf.cacheEverything, true, "the profiles list is asked through the colo cache");
@@ -726,8 +730,17 @@ async function dexListCacheTest() {
     "a 429/5xx is kept OUT of the cache — a refused minute can never be served to the next tick as a fresh feed",
   );
   const hitStats = dex.getStats();
-  assert.equal(hitStats.listCacheHits, 1, "the HIT is counted — this is the reading that proves the fix worked");
-  assert.equal(hitStats.lastListCacheStatus, "HIT");
+  assert.equal(
+    hitStats.listCacheHits,
+    hitsBefore + 1,
+    "the HIT is counted — this is the reading that proves the fix worked",
+  );
+  assert.equal(hitStats.lastListCacheStatus, "HIT", "and the label is the one the edge just sent");
+  assert.equal(
+    typeof hitStats.listCacheMisses,
+    "number",
+    "the misses ride the same ledger — hits alone could not tell a working cache from a lane that never ran",
+  );
   assert.equal(hitStats.budgetDrops, 0, "and a dispatched attempt is never counted as a drop");
 
   // (b) The boosts list rides the same cache (same host, same bucket).

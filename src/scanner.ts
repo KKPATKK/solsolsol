@@ -8,7 +8,16 @@ import {
   type ScanFront,
   type TokenStats,
 } from "./db";
-import { DexScreenerClient, type PairInfo, type TokenProfile } from "./dexscreener";
+import {
+  DexScreenerClient,
+  consumeListCacheDelta,
+  peekListCacheDelta,
+  DEX_LIST_CACHE_HITS_KEY,
+  DEX_LIST_CACHE_LAST_KEY,
+  DEX_LIST_CACHE_MISSES_KEY,
+  type PairInfo,
+  type TokenProfile,
+} from "./dexscreener";
 import { fmtUsd } from "./format";
 import type { HeliusClient, SupplyFlowResult } from "./helius";
 import type { RugcheckClient } from "./rugcheck";
@@ -1684,14 +1693,70 @@ export class Scanner {
   /**
    * Queue one front bookkeeping row on the tick's single write, or write it on
    * its own when there is no front (a standalone Scanner).
+   *
+   * `add` is the counter shape (see ScanFrontWrite.add): the row is
+   * INCREMENTED instead of replaced. A counted zero is a no-op on both paths,
+   * exactly as Db.frontStamp treats it, so the caller does not have to know.
    */
-  private async stampFront(key: string, value: string): Promise<void> {
+  private async stampFront(
+    key: string,
+    value: string,
+    add = false,
+  ): Promise<void> {
+    if (add && Number(value) === 0) return;
     const front = this.scanFront;
     if (front) {
-      front.writes.push({ key, value });
+      front.writes.push({ key, value, add });
+      return;
+    }
+    if (add) {
+      await this.db.bumpTelemetryCounter(key, Number(value));
       return;
     }
     await this.db.setWorkerState(key, value);
+  }
+
+  /**
+   * Journal the list-feed edge cache (see src/dexscreener.ts). Called once per
+   * scan, immediately before the summary's `dex:` snapshot is taken, so the
+   * durable rows and that snapshot describe the same window.
+   *
+   * Each part is committed only after its own write landed (see
+   * consumeListCacheDelta): a row that failed is re-offered by the next tick,
+   * and a row that landed is never written twice. The loss that remains is the
+   * QUEUED front write itself — flushScanFront empties its buffer before the
+   * batch and does not re-offer a rejected one (see the note there) — i.e. the
+   * tick whose summary was lost with it, which leaves the ratio unbiased.
+   *
+   * Telemetry only: a counter may never cost or break the scan.
+   */
+  async stampListCacheDelta(): Promise<void> {
+    const delta = peekListCacheDelta();
+    if (delta.hits === 0 && delta.misses === 0 && delta.status === null) return;
+    const landed = { hits: false, misses: false, status: false };
+    const stamp = async (
+      key: string,
+      value: string,
+      add: boolean,
+      part: keyof typeof landed,
+    ): Promise<void> => {
+      try {
+        await this.stampFront(key, value, add);
+        landed[part] = true;
+      } catch (err) {
+        console.warn("[scanner] list-cache counter write failed:", err);
+      }
+    };
+    if (delta.hits > 0) {
+      await stamp(DEX_LIST_CACHE_HITS_KEY, String(delta.hits), true, "hits");
+    }
+    if (delta.misses > 0) {
+      await stamp(DEX_LIST_CACHE_MISSES_KEY, String(delta.misses), true, "misses");
+    }
+    if (delta.status !== null) {
+      await stamp(DEX_LIST_CACHE_LAST_KEY, delta.status, false, "status");
+    }
+    consumeListCacheDelta(delta, landed);
   }
 
   /**
@@ -2521,6 +2586,13 @@ export class Scanner {
         return { list: [] as TokenProfile[], settled: true };
       },
     );
+    // The list-feed edge cache is JOURNALED here (see stampListCacheDelta):
+    // the client's own counters are isolate memory, so the question they exist
+    // to answer — is LIST_FEED_CACHE_TTL_S leaving the entry expired by the
+    // time the next tick asks? — could not be answered from /health at all.
+    // Same point as the `dex:` snapshot below, so the durable rows and that
+    // snapshot cover one window.
+    await this.stampListCacheDelta();
     const diag: ScanSummary = {
       // Carried from the previous tick's tracker pass, which runs AFTER this
       // scan's flush (see runTrackerPass / worker.TRACKER_PASS_BUDGET_MS).

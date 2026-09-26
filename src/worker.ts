@@ -37,7 +37,12 @@ import {
   type SkipCaptureState,
   type SkipDelta,
 } from "./skipcapture";
-import { DexScreenerClient } from "./dexscreener";
+import {
+  DexScreenerClient,
+  DEX_LIST_CACHE_HITS_KEY,
+  DEX_LIST_CACHE_LAST_KEY,
+  DEX_LIST_CACHE_MISSES_KEY,
+} from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner, forgetDeferredTokens } from "./scanner";
@@ -4616,6 +4621,20 @@ export default {
         /** WHICH endpoint spent it, today and month-to-date (§4.14). */
         byEndpoint: { today: BirdeyeCuCounts; month: BirdeyeCuCounts };
       } | null = null;
+      // The list-feed edge cache, as the SCANNER journaled it (see
+      // src/dexscreener.ts). Read from Turso for the reason above: the
+      // counters move on the tick, and /health is answered by whichever
+      // isolate the request lands on. null = no tick has reported yet,
+      // which is a different reading from 0/0.
+      let dexListCache: {
+        hits: number;
+        misses: number;
+        /** hits / (hits + misses) as a percentage, or null while nothing
+         * was answered. THIS is the LIST_FEED_CACHE_TTL_S reading. */
+        hitPct: number | null;
+        /** The last list-feed `cf-cache-status` the durable row carries. */
+        lastStatus: string | null;
+      } | null = null;
       try {
         // The two arrival records in ONE read (was two): the claim-riding
         // counter/timestamp, plus the PRE-INIT stamp (see the scheduled
@@ -4643,6 +4662,14 @@ export default {
           "push_watch_pass",
           "telemetry_token_stats_count",
           "telemetry_seen_tokens_count",
+          // The list-feed edge-cache ledger the scanner journals
+          // (2026-09-26): the answer to LIST_FEED_CACHE_TTL_S rides THIS
+          // request for the same reason the two counters above do. The
+          // names are imported, never retyped — a literal here and a
+          // literal in the scanner is how the two ends drift apart.
+          DEX_LIST_CACHE_HITS_KEY,
+          DEX_LIST_CACHE_MISSES_KEY,
+          DEX_LIST_CACHE_LAST_KEY,
         ]);
         const tickState = front?.states;
         const rawTotal = tickState?.get("scheduled_tick_total") ?? null;
@@ -4707,6 +4734,33 @@ export default {
             parseBirdeyeCuByLedger(tickState?.get(BIRDEYE_CU_BY_STATE_KEY) ?? null),
           ),
         };
+        // Same batch, same rule: a row that is absent or drifted is not a
+        // number, and the pair is reported only when at least one of them
+        // IS one — a zero ADD is never written, so an absent row means the
+        // window has not reported yet rather than "nothing was answered".
+        const listCacheHits = parseTelemetryCounter(
+          tickState?.get(DEX_LIST_CACHE_HITS_KEY),
+        );
+        const listCacheMisses = parseTelemetryCounter(
+          tickState?.get(DEX_LIST_CACHE_MISSES_KEY),
+        );
+        if (
+          telemetryCounterUsable(listCacheHits) ||
+          telemetryCounterUsable(listCacheMisses)
+        ) {
+          const hits = telemetryCounterUsable(listCacheHits) ? listCacheHits : 0;
+          const misses = telemetryCounterUsable(listCacheMisses)
+            ? listCacheMisses
+            : 0;
+          const answered = hits + misses;
+          dexListCache = {
+            hits,
+            misses,
+            hitPct:
+              answered > 0 ? +((hits / answered) * 100).toFixed(1) : null,
+            lastStatus: tickState?.get(DEX_LIST_CACHE_LAST_KEY) ?? null,
+          };
+        }
       } catch {
         // telemetry only — never fail /health over the reads
       }
@@ -4762,6 +4816,7 @@ export default {
         tokenStatsCount,
         pushedTotal,
         birdeyeCu,
+        dexListCache,
         // WHY the last deferred write failed (method + error + when + how many
         // were waiting). This is the answer the field's absence asked for: live
         // 2026-09-24, `writeDrain {pending 47, totals {calls 57, ms 17759,

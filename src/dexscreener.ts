@@ -200,25 +200,155 @@ export const BOOST_FEED_SELF_BUDGET_MS = 480;
  * address set this tick happens to hold, and the client already has its own
  * short-lived pair cache for them.
  *
- * OPEN QUESTION (2026-09-26, deliberately NOT changed here). A TTL that equals
- * the tick period is a boundary: an entry minted at T is HIT-able to T+60, and
- * the next tick arrives at ~T+60 + jitter, so whether the tick's own fetch is a
- * HIT or a MISS is decided by that jitter — and the MISS is the one that pays
- * origin latency (300-800ms on the shared egress) against FEED_DEADLINE_MS 900,
- * which is the shape of the ticks that evaluate no profiles at all. Raising this
- * to 180 would keep the entry alive across two ticks and stay inside what the
- * client already tolerates (a FAILED fetch serves a list up to
- * PROFILE_FEED_REUSE_MS old), i.e. it satisfies the invariant the guard in
- * scripts/test-deferred-priority.js pins. It is not done because the reading
- * that would settle it — listCacheHits / lastListCacheStatus — is CLIENT
- * module state, so an isolate recycled every tick reports `0 / null` however
- * well the cache is working (live 2026-09-26T14:01Z: listCacheHits 0,
- * lastListCacheStatus null, http429 0, budgetDrops 0 on a tick that read
- * `profiles: 2`). Make that reading durable first (the dex429 ring is the
- * existing pattern) — then the hit:miss ratio decides this number with data
- * instead of a theory.
+ * OPEN QUESTION (2026-09-26, deliberately NOT changed here — but no longer
+ * unanswerable). A TTL that equals the tick period is a boundary: an entry
+ * minted at T is HIT-able to T+60, and the next tick arrives at ~T+60 +
+ * jitter, so whether the tick's own fetch is a HIT or a MISS is decided by that
+ * jitter — and the MISS is the one that pays origin latency (300-800ms on the
+ * shared egress) against FEED_DEADLINE_MS 900, which is the shape of the ticks
+ * that evaluate no profiles at all. Raising this to 180 would keep the entry
+ * alive across two ticks and stay inside what the client already tolerates (a
+ * FAILED fetch serves a list up to PROFILE_FEED_REUSE_MS old), i.e. it
+ * satisfies the invariant the guard in scripts/test-deferred-priority.js pins.
+ *
+ * What it was waiting for is the reading, and the reading was unusable:
+ * listCacheHits / lastListCacheStatus were CLIENT module state, so an isolate
+ * recycled every tick reported `0 / null` however well the cache was working
+ * (live 2026-09-26T14:01Z: listCacheHits 0, lastListCacheStatus null, http429
+ * 0, budgetDrops 0 on a tick that read `profiles: 2`). As of this build the
+ * ledger is journaled into worker_state (see the ledger below and
+ * /health's `dexListCache`), so the number is decided by DATA now: raise this
+ * only when the durable misses are a real share of the total while http429
+ * stays flat — that is the origin being asked because the entry expired, not
+ * because we were refused. Until then 60 stands, and so does the guard that
+ * pins it (its reason — a HIT is fresher than the 10-minute reuse lane — is
+ * still true and is not what the data would overturn).
  */
 export const LIST_FEED_CACHE_TTL_S = 60;
+
+/**
+ * The list-feed edge-cache LEDGER, and the durable key names it is mirrored
+ * into.
+ *
+ * MODULE scope, not instance scope, and that is the point: this is the
+ * accumulator the durable `dex_list_cache_*` rows are made from, and the tick
+ * that reports it (Scanner.stampListCacheDelta) does not own the client's
+ * fields. A second accumulator fed by the same event is exactly the drift this
+ * repo keeps paying for, so there is ONE pair of counters: getStats() reads
+ * them and the delta below is a difference against a baseline.
+ *
+ * WHAT IT ANSWERS: whether the edge cache actually serves the list feed.
+ * `hits` climbing with `http429` flat means the origin was never asked; a
+ * `misses` share that keeps growing means the entry EXPIRED before the next
+ * tick needed it — which is the whole of the LIST_FEED_CACHE_TTL_S question.
+ * A response with NO `cf-cache-status` header counts as a MISS: a hit is the
+ * one outcome that needs a header to prove itself, and a response whose
+ * provenance is unknown was answered by the origin as far as we can tell.
+ */
+const LIST_CACHE_HIT_RE = /^(HIT|REVALIDATED)$/i;
+
+const listCacheLedger = {
+  hits: 0,
+  misses: 0,
+  /** The last status seen in this isolate (null = no list fetch yet). */
+  status: null as string | null,
+  /**
+   * The status the durable row already carries, so a replacement is queued
+   * only when the label CHANGED (see peekListCacheDelta).
+   */
+  reported: null as string | null,
+};
+
+/**
+ * Count one list-feed outcome. Called from getJson — the only place the
+ * `cf-cache-status` header is visible — so there is exactly one place that
+ * decides what a hit is; an inline regex at a second call site is how the
+ * durable ratio would come to disagree with the page's own reading.
+ */
+function noteListCacheOutcome(status: string | null): void {
+  listCacheLedger.status = status;
+  if (status !== null && LIST_CACHE_HIT_RE.test(status)) {
+    listCacheLedger.hits += 1;
+    return;
+  }
+  listCacheLedger.misses += 1;
+}
+
+/** The hit/miss counts as of the last consume (see peekListCacheDelta). */
+let listCacheBaseline = { hits: 0, misses: 0 };
+
+/** What a reporter has to persist, and nothing it does not. */
+export interface ListCacheDelta {
+  hits: number;
+  misses: number;
+  /**
+   * The status to persist, or null when the durable row already says it —
+   * absent and "no list fetch yet" are the same row value, so a null status
+   * can never be reported and never needs to be.
+   */
+  status: string | null;
+}
+
+/**
+ * The counters since the last consume, WITHOUT advancing: the caller peeks,
+ * writes, and only then commits (consumeListCacheDelta), so a refused write
+ * re-offers the same window instead of dropping it. The same two-step the
+ * Birdeye CU ledger uses for the same reason (peekBirdeyeCuDelta /
+ * consumeBirdeyeCuDelta in src/birdeye.ts).
+ */
+export function peekListCacheDelta(): ListCacheDelta {
+  return {
+    hits: listCacheLedger.hits - listCacheBaseline.hits,
+    misses: listCacheLedger.misses - listCacheBaseline.misses,
+    status:
+      listCacheLedger.status !== listCacheLedger.reported
+        ? listCacheLedger.status
+        : null,
+  };
+}
+
+/**
+ * Which rows of a peeked delta actually landed. Absent means NOT landed, so a
+ * partial write commits only the rows it wrote.
+ */
+export interface ListCacheDeltaLanded {
+  hits?: boolean;
+  misses?: boolean;
+  status?: boolean;
+}
+
+/**
+ * Commit the parts of a peeked delta whose writes LANDED, and only those: a
+ * row that failed is re-offered by the next peek, and a row that landed is
+ * never written twice. The baseline advances by the delta rather than
+ * jumping to the live ledger, so an outcome that arrived while the write was
+ * in flight stays part of the NEXT delta instead of being lost or counted
+ * once for two windows.
+ *
+ * The default acks everything, which is the QUEUED case (a front is present:
+ * the row is on the tick's one write and there is nothing to retry yet).
+ */
+export function consumeListCacheDelta(
+  delta: ListCacheDelta,
+  landed: ListCacheDeltaLanded = { hits: true, misses: true, status: true },
+): void {
+  if (landed.hits) listCacheBaseline.hits += delta.hits;
+  if (landed.misses) listCacheBaseline.misses += delta.misses;
+  if (landed.status && delta.status !== null) {
+    listCacheLedger.reported = delta.status;
+  }
+}
+
+/**
+ * The durable rows the ledger is mirrored into — ONE set of names, imported by
+ * both the writer (Scanner.stampListCacheDelta) and the reader (/health),
+ * because a literal in two places is how the two ends of a counter drift apart.
+ * The first two are ADD counters (Db.bumpTelemetryCounter /
+ * ScanFrontWrite.add), the third is a replacement (the label, not a count).
+ */
+export const DEX_LIST_CACHE_HITS_KEY = "dex_list_cache_hits";
+export const DEX_LIST_CACHE_MISSES_KEY = "dex_list_cache_misses";
+export const DEX_LIST_CACHE_LAST_KEY = "dex_list_cache_last";
 
 /**
  * The Cloudflare-specific fetch options this client asks for (see
@@ -502,16 +632,10 @@ export class DexScreenerClient {
   private http429Total = 0;
   /** Epoch of the most recent 429 response, or null if never. */
   private last429At: number | null = null;
-  /**
-   * Edge-cache readings for the list feeds (see LIST_FEED_CACHE_TTL_S): how
-   * many profile/boost responses came from the colo cache (`cf-cache-status`
-   * HIT/REVALIDATED) and what the LAST one said. This is the reading that
-   * proves the 429-driven `raw 0` ticks were cured by the cache rather than by
-   * the upstream getting kinder: `cacheHits` climbing with `http429` flat means
-   * the origin was never asked.
-   */
-  private listCacheHits = 0;
-  private lastListCacheStatus: string | null = null;
+  // The list-feed edge-cache ledger is MODULE state (see the ledger beside
+  // LIST_FEED_CACHE_TTL_S): it is the accumulator the durable
+  // dex_list_cache_* rows mirror, so it cannot be per-instance without the two
+  // drifting — and getStats() below reads it from there.
   /**
    * Attempts this client NEVER SENT because the caller's deadline was already
    * spent (the throttle queue held them past it — see getJson). Counted apart
@@ -566,6 +690,11 @@ export class DexScreenerClient {
     /** List-feed responses served from the colo edge cache (see
      * LIST_FEED_CACHE_TTL_S) — climbing = the origin was never asked. */
     listCacheHits: number;
+    /** The same lane's responses the cache did NOT serve (`cf-cache-status`
+     * MISS / BYPASS / EXPIRED / DYNAMIC, or no header at all): the share of
+     * these against the hits is what decides LIST_FEED_CACHE_TTL_S, and hits
+     * alone could not tell a working cache from a lane that never ran. */
+    listCacheMisses: number;
     /** The LAST list-feed `cf-cache-status` (HIT / MISS / BYPASS / DYNAMIC…), or
      * null when the leg has not run in this isolate. */
     lastListCacheStatus: string | null;
@@ -588,8 +717,9 @@ export class DexScreenerClient {
       last429At: this.last429At,
       blockedForMs: Math.max(0, this.batchBlockedUntil - Date.now()),
       cacheSize: this.pairCache.size,
-      listCacheHits: this.listCacheHits,
-      lastListCacheStatus: this.lastListCacheStatus,
+      listCacheHits: listCacheLedger.hits,
+      listCacheMisses: listCacheLedger.misses,
+      lastListCacheStatus: listCacheLedger.status,
       budgetDrops: this.budgetDrops,
       lastDroppedAt: this.lastDroppedAt,
       dropsByLeg: { ...this.dropsByLeg },
@@ -738,11 +868,10 @@ export class DexScreenerClient {
         // fallback, and retrying would only spend the caller's window.
         if (res === null) return null;
         if (listCacheTtlS !== undefined) {
-          const cacheStatus = res.headers.get("cf-cache-status");
-          this.lastListCacheStatus = cacheStatus;
-          if (cacheStatus !== null && /^(HIT|REVALIDATED)$/i.test(cacheStatus)) {
-            this.listCacheHits += 1;
-          }
+          // ONE place counts a list outcome and one place decides what a hit
+          // is (see the ledger): a second inline regex here is how the durable
+          // ratio would come to disagree with the page's own reading.
+          noteListCacheOutcome(res.headers.get("cf-cache-status"));
         }
         if (res.status === 429) this.note429();
         if (res.status === 429 || res.status >= 500) {

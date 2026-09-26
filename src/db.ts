@@ -2562,8 +2562,14 @@ export class Db {
    * a COUNT(*) per read. The upsert-add is atomic in SQLite, so concurrent
    * isolates can never lose an increment (a read-modify-write could).
    * Telemetry only — a failed bump must never fail the write it follows.
+   *
+   * PUBLIC because there is a second ADD path with the same contract:
+   * Scanner.stampListCacheDelta writes its counters through this method when
+   * the scanner has no front (a standalone Scanner, see Scanner.stampFront).
+   * The SQL is inside, so the two paths cannot come to disagree about what an
+   * ADD is — and the swallowing above is exactly what that path needs.
    */
-  private async bumpTelemetryCounter(
+  async bumpTelemetryCounter(
     key: string,
     delta: number,
   ): Promise<void> {
