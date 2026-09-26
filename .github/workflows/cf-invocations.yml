@@ -1,0 +1,62 @@
+name: Cloudflare invocation forensics
+
+# WHY: the Worker's own telemetry cannot see a dead tick. Once an invocation
+# runs out of subrequests, every later `fetch` — INCLUDING the Turso writes
+# that would have recorded the loss — throws, so the peak subrequest count of
+# the failing ticks is never written anywhere. The only observer left is
+# Cloudflare's own analytics, and this workflow is how the operator reaches it
+# without opening the dashboard: it reuses the deploy workflow's API token
+# secret and prints a per-minute status/subrequest table.
+#
+# WHAT IT ANSWERS: for the window a "no completion" alert names, are the
+# invocations `ok`, or do they carry a failure status — and does
+# `subrequests / requests` climb toward the Workers Free cap of 50?
+#
+# Scheduled so the agent can read the answer out of the run log with `gh run
+# view --log` instead of asking a human to open the dashboard — that is the
+# whole reason this file exists while the question is open. The schedule is
+# TEMPORARY: once the dead ticks are attributed, delete the `schedule:` block
+# and keep `workflow_dispatch` as the on-demand probe. Two runs an hour on a
+# ~1 minute job is well inside the Actions allowance and it never gates a
+# deploy.
+on:
+  schedule:
+    # :07 and :37 — off the hour on purpose, so a run never shares a minute
+    # with a deploy and the two are never confused for one another.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How many hours back to query (Free-plan retention is short)"
+        required: false
+        default: "12"
+      worker:
+        description: "Worker name (scriptName)"
+        required: false
+        default: "solana-meme-bot"
+
+jobs:
+  invocations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The script prints the table to the log AND appends it to the run
+      # summary, so a failed run still shows whatever Cloudflare answered
+      # (an empty result and a permissions error look very different).
+      # A dispatch may narrow the window; a scheduled run always looks back
+      # far enough to still cover the burst being investigated.
+      - name: Query workersInvocationsAdaptive
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HOURS: ${{ inputs.hours || '12' }}
+          WORKER: ${{ inputs.worker || 'solana-meme-bot' }}
+        run: node scripts/cf-invocations.mjs
