@@ -198,6 +198,17 @@ const quantSelection = quantFieldName
   ? `${quantFieldName} { ${QUANT_CANDIDATES.join(" ")} }`
   : "";
 
+// `exceededResources` is a FAMILY, so the last fork to close is CPU vs memory
+// (128 MB per isolate). The max object carries memoryUsageBytes, which settles
+// it: a killed invocation near 128 MB is the memory limit, one at a few MB is
+// not, and the CPU quantiles above then name the limit that did fire.
+const MAX_CANDIDATES = ["memoryUsageBytes", "cpuTime", "wallTime"].filter((n) =>
+  maxFields.includes(n),
+);
+const maxSelection = MAX_CANDIDATES.length
+  ? `max { ${MAX_CANDIDATES.join(" ")} }`
+  : "";
+
 say(`Quantile fields in the schema: ${QUANT_CANDIDATES.join(", ") || "(none)"}.`);
 say(`Max fields in the schema: ${maxFields.join(", ") || "(none)"}.`);
 say("");
@@ -208,6 +219,7 @@ query ($accountTag: String!, $filter: WorkersInvocationsAdaptiveGroupsFilter!) {
     accounts(filter: {accountTag: $accountTag}) {
       workersInvocationsAdaptive(filter: $filter, limit: 10000) {
         sum { requests errors subrequests }
+        ${maxSelection}
         dimensions { ${dimSelection} }
         ${quantSelection}
       }
@@ -289,6 +301,8 @@ for (const g of groups) {
       badSubreq: 0,
       badCpuP99: 0,
       healthyCpuP99: 0,
+      badMem: 0,
+      badWall: 0,
     };
     byMinute.set(minute, row);
   }
@@ -311,6 +325,9 @@ for (const g of groups) {
     row.badCpuP99 = Math.max(row.badCpuP99, cpuP99);
     // One failed invocation per minute, so this group's own sum IS its count.
     row.badSubreq = Math.max(row.badSubreq, subrequests / Math.max(1, requests));
+    const mx = g?.max ?? {};
+    row.badMem = Math.max(row.badMem, Number(mx.memoryUsageBytes ?? 0));
+    row.badWall = Math.max(row.badWall, Number(mx.wallTime ?? mx.cpuTime ?? 0));
   } else {
     row.healthyCpuP99 = Math.max(row.healthyCpuP99, cpuP99);
   }
@@ -361,19 +378,30 @@ if (badMinutes.length === 0) {
 } else {
   say(
     "| minute (UTC) | by status | subrequests of the FAILED one | " +
-      "its cpuP99 (us) | cpuP99 of the SURVIVORS (us) |",
+      "its cpuP99 (us) | cpuP99 of the SURVIVORS (us) | failed mem MB |",
   );
-  say("|---|---|---|---|---|");
+  say("|---|---|---|---|---|---|");
   for (const row of badMinutes) {
     const statuses = [...row.byStatus.entries()]
       .map(([status, n]) => `${isBad(status) ? `**${status}**` : status}:${n}`)
       .join(" ");
     say(
       `| ${row.minute} | ${statuses} | ${row.badSubreq.toFixed(1)} | ` +
-        `**${row.badCpuP99}** | ${row.healthyCpuP99} |`,
+        `**${row.badCpuP99}** | ${row.healthyCpuP99} | ` +
+        `${(row.badMem / (1024 * 1024)).toFixed(1)} |`,
     );
   }
 }
+say("");
+say(
+  `Memory, ruled out first because it is the cheaper mistake to make: the ` +
+    `failed invocations peak at ` +
+    `**${(
+      Math.max(0, ...badMinutes.map((row) => row.badMem)) /
+      (1024 * 1024)
+    ).toFixed(1)} MB**, against the 128 MB isolate limit. An ` +
+    "`exceededResources` hitting memory would read an order of magnitude higher.",
+);
 say("");
 
 const allSubreqs = [];
