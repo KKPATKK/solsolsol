@@ -95,7 +95,13 @@ export function renderMessage(
   coin: QualifyingCoin,
   bundlerPct: number | null,
   top10Pct: number | null,
-  supplyFlowClean: boolean,
+  /**
+   * The supply-flow reading: true = the on-chain check passed, false =
+   * analyzed-not-yet / pending (the card prints 未分析), null = the check is
+   * DISABLED (SUPPLY_FLOW_ENABLED = "false") → the 供應流 line is hidden
+   * entirely, the same "no data, no line" stance GMGN / Arkham / crime take.
+   */
+  supplyFlowClean: boolean | null,
   creator: string | null,
   gmgn: GmgnTokenInfo | null,
   arkham: ArkhamTokenHolders | null,
@@ -136,9 +142,12 @@ export function renderMessage(
     top10Pct === null
       ? "👥 Top10 持仓: —（未检测）"
       : `👥 Top10 持仓: ${top10Pct.toFixed(1)}% (剔除LP)`;
-  const flowLine = supplyFlowClean
-    ? "🕸 供應流: ✅ 无集中出货（链上检查通过）"
-    : "🕸 供應流: —（未分析）";
+  const flowLine =
+    supplyFlowClean === null
+      ? null
+      : supplyFlowClean
+        ? "🕸 供應流: ✅ 无集中出货（链上检查通过）"
+        : "🕸 供應流: —（未分析）";
   const creatorShort =
     creator === null ? "—（未检测）" : `${creator.slice(0, 6)}…${creator.slice(-4)}`;
   // Creator wallet depth (feature A): age from the oldest signature plus a
@@ -226,8 +235,9 @@ export function renderMessage(
             ? ""
             : ` | ${organic.tradersWindow ?? "1h"} 交易者 ${organic.tradersH1.toLocaleString("en-US")}`
         }`;
-  // Axiom summary replaces the five legacy enrichment lines when the
-  // payload resolved; otherwise the card keeps today's exact shape.
+  // Axiom summary replaces the legacy enrichment lines when the payload
+  // resolved; otherwise the card keeps today's shape — minus every line
+  // whose source is disabled (flowLine is null while the check is off).
   const axiomSummary = renderAxiomSummaryLine(axiom);
   const lines = [
     `🪙 ${name} (${symbol})`,
@@ -237,7 +247,7 @@ export function renderMessage(
     `📊 5m 量: ${fmtUsd(pair.volume.m5)}`,
     ...(axiomSummary
       ? [axiomSummary]
-      : [bundlerLine, top10Line, flowLine]),
+      : [bundlerLine, top10Line, ...(flowLine ? [flowLine] : [])]),
     ...(organicLine ? [organicLine] : []),
     creatorLine,
     ...(gmgnLine ? [gmgnLine] : []),

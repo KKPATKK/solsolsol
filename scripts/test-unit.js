@@ -11786,8 +11786,10 @@ async function main() {
         !renderSrc.includes("Sniper買入") &&
         !renderSrc.includes("👥Holders:"),
       "render (the signature dropped both values; the group is Bundler/Top10/flow)":
-        renderSrc.includes("[bundlerLine,top10Line,flowLine]") &&
-        renderSrc.includes("top10Pct:number|null,supplyFlowClean:boolean,creator:string|null,") &&
+        renderSrc.includes("[bundlerLine,top10Line,...(flowLine?[flowLine]:[])]") &&
+        renderSrc.includes(
+          "top10Pct:number|null,supplyFlowClean:boolean|null,creator:string|null,",
+        ) &&
         !renderSrc.includes("sniperPct:number|null,") &&
         !renderSrc.includes("holderCount:number|null,"),
       "birdeye (the TTL rule is gone; the endpoints are not)":
@@ -13022,6 +13024,91 @@ async function main() {
     if (done.length === 0) {
       console.log(
         "  \u2139 the round-3 admission-stamp merge is missing - apply docs/patches/round3-admission-stamp-2026-09-26.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
+  });
+
+  // ---------- the 供應流 card line is OFF (SUPPLY_FLOW_ENABLED="false") ----------
+  //
+  // The switch already existed; what these two pin is the DISABLED shape end
+  // to end. The behaviour first: a disabled reading (null) takes the line OFF
+  // the card — it is a card with one fewer line, not a card with an idle
+  // "未分析" line — while the enabled readings keep today's exact wording.
+  await test("render: a disabled supply-flow check takes the line OFF the card", () => {
+    const { renderMessage } = require(path.join(__dirname, "..", "dist", "render.js"));
+    // The /debug/card-preview mock's shape, trimmed to what the card reads.
+    const coin = {
+      chatId: "c",
+      profile: { tokenAddress: "FLOWOFF", name: "Flow Off", symbol: "FLOWOFF" },
+      pair: {
+        chainId: "solana",
+        url: "",
+        pairAddress: "p-FLOWOFF",
+        baseToken: { address: "FLOWOFF", name: "Flow Off", symbol: "FLOWOFF" },
+        priceUsd: "0.0001",
+        marketCap: 132_000,
+        volume: { h24: 100_000, h1: 5_000, m5: 1_000 },
+        priceChange: { m5: 3.2, h1: 5 },
+        liquidity: { usd: 21_000 },
+        pairCreatedAt: Date.now() - 5 * 3_600_000,
+      },
+      stats: { token: "FLOWOFF" },
+    };
+    const crime = {
+      hit: false,
+      creatorHit: false,
+      holderHits: [],
+      checkedHolders: 0,
+      loaded: false,
+      holders: [],
+    };
+    const card = (flow) =>
+      renderMessage(coin, null, null, flow, null, null, null, crime, null, null, null, null);
+    assert.ok(!card(null).includes("供應流"), "disabled → the line is gone");
+    assert.ok(
+      card(false).includes("🕸 供應流: —（未分析）"),
+      "enabled + pending → today's wording, unchanged",
+    );
+    assert.ok(card(true).includes("🕸 供應流: ✅"), "enabled + passed → unchanged");
+  });
+
+  // ...and the wiring: past the file tool's edit window and cross-file, so the
+  // shape is asserted on the source, the way every other out-of-window patch
+  // here is. The toml check reads the RAW file (the switch's own line must
+  // exist — its comment never spells that line out).
+  await test("out-of-window patch: the supply-flow check is off and its line is hidden (docs/patches/disable-supply-flow-2026-09-26.apply.js)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const renderSrc = read("src/render.ts");
+    const scannerSrc = read("src/scanner.ts");
+    const configSrc = read("src/config.ts");
+    const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    const applied = {
+      "wrangler.toml (the switch is OFF in the deployed vars)":
+        toml.includes('SUPPLY_FLOW_ENABLED = "false"'),
+      "config (the switch still reads the var, and the default is unchanged)":
+        configSrc.includes('enabled:(env.SUPPLY_FLOW_ENABLED??"true")!=="false",'),
+      "render (the reading is tri-state, and null is what hides the line)":
+        renderSrc.includes("supplyFlowClean:boolean|null,") &&
+        renderSrc.includes("constflowLine=supplyFlowClean===null?null:"),
+      "render (the legacy group carries the line only when it exists)":
+        renderSrc.includes("[bundlerLine,top10Line,...(flowLine?[flowLine]:[])]"),
+      "scanner (the card gets null, not false, while the check is off)":
+        scannerSrc.includes('this.config.supplyFlow.enabled?flow.status==="clean":null,'),
+      "scanner (a disabled read returns before any RPC, budget or write)":
+        scannerSrc.includes('if(!cfg.enabled||!this.config.heliusApiKey)return{status:"unknown"};'),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  \u2139 the supply-flow line removal is missing - apply docs/patches/disable-supply-flow-2026-09-26.apply.js",
       );
       return;
     }

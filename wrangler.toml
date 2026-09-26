@@ -234,6 +234,28 @@ JUPITER_TRENDING_LIMIT = "100"
 # minute", never a hammering loop. Watch http429/blockedForMs here: they are
 # the signal for the CONCURRENCY (PAIR_BATCH_CONCURRENCY), not this value.
 DEX_REQUEST_INTERVAL_MS = "250"
+# Supply-flow (rug/distribution) check — OFF as of 2026-09-26.
+#
+# WHY: the check's only product was ONE card line (on the legacy enrichment
+# group), and with AXIOM_ENABLED = "0" (2026-09-19) the Axiom summary no
+# longer replaces that group — so every card carried the line again. The
+# operator does not want it, and the check was the card's most expensive
+# part: a Helius analysis (~10 RPC calls — getTokenLargestAccounts +
+# gTFA out-transfers, budget-guarded to the SUPPLY_FLOW_BUDGET_MS below)
+# plus one token_stats write per analyzed coin, re-run per coin every
+# SUPPLY_FLOW_REFRESH_MIN. With "false" the scanner's resolveSupplyFlow
+# returns "unknown" BEFORE any RPC, budget arithmetic or write, and the
+# call site hands renderMessage null, which HIDES the line — an idle
+# "未分析" line on every push is exactly what this removes.
+#
+# TRADE-OFF, stated plainly: only a CONFIRMED flag ever blocked a push, and
+# that block goes with the check — a coin that would have been blocked now
+# pushes, which is the shape of today's "未分析" cards (the detector was
+# always best-effort, never a gate). The manual /flow command still works
+# (its analyzer is built on demand and costs nothing until used). Restore
+# "true" to bring the check — and the line — back.
+SUPPLY_FLOW_ENABLED = "false"
+
 # Supply-flow (rug/distribution) per-coin budget. Two jobs: the upper bound
 # for what the analyzer may spend, and the unit the gate's start guard uses.
 # 2026-09-16: the guard compared the remaining tick time against this budget

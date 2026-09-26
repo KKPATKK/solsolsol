@@ -3581,6 +3581,10 @@ export class Scanner {
         // display lookups so a flagged coin never wastes the tick. Only a
         // confirmed flag blocks the push; a pending/incomplete analysis
         // (hold/unknown) pushes anyway with the card showing 未分析.
+        // DISABLED (SUPPLY_FLOW_ENABLED = "false", 2026-09-26): the read is
+        // free — resolveSupplyFlow returns "unknown" before any RPC, budget
+        // arithmetic or write — and the card drops the line (the call site
+        // below hands renderMessage null, not false).
         this.markPhase(diag, "flow", startedAt);
         const flow = await this.resolveSupplyFlow(coin, chainDeadline);
         if (flow.status === "flagged") {
@@ -3887,7 +3891,9 @@ export class Scanner {
           coin,
           rugcheck.bundlerPct,
           rugcheck.top10Pct,
-          flow.status === "clean",
+          // null (not false) while the check is disabled: the card HIDES the
+          // 供應流 line instead of printing an idle "未分析" on every push.
+          this.config.supplyFlow.enabled ? flow.status === "clean" : null,
           rugcheck.creator,
           gmgn,
           arkham,
