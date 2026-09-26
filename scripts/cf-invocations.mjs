@@ -303,6 +303,11 @@ for (const g of groups) {
       healthyCpuP99: 0,
       badMem: 0,
       badWall: 0,
+      // One entry per status, so a later join can see WHICH invocation in the
+      // minute cost the CPU (the cron tick vs the /health polls beside it).
+      cpuByStatus: {},
+      memMax: 0,
+      wallMax: 0,
     };
     byMinute.set(minute, row);
   }
@@ -313,11 +318,16 @@ for (const g of groups) {
   row.requests += requests;
   row.errors += Number(sum.errors ?? 0);
   row.subrequests += subrequests;
+  const mx = g?.max ?? {};
   const q0 = (quantFieldName ? g?.[quantFieldName] : null) ?? {};
   const cpuP50 = Number(q0.cpuTimeP50 ?? 0);
   const cpuP99 = Number(q0.cpuTimeP99 ?? 0);
+  const cpuMax = Number(mx.cpuTime ?? cpuP99 ?? 0);
   row.cpuP50s.push(cpuP50);
   row.cpuP99s.push(cpuP99);
+  row.cpuByStatus[status] = Math.max(row.cpuByStatus[status] ?? 0, cpuMax);
+  row.memMax = Math.max(row.memMax, Number(mx.memoryUsageBytes ?? 0));
+  row.wallMax = Math.max(row.wallMax, Number(mx.wallTime ?? 0));
   // Every reading that matters is tracked PER STATUS: a number taken across
   // the whole minute mixes the healthy polls in with the one invocation being
   // investigated, which is the mistake the first two tables made.
@@ -325,7 +335,6 @@ for (const g of groups) {
     row.badCpuP99 = Math.max(row.badCpuP99, cpuP99);
     // One failed invocation per minute, so this group's own sum IS its count.
     row.badSubreq = Math.max(row.badSubreq, subrequests / Math.max(1, requests));
-    const mx = g?.max ?? {};
     row.badMem = Math.max(row.badMem, Number(mx.memoryUsageBytes ?? 0));
     row.badWall = Math.max(row.badWall, Number(mx.wallTime ?? mx.cpuTime ?? 0));
   } else {
@@ -435,6 +444,32 @@ say(
     `**10,000 us (10 ms)** per invocation. The Worker is one to twelve times ` +
     `over that limit as a matter of course.`,
 );
+say("");
+say("## Machine-readable per-minute rows");
+say("");
+say(
+  "One line per minute, prefixed `CFMIN ` so a reader (or a script joining " +
+    "this against the Worker's own /debug/scan-history) can pick them out of " +
+    "the log with no parsing of prose. cpuMax is `max{cpuTime}` for that " +
+    "minute — the most expensive invocation in it, which is the cron tick. " +
+    "cpuTick is the same reading filtered to `success`, i.e. an invocation " +
+    "that completed its whole tick rather than being cut.",
+);
+say("");
+for (const row of minutes) {
+  say(
+    "CFMIN " +
+      JSON.stringify({
+        minute: row.minute,
+        invocations: row.requests,
+        subrequests: row.subrequests,
+        cpuMax: Math.max(0, ...Object.values(row.cpuByStatus)),
+        cpuByStatus: row.cpuByStatus,
+        memMax: row.memMax,
+        wallMax: row.wallMax,
+      }),
+  );
+}
 say("");
 say(
   "The two columns on the right are the whole argument: an invocation killed " +
