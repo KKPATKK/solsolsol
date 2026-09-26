@@ -215,6 +215,51 @@ async function main() {
     );
   });
 
+  // ---------- the fast fetch that beats the front read ----------
+  await test("a list fetched BEFORE the front read still journals (the live miss)", async () => {
+    // The ordering the live bug ran on (2026-09-26T22:44-22:50Z): the fetch is
+    // dispatched above the front read, so an edge-cache HIT — and every 200
+    // that beats Turso's ~100ms — is already in the client when the row is
+    // read. The scanner derives its skip stamp from the ROW it read; deriving
+    // it from the client stamped this tick's own fresh list and skipped the
+    // write, leaving `dex_profiles_last` absent for nine minutes of successful
+    // ticks.
+    globalThis.fetch = async () => okList(["FAST_A"]);
+    const dex = client();
+    const row = parseProfileFeedSnapshot(null); // the read found no row
+    dex.seedLastGoodProfiles(row); // …and seeded nothing
+    const out = await dex.fetchLatestSolanaProfiles();
+    const snap = dex.lastGoodProfilesSnapshot();
+    assert.deepEqual(out.map((p) => p.tokenAddress), ["FAST_A"]);
+    assert.ok(
+      snap !== null && snap.at !== (row?.at ?? null),
+      "a snapshot newer than the row is journaled, however early the fetch landed",
+    );
+
+    // The other half of the rule, once the row carries that very list: a REUSED
+    // list keeps the row's stamp, so the scanner's `snap.at === stamped` skip
+    // still spares the redundant write.
+    const t = tmpDb();
+    const db = new Db("file:injected", undefined, t.client);
+    await db.init();
+    await db.writeScanFront([
+      { key: DEX_PROFILES_LAST_KEY, value: JSON.stringify(snap), add: false },
+    ]);
+    const front = await db.readScanFront(SCAN_FRONT_GATE_KEYS);
+    const row2 = parseProfileFeedSnapshot(
+      front.gates.get(DEX_PROFILES_LAST_KEY) ?? null,
+    );
+    globalThis.fetch = async () => refused();
+    const dex2 = client();
+    dex2.seedLastGoodProfiles(row2);
+    await dex2.fetchLatestSolanaProfiles();
+    assert.equal(
+      dex2.lastGoodProfilesSnapshot().at,
+      row2?.at ?? null,
+      "the reused list keeps the ROW's stamp — no re-write, and the reuse lane works",
+    );
+  });
+
   // ---------- the scanner is wired to both ends ----------
   await test("the scanner seeds from the front read and journals exactly once", () => {
     const src = fs.readFileSync(
@@ -227,14 +272,31 @@ async function main() {
     assert.ok(seed !== -1, "the seed exists");
     assert.ok(seed > read, "the seed comes after the read that carries the row");
     assert.ok(
-      src.includes("parseProfileFeedSnapshot(front.gates.get(DEX_PROFILES_LAST_KEY)"),
+      src.includes("front.gates.get(DEX_PROFILES_LAST_KEY) ?? null"),
       "and it parses the row, not a retyped shape",
+    );
+    assert.ok(
+      src.includes("const profileFeedRow = parseProfileFeedSnapshot("),
+      "with the parsed row held in one place, so the seed and the stamp cannot drift",
     );
     const calls = src.split("this.stampProfileFeedSnapshot();").length - 1;
     assert.equal(calls, 1, "the journal runs on the tick's own journal block");
     assert.ok(
       src.includes("snap.at === this.profileFeedStampedAt"),
       "and a reused list is skipped by stamp rather than re-written",
+    );
+    // …and the stamp is the ROW's, taken from the parse this seed already does.
+    // Reading it off the client (the live bug) made a fetch that beat the front
+    // read look journaled; the pin is on BOTH halves, so neither can come back.
+    assert.ok(
+      src.includes("this.profileFeedStampedAt = profileFeedRow?.at ?? null"),
+      "the stamp is the front-read row's, so the tick's own fresh list still journals",
+    );
+    assert.ok(
+      !src.includes(
+        "this.profileFeedStampedAt = this.dex.lastGoodProfilesSnapshot()?.at ?? null",
+      ),
+      "and never the client's live list, which the pre-read fetch has already written",
     );
   });
 

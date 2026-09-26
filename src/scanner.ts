@@ -1817,12 +1817,15 @@ export class Scanner {
    */
   private scanFront: ScanFront | null = null;
   /**
-   * The `at` stamp of the last-good profile list this tick already put in the
-   * durable journal (see DEX_PROFILES_LAST_KEY /
-   * DexScreenerClient.lastGoodProfilesSnapshot). Seeded from the front read,
-   * so a REUSED list — which carries the stamp the row already has — never
-   * re-writes itself, and only a fetch that actually produced a newer list
-   * does.
+   * The `at` stamp the durable journal already carries for the last-good
+   * profile list (see DEX_PROFILES_LAST_KEY /
+   * DexScreenerClient.lastGoodProfilesSnapshot). A REUSED list keeps that same
+   * stamp, so it never re-writes itself, while a fetch that produced a newer
+   * list does. It is the ROW's stamp, never the client's live list: the
+   * profiles fetch is dispatched BEFORE the front read that carries the row, so
+   * a fast answer — an edge-cache HIT, and every 200 that beats Turso's ~100ms
+   * — is already in the client here, and reading the stamp off it marked this
+   * tick's own fresh list as journaled (see the seed's call site).
    */
   private profileFeedStampedAt: number | null = null;
   /**
@@ -2739,10 +2742,23 @@ export class Scanner {
       // behaviour, never worse. Measured, a 429 on the shared egress answers in
       // 200-500ms while the front read settles in ~90-110ms, so the seed wins
       // that race on the common tick.
-      this.dex.seedLastGoodProfiles(
-        parseProfileFeedSnapshot(front.gates.get(DEX_PROFILES_LAST_KEY) ?? null),
+      // The stamp comes from the ROW, never from the client's live list (live
+      // bug, 2026-09-26T22:44-22:50Z): because the profiles fetch is dispatched
+      // above this read, a fetch that answers EARLY has already written
+      // lastGoodProfiles by the time this line runs, so taking the stamp from
+      // the client looked exactly like "this list is already journaled" and
+      // stampProfileFeedSnapshot skipped the write. Four successful ticks and
+      // nine minutes after the deploy, `dex_profiles_last` was still absent
+      // while the scan rows read `profiles 28` — the list crossed no isolate
+      // boundary, so the ~43% of ticks whose fetch is refused kept falling back
+      // to the make-up lane alone. From the ROW the rule holds on both sides of
+      // the race: an absent row journals, and a row this tick merely reuses is
+      // skipped by stamp instead of re-written.
+      const profileFeedRow = parseProfileFeedSnapshot(
+        front.gates.get(DEX_PROFILES_LAST_KEY) ?? null,
       );
-      this.profileFeedStampedAt = this.dex.lastGoodProfilesSnapshot()?.at ?? null;
+      this.dex.seedLastGoodProfiles(profileFeedRow);
+      this.profileFeedStampedAt = profileFeedRow?.at ?? null;
       const chats = front.chats;
       if (chats.length === 0) {
         console.log("[scanner] no chats with push enabled, skipping");
