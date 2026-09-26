@@ -1113,14 +1113,27 @@ async function main() {
       "the setup swallowed it and the pass died at the rows re-read — the label ADVANCED, and the counter still says 29 were free",
     );
 
-    // (b) It dies later, in the row loop.
+    // (b) It dies later, in the row loop — on a spend the gates CLEARED.
+    // The probe is deliberately ABOVE the tail's reserve: at or below it the
+    // loop now REFUSES an alerting row (see (b')), so a throw can only come
+    // from a chain the gates allowed to start.
     const late = boom("rows");
     const pwLate = termWatcher(late, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
     await assert.rejects(
-      () => pwLate.runTick(Date.now() + 5_000, undefined, () => 3),
+      () => pwLate.runTick(Date.now() + 5_000, undefined, () => 7),
       /Too many subrequests/
     );
-    assert.equal(pwLate.passDiag(), "rows subreq 3", "the stage tracks the pass, and the number is read at the throw");
+    assert.equal(pwLate.passDiag(), "rows subreq 7", "the stage tracks the pass, and the number is read at the throw");
+
+    // (b') The shape the live readings actually produced (2026-09-26:
+    // `[rows subreq 0]` / `[rows subreq 2]`): three left, an alerting head
+    // row, and a database that WOULD throw on its claim. The reserve refuses
+    // the spend instead — a named defer, never a dead pass.
+    const nearWall = boom("rows");
+    const pwNear = termWatcher(nearWall, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    const nearOut = await pwNear.runTick(Date.now() + 5_000, undefined, () => 3);
+    assert.match(String(nearOut.note), /subreq-cut 1/, "the head's spend is refused BY NAME — the wall shape, defused");
+    assert.equal(nearOut.alerted, 0, "and no card is attempted with the chain's room unaffordable");
 
     // (c) A pass with no probe installed must not invent a number — this is
     // every caller and every direct test that predates the two ceilings.
@@ -1289,22 +1302,50 @@ async function main() {
     assert.doesNotMatch(String(out.note), /subreq/, "a healthy pass never mentions the subrequest gate");
   });
 
-  await test("PushWatcher: the row loop keeps the tail's RESERVE, and still runs its first row", async () => {
-    // Two alerting rows, six subrequests left: above TRACKER_SUBREQ_FLOOR (the
-    // rotation can start) and at TRACKER_SUBREQ_RESERVE (nothing may be spent
-    // past it, because the deferral sync and the write drain come next).
-    const db = termDb([termRow(), termRow({ token: "SECOND", symbol: "SECOND" })]);
+  await test("PushWatcher: the row loop keeps the tail's RESERVE on EVERY row — and measurement never needs it", async () => {
+    // Two ALERTING rows and one backfill row, six subrequests left: above
+    // TRACKER_SUBREQ_FLOOR (the rotation may start) and at
+    // TRACKER_SUBREQ_RESERVE (nothing may be SPENT past it — the deferral sync
+    // and the write drain come next).
+    //
+    // The head used to be EXEMPT from this gate — a progress floor. Live
+    // 2026-09-26 that floor was the bug: /debug/tick read
+    // `err:Too many subrequests … [rows subreq 0]` pass after pass, because an
+    // alerting head row's chain (claim + reservation + send + two writes) was
+    // started with 0-6 left and refused halfway, taking the pass's tail and the
+    // rest of its rotation with it — and the card never went out anyway.
+    // Measurement is what the floor was for, and measurement still happens: the
+    // backfill row rides the pass's ONE batched claim whatever the counter says.
+    const db = termDb([
+      termRow(),
+      termRow({ token: "SECOND", symbol: "SECOND" }),
+      // No send of its own (a stale-observation backfill), so this row proves
+      // the floor survived the gate change.
+      termRow({
+        token: "QUIET",
+        symbol: "QUIET",
+        pushedAt: Date.now() - 3 * 3_600_000,
+        lastMcap: null,
+        upStages: null,
+      }),
+    ]);
     const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
     const out = await pw.runTick(Date.now() + 5_000, undefined, () => 6);
-    assert.equal(out.checked, 1, "the FIRST row runs regardless — the 2026-09-17 progress floor, on this ceiling too");
-    assert.equal(out.alerted, 1, "and its card still goes out");
-    assert.equal(db.updated.length, 1, "only that row was written");
-    assert.match(String(out.note), /subreq-cut 1/, "the refused row is named in the note");
-    assert.match(String(out.note), /defer-send 1/, "and counted as a card this pass could not deliver");
-    // The loop's own prefix, not `rows 0/` anywhere: stageNote()'s `spend[...]`
-    // carries the row stage's OWN ms/trips as `rows 0/1`, so a loose match
-    // would read the stage and not the rotation.
-    assert.match(String(out.note), /^rows 1\/2 /, "the loop measured its head and refused the rest — never the silent 2026-09-17 `rows 0/` shape");
+    assert.equal(out.alerted, 0, "nothing is sent with only the tail's reserve in hand");
+    assert.equal(out.checked, 1, "the backfill row is still measured — the floor the head exemption claimed to keep");
+    assert.equal(db.updated.length, 1, "and only that row was written");
+    assert.match(String(out.note), /subreq-cut 2/, "both refused alerts are named");
+    assert.match(String(out.note), /defer-send 2/, "…and counted as cards this pass could not deliver");
+    // `rows 1/3`: one measured of three due. The loop's own prefix, because
+    // stageNote()'s `spend[rows …]` carries the stage's OWN ms/trips.
+    assert.match(String(out.note), /^rows 1\/3 /, "measured, not silently skipped");
+    // ONE subrequest above the reserve: the head's spend is allowed again, so
+    // the gate is a reserve and not a freeze.
+    const db2 = termDb([termRow()]);
+    const pw2 = termWatcher(db2, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    const out2 = await pw2.runTick(Date.now() + 5_000, undefined, () => 7);
+    assert.equal(out2.alerted, 1, "one above the reserve: the head row still gets its card");
+    assert.doesNotMatch(String(out2.note), /subreq-cut/, "and nothing is refused");
   });
 
   await test("PushWatcher: a REJECTED terminal card still rolls back (a fact, not an absence)", async () => {
@@ -12299,8 +12340,11 @@ async function main() {
         !pushwatchSrc.includes("if(past())returndeferred;"),
       "pushwatch (the note names the ceiling)":
         pushwatchSrc.includes("deferred:${deferReason}${stageNote()}trips${trips}"),
-      "pushwatch (the row loop keeps the tail reserve)":
-        pushwatchSrc.includes("rowIndex>0&&subreqsLeft()<=TRACKER_SUBREQ_RESERVE;") &&
+      "pushwatch (the row loop keeps the tail reserve on EVERY row — no head exemption)":
+        pushwatchSrc.includes(
+          "constsubreqShort=subreqsLeft()<=TRACKER_SUBREQ_RESERVE;",
+        ) &&
+        !pushwatchSrc.includes("rowIndex") &&
         pushwatchSrc.includes("subreqCut+=1;"),
       "pushwatch (the cut is in the note)":
         pushwatchSrc.includes("subreq-cut${subreqCut}"),

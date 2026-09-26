@@ -1948,3 +1948,19 @@ row 繼續揸住成張 pending list，而下一個冷 isolate 又會由 row re-s
 副作用係好事：條 gate 而家有行為測試（未 hydrate → `undefined`；hydrate 一個空 row → `[]`；退場嘅 token 連 hydrate 都唔收），
 而 wiring guard 唔使再靠 scanner 嘅 flag 字串。三條尾段測試亦改為經 `hydrateDeferredTokens()` 建 registry —— 生產本來就係嗰條路。
 
+### §4.28 追蹤 pass 嘅 head row 唔再豁免 subrequest 閘（2026-09-26）
+
+live 讀數（`/debug/tick` 連續幾個 tick）：`pushWatch: err:Too many subrequests by single Worker invocation … [rows subreq 0]`、
+`[rows subreq 2]` —— pass 喺 `rows` stage 死，counter 嗰刻只剩 0–2（即係 invocation 真係到咗 50 嘅牆）。
+成因唔係閘唔夠，而係**第一行豁免**：`subreqShort` 之前係 `rowIndex > 0 && subreqsLeft() <= TRACKER_SUBREQ_RESERVE`（常數 6），
+即係 head row 就算得 0–2 剩都可以起一條「claim → 保留 → send → 兩個 write」嘅鏈，中途畀 runtime 拒 ⇒ **整個 pass 掉失**
+（佢自己嘅 note、tail writes、剩返嘅 rotation 一齊冇），而張卡最後都冇出。
+
+改法：閘套用到**每一行**（head 都唔例外），因為嗰個 floor 本來就屬於「量度」而唔係「花費」：
+安靜行根本行唔到呢個閘（佢喺 `silentChecks` 分支已經 `continue`），所以頭行照樣畀評估、`last_checked` 照樣入 batch ——
+舊註解講嘅「pass 唔可以連自己個 head 都拒」仍然成立，只係唔再包「花費」。alerting 行被拒係免費：row 完全冇動，
+下一 tick 由 rotation 最前再衍生一次（最多延遲一個 tick），而 `subreq-cut N` / `defer-send N` 會喺 note 點名 —— 唔會再靜靜死。
+
+落線紀錄：`docs/patches/tracker-head-subreq-gate-2026-09-26.apply.js`（src/pushwatch.ts ＋ scripts/test-unit.js）。
+測試改為兩面：6 剩 → 兩條 alerting 行都拒、一條 backfill 行照量度（`rows 1/3 subreq-cut 2 defer-send 2`）；7 剩 → 頭行照樣出卡。
+

@@ -3340,21 +3340,32 @@ export class PushWatcher {
     const rowReserveMs = (): number =>
       Math.min(TRACKER_ROW_LEASH_MS, tripMs());
     /**
-     * The subrequest gate BETWEEN rows — the second half of the pair with
-     * overBudget. It gates the row's SPEND, never the row itself: a silent
-     * row rides the ONE batched claim the pass was already paying for, and
-     * the loop's FIRST row is exempt outright, the same progress-floor rule
-     * the clock keeps, because a pass that refuses its own head has measured
-     * nothing at all (the 2026-09-17 shape). Only an ALERTING row — claim +
-     * sends + write — consults it, and refusing one is free: the row is left
+     * The subrequest gate on every row's SPEND — the second half of the pair
+     * with overBudget. It never gates the row itself: a silent row costs
+     * nothing of its own and rides the ONE batched claim the pass was already
+     * paying for. Only an ALERTING row — claim + state reservation + send +
+     * writes — consults it, and refusing one is free: the row is left
      * completely untouched, exactly as the send-slice gate leaves it, so the
      * next tick re-derives it against a fresh budget.
+     *
+     * NO HEAD EXEMPTION (2026-09-26, live). The loop's first row used to be
+     * exempt outright — a progress floor, so a pass could never refuse its own
+     * head. What that floor actually bought was a DEATH: /debug/tick read
+     * `err:Too many subrequests by single Worker invocation … [rows subreq 0]`
+     * and `[rows subreq 2]` pass after pass, i.e. an alerting head row was
+     * started with at most the tail's reserve in hand, the runtime refused a
+     * call in the middle of its chain, and the pass lost its note, its tail
+     * writes and the rest of its rotation — while the card it was started for
+     * was not delivered either. The floor belongs to MEASUREMENT, and
+     * measurement never needed it: a quiet row continues into silentChecks
+     * BEFORE this gate and is counted in `rows` whatever the counter says, so
+     * the head is still evaluated (and checked, riding the pass's ONE batch)
+     * with nothing in hand — while a refused ALERT is named (`subreq-cut N`,
+     * `defer-send N`) and re-derived next tick from the front of the
+     * rotation.
      */
-    let rowIndex = 0;
     for (const row of head) {
-      const subreqShort =
-        rowIndex > 0 && subreqsLeft() <= TRACKER_SUBREQ_RESERVE;
-      rowIndex += 1;
+      const subreqShort = subreqsLeft() <= TRACKER_SUBREQ_RESERVE;
       // Budget check BETWEEN rows — but it gates the SPENDS, not the rows. A
       // quiet row costs no round trip of its own (its write rides the ONE
       // batched claim after the loop, see silentChecks), so charging it this
