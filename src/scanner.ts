@@ -36,6 +36,7 @@ import {
   dropDeferredToken,
   isDeferredToken,
   missingDeferredTokens,
+  noteDeferredCoin,
 } from "./deferredmakeup";
 
 
@@ -548,6 +549,7 @@ export function forgetDeferredTokens(tokens: readonly string[]): number {
 
 export class DeferredPushLedger {
   private recoveredCount = 0;
+  private prunedCount = 0;
 
   constructor(private readonly maxEntries = 500) {}
 
@@ -564,6 +566,37 @@ export class DeferredPushLedger {
     if (!dropDeferredToken(token)) return false;
     this.recoveredCount += 1;
     return true;
+  }
+
+  /**
+   * Feed one owed coin's make-up facts to the registry and count the
+   * retirement here when it happens (see noteDeferredCoin).
+   *
+   * The count is LOCAL — this scanner's own — for the reason `recovered` is:
+   * it is a CURSOR (worker baseline + applied marker), and the dead-tick
+   * rebuild zeroes that baseline together with the Scanner that owns this
+   * ledger, while the registry's cumulative survives it (module state).
+   * Reporting the registry's total here would re-offer every retirement
+   * since boot as fresh, once per rebuild.
+   */
+  noteCoinAge(token: string, ageMs: number | null, windowMaxAgeMs: number): void {
+    if (noteDeferredCoin(token, { ageMs, windowMaxAgeMs })) this.prunedCount += 1;
+  }
+
+  /**
+   * Obligations this scanner RETIRED as unpayable (see noteDeferredCoin):
+   * the coin aged past every enabled chat's max age, or had no pair data
+   * for DEFERRED_PRUNE_ATTEMPTS consecutive make-up observations.
+   *
+   * Cumulative like `recovered`, and the worker folds it into the durable
+   * row on the same cursor discipline (baseline + applied marker). It is
+   * not only telemetry: a tick whose only new fact is a retirement has to
+   * REWRITE that row, because the row is what carries the pending list
+   * this shrank — a recycled isolate re-seeds from it. That write is also
+   * why the counter must restart with the Scanner (see noteCoinAge).
+   */
+  get pruned(): number {
+    return this.prunedCount;
   }
 
   /** Coins deferred and not yet pushed back (visibility into the backlog). */
@@ -1249,6 +1282,13 @@ export interface ScanSummary {
   deferRecovered?: number;
   /** Coins still waiting for that make-up push (deferred and never pushed). */
   deferPending?: number;
+  /**
+   * Obligations the registry retired as unpayable (see noteDeferredCoin in
+   * src/deferredmakeup.ts), cumulative per isolate. Published so the durable
+   * row can prove the rule ran fleet-wide and not just on one isolate: the
+   * acceptance point is this rising while `deferPending` falls.
+   */
+  deferPruned?: number;
   /**
    * Cumulative tracker cards a pass could not deliver (PushWatcher's
    * `undelivered`): the per-pass note only reports the pass it happened in,
@@ -2505,6 +2545,7 @@ export class Scanner {
       cardSendDeferredTotal: this.cardSendDeferredTotal,
       deferRecovered: this.deferredPushes.recovered,
       deferPending: this.deferredPushes.pendingCount,
+      deferPruned: this.deferredPushes.pruned,
       rejects: [],
     };
     // LOW-WATER GATE (see SCAN_SUBREQ_FLOOR). The invocation's allowance is
@@ -4805,9 +4846,37 @@ export class Scanner {
     logBudget?: { feedBudgetStart: number; poolStartIdx: number },
   ): QualifyingCoin[] {
     const out: QualifyingCoin[] = [];
+    // The widest age window across the enabled chats — the bound a deferred
+    // obligation is judged against below. Infinity when there is no chat to
+    // push to: with nobody able to accept the card, no coin is "too old",
+    // and the only retirement left is the no-pair run.
+    const widestMaxAgeMs =
+      chats.length > 0 ? Math.max(...chats.map((c) => c.maxAgeMinutes)) * 60_000 : Infinity;
     for (let pi = 0; pi < profiles.length; pi++) {
       const profile = profiles[pi]!;
       const pair = pairsByToken.get(profile.tokenAddress);
+      // Deferred obligations get their make-up verdict HERE (2026-09-26).
+      // This is the one place every owed coin passes through — the feed's
+      // make-up lane injects the oldest ones into this list, the pool slice
+      // carries the in-window ones, and both hand their pairs to this loop —
+      // so the facts below are the AGE GATE'S OWN input, not a second
+      // opinion: ageMs is the same Date.now() - pair.pairCreatedAt the gate
+      // decides on, and widestMaxAgeMs is the widest enabled chat's limit.
+      // An obligation every chat would reject on age can never produce the
+      // card it is owed, and because the make-up lane is oldest-first,
+      // keeping it spends a slot on EVERY tick: live 2026-09-26, 20 pending
+      // with injectedTotal 8 per tick, the 8 oldest measured 47.6-167.0h
+      // against a 26h widest window, so the lane delivered nothing and
+      // anything newer (a genuine 7.7h obligation, last in the queue) never
+      // got a slot. A coin with NO pair is the soft case and needs the
+      // registry's run-of-misses slack (see noteDeferredCoin).
+      if (isDeferredToken(profile.tokenAddress)) {
+        this.deferredPushes.noteCoinAge(
+          profile.tokenAddress,
+          pair ? Date.now() - pair.pairCreatedAt : null,
+          widestMaxAgeMs,
+        );
+      }
       if (!pair) continue;
       const stats = statsByToken.get(profile.tokenAddress);
       if (!stats) continue;

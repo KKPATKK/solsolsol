@@ -39,7 +39,7 @@ import { DexScreenerClient } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import { Scanner, deferredPushTokens, forgetDeferredTokens } from "./scanner";
-import { feedMakeupView } from "./deferredmakeup";
+import { deferralRegistryView, feedMakeupView } from "./deferredmakeup";
 import {
   installTickProbe,
   dbStepView,
@@ -304,11 +304,22 @@ let pushDeferralSnapshot: PushDeferralSnapshot | null = null;
  * read as zero rather than fail to compile. It costs nothing — the amount
  * added for held-back coins comes from stalledUnflushed, not from this
  * difference, and this field only rides along to keep the delta one shape.
+ *
+ * `pruned` is optional for that same reason, but it IS a cursor difference
+ * (like `deferred`/`recovered`): the retirements it counts live on the
+ * scanner's registry, which the dead-tick rebuild replaces together with
+ * this baseline — see the reset at both rebuild sites.
  */
-let pushDeferralBaseline: { deferred: number; recovered: number; stalled?: number } = {
+let pushDeferralBaseline: {
+  deferred: number;
+  recovered: number;
+  stalled?: number;
+  pruned?: number;
+} = {
   deferred: 0,
   recovered: 0,
   stalled: 0,
+  pruned: 0,
 };
 /**
  * Candidate coins this isolate has watched a tick END with: qualifying coins
@@ -926,6 +937,10 @@ export async function syncPushDeferralCounters(
     deferred: summary?.cardSendDeferredTotal ?? 0,
     recovered: summary?.deferRecovered ?? 0,
     stalled: stalledCandidatesTotal,
+    // Retirements are a CURSOR difference like deferred/recovered (the
+    // registry and the baseline above are replaced together by the
+    // dead-tick rebuild), never a pending delta like stalled.
+    pruned: summary?.deferPruned ?? 0,
   };
   const ledgerDue = now - pushLedgerSyncedAt >= PUSH_LEDGER_SYNC_MIN_GAP_MS;
   const skipDue = now - skipCaptureSyncedAt >= SKIP_CAPTURE_SYNC_MIN_GAP_MS;
@@ -1004,21 +1019,29 @@ export async function syncPushDeferralCounters(
   // that is what makes a chain-deferral-only tick persist at all: cursorDelta
   // is null whenever the scanner's own counters did not move — exactly the
   // shape this counter exists for. `totals.stalled` still travels with every
-  // write as the applied marker, but it is not the amount added.
+  // write as the applied marker, but it is not the amount added. Retirements
+  // (pruned) travel on the CURSOR, like deferred/recovered, because they are
+  // scanner state the dead-tick rebuild resets alongside this baseline.
   const delta = {
     deferred: cursorDelta?.deferred ?? 0,
     recovered: cursorDelta?.recovered ?? 0,
     stalled: stalledUnflushed,
+    pruned: cursorDelta?.pruned ?? 0,
   };
   // `stale.length > 0` keeps the write path open for a drop-only tick: the
   // durable row has to lose those tokens too, or a recycled isolate re-seeds
   // them from storage (see the seed call site) and pushes the same card again.
+  // A RETIREMENT-only tick rides the same way through its own delta
+  // (`delta.pruned`): that is what persists the pending list the prune
+  // shrank, and why a prune with no deferral/recovery/held-back coin still
+  // writes.
   let next: PushDeferralSnapshot | null = null;
   let acked = false;
   if (
     delta.deferred <= 0 &&
     delta.recovered <= 0 &&
     delta.stalled <= 0 &&
+    delta.pruned <= 0 &&
     stale.length === 0
   ) {
     // Nothing new for the deferral row; the telemetry half of the batch (if
@@ -1101,7 +1124,7 @@ export async function syncPushDeferralCounters(
     // point with the cursor above, so a lost write re-offers both together.
     stalledUnflushed = 0;
     console.log(
-      `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered / +${delta.stalled} held back (totals ${next.deferredTotal}/${next.recoveredTotal}/${next.stalledTotal})`,
+      `[worker] deferral counters persisted: +${delta.deferred} deferred / +${delta.recovered} recovered / +${delta.stalled} held back / +${delta.pruned} retired (totals ${next.deferredTotal}/${next.recoveredTotal}/${next.stalledTotal}/${next.prunedTotal})`,
     );
   } else if (shrunk && landed) {
     pushDeferralSnapshot = shrunk;
@@ -2765,7 +2788,7 @@ async function ensureInitialized(env: Env): Promise<void> {
         // The rebuilt Scanner restarts its counters at zero, so a surviving
         // baseline would make every later increment look "already written"
         // (delta <= 0) and silently drop it.
-        pushDeferralBaseline = { deferred: 0, recovered: 0 };
+        pushDeferralBaseline = { deferred: 0, recovered: 0, pruned: 0 };
         // Announce the rebuild in the heartbeat, keeping the DEAD tick's `at`:
         // `now` would make the cadence gate skip the tick that just rebuilt the
         // state, and `rebuiltAt` is the marker that stops the same death from
@@ -4061,7 +4084,7 @@ async function runScan(
       // The rebuilt Scanner restarts its counters at zero, so a surviving
       // baseline would make every later increment look "already written"
       // (delta <= 0) and silently drop it.
-      pushDeferralBaseline = { deferred: 0, recovered: 0 };
+      pushDeferralBaseline = { deferred: 0, recovered: 0, pruned: 0 };
     }
     // Only rebuild when the tick still has room: re-init costs DB round
     // trips, and spending them here would eat the very margin that lets the
@@ -5813,6 +5836,40 @@ export default {
       try {
         const rows = await db?.getFeedAttribution();
         return Response.json({ ok: true, byFeed: rows ?? [] });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        );
+      }
+    }
+    // Deferred-card ledger probe (2026-09-26). One read-only request answers
+    // both halves of "are the owed cards moving, and why not":
+    //
+    //  - `durable`: the row the whole fleet shares — the pending list, the
+    //    cumulative counters (deferred/recovered/stalled/pruned) and the
+    //    prune stamps. Re-read here rather than mirroring the tick's copy, so
+    //    a cold isolate answers with the live row too.
+    //  - `isolate`: THIS isolate's registry — how long each owed coin has
+    //    been owed, its consecutive no-pair misses, the window the last
+    //    observation judged against, and the recent retirements with the
+    //    reason and the age each was judged at. Asymmetry, on purpose: a COLD
+    //    isolate has not ticked yet, so it hydrates nothing and this half
+    //    reads empty (windowMaxAgeMin: null) while `durable` is already the
+    //    fleet's live row — "this isolate has not seeded yet", never "nothing
+    //    is owed".
+    //
+    // The acceptance point for the prune rule is the pair: `pending` falling
+    // while `prunedTotal` rises, with `lastPruned` naming each coin.
+    if (url.pathname === "/debug/deferral") {
+      try {
+        const raw = await db?.getWorkerState(PUSH_DEFERRAL_STATE_KEY);
+        return Response.json({
+          ok: true,
+          now: Date.now(),
+          durable: loadPushDeferralSnapshot(raw ?? null),
+          isolate: deferralRegistryView(),
+        });
       } catch (err) {
         return Response.json(
           { ok: false, error: err instanceof Error ? err.message : String(err) },

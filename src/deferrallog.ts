@@ -107,6 +107,29 @@ export interface PushDeferralSnapshot {
   /** When the most recent one was recorded. */
   lastStallAt: number | null;
   /**
+   * Obligations the registry's prune rule has RETIRED: the coin either aged
+   * past every enabled chat's max age, or had no pair data for
+   * DEFERRED_PRUNE_ATTEMPTS consecutive make-up observations (see
+   * noteDeferredCoin in src/deferredmakeup.ts).
+   *
+   * A counter rather than only a shrinking list, because the list alone cannot
+   * say what happened: `pending` falls for a recovered card, a delivered-drop
+   * and a retirement alike. Live 2026-09-26 the row read `pending 20` beside
+   * `injectedTotal 8` on EVERY tick — a dead tail (measured 47.6-167.0 h old
+   * against the widest chat's 26 h max age) holding all eight make-up slots —
+   * and this number rising while `pending` falls is that fix's acceptance
+   * point, with `/debug/deferral` naming the reason per coin.
+   *
+   * It is also what keeps the WRITE path open: a tick whose only new fact is
+   * a retirement has to rewrite the row, or the shrunken pending list would
+   * sit in memory until the next deferral happened to land.
+   */
+  prunedTotal: number;
+  /** When the first retirement was recorded (null until one happens). */
+  firstPruneAt: number | null;
+  /** When the most recent retirement was recorded. */
+  lastPruneAt: number | null;
+  /**
    * Token identities still awaiting a make-up push. Bounded with the same
    * cap as the in-memory ledger so a recycled isolate can hydrate the actual
    * obligations, not just their aggregate count.
@@ -142,6 +165,14 @@ export interface PushDeferralSnapshot {
     deferred: number;
     recovered: number;
     stalled: number;
+    /**
+     * Retirements are cumulative cursor state like `deferred`/`recovered`, so
+     * they ride the same marker. Optional for the same reason `stalled` is on
+     * the worker's baseline: a literal written before this counter existed
+     * must read as zero rather than fail, and a legacy row's `applied` must
+     * never look like an ACK for a delta it never recorded.
+     */
+    pruned?: number;
   } | null;
 }
 
@@ -177,6 +208,9 @@ function emptyPushDeferralSnapshot(): PushDeferralSnapshot {
     stalledTotal: 0,
     firstStallAt: null,
     lastStallAt: null,
+    prunedTotal: 0,
+    firstPruneAt: null,
+    lastPruneAt: null,
     pending: 0,
     pendingTokens: [],
     firstDeferredAt: null,
@@ -274,6 +308,11 @@ export function parsePushDeferralSnapshot(
     stalledTotal: count(rec.stalledTotal),
     firstStallAt: stamp(rec.firstStallAt),
     lastStallAt: stamp(rec.lastStallAt),
+    // A row written before the prune rule existed reads 0/null — the honest
+    // "no retirement recorded yet", and the shape every later read folds into.
+    prunedTotal: count(rec.prunedTotal),
+    firstPruneAt: stamp(rec.firstPruneAt),
+    lastPruneAt: stamp(rec.lastPruneAt),
     pending: count(rec.pending),
     pendingTokens,
     firstDeferredAt: stamp(rec.firstDeferredAt),
@@ -294,7 +333,7 @@ export function parsePushDeferralSnapshot(
 export function pushDeferralAlreadyApplied(
   snapshot: PushDeferralSnapshot | null,
   owner: string,
-  totals: { deferred: number; recovered: number; stalled: number },
+  totals: { deferred: number; recovered: number; stalled: number; pruned?: number },
 ): boolean {
   const applied = snapshot?.applied;
   if (!applied) return false;
@@ -302,7 +341,10 @@ export function pushDeferralAlreadyApplied(
     applied.owner === owner &&
     applied.deferred === totals.deferred &&
     applied.recovered === totals.recovered &&
-    applied.stalled === totals.stalled
+    applied.stalled === totals.stalled &&
+    // Counted on both sides: a legacy marker (`pruned` absent = 0) must not
+    // ACK a delta whose retirements this isolate is still offering.
+    count(applied.pruned) === count(totals.pruned)
   );
 }
 
@@ -345,13 +387,22 @@ export function loadPushDeferralSnapshot(
  * twice.
  */
 export function pushDeferralDelta(
-  baseline: { deferred: number; recovered: number },
-  totals: { deferred: number; recovered: number },
-): { deferred: number; recovered: number } | null {
+  baseline: { deferred: number; recovered: number; pruned?: number },
+  totals: { deferred: number; recovered: number; pruned?: number },
+): { deferred: number; recovered: number; pruned: number } | null {
   const deferred = count(totals.deferred) - count(baseline.deferred);
   const recovered = count(totals.recovered) - count(baseline.recovered);
-  if (deferred <= 0 && recovered <= 0) return null;
-  return { deferred: Math.max(0, deferred), recovered: Math.max(0, recovered) };
+  // Retirements are a cursor difference exactly like the other two (they live
+  // on the scanner's registry, and the dead-tick rebuild replaces both the
+  // Scanner and this baseline), so they can share the mechanism — and the
+  // null test is what keeps a retirement the only reason a quiet tick writes.
+  const pruned = count(totals.pruned) - count(baseline.pruned);
+  if (deferred <= 0 && recovered <= 0 && pruned <= 0) return null;
+  return {
+    deferred: Math.max(0, deferred),
+    recovered: Math.max(0, recovered),
+    pruned: Math.max(0, pruned),
+  };
 }
 
 /**
@@ -936,7 +987,7 @@ export function heldBackCandidates(
  */
 export function nextPushDeferralSnapshot(
   raw: string | null | undefined,
-  delta: { deferred: number; recovered: number; stalled: number; pending: number },
+  delta: { deferred: number; recovered: number; stalled: number; pending: number; pruned?: number },
   at: number,
   /**
    * The isolate + cumulative totals this delta came from (see `applied`).
@@ -948,6 +999,7 @@ export function nextPushDeferralSnapshot(
     deferred: number;
     recovered: number;
     stalled: number;
+    pruned?: number;
   } | null = null,
   /**
    * The tokens this isolate holds as owed. Passing it makes the pending list
@@ -962,6 +1014,7 @@ export function nextPushDeferralSnapshot(
   const deferred = count(delta.deferred);
   const recovered = count(delta.recovered);
   const stalled = count(delta.stalled);
+  const pruned = count(delta.pruned);
   // The backlog gauge and the token list are ONE fact: the gauge is the length
   // of the list this very snapshot carries, so /health can never publish a
   // backlog that disagrees with the tokens it is listing.
@@ -992,6 +1045,9 @@ export function nextPushDeferralSnapshot(
     stalledTotal: prev.stalledTotal + stalled,
     firstStallAt: prev.firstStallAt,
     lastStallAt: prev.lastStallAt,
+    prunedTotal: prev.prunedTotal + pruned,
+    firstPruneAt: prev.firstPruneAt,
+    lastPruneAt: prev.lastPruneAt,
     pending: hasList ? catalogued.length : count(delta.pending),
     pendingTokens: catalogued,
     firstDeferredAt: prev.firstDeferredAt,
@@ -1001,7 +1057,7 @@ export function nextPushDeferralSnapshot(
     events: prev.events.slice(),
     applied: prev.applied,
   };
-  if (appliedBy && (deferred > 0 || recovered > 0 || stalled > 0)) {
+  if (appliedBy && (deferred > 0 || recovered > 0 || stalled > 0 || pruned > 0)) {
     next.applied = appliedBy;
   }
   if (deferred > 0) {
@@ -1015,6 +1071,10 @@ export function nextPushDeferralSnapshot(
   if (stalled > 0) {
     if (next.firstStallAt === null) next.firstStallAt = at;
     next.lastStallAt = at;
+  }
+  if (pruned > 0) {
+    if (next.firstPruneAt === null) next.firstPruneAt = at;
+    next.lastPruneAt = at;
   }
   next.events.push({ at, deferred, recovered, stalled, pending: next.pending });
   const cutoff = at - PUSH_DEFERRAL_RING_TTL_MS;
