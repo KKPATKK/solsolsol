@@ -548,6 +548,57 @@ export interface PushWatchListRow {
     upStages: string | null;
   }
 
+/**
+ * worker_state key holding the fingerprint of the DDL `init` ran last (see the
+ * fingerprint gate inside `init`). Read once per cold isolate; written only
+ * when the batch actually ran.
+ */
+export const SCHEMA_DDL_FINGERPRINT_KEY = "schema_ddl_fingerprint";
+
+/**
+ * Every table addColumnIfMissing is called for (checked 2026-09-26:
+ * token_stats 15 call sites, chat_settings 7, push_watch 4). Listed here
+ * because the batched probe below has to ask for their columns UP FRONT
+ * — a table missing from this list is not broken, it just keeps paying
+ * the old one-round-trip-per-column path.
+ */
+export const COLUMN_PROBE_TABLES = ["chat_settings", "token_stats", "push_watch"] as const;
+
+/**
+ * Cache key for one column: `table\0column`. The separator is a NUL
+ * rather than a dot so a table name containing a dot could never be
+ * confused with a column of another table.
+ */
+function columnKey(table: string, column: string): string {
+  return `${table}\u0000${column}`;
+}
+
+/**
+ * FNV-1a over the init DDL statements, as 8 hex digits.
+ *
+ * Deliberately NOT a cryptographic hash: this decides whether to skip
+ * idempotent `CREATE ... IF NOT EXISTS` statements, where the only requirement
+ * is that any edit to the list produces a different value. A cheap non-crypto
+ * hash is also the right cost here — the gate exists to spend less CPU than
+ * the batch it skips, so it must not itself become work.
+ *
+ * The statements are hashed WITH a separator between them, so moving text
+ * across a statement boundary (["ab","c"] vs ["a","bc"]) still changes the
+ * value. Exported for the unit tests that pin the gate's behaviour.
+ */
+export function schemaFingerprint(statements: readonly string[]): string {
+  let h = 0x811c9dc5;
+  for (const statement of statements) {
+    for (let i = 0; i < statement.length; i++) {
+      h ^= statement.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    h ^= 0x2f;
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
 export class Db {
   /**
    * Entries kept in the shared delivery ring (see recordPushDelivery).
@@ -1292,8 +1343,25 @@ export class Db {
     // so a degraded database could push init past the ~30s scheduled-event
     // wall clock and kill the tick before the scanner initialized — cron then
     // LOOKED dead from /health (observed 2026-08-14).
-    await c.batch(
-      [
+    //
+    // THE FINGERPRINT GATE (2026-09-26). One round trip, but not a cheap one:
+    // measured with scripts/cpu-profile.js against this same database, the
+    // DDL batch costs 46-189ms of CPU on the client (18 long statements to
+    // encode and their results to decode) while a single-row read costs
+    // 2.4-5.8ms. That made it the largest single CPU item in a tick — and an
+    // isolate recycles, so the next one pays it again: this is the one cost a
+    // cron Worker pays for a schema that has not changed since yesterday.
+    // Workers Free allows 10ms of CPU per invocation, Cloudflare has been
+    // killing this Worker with `exceededResources` because of it, so the DDL
+    // is now behind a fingerprint: read ONE small row, run the batch only when
+    // that row does not already describe exactly these statements.
+    //
+    // The fingerprint is derived from `ddl` ITSELF, not hand-maintained, so a
+    // statement added or edited above busts the gate automatically — the
+    // failure a hand-kept version number would eventually produce (DDL
+    // skipped, table missing) is not reachable here. Any read failure is also
+    // a mismatch: an unknown schema is exactly when the DDL should run.
+    const ddl: string[] = [
         `CREATE TABLE IF NOT EXISTS chat_settings (
           chat_id TEXT PRIMARY KEY,
           min_liquidity_usd REAL NOT NULL DEFAULT 10000,
@@ -1431,9 +1499,53 @@ export class Db {
         );`,
         `CREATE INDEX IF NOT EXISTS idx_pushed_holders_owner ON pushed_holders(owner, pushed_at);`,
         `CREATE INDEX IF NOT EXISTS idx_pushed_holders_at ON pushed_holders(pushed_at);`,
-      ],
-      "write",
-    );
+    ];
+
+    // See the fingerprint gate comment above `ddl`. ONE small read decides
+    // whether the batch runs at all: the row is a single short string (~46
+    // bytes on the wire), against ~8KB of statements and their results.
+    const ddlFingerprint = schemaFingerprint(ddl);
+    let storedFingerprint: string | null = null;
+    try {
+      const known = await c.batch(
+        [
+          {
+            sql: "SELECT value FROM worker_state WHERE key = ?",
+            args: [SCHEMA_DDL_FINGERPRINT_KEY],
+          },
+        ],
+        "read",
+      );
+      storedFingerprint =
+        known[0]?.rows.length > 0 ? String(known[0].rows[0].value) : null;
+    } catch {
+      // Every `worker_state` failure mode — table absent (a database that
+      // has never been initialized), refused read, timeout — means an
+      // UNKNOWN schema, which is exactly when the DDL should run. Swallowing
+      // it here is required, not optional: a gate that could throw would
+      // turn a cheap optimisation into a way for init to fail on the one
+      // database it has never seen.
+      storedFingerprint = null;
+    }
+    if (storedFingerprint !== ddlFingerprint) {
+      await c.batch(ddl, "write");
+      // Stamped AFTER the batch, so the marker can never claim a schema the
+      // database does not have. Best-effort: a refused write only means the
+      // next cold isolate pays the DDL again, which is the pre-gate shape.
+      try {
+        await c.batch(
+          [
+            {
+              sql: "INSERT OR REPLACE INTO worker_state (key, value) VALUES (?, ?)",
+              args: [SCHEMA_DDL_FINGERPRINT_KEY, ddlFingerprint],
+            },
+          ],
+          "write",
+        );
+      } catch {
+        /* telemetry-grade: the gate must never be able to fail init */
+      }
+    }
 
     // Flag reads in ONE batched read round trip.
     const flags = await c.batch(
@@ -1903,16 +2015,84 @@ export class Db {
     );
   }
 
+  /**
+   * Columns this isolate has already confirmed exist, keyed
+   * `table\0column` (see columnKey). Null until the first probe.
+   */
+  private columnCache: Set<string> | null = null;
+
+  /**
+   * Whether `table.column` exists — WITHOUT a round trip of its own once
+   * the cache is primed.
+   *
+   * WHY THIS EXISTS (2026-09-26, CPU). addColumnIfMissing used to ask the
+   * database one column at a time, by attempting an ALTER and reading
+   * SQLite's "duplicate column name" as a negative answer: one round trip
+   * PER COLUMN on every cold isolate — 26 call sites, 12 reached on this
+   * schema. scripts/cpu-profile.js measured a libsql round trip at 2.4-5.8ms
+   * of CLIENT CPU even for a 46-byte, one-row reply (the encode/decode, not
+   * the network), so the probes alone were ~30-70ms: the largest item left
+   * in a tick once the DDL batch went behind a fingerprint. Cloudflare kills
+   * these invocations with `exceededResources` at exactly 10,000us, the
+   * Workers Free CPU ceiling, while the same minutes' surviving invocations
+   * report 13,000-187,000us. The answer is to ask ONCE: one batched read of
+   * pragma_table_info for every table this migration touches, then answer
+   * every following call from memory.
+   */
+  private async columnExists(table: string, column: string): Promise<boolean> {
+    if (this.columnCache === null) this.columnCache = await this.readColumnNames();
+    return this.columnCache.has(columnKey(table, column));
+  }
+
+  /**
+   * Every column of COLUMN_PROBE_TABLES, in ONE round trip.
+   *
+   * Best-effort by design: on an unreadable batch it returns an empty set,
+   * which makes every following columnExists() false and so reproduces the
+   * pre-2026-09-26 behaviour exactly — one ALTER per call, duplicates
+   * swallowed — instead of skipping a migration that might be needed. A
+   * table the DDL has not created yet returns zero rows (verified against
+   * libsql; it does not throw), which is the same answer as an empty table.
+   */
+  private async readColumnNames(): Promise<Set<string>> {
+    const found = new Set<string>();
+    try {
+      const res = await this.get().batch(
+        COLUMN_PROBE_TABLES.map((table) => ({
+          sql: "SELECT name FROM pragma_table_info(?)",
+          args: [table],
+        })),
+        "read",
+      );
+      COLUMN_PROBE_TABLES.forEach((table, i) => {
+        for (const row of res?.[i]?.rows ?? []) {
+          found.add(columnKey(table, String(row.name ?? "")));
+        }
+      });
+    } catch (err) {
+      console.warn(
+        "[db] column probe unavailable, falling back to one ALTER per column:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    return found;
+  }
+
   private async addColumnIfMissing(
     table: string,
     column: string,
     definition: string,
   ): Promise<void> {
+    if (await this.columnExists(table, column)) return;
     try {
       await this.get().execute({
         sql: `ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`,
         args: [],
       });
+      // Keep the cache honest for the rest of this isolate's init: without
+      // this, a second call for the same column in the same init would pay
+      // an ALTER that must fail — the exact cost this cache exists to avoid.
+      this.columnCache?.add(columnKey(table, column));
       console.log(`[db] added column ${table}.${column}`);
     } catch (err) {
       // SQLite throws "duplicate column name" when it already exists — fine.
