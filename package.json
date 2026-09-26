@@ -10,7 +10,7 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test-filters.js",
-    "test:unit": "npm run build && node scripts/test-unit.js && node scripts/test-deferred-priority.js && node scripts/test-tick-path.js && node scripts/test-schema-gate.js && node scripts/test-health-front.js && node scripts/test-dex-list-cache.js",
+    "test:unit": "npm run build && node scripts/test-unit.js && node scripts/test-deferred-priority.js && node scripts/test-tick-path.js && node scripts/test-schema-gate.js && node scripts/test-health-front.js && node scripts/test-dex-list-cache.js && node scripts/test-usd-formatter.js",
     "deploy:worker": "wrangler deploy",
     "deploy:env": "node --env-file-if-exists=.env.local node_modules/wrangler/bin/wrangler.js deploy"
   },

@@ -40,6 +40,11 @@
 
 const { loadConfig } = require("../dist/config.js");
 const { Db, COLUMN_PROBE_TABLES } = require("../dist/db.js");
+// The eval phase's own code (see the eval legs): the tick's per-coin work is
+// measured by CALLING the function the tick calls, never by re-implementing it.
+const { Scanner } = require("../dist/scanner.js");
+const { DexScreenerClient } = require("../dist/dexscreener.js");
+const { fmtUsd } = require("../dist/format.js");
 const { parseJupTrendTokens } = require("../dist/jupfeeds.js");
 const { parseNewPools } = require("../dist/geckoterminal.js");
 const { parseMeteoraPools } = require("../dist/meteora.js");
@@ -350,6 +355,9 @@ async function main() {
 
   // ---------- the re-eval pool read (production, read-only) ----------
   const chats = await db.listEnabledChats();
+  // Declared OUT here, not inside the branch below: the eval legs need the same
+  // rows and the branch is a block.
+  let poolRows = [];
   if (chats.length === 0) {
     rows.push({
       label: "pool: SKIPPED (no enabled chats)",
@@ -382,8 +390,12 @@ async function main() {
     // Three readings of the SAME query at the configured size: #1 pays the
     // cold start, #2 and #3 are what a warm tick pays. Wall clock is dominated
     // by the network; the CPU column is the part a Workers budget is spent on.
+    // The rows are KEPT for the eval legs below: they are the real input to the
+    // per-coin evaluation, and this is the same query the tick's pool phase
+    // runs (one more read of the same shape, nothing written).
     await phaseRepeat("pool: getReevalPool (configured size)", 0, 3, async () => {
       const out = await db.getReevalPool(args);
+      poolRows = out;
       return `${out.length} rows`;
     });
 
@@ -427,6 +439,200 @@ async function main() {
     });
   }
 
+  // ---------- the EVAL phase ----------
+  // WHY IT WAS THE ONE PHASE WITH NO MEASUREMENT. `evalMs` (Scanner: `const
+  // evalStart = Date.now()` → `diag.evalMs = ...`) is the tick's LONGEST
+  // wall-clock stretch — the pair phase, the per-coin gate evaluation, the
+  // enrichment chain, rendering and the send. Its I/O parts are priced
+  // elsewhere in this report (the round trips, the feed parsers); what was
+  // missing is the JS the tick runs PER COIN, i.e. `Scanner.matchCoins`, the
+  // loop that decides what qualifies. Same discipline as the feed parsers: the
+  // REAL function from dist/, over the REAL pool rows, the REAL pair payload
+  // and the REAL chats.
+  if (chats.length > 0 && poolRows.length > 0) {
+    const feedProfiles = (() => {
+      try {
+        return JSON.parse(profiles.text)
+          .filter((p) => p.chainId === "solana")
+          .slice(0, config.scanProfileLimit)
+          .map((p) => ({
+            tokenAddress: String(p.tokenAddress ?? ""),
+            symbol: typeof p.symbol === "string" ? p.symbol : undefined,
+            openTimestamp: typeof p.openTimestamp === "number" ? p.openTimestamp : undefined,
+          }))
+          .filter((p) => p.tokenAddress);
+      } catch {
+        return [];
+      }
+    })();
+    // The list the tick evaluates: the feed's coins FIRST, then the pool slice
+    // as profiles carrying their launch time (scannedProfiles in
+    // Scanner.runOnce). The stats of the pool coins come in through
+    // statsByToken, exactly as they do live.
+    const evalProfiles = [
+      ...feedProfiles,
+      ...poolRows.map((r) => ({
+        tokenAddress: r.token,
+        openTimestamp: r.launchMs ?? undefined,
+      })),
+    ];
+    const statsByToken = new Map(poolRows.map((r) => [r.token, r]));
+    const evalDex = new DexScreenerClient(config);
+    const addrs = [...new Set(evalProfiles.map((p) => p.tokenAddress))];
+    // The tick gets ONE attempt and whatever comes back is what the gates judge
+    // (live: `pairs 166` on a tick that asked for ~144 addresses). This leg is
+    // about the GATE work, so the fetch is retried while the input is clearly
+    // incomplete — a half-empty pair map would under-report the very phase
+    // being measured, which is the one way this reading could lie. Bounded to
+    // two extra attempts and 150 addresses each, so a rate-limited egress
+    // cannot turn the run into a retry loop.
+    const pairsByToken = await evalDex.fetchPairsForTokens(addrs);
+    for (let attempt = 2; attempt <= 3; attempt++) {
+      if (pairsByToken.size >= addrs.length * 0.3) break;
+      const missing = addrs.filter((a) => !pairsByToken.has(a)).slice(0, 150);
+      if (missing.length === 0) break;
+      const more = await evalDex.fetchPairsForTokens(missing);
+      for (const [k, v] of more) pairsByToken.set(k, v);
+    }
+    const scanner = new Scanner(
+      db,
+      { api: { sendMessage: async () => ({}) } },
+      evalDex,
+      config,
+      null,
+      null,
+      null,
+    );
+    // Fresh objects per call: matchCoins WRITES into all three (fails, rejects,
+    // agedEval), and a shared one would make the second reading differ from the
+    // first for reasons that are not CPU.
+    const runEval = (list) => {
+      const fails = { mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, flurry: 0, other: 0 };
+      const rejects = [];
+      const agedEval = { count: 0 };
+      const out = scanner.matchCoins(
+        list,
+        pairsByToken,
+        statsByToken,
+        chats,
+        fails,
+        rejects,
+        agedEval,
+        // REJECT_LOG_MAX is 20 in src/scanner.ts (the comment around it still
+        // says 50). The split only decides WHICH coins may log a reason — the
+        // per-coin work runs either way — so the CPU reading does not depend on
+        // this number.
+        {
+          feedBudgetStart: Math.max(0, 20 - Math.min(poolRows.length, 20)),
+          poolStartIdx: feedProfiles.length,
+        },
+      );
+      return { out, fails, rejects, agedEval };
+    };
+    rows.push({
+      label: `eval: inputs (${addrs.length} addrs, ${pairsByToken.size} pairs, ${chats.length} chat)`,
+      bytes: 0,
+      wallMs: 0,
+      cpuMs: 0,
+      note: "real pool rows + real pair payload; fewer pairs than addrs = DexScreener refused or skipped them",
+    });
+    // The formatter, measured FIRST and separately (see the note on fmtUsd):
+    // before anything here has called it, so reading #1 is the one that pays
+    // for ICU/data initialization in this process and the later ones are what
+    // every call after it costs. It runs before the matchCoins legs on purpose
+    // — the earlier run of this script had matchCoins #1 at 41.95 ms, and the
+    // question is whether that was the GATES or the formatter they build
+    // messages with.
+    await phaseRepeat("eval: new Intl.NumberFormat + format (×100)", 0, 3, () => {
+      let n = 0;
+      for (let i = 0; i < 100; i++) {
+        const compact = i % 2 === 1;
+        n += new Intl.NumberFormat("en-US", {
+          style: "currency",
+          currency: "USD",
+          notation: compact ? "compact" : undefined,
+          maximumFractionDigits: 2,
+        }).format(compact ? 1234.5 : 0.00042).length;
+      }
+      return `${n} chars`;
+    });
+    await phaseRepeat("eval: fmtUsd ×100 (the real one, warm)", 0, 3, () => {
+      let n = 0;
+      for (let i = 0; i < 100; i++) {
+        n += fmtUsd(i % 2 === 1 ? 1_234_567.89 : 0.00042).length;
+      }
+      return `${n} chars`;
+    });
+    await phaseRepeat(
+      `eval: matchCoins (${evalProfiles.length} coins, ${pairsByToken.size} pairs)`,
+      0,
+      5,
+      async () => {
+        const r = runEval(evalProfiles);
+        return (
+          `${r.out.length} candidates, ${r.rejects.length} rejects, ` +
+          `agedEval ${r.agedEval.count}, fails ${JSON.stringify(r.fails)}`
+        );
+      },
+    );
+    // The gate path alone: coins WITHOUT a pair are skipped by a Map lookup, so
+    // the per-coin cost of the gates is only visible on the ones that have one
+    // (live: 166 of 477 pool rows). This is the row to scale by the tick's own
+    // `pairs` count, not the full-list one.
+    const pairedProfiles = evalProfiles.filter((p) => pairsByToken.has(p.tokenAddress));
+    await phaseRepeat(
+      `eval: matchCoins (${pairedProfiles.length} PAIRED coins — gate path)`,
+      0,
+      3,
+      async () => {
+        const r = runEval(pairedProfiles);
+        return `${r.out.length} candidates, ${r.rejects.length} rejects, fails ${JSON.stringify(r.fails)}`;
+      },
+    );
+    // Scaling: is the COIN COUNT the knob a budget buys? The same function on
+    // twice the list. Synthetic in the sense that the list is doubled, but the
+    // per-coin work is the same work, so a doubling CPU means the count is
+    // what the phase's cost is made of.
+    await phase(`eval: matchCoins (${evalProfiles.length * 2} coins, doubled)`, 0, async () => {
+      const r = runEval([...evalProfiles, ...evalProfiles]);
+      return `${r.out.length} candidates, ${r.rejects.length} rejects`;
+    });
+  } else {
+    rows.push({
+      label: "eval: SKIPPED (no chats or no pool rows)",
+      bytes: 0,
+      wallMs: 0,
+      cpuMs: 0,
+      note: "",
+    });
+  }
+
+  // ---------- the real tick's own phase clocks (context for the table) ------
+  // One row read, no write: what a PRODUCTION evalMs actually measures, on the
+  // tick whose list the legs above just evaluated. Without it the eval rows
+  // below are a cost with nothing to compare against.
+  let tickContext = null;
+  try {
+    const raw = await db.getWorkerState("scan_heartbeat");
+    const hb = raw ? JSON.parse(raw) : null;
+    const s = hb?.summary ?? {};
+    tickContext = {
+      at: hb?.at ? new Date(hb.at).toISOString() : null,
+      scanMs: hb?.ms ?? null,
+      feedsMs: s.feedsMs ?? null,
+      poolMs: s.poolMs ?? null,
+      evalMs: s.evalMs ?? null,
+      pool: s.pool ?? null,
+      pairs: s.pairs ?? null,
+      candidates: s.candidates ?? null,
+      pushed: s.pushed ?? null,
+      pushPhase: s.pushPhase ?? null,
+      pushPhaseMs: s.pushPhaseMs ?? null,
+    };
+  } catch {
+    /* an unparseable row reports as no context */
+  }
+
   // ---------- report ----------
   const totalCpu = rows.reduce((n, r) => n + r.cpuMs, 0);
   const worst = rows.reduce((b, r) => (r.cpuMs > (b?.cpuMs ?? -1) ? r : b), null);
@@ -448,6 +654,23 @@ async function main() {
       `${rows.length} phases; biggest single phase: ${worst?.label} ` +
       `(${worst?.cpuMs.toFixed(2)} ms)`,
   );
+  if (tickContext) {
+    console.log("");
+    console.log(`the last real tick (@ ${tickContext.at}, ${tickContext.scanMs} ms):`);
+    console.log(
+      `  feedsMs ${tickContext.feedsMs}  poolMs ${tickContext.poolMs}  ` +
+        `evalMs ${tickContext.evalMs}  (last phase mark: ${tickContext.pushPhase} ${tickContext.pushPhaseMs} ms)`,
+    );
+    console.log(
+      `  pool ${tickContext.pool} rows, pairs ${tickContext.pairs}, ` +
+        `candidates ${tickContext.candidates}, pushed ${tickContext.pushed}`,
+    );
+    console.log(
+      "  NOTE: those are WALL CLOCK, and evalMs covers the pair phase, the " +
+        "enrichment chain and the send — not just matchCoins. The eval rows " +
+        "above are the CPU of the part that runs per coin.",
+    );
+  }
   console.log("");
   console.log(
     `Workers Free allows 10 ms of CPU per invocation, so compare each row ` +
