@@ -13116,6 +13116,68 @@ async function main() {
     assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
   });
 
+  // ---------- the card-only batch is dispatched IN FRONT of RugCheck ----------
+  //
+  // 2026-09-26: the 🌱 有機度 line went missing again (the 2026-09-17 complaint,
+  // same line). The data was there — all five of the day's pushes had an
+  // organicScore (55-68) from a normal host — but the batch's dispatch had slid
+  // BEHIND the RugCheck await, which is a live HTTP call on every tick (its
+  // freshness map is per-isolate). A dispatch at ~2.0-3.0s against a wall at
+  // +2.2s made `bestEffort` return its fallback the moment the deadline had
+  // passed: every slot died before it started. The fix is a MOVE — same calls,
+  // same deadline, only the overlap changes — and scanner.ts is far past the
+  // file tool's edit window, so the order is pinned on the source.
+  await test("out-of-window patch: the card-only display batch is dispatched in FRONT of RugCheck (docs/patches/organic-dispatch-before-rugcheck-2026-09-26.apply.js)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const scannerSrc = read("src/scanner.ts");
+    const before = (a, b) => {
+      const ia = scannerSrc.indexOf(a);
+      const ib = scannerSrc.indexOf(b);
+      return ia >= 0 && ib >= 0 && ia < ib;
+    };
+    const applied = {
+      "scanner (the batch is opened before the RugCheck call, not after it)":
+        before(
+          'constjupiterOrganic=this.jupiter;this.markPhase(diag,"enrich-dispatch",startedAt);',
+          'this.markPhase(diag,"rugcheck",startedAt);',
+        ) &&
+        before('construgcheck=awaitthis.bestEffort(', "const[gmgn,arkham,organic]=awaitdisplayBatch;") &&
+        !before(
+          'construgcheck=awaitthis.bestEffort(',
+          'constjupiterOrganic=this.jupiter;this.markPhase(diag,"enrich-dispatch",startedAt);',
+        ),
+      "scanner (the batch itself is unchanged: three slots, one shared deadline)":
+        scannerSrc.includes("constdisplayBatch=Promise.all([") &&
+        scannerSrc.includes("()=>this.resolveGmgnInfo(coin),") &&
+        scannerSrc.includes("()=>this.resolveArkhamInfo(coin),") &&
+        scannerSrc.includes("?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token):null,") &&
+        scannerSrc.includes("const[gmgn,arkham,organic]=awaitdisplayBatch;"),
+      "scanner (the batch still rides AFTER the supply-flow gate and the seen-check)":
+        before(
+          'if(flow.status==="flagged"){',
+          'constjupiterOrganic=this.jupiter;this.markPhase(diag,"enrich-dispatch",startedAt);',
+        ) &&
+        before(
+          "if(unseen.length===0)continue;",
+          'constjupiterOrganic=this.jupiter;this.markPhase(diag,"enrich-dispatch",startedAt);',
+        ),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  \u2139 the organic-dispatch move is missing - apply docs/patches/organic-dispatch-before-rugcheck-2026-09-26.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
+  });
+
   console.log("\n===== UNIT TESTS =====");
   for (const line of results) console.log(line);
   console.log(`\n  ${passed} passed, ${failed} failed`);

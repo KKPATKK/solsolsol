@@ -3599,31 +3599,10 @@ export class Scanner {
           );
           continue;
         }
-        // Bundler + top-10 holder share is resolved for the message card but
-        // no longer filters — those filters were removed, so coins push even
-        // when the RugCheck report is not ready yet (the card shows 未检测).
-        // From here to the Flurry gate every step is a live network call and
-        // they are awaited SERIALLY, so the chain — not the front phases — is
-        // what the tick race actually cuts. Each step now races the chain
-        // deadline with the exact value its resolver returns when the
-        // upstream fails, so a miss degrades the card ("未检测" / "—") and
-        // never the push. See bestEffort().
-        this.markPhase(diag, "rugcheck", startedAt);
-        const rugcheck = await this.bestEffort(
-          () => this.resolveRugcheckData(coin),
-          chainDeadline,
-          {
-            // The resolver's own cache, so a deadline miss still renders
-            // whatever RugCheck already told us about this coin.
-            bundlerPct: coin.stats.rugcheckBundlerPct,
-            top10Pct: coin.stats.rugcheckTop10Pct,
-            creator: this.rugcheckCreator.get(coin.stats.token) ?? null,
-          },
-        );
-        // Card-only display batch, dispatched HERE — concurrently with the
-        // crime check and the Axiom token-info that follow — instead of being
-        // awaited one call at a time later in the chain. Two measured
-        // reasons:
+        // Card-only display batch, dispatched in FRONT of the RugCheck await
+        // (2026-09-26) — concurrently with the RugCheck / crime / Axiom calls
+        // that follow — instead of being awaited one call at a time later in
+        // the chain. The measured reasons, in the order they were found:
         //  - Serially the batch cost the SUM of its upstream round trips
         //    (~1-2.5s) while racing a single shared deadline, so whatever sat
         //    at the back of the queue started with an empty window and
@@ -3631,12 +3610,25 @@ export class Scanner {
         //    Jupiter 🌱 有機度 / 1h 交易者 line stopped appearing (upstream
         //    verified healthy — the Jupiter search endpoint still returns
         //    organicScore for the same mints).
-        //  - Starting it here gives the batch the chain's whole remaining
-        //    window AND overlaps it with two other awaits, so the chain's
-        //    total wall time drops and the gate tail below (wallet analysis,
-        //    top-10 band, Flurry) starts earlier — better for the push path
-        //    too.
-        // Same calls, same count, same deadline: only the overlap changes.
+        //  - 2026-09-26, the SAME line missing again: the dispatch had slid
+        //    BEHIND the RugCheck await, and that await is a live HTTP call on
+        //    every tick (its freshness map is per-isolate), so the batch was
+        //    being opened at ~2.0-3.0s against its own wall at +2.2s
+        //    (enrichDeadline). `bestEffort` returns its fallback the moment
+        //    the deadline has passed — every slot died before it started. The
+        //    day's five pushes were checked against a normal host: ALL had an
+        //    organicScore (55-68, label medium), so the data existed and the
+        //    window did not. Opening the batch in front of the RugCheck call
+        //    hands it that call's ~0.2-0.8s — the difference between "no
+        //    data" and "no window".
+        //  - Starting it here still overlaps it with the waits that follow, so
+        //    the chain's total wall time is unchanged: same calls, same count,
+        //    same deadline (enrichDeadline), only the overlap changes.
+        // The batch stays AFTER the supply-flow gate and AFTER the seen-check:
+        // a coin that will not push must never leave three opened calls behind
+        // it (while SUPPLY_FLOW_ENABLED is false the gate is an instant
+        // return, so this is the loop's own entry for every card-producing
+        // candidate).
         // Nothing in the batch gates anything — GMGN's wash-trading flag is
         // judged where the batch is awaited, and each slot that misses its
         // deadline degrades to exactly the value the old code used.
@@ -3676,6 +3668,28 @@ export class Scanner {
             null,
           ),
         ]);
+        // Bundler + top-10 holder share is resolved for the message card but
+        // no longer filters — those filters were removed, so coins push even
+        // when the RugCheck report is not ready yet (the card shows 未检测).
+        // From here to the Flurry gate every step is a live network call and
+        // they are awaited SERIALLY, so the chain — not the front phases — is
+        // what the tick race actually cuts. Each step now races the chain
+        // deadline with the exact value its resolver returns when the
+        // upstream fails, so a miss degrades the card ("未检测" / "—") and
+        // never the push. See bestEffort().
+        this.markPhase(diag, "rugcheck", startedAt);
+        const rugcheck = await this.bestEffort(
+          () => this.resolveRugcheckData(coin),
+          chainDeadline,
+          {
+            // The resolver's own cache, so a deadline miss still renders
+            // whatever RugCheck already told us about this coin.
+            bundlerPct: coin.stats.rugcheckBundlerPct,
+            top10Pct: coin.stats.rugcheckTop10Pct,
+            creator: this.rugcheckCreator.get(coin.stats.token) ?? null,
+          },
+        );
+
         // Crime-wallet check: the coin's creator (RugCheck) and top holder
         // owner wallets are matched against the community blocklist. A hit
         // is a warning (flagged on the card) unless CRIME_WALLETS_BLOCK
