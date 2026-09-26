@@ -102,18 +102,24 @@ function say(line) {
 const TYPE_FILTER = "AccountWorkersInvocationsAdaptiveFilter_InputObject";
 const TYPE_GROUP = "AccountWorkersInvocationsAdaptive";
 const TYPE_DIMS = "AccountWorkersInvocationsAdaptiveDimensions";
+const TYPE_MAX = "AccountWorkersInvocationsAdaptiveMax";
+const TYPE_QUANTILES = "AccountWorkersInvocationsAdaptiveQuantiles";
 
 const INTROSPECTION = `
-query ($f: String!, $g: String!, $d: String!) {
+query ($f: String!, $g: String!, $d: String!, $m: String!, $q: String!) {
   filterType: __type(name: $f) { inputFields { name } }
   groupType: __type(name: $g) { fields { name } }
   dimType: __type(name: $d) { fields { name } }
+  maxType: __type(name: $m) { fields { name } }
+  quantType: __type(name: $q) { fields { name } }
 }`;
 
 const intro = await graphql(INTROSPECTION, {
   f: TYPE_FILTER,
   g: TYPE_GROUP,
   d: TYPE_DIMS,
+  m: TYPE_MAX,
+  q: TYPE_QUANTILES,
 });
 if (intro.errors?.length) {
   console.error("Introspection failed — the token likely cannot read this schema:");
@@ -124,6 +130,8 @@ const introData = intro?.data ?? {};
 const filterArgs = (introData.filterType?.inputFields ?? []).map((f) => f.name);
 const dimFields = (introData.dimType?.fields ?? []).map((f) => f.name);
 const groupFields = introData.groupType?.fields ?? [];
+const maxFields = (introData.maxType?.fields ?? []).map((f) => f.name);
+const quantFields = (introData.quantType?.fields ?? []).map((f) => f.name);
 
 // The filter's time bounds: the dataset carries whichever pair its vintage
 // uses. Both are accepted here, named first so the schema's own spelling wins.
@@ -165,9 +173,37 @@ if (!geArg || !leArg || !timeDim) {
 const dimSelection = [timeDim, hasStatus ? "status" : null, "scriptName"]
   .filter(Boolean)
   .join(" ");
+
+// `quantiles` and `max` are what tell the two remaining resource limits apart,
+// and both are needed for reasons the sum cannot cover:
+//   - `max.subrequests` is the ONLY per-invocation view. The average hides a
+//     single tick that spent all 50 behind three invocations that spent 15 —
+//     it reads as 23.75, exactly the healthy-looking number, which is how the
+//     cap hid from the first version of this table.
+//   - `cpuTimeP50/P99` is the reading the Free plan actually caps at 10 ms, and
+//     an `exceededResources` outcome next to a P99 at the cap is that limit
+//     being hit rather than a wall-clock kill.
+const QUANT_CANDIDATES = [
+  "cpuTimeP50",
+  "cpuTimeP95",
+  "cpuTimeP99",
+  "durationP50",
+  "durationP95",
+  "durationP99",
+].filter((n) => quantFields.includes(n));
+const MAX_CANDIDATES = ["subrequests", "requests", "errors"].filter((n) =>
+  maxFields.includes(n),
+);
 const quantSelection = quantFieldName
-  ? `${quantFieldName} { durationP50 durationP95 durationP99 }`
+  ? `${quantFieldName} { ${QUANT_CANDIDATES.join(" ")} }`
   : "";
+const maxSelection = MAX_CANDIDATES.length
+  ? `max { ${MAX_CANDIDATES.join(" ")} }`
+  : "";
+
+say(`Quantile fields in the schema: ${QUANT_CANDIDATES.join(", ") || "(none)"}.`);
+say(`Max fields in the schema: ${MAX_CANDIDATES.join(", ") || "(none)"}.`);
+say("");
 
 const QUERY = `
 query ($accountTag: String!, $filter: WorkersInvocationsAdaptiveGroupsFilter!) {
@@ -175,6 +211,7 @@ query ($accountTag: String!, $filter: WorkersInvocationsAdaptiveGroupsFilter!) {
     accounts(filter: {accountTag: $accountTag}) {
       workersInvocationsAdaptive(filter: $filter, limit: 10000) {
         sum { requests errors subrequests }
+        ${maxSelection}
         dimensions { ${dimSelection} }
         ${quantSelection}
       }
@@ -221,6 +258,17 @@ if (!Array.isArray(groups) || groups.length === 0) {
 }
 
 /**
+ * `success` is this dataset's spelling of a normal invocation — NOT `ok`,
+ * which the Worker's own /health uses. Marking anything that is not literally
+ * `ok` as a failure flagged all 700-odd healthy minutes of the first run, so
+ * the accepted set is named here rather than inferred from one string.
+ * `unknown` is deliberately treated as healthy: it is what Cloudflare emits
+ * for an outcome it did not classify, and paging on it would be noise.
+ */
+const OK_STATUSES = new Set(["success", "ok", "unknown"]);
+const isBad = (status) => !OK_STATUSES.has(status);
+
+/**
  * One group is one (status, minute) bucket. Roll them up into per-minute rows
  * so the table reads like the Worker's own /debug/tick ring: left = UTC minute
  * the alert names, right = what Cloudflare saw.
@@ -234,7 +282,19 @@ for (const g of groups) {
   if (!minute) continue;
   let row = byMinute.get(minute);
   if (!row) {
-    row = { minute, byStatus: new Map(), requests: 0, errors: 0, subrequests: 0, p99: [] };
+    row = {
+      minute,
+      byStatus: new Map(),
+      requests: 0,
+      errors: 0,
+      subrequests: 0,
+      maxSubreq: 0,
+      maxRequests: 0,
+      cpuP50: 0,
+      cpuP99: 0,
+      badMaxSubreq: 0,
+      badCpuP99: 0,
+    };
     byMinute.set(minute, row);
   }
   const prev = row.byStatus.get(status) ?? 0;
@@ -242,8 +302,21 @@ for (const g of groups) {
   row.requests += Number(sum.requests ?? 0);
   row.errors += Number(sum.errors ?? 0);
   row.subrequests += Number(sum.subrequests ?? 0);
+  const mx = g?.max ?? {};
   const q0 = (quantFieldName ? g?.[quantFieldName] : null) ?? {};
-  row.p99.push(Number(q0.durationP99 ?? 0));
+  const maxSubreq = Number(mx.subrequests ?? 0);
+  const cpuP99 = Number(q0.cpuTimeP99 ?? 0);
+  row.maxSubreq = Math.max(row.maxSubreq, maxSubreq);
+  row.maxRequests = Math.max(row.maxRequests, Number(mx.requests ?? 0));
+  row.cpuP50 = Math.max(row.cpuP50, Number(q0.cpuTimeP50 ?? 0));
+  row.cpuP99 = Math.max(row.cpuP99, cpuP99);
+  // The two readings that matter are tracked PER STATUS: an average or a max
+  // taken across the whole minute mixes the healthy polls in with the one
+  // invocation being investigated, which is the mistake the first table made.
+  if (isBad(status)) {
+    row.badMaxSubreq = Math.max(row.badMaxSubreq, maxSubreq);
+    row.badCpuP99 = Math.max(row.badCpuP99, cpuP99);
+  }
 }
 
 const minutes = [...byMinute.values()].sort((a, b) => (a.minute < b.minute ? -1 : 1));
@@ -256,17 +329,6 @@ say(
     `tick of this Worker spends ${HEALTHY_TICK}.`,
 );
 say("");
-
-/**
- * `success` is this dataset's spelling of a normal invocation — NOT `ok`,
- * which the Worker's own /health uses. Marking anything that is not literally
- * `ok` as a failure flagged all 700-odd healthy minutes of the first run, so
- * the accepted set is named here rather than inferred from one string.
- * `unknown` is deliberately treated as healthy: it is what Cloudflare emits
- * for an outcome it did not classify, and paging on it would be noise.
- */
-const OK_STATUSES = new Set(["success", "ok", "unknown"]);
-const isBad = (status) => !OK_STATUSES.has(status);
 
 const statusTotals = new Map();
 for (const row of minutes) {
@@ -300,8 +362,11 @@ if (badMinutes.length === 0) {
       "so a 17:38 HKT alert is 09:38 UTC) before reading anything into it.",
   );
 } else {
-  say("| minute (UTC) | invocations | by status | subreq/inv |");
-  say("|---|---|---|---|");
+  say(
+    "| minute (UTC) | invocations | by status | **max subreq of the " +
+      "failed invocation** | max subreq overall | cpuP99 ms |",
+  );
+  say("|---|---|---|---|---|---|");
   for (const row of badMinutes) {
     const invocations = row.requests || 1;
     const statuses = [...row.byStatus.entries()]
@@ -309,36 +374,47 @@ if (badMinutes.length === 0) {
       .join(" ");
     say(
       `| ${row.minute} | ${invocations} | ${statuses} | ` +
-        `${(row.subrequests / invocations).toFixed(1)} |`,
+        `**${row.badMaxSubreq}** | ${row.maxSubreq} | ${row.badCpuP99 || row.cpuP99} |`,
     );
   }
 }
 say("");
 
-let worst = { avg: -1, minute: "" };
-for (const row of minutes) {
-  const avg = row.subrequests / (row.requests || 1);
-  if (avg > worst.avg) worst = { avg, minute: row.minute };
-}
+const peak = minutes.reduce(
+  (best, row) => (row.maxSubreq > best.maxSubreq ? row : best),
+  { maxSubreq: -1, minute: "" },
+);
 const allInvocations = minutes.reduce((n, row) => n + (row.requests || 0), 0);
 const allSubrequests = minutes.reduce((n, row) => n + row.subrequests, 0);
 
-say("## The subrequest question, answered");
+say("## The subrequest question, answered with a maximum, not an average");
 say("");
 say(
   `${allInvocations} invocations over ${minutes.length} minutes averaged ` +
-    `**${(allSubrequests / Math.max(1, allInvocations)).toFixed(1)} subrequests**, ` +
-    `peaking at **${worst.avg.toFixed(1)}** in ${worst.minute} — against a Free-plan ` +
-    `cap of ${FREE_CAP} (the Worker's own budget arithmetic keeps 38 usable).`,
+    `**${(allSubrequests / Math.max(1, allInvocations)).toFixed(1)} subrequests**. ` +
+    `The busiest SINGLE invocation in the whole window spent ` +
+    `**${peak.maxSubreq}** (${peak.minute}), against a Free-plan cap of ${FREE_CAP}.`,
 );
 say("");
 say(
-  "If that peak is far below the cap, the cap is NOT the mechanism: a blown " +
-    "subrequest budget would show a minute at or above it, and this table would " +
-    "have to explain where 50 fetches went. What is left for an " +
-    "`exceededResources` outcome, once subrequests are ruled out by arithmetic, " +
-    "is CPU time (10 ms/invocation on Free, `exceededCpu` in the docs) or memory " +
-    "(`exceededMemory`) — neither of which the Worker's own telemetry can see, " +
-    "and both of which are fixed by doing less work per tick or raising the limit " +
-    "on the Paid plan.",
+  "Subrequests are therefore ruled IN or OUT by that one number, and the two " +
+    "answers call for opposite work:",
+);
+say("");
+say(
+  `- **At or above ${FREE_CAP}**: the cap is the mechanism and the fix is to stop ` +
+    "spending fetches — every Turso round trip is a subrequest here (the client " +
+    "speaks libsql over HTTP) and libsql's internal retries multiply them, so " +
+    "batching DB trips is the lever.",
+);
+say(
+  "- **Well below it**: the cap cannot be the mechanism, and an " +
+    "`exceededResources` outcome has to be CPU time (10 ms/invocation on Free) or " +
+    "memory (128 MB) — neither of which the Worker's own telemetry can see, and " +
+    "both of which are fixed by doing less work per tick or by raising the limit.",
+);
+say("");
+say(
+  "A minute listed as `exceededResources` whose failed invocation ALSO shows a " +
+    "subrequest max near the cap is the one case where both readings agree.",
 );
