@@ -2176,6 +2176,26 @@ export class Db {
      * write instead of costing their own round trips.
      */
     cronTick?: ScheduledTickEntry | null,
+    /**
+     * The tick's ADMISSION stamp (worker.TICK_PROGRESS_KEY), written WITH the
+     * claim that admits it (2026-09-26).
+     *
+     * WHY: the phase ladder's first stamp used to be a request of its own
+     * (~150ms after the claim), and its whole reading — "this tick was
+     * admitted, the scan not yet entered" — is already written by this batch
+     * (the heartbeat below carries the same `at` and `phase: "scanning"`).
+     * Measured live 2026-09-26 with the labelled census: the ladder cost FIVE
+     * requests per tick, the single largest DB item in a ~21-request tick,
+     * and the per-tick census under-read it at 2 because the trail lands
+     * after the scan window. Riding the claim makes the stamp free.
+     *
+     * GUARDED (see historyStmt): the stamp is written only when THIS tick's
+     * claim won the lock, so a tick that lost the lease — and therefore
+     * skipped the scan — cannot stamp a phase it never reached. A refused
+     * batch loses the stamp with the claim: the pre-merge shape (no claim,
+     * no admission reading).
+     */
+    tickProgressJson?: string | null,
   ): Promise<string | null> {
     const value = `${now + ttlMs}|${owner}`;
     const claimStmt: { sql: string; args: Array<string | number | null> } = {
@@ -2198,14 +2218,34 @@ export class Db {
             args: [historyEntry.at, historyEntry.ms, historyEntry.err, value],
           }
         : null;
+    const progressStmt: { sql: string; args: Array<string | number | null> } | null =
+      tickProgressJson
+        ? {
+            // INSERT..SELECT carries an explicit WHERE because SQLite's
+            // UPSERT parser needs one to disambiguate the ON CONFLICT clause
+            // (the documented workaround), and that WHERE is the guard: the
+            // row lands only while this tick's own lock value is in place.
+            sql: `INSERT INTO worker_state (key, value)
+                  SELECT 'tick_progress', ?
+                  WHERE EXISTS (SELECT 1 FROM worker_state WHERE key = 'scan_lock' AND value = ?)
+                  ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            args: [tickProgressJson, value],
+          }
+        : null;
     const cronStatements = cronTick ? this.scheduledTickStatements(cronTick) : [];
-    const winBatch = [claimStmt, heartbeatStmt, historyStmt, ...cronStatements].filter(
+    const winBatch = [
+      claimStmt,
+      heartbeatStmt,
+      historyStmt,
+      progressStmt,
+      ...cronStatements,
+    ].filter(
       (s): s is { sql: string; args: Array<string | number | null> } => s !== null,
     );
     // Winner path: one batched round trip carrying the claim + heartbeat
     // (+ the dead-tick backfill row when a predecessor died mid-scan,
     //  + the caller's cron-arrival bookkeeping).
-    if (heartbeatStmt || historyStmt || cronStatements.length > 0) {
+    if (heartbeatStmt || historyStmt || progressStmt || cronStatements.length > 0) {
       const batch = await this.get().batch(winBatch, "write");
       if (Number(batch[0]?.rowsAffected ?? 0) > 0) return value;
     } else {
@@ -2222,7 +2262,7 @@ export class Db {
     if (!raw) {
       // Row vanished between insert and read (owner released mid-claim) —
       // retry once instead of losing this claim to a race.
-      if (heartbeatStmt || historyStmt || cronStatements.length > 0) {
+      if (heartbeatStmt || historyStmt || progressStmt || cronStatements.length > 0) {
         const batch = await this.get().batch(winBatch, "write");
         return Number(batch[0]?.rowsAffected ?? 0) > 0 ? value : null;
       }
@@ -2237,12 +2277,15 @@ export class Db {
       args: [value, raw],
     });
     const won = Number(upd.rowsAffected ?? 0) > 0;
-    if (won && (heartbeatStmt || historyStmt || cronStatements.length > 0)) {
+    if (won && (heartbeatStmt || historyStmt || progressStmt || cronStatements.length > 0)) {
       // Rare path (dead holder): restore liveness with a separate write —
-      // one extra round trip only when a takeover actually happens.
+      // one extra round trip only when a takeover actually happens. The
+      // ADMISSION stamp rides it for the same reason it rides the win path
+      // (2026-09-26): the takeover UPDATE above already put this tick's lock
+      // value in place, so the stamp's guard sees it.
       try {
         await this.get().batch(
-          [heartbeatStmt, historyStmt, ...cronStatements].filter(
+          [heartbeatStmt, historyStmt, progressStmt, ...cronStatements].filter(
             (s): s is { sql: string; args: Array<string | number | null> } => s !== null,
           ),
           "write",

@@ -2318,7 +2318,10 @@ export function tickProgressNote(
   // A PHASE stamp carries no batch (payloadBytes 0): the size only means
   // something once the record describes a flush (see tickPhaseLadder).
   if (rec.payloadBytes > 0) bits.push(`${rec.payloadBytes}B`);
-  bits.push(`subreqs ${rec.subreqs}`, `preRace ${rec.preRaceMs}ms`);
+  // 0 = the split did not exist when this record was written (the admission
+  // stamp, which rides the claim — see Db.claimScanLock): printing it as
+  // "0ms" would read as a pre-race phase that cost nothing.
+  bits.push(`subreqs ${rec.subreqs}`, `preRace ${rec.preRaceMs > 0 ? `${rec.preRaceMs}ms` : "n/a"}`);
   if (rec.cut) bits.push("cut");
   if (rec.err) bits.push(`err:${rec.err}`);
   return ` [${bits.join(" ")}]`.slice(0, limit);
@@ -3345,6 +3348,24 @@ async function runScan(
   preTick.steps.json = Date.now() - heartbeatAt;
   if (db) {
     const claimAt = Date.now();
+    // The tick's ADMISSION stamp rides the claim (2026-09-26): the ladder's
+    // first stamp was a request of its own, and its reading — admitted, the
+    // scan not yet entered — is what this batch already writes (the heartbeat
+    // above carries the same `at` and phase). Measured live: the ladder cost
+    // FIVE requests per tick (the census's largest DB item) and this is the
+    // one that was free. `preRaceMs: 0` is honest — the pre-race split is
+    // computed after the claim returns, so it did not exist at stamp time
+    // (the note renders a 0 as `preRace n/a`).
+    const admissionRecord = tickProgressRecord({
+      at: startedAt,
+      stage: "scan",
+      payloadBytes: 0,
+      scanMs: 0,
+      preRaceMs: 0,
+      subreqs: subreqView().current.total,
+      cut: false,
+      err: null,
+    });
     try {
       scanLock = await db.claimScanLock(
         SCAN_LOCK_OWNER,
@@ -3353,6 +3374,7 @@ async function runScan(
         heartbeatJson,
         backfillEntry,
         cronTick ?? null,
+        admissionRecord,
       );
     } catch (err) {
       claimErrored = true;
@@ -3503,11 +3525,12 @@ async function runScan(
         raceAt: Date.now(),
         raceMs: scanRaceMs,
       });
-      // The phase stamp the worker itself owns (see tickPhaseLadder): the
-      // tick is admitted, the scan not yet entered. The three phases INSIDE
-      // the scan are stamped through the scanner's hook below — without it
-      // the row would stop here, which is where four of four captured deaths
-      // stopped.
+      // The phases INSIDE the scan are stamped through the scanner's hook
+      // below — without it the row would stop at the admission stamp, which
+      // is where four of four captured deaths stopped. The ADMISSION stamp
+      // itself no longer queues here (2026-09-26): it rides the claim batch
+      // above, so the ladder's own writes start with the scan's first phase
+      // (or with the postscan record on a tick whose scan never stamped).
       const notePhase = (phase: string) =>
         void ladder.stamp({
           at: startedAt,
@@ -3520,7 +3543,6 @@ async function runScan(
           err: null,
         });
       if (scanner) scanner.onTickPhase = notePhase;
-      notePhase("scan");
       // Wired only for the duration of the scan: the hook is unwired after
       // the race, so the tail (the tracker pass) cannot stamp a phase the
       // scan never had.
