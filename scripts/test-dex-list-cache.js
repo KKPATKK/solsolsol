@@ -139,6 +139,27 @@ async function main() {
     );
   });
 
+  await test("a refusal is NOT a miss: 2xx only, because a 429 was never cached", async () => {
+    drain();
+    const before = peekListCacheDelta();
+    // A 429 (and a 5xx) carries a cf-cache-status here on purpose: the point is
+    // that the status is irrelevant, not that it is absent.
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ error: "nope" }), {
+        status: 429,
+        headers: { "cf-cache-status": "BYPASS" },
+      });
+    const dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" }));
+    const out = await dex.fetchLatestSolanaProfiles();
+    assert.deepEqual(out, [], "a refused list answers nothing (the make-up lane has nothing to add yet)");
+    assert.ok(dex.getStats().http429 > 0, "the refusal WAS seen — otherwise this case asserts nothing");
+    assert.deepEqual(
+      peekListCacheDelta(),
+      before,
+      "cacheTtlByStatus gives a TTL to 200-299 alone: a refusal cannot read as an entry that had expired, and it has its own counter (http429)",
+    );
+  });
+
   await test("getStats reads the same ledger, and peeking never consumes it", async () => {
     drain();
     const dex = await oneListFetch("HIT");
@@ -300,6 +321,37 @@ async function main() {
         /* best-effort */
       }
     }
+  });
+
+  // ---------- where the journal runs: the mistake the first deploy made ------
+  await test("src/scanner.ts: the journal runs AFTER this tick's fetches, on the front's write", () => {
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    const journal = src.indexOf("await this.stampListCacheDelta();");
+    assert.ok(journal > 0, "the scan must journal the ledger at all");
+    assert.equal(
+      src.split("await this.stampListCacheDelta();").length - 1,
+      1,
+      "exactly ONE call site: a second one would report the same window twice or from two places",
+    );
+    const order = (needle) => src.indexOf(needle);
+    for (const [what, at] of [
+      ["the profiles result", order("() => profilesCall")],
+      ["the boosts fetch", order("fetchBoostedTokens(this.config.dexscreenerBoostsLimit)")],
+      ["the pool phase", order("getReevalPoolCached(now")],
+    ]) {
+      assert.ok(
+        at > 0 && at < journal,
+        `${what} must be read BEFORE the journal — a cold isolate (most ticks) journals before its own fetches answer, loses the window with the isolate, and the durable row stays empty (live 2026-09-26T15:37Z: a single misses-2 row in 8 ticks)`,
+      );
+    }
+    assert.ok(
+      order("await this.flushScanFront();") > journal,
+      "and it must ride the front's own write, not queue rows nobody flushes",
+    );
+    assert.ok(
+      journal > order("const diag: ScanSummary = {"),
+      "the summary's `dex:` snapshot is the isolate's own view and one tick stale BY DESIGN — the durable rows are not",
+    );
   });
 
   // ---------- the reader ----------

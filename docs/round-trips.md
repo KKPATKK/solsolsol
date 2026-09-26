@@ -2033,5 +2033,7 @@ consume 只 commit 落地嘅行、兩條 ADD 真係經**真** `Db.writeScanFront
 以及 /health 用 import 嘅常數而唔係字面值。另外 `test-deferred-priority.js` 嗰個 `listCacheHits === 1` 改成 baseline-relative —— 帳本由 client state
 變 module state（就係畀掃描器逐 tick journal 嘅前提），個位數固定 1 已經唔再成立。
 
+**落線後修正（同日，§4.31）：兩個錯都由 durable row 揭出嚟，唔係由頁面。**
+
 落線紀錄：`docs/patches/round5-dex-listcache-client-2026-09-26.apply.js`、`docs/patches/round5-dex-listcache-wire-2026-09-26.apply.js`、
 `docs/patches/round5-dex-listcache-health-2026-09-26.apply.js`。

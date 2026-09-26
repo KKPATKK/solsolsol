@@ -19,6 +19,11 @@
  *
  * Run: node scripts/read-heartbeat.js        (needs the .env.local Turso creds)
  *      node scripts/read-heartbeat.js 3 70   (3 samples, 70s apart)
+ *      node scripts/read-heartbeat.js --keys dex_list_cache_hits,dex_list_cache_last
+ *        (any durable worker_state row, by name — one SELECT for the list, the
+ *         same read-only discipline, for the questions that are about a ROW and
+ *         not the heartbeat; `-` means the row is absent, which is a different
+ *         reading from an empty one)
  */
 "use strict";
 
@@ -33,6 +38,27 @@ async function main() {
   const samples = Number(process.argv[2] ?? 1);
   const gapSeconds = Number(process.argv[3] ?? 70);
   const config = loadConfig(process.env);
+
+  const keyArg = process.argv.indexOf("--keys");
+  if (keyArg !== -1) {
+    const keys = String(process.argv[keyArg + 1] ?? "")
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean);
+    if (keys.length === 0) {
+      console.error("--keys needs a comma-separated list of worker_state keys");
+      process.exit(1);
+    }
+    const db = new Db(config.tursoUrl, config.tursoAuthToken);
+    await db.init();
+    // ONE request for the whole list (see Db.getWorkerStates): reading rows by
+    // name must not cost a round trip each, which is the same reason the tick
+    // batches them.
+    const rows = await db.getWorkerStates(keys);
+    console.log(`worker_state @ ${new Date().toISOString()}`);
+    for (const key of keys) show(key, rows.get(key));
+    process.exit(0);
+  }
 
   for (let i = 1; i <= samples; i++) {
     const db = new Db(config.tursoUrl, config.tursoAuthToken);

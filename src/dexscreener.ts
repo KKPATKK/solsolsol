@@ -241,9 +241,11 @@ export const LIST_FEED_CACHE_TTL_S = 60;
  * `hits` climbing with `http429` flat means the origin was never asked; a
  * `misses` share that keeps growing means the entry EXPIRED before the next
  * tick needed it — which is the whole of the LIST_FEED_CACHE_TTL_S question.
- * A response with NO `cf-cache-status` header counts as a MISS: a hit is the
- * one outcome that needs a header to prove itself, and a response whose
+ * A 2xx response with NO `cf-cache-status` header counts as a MISS: a hit is
+ * the one outcome that needs a header to prove itself, and a response whose
  * provenance is unknown was answered by the origin as far as we can tell.
+ * A non-2xx response is not counted at all (see getJson): it was never a
+ * candidate for the cache, and the refusals have their own counters.
  */
 const LIST_CACHE_HIT_RE = /^(HIT|REVALIDATED)$/i;
 
@@ -867,10 +869,16 @@ export class DexScreenerClient {
         // budget answer, not a failure: the caller already owns its own
         // fallback, and retrying would only spend the caller's window.
         if (res === null) return null;
-        if (listCacheTtlS !== undefined) {
+        if (listCacheTtlS !== undefined && res.ok) {
           // ONE place counts a list outcome and one place decides what a hit
           // is (see the ledger): a second inline regex here is how the durable
           // ratio would come to disagree with the page's own reading.
+          //
+          // 2xx ONLY, and it is the ratio's meaning that requires it:
+          // `cacheTtlByStatus` gives an entry a TTL for 200-299 alone, so a
+          // 429/5xx was never a candidate for the edge cache and cannot read
+          // as an entry that had EXPIRED — a refusal is its own reading (see
+          // note429), and live 2026-09-26 they arrive every few minutes.
           noteListCacheOutcome(res.headers.get("cf-cache-status"));
         }
         if (res.status === 429) this.note429();

@@ -1718,8 +1718,11 @@ export class Scanner {
 
   /**
    * Journal the list-feed edge cache (see src/dexscreener.ts). Called once per
-   * scan, immediately before the summary's `dex:` snapshot is taken, so the
-   * durable rows and that snapshot describe the same window.
+   * scan, after this tick's own list fetches and just before the front's
+   * write (see the call site), so the window is the one the tick produced and
+   * the rows cost no request of their own. The summary's `dex:` snapshot is a
+   * separate reading and stays where it was: it is the isolate's own view and
+   * carries the previous tick's fetches by design.
    *
    * Each part is committed only after its own write landed (see
    * consumeListCacheDelta): a row that failed is re-offered by the next tick,
@@ -2586,13 +2589,6 @@ export class Scanner {
         return { list: [] as TokenProfile[], settled: true };
       },
     );
-    // The list-feed edge cache is JOURNALED here (see stampListCacheDelta):
-    // the client's own counters are isolate memory, so the question they exist
-    // to answer — is LIST_FEED_CACHE_TTL_S leaving the entry expired by the
-    // time the next tick asks? — could not be answered from /health at all.
-    // Same point as the `dex:` snapshot below, so the durable rows and that
-    // snapshot cover one window.
-    await this.stampListCacheDelta();
     const diag: ScanSummary = {
       // Carried from the previous tick's tracker pass, which runs AFTER this
       // scan's flush (see runTrackerPass / worker.TRACKER_PASS_BUDGET_MS).
@@ -3351,10 +3347,25 @@ export class Scanner {
           err instanceof Error ? err.message : err,
         );
       }
+      // The list-feed edge cache is JOURNALED here, and the position is the
+      // whole point: it must be after THIS tick's own list fetches (the
+      // profiles result is awaited in the feed phase, the boosts fetch is
+      // there too) and before the front's ONE write, so its rows ride a
+      // request that is already going out and the window it reports is the
+      // one the tick just produced.
+      //
+      // Journaling at the summary's build — the obvious place, since the
+      // page's `dex:` snapshot is taken there — was a live mistake
+      // (2026-09-26T15:37Z: 8 ticks after the deploy, the only row written
+      // was a rare warm isolate's `misses 2`). That build runs BEFORE the
+      // fetches answer, so every COLD isolate — which is most ticks —
+      // journaled an empty delta and lost its window with the isolate.
+      await this.stampListCacheDelta();
       // ...and the front's ONE write (see Db.writeScanFront): the launch_ms
-      // migration flag, the Birdeye backfill stamp and the prune's counter +
-      // stamp, in one request instead of up to four. Idempotent — the scan's
-      // `finally` calls this again for the paths that return earlier.
+      // migration flag, the Birdeye backfill stamp, the prune's counter +
+      // stamp and now the cache ledger, in one request instead of up to
+      // four. Idempotent — the scan's `finally` calls this again for the
+      // paths that return earlier.
       await this.flushScanFront();
       if (feedProfiles.length === 0 && recentStats.length === 0) {
         console.log("[scanner] no Solana profiles or re-eval candidates returned");
