@@ -2602,29 +2602,13 @@ export class Scanner {
     // clamped to this, so no combination of them can consume the tick.
     const frontDeadline = startedAt + FRONT_PHASE_WINDOW_MS;
     const feedDeadline = Math.min(startedAt + FEED_DEADLINE_MS, frontDeadline);
-    // The profiles fetch is STARTED here — at tick start, before the
-    // enabled-chats read and the crime-wallet load below — and awaited where
-    // its result is used (see the call site). Its window is `feedDeadline`,
-    // i.e. FEED_DEADLINE_MS measured from tick start, and the point of
-    // starting it early is that it is already in flight while those pre-feed
-    // steps run: they used to run FIRST, and on a cold isolate they spent
-    // 2.8-3.6s of the 900ms window, so `fetchFeedCapped` short-circuited and
-    // this call was never even dispatched (2026-09-21, see FEED_DEADLINE_MS).
-    // Both handlers are attached HERE, so every early return below — no
-    // enabled chats, the stop checks — can abandon the promise without an
-    // unhandled rejection, and a late settle still reaches the client's own
-    // bookkeeping (noteProfileFeed) exactly as it did when the call was made
-    // later in the tick.
-    const profilesCall = this.dex.fetchLatestSolanaProfiles().then(
-      (list) => ({ list, settled: true }),
-      (err: unknown) => {
-        console.error(
-          "[scanner] dexscreener profile feed failed:",
-          err instanceof Error ? err.message : err,
-        );
-        return { list: [] as TokenProfile[], settled: true };
-      },
-    );
+    // The profiles fetch is dispatched further down, together with the front
+    // read whose row it takes as its seed (see the dispatch): the point of
+    // starting it early is unchanged — it is already in flight while the
+    // pre-feed steps run, because those used to run FIRST and on a cold
+    // isolate spent 2.8-3.6s of the 900ms window, so `fetchFeedCapped`
+    // short-circuited and this call was never even dispatched (2026-09-21,
+    // see FEED_DEADLINE_MS).
     const diag: ScanSummary = {
       // Carried from the previous tick's tracker pass, which runs AFTER this
       // scan's flush (see runTrackerPass / worker.TRACKER_PASS_BUDGET_MS).
@@ -2719,6 +2703,43 @@ export class Scanner {
         this.running = false;
       }
     }, SCAN_TIMEOUT_MS);
+    // THE FRONT'S ONE READ starts HERE, and the profiles fetch is dispatched
+    // with the row that read carries as its seed (see
+    // DexScreenerClient.fetchLatestSolanaProfiles). The read goes first so the
+    // seed exists at all, and it goes AFTER enterScanMode above on purpose: it
+    // is a round trip of this scan, and the scan client is the one that
+    // carries the tick's 1.2s leash (a read started earlier would ride the 6s
+    // command-handler budget instead).
+    //
+    // Nothing but synchronous bookkeeping sits between the old dispatch site
+    // and this one, so the fetch is still in flight before the tick's first
+    // await, still bounded by `feedDeadline`, and both handlers still ride the
+    // promise so every early return below — no enabled chats, the stop checks
+    // — can abandon it without an unhandled rejection.
+    //
+    // WHY THE PROMISE (live 2026-09-26T23:10:10Z, 23:11:15Z): with the fetch
+    // dispatched above the read, a refusal that landed first — and this
+    // client's own 90s cache-only backoff makes those refusals INSTANT —
+    // settled before the seed existed, so those ticks read `profiles 3` (the
+    // make-up lane alone) while the durable row was two minutes old. Handing
+    // the row over as a promise moves that decision inside the client, after
+    // the row is known.
+    const frontRead = this.db.readScanFront(SCAN_FRONT_GATE_KEYS);
+    const profileFeedSeed = frontRead.then(
+      (front) =>
+        parseProfileFeedSnapshot(front.gates.get(DEX_PROFILES_LAST_KEY) ?? null),
+      () => null,
+    );
+    const profilesCall = this.dex.fetchLatestSolanaProfiles(profileFeedSeed).then(
+      (list) => ({ list, settled: true }),
+      (err: unknown) => {
+        console.error(
+          "[scanner] dexscreener profile feed failed:",
+          err instanceof Error ? err.message : err,
+        );
+        return { list: [] as TokenProfile[], settled: true };
+      },
+    );
     try {
       // THE FRONT'S ONE READ (see Db.readScanFront): the enabled chats and the
       // three `worker_state` gate rows the front's maintenance legs consult
@@ -2728,20 +2749,19 @@ export class Scanner {
       // one `worker_state` lookup with a chat row beside it (docs/round-trips.md
       // §4.13). The projection and ordering of the chats half are unchanged
       // (Db.readScanFront issues the same SELECT listEnabledChats does).
-      const front = await this.db.readScanFront(SCAN_FRONT_GATE_KEYS);
+      const front = await frontRead;
       this.scanFront = front;
       // The last-good profile list rides that same read (see
-      // DEX_PROFILES_LAST_KEY): seeding it HERE is what lets a 429 tick reuse
-      // a minutes-old list instead of the make-up coins alone, and this is the
-      // earliest point in the tick that already has the row in hand. The stamp
-      // is kept beside the seed so a reused list never re-writes itself.
+      // DEX_PROFILES_LAST_KEY): its row is what a refused fetch evaluates
+      // instead of the make-up coins alone — the client is handed this very
+      // promise (see the dispatch) — and it is also where this tick's skip
+      // stamp comes from, so a reused list never re-writes itself.
       //
-      // One honest caveat: the profiles fetch is dispatched ABOVE this read
-      // (see profilesCall), so a refusal that lands before this point returns
-      // sees no seed and falls back to the make-up lane — exactly the old
-      // behaviour, never worse. Measured, a 429 on the shared egress answers in
-      // 200-500ms while the front read settles in ~90-110ms, so the seed wins
-      // that race on the common tick.
+      // The caveat that used to live here is gone: the fetch is dispatched with
+      // this read's row as a promise, so a refusal that lands first no longer
+      // falls back to the make-up lane (live 2026-09-26T23:10-23:11Z: two
+      // instant refusals read `profiles 3` under the old shape while the row
+      // was two minutes old).
       // The stamp comes from the ROW, never from the client's live list (live
       // bug, 2026-09-26T22:44-22:50Z): because the profiles fetch is dispatched
       // above this read, a fetch that answers EARLY has already written
@@ -2754,9 +2774,10 @@ export class Scanner {
       // to the make-up lane alone. From the ROW the rule holds on both sides of
       // the race: an absent row journals, and a row this tick merely reuses is
       // skipped by stamp instead of re-written.
-      const profileFeedRow = parseProfileFeedSnapshot(
-        front.gates.get(DEX_PROFILES_LAST_KEY) ?? null,
-      );
+      // The row is the SAME promise the fetch was handed (see the dispatch),
+      // so the client's reuse seed and this tick's stamp can never disagree
+      // about what the row said.
+      const profileFeedRow = await profileFeedSeed;
       this.dex.seedLastGoodProfiles(profileFeedRow);
       this.profileFeedStampedAt = profileFeedRow?.at ?? null;
       const chats = front.chats;

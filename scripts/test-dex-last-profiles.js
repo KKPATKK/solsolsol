@@ -260,7 +260,87 @@ async function main() {
     );
   });
 
+  // ---------- the seed arrives AFTER the refusal (round 6.2) ----------
+  await test("a refusal that beat the row read is still served the ROW itself", async () => {
+    // The race ordering cannot remove (live 2026-09-26T23:10:10Z, 23:11:15Z):
+    // the caller dispatches the fetch BEFORE it has read the row, so a refusal
+    // — instant, in this client's own 90s cache-only backoff — settles first
+    // and those ticks read `profiles 3` (the make-up lane) while the row was
+    // two minutes old. The row is handed over as a promise, so the lane is
+    // decided after it is known.
+    globalThis.fetch = async () => refused();
+    const dex = client();
+    const at = Date.now() - 90_000;
+    const out = await dex.fetchLatestSolanaProfiles(
+      Promise.resolve({ at, tokens: ["ROW_A", "ROW_B"] }),
+    );
+    assert.deepEqual(
+      out.map((p) => p.tokenAddress),
+      ["ROW_A", "ROW_B"],
+      "the refused fetch served the row it could not have read yet",
+    );
+    assert.equal(
+      dex.lastGoodProfilesSnapshot().at,
+      at,
+      "and it keeps the ROW's stamp, so the tick never re-journals what it read",
+    );
+  });
+
+  await test("a healthy fetch never waits on the seed", async () => {
+    globalThis.fetch = async () => okList(["FRESH_A"]);
+    const dex = client();
+    // Never settles: if the client awaited the seed on the success path, this
+    // would hang. Racing it keeps a future regression a FAILURE, not a stall.
+    const out = await Promise.race([
+      dex.fetchLatestSolanaProfiles(new Promise(() => {})),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("a healthy fetch waited on the seed")),
+          500,
+        ),
+      ),
+    ]);
+    assert.deepEqual(out.map((p) => p.tokenAddress), ["FRESH_A"]);
+    assert.deepEqual(
+      dex.lastGoodProfilesSnapshot().tokens,
+      ["FRESH_A"],
+      "and the fresh list is what the tick journals",
+    );
+  });
+
+  await test("a row that cannot be read is simply no seed", async () => {
+    globalThis.fetch = async () => refused();
+    const dex = client();
+    const out = await dex.fetchLatestSolanaProfiles(
+      Promise.reject(new Error("front read failed")),
+    );
+    assert.deepEqual(
+      out,
+      [],
+      "a failed row read leaves the make-up lane as the only list — never a throw",
+    );
+  });
+
   // ---------- the scanner is wired to both ends ----------
+  await test("the scanner starts the front read before the fetch and hands it over", () => {
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    const readAt = src.indexOf("const frontRead = this.db.readScanFront(SCAN_FRONT_GATE_KEYS);");
+    const dispatchAt = src.indexOf("this.dex.fetchLatestSolanaProfiles(profileFeedSeed)");
+    assert.ok(readAt !== -1, "the front read promise exists");
+    assert.ok(dispatchAt !== -1, "the fetch takes the seed promise");
+    assert.ok(readAt < dispatchAt, "…and the read is started before the fetch is dispatched");
+    assert.equal(
+      src.split("readScanFront(SCAN_FRONT_GATE_KEYS)").length - 1,
+      1,
+      "the tick still pays ONE front read, not a second for the seed",
+    );
+    assert.ok(src.includes("const front = await frontRead;"), "and awaits that same promise");
+    assert.ok(
+      src.includes("const profileFeedRow = await profileFeedSeed;"),
+      "with the stamp taken from the same promise the client was handed",
+    );
+  });
+
   await test("the scanner seeds from the front read and journals exactly once", () => {
     const src = fs.readFileSync(
       path.join(__dirname, "..", "src", "scanner.ts"),
@@ -276,8 +356,8 @@ async function main() {
       "and it parses the row, not a retyped shape",
     );
     assert.ok(
-      src.includes("const profileFeedRow = parseProfileFeedSnapshot("),
-      "with the parsed row held in one place, so the seed and the stamp cannot drift",
+      src.includes("const profileFeedRow = await profileFeedSeed;"),
+      "with the row read ONCE, from the same promise the fetch was handed",
     );
     const calls = src.split("this.stampProfileFeedSnapshot();").length - 1;
     assert.equal(calls, 1, "the journal runs on the tick's own journal block");

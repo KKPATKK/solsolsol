@@ -1067,8 +1067,20 @@ export class DexScreenerClient {
    * upstream that never answers at all: the call abandons its own fetch
    * inside the tick's window and still builds the make-up list, instead of
    * letting the caller's race throw the list away with the body.
+   *
+   * `seed` is the caller's durable journal row (see DEX_PROFILES_LAST_KEY),
+   * handed over as a PROMISE because the caller dispatches this fetch before
+   * it has read that row: the two overlap by design, and a refusal can land
+   * first — instantly, when this client is in its own 90-second cache-only
+   * backoff. Waiting for the row on the fallback path only (see below) is
+   * what makes the lane order-independent: live 2026-09-26T23:10-23:11Z, two
+   * ticks whose fetch was refused read `profiles 3` — the make-up lane alone
+   * — while the row on disk was two minutes old, purely because the fetch had
+   * already settled before the seed existed.
    */
-  async fetchLatestSolanaProfiles(): Promise<TokenProfile[]> {
+  async fetchLatestSolanaProfiles(
+    seed?: Promise<ProfileFeedSnapshot | null>,
+  ): Promise<TokenProfile[]> {
     let data: unknown = null;
     let failed = false;
     // The deadline bounds the WHOLE call, attempt 1 included (see
@@ -1148,6 +1160,20 @@ export class DexScreenerClient {
     // failedTotal / lastFailedAt / emptyFeedTotal keep reporting what the
     // upstream did. Only what this tick EVALUATES changes — a masked feed stays
     // impossible to miss in /health.summary.feedMakeup.
+    // The caller's row, waited for ONLY when this fetch is about to fall
+    // back (see the seed parameter): `failed || feed.length === 0` is exactly
+    // the set shouldReuseProfileList may serve below, so a healthy fetch never
+    // waits on Turso and a refused one gets the list the caller had ALREADY
+    // read. The wait is short by construction — the caller's row read is one
+    // round trip that is already in flight — and a rejected or absent row is
+    // simply no seed.
+    if (seed && (failed || feed.length === 0)) {
+      try {
+        this.seedLastGoodProfiles(await seed);
+      } catch {
+        /* the row is best-effort: a failed read seeds nothing */
+      }
+    }
     const now = Date.now();
     const reuse = shouldReuseProfileList(
       feed.length,
