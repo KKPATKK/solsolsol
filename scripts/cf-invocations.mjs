@@ -96,23 +96,25 @@ function say(line) {
  * the schema instead of assuming, and print what it said — a future rename
  * then reads as a name list, not as silence.
  */
+// The account-scoped dataset is spelled with the `Account` prefix in the
+// schema (`AccountWorkersInvocationsAdaptive…`), which is why the bare name
+// resolved to nothing and the first lookup printed an empty field list.
+const TYPE_FILTER = "AccountWorkersInvocationsAdaptiveFilter_InputObject";
+const TYPE_GROUP = "AccountWorkersInvocationsAdaptive";
+const TYPE_DIMS = "AccountWorkersInvocationsAdaptiveDimensions";
+
 const INTROSPECTION = `
-query {
-  filterType: __type(name: "WorkersInvocationsAdaptiveGroupsFilter") {
-    inputFields { name }
-  }
-  groupType: __type(name: "WorkersInvocationsAdaptiveGroups") {
-    fields {
-      name
-      type { name kind ofType { name kind ofType { name } } }
-    }
-  }
-  dimType: __type(name: "WorkersInvocationsAdaptiveDimensions") {
-    fields { name }
-  }
+query ($f: String!, $g: String!, $d: String!) {
+  filterType: __type(name: $f) { inputFields { name } }
+  groupType: __type(name: $g) { fields { name } }
+  dimType: __type(name: $d) { fields { name } }
 }`;
 
-const intro = await graphql(INTROSPECTION, {});
+const intro = await graphql(INTROSPECTION, {
+  f: TYPE_FILTER,
+  g: TYPE_GROUP,
+  d: TYPE_DIMS,
+});
 if (intro.errors?.length) {
   console.error("Introspection failed — the token likely cannot read this schema:");
   console.error(JSON.stringify(intro.errors, null, 2).slice(0, 1500));
