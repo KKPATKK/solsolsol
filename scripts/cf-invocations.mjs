@@ -257,47 +257,88 @@ say(
 );
 say("");
 
-const header = "| minute (UTC) | invocations | by status | subreq/inv | durP99 ms |";
-say(header);
-say("|---|---|---|---|---|");
+/**
+ * `success` is this dataset's spelling of a normal invocation — NOT `ok`,
+ * which the Worker's own /health uses. Marking anything that is not literally
+ * `ok` as a failure flagged all 700-odd healthy minutes of the first run, so
+ * the accepted set is named here rather than inferred from one string.
+ * `unknown` is deliberately treated as healthy: it is what Cloudflare emits
+ * for an outcome it did not classify, and paging on it would be noise.
+ */
+const OK_STATUSES = new Set(["success", "ok", "unknown"]);
+const isBad = (status) => !OK_STATUSES.has(status);
 
-let flagged = 0;
-let worst = { avg: -1, minute: "" };
+const statusTotals = new Map();
 for (const row of minutes) {
-  const invocations = row.requests || 1;
-  const avg = row.subrequests / invocations;
-  const statuses = [...row.byStatus.entries()]
-    .map(([status, n]) => `${status}:${n}`)
-    .join(" ");
-  const notOk = [...row.byStatus.entries()].filter(([s]) => s !== "ok");
-  const p99 = row.p99.length ? Math.max(...row.p99) : 0;
-  const mark = notOk.length > 0 ? " **FAIL**" : "";
-  if (notOk.length > 0) flagged++;
-  if (avg > worst.avg) worst = { avg, minute: row.minute };
-  say(
-    `| ${row.minute} | ${invocations} | ${statuses}${mark} | ${avg.toFixed(1)} | ${p99} |`,
-  );
+  for (const [status, n] of row.byStatus) {
+    statusTotals.set(status, (statusTotals.get(status) ?? 0) + n);
+  }
 }
 
+say("## Every invocation status Cloudflare recorded in the window");
 say("");
-if (flagged === 0) {
+say("| status | invocations |  |");
+say("|---|---|---|");
+for (const [status, n] of [...statusTotals.entries()].sort((a, b) => b[1] - a[1])) {
   say(
-    "**No minute in this window carries a non-`ok` invocation status.** That " +
-      "argues against the invocation-cap reading: check that the window covers " +
-      "the alert (HKT = UTC+8, so a 17:38 HKT alert is 09:38 UTC).",
+    `| ${isBad(status) ? `**${status}**` : status} | ${n} | ` +
+      `${isBad(status) ? "non-`success` — the alert's shape" : "normal"} |`,
+  );
+}
+say("");
+
+const badMinutes = minutes.filter((row) =>
+  [...row.byStatus.keys()].some(isBad),
+);
+
+say("## Minutes carrying a non-`success` outcome");
+say("");
+if (badMinutes.length === 0) {
+  say(
+    "None. If the window covers the alert and this is empty, the loss was not " +
+      "an invocation-level failure at all — check the window first (HKT = UTC+8, " +
+      "so a 17:38 HKT alert is 09:38 UTC) before reading anything into it.",
   );
 } else {
-  say(`**${flagged} minute(s) carry a non-\`ok\` status.**`);
+  say("| minute (UTC) | invocations | by status | subreq/inv |");
+  say("|---|---|---|---|");
+  for (const row of badMinutes) {
+    const invocations = row.requests || 1;
+    const statuses = [...row.byStatus.entries()]
+      .map(([status, n]) => `${isBad(status) ? `**${status}**` : status}:${n}`)
+      .join(" ");
+    say(
+      `| ${row.minute} | ${invocations} | ${statuses} | ` +
+        `${(row.subrequests / invocations).toFixed(1)} |`,
+    );
+  }
 }
+say("");
+
+let worst = { avg: -1, minute: "" };
+for (const row of minutes) {
+  const avg = row.subrequests / (row.requests || 1);
+  if (avg > worst.avg) worst = { avg, minute: row.minute };
+}
+const allInvocations = minutes.reduce((n, row) => n + (row.requests || 0), 0);
+const allSubrequests = minutes.reduce((n, row) => n + row.subrequests, 0);
+
+say("## The subrequest question, answered");
+say("");
 say(
-  `Busiest minute on subrequests: ${worst.minute} at ${worst.avg.toFixed(1)} ` +
-    `per invocation (cap ${FREE_CAP}).`,
+  `${allInvocations} invocations over ${minutes.length} minutes averaged ` +
+    `**${(allSubrequests / Math.max(1, allInvocations)).toFixed(1)} subrequests**, ` +
+    `peaking at **${worst.avg.toFixed(1)}** in ${worst.minute} — against a Free-plan ` +
+    `cap of ${FREE_CAP} (the Worker's own budget arithmetic keeps 38 usable).`,
 );
 say("");
 say(
-  "Read: a FAIL minute whose subreq/inv sits in the high 40s is the cap being " +
-    "grazed then missed (Turso latency → libsql retries → more fetches). A FAIL " +
-    "minute in the low 20s is a different mechanism — a wall-clock kill, an " +
-    "eviction, or a deploy — and `npx wrangler tail` during the next burst, or " +
-    "the deploy timestamps, would be the next witness.",
+  "If that peak is far below the cap, the cap is NOT the mechanism: a blown " +
+    "subrequest budget would show a minute at or above it, and this table would " +
+    "have to explain where 50 fetches went. What is left for an " +
+    "`exceededResources` outcome, once subrequests are ruled out by arithmetic, " +
+    "is CPU time (10 ms/invocation on Free, `exceededCpu` in the docs) or memory " +
+    "(`exceededMemory`) — neither of which the Worker's own telemetry can see, " +
+    "and both of which are fixed by doing less work per tick or raising the limit " +
+    "on the Paid plan.",
 );
