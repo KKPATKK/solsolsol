@@ -13538,11 +13538,26 @@ async function main() {
         scannerSrc.includes("if(isDeferredToken(profile.tokenAddress)){"),
       "scanner (the ledger and the summary carry the cursor)":
         scannerSrc.includes("getpruned():number{returnthis.prunedCount;}") &&
+        scannerSrc.includes("getobserved():number{returnthis.observedCount;}") &&
+        // The refresh runs on the TICK'S OWN summary: without it a
+        // retirement only reaches the next summary, which normally never
+        // comes (one tick per freshly recycled isolate) — the first
+        // deploy's measured failure.
         scannerSrc.includes(
-          "noteCoinAge(token:string,ageMs:number|null,windowMaxAgeMs:number):void{if(noteDeferredCoin(token,{ageMs,windowMaxAgeMs}))this.prunedCount+=1;}",
+          "diag.deferObserved=this.deferredPushes.observed-deferObservedBefore;",
+        ) &&
+        scannerSrc.includes("diag.deferPruned=this.deferredPushes.pruned;") &&
+        scannerSrc.includes("diag.deferPending=this.deferredPushes.pendingCount;") &&
+        scannerSrc.includes(
+          "constdeferObservedBefore=this.deferredPushes.observed;",
+        ) &&
+        scannerSrc.includes(
+          "noteCoinAge(token:string,ageMs:number|null,windowMaxAgeMs:number):void{this.observedCount+=1;if(noteDeferredCoin(token,{ageMs,windowMaxAgeMs}))this.prunedCount+=1;}",
         ) &&
         scannerSrc.includes("deferPruned?:number;") &&
-        scannerSrc.includes("deferPruned:this.deferredPushes.pruned,"),
+        scannerSrc.includes("deferPruned:this.deferredPushes.pruned,") &&
+        scannerSrc.includes("deferObserved?:number;") &&
+        scannerSrc.includes("deferObserved:0,"),
       "worker (totals → delta → the no-op guard: a prune-only tick writes the row)":
         workerSrc.includes("pruned:summary?.deferPruned??0,") &&
         workerSrc.includes("pruned:cursorDelta?.pruned??0,") &&

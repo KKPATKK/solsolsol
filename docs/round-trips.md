@@ -1910,6 +1910,19 @@ durable cursor 測試（累加、首末時間戳、applied marker、legacy row �
 同一條 out-of-window wiring guard；三條舊測試（`pushDeferralDelta` ×2、`loadPushDeferralSnapshot`）照新形狀 re-point。
 `npx wrangler deploy --dry-run` 過（1562.41 KiB）。
 
+**落線後第一個 bug（同日修）：counter 一定要喺同一 tick refresh。** 第一次 deploy 之後，規則明明行緊
+（`/health`：`profiles 8` ＝ `lastRawProfiles 0` ＋ `injectedTotal 8`，`agedEval 10` 證明評估有行），
+但 `durable.prunedTotal` 一直 0、探針 `windowMaxAgeMin` 一直 null。原因唔係 hook，而係 **summary 嘅 counter 幾時影快相**：
+diag 係 tick 開頭建好（`deferPruned` 係嗰一刻嘅值），而 durable 寫入係 tick 尾讀 summary ⇒ 呢個 tick 退嘅 obligation
+只會喺**下一個 tick** 嘅 summary 出現。對累積幾日嘅 counter（`deferRecovered` 同款滯後）無所謂，但呢個唔得：
+cron tick 通常落喺**新 recycle 嘅 isolate**（一個 isolate 只行一個 tick），所以「下一個 tick」永遠唔會嚟，
+row 繼續揸住成張 pending list，而下一個冷 isolate 又會由 row re-seed 返落 registry —— **退咗都等於冇退**。
+
+修法就係 recovery path 已經用緊嘅模式（recover 嗰度即場寫 `diag.deferRecovered`／`diag.deferPending`）：
+`matchCoins` 之後即刻 refresh —— `deferPruned`（今個 tick 退幾多 ⇒ 同一 tick 就寫入 row）、`deferPending`（收縮後嘅 gauge），
+同一個**新觀測值 `deferObserved`**：今個 tick 有幾多條**欠單**真係畀評估睇過。呢個數字就係「hook 冇行」同「行咗但冇嘢退」
+之間嘅分界（今次就係喺呢個歧義上面嘥咗一個鐘），而佢用 ledger 累計值嘅前後差計，所以 rebuilt scanner 都唔會歪。
+
 落線紀錄：`docs/patches/deferred-prune-2026-09-26.apply.js`（src/scanner.ts ＋ src/worker.ts）、
 `docs/patches/deferred-prune-tests-2026-09-26.apply.js`、`docs/patches/deferred-prune-tests-fixes-2026-09-26.apply.js`、
 `docs/patches/deferred-prune-cursor-fix-2026-09-26.apply.js`（deferredmakeup.ts / deferrallog.ts 用普通 edit）。

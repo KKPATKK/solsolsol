@@ -550,6 +550,7 @@ export function forgetDeferredTokens(tokens: readonly string[]): number {
 export class DeferredPushLedger {
   private recoveredCount = 0;
   private prunedCount = 0;
+  private observedCount = 0;
 
   constructor(private readonly maxEntries = 500) {}
 
@@ -580,7 +581,19 @@ export class DeferredPushLedger {
    * since boot as fresh, once per rebuild.
    */
   noteCoinAge(token: string, ageMs: number | null, windowMaxAgeMs: number): void {
+    this.observedCount += 1;
     if (noteDeferredCoin(token, { ageMs, windowMaxAgeMs })) this.prunedCount += 1;
+  }
+
+  /**
+   * Owed coins this scanner has JUDGED (every noteCoinAge call, retired or
+   * not). Cumulative, and read as a within-tick diff by the caller that
+   * publishes it — that diff is what tells "the hook never fired" (a cold
+   * registry at scan time) apart from "it fired and nothing qualified",
+   * which is otherwise indistinguishable from a silent prune rule.
+   */
+  get observed(): number {
+    return this.observedCount;
   }
 
   /**
@@ -1289,6 +1302,12 @@ export interface ScanSummary {
    * acceptance point is this rising while `deferPending` falls.
    */
   deferPruned?: number;
+  /**
+   * Owed coins this tick's evaluation JUDGED (see noteDeferredCoin). 0 on a
+   * tick whose registry was cold at scan time, or whose evaluation never
+   * ran — the number that tells a silent rule from an unfed one.
+   */
+  deferObserved?: number;
   /**
    * Cumulative tracker cards a pass could not deliver (PushWatcher's
    * `undelivered`): the per-pass note only reports the pass it happened in,
@@ -2546,6 +2565,7 @@ export class Scanner {
       deferRecovered: this.deferredPushes.recovered,
       deferPending: this.deferredPushes.pendingCount,
       deferPruned: this.deferredPushes.pruned,
+      deferObserved: 0,
       rejects: [],
     };
     // LOW-WATER GATE (see SCAN_SUBREQ_FLOOR). The invocation's allowance is
@@ -3513,6 +3533,10 @@ export class Scanner {
       }
 
       const agedEval = { count: 0 };
+      // Owed coins this evaluation is about to judge (see noteDeferredCoin):
+      // read as a diff of the ledger's cumulative counter, so a rebuilt
+      // scanner — whose counters restart at zero — cannot skew it.
+      const deferObservedBefore = this.deferredPushes.observed;
       const candidates = this.matchCoins(
         scannedProfiles,
         pairsByToken,
@@ -3528,6 +3552,20 @@ export class Scanner {
       );
       diag.agedEval = agedEval.count;
       diag.candidates = candidates.length;
+      // The prune's counters belong to THIS tick, so they are refreshed
+      // here — the same pattern the recovery path uses for
+      // deferRecovered/deferPending at its send site. The diag object is
+      // built at tick start and the durable write reads it at the tail, so
+      // leaving these at their start-of-tick values would push a
+      // retirement into the NEXT tick's summary — which normally never
+      // comes (cron ticks land on freshly recycled isolates), leaving the
+      // row with the full pending list, which the next cold isolate then
+      // re-seeds into its registry. Measured on the first deploy:
+      // deployments of make-up coins went out every tick, agedEval moved,
+      // and prunedTotal still read 0 — the rule had no way to persist.
+      diag.deferObserved = this.deferredPushes.observed - deferObservedBefore;
+      diag.deferPruned = this.deferredPushes.pruned;
+      diag.deferPending = this.deferredPushes.pendingCount;
       let pushed = 0;
       // Group candidates by token: all the expensive per-coin lookups below
       // (supply flow, RugCheck, Birdeye, GMGN, Arkham) are token-level, so
