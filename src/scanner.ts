@@ -3660,14 +3660,31 @@ export class Scanner {
             enrichDeadline,
             null,
           ),
-          this.bestEffort(
-            jupiterOrganic
-              ? () => jupiterOrganic.fetchOrganicScore(coin.stats.token)
-              : null,
-            enrichDeadline,
-            null,
-          ),
         ]);
+        // The 🌱 有機度 slot is opened WITH the batch but is NOT awaited by it
+        // (2026-09-26): its reading is late-bound to the card below. The
+        // batch's wall (enrichDeadline, tick start + 2.2s) is where the chain
+        // usually STARTS rather than where it can finish — live `seen` stamps
+        // land at 1.4-2.5s and the seen-check itself is a read — and the
+        // Jupiter client spaces its own calls 500ms apart, so an AWAITED
+        // organic call was cut before it could answer even after the batch's
+        // dispatch moved in front of RugCheck (operator report: roon, msgId
+        // 5384). Nothing here gates anything — the line is display-only — so
+        // the card reads whatever landed by render time: same call, same
+        // count, same fallback (null → the line is hidden), and no wait added
+        // anywhere. Its wall is the tick deadline because it blocks nobody.
+        const organicSlot = this.bestEffort(
+          jupiterOrganic
+            ? () => jupiterOrganic.fetchOrganicScore(coin.stats.token)
+            : null,
+          tickDeadline,
+          null,
+        );
+        const organicBox: { value: Awaited<typeof organicSlot> } = { value: null };
+        void organicSlot.then((v) => {
+          organicBox.value = v;
+          if (v) diag.organic++;
+        });
         // Bundler + top-10 holder share is resolved for the message card but
         // no longer filters — those filters were removed, so coins push even
         // when the RugCheck report is not ready yet (the card shows 未检测).
@@ -3775,9 +3792,11 @@ export class Scanner {
         // simply omits its line (§4.17 — the two Birdeye slots, and with them
         // their lines, were removed outright).
         this.markPhase(diag, "enrich-await", startedAt);
-        const [gmgn, arkham, organic] = await displayBatch;
+        const [gmgn, arkham] = await displayBatch;
         if (arkham) diag.arkham++;
-        if (organic) diag.organic++;
+        // organic has no counter line here: its late-bound slot (see above)
+        // owns the increment, so a reading that has not landed yet can never
+        // be counted as "this tick had one".
         if (
           this.gmgn &&
           this.config.gmgnBlockWashTrading &&
@@ -3913,7 +3932,9 @@ export class Scanner {
           arkham,
           crime,
           wallet,
-          organic,
+          // The late-bound reading (see organicSlot): whatever landed by the
+          // time this card is built, or null → the line is hidden.
+          organicBox.value,
           axiomInfo,
           // null = forensics disabled → line hidden; { report: null } =
           // configured but nothing to report (non-pump mint / skip).

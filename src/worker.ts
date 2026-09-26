@@ -5468,6 +5468,23 @@ export default {
     if (url.pathname === "/debug/jupiter") {
       if (!cfg) return Response.json({ ok: false, error: "not initialized" });
       const client = new JupTokensClient(cfg);
+      // ?organic=<mint> — the push card's 🌱 有機度 reading, asked from the
+      // WORKER's own egress (2026-09-26). The card line is display-only and
+      // best-effort, so a missing line has two possible halves: no window in
+      // the tick, or no data from this egress. This answers the second one
+      // with the same call the scanner makes, plus its latency — one request
+      // instead of another push-and-wait cycle.
+      const organicMint = (url.searchParams.get("organic") ?? "").trim();
+      if (organicMint) {
+        const t0 = Date.now();
+        const reading = await client.fetchOrganicScore(organicMint);
+        return Response.json({
+          ok: reading !== null,
+          mint: organicMint,
+          ms: Date.now() - t0,
+          reading,
+        });
+      }
       const [recent, trending] = await Promise.all([
         client.fetchRecentTokens(5),
         client.fetchTrendingTokens(5),

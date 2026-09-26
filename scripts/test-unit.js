@@ -11776,8 +11776,10 @@ async function main() {
       "scanner (and no reader of the §4.15 cache: its import and dial went too)":
         !scannerSrc.includes("holderCountCacheHit") &&
         !scannerSrc.includes("birdeyeHolderCacheMs"),
-      "scanner (the enrich batch is down to the three display-only slots)":
-        scannerSrc.includes("const[gmgn,arkham,organic]=awaitdisplayBatch;") &&
+      "scanner (the enrich batch is down to the display-only slots)":
+        // 2026-09-26: the organic slot is late-bound now (see the organic
+        // guards), so the awaited batch is GMGN + Arkham.
+        scannerSrc.includes("const[gmgn,arkham]=awaitdisplayBatch;") &&
         scannerSrc.includes("()=>this.resolveGmgnInfo(coin),") &&
         !scannerSrc.includes("proTraders:coin.stats.birdeyeProTraders,"),
       "render (the card has no sniper/holders line left to fill)":
@@ -13146,17 +13148,16 @@ async function main() {
           'constjupiterOrganic=this.jupiter;this.markPhase(diag,"enrich-dispatch",startedAt);',
           'this.markPhase(diag,"rugcheck",startedAt);',
         ) &&
-        before('construgcheck=awaitthis.bestEffort(', "const[gmgn,arkham,organic]=awaitdisplayBatch;") &&
+        before('construgcheck=awaitthis.bestEffort(', "const[gmgn,arkham]=awaitdisplayBatch;") &&
         !before(
           'construgcheck=awaitthis.bestEffort(',
           'constjupiterOrganic=this.jupiter;this.markPhase(diag,"enrich-dispatch",startedAt);',
         ),
-      "scanner (the batch itself is unchanged: three slots, one shared deadline)":
+      "scanner (the batch itself is unchanged: GMGN + Arkham on one deadline)":
         scannerSrc.includes("constdisplayBatch=Promise.all([") &&
         scannerSrc.includes("()=>this.resolveGmgnInfo(coin),") &&
         scannerSrc.includes("()=>this.resolveArkhamInfo(coin),") &&
-        scannerSrc.includes("?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token):null,") &&
-        scannerSrc.includes("const[gmgn,arkham,organic]=awaitdisplayBatch;"),
+        scannerSrc.includes("const[gmgn,arkham]=awaitdisplayBatch;"),
       "scanner (the batch still rides AFTER the supply-flow gate and the seen-check)":
         before(
           'if(flow.status==="flagged"){',
@@ -13171,6 +13172,62 @@ async function main() {
     if (done.length === 0) {
       console.log(
         "  \u2139 the organic-dispatch move is missing - apply docs/patches/organic-dispatch-before-rugcheck-2026-09-26.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
+  });
+
+  // ---------- the 🌱 有機度 slot is late-bound (and the probe that says why) ---
+  //
+  // 2026-09-26, second fix of the day for the same line. Moving the batch in
+  // front of RugCheck was necessary but not sufficient: the batch's wall
+  // (enrichDeadline, tick start + 2.2s) is where the chain usually STARTS
+  // (live `seen` stamps: 1.4-2.5s), and the Jupiter client spaces its calls
+  // 500ms apart, so an AWAITED organic call still could not answer in time —
+  // the operator's next push card (roon, msgId 5384) had no line. The reading
+  // is display-only, so the slot is no longer awaited: opened with the batch,
+  // walled at the TICK deadline (it blocks nobody), read late-bound at render.
+  // Same call, same count, same fallback. The worker probe answers the other
+  // half of the question — whether this egress can fetch it at all.
+  await test("out-of-window patch: the organic slot is late-bound, and the worker can be asked directly (docs/patches/organic-late-bound-and-probe-2026-09-26.apply.js)", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const scannerSrc = read("src/scanner.ts");
+    const workerSrc = read("src/worker.ts");
+    const applied = {
+      "scanner (the slot rides the batch's dispatch but not its await)":
+        scannerSrc.includes("constorganicSlot=this.bestEffort(") &&
+        scannerSrc.includes(
+          "?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token):null,tickDeadline,null,",
+        ) &&
+        scannerSrc.includes(
+          "voidorganicSlot.then((v)=>{organicBox.value=v;if(v)diag.organic++;});",
+        ),
+      "scanner (the card reads the box, and the awaited batch is two slots)":
+        scannerSrc.includes(
+          "constorganicBox:{value:Awaited<typeoforganicSlot>}={value:null};",
+        ) &&
+        scannerSrc.includes("const[gmgn,arkham]=awaitdisplayBatch;") &&
+        scannerSrc.includes("organicBox.value,"),
+      "worker (the probe asks from the worker's own egress, with its latency)":
+        workerSrc.includes(
+          'constorganicMint=(url.searchParams.get("organic")??"").trim();',
+        ) &&
+        workerSrc.includes(
+          "constreading=awaitclient.fetchOrganicScore(organicMint);",
+        ) &&
+        workerSrc.includes("ms:Date.now()-t0,"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  \u2139 the late-bound organic slot is missing - apply docs/patches/organic-late-bound-and-probe-2026-09-26.apply.js",
       );
       return;
     }
