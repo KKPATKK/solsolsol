@@ -504,6 +504,36 @@ export interface ScanFrontWrite {
 }
 
 /**
+ * A telemetry counter row as a number: the integer it holds, or null when the
+ * row is absent or not integer-shaped.
+ *
+ * A NEGATIVE value is returned as it is, on purpose: it is the drifted state
+ * readTelemetryCounter self-heals (observed telemetry_token_stats_count =
+ * -3105, where the incremental bumps had drifted past zero), and folding it
+ * into the same null an absent row returns would erase the only signal that a
+ * heal is due.
+ *
+ * Exported and pure because the judgement has TWO callers: the single-row
+ * read inside Db and /health's batched front (Db.readHealthFront), which
+ * receives the row for free and must not re-invent the rule.
+ */
+export function parseTelemetryCounter(
+  raw: string | null | undefined,
+): number | null {
+  if (raw === null || raw === undefined) return null;
+  return /^-?\d+$/.test(raw) ? Number(raw) : null;
+}
+
+/**
+ * Whether a counter read may be SERVED, or has to be re-derived from the live
+ * COUNT(*) instead: absent and negative are both "re-derive" (see
+ * parseTelemetryCounter for why negative is kept rather than discarded).
+ */
+export function telemetryCounterUsable(value: number | null): value is number {
+  return value !== null && value >= 0;
+}
+
+/**
  * The front's gate keys, in one place so the read and the legs cannot drift:
  * the launch_ms migration flag, the token_stats prune stamp and the Birdeye
  * backfill stamp. Every one of them is a "when did this job last run" row,
@@ -2562,8 +2592,7 @@ export class Db {
   ): Promise<number> {
     let cached: number | null = null;
     try {
-      const v = await this.getWorkerState(key);
-      if (v !== null && /^-?\d+$/.test(v)) cached = Number(v);
+      cached = parseTelemetryCounter(await this.getWorkerState(key));
     } catch {
       // fall through to the live count
     }
@@ -2606,6 +2635,48 @@ export class Db {
       "telemetry_token_stats_count",
       "SELECT COUNT(*) AS n FROM token_stats",
     );
+  }
+
+  /**
+   * Everything /health reads in ONE round trip (2026-09-26).
+   *
+   * The page's forensic rows are read by an uptime monitor once a minute,
+   * and they used to arrive as two batched reads plus four single-key reads
+   * (~6 round trips, ~15-20ms of CPU at the 2.4-5.8ms scripts/cpu-profile.js
+   * measures per round trip) — under the same 10ms Workers Free ceiling that
+   * Cloudflare has been killing this Worker's invocations for. Same shape as
+   * Db.readScanFront: one batch, one request, and the caller passes the keys
+   * it needs so the list stays visible where it is used.
+   *
+   * `enabledChats` is a COUNT, not the listing: /health only ever used the
+   * length of listEnabledChats, so the row mapping was decoded for nothing.
+   *
+   * Failure is all-or-nothing, like every other batched read here: the caller
+   * catches once and the page renders with nulls, which is what its per-block
+   * try/catch already did for the reads that lived in separate requests.
+   */
+  async readHealthFront(keys: readonly string[]): Promise<{
+    states: Map<string, string>;
+    enabledChats: number;
+  }> {
+    const state = {
+      sql: `SELECT key, value FROM worker_state WHERE key IN (${keys
+        .map(() => "?")
+        .join(",")})`,
+      args: [...keys] as Array<string | number | null>,
+    };
+    const chats = {
+      sql: "SELECT COUNT(*) AS n FROM chat_settings WHERE enabled = 1",
+      args: [] as Array<string | number | null>,
+    };
+    const res = await this.get().batch([state, chats], "read");
+    const states = new Map<string, string>();
+    for (const row of res[0]?.rows ?? []) {
+      const r = row as Record<string, unknown>;
+      states.set(String(r.key), String(r.value));
+    }
+    const counted = res[1]?.rows?.[0] as { n?: number | bigint } | undefined;
+    return { states, enabledChats: Number(counted?.n ?? 0) };
   }
 
   /**

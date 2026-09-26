@@ -15,7 +15,9 @@ import { loadConfig, type AppConfig } from "./config";
 import {
   Db,
   parseScheduledTickRing,
+  parseTelemetryCounter,
   parseTradeModeOverride,
+  telemetryCounterUsable,
   type ScheduledTickEntry,
 } from "./db";
 // Subclass with the last-good pool fallback: the method it wraps lives past
@@ -4578,13 +4580,10 @@ export default {
       // populated when the next tick lands on the same isolate, so on the
       // 2026-09-21 stall it was usually absent — the one number that explained
       // the zero-row tracker was the one number /health could not show.
+      // Assigned from the page's ONE batched read below (see
+      // Db.readHealthFront): this row used to be a round trip of its own,
+      // for a request the front already pays for.
       let pushWatchPass: unknown = null;
-      try {
-        const rawPass = await db?.getWorkerState("push_watch_pass");
-        pushWatchPass = rawPass ? JSON.parse(rawPass) : null;
-      } catch {
-        pushWatchPass = null;
-      }
       // Cross-isolate cron diagnostics: the scheduled handler persists a
       // running total + last event time to Turso, so any isolate serving
       // /health can prove whether the Cron Trigger is actually delivering.
@@ -4623,7 +4622,7 @@ export default {
         // handler). Reading them together is what makes the pair comparable —
         // `scheduledArrivalAt > scheduledTickAt` means the newest cron delivery
         // never accounted for itself, i.e. the tick died in front of its claim.
-        const tickState = await db?.getWorkerStates([
+        const front = await db?.readHealthFront([
           "scheduled_tick_total",
           "scheduled_tick_at",
           "scheduled_arrival_total",
@@ -4637,7 +4636,15 @@ export default {
           // have been a third. Same request, so the breakdown is free.
           BIRDEYE_CU_STATE_KEY,
           BIRDEYE_CU_BY_STATE_KEY,
+          // The tracker pass line and both telemetry counters ride THIS
+          // request (2026-09-26): each was a round trip of its own for a row
+          // one batch carries for free — see Db.readHealthFront, which also
+          // answers the enabled-chats count in the same batch.
+          "push_watch_pass",
+          "telemetry_token_stats_count",
+          "telemetry_seen_tokens_count",
         ]);
+        const tickState = front?.states;
         const rawTotal = tickState?.get("scheduled_tick_total") ?? null;
         const rawAt = tickState?.get("scheduled_tick_at") ?? null;
         const rawArrivalTotal = tickState?.get("scheduled_arrival_total") ?? null;
@@ -4658,9 +4665,28 @@ export default {
             writeDrainError = null;
           }
         }
-        enabledChats = (await db?.listEnabledChats())?.length ?? null;
-        tokenStatsCount = (await db?.countTokenStats()) ?? null;
-        pushedTotal = (await db?.countSeenTokens()) ?? null;
+        const rawPass = tickState?.get("push_watch_pass") ?? null;
+        pushWatchPass = rawPass ? JSON.parse(rawPass) : null;
+        // The count, not the listing: /health only ever used the length of
+        // listEnabledChats, so its row mapping was decoded for nothing — the
+        // front's second statement answers it with COUNT(*).
+        enabledChats = front ? front.enabledChats : null;
+        // The counters ride the same batch. The heal path (absent or
+        // negative — see parseTelemetryCounter) is the only case that still
+        // pays a round trip, and it re-derives the number through the SAME
+        // rule the single-row read applies rather than a second copy of it.
+        const statsRaw = parseTelemetryCounter(
+          tickState?.get("telemetry_token_stats_count"),
+        );
+        tokenStatsCount = telemetryCounterUsable(statsRaw)
+          ? statsRaw
+          : ((await db?.countTokenStats()) ?? null);
+        const seenRaw = parseTelemetryCounter(
+          tickState?.get("telemetry_seen_tokens_count"),
+        );
+        pushedTotal = telemetryCounterUsable(seenRaw)
+          ? seenRaw
+          : ((await db?.countSeenTokens()) ?? null);
         const cuDays = parseBirdeyeCuLedger(
           tickState?.get(BIRDEYE_CU_STATE_KEY) ?? null,
         );
