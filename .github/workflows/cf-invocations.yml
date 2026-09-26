@@ -24,6 +24,16 @@ on:
     # :07 and :37 — off the hour on purpose, so a run never shares a minute
     # with a deploy and the two are never confused for one another.
     - cron: "7,37 * * * *"
+  # Path-scoped so that touching the probe ITSELF is what runs it. GitHub's
+  # scheduled delivery is routinely late by 10+ minutes, and the schedule is
+  # the only trigger a read-only integration can cause, so this gives the
+  # question a same-minute answer: push a change to either file below on any
+  # branch (a non-main branch keeps it clear of the deploy workflow, which is
+  # main-only) and the run starts immediately.
+  push:
+    paths:
+      - ".github/workflows/cf-invocations.yml"
+      - "scripts/cf-invocations.mjs"
   workflow_dispatch:
     inputs:
       hours:
