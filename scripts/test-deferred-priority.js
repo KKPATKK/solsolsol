@@ -765,6 +765,79 @@ async function dexListCacheTest() {
     ["EDGE_B"],
     "a dropped fetch still evaluates the list the tick already had (the reuse lane), never nothing",
   );
+  // ...and the LEG that wanted it is named. The total alone could not be acted
+  // on: the profiles list is the tick's biggest discovery lane, the boosts list
+  // is optional by construction and the pair batches are a rotation whose
+  // leftovers stay in the pool — three legs, three different fixes.
+  assert.deepEqual(
+    dropStats.dropsByLeg,
+    { profiles: 1, boosts: 0, pairs: 0, other: 0 },
+    "every leg has a number, zero included: 'never dropped' must not read like 'never ran'",
+  );
+  assert.equal(dropStats.lastDropLeg, "profiles", "and the newest drop names its leg");
+  const { dexFeedLeg } = require("../dist/dexscreener.js");
+  assert.equal(dexFeedLeg("/token-profiles/latest/v1"), "profiles");
+  assert.equal(dexFeedLeg("/token-boosts/latest/v1"), "boosts");
+  assert.equal(dexFeedLeg("/latest/dex/tokens/A,B"), "pairs");
+  assert.equal(dexFeedLeg("/something/else"), "other");
+
+  // ---------- a dropped attempt costs NO dispatch slot ----------------------
+  // The throttle's chain is global across callers and spaces request STARTS
+  // `intervalMs` apart, so an attempt that can never be answered used to take a
+  // full gap from the legs behind it — which is how one drop became two (live
+  // 2026-09-26: 2-3 drops per tick, request never sent). This drives the exact
+  // shape with numbers instead of a stopwatch: gap 700ms against the list
+  // feeds' own 480ms budget, so the SECOND profiles call can only be dropped,
+  // then a THIRD call is issued late enough that it fits the NEXT free slot
+  // (t0+700) but not the phantom one (t0+1400) the drop used to consume.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    return json([{ chainId: "solana", tokenAddress: "EDGE_D" }]);
+  };
+  dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "700" }));
+  await dex.fetchLatestSolanaProfiles(); // #1 takes the only slot (t0)
+  await dex.fetchLatestSolanaProfiles(); // #2: next slot t0+700 > t0+480 → DROPPED
+  await sleep(400); // ...and its phantom slot is now in the past either way
+  const boosted = await dex.fetchBoostedTokens(20); // #3: deadline ~t0+880
+  const slotStats = dex.getStats();
+  assert.equal(slotStats.budgetDrops, 1, "only the attempt with no window left is a drop");
+  assert.deepEqual(
+    slotStats.dropsByLeg,
+    { profiles: 1, boosts: 0, pairs: 0, other: 0 },
+    "the request AFTER the drop still fit — the drop never took the boosts leg's slot",
+  );
+  assert.deepEqual(boosted.map((p) => p.tokenAddress), ["EDGE_D"], "and it was answered");
+  assert.deepEqual(
+    urls.map((u) => (u.includes("token-profiles") ? "profiles" : u.includes("token-boosts") ? "boosts" : u)),
+    ["profiles", "boosts"],
+    "exactly two requests reached the network: the dropped attempt was never sent",
+  );
+
+  // ---------- the PAIR phase stops at the window, not at a drop -------------
+  // Its tail batches used to be enqueued only for the queue to hold them past
+  // PAIRS_FETCH_BUDGET_MS: each consumed a 250ms slot (delaying the legs behind
+  // it) and then answered nothing. A batch that cannot START is pure latency —
+  // skipped tokens keep their pool slot and are re-read on the next rotation —
+  // so the phase ends instead, and the drop counter stays reserved for a
+  // request a leg genuinely wanted.
+  globalThis.fetch = async () => json({ pairs: [] });
+  dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "700" }));
+  const addresses = Array.from({ length: 90 }, (_, i) => `PAIR_${i}`);
+  await dex.fetchPairsForTokens(addresses);
+  const pairStats = dex.getStats();
+  assert.equal(
+    pairStats.budgetDrops,
+    0,
+    "a batch the phase's window cannot hold is not attempted at all — never counted as a drop",
+  );
+  assert.deepEqual(
+    pairStats.dropsByLeg,
+    { profiles: 0, boosts: 0, pairs: 0, other: 0 },
+    "...so no leg is blamed for it",
+  );
+  assert.equal(pairStats.cacheSize, 0, "the stub answered an empty pair list");
 }
 
 // ---------- the durable snapshot the worker writes after the flush ----------

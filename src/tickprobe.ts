@@ -774,6 +774,31 @@ function noteStep(name: string, ms: number): void {
 }
 
 /**
+ * The census label for one call: a `worker_state` read or write names its KEY.
+ *
+ * WHY (2026-09-26, live): the census did what it was built for — a tick's scan
+ * read `getWorkerState 5 calls / 2559ms` against a ~20-round-trip tick, i.e.
+ * the single largest method in the window — and then stopped one step short of
+ * being actionable: `getWorkerState` is the SHARED read of ~40 keys (the gate
+ * rows, the tracker's holder stamp, the axiom session, the push-failure
+ * record), so "5 calls" cannot say which five, and the next merge (the whole
+ * point of the census, docs/round-trips.md §4.11) needs the names. The two
+ * methods are generic by design and their CALLERS are what cost the round
+ * trips, so the key rides the label: `getWorkerState:axiom_access_token 2`.
+ *
+ * Only these two: every other method in the census list is already a specific
+ * operation (`claimPushWatchChecksMany`, `readScanFront`), and labelling them
+ * would only multiply the map's keys. The label is a pure function of the
+ * call's own arguments, so the cumulative `dbSteps` and the per-tick
+ * `dbTickSteps` stay comparable.
+ */
+export function dbStepLabel(name: string, args: readonly unknown[]): string {
+  if (name !== "getWorkerState" && name !== "setWorkerState") return name;
+  const key = typeof args[0] === "string" ? args[0] : "";
+  return key.length > 0 ? `${name}:${key}` : name;
+}
+
+/**
  * Wrap one DB method. A read is timed and still awaited by the scanner; a
  * deferred write hands the scanner an already-resolved promise and queues the
  * real call (see the header).
@@ -787,15 +812,20 @@ function wrapDbMethod(
   if (typeof original !== "function") return;
   const call = original as (...args: unknown[]) => Promise<unknown>;
   target[name] = (...args: unknown[]): Promise<unknown> => {
+    // One label per CALL, not per wrapper: this wrapper is shared by every
+    // key the tick happens to read or write, and for the two worker_state
+    // methods the KEY is exactly what the census has to name (see
+    // dbStepLabel).
+    const label = dbStepLabel(name, args);
     if (!defer || !tickActive) {
       const at = dbClock();
       return call.apply(target, args).then(
         (value) => {
-          noteStep(name, dbClock() - at);
+          noteStep(label, dbClock() - at);
           return value;
         },
         (err: unknown) => {
-          noteStep(name, dbClock() - at);
+          noteStep(label, dbClock() - at);
           throw err;
         },
       );
@@ -808,7 +838,7 @@ function wrapDbMethod(
         try {
           return await call.apply(target, args);
         } finally {
-          noteStep(name, dbClock() - at);
+          noteStep(label, dbClock() - at);
         }
       },
     });

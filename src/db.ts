@@ -497,6 +497,39 @@ export const SCAN_FRONT_GATE_KEYS = [
   "birdeye_backfill_at",
 ] as const;
 
+/**
+ * One `push_watch` row as the tracker reads it (see Db.listPushWatch).
+ *
+ * WHY IT IS A NAMED TYPE (2026-09-26): the pass's entry batch returns the
+ * SAME listing (see Db.beginTrackerPass), and a second inline copy of
+ * these twenty fields is a silent way for the two to drift apart — a row
+ * field added on one side only would read as `undefined` on the other.
+ * The extraction is byte-for-byte, so both signatures are one definition.
+ */
+export interface PushWatchListRow {
+    token: string;
+    chatId: string;
+    symbol: string | null;
+    pushedAt: number;
+    mcapAtPush: number;
+    peakMcap: number;
+    lastLiquidity: number | null;
+    lastVol5m: number | null;
+    deadTroughMcap: number | null;
+    holdersAtPush: number | null;
+    holdersLast: number | null;
+    holdersCheckedAt: number | null;
+    /** Consecutive 🧨 sell-dominant checks (streak; resets on recovery). */
+    sellDomStreak: number;
+    /** Latest tracker-observed mcap (🏁 recap final value). */
+    lastMcap: number | null;
+    lastChecked: number;
+    lastAlertAt: number;
+    followupsSent: number;
+    lastState: string | null;
+    upStages: string | null;
+  }
+
 export class Db {
   /**
    * Entries kept in the shared delivery ring (see recordPushDelivery).
@@ -3311,29 +3344,7 @@ export class Db {
     });
   }
 
-  async listPushWatch(limit = 40): Promise<Array<{
-    token: string;
-    chatId: string;
-    symbol: string | null;
-    pushedAt: number;
-    mcapAtPush: number;
-    peakMcap: number;
-    lastLiquidity: number | null;
-    lastVol5m: number | null;
-    deadTroughMcap: number | null;
-    holdersAtPush: number | null;
-    holdersLast: number | null;
-    holdersCheckedAt: number | null;
-    /** Consecutive 🧨 sell-dominant checks (streak; resets on recovery). */
-    sellDomStreak: number;
-    /** Latest tracker-observed mcap (🏁 recap final value). */
-    lastMcap: number | null;
-    lastChecked: number;
-    lastAlertAt: number;
-    followupsSent: number;
-    lastState: string | null;
-    upStages: string | null;
-  }>> {
+  async listPushWatch(limit = 40): Promise<PushWatchListRow[]> {
     const res = await this.get().execute({
       // Active rows claim their slots FIRST; terminal rows (rug / unwatched /
       // expired tombstones kept only so the self-heal skips them) fill any
@@ -3359,7 +3370,100 @@ export class Db {
             LIMIT ?`,
       args: [limit],
     });
-    return res.rows.map((row) => {
+    return this.mapPushWatchRows(res.rows);
+  }
+
+  /**
+   * The tracker pass's ENTRY, in ONE request (2026-09-26).
+   *
+   * WHY (docs/round-trips.md §4.11: a tick's Turso is ~20 DISTINCT one-shot
+   * statements, not one fat loop — the pass's own note read `trips 5`): the
+   * pass opened with three of them, none of which depends on the others:
+   *
+   *   1. the `push_watch` listing the pass rotates AND its recap/prune read
+   *      (the same SELECT listPushWatch issues, byte for byte);
+   *   2. the single `worker_state` row the settle stage decides on
+   *      (deferrallog.UNCONFIRMED_TERMINAL_STATE_KEY) — a caller that knows
+   *      which row it will need passes the key here and reads it for free;
+   *   3. the RUNNING stamp on `push_watch_pass`, so the durable row moves the
+   *      moment a pass starts (a stuck pass must not look like a quiet one).
+   *
+   * A libsql batch is ONE HTTP request whose statements run in order, so all
+   * three ride it: 3 round trips -> 1 on a tick whose binding constraint is
+   * Workers Free's 50 subrequests per invocation, where every Turso round
+   * trip is one. The saving also lands in FRONT of the row rotation, which
+   * is the stage the whole pass exists for.
+   *
+   * A batch is a transaction, so a refusal loses all three readings — the
+   * caller re-reads the listing, re-writes the stamp and lets the settle
+   * stage read its own row (the pre-merge shapes, see PushWatcher.runTick),
+   * i.e. a refused batch costs today's price and never a lost reading.
+   *
+   * `stateKeys` empty => no state statement at all (an `IN ()` is not SQL)
+   * and an empty map. A caller must read `states.get(k)` as "this batch did
+   * not carry that row", never as "the row does not exist" — the same
+   * discipline the scan front's gates keep (Db.readScanFront).
+   */
+  async beginTrackerPass(
+    stampKey: string,
+    stampValue: string,
+    stateKeys: readonly string[],
+    limit: number,
+  ): Promise<{ rows: PushWatchListRow[]; states: Map<string, string> }> {
+    const statements: Array<{
+      sql: string;
+      args: Array<string | number | null>;
+    }> = [];
+    if (stateKeys.length > 0) {
+      statements.push({
+        sql: `SELECT key, value FROM worker_state WHERE key IN (${stateKeys
+          .map(() => "?")
+          .join(",")})`,
+        args: [...stateKeys],
+      });
+    }
+    const stateSlot = statements.length - 1;
+    statements.push({
+      // listPushWatch's own listing, verbatim: the row SET the pass rotates
+      // and the rows its prune keeps are the ones the standalone listing
+      // returns (active rows first, oldest last_checked first).
+      sql: `SELECT * FROM push_watch
+            ORDER BY CASE WHEN COALESCE(last_state, '') IN ('rug', 'unwatched', 'expired') THEN 1 ELSE 0 END,
+                     CASE WHEN COALESCE(last_state, '') IN ('rug', 'unwatched', 'expired')
+                          THEN pushed_at ELSE last_checked END ASC
+            LIMIT ?`,
+      args: [limit],
+    });
+    statements.push({
+      // setWorkerState's own upsert, last: the reads above must not be able
+      // to observe a stamp written for a pass that never got its listing.
+      sql: "INSERT INTO worker_state (key, value) VALUES (?, ?)" +
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      args: [stampKey, stampValue],
+    });
+    const res = await this.get().batch(statements, "write");
+    const states = new Map<string, string>();
+    if (stateSlot >= 0) {
+      for (const row of res[stateSlot]?.rows ?? []) {
+        const r = row as Record<string, unknown>;
+        states.set(String(r.key), String(r.value));
+      }
+    }
+    return {
+      rows: this.mapPushWatchRows(res[stateSlot + 1]?.rows ?? []),
+      states,
+    };
+  }
+
+  /**
+   * The shared mapping for a push_watch listing — ONE definition, used by
+   * listPushWatch and by the pass's entry batch (see beginTrackerPass), so
+   * the two cannot drift apart.
+   */
+  private mapPushWatchRows(
+    rows: ReadonlyArray<Record<string, unknown>>,
+  ): PushWatchListRow[] {
+    return rows.map((row) => {
       const r = row as Record<string, unknown>;
       return {
         token: String(r.token),

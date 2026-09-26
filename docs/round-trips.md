@@ -1667,3 +1667,27 @@ re-eval pool，一次延遲，唔係漏推）。同時 list feed（profiles / bo
 `raw 0` 嘅 27% 對得上 `/debug/dex429` 嘅 17 次/鐘 —— 共用 egress IP 嘅 429，唔係我哋嘅 spacing。
 
 全部細節、代價同驗收步驟：`docs/tick-spend-and-profiles-2026-09-25.md`。
+
+---
+
+## 4.20 Round 2：tick 嘅 Turso round trip 再收三刀 ＋ `budgetDrops` 嘅真身（2026-09-26）
+
+§4.11 量到嘅「一個 tick ~16–20 個 distinct one-shot statement」今次收咗三個：**cold init 嘅
+四個 `worker_state` 讀 → 1 個 `getWorkerStates`**、**tracker pass 嘅 entry（RUNNING stamp ＋
+listing ＋ settle 嗰行）3 → 1 個 batch**（`Db.beginTrackerPass`，被拒就跌落 pre-merge 三步，
+代價最多等於舊 code）、**stamp 由 scanner 自己嘅一個 round trip 改為騎 entry batch**；
+同時 census 加咗 key 入 label（`getWorkerState:axiom_access_token`），令下一輪合併有數可依。
+
+另外一條獨立讀數：`budgetDrops` 每 tick 2–3 唔係被拒（429），係 **request 根本冇發出** ——
+throttle 條 global 鏈會俾「注定答唔到嘅 attempt」佔 250ms 一個 slot，所以一個 drop 會推遲
+後面嘅腿、變兩個。修法＝ `Throttle.nextSlotAt()` 喺入隊前先問 slot（冇窗就免費 drop，queue
+內舊檢查留做 backstop），pair 階段喺 `nextSlotAt() >= deadline` 時直接收工、唔再製造尾巴
+batch；同時 `dropsByLeg` / `lastDropLeg` 令讀數點名邊條腿（profiles / boosts / pairs 三種處理）。
+
+本地驗收：`npm run typecheck` clean、`npm run test:unit` **353 passed / 0 failed**（前值 348；
+新增真 Db 嘅 entry-batch case、source-shape guard、census labelled case，同
+`test-deferred-priority` 嘅兩條 drop-slot case）。
+
+全部細節、代價、已知取捨同落線驗收步驟：`docs/round2-merges-and-budget-drops-2026-09-26.md`；
+落線紀錄：`docs/patches/round2-tick-merges-2026-09-26.apply.js` ＋
+`docs/patches/round2-stamp-move-tests-2026-09-26.apply.js`。

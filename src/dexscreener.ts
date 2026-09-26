@@ -216,6 +216,33 @@ interface CloudflareFetchInit extends RequestInit {
 }
 
 /**
+ * Which feed a request path belongs to — the label `budgetDrops` counts by
+ * (2026-09-26).
+ *
+ * WHY THE LEG IS NAMED (live 2026-09-26): the counter told the operator that 2-3
+ * requests per tick were never SENT (the throttle queue held them past the
+ * caller's 480ms / 1s window), but not WHICH leg wanted them — and the three
+ * legs have three different fixes: the profiles list is the tick's biggest
+ * discovery lane (a drop there is a real loss, softened only by the 10-minute
+ * reuse lane), the boosts list is optional by construction (dropOptionalLeg),
+ * and the pair batches are a ROTATION whose leftovers stay in the re-eval pool
+ * by design. One counter cannot be read without that name.
+ *
+ * Derived from the PATH rather than passed by each caller: the call sites are
+ * three and the paths are fixed, so a third parameter would be three chances to
+ * mislabel with no extra information. Pure and exported so the mapping is
+ * unit-tested rather than inferred from a live reading.
+ */
+export type DexFeedLeg = "profiles" | "boosts" | "pairs" | "other";
+
+export function dexFeedLeg(path: string): DexFeedLeg {
+  if (path.startsWith("/token-profiles/")) return "profiles";
+  if (path.startsWith("/token-boosts/")) return "boosts";
+  if (path.startsWith("/latest/dex/tokens/")) return "pairs";
+  return "other";
+}
+
+/**
  * Should this tick evaluate the previous profile list instead of the one it
  * just fetched? Pure and exported so the rule is unit-tested rather than only
  * observed (scripts/test-deferred-priority.js).
@@ -268,9 +295,45 @@ export function passesChgGate(
 class Throttle {
   private lastCallAt = 0;
   private tail: Promise<void> = Promise.resolve();
+  /**
+   * The slot handed to the item enqueued LAST (see nextSlotAt); 0 = this
+   * isolate never queued anything yet. Distinct from `lastCallAt` on purpose:
+   * it is a PLAN, and the plan is what a caller with a deadline needs to see
+   * before it spends a slot (see getJson's drop check).
+   */
+  private plannedAt = 0;
   constructor(private readonly intervalMs: number) {}
 
+  /**
+   * When an item enqueued NOW would actually start.
+   *
+   * WHY (2026-09-26, live): the queue spaces request STARTS `intervalMs`
+   * (250ms) apart and its chain is global across callers, so a slot spent by an
+   * attempt that can never be answered is 250ms of dispatch spacing taken from
+   * the requests BEHIND it — a dropped pair batch pushes the boosts list's one
+   * request a full gap later, which is how one drop becomes two. The queue is
+   * therefore asked for its next slot BEFORE an attempt is enqueued, so a
+   * caller whose window has already gone drops the attempt for free instead of
+   * paying for the slot (see getJson).
+   *
+   * Exact for a busy queue (each item dispatches one gap after the previous
+   * plan, and a plan cannot start before the previous real dispatch because the
+   * chain serializes them) and "now" for an idle one, where the next item has
+   * no wait to pay: idle long enough and both terms are in the past.
+   */
+  nextSlotAt(): number {
+    return Math.max(
+      Date.now(),
+      this.plannedAt + this.intervalMs,
+      // A slot can slip past its plan when the isolate is busy (the callback
+      // runs late), and the chain is ordered by ACTUAL dispatch — so the later
+      // of the two is what the next item would really wait for.
+      this.lastCallAt + this.intervalMs,
+    );
+  }
+
   run<T>(fn: () => Promise<T>): Promise<T> {
+    this.plannedAt = this.nextSlotAt();
     const dispatched = this.tail.then(async () => {
       const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
       if (wait > 0) await sleep(wait);
@@ -443,6 +506,18 @@ export class DexScreenerClient {
   private budgetDrops = 0;
   private lastDroppedAt: number | null = null;
   /**
+   * Those drops split by leg (see dexFeedLeg). The total says an attempt was
+   * never sent; only the split says WHICH leg wanted it — and the three legs
+   * have three different fixes (see the note on dexFeedLeg).
+   */
+  private dropsByLeg: Record<DexFeedLeg, number> = {
+    profiles: 0,
+    boosts: 0,
+    pairs: 0,
+    other: 0,
+  };
+  private lastDropLeg: DexFeedLeg | null = null;
+  /**
    * The last profile fetch that returned coins, and when (see
    * PROFILE_FEED_REUSE_MS): what a rate-limited tick evaluates instead of
    * nothing. In-memory by design — the scanner hands this list to the tick, so
@@ -481,6 +556,13 @@ export class DexScreenerClient {
      * "never asked". */
     budgetDrops: number;
     lastDroppedAt: number | null;
+    /** The drops split by leg — WHICH leg wanted the attempts that never went
+     * out (see dexFeedLeg). Always all four keys, zero included: a leg that
+     * never dropped has to read as 0, not as absent (which would be
+     * indistinguishable from a client that never ran the leg at all). */
+    dropsByLeg: Record<DexFeedLeg, number>;
+    /** The leg of the most recent drop, or null while none dropped. */
+    lastDropLeg: DexFeedLeg | null;
   } {
     return {
       intervalMs: this.config.dexRequestIntervalMs,
@@ -492,7 +574,22 @@ export class DexScreenerClient {
       lastListCacheStatus: this.lastListCacheStatus,
       budgetDrops: this.budgetDrops,
       lastDroppedAt: this.lastDroppedAt,
+      dropsByLeg: { ...this.dropsByLeg },
+      lastDropLeg: this.lastDropLeg,
     };
+  }
+
+  /**
+   * Record one attempt that was NEVER SENT because the caller's window was
+   * already spent (see budgetDrops). Named by leg, because the total alone
+   * cannot be acted on (see dexFeedLeg).
+   */
+  private noteDrop(path: string): void {
+    const leg = dexFeedLeg(path);
+    this.budgetDrops += 1;
+    this.dropsByLeg[leg] += 1;
+    this.lastDropLeg = leg;
+    this.lastDroppedAt = Date.now();
   }
 
   /**
@@ -553,6 +650,23 @@ export class DexScreenerClient {
       const remaining =
         deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
       if (remaining <= 0) return null; // budget exhausted — stop trying
+      // THE SLOT IS DECIDED BEFORE IT IS SPENT (2026-09-26).
+      //
+      // The check inside the queue below can only notice the window is gone
+      // AFTER the queue has handed this attempt a slot — and a slot is not
+      // free: the throttle's chain is global across callers and spaces every
+      // request START 250ms apart, so a doomed attempt delays the legs behind
+      // it by a full gap. Live 2026-09-26: `budgetDrops` 2-3 per tick, every
+      // one of them an attempt that could never have been answered (the
+      // operator's reading: the request was never dispatched). Predicting the
+      // slot first (see Throttle.nextSlotAt) drops such an attempt for free,
+      // and the in-queue check stays as a BACKSTOP for the one case a plan
+      // cannot see: the isolate stalls long enough for a real dispatch to slip
+      // past it.
+      if (deadline !== undefined && this.throttle.nextSlotAt() >= deadline) {
+        this.noteDrop(path);
+        return null;
+      }
       try {
         const res = await this.throttle.run(async () => {
           // COUNT THE THROTTLE WAIT AGAINST THE CALLER'S DEADLINE (2026-09-25).
@@ -569,8 +683,7 @@ export class DexScreenerClient {
             // NEVER SENT (see budgetDrops): the queue held this attempt past
             // the caller's window. Counting it apart from a 429 is the whole
             // reason the field exists — the two have different fixes.
-            this.budgetDrops += 1;
-            this.lastDroppedAt = Date.now();
+            this.noteDrop(path);
             return null;
           }
           // A BOUNDED caller gets its deadline enforced on every attempt,
@@ -856,6 +969,22 @@ export class DexScreenerClient {
     const worker = async (): Promise<void> => {
       while (nextBatch < batches.length && !saw429) {
         if (Date.now() > deadline) return; // keep the tick inside its budget
+        // A batch the throttle cannot START inside this phase's window is not
+        // a drop — it is not attempted AT ALL (2026-09-26).
+        //
+        // WHY (live 2026-09-26: `budgetDrops` 2-3 per tick, the operator's
+        // reading "the request was never sent"): the pair phase dispatches up
+        // to 6 batches into a 1s window at a 250ms global spacing, so its TAIL
+        // batches were being enqueued only for the queue to hold them past the
+        // deadline — every one of them consumed a 250ms slot from the legs
+        // behind it and then answered nothing. A batch that cannot start is
+        // pure latency here: skipped tokens keep their pool slot and are
+        // re-read on the next rotation (see PAIRS_FETCH_BUDGET_MS), i.e. the
+        // same outcome the drop produced, minus the slot and minus the false
+        // reading. So the phase ENDS instead: `nextSlotAt` is the queue's own
+        // plan, and this is the same arithmetic its drop check would have
+        // applied one call later.
+        if (this.throttle.nextSlotAt() >= deadline) return;
         const batch = batches[nextBatch++];
         let data: { pairs?: Array<Record<string, unknown>> } | null;
         try {

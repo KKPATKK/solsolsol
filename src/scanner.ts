@@ -2016,12 +2016,10 @@ export class Scanner {
   ): Promise<string | null> {
     if (!this.pushWatcher) return null;
     const startedAt = Date.now();
-    // Stamp the row RUNNING before the pass's first stage (see
-    // persistPassStart). The coverage line below is the pass's LAST write, so a
-    // pass that never returns would otherwise leave /health.pushWatchPass
-    // frozen while the row writes it DID make kept landing.
-    await this.persistPassStart();
-    // The pass runs on the TICK's DB leash, not the default one (see
+    // The RUNNING stamp is no longer written here: it rides the pass's ONE
+    // entry request (Db.beginTrackerPass, 2026-09-26), which the pass issues
+    // before it touches a row — the guarantee this call existed for (a pass
+    // that starts moves the durable row) for one fewer round trip per tick.    // The pass runs on the TICK's DB leash, not the default one (see
     // Db.enterScanMode). The scanner's own exitScanMode() happens at the end of
     // runOnce — i.e. BEFORE this pass, even though the pass is part of the same
     // tick — so a degraded Turso handed every round trip in here the 3s window
@@ -2191,7 +2189,7 @@ export class Scanner {
      * "done" = a completed pass; "skip" = a tick that never got one (see
      * noteTrackerSkipped); "cut" = a pass the watchdog abandoned before it
      * returned (see racePassWatchdog). Written to the row so a reader can tell
-     * a pass in flight from a pass that is stuck (see persistPassStart).
+     * a pass in flight from a pass that is stuck (see Db.beginTrackerPass).
      */
     phase: "done" | "skip" | "cut" = "done",
   ): Promise<void> {
@@ -2212,44 +2210,6 @@ export class Scanner {
           note,
           trackerMs: phase === "skip" ? 0 : Date.now() - startedAt,
           phase,
-        }),
-      );
-    } catch {
-      /* telemetry only */
-    }
-  }
-
-  /**
-   * Stamp the pass RUNNING before its first stage runs.
-   *
-   * WHY (2026-09-23, measured live): the coverage line is the pass's LAST
-   * write, so a pass that does not return left the durable row frozen — and a
-   * pass can fail to return without failing to WORK. The row loop checks the
-   * budget only BETWEEN rows, and ONE row's chain (pair lookup, claim, alert
-   * reservation, send, delivery audit, final check write) is up to five Turso
-   * round trips, each walled at 3s outside scan mode. Live shape: the row
-   * `SRI` carried `lastChecked 02:45:13Z` (its own writes landed) while
-   * `push_watch_pass.at` sat at 02:36:26Z for 11+ minutes — rows moving, note
-   * frozen, which is exactly the shape docs/duplicate-cards.md 8.3 told the
-   * operator to read around instead of trusting the note.
-   *
-   * With this stamp the row moves whenever a pass STARTS: `phase:"running"`
-   * with a fresh `at` is a pass in flight, a stale `running` is a pass stuck
-   * inside one row, and `phase:"skip"` is a tick that never got a pass (see
-   * noteTrackerSkipped). A frozen `at` now means the invocation died before
-   * the tick's tail at all, which the heartbeat and scan_history already show.
-   *
-   * Best-effort and awaited exactly like the coverage write below.
-   */
-  private async persistPassStart(): Promise<void> {
-    try {
-      await this.db.setWorkerState(
-        "push_watch_pass",
-        JSON.stringify({
-          at: Date.now(),
-          note: "running",
-          trackerMs: 0,
-          phase: "running",
         }),
       );
     } catch {

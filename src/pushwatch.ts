@@ -980,6 +980,24 @@ const SELL_DOM_PACE_MS = 60 * 60_000;
  */
 const RESURRECTION_MULT = 1.5; // revival floor = trough (or push baseline) x this
 
+/**
+ * The durable `worker_state` row `/health.pushWatchPass` and /debug read,
+ * and the RUNNING stamp a passing pass writes into it.
+ *
+ * Named HERE because the stamp now rides the pass's entry batch (see
+ * Db.beginTrackerPass) instead of being written by
+ * Scanner.runTrackerPass — one spelling for the row, the value and the
+ * key, so the writer and the readers cannot drift apart. Scanner keeps the
+ * literal in persistPassNote (the coverage line) and that is fine: the two
+ * rows are one key, asserted by the tests.
+ */
+export const TRACKER_PASS_STATE_KEY = "push_watch_pass";
+
+/** The `phase:"running"` stamp: a pass in flight, before its first stage. */
+export function runningPassStamp(now = Date.now()): string {
+  return JSON.stringify({ at: now, note: "running", trackerMs: 0, phase: "running" });
+}
+
 export interface PushWatchRow {
   token: string;
   chatId: string;
@@ -2475,11 +2493,60 @@ export class PushWatcher {
     const setupStart = Date.now();
     const setupTrips = trips;
     let snapshot: PushWatchRow[] | null = null;
-    try {
-      snapshot = await this.db.listPushWatch(cfg.maxTracked);
-      trips += 1;
-    } catch {
-      /* listing failed — the loop re-reads below, the prune still runs */
+    /**
+     * The unconfirmed-card record the settle stage below decides on, when the
+     * entry batch carried it (see Db.beginTrackerPass). `undefined` = it did
+     * not (no entry batch, or this Db has none), and that stage then reads
+     * the row itself — the pre-merge shape, kept reachable on purpose.
+     */
+    let entryUnconfirmed: string | null | undefined;
+    /**
+     * The pass's ONE entry request (2026-09-26): the RUNNING stamp, the
+     * listing this stage and the prune both read, and the settle row. It is
+     * issued through a Partial<Pick<>> seam so a test double without the
+     * method keeps the three-step behaviour instead of throwing.
+     */
+    const entryRead = (this.db as Partial<Pick<Db, "beginTrackerPass">>)
+      .beginTrackerPass;
+    if (typeof entryRead === "function") {
+      try {
+        const entry = await entryRead.call(
+          this.db,
+          TRACKER_PASS_STATE_KEY,
+          runningPassStamp(),
+          [UNCONFIRMED_TERMINAL_STATE_KEY],
+          cfg.maxTracked,
+        );
+        trips += 1;
+        snapshot = entry.rows;
+        entryUnconfirmed = entry.states.get(UNCONFIRMED_TERMINAL_STATE_KEY) ?? null;
+      } catch {
+        // One request carried three readings, so a refusal lost all three:
+        // fall back to the pre-merge shapes below (the stamp on its own, then
+        // the listing), which is exactly what a pre-merge pass paid.
+        try {
+          await this.db.setWorkerState(TRACKER_PASS_STATE_KEY, runningPassStamp());
+          trips += 1;
+        } catch {
+          /* telemetry only — never fail the pass over its start stamp */
+        }
+      }
+    } else {
+      // A Db without the entry batch: the stamp on its own, as before.
+      try {
+        await this.db.setWorkerState(TRACKER_PASS_STATE_KEY, runningPassStamp());
+        trips += 1;
+      } catch {
+        /* telemetry only */
+      }
+    }
+    if (snapshot === null) {
+      try {
+        snapshot = await this.db.listPushWatch(cfg.maxTracked);
+        trips += 1;
+      } catch {
+        /* listing failed — the loop re-reads below, the prune still runs */
+      }
     }
     const expiring = (snapshot ?? []).filter(
       (x) => x.pushedAt < windowCutoff && x.lastState !== "unwatched",
@@ -2561,7 +2628,7 @@ export class PushWatcher {
     // zeroed, so it takes the front of the next rotation.
     this.passStage = "settle";
     notePassPulse({ stage: "settle" });
-    const settle = await this.settleUnconfirmedCards(now);
+    const settle = await this.settleUnconfirmedCards(now, entryUnconfirmed);
     trips += settle.trips;
     const rearmedCards = settle.rearmed;
     spent.setup.ms = Date.now() - setupStart;
@@ -4111,6 +4178,14 @@ export class PushWatcher {
    */
   private async settleUnconfirmedCards(
     now: number,
+    /**
+     * The record as the pass's ENTRY batch read it (see
+     * Db.beginTrackerPass): `undefined` = the batch did not carry it and
+     * this stage reads the row itself, exactly as before. `null` is a
+     * reading — the row is absent — so the two cases stay distinguishable
+     * (an absent row is not an unread one).
+     */
+    preRead?: string | null,
   ): Promise<{ rearmed: number; trips: number }> {
     // One read while something is pending, plus ONE probe per isolate: a record
     // left by an isolate that died between the send and its audit has no
@@ -4119,20 +4194,26 @@ export class PushWatcher {
     if (this.settleProbed && this.unconfirmedWrites === 0) {
       return { rearmed: 0, trips: 0 };
     }
-    const stateRead = (this.db as Partial<Pick<Db, "getWorkerState">>)
-      .getWorkerState;
-    if (typeof stateRead !== "function") return { rearmed: 0, trips: 0 };
     let trips = 0;
     let records: ReturnType<typeof parseUnconfirmedCardSends>;
-    try {
-      records = parseUnconfirmedCardSends(
-        await stateRead.call(this.db, UNCONFIRMED_TERMINAL_STATE_KEY),
-      );
-      trips += 1;
-    } catch {
-      // Unreadable: keep the probe armed so the next pass tries again — an
-      // unproven card may be waiting on this decision.
-      return { rearmed: 0, trips: 0 };
+    if (preRead !== undefined) {
+      // ZERO round trips: the entry batch already read this row, and reading
+      // it twice would spend a subrequest on the invocation's tightest one.
+      records = parseUnconfirmedCardSends(preRead);
+    } else {
+      const stateRead = (this.db as Partial<Pick<Db, "getWorkerState">>)
+        .getWorkerState;
+      if (typeof stateRead !== "function") return { rearmed: 0, trips: 0 };
+      try {
+        records = parseUnconfirmedCardSends(
+          await stateRead.call(this.db, UNCONFIRMED_TERMINAL_STATE_KEY),
+        );
+        trips += 1;
+      } catch {
+        // Unreadable: keep the probe armed so the next pass tries again — an
+        // unproven card may be waiting on this decision.
+        return { rearmed: 0, trips: 0 };
+      }
     }
     this.settleProbed = true;
     if (records.length === 0) {

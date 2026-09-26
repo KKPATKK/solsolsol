@@ -1159,7 +1159,7 @@ async function main() {
       "err:Too many subrequests by single Worker invocation [rows subreq 0]",
       "published to the field the next tick persists — the guarantee does not depend on a write",
     );
-    assert.equal(rowWrites, 2, "the row is still attempted immediately (running stamp + the note), so the common case stays instant");
+    assert.equal(rowWrites, 1, "exactly ONE write: the note. The RUNNING stamp rides the pass's entry batch now (Db.beginTrackerPass), so the common case stays instant without a second round trip");
 
     // And the same note survives a database that refuses the write entirely,
     // which is the shape the live occurrence had.
@@ -1982,7 +1982,7 @@ async function main() {
         "awaitthis.recordAbandonedTerminalCard(row,now);",
       ),
       "settle runs in the pass": pushwatchSrc.includes(
-        "constsettle=awaitthis.settleUnconfirmedCards(now);",
+        "constsettle=awaitthis.settleUnconfirmedCards(now,entryUnconfirmed);",
       ),
       "re-arm exists (guarded on rug)":
         dbSrc.includes("asyncrearmPushWatchAlert(token:string):Promise<boolean>{") &&
@@ -3641,13 +3641,18 @@ async function main() {
     assert.equal(typeof scanner.lastSummary.trackerMs, "number");
   });
 
-  await test("Scanner.runTrackerPass: the note row is stamped RUNNING before the pass works, and a skipped tick still moves it", async () => {
+  await test("Scanner.runTrackerPass: the note is the scanner's only write — the RUNNING stamp rides the pass's entry batch", async () => {
     // WHY (2026-09-23): the coverage line is the pass's LAST write, so any pass
     // that does not return left /health.pushWatchPass frozen while its row
     // writes kept landing (live: row `SRI` lastChecked 02:45:13Z, note `at`
-    // 02:36:26Z). Two shapes, one fix: the RUNNING stamp below (a pass that
-    // starts always moves the row) and noteTrackerSkipped (a tick with no
-    // budget for a pass publishes that instead of going quiet).
+    // 02:36:26Z).
+    //
+    // WHY IT CHANGED (2026-09-26): the RUNNING stamp used to be a round trip of
+    // the scanner's own, immediately before the pass — one of the three one-shot
+    // statements the pass's entry paid. It now rides Db.beginTrackerPass (the
+    // pass's first request, issued before it touches a row), so the scanner
+    // writes exactly ONE row per pass: the note. The stamp's own landing is
+    // pinned by the "a pass's entry is ONE request" case, against a real Db.
     const { Scanner } = require("../dist/scanner.js");
     const cfg = loadConfig({});
     const writes = [];
@@ -3660,14 +3665,15 @@ async function main() {
     const scanner = new Scanner(
       db, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
     );
-    // Read INSIDE the pass: the stamp must already be in the row before the
-    // pass touches a single row.
-    let stampedBeforeWork = null;
+    // A watcher that writes nothing of its own: what the RUNNING stamp was for
+    // lives in the entry batch now (see the next test's source assertions), so
+    // the scanner's own path must be exactly one write.
+    let writesWhenPassRan = null;
     scanner.pushWatcher = {
       headTokens: () => [],
       onPush: async () => {},
       runTick: async () => {
-        stampedBeforeWork = writes.length === 1 && writes[0].phase === "running";
+        writesWhenPassRan = writes.length;
         return {
           checked: 3, alerted: 0, trips: 7,
           note: "rows 3/29 pairs 6/6 miss 0 lost 0 trips 7",
@@ -3677,21 +3683,18 @@ async function main() {
     };
     scanner.lastSummary = {};
     await scanner.runTrackerPass(Date.now() + 2_500);
-    assert.equal(stampedBeforeWork, true, "the running stamp must land BEFORE the pass does any work");
-    assert.equal(writes.length, 2, `one write per phase (got ${writes.length})`);
-    assert.equal(writes[0].phase, "running");
-    assert.equal(writes[0].trackerMs, 0, "a running stamp has no pass duration yet");
-    assert.equal(writes[1].phase, "done");
-    assert.match(String(writes[1].note), /^ok:3\/0 rows 3\/29/);
-    assert.equal(typeof writes[1].trackerMs, "number");
+    assert.equal(writesWhenPassRan, 0, "the scanner no longer writes a RUNNING stamp of its own — the pass's entry batch owns it");
+    assert.equal(writes.length, 1, `one write per pass, the note (got ${writes.length})`);
+    assert.equal(writes[0].phase, "done");
+    assert.match(String(writes[0].note), /^ok:3\/0 rows 3\/29/);
+    assert.equal(typeof writes[0].trackerMs, "number");
     // A tick whose envelope was spent before the pass ever started.
     await scanner.noteTrackerSkipped("tick 11500ms timed-out");
-    assert.equal(writes.length, 3);
-    assert.equal(writes[2].phase, "skip");
-    assert.equal(writes[2].note, "skip:tick 11500ms timed-out");
-    assert.equal(writes[2].trackerMs, 0, "no pass ran, so there is no pass duration to report");
+    assert.equal(writes.length, 2);
+    assert.equal(writes[1].phase, "skip");
+    assert.equal(writes[1].note, "skip:tick 11500ms timed-out");
+    assert.equal(writes[1].trackerMs, 0, "no pass ran, so there is no pass duration to report");
   });
-
   await test("Scanner.runTrackerPass: the watchdog abandons a pass that never returns, and says so", async () => {
     // WHY (2026-09-23): every stage inside the pass is bounded and the row loop
     // re-checks its budget BETWEEN rows, but an await NOTHING bounds still held
@@ -3726,8 +3729,8 @@ async function main() {
     const waited = Date.now() - t0;
     assert.match(String(note), /^cut:watchdog \d+ms db \d+ms$/, `the note names the watchdog cut (got ${note})`);
     assert.ok(waited < 1_000, `the watchdog returns the pass instead of hanging (waited ${waited}ms)`);
-    assert.equal(writes[0].phase, "running", "the running stamp still lands before the pass works");
-    assert.equal(writes[1].phase, "cut", "the durable row says the pass was cut, not that it finished");
+    assert.equal(writes.length, 1, "one write: the RUNNING stamp rides the pass's entry batch now (Db.beginTrackerPass), so the scanner's own write is the cut note");
+    assert.equal(writes[0].phase, "cut", "the durable row says the pass was cut, not that it finished");
     assert.equal(scanner.lastSummary.pushWatch, note, "the cut rides /health like any other note");
     assert.equal(scanner.pushWatchNote, note, "the cut note is carried into the next summary");
     // The bound is the pass's own DEADLINE plus the overrun, not the overrun
@@ -7844,7 +7847,7 @@ async function main() {
     // repo could say WHICH calls those were — `dbSteps` covers three methods
     // cumulatively since boot. The census is the whole map's difference against
     // the snapshot taken at tick start, i.e. per-tick AND per-method.
-    const { installTickProbe, resetTickProbe, dbTickStepView, dbStepView } = require("../dist/tickprobe.js");
+    const { installTickProbe, resetTickProbe, dbTickStepView, dbStepView, dbStepLabel } = require("../dist/tickprobe.js");
     let clock = 1_000;
     const db = {
       getWorkerState: async () => { clock += 7; return null; },
@@ -7864,16 +7867,29 @@ async function main() {
     await db.getWorkerState("outside");
     await seam.runOnce();
     const census = dbTickStepView();
-    assert.deepEqual(Object.keys(census).sort(), ["getWorkerState", "setWorkerState"], "exactly the methods the tick called");
-    assert.equal(census.getWorkerState.calls, 1, "a delta, not a cumulative — the call before the tick is not this tick's");
-    assert.equal(census.getWorkerState.ms, 7, "and the ms are the tick's own");
-    assert.equal(census.setWorkerState.calls, 1);
-    assert.equal(census.setWorkerState.ms, 3);
+    // The KEY is in the label (2026-09-26): getWorkerState is the shared read
+    // of ~40 rows, so "5 calls" could not say WHICH five — and the next merge
+    // (this census's whole purpose) needs the names.
+    assert.deepEqual(
+      Object.keys(census).sort(),
+      ["getWorkerState:k", "setWorkerState:k"],
+      "the census names the KEY of every worker_state call the tick paid for",
+    );
+    assert.equal(census["getWorkerState:k"].calls, 1, "a delta, not a cumulative — the call before the tick is not this tick's");
+    assert.equal(census["getWorkerState:k"].ms, 7, "and the ms are the tick's own");
+    assert.equal(census["setWorkerState:k"].calls, 1);
+    assert.equal(census["setWorkerState:k"].ms, 3);
     assert.equal(census.getTokenStatsMany, undefined, "a method the tick never touched is omitted, so the census is a list of what cost something");
     // The cumulative view is still the whole isolate's: together the two
-    // readings say "this tick" AND "since boot".
+    // readings say "this tick" AND "since boot" — and it names the outside
+    // call's own key, which is what makes a cold isolate's boot reads readable.
     const cumulative = dbStepView();
-    assert.equal(cumulative.getWorkerState.calls, 2, "the outside call is still in the isolate view");
+    assert.equal(cumulative["getWorkerState:outside"].calls, 1, "the outside call is in the isolate view, under its own key");
+    assert.equal(cumulative["getWorkerState:k"].calls, 1);
+    assert.equal(dbStepLabel("getWorkerState", ["scan_heartbeat"]), "getWorkerState:scan_heartbeat");
+    assert.equal(dbStepLabel("setWorkerState", ["k", "v"]), "setWorkerState:k");
+    assert.equal(dbStepLabel("getWorkerState", []), "getWorkerState", "no key = the bare method name, never a dangling colon");
+    assert.equal(dbStepLabel("claimScanLock", ["x"]), "claimScanLock", "every other method keeps its own name");
     resetTickProbe();
   });
 
@@ -12819,6 +12835,135 @@ async function main() {
     }
   });
 
+  // ---------- the tracker pass's ENTRY: ONE request (src/db.ts + pushwatch) ----
+  //
+  // §4.11 measured a tick's Turso as ~20 DISTINCT one-shot statements and the
+  // pass's own note names itself `trips 5` — the biggest remaining cluster. Its
+  // entry was three of those statements (the RUNNING stamp, the push_watch
+  // listing, the settle stage's single row), none of which depends on the
+  // others, so they ride ONE batch (one HTTP request, statements in order). This
+  // drives the real Db method against a counting client, because the merge's
+  // whole promise is a ROUND TRIP count.
+  await test("db: a pass's entry is ONE request — stamp, listing and the settle row together", async () => {
+    const t = tmpDb();
+    const now = Date.now();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({ chatId: "c", ...DEFAULT_SETTINGS, enabled: true });
+      await db.setWorkerState("unconfirmed_terminal_cards", "[]");
+      // One tracked row, through the writer the scanner itself uses.
+      await db.upsertPushWatchMany([
+        {
+          token: "ENTRY_ROW",
+          chatId: "c",
+          symbol: "ENTRY",
+          pushedAt: now - 60_000,
+          mcapAtPush: 50_000,
+          liquidityUsd: 20_000,
+        },
+      ]);
+      let batches = 0;
+      let executes = 0;
+      const counting = {
+        execute: (a) => { executes += 1; return t.client.execute(a); },
+        batch: (a, m) => { batches += 1; return t.client.batch(a, m); },
+        close: () => t.client.close(),
+      };
+      const fdb = new Db(t.p, undefined, counting);
+      await fdb.init();
+      batches = 0;
+      executes = 0;
+      const entry = await fdb.beginTrackerPass(
+        "push_watch_pass",
+        JSON.stringify({ at: now, note: "running", trackerMs: 0, phase: "running" }),
+        ["unconfirmed_terminal_cards"],
+        30,
+      );
+      assert.equal(batches, 1, "the whole entry is ONE request");
+      assert.equal(executes, 0, "...and one batch, not an execute");
+      assert.equal(entry.rows.length, 1, "the listing comes back");
+      assert.equal(entry.rows[0].token, "ENTRY_ROW");
+      assert.equal(entry.states.get("unconfirmed_terminal_cards"), "[]", "the settle row rode the same request");
+      assert.equal(
+        JSON.parse(await fdb.getWorkerState("push_watch_pass")).phase,
+        "running",
+        "the RUNNING stamp landed with it: a pass that starts moves the row in the same request, not in a second one",
+      );
+      // The listing is listPushWatch's own: same row set, same order, same shape.
+      const standalone = await fdb.listPushWatch(30);
+      assert.deepEqual(entry.rows, standalone, "the entry's listing IS listPushWatch's");
+      assert.equal(standalone.length, 1);
+      // A caller with no state rows to read pays the same ONE request, and an
+      // empty map is "not carried", never "the row is absent".
+      batches = 0;
+      const bare = await fdb.beginTrackerPass("push_watch_pass", "{}", [], 30);
+      assert.equal(batches, 1, "no state keys is still one request");
+      assert.equal(bare.states.size, 0);
+      assert.ok(!bare.states.has("unconfirmed_terminal_cards"));
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("out-of-window patch: the cold-init reads and the pass entry are ONE request each", () => {
+    // The two merges of docs/patches/round2-tick-merges-2026-09-26.apply.js live
+    // past the file tool's edit window, and a half-applied paste is the worst of
+    // both — so the shape is asserted on the source, the way every other
+    // out-of-window patch in this repo is.
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const workerSrc = read("src/worker.ts");
+    const dbSrc = read("src/db.ts");
+    const pushwatchSrc = read("src/pushwatch.ts");
+    const scannerSrc = read("src/scanner.ts");
+    const applied = {
+      "worker (the four boot rows ride ONE getWorkerStates)":
+        workerSrc.includes(
+          'bootStates=(awaitdb?.getWorkerStates(["axiom_access_token",PUSH_DEFERRAL_STATE_KEY,PUSH_LEDGER_STATE_KEY,SKIP_CAPTURE_STATE_KEY,]))??null;',
+        ),
+      "worker (and the cold-init block pays no single-key read of its own)": (() => {
+        // SCOPED to the block (2026-09-26): a whole-FILE ban on the
+        // axiom_access_token read fails on three legitimate callers (the axiom
+        // token refresh paths re-check it) — which is what the first run of
+        // this assertion showed. The cold-init region is what the merge
+        // changed — and `getWorkerState(` cannot match `getWorkerStates(`.
+        const from = workerSrc.indexOf("bootStates=(awaitdb?.getWorkerStates([");
+        const to = workerSrc.indexOf(
+          "}catch(err){initError=errinstanceofError?err.message:String(err);",
+          from,
+        );
+        return from >= 0 && to > from && !workerSrc.slice(from, to).includes("getWorkerState(");
+      })(),
+      "db (the entry batch exists, and returns the shared row type)":
+        dbSrc.includes("exportinterfacePushWatchListRow{") &&
+        dbSrc.includes("asyncbeginTrackerPass(") &&
+        dbSrc.includes("asynclistPushWatch(limit=40):Promise<PushWatchListRow[]>") &&
+        dbSrc.includes("privatemapPushWatchRows("),
+      "pushwatch (the pass reads its entry through the batch, with the fallbacks kept)":
+        pushwatchSrc.includes('Partial<Pick<Db,"beginTrackerPass">>') &&
+        pushwatchSrc.includes("awaitentryRead.call(this.db,") &&
+        pushwatchSrc.includes("awaitthis.db.listPushWatch(cfg.maxTracked);") &&
+        pushwatchSrc.includes("this.settleUnconfirmedCards(now,entryUnconfirmed);") &&
+        pushwatchSrc.includes("preRead?:string|null,"),
+      "scanner (the RUNNING stamp is no longer its own write)":
+        !scannerSrc.includes("awaitthis.persistPassStart();") &&
+        !scannerSrc.includes("privateasyncpersistPassStart("),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  \u2139 the round-2 tick merges are missing - apply docs/patches/round2-tick-merges-2026-09-26.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
+  });
   console.log("\n===== UNIT TESTS =====");
   for (const line of results) console.log(line);
   console.log(`\n  ${passed} passed, ${failed} failed`);

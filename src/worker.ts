@@ -2810,48 +2810,78 @@ async function ensureInitialized(env: Env): Promise<void> {
           await db.init();
           dbReady = true;
           console.log("[worker] Turso ready");
+          // ONE read for the four rows this boot needs (2026-09-26).
+          //
+          // WHY: an isolate recycles and the next one pays this block again —
+          // four worker_state reads, each a full Turso round trip and, on the
+          // invocation's books, one of its 50 subrequests. getWorkerStates
+          // exists for exactly this shape ("Many keys, ONE round trip", see
+          // db.ts) and the tick's front read already uses it. Live
+          // 2026-09-25: a census window read "getWorkerState 5 calls /
+          // 2559ms" — the largest single method in a ~20-round-trip tick —
+          // and this block is four of those keys on every cold isolate.
+          //
+          // ONE try around the four (they used to have one each): the three
+          // mirrors are best-effort telemetry that a refused read leaves at
+          // its previous value either way, and the axiom flag below is a
+          // nicety the credential check re-derives. A failed read is "no
+          // reading", never "no row": the map simply lacks the key, which is
+          // the same null the four single reads produced.
+          let bootStates: Map<string, string> | null = null;
+          try {
+            bootStates = (await db?.getWorkerStates([
+              "axiom_access_token",
+              PUSH_DEFERRAL_STATE_KEY,
+              PUSH_LEDGER_STATE_KEY,
+              SKIP_CAPTURE_STATE_KEY,
+            ])) ?? null;
+          } catch {
+            // telemetry only — never fail init over a counter read
+          }
           // A Google/SSO Axiom account has no password — its tokens are
           // persisted by /debug/axiom-tokens, so the feed is "configured"
           // whenever a stored access token exists too.
-          const storedAxiomToken = await db?.getWorkerState("axiom_access_token");
+          const storedAxiomToken = bootStates?.get("axiom_access_token") ?? null;
           if (storedAxiomToken && config.axiomEnabled) axiomConfigured = true;
-          // Mirror the durable deferral counters (src/deferrallog.ts) so this
-          // isolate's heartbeats carry the fleet-wide numbers even before it
-          // has any of its own. A row that does not exist yet loads as an
-          // all-zero snapshot (never null): /health then reads "nothing has
-          // been deferred yet" instead of something indistinguishable from a
-          // missing counter channel, which is what makes the first rise
-          // visible as 0 → 1 rather than null → object.
-          try {
-            pushDeferralSnapshot = loadPushDeferralSnapshot(
-              await db?.getWorkerState(PUSH_DEFERRAL_STATE_KEY),
-            );
-          } catch {
-            // telemetry only — never fail init over a counter read
-          }
-          // Same for the push-baseline ledger (src/pushledger.ts): a freshly
-          // recycled isolate answers /health with the durable view instead of
-          // null until its first reconciliation comes due.
-          try {
-            pushLedgerMirror = {
-              ...pushLedgerStats(
-                parsePushLedger(await db?.getWorkerState(PUSH_LEDGER_STATE_KEY)),
-                Date.now(),
-              ),
-              heal: pushWatchHealStats(),
-            };
-          } catch {
-            // telemetry only — never fail init over a ledger read
-          }
-          // Same for the early-return counters (src/skipcapture.ts): a
-          // recycled isolate answers /health with the fleet totals instead of
-          // zeros until its own first sync comes due.
-          try {
-            skipCaptureMirror = parseSkipCaptureState(
-              await db?.getWorkerState(SKIP_CAPTURE_STATE_KEY),
-            );
-          } catch {
-            // telemetry only — never fail init over a counter read
+          if (bootStates) {
+            // Mirror the durable deferral counters (src/deferrallog.ts) so this
+            // isolate's heartbeats carry the fleet-wide numbers even before it
+            // has any of its own. A row that does not exist yet loads as an
+            // all-zero snapshot (never null): /health then reads "nothing has
+            // been deferred yet" instead of something indistinguishable from a
+            // missing counter channel, which is what makes the first rise
+            // visible as 0 → 1 rather than null → object.
+            try {
+              pushDeferralSnapshot = loadPushDeferralSnapshot(
+                bootStates.get(PUSH_DEFERRAL_STATE_KEY) ?? null,
+              );
+            } catch {
+              // telemetry only — never fail init over a counter read
+            }
+            // Same for the push-baseline ledger (src/pushledger.ts): a freshly
+            // recycled isolate answers /health with the durable view instead of
+            // null until its first reconciliation comes due.
+            try {
+              pushLedgerMirror = {
+                ...pushLedgerStats(
+                  parsePushLedger(bootStates.get(PUSH_LEDGER_STATE_KEY) ?? null),
+                  Date.now(),
+                ),
+                heal: pushWatchHealStats(),
+              };
+            } catch {
+              // telemetry only — never fail init over a ledger read
+            }
+            // Same for the early-return counters (src/skipcapture.ts): a
+            // recycled isolate answers /health with the fleet totals instead of
+            // zeros until its own first sync comes due.
+            try {
+              skipCaptureMirror = parseSkipCaptureState(
+                bootStates.get(SKIP_CAPTURE_STATE_KEY) ?? null,
+              );
+            } catch {
+              // telemetry only — never fail init over a counter read
+            }
           }
         } catch (err) {
           initError = err instanceof Error ? err.message : String(err);
