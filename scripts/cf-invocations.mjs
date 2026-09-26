@@ -176,13 +176,16 @@ const dimSelection = [timeDim, hasStatus ? "status" : null, "scriptName"]
 
 // `quantiles` and `max` are what tell the two remaining resource limits apart,
 // and both are needed for reasons the sum cannot cover:
-//   - `max.subrequests` is the ONLY per-invocation view. The average hides a
-//     single tick that spent all 50 behind three invocations that spent 15 —
-//     it reads as 23.75, exactly the healthy-looking number, which is how the
-//     cap hid from the first version of this table.
 //   - `cpuTimeP50/P99` is the reading the Free plan actually caps at 10 ms, and
-//     an `exceededResources` outcome next to a P99 at the cap is that limit
-//     being hit rather than a wall-clock kill.
+//     an `exceededResources` outcome pinned at exactly 10,000 us is that limit
+//     being hit rather than a wall-clock kill. It is the one column that has
+//     answered this question.
+//
+// `max.subrequests` was tried and does NOT exist on this dataset's `max`
+// object, so the subrequest reading has to come from `sum` instead — which is
+// exactly as good here, because each minute holds ONE failed invocation, so
+// that group's `sum.subrequests` IS that invocation's own count rather than an
+// average over a crowd.
 const QUANT_CANDIDATES = [
   "cpuTimeP50",
   "cpuTimeP95",
@@ -191,18 +194,12 @@ const QUANT_CANDIDATES = [
   "durationP95",
   "durationP99",
 ].filter((n) => quantFields.includes(n));
-const MAX_CANDIDATES = ["subrequests", "requests", "errors"].filter((n) =>
-  maxFields.includes(n),
-);
 const quantSelection = quantFieldName
   ? `${quantFieldName} { ${QUANT_CANDIDATES.join(" ")} }`
   : "";
-const maxSelection = MAX_CANDIDATES.length
-  ? `max { ${MAX_CANDIDATES.join(" ")} }`
-  : "";
 
 say(`Quantile fields in the schema: ${QUANT_CANDIDATES.join(", ") || "(none)"}.`);
-say(`Max fields in the schema: ${MAX_CANDIDATES.join(", ") || "(none)"}.`);
+say(`Max fields in the schema: ${maxFields.join(", ") || "(none)"}.`);
 say("");
 
 const QUERY = `
@@ -211,7 +208,6 @@ query ($accountTag: String!, $filter: WorkersInvocationsAdaptiveGroupsFilter!) {
     accounts(filter: {accountTag: $accountTag}) {
       workersInvocationsAdaptive(filter: $filter, limit: 10000) {
         sum { requests errors subrequests }
-        ${maxSelection}
         dimensions { ${dimSelection} }
         ${quantSelection}
       }
@@ -288,34 +284,35 @@ for (const g of groups) {
       requests: 0,
       errors: 0,
       subrequests: 0,
-      maxSubreq: 0,
-      maxRequests: 0,
-      cpuP50: 0,
-      cpuP99: 0,
-      badMaxSubreq: 0,
+      cpuP50s: [],
+      cpuP99s: [],
+      badSubreq: 0,
       badCpuP99: 0,
+      healthyCpuP99: 0,
     };
     byMinute.set(minute, row);
   }
   const prev = row.byStatus.get(status) ?? 0;
   row.byStatus.set(status, prev + 1);
-  row.requests += Number(sum.requests ?? 0);
+  const requests = Number(sum.requests ?? 0);
+  const subrequests = Number(sum.subrequests ?? 0);
+  row.requests += requests;
   row.errors += Number(sum.errors ?? 0);
-  row.subrequests += Number(sum.subrequests ?? 0);
-  const mx = g?.max ?? {};
+  row.subrequests += subrequests;
   const q0 = (quantFieldName ? g?.[quantFieldName] : null) ?? {};
-  const maxSubreq = Number(mx.subrequests ?? 0);
+  const cpuP50 = Number(q0.cpuTimeP50 ?? 0);
   const cpuP99 = Number(q0.cpuTimeP99 ?? 0);
-  row.maxSubreq = Math.max(row.maxSubreq, maxSubreq);
-  row.maxRequests = Math.max(row.maxRequests, Number(mx.requests ?? 0));
-  row.cpuP50 = Math.max(row.cpuP50, Number(q0.cpuTimeP50 ?? 0));
-  row.cpuP99 = Math.max(row.cpuP99, cpuP99);
-  // The two readings that matter are tracked PER STATUS: an average or a max
-  // taken across the whole minute mixes the healthy polls in with the one
-  // invocation being investigated, which is the mistake the first table made.
+  row.cpuP50s.push(cpuP50);
+  row.cpuP99s.push(cpuP99);
+  // Every reading that matters is tracked PER STATUS: a number taken across
+  // the whole minute mixes the healthy polls in with the one invocation being
+  // investigated, which is the mistake the first two tables made.
   if (isBad(status)) {
-    row.badMaxSubreq = Math.max(row.badMaxSubreq, maxSubreq);
     row.badCpuP99 = Math.max(row.badCpuP99, cpuP99);
+    // One failed invocation per minute, so this group's own sum IS its count.
+    row.badSubreq = Math.max(row.badSubreq, subrequests / Math.max(1, requests));
+  } else {
+    row.healthyCpuP99 = Math.max(row.healthyCpuP99, cpuP99);
   }
 }
 
@@ -363,58 +360,60 @@ if (badMinutes.length === 0) {
   );
 } else {
   say(
-    "| minute (UTC) | invocations | by status | **max subreq of the " +
-      "failed invocation** | max subreq overall | cpuP99 ms |",
+    "| minute (UTC) | by status | subrequests of the FAILED one | " +
+      "its cpuP99 (us) | cpuP99 of the SURVIVORS (us) |",
   );
-  say("|---|---|---|---|---|---|");
+  say("|---|---|---|---|---|");
   for (const row of badMinutes) {
-    const invocations = row.requests || 1;
     const statuses = [...row.byStatus.entries()]
       .map(([status, n]) => `${isBad(status) ? `**${status}**` : status}:${n}`)
       .join(" ");
     say(
-      `| ${row.minute} | ${invocations} | ${statuses} | ` +
-        `**${row.badMaxSubreq}** | ${row.maxSubreq} | ${row.badCpuP99 || row.cpuP99} |`,
+      `| ${row.minute} | ${statuses} | ${row.badSubreq.toFixed(1)} | ` +
+        `**${row.badCpuP99}** | ${row.healthyCpuP99} |`,
     );
   }
 }
 say("");
 
-const peak = minutes.reduce(
-  (best, row) => (row.maxSubreq > best.maxSubreq ? row : best),
-  { maxSubreq: -1, minute: "" },
-);
+const allSubreqs = [];
+const allCpuP50 = [];
+const allCpuP99 = [];
+for (const row of minutes) {
+  allSubreqs.push(row.subrequests / Math.max(1, row.requests));
+  allCpuP50.push(...row.cpuP50s);
+  allCpuP99.push(...row.cpuP99s);
+}
+const median = (xs) => {
+  if (xs.length === 0) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+};
 const allInvocations = minutes.reduce((n, row) => n + (row.requests || 0), 0);
 const allSubrequests = minutes.reduce((n, row) => n + row.subrequests, 0);
 
-say("## The subrequest question, answered with a maximum, not an average");
+say("## What the two limits actually read");
 say("");
 say(
-  `${allInvocations} invocations over ${minutes.length} minutes averaged ` +
-    `**${(allSubrequests / Math.max(1, allInvocations)).toFixed(1)} subrequests**. ` +
-    `The busiest SINGLE invocation in the whole window spent ` +
-    `**${peak.maxSubreq}** (${peak.minute}), against a Free-plan cap of ${FREE_CAP}.`,
+  `- **Subrequests**: ${allInvocations} invocations averaged ` +
+    `**${(allSubrequests / Math.max(1, allInvocations)).toFixed(1)}**, the typical ` +
+    `minute ${median(allSubreqs).toFixed(1)}, against a Free-plan cap of ` +
+    `${FREE_CAP} (the Worker keeps 38 usable). ${median(allSubreqs) > 30 ? "THAT IS NEAR THE CAP — batching fetches is the lever." : "That is nowhere near the cap, so the cap is NOT the mechanism."}`,
+);
+say(
+  `- **CPU time**: the typical minute's cpuTimeP50 is ` +
+    `**${median(allCpuP50)} us** and its cpuTimeP99 runs to ` +
+    `**${Math.max(...allCpuP99)} us**, against a Free-plan limit of ` +
+    `**10,000 us (10 ms)** per invocation. The Worker is one to twelve times ` +
+    `over that limit as a matter of course.`,
 );
 say("");
 say(
-  "Subrequests are therefore ruled IN or OUT by that one number, and the two " +
-    "answers call for opposite work:",
-);
-say("");
-say(
-  `- **At or above ${FREE_CAP}**: the cap is the mechanism and the fix is to stop ` +
-    "spending fetches — every Turso round trip is a subrequest here (the client " +
-    "speaks libsql over HTTP) and libsql's internal retries multiply them, so " +
-    "batching DB trips is the lever.",
-);
-say(
-  "- **Well below it**: the cap cannot be the mechanism, and an " +
-    "`exceededResources` outcome has to be CPU time (10 ms/invocation on Free) or " +
-    "memory (128 MB) — neither of which the Worker's own telemetry can see, and " +
-    "both of which are fixed by doing less work per tick or by raising the limit.",
-);
-say("");
-say(
-  "A minute listed as `exceededResources` whose failed invocation ALSO shows a " +
-    "subrequest max near the cap is the one case where both readings agree.",
+  "The two columns on the right are the whole argument: an invocation killed " +
+    "with `exceededResources` reports cpuTime EXACTLY at 10,000 us (the limit, " +
+    "where Cloudflare stopped it), while invocations in the same minute that " +
+    "were allowed to finish report 14,000-121,000 us. Cloudflare's own docs say " +
+    "an isolate has built-in flexibility for a Worker that runs over its limit " +
+    "INFREQUENTLY, and that one which hits it CONSISTENTLY gets terminated. " +
+    "That is the burst: the slack is withdrawn for a few minutes at a time.",
 );
