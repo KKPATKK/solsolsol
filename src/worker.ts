@@ -12,7 +12,12 @@ import {
 } from "./birdeye";
 import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
-import { Db, parseScheduledTickRing, type ScheduledTickEntry } from "./db";
+import {
+  Db,
+  parseScheduledTickRing,
+  parseTradeModeOverride,
+  type ScheduledTickEntry,
+} from "./db";
 // Subclass with the last-good pool fallback: the method it wraps lives past
 // the file-sync window in src/db.ts, so the production path is adjusted here.
 import { PoolFallbackDb, poolFallbackStats } from "./poolfallback";
@@ -1860,13 +1865,47 @@ let lastProgressRead: { raw: string | null; at: number } | null = null;
  * progress record rides the SAME statement — one more key in a statement that
  * was already going out costs no subrequest, and the successor tick is the
  * only witness a killed tick can have.
+ *
+ * ROUND 4 (2026-09-26, docs/round-trips.md §4.25): the trade-mode override
+ * rides it too. Measured live across three consecutive ticks, that row was
+ * the last EVERY-TICK single-key read in the census
+ * (`getWorkerState:trade_mode_override 1` / 86-117ms, `modeRead reads 1
+ * reuses 0`) — while `scan_heartbeat` showed ZERO on the same ticks, its
+ * readers already sharing this very statement. The tick's prefetch finds the
+ * value primed from here (see frontModeOverrideRead) and pays nothing.
+ *
+ * EXPORTED for the same reason cronGateLoad is: the merge's whole promise is
+ * a round-trip count, so what the statement carries has to be assertable
+ * offline instead of only observed live.
  */
-const WEDGE_READ_KEYS = [
+export const WEDGE_READ_KEYS = [
   "scan_heartbeat",
   "scheduled_tick_total",
   "scheduled_tick_ring",
   TICK_PROGRESS_KEY,
+  // Round 4: the tick prefetch's row (TradeService.primeModeOverride).
+  "trade_mode_override",
 ];
+
+/**
+ * The trade-mode row as the tick-front's ONE batch read it (see
+ * WEDGE_READ_KEYS), or null when there is no READING to trust: no front read
+ * this invocation, one that TIMED OUT (its `map` is null), or one older than
+ * HEARTBEAT_REUSE_MS.
+ *
+ * The three-state contract is the point. `{ raw: null }` is a real reading —
+ * the row is absent, i.e. no override — and must prime the cache as such.
+ * `null` (no reading) must NOT prime: the prefetch then pays its own round
+ * trip, the pre-round-4 shape, which is strictly safer than inventing a mode.
+ * Same discipline as lastHeartbeatRead / lastProgressRead, and the reason
+ * the caller reads `if (ride !== null)` rather than testing the value.
+ */
+export function frontModeOverrideRead(): { raw: string | null; at: number } | null {
+  const seen = lastCronKeysRead;
+  if (seen === null || seen.map === null) return null;
+  if (Date.now() - seen.at > HEARTBEAT_REUSE_MS) return null;
+  return { raw: seen.map.get("trade_mode_override") ?? null, at: seen.at };
+}
 
 /**
  * What the cadence gate still has to fetch itself, given what the tick's
@@ -3117,7 +3156,17 @@ async function ensureInitialized(env: Env): Promise<void> {
         // promises and the real calls are drained from onTickEnd below, i.e.
         // after the chain and the tracker pass.
         installTickProbe(scanner, {
-          onTickStart: () => trade?.prefetchMode(),
+          onTickStart: () => {
+            // ROUND 4 (§4.25): the override row already rode the tick-front
+            // batch, so the cache is primed from it BEFORE the prefetch —
+            // which is then a no-op, leaving this tick no mode read at all.
+            // A front read that timed out, never happened, or is too old
+            // leaves the ride null and the prefetch reads for itself (the
+            // pre-round-4 shape: slower, never wrong).
+            const ride = frontModeOverrideRead();
+            if (ride !== null) trade?.primeModeOverride(ride.raw, ride.at);
+            trade?.prefetchMode();
+          },
           onTickEnd: (summary) => {
             const view = summary as Record<string, unknown> | null;
             if (!view) return;
@@ -4443,27 +4492,53 @@ export default {
       let heartbeat: unknown = null;
       let lastScanGapMs: number | null = null;
       let tickProgress: unknown = null;
+      // The mode row rides the SAME statement (round 4, §4.25): /health used
+      // to read it a SECOND time (the single-row read) for a value this
+      // request had already paid for. `modeLanded` is the reading-vs-missing
+      // split the prime below needs: "read, row absent" is a real reading
+      // (no override), "no reading at all" must not become one.
+      let modeRaw: string | null = null;
+      let modeReadAt = 0;
+      let modeLanded = false;
       try {
-        // Both rows in ONE statement (see Db.getWorkerStates): the progress
-        // record is the tick's own account of how far it got before its flush,
-        // so a stale phase=scanning heartbeat can be READ together with the
-        // reason it is stale (see TICK_PROGRESS_KEY).
-        const rows = await db?.getWorkerStates(["scan_heartbeat", TICK_PROGRESS_KEY]);
+        // All three rows in ONE statement (see Db.getWorkerStates): the
+        // progress record is the tick's own account of how far it got before
+        // its flush, so a stale phase=scanning heartbeat can be READ together
+        // with the reason it is stale (see TICK_PROGRESS_KEY).
+        const rows = await db?.getWorkerStates([
+          "scan_heartbeat",
+          TICK_PROGRESS_KEY,
+          "trade_mode_override",
+        ]);
         const raw = rows?.get("scan_heartbeat") ?? null;
         heartbeat = raw ? JSON.parse(raw) : null;
         const progressRaw = rows?.get(TICK_PROGRESS_KEY) ?? null;
         tickProgress = progressRaw ? JSON.parse(progressRaw) : null;
         const at = (heartbeat as { at?: number } | null)?.at;
         if (typeof at === "number") lastScanGapMs = Date.now() - at;
+        if (rows) {
+          modeRaw = rows.get("trade_mode_override") ?? null;
+          modeReadAt = Date.now();
+          modeLanded = true;
+        }
       } catch {
         heartbeat = null;
       }
-      // Effective trade mode: Telegram /setmode override wins over env.
+      // Effective trade mode: Telegram /setmode override wins over env. Both
+      // numbers now come from the ONE row read above (round 4, §4.25):
+      // `tradeModeOverride` is that raw value through the shared validation
+      // (parseTradeModeOverride — the rule the single-row read applies),
+      // and a row this request actually read primes the service, so
+      // effectiveMode is answered from it instead of paying a second round
+      // trip for the very same row.
       let effectiveTradeMode: string = cfg?.trade.mode ?? "off";
       let tradeModeOverride: string | null = null;
       try {
+        if (modeLanded) {
+          trade?.primeModeOverride(modeRaw, modeReadAt);
+          tradeModeOverride = parseTradeModeOverride(modeRaw);
+        }
         effectiveTradeMode = (await trade?.effectiveMode()) ?? effectiveTradeMode;
-        tradeModeOverride = (await db?.getTradeModeOverride()) ?? null;
       } catch {
         // telemetry only — never fail /health over the mode read
       }

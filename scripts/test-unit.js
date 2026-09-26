@@ -12669,9 +12669,15 @@ async function main() {
         workerSrc.includes('noteProgress("flush-retry-failed"'),
       "worker (the backfill row carries the note)":
         workerSrc.includes("tickProgressNote(prevProgressRaw,dead.at)"),
+      // ROUND 4 (2026-09-26): that read now carries the trade-mode row in
+      // the SAME batch (docs/round-trips.md §4.25), so the pinned shape
+      // follows the statement instead of the old two-key list. The property
+      // is unchanged — the record is published by the same read.
       "worker (/health publishes it)":
         workerSrc.includes("tickProgress,") &&
-        workerSrc.includes('getWorkerStates(["scan_heartbeat",TICK_PROGRESS_KEY])'),
+        workerSrc.includes(
+          'getWorkerStates(["scan_heartbeat",TICK_PROGRESS_KEY,"trade_mode_override",])',
+        ),
       "worker (the phase ladder is what writes the row, so no phase stamp can overtake the record)":
         workerSrc.includes("tickPhaseLadder(") &&
         workerSrc.includes("ladder.stamp({"),
@@ -13228,6 +13234,71 @@ async function main() {
     if (done.length === 0) {
       console.log(
         "  \u2139 the late-bound organic slot is missing - apply docs/patches/organic-late-bound-and-probe-2026-09-26.apply.js",
+      );
+      return;
+    }
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
+  });
+
+  // ---------- round 4: the trade-mode override rides the tick-front batch ---
+  //
+  // The labelled census named two candidates and three live ticks separated
+  // them: `getWorkerState:trade_mode_override` was 1 call / 86-117ms on EVERY
+  // tick (modeRead reads 1 reuses 0), while `getWorkerState:scan_heartbeat`
+  // read 0 on those same ticks — its consumers already share ONE statement
+  // (WEDGE_READ_KEYS) and only the diagnostic/fallback paths ever read it
+  // alone. So the merge is the mode row: the key joins the statement the tick
+  // front already sends, the tick's prefetch is primed from that read (reads
+  // 0), and the validation the single-row read always applied becomes one
+  // shared parser for every reader of the row.
+  await test("out-of-window patch: the trade-mode override rides the tick-front batch (docs/patches/round4-mode-rides-front-2026-09-26.apply.js)", () => {
+    // Whitespace-only squash, and deliberately REGEX-FREE: this block is
+    // itself written by a patch script, and a half-escaped regex in one of
+    // those is how a strip silently starts matching nothing — or fails to
+    // compile at all, which is exactly what round 4's first cut did.
+    // Comments are NOT stripped, so the assertion about /health's read below
+    // runs against the raw source (and the comments it reads say the same
+    // thing without spelling the identifier).
+    const WS = new Set([9, 10, 13, 32]);
+    const strip = (text) =>
+      [...text].filter((ch) => !WS.has(ch.charCodeAt(0))).join("");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const workerSrc = read("src/worker.ts");
+    const dbSrc = read("src/db.ts");
+    const { WEDGE_READ_KEYS } = require("../dist/worker.js");
+    const { parseTradeModeOverride } = require("../dist/db.js");
+    const applied = {
+      "the front's statement carries the mode row (the ride exists)":
+        Array.isArray(WEDGE_READ_KEYS) &&
+        WEDGE_READ_KEYS.includes("trade_mode_override") &&
+        WEDGE_READ_KEYS.includes("scan_heartbeat") &&
+        WEDGE_READ_KEYS.includes(TICK_PROGRESS_KEY),
+      "one validation rule, shared by every reader of that row":
+        parseTradeModeOverride("off") === "off" &&
+        parseTradeModeOverride("manual") === "manual" &&
+        parseTradeModeOverride("auto") === "auto" &&
+        parseTradeModeOverride("nonsense") === null &&
+        parseTradeModeOverride("") === null &&
+        parseTradeModeOverride(null) === null &&
+        parseTradeModeOverride(undefined) === null,
+      "worker (the tick primes from the front read BEFORE the prefetch)":
+        workerSrc.includes("constride=frontModeOverrideRead();") &&
+        workerSrc.includes("if(ride!==null)trade?.primeModeOverride(ride.raw,ride.at);") &&
+        workerSrc.indexOf("frontModeOverrideRead()") <
+          workerSrc.indexOf("trade?.prefetchMode()"),
+      "worker (no READING never primes: the miss is null, not an empty value)":
+        workerSrc.includes("if(seen===null||seen.map===null)returnnull;") &&
+        workerSrc.includes("if(Date.now()-seen.at>HEARTBEAT_REUSE_MS)returnnull;"),
+      "worker (/health reads that row in its own batch, never a second time)":
+        workerSrc.includes('"scan_heartbeat",TICK_PROGRESS_KEY,"trade_mode_override",') &&
+        workerSrc.includes("tradeModeOverride=parseTradeModeOverride(modeRaw);") &&
+        !workerSrc.includes("getTradeModeOverride"),
+    };
+    const done = Object.entries(applied).filter(([, v]) => v);
+    if (done.length === 0) {
+      console.log(
+        "  \u2139 the tick-front mode ride is missing - apply docs/patches/round4-mode-rides-front-2026-09-26.apply.js",
       );
       return;
     }

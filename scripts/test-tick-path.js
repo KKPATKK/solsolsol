@@ -237,6 +237,54 @@ installTickProbe(fakeScanner, {
   assert.equal(broken.modeStats().timeouts, 1, "the cut read is visible");
   failReads = false;
 
+  // ---------- round 4: the tick-front batch PRIMES the override -----------
+  // The worker reads `trade_mode_override` in the statement it already sends
+  // before the scan (WEDGE_READ_KEYS) and hands the value over, so the tick's
+  // prefetch pays nothing: a primed service reports `primes 1 / reads 0`.
+  overrideReads = 0;
+  overrideValue = "auto";
+  const primed = new TradeService(cfg, {}, db);
+  primed.primeModeOverride("auto", Date.now());
+  primed.prefetchMode();
+  assert.equal(overrideReads, 0, "a primed prefetch issues no round trip");
+  assert.equal(await primed.effectiveMode(), "auto", "the chain is answered from it");
+  assert.equal(overrideReads, 0, "and pays nothing either");
+  assert.equal(primed.modeStats().primes, 1, "the ride is visible, not assumed");
+  assert.equal(primed.modeStats().reads, 0, "reads still means round trips WE paid for");
+
+  // A reading of "no override stored" is still a reading: it must not turn
+  // into a re-read (nor into a mode).
+  overrideReads = 0;
+  const noOverride = new TradeService(cfg, {}, db);
+  noOverride.primeModeOverride(null, Date.now());
+  assert.equal(await noOverride.effectiveMode(), "manual", "null = no override, so the env mode answers");
+  assert.equal(overrideReads, 0, "an explicit null reading costs nothing");
+
+  // ...and a ride is not a licence to be stale forever: past the TTL the value
+  // ages out exactly like one of our own reads.
+  overrideReads = 0;
+  overrideValue = "off";
+  const stale = new TradeService(cfg, {}, db);
+  stale.primeModeOverride("auto", Date.now() - 60_000);
+  assert.equal(await stale.effectiveMode(), "off", "a ride older than the TTL is not reused");
+  assert.equal(overrideReads, 1, "so the service reads for itself");
+
+  // A junk value is no override — the same rule the single-row read applies.
+  overrideReads = 0;
+  const junk = new TradeService(cfg, {}, db);
+  junk.primeModeOverride("nonsense", Date.now());
+  assert.equal(await junk.effectiveMode(), "manual", "junk never invents a mode");
+  assert.equal(overrideReads, 0, "and never triggers a re-read inside the TTL");
+
+  // A fresher cached read is never clobbered by an older ride.
+  overrideValue = "auto";
+  const ordered = new TradeService(cfg, {}, db);
+  assert.equal(await ordered.effectiveMode(), "auto");
+  overrideReads = 0;
+  ordered.primeModeOverride("off", Date.now() - 60_000);
+  assert.equal(await ordered.effectiveMode(), "auto", "an older ride cannot overwrite a fresher read");
+  assert.equal(overrideReads, 0, "and nothing re-read");
+
   // ---------- the feed view behind the make-up ----------------------------
   resetFeedMakeup();
   noteProfileFeed(0, 3, 700);

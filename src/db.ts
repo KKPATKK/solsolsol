@@ -443,6 +443,24 @@ export interface ScheduledTickEntry {
 }
 
 /**
+ * Validate a raw `trade_mode_override` row value — the ONE rule, shared by
+ * every reader of that row: Db.getTradeModeOverride (the single-row read),
+ * /health (which gets the row out of its own batch) and TradeService's
+ * primed cache (round 4, docs/round-trips.md §4.25).
+ *
+ * Anything else — a junk value from a hand edit, an empty row, a row that
+ * was never written — is null, i.e. "no override, use the env config".
+ * Collapsing "could not read" into this null is why the batch readers must
+ * only call it when their read LANDED (see worker.ts's frontModeOverrideRead
+ * and the /health handler's `modeLanded`).
+ */
+export function parseTradeModeOverride(
+  raw: string | null | undefined,
+): "off" | "manual" | "auto" | null {
+  return raw === "off" || raw === "manual" || raw === "auto" ? raw : null;
+}
+
+/**
  * The scan front's ONE read (2026-09-25, docs/round-trips.md §4.13): the
  * `worker_state` rows the front's maintenance legs gate on, plus the enabled
  * chats — one libsql `batch`, so the row set is exactly what it was and only the
@@ -2600,12 +2618,13 @@ export class Db {
    * Telegram-set trade-mode override (worker_state key trade_mode_override).
    * Takes precedence over the env TRADE_MODE var in every money-moving path;
    * null means "no override — use the env config". Invalid stored values
-   * (e.g. a stale hand edit) are ignored and treated as no override.
+   * (e.g. a stale hand edit) are ignored and treated as no override — the
+   * rule itself lives in parseTradeModeOverride, so a reader that already
+   * holds the raw row (a batch, see docs/round-trips.md §4.25) applies
+   * exactly the same one instead of re-reading this row.
    */
   async getTradeModeOverride(): Promise<"off" | "manual" | "auto" | null> {
-    const v = await this.getWorkerState("trade_mode_override");
-    if (v === "off" || v === "manual" || v === "auto") return v;
-    return null;
+    return parseTradeModeOverride(await this.getWorkerState("trade_mode_override"));
   }
 
   /** Persist (or clear, when null) the Telegram trade-mode override. */

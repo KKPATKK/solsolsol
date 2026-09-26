@@ -1,7 +1,7 @@
 import { Keypair, VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import type { TradeConfigSettings } from "./config";
-import type { Db } from "./db";
+import { parseTradeModeOverride, type Db } from "./db";
 
 /**
  * Jupiter direct on-chain trading — the replacement for the retired Trojan
@@ -608,6 +608,14 @@ export class TradeService {
   private modeReadReuses = 0;
   private modeReadTimeouts = 0;
   private lastModeReadMs = 0;
+  /**
+   * Override values HANDED to the cache by a caller that already read the row
+   * (round 4: the worker's tick-front batch — see primeModeOverride). Counted
+   * apart from `modeReads`, which must keep meaning "round trips this service
+   * paid for": a primed tick reads NOTHING, so `primes 1 / reads 0` is the
+   * reading that says the ride worked.
+   */
+  private modePrimes = 0;
 
   /**
    * Start the override read off the critical path: the worker calls this at the
@@ -621,6 +629,28 @@ export class TradeService {
       return;
     }
     void this.readOverrideOnce();
+  }
+
+  /**
+   * A RIDE, not a read: hand the override value a caller ALREADY fetched for
+   * us to the cache (round 4, docs/round-trips.md §4.25 — the worker's
+   * tick-front batch, whose statement was going out anyway, and /health's own
+   * multi-key read).
+   *
+   * `readAtMs` is when that read RETURNED, so the value ages exactly like one
+   * of ours: past MODE_OVERRIDE_TTL_MS the prefetch/callers pay for a real
+   * read instead of reusing it. An older ride never overwrites a fresher cache
+   * entry (the two callers can arrive in either order).
+   *
+   * `raw === null` is a READING — the row is absent, i.e. no override — and
+   * primes as such. A caller with no reading at all must simply NOT call this:
+   * collapsing "could not read" into "nothing stored" is how a mode gets
+   * invented, which is the one thing the fail-safe above exists to prevent.
+   */
+  primeModeOverride(raw: string | null, readAtMs: number): void {
+    if (this.modeOverride !== null && readAtMs < this.modeOverride.at) return;
+    this.modeOverride = { at: readAtMs, value: parseTradeModeOverride(raw) };
+    this.modePrimes += 1;
   }
 
   /**
@@ -689,12 +719,15 @@ export class TradeService {
   /**
    * The mode lookup's own telemetry, published per tick on the scan summary
    * (see the worker's runOnce wrapper): `reuses` rising next to `reads` is the
-   * proof that the tail call stopped paying for a round trip.
+   * proof that the tail call stopped paying for a round trip, and `primes`
+   * (round 4, §4.25) counts the reads a CALLER did for us — a tick that rides
+   * the tick-front batch reads `primes 1 / reads 0`.
    */
   modeStats(): {
     reads: number;
     reuses: number;
     timeouts: number;
+    primes: number;
     lastReadMs: number;
     cachedAgeMs: number | null;
   } {
@@ -702,6 +735,7 @@ export class TradeService {
       reads: this.modeReads,
       reuses: this.modeReadReuses,
       timeouts: this.modeReadTimeouts,
+      primes: this.modePrimes,
       lastReadMs: this.lastModeReadMs,
       cachedAgeMs: this.modeOverride ? Date.now() - this.modeOverride.at : null,
     };
