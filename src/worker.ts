@@ -1592,12 +1592,19 @@ const TRACKER_PASS_BUDGET_MS = 5_000;
  * are the only work in a tick that can be dropped, and they now stand down
  * while the pass's slice is intact.
  *
- * THE NUMBER is the pass's own arithmetic (pushwatch.TRACKER_SUBREQ_FLOOR 3
- * entry + TRACKER_SUBREQ_RESERVE 6 tail writes = 9), so this names exactly
- * what the pass needs to be worth starting rather than a round number.
- * `scanSubreqLeft` applies it; the scan's other gating is unchanged.
+ * THE NUMBER is the pass's own arithmetic, and the first version of it was
+ * short by exactly one CARD: entry (pushwatch.TRACKER_SUBREQ_FLOOR 3) + the
+ * tail's writes (pushwatch.TRACKER_SUBREQ_RESERVE 6) = 9 lets a pass start
+ * and close cleanly while every alerting row behind it is refused — live
+ * 2026-09-26T21:39Z, two consecutive passes read `rows 8/30 … subreq-cut 22
+ * defer-send 22` while the rotation aged in hours (the oldest row 126
+ * minutes). One alerting row's path (claim + reservation + send + final
+ * write, see pushwatch.TRACKER_ALERT_PATH_SUBREQ) is 4 more, so the slice
+ * is 13: what the pass needs to be worth starting IS a delivered card, not
+ * just a closed ledger. `scanSubreqLeft` applies it; the scan's other
+ * gating is unchanged.
  */
-export const TRACKER_PASS_SUBREQ_RESERVE = 9;
+export const TRACKER_PASS_SUBREQ_RESERVE = 13;
 /**
  * The scan's view of the invocation's remaining subrequests: the counter
  * with the tracker pass's slice already taken off (see

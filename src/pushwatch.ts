@@ -127,6 +127,35 @@ const TRACKER_TICK_BUDGET_MS = 5_000;
 const TRACKER_SUBREQ_FLOOR = 3;
 const TRACKER_SUBREQ_RESERVE = 6;
 /**
+ * What ONE alerting row's path spends, and why it is a named number: the
+ * claim CAS, the reservation, the Telegram send and the row's final write.
+ * The maintenance floor below is derived from it (and so is
+ * worker.TRACKER_PASS_SUBREQ_RESERVE), because "the pass fits" has to mean
+ * "a card fits", not "the gates close cleanly".
+ */
+const TRACKER_ALERT_PATH_SUBREQ = 4;
+/**
+ * The ceiling the pass's MAINTENANCE stages (the heal, the baseline repair)
+ * yield to BEFORE they may start (2026-09-26, live).
+ *
+ * WHY: the pass runs LAST and shares the invocation's 50 subrequests with
+ * the scan, so the first trips it spends are trips the row loop cannot have.
+ * Live 2026-09-26T21:39Z: two consecutive passes read `rows 8/30 … subreq-cut
+ * 22 defer-send 22` — 22 alerting rows refused at the reserve gate after the
+ * heal and the repair had taken their trips. The costs are not symmetric: a
+ * refused ALERT is re-derived next tick but its row ages in HOURS (the
+ * oldest read 126 minutes), while the heal is a backstop whose work the same
+ * listing re-offers on the next pass. So the rotation is funded first and
+ * maintenance yields — by NAME, in the coverage note (`heal-yield`), never
+ * silently.
+ *
+ * The number: the tail reserve (TRACKER_SUBREQ_RESERVE) plus ONE alerting
+ * row's path (TRACKER_ALERT_PATH_SUBREQ) — below it, spending the heal would
+ * cost the rotation the card the pass exists for.
+ */
+const TRACKER_MAINTENANCE_SUBREQ_FLOOR =
+  TRACKER_SUBREQ_RESERVE + TRACKER_ALERT_PATH_SUBREQ;
+/**
  * Budget reserved BEFORE a row is claimed (see the row loop). A SILENT row —
  * nothing to announce, which is nearly every row on nearly every pass — costs
  * ONE round trip now (the claim and the check write are the same UPDATE, see
@@ -2384,6 +2413,12 @@ export class PushWatcher {
     let healCut = false;
     let healSkipped = false;
     /**
+     * The heal stood down for the ROTATION's slice (see
+     * TRACKER_MAINTENANCE_SUBREQ_FLOOR), not for its own clock. Named apart
+     * from healSkipped so the note says which ceiling moved it.
+     */
+    let healYield = false;
+    /**
      * Rows this pass REPAIRED (see the baseline-repair stage). Declared next to
      * the heal counters and BEFORE stageNote(), which reads it: the early
      * returns below call stageNote() too, and a `let` declared further down
@@ -2421,7 +2456,9 @@ export class PushWatcher {
     let holderProbeMisses = 0;
     const stageNote = () =>
       `allow ${budgetMs} spend[setup ${spent.setup.ms}/${spent.setup.trips}` +
-      ` heal${healSkipped ? "-skipped" : healCut ? "-cut" : ""}` +
+      ` heal${
+        healYield ? "-yield" : healSkipped ? "-skipped" : healCut ? "-cut" : ""
+      }` +
       ` ${spent.heal.ms}/${spent.heal.trips}` +
       ` miss${healMissing} enrolled${healEnrolled}` +
       ` pairs ${spent.pairs.ms}/${spent.pairs.trips}` +
@@ -2656,6 +2693,9 @@ export class PushWatcher {
     );
     const healPast = () => Date.now() > healDeadline;
     if (healDeadline - healStart < TRACKER_HEAL_MIN_MS) healSkipped = true;
+    // The second ceiling (see TRACKER_MAINTENANCE_SUBREQ_FLOOR): when the
+    // invocation cannot afford the heal AND an alerting row, the card wins.
+    if (subreqsLeft() <= TRACKER_MAINTENANCE_SUBREQ_FLOOR) healYield = true;
     try {
       let missing: Array<{
         token: string;
@@ -2670,7 +2710,7 @@ export class PushWatcher {
        * its budget cut.
        */
       let ledgerRaw: string | null = null;
-      if (!healSkipped) {
+      if (!healSkipped && !healYield) {
         trips += 1;
         const healRead = await this.db.findUntrackedPushesAndLedger(
           now - cfg.windowHours * 3_600_000,
@@ -2681,7 +2721,7 @@ export class PushWatcher {
         ledgerRaw = healRead.ledgerRaw;
         healMissing = missing.length;
       }
-      if (missing.length > 0) {
+      if (missing.length > 0 && subreqsLeft() > TRACKER_MAINTENANCE_SUBREQ_FLOOR) {
         // Two reads hoisted out of the per-coin loop: the audit ring is ONE
         // worker_state row (hasInitialPushAudit re-read it for every coin) and
         // the trade mode is ONE setting (the re-send keyboard asked for it per
@@ -2970,7 +3010,11 @@ export class PushWatcher {
     const needsBaselineRepair =
       !baselineRepairDone ||
       rows.some((r) => r.mcapAtPush <= 0 && r.peakMcap > 0);
-    if (needsBaselineRepair) {
+    // Same ceiling as the heal's (see TRACKER_MAINTENANCE_SUBREQ_FLOOR): a
+    // repair the invocation cannot afford is left UNATTEMPTED, so both of its
+    // triggers stay true (the one-shot flag is only set when the statement
+    // actually goes out) and the next pass retries it.
+    if (needsBaselineRepair && subreqsLeft() > TRACKER_MAINTENANCE_SUBREQ_FLOOR) {
       baselineRepairDone = true;
       trips += 1;
       spent.repair.trips += 1;

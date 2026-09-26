@@ -155,13 +155,17 @@ async function main() {
   // stalled). The scan is the only phase with optional work, so the counter
   // it consults carries the pass's slice.
   await test("subreq reserve: the scan is handed its budget minus the tracker pass's slice", () => {
-    // The pass's own arithmetic: entry floor 3 + tail reserve 6.
-    assert.equal(TRACKER_PASS_SUBREQ_RESERVE, 9);
-    assert.equal(scanSubreqLeft(30), 21);
+    // The pass's own arithmetic: entry floor 3 + tail reserve 6 + ONE alerting
+    // row's path 4 (the claim, the reservation, the send and the final write).
+    // The first version stopped at 9 and the live pass read `rows 8/30 …
+    // subreq-cut 22 defer-send 22`: the pass could start and close while every
+    // card behind it was refused.
+    assert.equal(TRACKER_PASS_SUBREQ_RESERVE, 13);
+    assert.equal(scanSubreqLeft(30), 17);
     assert.equal(scanSubreqLeft(TRACKER_PASS_SUBREQ_RESERVE), 0);
     // Negative is a real answer — clamping it to 0 would read as "exactly at
     // the reserve" and hide that the slice is already spent.
-    assert.equal(scanSubreqLeft(2), -7);
+    assert.equal(scanSubreqLeft(2), -11);
     const workerSrc = fs.readFileSync(
       path.join(__dirname, "..", "src", "worker.ts"),
       "utf8",
@@ -1069,6 +1073,43 @@ async function main() {
     assert.match(String(out.note), /^deferred:subreq-budget /, "the ceiling names itself here too");
     assert.equal(reads.listings, 1, "the setup ran — so this is the between-stage gate, not the door");
     assert.equal(out.checked, 0, "and the row loop was never entered");
+  });
+
+  // The maintenance stages yield to the ROTATION (2026-09-26, live): the pass
+  // runs LAST on the shared 50-subrequest allowance, and the live readings
+  // (`rows 8/30 … subreq-cut 22 defer-send 22`, the oldest row 126 minutes)
+  // showed the heal and the repair taking their trips before the row loop had
+  // any. A refused alert is re-derived next tick but its row ages in HOURS,
+  // while the heal is a backstop the same listing re-offers on the next pass:
+  // so below the maintenance floor the heal stands down — and says so.
+  await test("PushWatcher: a thin slice defers the HEAL, not the rotation", async () => {
+    const db = termDb([termRow()]);
+    let healReads = 0;
+    db.findUntrackedPushesAndLedger = async () => {
+      healReads += 1;
+      return { missing: [], ledgerRaw: null };
+    };
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    // 8 left: above the tail reserve (6), so the rotation can still pay for a
+    // card — below the maintenance floor (10), so the heal must not spend it.
+    const out = await pw.runTick(Date.now() + 5_000, undefined, () => 8);
+    assert.equal(healReads, 0, "the heal never read — the rotation's slice stayed intact");
+    assert.match(String(out.note), /heal-yield/, "and the note names WHY it stood down");
+    assert.equal(out.checked, 1, "the rotation still ran");
+    assert.equal(out.alerted, 1, "and the card the pass exists for went out");
+  });
+
+  await test("PushWatcher: a healthy slice still heals", async () => {
+    const db = termDb([termRow()]);
+    let healReads = 0;
+    db.findUntrackedPushesAndLedger = async () => {
+      healReads += 1;
+      return { missing: [], ledgerRaw: null };
+    };
+    const pw = termWatcher(db, { api: { sendMessage: async () => ({ message_id: 1 }) } }, 2_000);
+    const out = await pw.runTick(Date.now() + 5_000, undefined, () => 50);
+    assert.equal(healReads, 1, "a slice with room runs the heal exactly once");
+    assert.doesNotMatch(String(out.note), /heal-yield/, "and the note does not claim a yield");
   });
 
   await test("PushWatcher: a thrown pass names the stage it died in, with the counter's opinion", async () => {
