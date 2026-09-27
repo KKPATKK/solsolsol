@@ -14156,6 +14156,34 @@ async function main() {
     assert.equal(JSON.parse(writes[0].value).via, "cron-pass");
   });
 
+  await test("subreqs: the fallback opens its window only where it commits (a ping that bails out must not roll the tick's)", () => {
+    // Live 2026-09-27 03:56-03:57Z, first deploy with the owner tag: the scan
+    // tick's own window read [http] 38 — the uptime monitor's /health ping had
+    // opened a window at maybeRunScanIfStale's top and then returned at the
+    // dedupe, rolling the tick's reading mid-scan and leaving 3-subrequest ping
+    // windows in the recent ring instead of a pass's rotation. The window has to
+    // open where the request COMMITS, so the pin is an ORDER: the entry stamp
+    // first, the window reset only after the returns.
+    const src = fs
+      .readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8")
+      .replace(/\s+/g, "");
+    const from = src.indexOf("asyncfunctionmaybeRunScanIfStale(");
+    const to = src.indexOf("exportdefault{", from);
+    assert.ok(from >= 0 && to > from, "the fallback path must exist");
+    const fallback = src.slice(from, to);
+    const stamp = fallback.indexOf("markPreTickEntry(now);");
+    const cadence = fallback.indexOf("if(now-lastScanTriggerAt<SCAN_TRIGGER_INTERVAL_MS)return;");
+    const dedupe = fallback.indexOf('if(typeofat==="number"&&now-at<SCAN_TRIGGER_INTERVAL_MS)return;');
+    const open = fallback.indexOf('beginSubreqWindow(now,"http");');
+    assert.ok(stamp >= 0 && cadence > stamp, "the request's pre-scan slice is still measured from its entry");
+    assert.ok(dedupe > cadence, "both early returns come first");
+    assert.ok(open > dedupe, "the window opens only after them, i.e. only when this request really scans");
+    assert.ok(
+      src.includes('functionbeginPreTick(entryAt:number,owner:SubreqOwner="unknown"):void{beginSubreqWindow(entryAt,owner);markPreTickEntry(entryAt);}'),
+      "the scheduled seam keeps the pair together",
+    );
+  });
+
   await test("subreqs: a window names which invocation opened it (two owners share one isolate)", () => {
     const { beginSubreqWindow, countSubreq, subreqView, resetSubreqWindows } =
       require("../dist/subreqs.js");

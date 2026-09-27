@@ -2162,20 +2162,19 @@ export function preTickView(): PreTickView {
 }
 
 /** Start a fresh pre-scan split for a tick entering the handler. */
-function beginPreTick(entryAt: number, owner: SubreqOwner = "unknown"): void {
-  // The subrequest window opens here, with the pre-scan split: both
-  // handlers (cron and the HTTP fallback) enter through this seam, so a
-  // window is one scan attempt's spend — the unit Cloudflare limits to 50
-  // per invocation (see src/subreqs.ts). Anything else this isolate serves
-  // inside the same window (a webhook, a /debug probe) is counted too, so
-  // the reading is an upper bound on the tick; the phase ring is what
-  // localizes it.
-  //
-  // The OWNER rides along (2026-09-27): the pass's own cron delivery is a
-  // separate invocation that lands on this same isolate most minutes, so
-  // without it a scan front and a pass rotation are one indistinguishable
-  // `turso: N` — and every question about the front's cost is unanswerable.
-  beginSubreqWindow(entryAt, owner);
+/**
+ * Start the PRE-SCAN SLICE at `entryAt`: the entry stamp the split is measured
+ * from (see PreTickView), with the step split reset.
+ *
+ * WHY IT IS APART FROM beginPreTick (2026-09-27): a caller that only wants the
+ * slice MEASURED must not reset this isolate's subrequest counter — the HTTP
+ * fallback used to do exactly that on every request, including the uptime
+ * monitor's /health ping, which then returned without scanning. The reset rolled
+ * the scan tick's own window mid-scan: its remaining counts landed in a
+ * stranger's window and, once windows carried owners, the tick's own reading
+ * came back `owner:"http"` (live 03:56-03:57Z).
+ */
+function markPreTickEntry(entryAt: number): void {
   preTickEntryAt = entryAt;
   preTick = {
     at: entryAt,
@@ -2184,6 +2183,28 @@ function beginPreTick(entryAt: number, owner: SubreqOwner = "unknown"): void {
     preRaceMs: null,
     raceMs: null,
   };
+}
+
+/**
+ * The seam for the paths whose window IS their own: the slice stamp PLUS the
+ * subrequest window — the unit Cloudflare limits to 50 per invocation (see
+ * src/subreqs.ts). Anything else this isolate serves inside the same window (a
+ * webhook, a /debug probe) is counted into it as an upper bound, and the phase
+ * ring localizes the spend.
+ *
+ * The HTTP fallback does NOT enter here: it stamps with markPreTickEntry at the
+ * request's entry and opens its window only where it commits to scanning, so a
+ * ping that then returns cannot roll the scan tick's window mid-scan (see
+ * markPreTickEntry, measured 2026-09-27 03:56-03:57Z).
+ *
+ * The OWNER rides along (2026-09-27): the pass's own cron delivery is a
+ * separate invocation that lands on this same isolate most minutes, so without
+ * it a scan front and a pass rotation are one indistinguishable `turso: N` —
+ * and every question about the front's cost is unanswerable.
+ */
+function beginPreTick(entryAt: number, owner: SubreqOwner = "unknown"): void {
+  beginSubreqWindow(entryAt, owner);
+  markPreTickEntry(entryAt);
 }
 
 /**
@@ -4587,8 +4608,14 @@ async function maybeRunScanIfStale(
   // next invocation overwrites it at its own entry.
   if (ctx) tickWaitUntil = (promise) => ctx.waitUntil(promise);
   // The HTTP fallback's own pre-scan slice: measured from here, because this
-  // is where a request's work before the scan starts (see PreTickView).
-  beginPreTick(now, "http");
+  // is where a request's work before the scan starts (see PreTickView) — but
+  // ONLY the stamp. The subrequest window is opened below, where this request
+  // actually commits to scanning: opening it here (the pre-2026-09-27 shape)
+  // reset the counter on every request, and this path is driven once a minute by
+  // the uptime monitor, which then returned at the dedupe below — rolling the
+  // scan tick's window mid-scan and handing the tick's remaining counts to a
+  // window that never scanned.
+  markPreTickEntry(now);
   if (now - lastScanTriggerAt < SCAN_TRIGGER_INTERVAL_MS) return;
   lastScanTriggerAt = now;
   // Dedupe against a healthy cron: skip when a scan already completed
@@ -4615,6 +4642,10 @@ async function maybeRunScanIfStale(
   } catch {
     // heartbeat unreadable — fail open and run the fallback scan
   }
+  // COMMITTED (see markPreTickEntry above): this request is the scan's owner,
+  // so the window it opens is a scan's window — and every path that returned
+  // above left the open window alone.
+  beginSubreqWindow(now, "http");
   try {
     await runScan(hbRaw, env);
   } catch (err) {
