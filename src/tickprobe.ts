@@ -49,7 +49,8 @@ import { markSubreqPhase, subreqRemaining } from "./subreqs";
  * maps already hold the data the gates read, and its comment on the
  * registration explicitly accepts a lost tick ("the feed re-registers the coin
  * next tick"). So the probe TIMES them always, and can DEFER them: the scanner
- * is handed an already-resolved promise, the real call is queued FIFO, and the
+ * is handed an already-resolved promise, the real call is queued (FIFO across
+ * methods, coalesced per token since 2026-09-27 — see DeferredBucket), and the
  * worker drains the queue AFTER its completion flush (see the worker's
  * `drainDeferredWrites` call), i.e. outside the scan race the claim gate
  * measures.
@@ -63,7 +64,7 @@ import { markSubreqPhase, subreqRemaining } from "./subreqs";
  * 2026-09-20: a deferred write that FAILED used to be counted and dropped
  * (live measurement: `writeDrain` 4 calls / 4 failures = 100%, because an
  * un-awaited drain is cancelled when the invocation returns and its writes
- * reject). The queue now owns the retry — an entry leaves it only once it has
+ * reject). The queue now owns the retry — a record leaves it only once it has
  * landed — so a cancelled drain costs one tick of latency instead of a
  * permanent gap in token_stats (see drainDeferredWrites). The same tick also
  * publishes the GeckoTerminal feed's state onto the summary, since `geo: 0`
@@ -195,7 +196,7 @@ export interface WriteDrainView {
    * table through the same client, so "turso 522" alone does not say whether
    * the registration INSERT or the max-mcap UPDATE is the one that cannot
    * land — and those two have different fixes (batch size vs. a raise-only
-   * statement). The name is the queue entry's own, i.e. the real Db method.
+   * statement). The name is the failing bucket's own, i.e. the real Db method.
    *
    * WHY IT ALSO GOES DURABLE (2026-09-24, later): this mirror is MODULE
    * state, and the isolate holding the backlog is not the one answering
@@ -217,12 +218,23 @@ export interface WriteDrainView {
     at: number;
   } | null;
   /**
-   * Calls still waiting after this drain (0 = the queue is empty). A failed
-   * write is NOT dropped: it stays at the head of the queue and is retried by
-   * the next drain, so `failures > 0` with `pending > 0` reads as "the last
-   * tick's batch did not land yet", not "lost".
+   * CALLS still waiting after this drain (0 = nothing owed). A failed call is
+   * NOT dropped: its records stay in their bucket and are retried by the next
+   * drain, so `failures > 0` with `pending > 0` reads as "the last tick's
+   * batch did not land yet", not "lost". Bounded by the number of deferred
+   * methods (one call per method, see DeferredBucket) — read `owedTokens` for
+   * the backlog behind them.
    */
   pending: number;
+  /**
+   * RECORDS still owed behind those calls — the backlog, which `pending` cannot
+   * express any more: the queue coalesces per token (see DeferredBucket), so one
+   * owed call can carry dozens of records and `pending` stays 0-2 whatever the
+   * backlog is. THIS is the number that used to grow without bound (live
+   * 2026-09-27: 12 → 31 in eleven minutes) and the one that says how far the
+   * token_stats bookkeeping is behind.
+   */
+  owedTokens: number;
   /**
    * Entries this drain did NOT touch because the tracker pass behind it still
    * needed the invocation's subrequest allowance (see DRAIN_TRACKER_RESERVE).
@@ -236,20 +248,30 @@ export interface WriteDrainView {
 }
 
 /**
- * How many times one deferred write may fail before it is dropped. The calls
- * are idempotent (INSERT OR IGNORE / raise-only UPDATE), so retrying is free of
- * consequence; the bound exists so a database that is down for hours cannot
- * grow the in-memory queue without limit.
+ * How many times a deferred BATCH may fail before its records are dropped. The
+ * calls are idempotent (INSERT OR IGNORE / raise-only UPDATE), so retrying is
+ * free of consequence; the bound exists so a database that is down for hours
+ * cannot hold the same records forever (it counts FAILURES per bucket, and the
+ * scanner re-issues whatever it still needs — see DeferredBucket).
  */
 export const DEFERRED_WRITE_MAX_ATTEMPTS = 3;
+
+/**
+ * Records one coalesced call may carry (see DeferredBucket). The payload is a
+ * multi-row statement, so the cap bounds its size: one tick's registration is
+ * ~23-30 feed profiles and its raises are the pool slice, i.e. 40 keeps a
+ * catch-up at the worst case a single tick ALREADY wrote before coalescing,
+ * while a long backlog drains in bounded chunks (what did not fit stays owed).
+ */
+export const DEFERRED_COALESCE_MAX_PER_CALL = 40;
 
 /**
  * Subrequests the write drain leaves for the TRACKER PASS behind it.
  *
  * WHY A FLOOR (live 2026-09-25, ~41 minutes of starvation): the drain is fired
  * from the worker's `onTickEnd` — i.e. as soon as the scan ends, which is
- * BEFORE the tracker pass in that invocation's tail — and it walks its queue
- * with no ceiling at all: `while (queue.length > 0)`. Its cost is therefore
+ * BEFORE the tracker pass in that invocation's tail — and it used to walk its
+ * queue with no ceiling at all (an entry per call). Its cost was therefore
  * "however long the backlog is", and a 20-entry backlog is 20 Turso round trips
  * spent in front of the one stage that runs LAST and is explicitly the residual
  * claimant of the platform's 50-subrequest allowance (see worker.ts's note on
@@ -293,6 +315,25 @@ export const WRITE_DRAIN_ERROR_KEY = "write_drain_error";
 export const WRITE_DRAIN_ERROR_STALE_MS = 10 * 60_000;
 
 /**
+ * Whether a durable drain-failure record is HISTORY rather than a live failure
+ * (see WRITE_DRAIN_ERROR_STALE_MS).
+ *
+ * ONE rule for both readers, because they must never disagree: /health's
+ * `writeDrainErrorStale` flag and the retirement that deletes a row nobody
+ * will ever clear (see the retire in worker.ts's /health). A record without a
+ * usable `at` is never stale — an unreadable row must not license a write.
+ */
+export function drainErrorIsStale(
+  record: { at?: unknown } | null | undefined,
+  now: number,
+): boolean {
+  if (record === null || record === undefined || typeof record !== "object") return false;
+  const at = Number((record as { at?: unknown }).at);
+  if (!Number.isFinite(at) || at <= 0) return false;
+  return now - at > WRITE_DRAIN_ERROR_STALE_MS;
+}
+
+/**
  * What that row holds: the failed drain's own record (see
  * WriteDrainView.lastError) plus `pending` — the size of the queue the failure
  * stalled, which is the number that separates a blip from an outage.
@@ -303,6 +344,12 @@ export const WRITE_DRAIN_ERROR_STALE_MS = 10 * 60_000;
  */
 export type WriteDrainErrorRecord = NonNullable<WriteDrainView["lastError"]> & {
   pending: number;
+  /**
+   * Records the failure stalled (see WriteDrainView.owedTokens) — the backlog
+   * the reader needs, since `pending` counts coalesced CALLS and is 0-2.
+   * Optional because a record written before 2026-09-27 does not carry it.
+   */
+  owedTokens?: number;
 };
 
 /**
@@ -361,18 +408,178 @@ let cardSend: CardSendView = {
 let dbClock: () => number = () => Date.now();
 
 /**
- * One deferred write waiting for the drain. `attempts` counts FAILED runs: an
- * entry leaves the queue when it lands, or after DEFERRED_WRITE_MAX_ATTEMPTS
- * (see drainDeferredWrites for why the queue, not the batch, owns the state).
+ * One COALESCED deferred write: everything owed to ONE Db method on ONE handle.
+ *
+ * WHY ONE BUCKET PER METHOD INSTEAD OF ONE ENTRY PER CALL (2026-09-27): the
+ * queue held every call VERBATIM, and both deferred calls decide what to write
+ * from the STORED value — `recordTokenStatsMany` only registers a token the
+ * stats read did not return, `updateTokenMaxMcaps` only raises a maximum — so a
+ * write that has not landed yet makes the SAME token look new again on the next
+ * tick and queues ANOTHER copy of it. Live 2026-09-27: `pending` went 12 → 31
+ * in eleven minutes while `totals.calls` went 2 → 7, every entry
+ * `heldForTracker` (the drain never got room), i.e. the queue was feeding
+ * itself and could only grow. Coalescing by token makes the backlog BOUNDED by
+ * the number of DISTINCT tokens owed rather than by the number of ticks that
+ * wanted them, turns a catch-up into ONE round trip per method, and removes the
+ * duplicates that were the growth.
+ *
+ * `owed` maps each record's own token to the record still waiting, insertion
+ * ordered (Map), so one bucket's payload keeps the order it was absorbed in.
+ * `rank` fixes the LANDING order ACROSS buckets: a registration must land
+ * before a raise for the same token, or the raise's UPDATE matches no row and
+ * the high-water mark is silently lost.
  */
-interface DeferredCall {
+interface DeferredBucket {
   name: string;
-  run: () => Promise<unknown>;
+  rank: number;
+  /** The original Db method, captured at install (the wrapper replaces it). */
+  call: (...args: unknown[]) => Promise<unknown>;
+  owed: Map<string, unknown>;
+  /** Merge one absorbed call's arguments into `owed` (first-wins / max-wins). */
+  absorb: (args: readonly unknown[]) => void;
+  /** FAILED runs: an owed batch is dropped after DEFERRED_WRITE_MAX_ATTEMPTS. */
   attempts: number;
 }
 
-/** Writes waiting for the drain, in call order. */
-let queue: DeferredCall[] = [];
+/** Every bucket this isolate has opened (see DeferredBucket). */
+let buckets: DeferredBucket[] = [];
+/** Unique keys for records a bucket cannot coalesce by token (see below). */
+let opaqueRecords = 0;
+
+/** Records owed across every bucket (0 = nothing to drain). */
+function owedRecordCount(): number {
+  let n = 0;
+  for (const bucket of buckets) n += bucket.owed.size;
+  return n;
+}
+
+/**
+ * The buckets with something owed, in LANDING order (see DeferredBucket.rank).
+ * A stable sort, so equal ranks keep the order they were opened in — a rebuilt
+ * handle's bucket never overtakes the live one's.
+ */
+function owedBuckets(): DeferredBucket[] {
+  return buckets.filter((bucket) => bucket.owed.size > 0).sort((a, b) => a.rank - b.rank);
+}
+
+/**
+ * The coalescing key of one deferred record: the token it writes. A record
+ * without one (a test double's primitive, or a future call shape) gets a unique
+ * key instead, so it keeps its own slot rather than being merged into a
+ * stranger's row.
+ */
+function deferredRecordKey(record: unknown): string {
+  if (typeof record === "string" && record.length > 0) return record;
+  if (record !== null && typeof record === "object") {
+    const token = (record as { token?: unknown }).token;
+    if (typeof token === "string" && token.length > 0) return token;
+  }
+  opaqueRecords += 1;
+  return `#${opaqueRecords}`;
+}
+
+/**
+ * Registration absorbs FIRST-WINS: the FIRST sight of a token is the row's
+ * truth (`recordTokenStatsMany` is INSERT OR IGNORE, and re-absorbing a later
+ * sight would move first_seen_at forward — the pool's age signal).
+ */
+function absorbFirstWins(owed: Map<string, unknown>, args: readonly unknown[]): void {
+  const list = Array.isArray(args[0]) ? (args[0] as unknown[]) : [];
+  for (const record of list) {
+    const key = deferredRecordKey(record);
+    if (owed.has(key)) continue;
+    owed.set(key, record);
+  }
+}
+
+/**
+ * Two raise records merged into one — MAX-WINS on both columns, which is
+ * IDENTICAL to landing them in sequence: the statement is raise-only, so the
+ * column ends at max(stored, a, b) either way. A finite liquidity reading (0
+ * included — a corpse's $0 LP is its signal) survives a later record that has
+ * none.
+ */
+function mergeRaise(prev: unknown, next: unknown): Record<string, unknown> {
+  const a = (prev ?? {}) as { token?: unknown; mcapUsd?: unknown; liquidityUsd?: unknown };
+  const b = (next ?? {}) as { token?: unknown; mcapUsd?: unknown; liquidityUsd?: unknown };
+  const mcap = Math.max(Number(a.mcapUsd) || 0, Number(b.mcapUsd) || 0);
+  const la =
+    typeof a.liquidityUsd === "number" && Number.isFinite(a.liquidityUsd)
+      ? a.liquidityUsd
+      : undefined;
+  const lb =
+    typeof b.liquidityUsd === "number" && Number.isFinite(b.liquidityUsd)
+      ? b.liquidityUsd
+      : undefined;
+  const liquidityUsd = la === undefined ? lb : lb === undefined ? la : Math.max(la, lb);
+  const merged: Record<string, unknown> = {
+    token: typeof a.token === "string" && a.token.length > 0 ? a.token : b.token,
+    mcapUsd: mcap,
+  };
+  if (liquidityUsd !== undefined) merged.liquidityUsd = liquidityUsd;
+  return merged;
+}
+
+/** Raise-only bookkeeping absorbs MAX-WINS (see mergeRaise). */
+function absorbMaxWins(owed: Map<string, unknown>, args: readonly unknown[]): void {
+  const list = Array.isArray(args[0]) ? (args[0] as unknown[]) : [];
+  for (const record of list) {
+    const key = deferredRecordKey(record);
+    const prev = owed.get(key);
+    owed.set(key, prev === undefined ? record : mergeRaise(prev, record));
+  }
+}
+
+/**
+ * The bucket for one (method, handle) pair, opened on first use: a rebuilt Db
+ * handle (the worker's dead-tick rebuild) gets its own, so a record never rides
+ * a handle that is no longer the one the scanner writes through.
+ */
+function bucketFor(
+  name: string,
+  rank: number,
+  call: (...args: unknown[]) => Promise<unknown>,
+  absorb: (owed: Map<string, unknown>, args: readonly unknown[]) => void,
+): DeferredBucket {
+  for (const bucket of buckets) {
+    if (bucket.name === name && bucket.call === call) return bucket;
+  }
+  const owed = new Map<string, unknown>();
+  const bucket: DeferredBucket = {
+    name,
+    rank,
+    call,
+    owed,
+    absorb: (args) => absorb(owed, args),
+    attempts: 0,
+  };
+  buckets.push(bucket);
+  return bucket;
+}
+
+/**
+ * Land what one bucket owes: up to DEFERRED_COALESCE_MAX_PER_CALL records in
+ * ONE call. Only the records that actually landed leave the bucket, so a failed
+ * call re-offers its whole slice to the next drain — the container's "an entry
+ * leaves the queue only once it has landed", now per record.
+ */
+async function runBucket(bucket: DeferredBucket): Promise<void> {
+  const keys: string[] = [];
+  const payload: unknown[] = [];
+  for (const [key, record] of bucket.owed) {
+    keys.push(key);
+    payload.push(record);
+    if (payload.length >= DEFERRED_COALESCE_MAX_PER_CALL) break;
+  }
+  const at = dbClock();
+  try {
+    await bucket.call(payload);
+  } finally {
+    // Timed where it REALLY ran, exactly like every other censused call.
+    noteStep(bucket.name, dbClock() - at);
+  }
+  for (const key of keys) bucket.owed.delete(key);
+}
 /** One drain at a time — the queue is walked in place (see drainDeferredWrites). */
 let draining = false;
 /**
@@ -404,6 +611,7 @@ let drain: WriteDrainView = {
   failures: 0,
   lastError: null,
   pending: 0,
+  owedTokens: 0,
   heldForTracker: 0,
   totals: { calls: 0, ms: 0, failures: 0 },
 };
@@ -538,9 +746,14 @@ export function writeDrainView(): WriteDrainView {
   return { ...drain, totals: { ...drain.totals } };
 }
 
-/** How many deferred writes are still waiting (0 = nothing queued). */
+/**
+ * How many deferred RECORDS are still waiting (0 = nothing queued). Records,
+ * not calls: the queue coalesces per token (see DeferredBucket), so this is the
+ * backlog a reader means by "how much bookkeeping is behind" — the number of
+ * owed CALLS is `writeDrainView().pending`.
+ */
 export function deferredWriteCount(): number {
-  return queue.length;
+  return owedRecordCount();
 }
 
 /**
@@ -575,11 +788,19 @@ export async function drainDeferredWrites(
   // Entries this drain walked past to keep the tracker pass's slice intact.
   let heldForTracker = 0;
   try {
-    if (queue.length === 0) {
+    if (owedRecordCount() === 0) {
       // Nothing was queued: report the empty batch without erasing the last
       // real drain's stamp, so a reader can tell "nothing to do" from "never
       // drained".
-      drain = { ...drain, calls: 0, ms: 0, failures: 0, pending: 0, heldForTracker: 0 };
+      drain = {
+        ...drain,
+        calls: 0,
+        ms: 0,
+        failures: 0,
+        pending: 0,
+        owedTokens: 0,
+        heldForTracker: 0,
+      };
       // An empty queue is also the DRY half of a recovery: if this isolate left
       // a failure row behind, it now describes an incident that is over.
       await clearPersistedDrainError();
@@ -597,41 +818,45 @@ export async function drainDeferredWrites(
     // the token_stats bookkeeping never landed at all. Retrying the failed
     // entry on the next drain turns that permanent data gap into one tick of
     // latency (writeDrain.pending keeps it visible while it waits).
-    while (queue.length > 0) {
+    // One round trip per BUCKET, not per record (see DeferredBucket): the
+    // backlog is measured in records (`owedTokens`) but paid for in calls.
+    const ready = owedBuckets();
+    while (ready.length > 0) {
       // The tracker pass runs BEHIND this drain in the same invocation (the
       // worker fires the drain from onTickEnd and calls runTrackerPass in its
       // tail), and it is the stage that both needs the most round trips and has
       // no reservation of its own — it defers by name instead. So the drain
-      // yields: a held entry is not lost, it just waits (see the queue's own
+      // yields: a held bucket is not lost, it just waits (see the queue's own
       // "an entry leaves it only once it has landed").
       if (subreqLeft() <= DRAIN_TRACKER_RESERVE) {
-        heldForTracker = queue.length;
+        heldForTracker = ready.length;
         break;
       }
-      const call = queue[0];
+      const bucket = ready.shift();
+      if (!bucket) break;
       calls += 1;
       try {
-        await call.run();
-        queue.shift();
+        await runBucket(bucket);
       } catch (err) {
         failures += 1;
-        call.attempts += 1;
+        bucket.attempts += 1;
         const message = err instanceof Error ? err.message : err;
         lastError = {
-          method: call.name,
+          method: bucket.name,
           name: err instanceof Error ? err.name : "Error",
           message: typeof message === "string" ? message : String(message),
           at: dbClock(),
         };
-        if (call.attempts >= DEFERRED_WRITE_MAX_ATTEMPTS) {
-          queue.shift();
+        const owed = bucket.owed.size;
+        if (bucket.attempts >= DEFERRED_WRITE_MAX_ATTEMPTS) {
+          bucket.owed.clear();
           console.error(
-            `[tickprobe] deferred ${call.name} failed ${call.attempts}x — dropping it:`,
+            `[tickprobe] deferred ${bucket.name} failed ${bucket.attempts}x — dropping ${owed} record(s):`,
             message,
           );
         } else {
           console.error(
-            `[tickprobe] deferred ${call.name} failed (attempt ${call.attempts}/${DEFERRED_WRITE_MAX_ATTEMPTS}) — kept for the next drain:`,
+            `[tickprobe] deferred ${bucket.name} failed (attempt ${bucket.attempts}/${DEFERRED_WRITE_MAX_ATTEMPTS}) — ${owed} record(s) kept for the next drain:`,
             message,
           );
         }
@@ -650,7 +875,8 @@ export async function drainDeferredWrites(
     at: dbClock(),
     failures,
     lastError,
-    pending: queue.length,
+    pending: owedBuckets().length,
+    owedTokens: owedRecordCount(),
     heldForTracker,
     totals: {
       calls: drain.totals.calls + calls,
@@ -665,7 +891,7 @@ export async function drainDeferredWrites(
   // failure: a drain that landed (`lastError === null`) writes nothing, so a
   // healthy tick pays nothing for this.
   if (lastError !== null) {
-    await persistDrainError(lastError, queue.length);
+    await persistDrainError(lastError, owedBuckets().length, owedRecordCount());
   } else {
     // THE RECOVERY HALF (2026-09-25): the row is only ever rewritten by a
     // FAILURE, so without this a single bad minute left it standing forever —
@@ -705,10 +931,14 @@ export async function drainDeferredWrites(
 async function persistDrainError(
   error: NonNullable<WriteDrainView["lastError"]>,
   pending: number,
+  owedTokens: number,
 ): Promise<void> {
   if (stateWriter === null) return;
   try {
-    await stateWriter(WRITE_DRAIN_ERROR_KEY, JSON.stringify({ ...error, pending }));
+    await stateWriter(
+      WRITE_DRAIN_ERROR_KEY,
+      JSON.stringify({ ...error, pending, owedTokens }),
+    );
     drainErrorPersisted = true;
   } catch {
     // See above: a record that cannot be written must not cost the tail.
@@ -746,7 +976,8 @@ export function resetTickProbe(): void {
   view = null;
   tickStartedAt = 0;
   stamps = [];
-  queue = [];
+  buckets = [];
+  opaqueRecords = 0;
   steps.clear();
   // The census baseline goes with the cumulative map it was copied from:
   // a stale snapshot would subtract another run's calls from this one's.
@@ -762,6 +993,7 @@ export function resetTickProbe(): void {
     failures: 0,
     lastError: null,
     pending: 0,
+    owedTokens: 0,
     heldForTracker: 0,
     totals: { calls: 0, ms: 0, failures: 0 },
   };
@@ -807,6 +1039,13 @@ function wrapDbMethod(
   target: Record<string, unknown>,
   name: string,
   defer: boolean,
+  /**
+   * The coalescing rule for a deferred call (see DeferredBucket). REQUIRED when
+   * `defer` is on: the probe refuses to defer a call it cannot merge by token,
+   * because the un-coalesced queue is what grew without bound.
+   */
+  absorb?: (owed: Map<string, unknown>, args: readonly unknown[]) => void,
+  rank = 0,
 ): void {
   const original = target[name];
   if (typeof original !== "function") return;
@@ -817,7 +1056,7 @@ function wrapDbMethod(
     // methods the KEY is exactly what the census has to name (see
     // dbStepLabel).
     const label = dbStepLabel(name, args);
-    if (!defer || !tickActive) {
+    if (!defer || !tickActive || !absorb) {
       const at = dbClock();
       return call.apply(target, args).then(
         (value) => {
@@ -830,18 +1069,11 @@ function wrapDbMethod(
         },
       );
     }
-    queue.push({
-      name,
-      attempts: 0,
-      run: async () => {
-        const at = dbClock();
-        try {
-          return await call.apply(target, args);
-        } finally {
-          noteStep(label, dbClock() - at);
-        }
-      },
-    });
+    // Deferred: the scanner keeps its already-resolved promise, the record
+    // goes into this method's bucket, and the drain lands it (see
+    // drainDeferredWrites / runBucket — the timing note is taken there, where
+    // the call REALLY runs).
+    bucketFor(name, rank, call, absorb).absorb(args);
     return Promise.resolve();
   };
 }
@@ -919,8 +1151,11 @@ function wrapDb(db: TickProbeDb, deferWrites: boolean): void {
   // Reads keep their contract (the gates consume the result in this tick).
   wrapDbMethod(target, "getTokenStatsMany", false);
   // Writes: registration + raise-only bookkeeping, neither read by the gates.
-  wrapDbMethod(target, "recordTokenStatsMany", deferWrites);
-  wrapDbMethod(target, "updateTokenMaxMcaps", deferWrites);
+  // The merge rules are the two coalescing absorbs (see DeferredBucket), and
+  // the ranks fix the order they LAND in: a registration must exist before a
+  // raise for the same token can match it.
+  wrapDbMethod(target, "recordTokenStatsMany", deferWrites, absorbFirstWins, 0);
+  wrapDbMethod(target, "updateTokenMaxMcaps", deferWrites, absorbMaxWins, 1);
   // The census: timed, never deferred (see CENSUS_METHODS). `setWorkerState`
   // is in it on purpose — the header's warning is about DEFERRING it (it is
   // the channel a failed drain publishes its own reason through), and a timed

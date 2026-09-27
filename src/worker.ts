@@ -58,7 +58,8 @@ import {
   writeDrainView,
   drainDeferredWrites,
   noteDuplicateCards,
-  WRITE_DRAIN_ERROR_STALE_MS,
+  WRITE_DRAIN_ERROR_KEY,
+  drainErrorIsStale,
   type WriteDrainErrorRecord,
 } from "./tickprobe";
 import {
@@ -5093,6 +5094,28 @@ export default {
             writeDrainError = null;
           }
         }
+        // RETIRE A STALE RECORD (2026-09-27). The row is cleared by the isolate
+        // that WROTE it (see clearPersistedDrainError), so an isolate recycled
+        // before its own recovery leaves it standing forever: live that day a
+        // poll read a record from 2026-09-25 (2.2 days old, `pending 30`) while
+        // every drain behind it had landed. The reader that RENDERS the field
+        // is the one place that sees it from any isolate, and /health is polled
+        // every minute, so retiring it here costs ONE write per incident:
+        // nothing to do when there is no row, and a LIVE row stays the writer's
+        // own to clear — this only touches what WRITE_DRAIN_ERROR_STALE_MS
+        // already calls history. Durable like the clear (waited on, not
+        // floating: an un-awaited write is cancelled when the handler returns).
+        if (db && drainErrorIsStale(writeDrainError, Date.now())) {
+          const retiring = db
+            .setWorkerState(WRITE_DRAIN_ERROR_KEY, "")
+            .catch(() => undefined);
+          try {
+            ctx.waitUntil(retiring);
+          } catch {
+            // A caller without a live context (tests) must not see a rejection.
+            void retiring;
+          }
+        }
         const rawPass = tickState?.get("push_watch_pass") ?? null;
         pushWatchPass = rawPass ? JSON.parse(rawPass) : null;
         // The count, not the listing: /health only ever used the length of
@@ -5243,10 +5266,14 @@ export default {
         // clearPersistedDrainError); this flag covers the cross-isolate case —
         // the isolate answering /health is not necessarily the one that
         // failed — so a stale record can never be read as a current one.
+        // The SAME threshold the retire above applies (see drainErrorIsStale),
+        // so a row this handler would delete can never be the one the flag
+        // calls live. null keeps its old meaning ("no usable record") — an
+        // unreadable row must not read as a boolean either way.
         writeDrainErrorStale:
-          writeDrainError === null || !(writeDrainError.at > 0)
+          writeDrainError === null || !(Number(writeDrainError.at) > 0)
             ? null
-            : Date.now() - writeDrainError.at > WRITE_DRAIN_ERROR_STALE_MS,
+            : drainErrorIsStale(writeDrainError, Date.now()),
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         // Cross-isolate single-flight: how often this isolate skipped a

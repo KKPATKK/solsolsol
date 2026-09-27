@@ -1269,6 +1269,12 @@ export interface ScanSummary {
     at: number;
     failures: number;
     totals: { calls: number; ms: number; failures: number };
+    /** CALLS still owed (the queue coalesces per token, so this is 0-2). */
+    pending?: number;
+    /** Records still owed behind those calls — the backlog (see tickprobe). */
+    owedTokens?: number;
+    /** Calls held back for the tracker pass behind the drain. */
+    heldForTracker?: number;
   } | null;
   /**
    * Wall-clock ms the scan spent in tick-scoped Turso round trips (see

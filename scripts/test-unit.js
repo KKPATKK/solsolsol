@@ -827,8 +827,10 @@ async function main() {
     const applied = {
       "probe (durable key)": probeSrc.includes("export const WRITE_DRAIN_ERROR_KEY"),
       "probe (record type)": probeSrc.includes("export type WriteDrainErrorRecord"),
-      "probe (which method threw)": probeSrc.includes("method: call.name,"),
-      "probe (the durable copy)": probeSrc.includes("persistDrainError(lastError, queue.length)"),
+      "probe (which method threw)": probeSrc.includes("method: bucket.name,"),
+      "probe (the durable copy)": probeSrc.includes(
+        "persistDrainError(lastError, owedBuckets().length, owedRecordCount())",
+      ),
       "db (repairPushWatchBaselines)": dbSrc.includes("async repairPushWatchBaselines()"),
       "db (the peak guard)": dbSrc.includes("AND peak_mcap > 0"),
       "worker (reads the row)": workerSrc.includes('"write_drain_error",'),
@@ -8274,17 +8276,24 @@ async function main() {
     const landedOf = (db) => db.landed.length;
     resetTickProbe();
     const db = mkDb();
-    // The fake records the writes it actually ran.
-    db.recordTokenStatsMany = async (tokens) => { db.landed.push(tokens.length); };
+    // The fake records WHAT each call carried, so coalescing is visible.
+    db.recordTokenStatsMany = async (tokens) => { db.landed.push(tokens.slice()); };
     await runTick(db, 3);
     assert.equal(landedOf(db), 0, "a deferred write does not land inside the tick");
-    assert.equal(deferredWriteCount(), 3, "it waits in the queue");
+    assert.equal(deferredWriteCount(), 3, "three records wait");
+    // The queue COALESCES (2026-09-27): three calls of one method are ONE round
+    // trip carrying three records, so the backlog (records) and the cost (calls)
+    // are different readings. `pending`/`owedTokens` are DRAIN-TIME snapshots —
+    // the calls half is pinned by the held case below, where a drain reports it.
+    assert.equal(deferredWriteCount(), 3, "three records are owed behind one call");
 
-    // (a) With the allowance roomy, the drain lands the whole batch — the
-    //     behaviour a healthy tick has always had.
+    // (a) With the allowance roomy, the drain lands the whole batch in ONE call
+    //     — the behaviour a healthy tick has always had, now in one round trip.
     await drainDeferredWrites(() => 50);
-    assert.equal(landedOf(db), 3);
+    assert.equal(landedOf(db), 1, "one coalesced call lands the batch");
+    assert.deepEqual(db.landed[0], ["T0", "T1", "T2"], "carrying every record in call order");
     assert.equal(writeDrainView().pending, 0);
+    assert.equal(writeDrainView().owedTokens, 0);
     assert.equal(writeDrainView().heldForTracker, 0, "nothing was held");
 
     // (b) With only the tracker's reserve left, the batch is HELD — and held is
@@ -8295,16 +8304,196 @@ async function main() {
     await drainDeferredWrites(() => DRAIN_TRACKER_RESERVE);
     assert.equal(landedOf(db), before, "the tracker's slice is not spent");
     const held = writeDrainView();
-    assert.equal(held.heldForTracker, 3, "the view names why the batch stopped");
-    assert.equal(held.pending, 3, "the entries stay queued");
+    assert.equal(held.heldForTracker, 1, "the view names the CALL it held");
+    assert.equal(held.pending, 1, "the call stays owed");
+    assert.equal(held.owedTokens, 3, "with all three records behind it");
     assert.equal(held.failures, 0, "held is not failed");
     assert.equal(held.lastError, null, "and it is not a write-drain error");
 
-    // (c) The next drain takes them once the allowance is back.
+    // (c) The next drain takes them once the allowance is back — still ONE call.
     await drainDeferredWrites(() => 40);
-    assert.equal(landedOf(db), before + 3);
-    assert.equal(writeDrainView().pending, 0);
+    assert.equal(landedOf(db), before + 1, "the catch-up is one round trip");
+    assert.equal(db.landed[before].length, 3, "carrying all three records");
+    assert.equal(writeDrainView().owedTokens, 0);
     resetTickProbe();
+  });
+
+  await test("tickprobe: the deferred queue coalesces per token", async () => {
+    // WHY (2026-09-27): both deferred calls decide what to write from the STORED
+    // value — the registration only writes a token the stats read did not
+    // return, the raise only raises a maximum — so a write that has not landed
+    // makes the SAME token look new again on the next tick and queues another
+    // copy of it. Live: `pending` 12 → 31 in eleven minutes with every entry
+    // `heldForTracker` (the drain never got room), i.e. the queue fed itself.
+    // Coalescing bounds the backlog by DISTINCT tokens and makes a catch-up one
+    // call per method.
+    const {
+      installTickProbe,
+      drainDeferredWrites,
+      resetTickProbe,
+      writeDrainView,
+      deferredWriteCount,
+      DEFERRED_COALESCE_MAX_PER_CALL,
+    } = require("../dist/tickprobe.js");
+    const calls = [];
+    const db = {
+      recordTokenStatsMany: async (records) => {
+        // The RECORDS matter, not just the tokens: first-wins is a claim about
+        // which sight of a token survives (first_seen_at is the pool's age).
+        calls.push({ name: "register", tokens: records.map((r) => r.token), records });
+      },
+      updateTokenMaxMcaps: async (records) => { calls.push({ name: "raise", records }); },
+    };
+    const tick = async (fn) => {
+      const seam = { runOnce: async () => { await fn(); } };
+      installTickProbe(seam, { db, deferWrites: true });
+      await seam.runOnce();
+    };
+    resetTickProbe();
+
+    await tick(async () => {
+      await db.recordTokenStatsMany([
+        { token: "A", firstSeenAt: 100 },
+        { token: "B", firstSeenAt: 100 },
+      ]);
+      await db.updateTokenMaxMcaps([{ token: "A", mcapUsd: 5, liquidityUsd: 1000 }]);
+    });
+    await tick(async () => {
+      await db.recordTokenStatsMany([{ token: "A", firstSeenAt: 900 }]);
+      await db.updateTokenMaxMcaps([{ token: "A", mcapUsd: 9 }]);
+    });
+    assert.equal(
+      deferredWriteCount(),
+      3,
+      "three records across two buckets — two registrations and one raise, not the four calls that were made",
+    );
+    const drained = await drainDeferredWrites(() => 50);
+    assert.equal(drained.calls, 2, "one call per method, whatever the record count");
+    assert.equal(drained.owedTokens, 0, "nothing left owed");
+    assert.deepEqual(
+      calls,
+      [
+        {
+          name: "register",
+          tokens: ["A", "B"],
+          records: [
+            { token: "A", firstSeenAt: 100 },
+            { token: "B", firstSeenAt: 100 },
+          ],
+        },
+        {
+          name: "raise",
+          records: [{ token: "A", mcapUsd: 9, liquidityUsd: 1000 }],
+        },
+      ],
+      "registration lands first and keeps the FIRST sight (A's firstSeenAt stays 100, not the second tick's 900); the raise keeps the MAX on both columns (a finite liquidity survives a record without one)",
+    );
+
+    // The cap: a backlog longer than one call may carry drains in chunks, and
+    // what did not fit stays owed.
+    calls.length = 0;
+    await tick(async () => {
+      for (let i = 0; i < DEFERRED_COALESCE_MAX_PER_CALL + 3; i += 1) {
+        await db.recordTokenStatsMany([{ token: `C${i}`, firstSeenAt: 1 }]);
+      }
+    });
+    assert.equal(
+      deferredWriteCount(),
+      DEFERRED_COALESCE_MAX_PER_CALL + 3,
+      "every record is owed",
+    );
+    const first = await drainDeferredWrites(() => 50);
+    assert.equal(first.calls, 1, "one call");
+    assert.equal(
+      calls[0].tokens.length,
+      DEFERRED_COALESCE_MAX_PER_CALL,
+      "capped at what one statement may carry",
+    );
+    assert.equal(deferredWriteCount(), 3, "the rest stays owed");
+    const second = await drainDeferredWrites(() => 50);
+    assert.equal(calls[1].tokens.length, 3, "the next drain takes the remainder");
+    assert.equal(second.owedTokens, 0, "and the backlog is empty");
+
+    // LANDING ORDER: a registration must beat the raise for the same token, or
+    // the raise's UPDATE matches no row and the high-water mark is lost — so
+    // the order is fixed by rank, not by which bucket was opened first.
+    resetTickProbe();
+    const order = [];
+    const db2 = {
+      recordTokenStatsMany: async () => { order.push("register"); },
+      updateTokenMaxMcaps: async () => { order.push("raise"); },
+    };
+    const tick2 = async (fn) => {
+      const seam = { runOnce: async () => { await fn(); } };
+      installTickProbe(seam, { db: db2, deferWrites: true });
+      await seam.runOnce();
+    };
+    await tick2(async () => { await db2.updateTokenMaxMcaps([{ token: "Z", mcapUsd: 3 }]); });
+    await tick2(async () => { await db2.recordTokenStatsMany([{ token: "Z", firstSeenAt: 1 }]); });
+    await drainDeferredWrites(() => 50);
+    assert.deepEqual(
+      order,
+      ["register", "raise"],
+      "the raise lands after the registration it depends on",
+    );
+    resetTickProbe();
+  });
+
+  await test("tickprobe: a drain record is retired once it is history", () => {
+    // WHY (2026-09-27): the row is only cleared by the isolate that WROTE it
+    // (see clearPersistedDrainError), so an isolate recycled before its own
+    // recovery leaves it standing forever — live that day a poll read a record
+    // from 2026-09-25 (2.2 days old, `pending 30`) while every drain behind it
+    // had landed. /health renders that field from ANY isolate, so it retires
+    // what its own stale flag already calls history, with ONE write.
+    const { drainErrorIsStale, WRITE_DRAIN_ERROR_STALE_MS } = require("../dist/tickprobe.js");
+    const now = 1_800_000_000_000;
+    assert.equal(drainErrorIsStale(null, now), false, "no record is not a stale record");
+    assert.equal(drainErrorIsStale(undefined, now), false);
+    assert.equal(drainErrorIsStale({}, now), false, "a record with no usable at never licenses a write");
+    assert.equal(drainErrorIsStale({ at: 0 }, now), false);
+    assert.equal(drainErrorIsStale({ at: "not-a-number" }, now), false);
+    assert.equal(
+      drainErrorIsStale({ at: now - 60_000 }, now),
+      false,
+      "a fresh failure stays the writer's own to clear",
+    );
+    assert.equal(
+      drainErrorIsStale({ at: now - WRITE_DRAIN_ERROR_STALE_MS }, now),
+      false,
+      "the boundary itself is still live",
+    );
+    assert.equal(
+      drainErrorIsStale({ at: now - WRITE_DRAIN_ERROR_STALE_MS - 1 }, now),
+      true,
+      "one ms past it is history",
+    );
+
+    // The wiring, whitespace-squashed (the same discipline the prune pins use):
+    // ONE write under the key the row lives in, kept alive by the invocation,
+    // and the published flag reading the SAME threshold so the two can never
+    // disagree about which rows are history.
+    const WS = new Set([9, 10, 13, 32]);
+    const strip = (text) => [...text].filter((ch) => !WS.has(ch.charCodeAt(0))).join("");
+    const workerSrc = strip(fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8"));
+    assert.ok(
+      workerSrc.includes("if(db&&drainErrorIsStale(writeDrainError,Date.now())){"),
+      "the retire fires on the shared rule",
+    );
+    assert.ok(
+      workerSrc.includes('db.setWorkerState(WRITE_DRAIN_ERROR_KEY,"")'),
+      "and clears the row it read, under the same key",
+    );
+    assert.ok(
+      workerSrc.includes("ctx.waitUntil(retiring)"),
+      "awaited by the invocation instead of floating (an un-awaited write is cancelled on return)",
+    );
+    assert.ok(
+      workerSrc.includes(
+        "writeDrainErrorStale:writeDrainError===null||!(Number(writeDrainError.at)>0)?null:drainErrorIsStale(writeDrainError,Date.now())",
+      ),
+      "the published flag is the same rule",
+    );
   });
 
   await test("tickprobe: the census names what a tick's scan paid, per method", async () => {
