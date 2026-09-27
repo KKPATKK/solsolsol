@@ -49,6 +49,7 @@ import {
 import { FlurryAnalyzer, type FlurryOutcome, type FlurryReport } from "./flurry";
 import {
   addDeferredToken,
+  DEFERRED_MAKEUP_MAX,
   deferredTokenList,
   dropDeferredToken,
   hydrateDeferredTokens,
@@ -1124,6 +1125,17 @@ export interface RejectionEntry {
   vol5Usd: number;
   chgPct: number;
   reason: string;
+  /**
+   * True when this coin is an UNPAID deferred-card obligation (a coin the bot
+   * owes somebody a card) rather than one of the feed's own discoveries.
+   *
+   * Marked because the two are otherwise indistinguishable in the list, and
+   * the debt is the entry an operator actually reads the log for: it is the
+   * only rejection that explains a standing obligation instead of a missed
+   * card (see logBudget — owed coins are also exempt from the feed's slot
+   * budget, for the reason recorded there).
+   */
+  owed?: boolean;
 }
 
 /** Rejection reasons from the last completed scan (surfaced via /health). */
@@ -3611,17 +3623,34 @@ export class Scanner {
       diag.poolMs = Date.now() - poolStart;
       const evalStart = Date.now();
       const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
-      // REJECT_LOG_MAX (50) is smaller than feed+slice (~90+ coins/tick), so
+      // REJECT_LOG_MAX (20) is smaller than feed+slice (~90+ coins/tick), so
       // the bounded reject list filled first-come-first-served: the feed's
       // dozens of fresh bonding-curve coins (all "流动性 ~$0") flooded it and
       // the pool coins' rejections never surfaced, making zero-push stretches
       // look unexplained on /health. Reserve the pool slice a guaranteed
       // share: feed coins may log only into the first `feedBudgetStart`
       // slots (the leftover), pool coins log up to the cap.
-      const rejectBudgetBeforeEval = REJECT_LOG_MAX - Math.min(
-        poolSlice.length,
-        REJECT_LOG_MAX,
+      //
+      // OWED COINS GET A RESERVE OF THEIR OWN (2026-09-27). Exempting them from
+      // the budget is not enough on its own: the log is capped at
+      // REJECT_LOG_MAX before anything else, and the make-up lane appends its
+      // coins to the END of the feed list — so a busy feed fills all 20 slots
+      // first and the debt is cut out again, which is the reading this reserve
+      // exists to produce (live that day: pending 1 for 95 minutes, every
+      // counter healthy, no way to name the gate). Bounded by the lane's own
+      // injection cap so the reserve can never exceed what the lane can
+      // actually deliver, and by what the pool's share leaves over so the
+      // budget cannot go negative.
+      const poolShare = Math.min(poolSlice.length, REJECT_LOG_MAX);
+      const owedShare = Math.max(
+        0,
+        Math.min(
+          DEFERRED_MAKEUP_MAX,
+          this.deferredPushes.pendingCount,
+          REJECT_LOG_MAX - poolShare,
+        ),
       );
+      const rejectBudgetBeforeEval = REJECT_LOG_MAX - poolShare - owedShare;
       // The post-push tracker's queue head rides along with the pool: its
       // coins are PUSHED coins, which the re-eval pool query excludes, so
       // this batch is what keeps them in Scanner.lastPairs — without it the
@@ -5183,6 +5212,14 @@ export class Scanner {
      * fresh bonding-curve coins (all "流动性 ~$0") flood the bounded list
      * before any pool coin is logged and zero-push stretches look
      * unexplained on /health.
+     *
+     * Three classes, not two (2026-09-27): pool coins and OWED coins always
+     * log; only the feed's own discoveries are budgeted. The owed class also
+     * gets a RESERVED share of the cap (see the reserve at the call site), so
+     * a busy feed cannot fill every slot before the make-up lane's coins — its
+     * tail entries — are evaluated. An owed coin carries `owed: true` so the
+     * reason it is still owed is readable at a glance instead of only
+     * inferable from the counters.
      */
     logBudget?: { feedBudgetStart: number; poolStartIdx: number },
   ): QualifyingCoin[] {
@@ -5211,7 +5248,10 @@ export class Scanner {
       // anything newer (a genuine 7.7h obligation, last in the queue) never
       // got a slot. A coin with NO pair is the soft case and needs the
       // registry's run-of-misses slack (see noteDeferredCoin).
-      if (isDeferredToken(profile.tokenAddress)) {
+      // Read ONCE: the make-up verdict below and the reject-log budget further
+      // down must not be able to disagree about whether this coin is owed.
+      const owed = isDeferredToken(profile.tokenAddress);
+      if (owed) {
         this.deferredPushes.noteCoinAge(
           profile.tokenAddress,
           pair ? Date.now() - pair.pairCreatedAt : null,
@@ -5235,8 +5275,20 @@ export class Scanner {
         // the first feedBudgetStart slots — the leftover after the pool
         // slice's guaranteed share — so the feed's fresh bonding-curve coins
         // cannot flood the list before any pool coin is logged.
+        //
+        // AN OWED COIN ALWAYS LOGS TOO (2026-09-27), for the same reason plus
+        // one of its own: the make-up lane appends the deferred tokens to the
+        // END of the feed list (src/dexscreener.ts), which is exactly the
+        // region the budget cuts. Measured live that day: one obligation held
+        // for 95 minutes with `deferObserved 1` every tick, `seen_tokens` and
+        // `push_audit` empty (never claimed, never delivered) and NO way to
+        // say which gate was refusing it — the debt was healthy, the reading
+        // was blind. A debt is also bounded by the make-up lane itself
+        // (DEFERRED_MAKEUP_MAX coins injected per tick), so the worst case
+        // here is 8 slots out of REJECT_LOG_MAX.
         if (
           logBudget &&
+          !owed &&
           pi < logBudget.poolStartIdx &&
           rejects.length >= logBudget.feedBudgetStart
         )
@@ -5248,6 +5300,7 @@ export class Scanner {
           vol5Usd: Math.round(pair.volume.m5),
           chgPct: Math.round(pair.priceChange.m5 * 10) / 10,
           reason,
+          ...(owed ? { owed: true } : {}),
         });
       };
 

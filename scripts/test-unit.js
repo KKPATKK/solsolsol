@@ -3834,6 +3834,116 @@ async function main() {
     }
   });
 
+  await test("Scanner: an owed coin's blocking gate survives the reject-log budget", async () => {
+    // WHY (2026-09-27): one deferred obligation sat pending for 95 minutes with
+    // every counter healthy — `deferObserved 1` on every tick, no prune, and
+    // `seen_tokens`/`push_audit` empty (never claimed, never delivered) — and
+    // the ONE reading that could name the refusing gate was missing, because the
+    // make-up lane appends owed coins to the END of the feed list and the
+    // bounded reject log fills up before them. The log now reserves them a share
+    // and marks the entry, so this test pins both halves: the debt LOGS, and the
+    // feed coin the budget cuts stays out.
+    const { Scanner } = require("../dist/scanner.js");
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const {
+      addDeferredToken,
+      DEFERRED_MAKEUP_MAX,
+      isDeferredToken,
+      resetDeferredRegistry,
+    } = require("../dist/deferredmakeup.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      // One chat that refuses EVERY coin on market cap, so the reason string
+      // cannot be what tells the entries apart — the budget is.
+      await db.saveChatSettings({
+        chatId: "chat-owed",
+        minLiquidityUsd: 0,
+        minVolume24hUsd: 0,
+        minMarketCapUsd: 10_000_000,
+        maxMarketCapUsd: 1_000_000_000,
+        minAgeMinutes: 0,
+        maxAgeMinutes: 100_000,
+        min5mVolUsd: 0,
+        min1hVolUsd: 0,
+        min5mChgPct: 0,
+        min1hChgPct: 0,
+        enabled: true,
+      });
+      const dex = new DexScreenerClient(cfg);
+      const FEED = 30;
+      const feed = [];
+      for (let i = 0; i < FEED; i++) feed.push({ tokenAddress: `FEED${i}` });
+      // The make-up lane's coin rides the TAIL — the exact position the budget
+      // cut, which is why the live debt read as "not rejected at all".
+      feed.push({ tokenAddress: "OWEDCOIN" });
+      dex.fetchLatestSolanaProfiles = async () => feed.slice();
+      dex.fetchPairsForTokens = async (addrs) =>
+        new Map(
+          addrs.map((a) => [
+            a,
+            {
+              chainId: "solana",
+              dexId: "raydium",
+              pairAddress: `pair-${a}`,
+              baseToken: { address: a, symbol: a === "OWEDCOIN" ? "OWED" : a },
+              quoteToken: {
+                address: "So11111111111111111111111111111111111111112",
+                symbol: "SOL",
+              },
+              priceUsd: "0.001",
+              marketCap: 1000,
+              liquidity: { usd: 5000 },
+              volume: { m5: 0, h1: 0, h24: 0 },
+              priceChange: { m5: 0, h1: 0, h24: 0 },
+              pairCreatedAt: Date.now() - 3_600_000,
+            },
+          ]),
+        );
+      resetDeferredRegistry();
+      addDeferredToken("OWEDCOIN", Date.now());
+      assert.ok(isDeferredToken("OWEDCOIN"), "the obligation is registered");
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg, null, null, null,
+      );
+      scanner.pushWatcher = {
+        headTokens: () => [],
+        runTick: async () => ({ checked: 0, alerted: 0, trips: 0 }),
+        onPush: async () => {},
+      };
+      await scanner.runOnce();
+      const rejects = scanner.lastSummary?.rejects ?? [];
+      assert.ok(rejects.length > 0, "the tick logged rejections");
+      assert.ok(rejects.length <= 20, "the log stays bounded (REJECT_LOG_MAX)");
+      const owed = rejects.filter((r) => r.owed === true);
+      assert.equal(owed.length, 1, "the owed coin's rejection is in the log");
+      assert.equal(owed[0].symbol, "OWED", "the entry names the debt");
+      assert.match(owed[0].reason, /市值/, "and the gate refusing it");
+      // The reserve is what bought that slot — the log is not simply bigger.
+      assert.ok(
+        !rejects.some((r) => r.symbol === `FEED${FEED - 1}`),
+        "the feed coin past the budget is still cut",
+      );
+      // The reserve can never exceed what the make-up lane can inject.
+      assert.ok(
+        DEFERRED_MAKEUP_MAX <= 20,
+        "the lane's cap is the bound the reserve is clamped to",
+      );
+    } finally {
+      resetDeferredRegistry();
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
   await test("Scanner.runTrackerPass: the tick tail's pass publishes its note on the last summary", async () => {
     // The post-push pass is not part of the scan any more (it ran on the
     // scan's leftover 400-1200ms, one or two rows a tick — live 2026-09-21
@@ -13936,7 +14046,30 @@ async function main() {
         ) &&
         hookAt >= 0 &&
         skipAt > hookAt &&
-        scannerSrc.includes("if(isDeferredToken(profile.tokenAddress)){"),
+        // 2026-09-27: the owed reading became a const so the make-up verdict
+        // and the reject-log budget cannot disagree about it — and it is read
+        // ONCE (the count below).
+        scannerSrc.includes("constowed=isDeferredToken(profile.tokenAddress);") &&
+        scannerSrc.includes("if(owed){") &&
+        count(scannerSrc, "isDeferredToken(profile.tokenAddress)") === 1,
+      "scanner (an owed coin's blocking gate always logs, with a reserved slot)":
+        // The exemption that makes the log reachable for the make-up lane's
+        // coins (its entries ride the END of the feed list)…
+        scannerSrc.includes(
+          "if(logBudget&&!owed&&pi<logBudget.poolStartIdx&&rejects.length>=logBudget.feedBudgetStart)return;",
+        ) &&
+        // …the marker that makes the entry self-explanatory…
+        scannerSrc.includes("...(owed?{owed:true}:{}),") &&
+        // …and the reserve, without which the hard cap cuts it anyway.
+        scannerSrc.includes(
+          "constpoolShare=Math.min(poolSlice.length,REJECT_LOG_MAX);",
+        ) &&
+        scannerSrc.includes(
+          "constowedShare=Math.max(0,Math.min(DEFERRED_MAKEUP_MAX,this.deferredPushes.pendingCount,REJECT_LOG_MAX-poolShare,),);",
+        ) &&
+        scannerSrc.includes(
+          "constrejectBudgetBeforeEval=REJECT_LOG_MAX-poolShare-owedShare;",
+        ),
       "scanner (the ledger and the summary carry the cursor)":
         scannerSrc.includes("getpruned():number{returnthis.prunedCount;}") &&
         scannerSrc.includes("getobserved():number{returnthis.observedCount;}") &&
