@@ -128,12 +128,18 @@ const TRACKER_SUBREQ_FLOOR = 3;
 const TRACKER_SUBREQ_RESERVE = 6;
 /**
  * What ONE alerting row's path spends, and why it is a named number: the
- * claim CAS, the reservation, the Telegram send and the row's final write.
- * The maintenance floor below is derived from it (and so is
+ * claim CAS **and** the alert reservation (2026-09-27: they ride ONE batch,
+ * see Db.claimAndReservePushWatch), the Telegram send and the row's final
+ * write. The maintenance floor below is derived from it (and so is
  * worker.TRACKER_PASS_SUBREQ_RESERVE), because "the pass fits" has to mean
  * "a card fits", not "the gates close cleanly".
+ *
+ * 4 → 3 on 2026-09-27, and that −1 is the pass's throughput story: the two
+ * statements hit the same row with nothing between them but an `await`,
+ * while live the tick's front had already spent 18-36 of the invocation's
+ * 50 and the row loop was refusing `defer-send 9`-`17` cards a pass.
  */
-const TRACKER_ALERT_PATH_SUBREQ = 4;
+const TRACKER_ALERT_PATH_SUBREQ = 3;
 /**
  * The ceiling the pass's MAINTENANCE stages (the heal, the baseline repair)
  * yield to BEFORE they may start (2026-09-26, live).
@@ -245,8 +251,9 @@ const TRACKER_ROW_RESERVE = 2;
  * the pass ran in front of the push path, the whole tick) open. Telegram
  * answers in a few hundred ms; a send that misses this ceiling is treated
  * exactly like a failed one — logged, not retried, because the state
- * transition was already reserved (see reservePushWatchAlert) and a retry
- * could deliver the duplicate card that guard exists to prevent.
+ * transition was already reserved (the reservation rides the claim's own
+ * batch — see Db.claimAndReservePushWatch) and a retry could deliver the
+ * duplicate card that guard exists to prevent.
  */
 const TRACKER_SEND_CAP_MS = 1_000;
 /**
@@ -3466,7 +3473,7 @@ export class PushWatcher {
       // DB), and knowing whether this row carries cards is what lets the
       // pass refuse a row it cannot finish: every alerting row reserves its
       // state transition before sending and never retries (see
-      // reservePushWatchAlert), so starting one without the send slice
+      // Db.claimAndReservePushWatch), so starting one without the send slice
       // DROPS its card forever. A refused row is left completely untouched —
       // last_checked included — so the next tick claims it with a fresh
       // budget and its place at the front of the rotation is preserved.
@@ -3586,10 +3593,9 @@ export class PushWatcher {
         continue;
       }
 
-      // ALERTING ROW — the reservation must land BEFORE the send, so the claim
-      // stays a round trip of its own. The loser's snapshot is stale: it would
-      // re-fire state-machine transitions (duplicate ⚠️/🚀 cards). Skip silently
-      // on a lost race.
+      // ALERTING ROW — the reservation must land BEFORE the send (see the batch
+      // below). The loser's snapshot is stale: it would re-fire state-machine
+      // transitions (duplicate ⚠️/🚀 cards). Skip silently on a lost race.
       if (subreqShort) {
         // `continue`, not `break`, for the reason the send-slice gate gives:
         // this row is left untouched and the quiet rows behind it still ride
@@ -3600,43 +3606,50 @@ export class PushWatcher {
         sendDeferred += 1;
         continue;
       }
+      // ONE round trip pays for BOTH of this row's compare-and-swaps: the
+      // per-tick claim and the alert reservation are the same row, one
+      // `await` apart, and batching them is what takes an alerting row's
+      // path from four subrequests to three (see Db.claimAndReservePushWatch
+      // and TRACKER_ALERT_PATH_SUBREQ). Statement order still runs claim →
+      // reservation, and the reservation additionally inherits the claim's
+      // own stamp (`last_checked = ?`), so it can never commit for a row a
+      // concurrent isolate claimed instead.
+      //
+      // The AUTHORITATIVE duplicate guard is still the reservation (matching
+      // on (last_state, last_alert_at) is what makes exactly one contender's
+      // UPDATE win — the last_checked claim alone cannot stop an isolate that
+      // reads between this isolate's claim and its final write).
+      //
+      // The two losses stay DISTINCT, because they mean different things: a
+      // lost CLAIM is another isolate's row, so this pass leaves it completely
+      // untouched; a lost RESERVATION means the row is ours but the transition
+      // was already announced elsewhere, so the announcement columns stay held
+      // and only the measurements land (the write below).
+      //
+      // HOLD THE RESERVATION → FINAL-WRITE SPAN (see holdRowSpan and
+      // docs/duplicate-cards.md §17.5): the batch below commits the transition
+      // before the send, and only the final write restores the bookkeeping
+      // that says so. Created BEFORE the batch goes out, so that write is
+      // covered too, and released at all three exits — the lost claim, the
+      // lost reservation, and the row's final write.
+      const releaseRowSpan = this.holdRowSpan(TRACKER_ROW_SPAN_HOLD_MS);
       trips += 1;
-      if (!(await this.db.claimPushWatch(row.token, row.lastChecked, now))) {
+      const { claimed, reserved } = await this.db.claimAndReservePushWatch(
+        row.token,
+        row.lastChecked,
+        now,
+        row.lastState ?? null,
+        row.lastAlertAt ?? 0,
+        evalResult.lastState ?? null,
+        evalResult.lastAlertAt,
+      );
+      if (!claimed) {
         claimLost += 1;
+        releaseRowSpan();
         continue;
       }
       checked += 1;
-      // HOLD THE RESERVATION → FINAL-WRITE SPAN (see holdRowSpan and
-      // docs/duplicate-cards.md §17.5): the reservation below commits the
-      // transition before the send, and only the final write restores the
-      // bookkeeping that says so. Created HERE — before the reservation goes
-      // out, so that write is covered too — and released at both of the span's
-      // exits: the lost race below, and the final write at the row's end.
-      const releaseRowSpan = this.holdRowSpan(TRACKER_ROW_SPAN_HOLD_MS);
-      // Authoritative duplicate guard: reserve the state transition
-      // BEFORE delivering. The last_checked claim alone cannot stop an
-      // isolate that reads between this isolate's claim and its final
-      // write — it inherits the claimed stamp but the pre-alert state.
-      // Matching on (last_state, last_alert_at) makes exactly one
-      // contender's UPDATE win; the loser skips delivery. Skipped entirely
-      // on a backfill pass, which sends nothing.
-      // Wrapped so the ledger counts the reservation exactly when it runs
-      // (the && chain short-circuits when there is nothing to alert).
-      const reserveAlert = async (): Promise<boolean> => {
-        trips += 1;
-        return this.db.reservePushWatchAlert(
-          row.token,
-          row.lastState ?? null,
-          row.lastAlertAt ?? 0,
-          evalResult.lastState ?? null,
-          evalResult.lastAlertAt,
-        );
-      };
-      if (
-        !backfill &&
-        evalResult.alerts.length > 0 &&
-        !(await reserveAlert())
-      ) {
+      if (!reserved) {
         trips += 1;
         await this.db.updatePushWatchCheck(row.token, {
           peakMcap: evalResult.peakMcap,
@@ -4323,8 +4336,10 @@ export class PushWatcher {
  * CONSUMING an alert, and `push_watch` records it in two columns written at
  * two different moments inside the same pass:
  *
- *   - `last_alert_at` — `reservePushWatchAlert` writes the pass's `now`;
- *   - `last_checked` — `claimPushWatch` writes that same `now`, and then the
+ *   - `last_alert_at` — the alert reservation writes the pass's `now` (since
+ *     2026-09-27 it rides the SAME batch as the claim, see
+ *     Db.claimAndReservePushWatch — two statements, one `now`);
+ *   - `last_checked` — the claim writes that same `now`, and then the
  *     completion write re-stamps it with a FRESH `Date.now()`
  *     (Db.updatePushWatchCheck), i.e. AFTER the row's card was delivered.
  *

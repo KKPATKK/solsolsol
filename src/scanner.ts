@@ -662,7 +662,8 @@ const TRACKER_GECKO_LOOKUPS = 2;
  * abandons waiting for it — the pass's watchdog (see racePassWatchdog).
  *
  * A pass cannot be cut in half and still be correct: its rule is
- * reserve-then-send. Db.reservePushWatchAlert flips (last_state, last_alert_at)
+ * reserve-then-send. The claim+reservation batch (Db.claimAndReservePushWatch;
+ * they were two calls until 2026-09-27) flips (last_state, last_alert_at)
  * BEFORE the card goes out, and only the row's FINAL updatePushWatchCheck rolls
  * that announcement back when a card did not go out. Abandon a pass between
  * those two writes and the transition stays reserved with no card in the chat
@@ -670,18 +671,23 @@ const TRACKER_GECKO_LOOKUPS = 2;
  * this whole subsystem exists to prevent. So the watchdog has to sit OUTSIDE
  * every bound the pass itself enforces, and catch only an await nothing bounds.
  *
- * That outer edge is ONE row's worst-case bounded chain, audited 2026-09-23:
- *   claim          TRACKER_ROW_LEASH_MS   1_500ms
- *   reservation    TRACKER_ROW_LEASH_MS   1_500ms
+ * That outer edge is ONE row's worst-case bounded chain, audited 2026-09-23
+ * and re-audited 2026-09-27 — the claim and the reservation became ONE
+ * batched call (Db.claimAndReservePushWatch), so the chain lost one leash:
+ *   claim+reserve  TRACKER_ROW_LEASH_MS   1_500ms  (ONE batch, two statements)
  *   sends (row)    TRACKER_SEND_CAP_MS    1_350ms  (sendBudgetEnd's window)
  *   audit insert   TRACKER_ROW_LEASH_MS   1_500ms
  *   final write    TRACKER_ROW_LEASH_MS   1_500ms
  *                                        -------
- *                                        7_350ms
+ *                                        5_850ms
  * plus the pair batch (TRACKER_PAIRS_BUDGET_MS 1_200ms since the whole-pool
- * head, 2026-09-24) on the row that opens a pass, so 8_600ms is that chain with
- * slack. A pass on a degraded Turso can genuinely need all of it; anything
- * LONGER is an await no bound covers — which is exactly what this is for (live
+ * head, 2026-09-24) on the row that opens a pass: 7_050ms. The constant stays
+ * at 8_600 rather than following the chain down, because this bound's ONE job
+ * is to catch awaits no bound covers, and an abandoned pass is the silent-miss
+ * class (docs/duplicate-cards.md §17.5) — tightening it to the new sum wants a
+ * live reading of the merged path, not just the arithmetic. A pass on a
+ * degraded Turso can genuinely need the whole chain; anything LONGER is an
+ * await no bound covers — which is exactly what this is for (live
  * 2026-09-23: 61 seconds on one pass).
  */
 const TRACKER_PASS_OVERRUN_MS = 8_600;

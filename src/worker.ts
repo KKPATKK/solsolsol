@@ -1598,13 +1598,15 @@ const TRACKER_PASS_BUDGET_MS = 5_000;
  * and close cleanly while every alerting row behind it is refused — live
  * 2026-09-26T21:39Z, two consecutive passes read `rows 8/30 … subreq-cut 22
  * defer-send 22` while the rotation aged in hours (the oldest row 126
- * minutes). One alerting row's path (claim + reservation + send + final
- * write, see pushwatch.TRACKER_ALERT_PATH_SUBREQ) is 4 more, so the slice
- * is 13: what the pass needs to be worth starting IS a delivered card, not
- * just a closed ledger. `scanSubreqLeft` applies it; the scan's other
- * gating is unchanged.
+ * minutes). One alerting row's path (the claim+reservation batch, the send
+ * and the final write — see pushwatch.TRACKER_ALERT_PATH_SUBREQ) is 3 more
+ * since 2026-09-27: it was 4 while those two CAS writes were separate round
+ * trips, which is where the 13 came from, and the pair now rides ONE batch
+ * (Db.claimAndReservePushWatch). So the slice is 12: what the pass needs to
+ * be worth starting IS a delivered card, not just a closed ledger.
+ * `scanSubreqLeft` applies it; the scan's other gating is unchanged.
  */
-export const TRACKER_PASS_SUBREQ_RESERVE = 13;
+export const TRACKER_PASS_SUBREQ_RESERVE = 12;
 /**
  * The scan's view of the invocation's remaining subrequests: the counter
  * with the tracker pass's slice already taken off (see

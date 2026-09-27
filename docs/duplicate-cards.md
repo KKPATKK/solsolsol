@@ -932,3 +932,23 @@ Turso 連線走 **HTTP transport**（`src/db.ts` `createRawClient`：`libsql://`
   **唔會**跟住多送一張卡（同一條 row 嘅 `undelivered` 唔會因為我哋壓抑咗一張而升）。
 
 
+---
+
+## 二十、claim 同 reservation 合併成一個 batch（2026-09-27）—— 守衛點樣保持
+
+`Db.claimAndReservePushWatch` 把 §17.5 講嘅 claim CAS 同 reservation 併成一個 `batch()`（兩句、次序不變），
+一張卡嘅 subrequest 由 4 變 3。對呢份文件最重要嘅係**守衛冇變鬆**：
+
+- **權威守衛仍然係 reservation**：`(last_state, last_alert_at)` CAS —— 兩個 isolate 之中只有一句 UPDATE 入到，
+  輸家唔送卡。呢個係所有「重複卡」修法嘅地基，冇動。
+- **新增 `last_checked = ?`（綁住同一個 batch 嘅 claim stamp）**：防止「自己冇 claim 到嘅 row 都宣佈」。
+  場景：isolate B 喺 A 落 claim 之後、A 落 reservation 之前讀（或者 B 嘅 call 之前個 claim 已經被 A 搶走）——
+  B 嘅 claim 會輸（`last_checked` 唔再係 B 讀到嘅值），冇呢句嘅話 B 嘅 reservation 仍然可以 commit（因為
+  `(state, alertAt)` 對得上），於是 B 會發一張 A 已經擁有嘅卡。有咗呢句，B 兩句都輸，走 lost-reservation 路徑：
+  寫 measurements、announcement 兩欄保持舊值、下一個 pass 重新推導。
+- **span**：`holdRowSpan`（§17.6 交俾 tick 嘅 waitUntil）而家喺 batch **之前**開，三個出口各自 release
+  （lost claim／lost reservation／final write），所以「reservation 已 commit 但 final write 未落」嘅窗口依然被覆蓋。
+- **測試**：真 DB 一條（另一 isolate 淨係 claim、未 reserve；拎走 `last_checked = ?` ⇒ 期望值反轉）、
+  SQL／round-trip 一條（一個 batch、兩句、args 綁 stamp）、pass 層兩條（兩種 loss 分流）。
+
+詳情同 live 讀數見 `docs/round-trips.md` §4.37。
