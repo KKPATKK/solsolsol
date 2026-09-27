@@ -35,6 +35,7 @@ import {
   installSkipCapture,
   markSkipCaptureSynced,
   mergeSkipCaptureState,
+  noteSkipReason,
   parseSkipCaptureState,
   skipCaptureSnapshot,
   takeSkipCaptureDelta,
@@ -3591,7 +3592,13 @@ async function runScan(
    */
   via: ScanTrigger = "cron",
 ): Promise<void> {
-  if (!scanner) return;
+  if (!scanner) {
+    // Same silence as the handler's guard above, on the HTTP path: an
+    // invocation that meant to scan (a rescue, a manual tick) and could not,
+    // with nothing durable to show for it.
+    noteSkipReason("init-no-scanner");
+    return;
+  }
   const scanVia: ScanTrigger = via;
   // Cross-isolate single-flight: cron and the HTTP fallback may run on
   // DIFFERENT isolates that each read the same stale heartbeat and both
@@ -3808,6 +3815,10 @@ async function runScan(
       );
     }
     console.log("[worker] scan skipped — another isolate holds the scan lock");
+    // The counter above is module state on THIS isolate and is only published by
+    // whichever invocation happens to serve /health; the reason rides the
+    // durable row with every other one (2026-09-27).
+    noteSkipReason("scan-lock-lost");
     // The claim never carried the cron-arrival bookkeeping, so write it here:
     // this tick DID arrive (that is what the counter records), it simply lost
     // the lease to another isolate's scan. ONE write, no read — the handler
@@ -6968,6 +6979,13 @@ export default {
     await recoveryAwait(ensureInitialized(env), FRONT_INIT_BOUND_MS, "init");
     preTick.steps.init = Date.now() - initAt;
     if (!scanner) {
+      // WHY THIS TICK DID NOTHING (2026-09-27): the arrival above is recorded,
+      // the scan below never starts, and before this line no counter, no
+      // heartbeat field and no log said so — a 2-minute cadence then read as if
+      // half the arrivals had never been delivered (measured 07:39-08:11 that
+      // day). The reason rides the next completion's tail write (see
+      // src/skipcapture.ts).
+      noteSkipReason("init-no-scanner");
       preTick.steps.bump = await bumpScheduledTickLegacy(env);
       scheduledTickFinishedAt = Date.now();
       return;
@@ -7037,6 +7055,11 @@ export default {
         console.log(
           `[worker] cron tick skipped — last scan claimed ${Math.round((Date.now() - hbAt) / 1000)}s ago (< ${Math.round(gateMs / 1000)}s)`,
         );
+        // Counted like every other early return (2026-09-27): in the 60s mode
+        // this is rare and should read ~0, while in a 90s/120s deployment it is
+        // the cadence knob WORKING — either way "how often does the gate skip"
+        // belongs in the same reading as the scanner's own reasons.
+        noteSkipReason("cron-gate");
         // A skipped tick still ARRIVED — record it (ONE write, no read).
         try {
           await db?.writeScheduledTick(cronTick);

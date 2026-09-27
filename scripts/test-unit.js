@@ -24,7 +24,7 @@ const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, a
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS } = require("../dist/worker.js");
-const { installSkipCapture, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
+const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
@@ -4296,6 +4296,116 @@ async function main() {
       skipCaptureSnapshot().reason,
       "empty-feed-and-pool",
       "the reason outlives the clear that made it unreadable",
+    );
+  });
+
+  await test("skipCapture: a tick-level reason survives the install its own path precedes", () => {
+    // WHY (2026-09-27): the scanner is not the only layer that returns without
+    // scanning. The handler's `!scanner` return and the gate skip are the two
+    // that produced NO trace at all — measured live, 07:39-08:11 had a
+    // 2-minute cadence with every counter flat, so half the arrivals looked as
+    // if they had never been delivered. Both now record here, and the harder
+    // half is the `!scanner` one: it fires in an isolate that has not built a
+    // scanner, so the reason is recorded with nothing installed — and the next
+    // tick's install is exactly what would have thrown it away.
+    resetSkipCapture();
+    noteSkipReason("init-no-scanner");
+    assert.equal(skipCaptureSnapshot().reason, "init-no-scanner");
+    assert.equal(skipCaptureSnapshot().total, 1, "recorded with no scanner in existence");
+    const scanner = { lastSkip: null };
+    installSkipCapture(scanner, () => 7);
+    assert.equal(
+      skipCaptureSnapshot().reason,
+      "init-no-scanner",
+      "the install preserves what the tick recorded before it",
+    );
+    assert.equal(takeSkipCaptureDelta().total, 1, "and the reason is still owed to the durable row");
+    // A scanner reason joins the same counters, and the two layers stay
+    // separable by name.
+    scanner.lastSkip = "previous-scan-still-running";
+    const delta = takeSkipCaptureDelta();
+    assert.equal(delta.total, 2);
+    assert.deepEqual(delta.counts, {
+      "init-no-scanner": 1,
+      "previous-scan-still-running": 1,
+    });
+    markSkipCaptureSynced();
+    assert.equal(takeSkipCaptureDelta(), null, "a landed write clears it");
+    // A rebuilt scanner re-offers nothing it already persisted…
+    installSkipCapture(scanner, () => 8);
+    assert.equal(takeSkipCaptureDelta(), null);
+    // …and still reports what comes after it.
+    noteSkipReason("cron-gate");
+    assert.equal(takeSkipCaptureDelta().total, 1);
+    assert.equal(takeSkipCaptureDelta().counts["cron-gate"], 1);
+    // A blank reason is not a reason.
+    noteSkipReason("");
+    assert.equal(takeSkipCaptureDelta().total, 1, "empty input is ignored");
+    // The durable merge treats it as one more key.
+    const merged = mergeSkipCaptureState(
+      emptySkipCaptureState(),
+      { total: 1, counts: { "cron-gate": 1 }, reason: "cron-gate", at: 8 },
+      8,
+    );
+    assert.equal(merged.lastReason, "cron-gate");
+    assert.equal(merged.counts["cron-gate"], 1);
+  });
+
+  await test("skipCapture: every layer that can return without scanning records why", () => {
+    // Whitespace-only squash, regex-free (same discipline as the prune pins).
+    const WS = new Set([9, 10, 13, 32]);
+    const strip = (text) => [...text].filter((ch) => !WS.has(ch.charCodeAt(0))).join("");
+    const workerSrc = strip(fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8"));
+    // The scheduled handler's no-scanner return: reason, then the arrival
+    // bookkeeping that was the ONLY thing it did before this round.
+    // (The splice is pinned comment-inclusive: the strip removes whitespace
+    // only, so the pinned pair is the reason immediately before the arrival
+    // bookkeeping that was the branch's only visible act.)
+    assert.ok(
+      workerSrc.includes(
+        'noteSkipReason("init-no-scanner");preTick.steps.bump=awaitbumpScheduledTickLegacy(env);',
+      ),
+      "the handler's no-scanner return says so",
+    );
+    // The cadence gate: pinned as a SLICE between the branch's own log line and
+    // the arrival write it ends with — comments sit inside that window, so an
+    // adjacency pin would be measuring the comments instead of the code.
+    const gateAt = workerSrc.indexOf("crontickskipped—lastscanclaimed");
+    const gateEnd = workerSrc.indexOf("writeScheduledTick(cronTick)", gateAt);
+    assert.ok(gateAt >= 0 && gateEnd > gateAt, "the gate branch is there to pin");
+    assert.ok(
+      workerSrc.slice(gateAt, gateEnd).includes('noteSkipReason("cron-gate");'),
+      "the gate skip says so",
+    );
+    // runScan's own guard (the HTTP/manual path). Pinned by the pair that only
+    // that branch has — reason immediately before the bare return (the
+    // handler's copy of the reason is followed by its arrival bookkeeping).
+    assert.ok(
+      workerSrc.includes('noteSkipReason("init-no-scanner");return;'),
+      "runScan's guard says so",
+    );
+    assert.ok(
+      workerSrc.split('noteSkipReason("init-no-scanner");').length - 1 === 2,
+      "both no-scanner returns record it (handler and runScan)",
+    );
+    // The lost cross-isolate lease: pinned from the log line that used to be its
+    // only trace (a comment sits between them, see the gate pin).
+    const leaseAt = workerSrc.indexOf("anotherisolateholdsthescanlock");
+    assert.ok(leaseAt >= 0, "the lease-lost branch is there to pin");
+    assert.ok(
+      workerSrc.slice(leaseAt, leaseAt + 400).includes('noteSkipReason("scan-lock-lost");'),
+      "a lost lease says so",
+    );
+    // The capture itself: the install must keep an existing capture instead of
+    // replacing it (that replacement is what dropped the tick-level reason).
+    const skipSrc = strip(fs.readFileSync(path.join(__dirname, "..", "src", "skipcapture.ts"), "utf8"));
+    assert.ok(
+      skipSrc.includes("constcapture:InstalledCapture=installed??{reason:null,at:null,total:0,counts:{}};"),
+      "install preserves the capture",
+    );
+    assert.ok(
+      skipSrc.includes("exportfunctionnoteSkipReason(reason:string):void{"),
+      "the tick-level API is exported",
     );
   });
 
