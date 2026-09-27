@@ -103,6 +103,7 @@ import {
   countSubreq,
   subreqRemaining,
   subreqView,
+  type SubreqOwner,
 } from "./subreqs";
 
 /**
@@ -1685,8 +1686,20 @@ export const TRACKER_PASS_FALLBACK_FRESH_MS = 120_000;
  * clamp it to 0, which would read as "exactly at the reserve" and hide the
  * overspend.
  */
-export function scanSubreqLeft(remaining: number): number {
-  return remaining - TRACKER_PASS_SUBREQ_RESERVE;
+export function scanSubreqLeft(
+  remaining: number,
+  /**
+   * The slice to hold back, defaulting to the pass's full one. It is a
+   * PARAMETER because the reservation is conditional since 2026-09-27: a tick
+   * whose own pass stage will stand down for the pass's own cron delivery
+   * (see Scanner.trackerPassSlice) hands the scan the whole allowance — the
+   * slice exists for a pass THIS invocation might run, and a tick that runs
+   * none would be holding subrequests it can never spend while its optional
+   * legs stand down ~12 early.
+   */
+  reserve: number = TRACKER_PASS_SUBREQ_RESERVE,
+): number {
+  return remaining - reserve;
 }
 /**
  * Tick tail kept clear after the tracker pass for the tick's own bookkeeping
@@ -1986,6 +1999,22 @@ let lastProgressRead: { raw: string | null; at: number } | null = null;
  * a round-trip count, so what the statement carries has to be assertable
  * offline instead of only observed live.
  */
+/**
+ * The rows the cold-init boot block needs (see ensureInitialized's
+ * initPromise): the stored Axiom token, and the three telemetry mirrors a
+ * recycled isolate answers /health with before it has any numbers of its own.
+ *
+ * Named as its own list because they ride the FRONT's statement (below) and
+ * the boot block's own read is now only the fallback — one list, so the two
+ * cannot drift.
+ */
+export const BOOT_STATE_KEYS = [
+  "axiom_access_token",
+  PUSH_DEFERRAL_STATE_KEY,
+  PUSH_LEDGER_STATE_KEY,
+  SKIP_CAPTURE_STATE_KEY,
+];
+
 export const WEDGE_READ_KEYS = [
   "scan_heartbeat",
   "scheduled_tick_total",
@@ -1993,7 +2022,26 @@ export const WEDGE_READ_KEYS = [
   TICK_PROGRESS_KEY,
   // Round 4: the tick prefetch's row (TradeService.primeModeOverride).
   "trade_mode_override",
+  // 2026-09-27: the boot rows ride it too. This statement is the cold
+  // isolate's FIRST read, and the boot block runs ~300ms later in the SAME
+  // invocation reading four more keys — a second round trip for values this
+  // one already had in hand. Measured live: a census window read
+  // `getWorkerStates 5 calls / 616ms`, the front's largest single item, and
+  // the boot read was one of them on every cold isolate. A read that TIMED OUT
+  // leaves lastBootKeysRead's map null and the boot block fetches its own copy,
+  // so the failure mode of the merge is the old shape, not a missing row.
+  ...BOOT_STATE_KEYS,
 ];
+
+/**
+ * The front statement's map, as the boot block consumes it (see
+ * BOOT_STATE_KEYS / WEDGE_READ_KEYS). Same discipline as lastCronKeysRead and
+ * lastProgressRead: `map: null` means NO READING — the read timed out — and
+ * must never be read as "no rows", because one of these keys decides whether
+ * the Axiom client is built. The boot block falls back to its own read when
+ * this is null or older than HEARTBEAT_REUSE_MS.
+ */
+let lastBootKeysRead: { map: Map<string, string> | null; at: number } | null = null;
 
 /**
  * The trade-mode row as the tick-front's ONE batch read it (see
@@ -2114,7 +2162,7 @@ export function preTickView(): PreTickView {
 }
 
 /** Start a fresh pre-scan split for a tick entering the handler. */
-function beginPreTick(entryAt: number): void {
+function beginPreTick(entryAt: number, owner: SubreqOwner = "unknown"): void {
   // The subrequest window opens here, with the pre-scan split: both
   // handlers (cron and the HTTP fallback) enter through this seam, so a
   // window is one scan attempt's spend — the unit Cloudflare limits to 50
@@ -2122,7 +2170,12 @@ function beginPreTick(entryAt: number): void {
   // inside the same window (a webhook, a /debug probe) is counted too, so
   // the reading is an upper bound on the tick; the phase ring is what
   // localizes it.
-  beginSubreqWindow(entryAt);
+  //
+  // The OWNER rides along (2026-09-27): the pass's own cron delivery is a
+  // separate invocation that lands on this same isolate most minutes, so
+  // without it a scan front and a pass rotation are one indistinguishable
+  // `turso: N` — and every question about the front's cost is unanswerable.
+  beginSubreqWindow(entryAt, owner);
   preTickEntryAt = entryAt;
   preTick = {
     at: entryAt,
@@ -2850,6 +2903,11 @@ async function ensureInitialized(env: Env): Promise<void> {
       if (kb) {
         lastProgressRead = { raw: kb.get(TICK_PROGRESS_KEY) ?? null, at: now };
       }
+      // The same statement now carries the boot rows (see BOOT_STATE_KEYS), so
+      // init's block below reads them from here instead of paying a second
+      // round trip for four keys it already has. Recorded ONLY when the read
+      // landed: a timed-out front read must not be dressed up as boot rows.
+      lastBootKeysRead = { map: kb, at: now };
       const verdict = deadTickRebuildDecision(prevRaw, now, BACKFILL_STALE_MS);
       if (verdict.rebuild) {
         console.error(
@@ -2960,7 +3018,9 @@ async function ensureInitialized(env: Env): Promise<void> {
           await db.init();
           dbReady = true;
           console.log("[worker] Turso ready");
-          // ONE read for the four rows this boot needs (2026-09-26).
+          // ONE read for the four rows this boot needs (2026-09-26) — and
+          // since 2026-09-27 the FRONT statement carries them, so the healthy
+          // path is zero reads (see BOOT_STATE_KEYS / lastBootKeysRead).
           //
           // WHY: an isolate recycles and the next one pays this block again —
           // four worker_state reads, each a full Turso round trip and, on the
@@ -2977,16 +3037,23 @@ async function ensureInitialized(env: Env): Promise<void> {
           // nicety the credential check re-derives. A failed read is "no
           // reading", never "no row": the map simply lacks the key, which is
           // the same null the four single reads produced.
-          let bootStates: Map<string, string> | null = null;
-          try {
-            bootStates = (await db?.getWorkerStates([
-              "axiom_access_token",
-              PUSH_DEFERRAL_STATE_KEY,
-              PUSH_LEDGER_STATE_KEY,
-              SKIP_CAPTURE_STATE_KEY,
-            ])) ?? null;
-          } catch {
-            // telemetry only — never fail init over a counter read
+          // ...and they are already in hand on the healthy path (2026-09-27):
+          // the front statement ABOVE read them (see BOOT_STATE_KEYS), in this
+          // same invocation, ~300ms ago. So this block pays ZERO subrequests
+          // and keeps its old shape only as the fallback — a front read that
+          // timed out (null map) or one older than the reuse window.
+          let bootStates: Map<string, string> | null =
+            lastBootKeysRead !== null &&
+            Date.now() - lastBootKeysRead.at <= HEARTBEAT_REUSE_MS
+              ? lastBootKeysRead.map
+              : null;
+          if (bootStates === null) {
+            try {
+              bootStates =
+                (await db?.getWorkerStates([...BOOT_STATE_KEYS])) ?? null;
+            } catch {
+              // telemetry only — never fail init over a counter read
+            }
           }
           // A Google/SSO Axiom account has no password — its tokens are
           // persisted by /debug/axiom-tokens, so the feed is "configured"
@@ -3759,6 +3826,11 @@ async function runScan(
       // Wired only for the duration of the scan: the hook is unwired after
       // the race, so the tail (the tracker pass) cannot stamp a phase the
       // scan never had.
+      // ONE capture for both halves: the call and the slice probe below must be
+      // the same scanner, and TS cannot keep this call site's narrowing inside
+      // a closure that outlives it (a null scanner is unreachable here — the
+      // tick's own guard returned before this point).
+      const scanOwner = scanner;
       await Promise.race([
         // The scan is handed the invocation's remaining allowance so its
         // OPTIONAL legs can yield before they starve the tail (see
@@ -3768,7 +3840,28 @@ async function runScan(
         // TRACKER_PASS_SUBREQ_RESERVE): optional legs stand down while the
         // pass's tail is intact, instead of the scan spending it and the pass
         // deferring by name.
-        scanner.runOnce(() => scanSubreqLeft(subreqRemaining())),
+        //
+        // ...AND THE SLICE IS CONDITIONAL (2026-09-27): when the pass's own
+        // cron delivery already owns this minute, the tick's pass stage stands
+        // down (see Scanner.runTrackerPass) and there is nothing left to hold
+        // back — so the slice goes to the scan, whose optional legs then stand
+        // down at the invocation's real floor instead of ~12 early. The
+        // question is asked AT THE LAST MOMENT a pass could start
+        // (`startedAt + SCAN_TICK_BUDGET_MS`, the tick's whole envelope), and
+        // it reads the same front row and the same window the pass stage reads:
+        // a row that will still be inside the window then is one the pass stage
+        // is bound to stand down for, which is what keeps the two decisions from
+        // disagreeing about a row that crosses the window in between.
+        scanOwner.runOnce(() =>
+          scanSubreqLeft(
+            subreqRemaining(),
+            scanOwner.trackerPassSlice(
+              TRACKER_PASS_FALLBACK_FRESH_MS,
+              TRACKER_PASS_SUBREQ_RESERVE,
+              startedAt + SCAN_TICK_BUDGET_MS,
+            ),
+          ),
+        ),
         new Promise<void>((resolve) => {
           setTimeout(() => {
             timedOut = true;
@@ -4495,7 +4588,7 @@ async function maybeRunScanIfStale(
   if (ctx) tickWaitUntil = (promise) => ctx.waitUntil(promise);
   // The HTTP fallback's own pre-scan slice: measured from here, because this
   // is where a request's work before the scan starts (see PreTickView).
-  beginPreTick(now);
+  beginPreTick(now, "http");
   if (now - lastScanTriggerAt < SCAN_TRIGGER_INTERVAL_MS) return;
   lastScanTriggerAt = now;
   // Dedupe against a healthy cron: skip when a scan already completed
@@ -6647,7 +6740,11 @@ export default {
     // subrequest window of its own (beginSubreqWindow, see src/subreqs.ts) and
     // the waitUntil that keeps a CUT card's delivery proof alive, and neither
     // of those is scan-specific.
-    beginPreTick(Date.now());
+    // ...tagged by trigger BEFORE the routing below (a pure string compare,
+    // so the tag cannot change the routing it describes): the pass's own
+    // delivery is a window of its own, and everything a reader concludes about
+    // "the tick front's spend" depends on the two not being mixed.
+    beginPreTick(Date.now(), isTrackerCron(event.cron) ? "pass" : "scan");
     tickWaitUntil = (promise) => ctx.waitUntil(promise);
     // THE TRACKER'S OWN DELIVERY (see TRACKER_CRON): the pass, and nothing
     // else. It returns BEFORE scheduledTicks, the cron-arrival stamp and the

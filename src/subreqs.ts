@@ -138,10 +138,29 @@ export interface SubreqHostCount {
   count: number;
 }
 
+/**
+ * WHO opened a window (see beginSubreqWindow).
+ *
+ * WHY IT IS NEEDED (2026-09-27): since the tracker pass got its own cron
+ * delivery, TWO invocations share most isolates — Cloudflare dispatches both
+ * triggers at the same minute, and the isolate that served the scan tick is
+ * the one the pass's delivery lands on — while this counter is per MODULE, not
+ * per invocation. A window therefore mixes the two: a scan front and a pass
+ * rotation both read as one `turso: N`, and the reader cannot say which owner
+ * to fix. Tagging the window is what makes "the tick's front spent X" a
+ * question with an answer.
+ *
+ * "unknown" is the honest default: an isolate's first request, a probe, or any
+ * caller that does not say. Nothing is guessed.
+ */
+export type SubreqOwner = "scan" | "pass" | "http" | "unknown";
+
 /** One invocation's counter state. */
 export interface SubreqWindowView {
   /** Window entry (epoch ms) — the tick's start, not its end. */
   at: number;
+  /** Which invocation opened it (see SubreqOwner). */
+  owner: SubreqOwner;
   /** Subrequests counted so far in this window. */
   total: number;
   /** Newest last, at most SUBREQ_PHASE_RING points. */
@@ -184,13 +203,20 @@ export interface SubreqView {
 /** Internally the host split is a map; the view flattens it to sorted rows. */
 interface SubreqWindowState {
   at: number;
+  owner: SubreqOwner;
   total: number;
   phases: SubreqPhasePoint[];
   hosts: Map<string, number>;
 }
 
 /** The window being spent, and the finished ones behind it (newest first). */
-let current: SubreqWindowState = { at: 0, total: 0, phases: [], hosts: new Map() };
+let current: SubreqWindowState = {
+  at: 0,
+  owner: "unknown",
+  total: 0,
+  phases: [],
+  hosts: new Map(),
+};
 let recent: SubreqWindowState[] = [];
 let windows = 0;
 
@@ -233,13 +259,16 @@ function hostRows(hosts: Map<string, number>): SubreqHostCount[] {
  * never gets to publish anything, so its last state has to be readable by the
  * NEXT one (see the header).
  */
-export function beginSubreqWindow(at = Date.now()): void {
+export function beginSubreqWindow(
+  at = Date.now(),
+  owner: SubreqOwner = "unknown",
+): void {
   // A window that never counted anything (a module load, a route that returned
   // before its first call) is not worth a slot in the ring.
   if (current.total > 0 || current.phases.length > 0) {
     recent = [current, ...recent].slice(0, SUBREQ_RECENT_WINDOWS);
   }
-  current = { at, total: 0, phases: [], hosts: new Map() };
+  current = { at, owner, total: 0, phases: [], hosts: new Map() };
   windows += 1;
 }
 
@@ -281,6 +310,7 @@ export function markSubreqPhase(phase: string, at = Date.now()): void {
 export function subreqView(): SubreqView {
   const flat = (w: SubreqWindowState): SubreqWindowView => ({
     at: w.at,
+    owner: w.owner,
     total: w.total,
     phases: w.phases.map((p) => ({ ...p })),
     hosts: hostRows(w.hosts),
@@ -332,7 +362,7 @@ export function subreqRemaining(budget: number = SUBREQ_BUDGET_FREE): number {
 
 /** Test seam: forget the boot's windows (never called on the tick path). */
 export function resetSubreqWindows(): void {
-  current = { at: 0, total: 0, phases: [], hosts: new Map() };
+  current = { at: 0, owner: "unknown", total: 0, phases: [], hosts: new Map() };
   recent = [];
   windows = 0;
 }

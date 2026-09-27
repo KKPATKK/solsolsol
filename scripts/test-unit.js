@@ -168,13 +168,27 @@ async function main() {
     // Negative is a real answer — clamping it to 0 would read as "exactly at
     // the reserve" and hide that the slice is already spent.
     assert.equal(scanSubreqLeft(2), -10);
+    // THE SLICE IS CONDITIONAL (2026-09-27): a tick whose pass stands down for
+    // the pass's own cron delivery hands the scan the whole allowance. Same
+    // arithmetic, one fewer reservation — and it is the DEFAULT that keeps
+    // every other caller (and every earlier reading) exactly as it was.
+    assert.equal(scanSubreqLeft(30, 0), 30);
+    assert.equal(scanSubreqLeft(2, 0), 2);
+    assert.equal(scanSubreqLeft(30, 4), 26);
     const workerSrc = fs.readFileSync(
       path.join(__dirname, "..", "src", "worker.ts"),
       "utf8",
     );
+    // The CALL is pinned, whitespace-flattened, because its shape is the whole
+    // point: the slice is not a constant any more, it is ASKED FOR — from the
+    // scanner, with the window and the slice, at the last moment this
+    // invocation could start a pass.
+    const flatWorker = workerSrc.replace(/\s+/g, "");
     assert.ok(
-      workerSrc.includes("scanner.runOnce(() => scanSubreqLeft(subreqRemaining()))"),
-      "the scan's counter must carry the reserve",
+      flatWorker.includes(
+        "scanOwner.runOnce(()=>scanSubreqLeft(subreqRemaining(),scanOwner.trackerPassSlice(TRACKER_PASS_FALLBACK_FRESH_MS,TRACKER_PASS_SUBREQ_RESERVE,startedAt+SCAN_TICK_BUDGET_MS,),),)",
+      ),
+      "the scan's counter must carry the slice the tick will actually need",
     );
   });
 
@@ -13264,10 +13278,16 @@ async function main() {
     const pushwatchSrc = read("src/pushwatch.ts");
     const scannerSrc = read("src/scanner.ts");
     const applied = {
-      "worker (the four boot rows ride ONE getWorkerStates)":
+      "worker (the four boot rows ride the front's ONE statement)":
         workerSrc.includes(
-          'bootStates=(awaitdb?.getWorkerStates(["axiom_access_token",PUSH_DEFERRAL_STATE_KEY,PUSH_LEDGER_STATE_KEY,SKIP_CAPTURE_STATE_KEY,]))??null;',
-        ),
+          'exportconstBOOT_STATE_KEYS=["axiom_access_token",PUSH_DEFERRAL_STATE_KEY,PUSH_LEDGER_STATE_KEY,SKIP_CAPTURE_STATE_KEY,];',
+        ) &&
+        workerSrc.includes("...BOOT_STATE_KEYS,];"),
+      "worker (and the boot block reads them from that statement, its own read kept as the fallback)":
+        workerSrc.includes(
+          "letbootStates:Map<string,string>|null=lastBootKeysRead!==null&&Date.now()-lastBootKeysRead.at<=HEARTBEAT_REUSE_MS?lastBootKeysRead.map:null;",
+        ) &&
+        workerSrc.includes("if(bootStates===null){try{bootStates=(awaitdb?.getWorkerStates([...BOOT_STATE_KEYS]))??null;"),
       "worker (and the cold-init block pays no single-key read of its own)": (() => {
         // SCOPED to the block (2026-09-26): a whole-FILE ban on the
         // axiom_access_token read fails on three legitimate callers (the axiom
@@ -14134,6 +14154,71 @@ async function main() {
     assert.equal(ran, 1, "the pass's own delivery owns the minute outright");
     assert.match(String(own), /^ok:1\/0/);
     assert.equal(JSON.parse(writes[0].value).via, "cron-pass");
+  });
+
+  await test("subreqs: a window names which invocation opened it (two owners share one isolate)", () => {
+    const { beginSubreqWindow, countSubreq, subreqView, resetSubreqWindows } =
+      require("../dist/subreqs.js");
+    resetSubreqWindows();
+    // The scan tick opens one...
+    beginSubreqWindow(1_000, "scan");
+    countSubreq("https://x.turso.io");
+    assert.equal(subreqView().current.owner, "scan");
+    // ...and the pass's own cron delivery lands on the SAME isolate, rolling
+    // the scan's window in behind it. Without the tag the two are one
+    // indistinguishable reading — which is what made "what did the tick front
+    // spend?" unanswerable while both owners shared this counter.
+    beginSubreqWindow(2_000, "pass");
+    countSubreq("https://api.telegram.org");
+    const view = subreqView();
+    assert.equal(view.current.owner, "pass", "the newest window says who opened it");
+    assert.equal(view.current.total, 1);
+    assert.equal(view.recent[0].owner, "scan", "and so does the rolled one");
+    assert.equal(view.recent[0].total, 1);
+    // A caller that does not say is not guessed at.
+    beginSubreqWindow(3_000);
+    assert.equal(subreqView().current.owner, "unknown");
+    resetSubreqWindows();
+    assert.equal(subreqView().current.owner, "unknown");
+  });
+
+  await test("Scanner.trackerPassSlice: the slice is released only when the pass WILL stand down", () => {
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const scanner = new Scanner(
+      {}, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    const now = Date.now();
+    const WINDOW = 120_000;
+    const SLICE = 12;
+    // No front read this tick (a standalone scanner, or a front read that
+    // failed): FAIL SAFE — the slice stays, because a pass might still run.
+    assert.equal(scanner.peerPassRow, null);
+    assert.equal(scanner.trackerPassSlice(WINDOW, SLICE, now), SLICE);
+    // The pass's own delivery wrote the row 40s ago: it owns this minute.
+    scanner.peerPassRow = JSON.stringify({
+      at: now - 40_000,
+      phase: "done",
+      via: "cron-pass",
+    });
+    assert.equal(scanner.trackerPassSlice(WINDOW, SLICE, now), 0);
+    // ...but the tick asks about the END of its envelope, and a row that will
+    // be stale by then is one its pass stage will NOT stand down for — so the
+    // slice stays. That difference is what keeps the scan's release and the
+    // pass's decision from disagreeing about a row crossing the window in
+    // between.
+    assert.equal(
+      scanner.trackerPassSlice(WINDOW, SLICE, now + 200_000),
+      SLICE,
+      "asked at the pass stage's own arrival, the same row reserves again",
+    );
+    // A skipped row is not an owner: the tick that ran no pass wrote it, and
+    // counting it would hold the slice for a card nobody announced.
+    scanner.peerPassRow = JSON.stringify({ at: now - 5_000, phase: "skip", via: "tick" });
+    assert.equal(scanner.trackerPassSlice(WINDOW, SLICE, now), SLICE);
+    // No window at all (the pass's own delivery, every pre-split caller): the
+    // slice is moot and the answer is the old, unconditional one.
+    assert.equal(scanner.trackerPassSlice(0, SLICE, now), SLICE);
   });
 
   console.log("\n===== UNIT TESTS =====");

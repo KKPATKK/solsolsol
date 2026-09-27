@@ -2223,6 +2223,39 @@ export class Scanner {
    * created at the pass's tail — is held rather than cancelled with the handler
    * (see pushwatch.holdForTick).
    */
+  /**
+   * The pass's row age when the row says a pass ran inside `windowMs`, or
+   * null when it does not — ONE reading behind both decisions about this
+   * minute: the scan's slice (trackerPassSlice) and the pass stage's own
+   * stand-down (below).
+   *
+   * `at` is WHEN the answer is needed, and callers differ on purpose: the
+   * pass stage asks at its own start, while the scan asks at the END of the
+   * tick's envelope, because the slice it releases must still be free when
+   * the pass stage runs. Both read the same row, so a row crossing the window
+   * between the two cannot make the scan release a slice the pass then needs.
+   */
+  private peerPassAgeMs(at: number, windowMs: number): number | null {
+    if (!(windowMs > 0)) return null;
+    const ageMs = passRowAgeMs(this.peerPassRow, at);
+    return ageMs !== null && ageMs < windowMs ? ageMs : null;
+  }
+
+  /**
+   * The subrequest slice this tick's pass stage still needs — what the scan's
+   * low-water gate takes off its allowance (see worker.scanSubreqLeft /
+   * TRACKER_PASS_SUBREQ_RESERVE).
+   *
+   * ZERO when the pass's own cron delivery owns this minute: the slice exists
+   * for a pass THIS invocation might run, and the pass stage will stand down,
+   * so holding it back would starve the scan's optional legs for nothing
+   * (measured: they stood down after ~14 of the 38 usable subrequests while
+   * every durable pass row read `via:"cron-pass"`).
+   */
+  trackerPassSlice(windowMs: number, slice: number, atMs: number): number {
+    return this.peerPassAgeMs(atMs, windowMs) !== null ? 0 : slice;
+  }
+
   async runTrackerPass(
     deadlineMs: number,
     keepAlive?: (promise: Promise<unknown>) => void,
@@ -2239,9 +2272,13 @@ export class Scanner {
     // what lets the tick spend its whole subrequest budget on the scan the way
     // it did before the pass existed.
     const peerPassFreshMs = options?.peerPassFreshMs ?? 0;
+    // The reading is SHARED (see peerPassAgeMs): the scan's slice was released
+    // against this very row earlier in the tick — asked at the last moment a
+    // pass could start — so this stage and that one agree by construction, not
+    // by both happening to look at the same row.
+    const ageMs = this.peerPassAgeMs(startedAt, peerPassFreshMs);
     if (peerPassFreshMs > 0) {
-      const ageMs = passRowAgeMs(this.peerPassRow, startedAt);
-      if (ageMs !== null && ageMs < peerPassFreshMs) {
+      if (ageMs !== null) {
         const note = `yield:peer-pass ${Math.round(ageMs / 1000)}s`;
         // Published, never persisted: the pass row's stamp IS the ownership
         // clock, so a yield that re-wrote it would keep the fallback asleep
