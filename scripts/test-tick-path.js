@@ -310,6 +310,11 @@ installTickProbe(fakeScanner, {
       return new Map(rows.map((r) => [r, {}]));
     },
     async recordTokenStatsMany(rows) {
+      // `this` ON PURPOSE: the real Db methods are called off their handle
+      // (`this.get`/`this.execute`), and the drain invokes this LATER with no
+      // call-site receiver — live 2026-09-27 that threw `TypeError: this.get is
+      // not a function` on every drained call while this fake passed.
+      assert.equal(this, seamDb, "the drain calls a method on its own handle");
       wire.push("register");
       clock += 200;
       return undefined;

@@ -837,6 +837,11 @@ export async function drainDeferredWrites(
       calls += 1;
       try {
         await runBucket(bucket);
+        // A landed batch proves the handle works, so the count is for
+        // CONSECUTIVE failures (the old per-entry rule): without this reset, a
+        // bucket that failed twice hours ago would be DROPPED — the whole
+        // backlog and all — by a single new failure today.
+        bucket.attempts = 0;
       } catch (err) {
         failures += 1;
         bucket.attempts += 1;
@@ -1049,7 +1054,13 @@ function wrapDbMethod(
 ): void {
   const original = target[name];
   if (typeof original !== "function") return;
-  const call = original as (...args: unknown[]) => Promise<unknown>;
+  // BOUND to its handle, on purpose (live 2026-09-27): the deferred path runs
+  // this LATER, from the drain (see runBucket), where `bucket.call(payload)`
+  // has no receiver — a real Db method reached that way threw `TypeError:
+  // this.get is not a function` in 0ms on every drain call, and after three
+  // attempts it dropped a whole owed bucket (313 registrations). The offline
+  // fakes are `this`-free, so only the binding keeps the production shape.
+  const call = (original as (...args: unknown[]) => Promise<unknown>).bind(target);
   target[name] = (...args: unknown[]): Promise<unknown> => {
     // One label per CALL, not per wrapper: this wrapper is shared by every
     // key the tick happens to read or write, and for the two worker_state
