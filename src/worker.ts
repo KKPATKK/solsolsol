@@ -274,6 +274,12 @@ let lastScanAt: number | null = null;
 let lastScanOk = false;
 let scanCount = 0;
 let initPromise: Promise<void> | null = null;
+/**
+ * The cached init promise's age bookkeeping (see trackInitBoot): when the boot
+ * currently in `initPromise` was created, 0 whenever nothing is pending. Read
+ * only through cachedInitVerdict, and only while `initPromise` is set.
+ */
+const initBoot: { pendingSince: number } = { pendingSince: 0 };
 
 // Diagnostics surfaced via /health so the state of the serverless runtime can
 // be observed directly (no terminal access to the isolate).
@@ -2943,6 +2949,83 @@ async function trackNoCompletionStretch(deadAt: number, now: number): Promise<vo
   await store.setWorkerState("outage_alert_at", String(now));
 }
 
+/**
+ * How long the cached init promise may stay UNSETTLED before the next tick
+ * drops it and lets a fresh attempt rebuild the isolate (see
+ * cachedInitVerdict). Generous on purpose: a healthy boot is ~1-2s (the handler
+ * only allows FRONT_INIT_BOUND_MS = 3.5s in front of a tick), so 60s is ~17x
+ * the measured cost and a merely SLOW Turso can never be mistaken for a hung
+ * one. The cost of waiting is bounded and honest — an isolate that reaches this
+ * barrier is answering every tick with the `!scanner` guard anyway.
+ */
+export const INIT_UNSETTLED_MAX_MS = 60_000;
+
+/**
+ * What a tick should do with the CACHED init promise. Pure and exported so the
+ * two shapes this closes can be asserted offline instead of watched live:
+ *
+ *   - `reuse`: nothing is pending, or the pending boot is young — the normal
+ *     shape, and the one that must never re-init (the cache is what keeps a
+ *     warm isolate from paying init on every tick and every request).
+ *   - `drop`: the boot has been UNSETTLED past `maxMs`, i.e. it is hung. It
+ *     will never set `scanner`, so every later tick would answer the
+ *     `!scanner` guard for as long as Cloudflare keeps the isolate warm — the
+ *     failure measured 2026-09-27 (cron ticks arriving every minute, no scan
+ *     completed for ~9h, ending only when a deploy replaced the isolate).
+ *     Dropping the cache is what lets the SAME tick start a fresh boot.
+ */
+export function cachedInitVerdict(
+  pendingSince: number,
+  now: number,
+  maxMs: number = INIT_UNSETTLED_MAX_MS,
+): "reuse" | "drop" {
+  return pendingSince > 0 && now - pendingSince > maxMs ? "drop" : "reuse";
+}
+
+/**
+ * Wire a freshly created init boot to the cache it is about to occupy.
+ * Exported (like the rest of this file's tick machinery) so the shapes below
+ * can be pinned offline.
+ *
+ * WHY THE SETTLE HANDLERS LIVE HERE, and not at the call site: the cached
+ * promise is handed to every later tick, so it must stop being cached the
+ * moment it can only make them fail, and `ensureInitialized` cannot do that
+ * for itself — its own reset sits AFTER `await initPromise`, which a REJECTION
+ * throws straight past, and a boot that never settles never reaches it at all.
+ * The two shapes are therefore:
+ *
+ *   - REJECTED (a constructor that throws — grammy on a bad token, a client
+ *     that validates its config, anything unguarded in the boot body): the
+ *     cache is cleared at once so the next tick retries, and `onReject` gets
+ *     the reason so the failure is visible instead of silent. Attaching a
+ *     handler also stops a boot that rejects AFTER its creator's 3.5s front
+ *     bound from surfacing as an UNHANDLED rejection on that isolate.
+ *   - STILL PENDING: handled by the next caller's cachedInitVerdict, which
+ *     drops it past INIT_UNSETTLED_MAX_MS (see there for why).
+ *
+ * `isCurrent()` is the identity test: a boot a newer one has already replaced
+ * must not zero the LIVE boot's age, or the staleness guard would be blinded by
+ * the very settle it is waiting for. Its rejection is still reported — that is
+ * a real failure of a real attempt — but the cache is left alone.
+ */
+export function trackInitBoot<T>(
+  boot: Promise<T>,
+  state: { pendingSince: number },
+  handlers: { isCurrent: () => boolean; onReject: (err: unknown) => void },
+  now: () => number = () => Date.now(),
+): void {
+  state.pendingSince = now();
+  void boot.then(
+    () => {
+      if (handlers.isCurrent()) state.pendingSince = 0;
+    },
+    (err: unknown) => {
+      if (handlers.isCurrent()) state.pendingSince = 0;
+      handlers.onReject(err);
+    },
+  );
+}
+
 async function ensureInitialized(env: Env): Promise<void> {
   // Dead-tick recovery (see DEAD_TICK_STREAK_RESET). The SUCCESSOR tick is the
   // only witness a killed tick can have, and this is the earliest hook every
@@ -3087,8 +3170,20 @@ async function ensureInitialized(env: Env): Promise<void> {
     console.log("[worker] trade bindings changed — re-initializing");
     initPromise = null;
   }
+  if (initPromise && cachedInitVerdict(initBoot.pendingSince, Date.now()) === "drop") {
+    // Hung, not merely slow (see cachedInitVerdict): it will never set
+    // `scanner`, so this tick drops the cache and boots again rather than
+    // answering the `!scanner` guard for the rest of the isolate's life.
+    console.error(
+      `[worker] init promise still unsettled after ${Math.round(
+        (Date.now() - initBoot.pendingSince) / 1000,
+      )}s — dropping the cached init so this tick can rebuild`,
+    );
+    initPromise = null;
+    initBoot.pendingSince = 0;
+  }
   if (initPromise) return initPromise;
-  initPromise = (async () => {
+  const boot = (async () => {
     const config = loadConfig(env);
     cfg = config;
     lastTradeFp = fp;
@@ -3507,14 +3602,37 @@ async function ensureInitialized(env: Env): Promise<void> {
       }
     }
   })();
-  await initPromise;
+  initPromise = boot;
+  // The cache must not outlive the boot it describes (see trackInitBoot): a
+  // REJECTED boot clears it here, because the reset below is unreachable on
+  // that path — the `await` underneath raises past it, and a hung boot never
+  // reaches it at all. The failure is logged either way, so a throwing
+  // constructor is a reading instead of the silent, hours-long wedge it
+  // produced on 2026-09-27.
+  trackInitBoot(boot, initBoot, {
+    isCurrent: () => initPromise === boot,
+    onReject: (err) => {
+      console.error(
+        "[worker] init THREW — dropping the cached init so the next tick retries:",
+        err instanceof Error ? err.message : err,
+      );
+      if (initPromise === boot) {
+        initPromise = null;
+        initBoot.pendingSince = 0;
+      }
+    },
+  });
+  await boot;
   // A failed Turso init (transient 522 / timeout) must not stick forever:
   // reset so the next tick re-attempts init and the isolate self-heals
   // once the database recovers, instead of staying scanner-less until
-  // Cloudflare evicts it.
+  // Cloudflare evicts it. NOTE: this arm is the SETTLED-but-not-ready shape
+  // (db.init() threw inside its own try) — the throwing and hung shapes are
+  // trackInitBoot's and cachedInitVerdict's above.
   if (tursoConfigured && !dbReady) {
     console.warn("[worker] Turso init failed — will retry on the next tick");
     initPromise = null;
+    initBoot.pendingSince = 0;
   }
 }
 

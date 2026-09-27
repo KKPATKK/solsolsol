@@ -24,6 +24,7 @@ const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, a
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS } = require("../dist/worker.js");
+const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
@@ -14775,6 +14776,104 @@ async function main() {
     assert.equal(scanRescueGapMs(90_000), 180_000);
     assert.equal(scanRescueGapMs(300_000), 600_000);
     assert.ok(scanRescueGapMs(60_000) > scanGateMs(60_000) * 2, "a rescue is never one gate late");
+  });
+
+  await test("init boot cache: a REJECTED or HUNG boot stops being cached", async () => {
+    const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } =
+      require("../dist/worker.js");
+    // The staleness test is the only thing that can free a boot that never
+    // settles — no rejection handler can see that shape. Reused while young,
+    // dropped past the bound, and never consulted with nothing pending (0 is
+    // the "no boot cached" stamp, not an ancient one).
+    const t0 = 1_000_000;
+    assert.equal(cachedInitVerdict(0, t0), "reuse", "nothing pending = nothing to drop");
+    assert.equal(
+      cachedInitVerdict(t0, t0 + INIT_UNSETTLED_MAX_MS),
+      "reuse",
+      "at the bound the boot is still reused",
+    );
+    assert.equal(
+      cachedInitVerdict(t0, t0 + INIT_UNSETTLED_MAX_MS + 1),
+      "drop",
+      "one ms past it, the tick must rebuild",
+    );
+    assert.equal(INIT_UNSETTLED_MAX_MS, 60_000, "the bound is the measured-generous one");
+    assert.ok(
+      INIT_UNSETTLED_MAX_MS > FRONT_INIT_BOUND_MS * 10,
+      "a healthy boot (bounded at FRONT_INIT_BOUND_MS in front of a tick) can never look hung",
+    );
+
+    // A REJECTED boot: the cache is cleared the moment it rejects, and the
+    // reason is reported — this is the shape that used to pin an isolate to
+    // `scanner === null` for hours, because the reset in the creating call
+    // sits after the `await` the rejection throws past.
+    const rejected = { pendingSince: 0 };
+    let rejectBoot;
+    const failing = new Promise((_, reject) => {
+      rejectBoot = reject;
+    });
+    const seen = [];
+    const current = true;
+    trackInitBoot(failing, rejected, {
+      isCurrent: () => current,
+      onReject: (err) => seen.push(err.message),
+    });
+    assert.ok(rejected.pendingSince > 0, "the age is stamped where the boot is cached");
+    rejectBoot(new Error("createBot: invalid token"));
+    await failing.catch(() => {});
+    assert.deepEqual(seen, ["createBot: invalid token"], "the reason is reported, never swallowed");
+    assert.equal(rejected.pendingSince, 0, "and the boot stops being pending");
+
+    // A boot that SETTLES is not pending either — the normal shape, and the
+    // one the staleness test must never touch.
+    const settled = { pendingSince: 0 };
+    let settledRejects = 0;
+    const ok = Promise.resolve();
+    trackInitBoot(ok, settled, {
+      isCurrent: () => true,
+      onReject: () => {
+        settledRejects += 1;
+      },
+    });
+    assert.ok(settled.pendingSince > 0, "a fresh boot is pending until it settles");
+    await ok;
+    assert.equal(settled.pendingSince, 0, "a resolved boot is not pending");
+    assert.equal(settledRejects, 0, "and a resolution is not a failure");
+
+    // A LATE settle of an abandoned boot must leave the LIVE boot's age alone:
+    // zeroing it would blind the staleness guard to the boot it is waiting for.
+    // Its rejection is still reported (a real attempt really failed); the cache
+    // itself is left to the call site's own identity test.
+    const live = { pendingSince: 0 };
+    let lateReject;
+    const stale = new Promise((_, reject) => {
+      lateReject = reject;
+    });
+    const lateReasons = [];
+    trackInitBoot(stale, live, {
+      isCurrent: () => false,
+      onReject: (err) => lateReasons.push(err.message),
+    });
+    live.pendingSince = 7_777; // a newer boot now owns the cache
+    lateReject(new Error("late"));
+    await stale.catch(() => {});
+    assert.equal(live.pendingSince, 7_777, "a late settle does not touch the live boot's age");
+    assert.deepEqual(lateReasons, ["late"], "but it is still reported");
+
+    // The wiring in worker.ts itself: the guard must CLEAR the cache (a log
+    // alone would leave the wedge in place), and the boot must be tracked with
+    // the identity test the case above relies on.
+    const workerSrc = fs
+      .readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8")
+      .replace(/\s+/g, "");
+    assert.ok(
+      workerSrc.includes('cachedInitVerdict(initBoot.pendingSince,Date.now())==="drop"'),
+      "the cached boot is tested for staleness through the shared verdict",
+    );
+    assert.ok(
+      workerSrc.includes("trackInitBoot(boot,initBoot,{isCurrent:()=>initPromise===boot,"),
+      "and it is tracked with the identity test, not a bare rejection handler",
+    );
   });
 
   await test("scan trigger attribution: `via` is a parameter, and every call site names its trigger", () => {
