@@ -432,6 +432,110 @@ export function parseScheduledTickRing(raw: string | null): number[] {
 }
 
 /**
+ * WHICH invocation ran a scan (2026-09-27, measured live): the cron tick and
+ * the HTTP fallback both write scan_history rows with nothing to tell them
+ * apart, and the fallback turned out to drive 26 of 76 completions (34%) in a
+ * 90-minute window — so "cron stopped delivering" could not be read off the
+ * history at all. The tag travels as a PARAMETER from the handler (never
+ * module state: the pass's own delivery shares the isolate and overwrites
+ * module-scope readings — a tick's done heartbeat published
+ * `subreqs.current.owner:"pass"` on 2026-09-27), lands in the heartbeat's
+ * `via`, and is counted durably by the statements below.
+ */
+export type ScanTrigger = "cron" | "http" | "manual";
+
+/** The durable counter row per trigger (see scanTriggerStatements). */
+export const SCAN_TRIGGER_COUNTER_KEYS: Record<ScanTrigger, string> = {
+  cron: "scan_trigger_cron",
+  http: "scan_trigger_http",
+  manual: "scan_trigger_manual",
+};
+
+/** The counters as a key list, for the front read that publishes them. */
+export const SCAN_TRIGGER_STATE_KEYS: readonly string[] = [
+  SCAN_TRIGGER_COUNTER_KEYS.cron,
+  SCAN_TRIGGER_COUNTER_KEYS.http,
+  SCAN_TRIGGER_COUNTER_KEYS.manual,
+];
+
+/** The fleet-wide per-trigger scan counts (see parseScanTriggerCounts). */
+export interface ScanTriggerCounts {
+  cron: number;
+  http: number;
+  manual: number;
+}
+
+/**
+ * The completion timestamp of the last COUNTED scan (see
+ * scanTriggerStatements): the idempotence key for a retried flush, and a
+ * reading of its own — it is the `at` of the newest scan_history row the
+ * counters account for.
+ */
+export const SCAN_TRIGGER_GUARD_KEY = "scan_trigger_last_at";
+
+/**
+ * Increment one trigger's counter as READ-FREE statements, on the same
+ * discipline as scheduledTickStatements: they ride the completion batch the
+ * tick already pays for (see persistScanCompletion), so attribution costs
+ * ZERO extra round trips — and the row is durable, so it survives the isolate
+ * that produced it.
+ *
+ * IDEMPOTENT UNDER THE FLUSH RETRY, which is the reason for `at`: the retry
+ * re-sends the SAME batch (a first attempt that committed but lost its response
+ * must not count the scan twice), and the other statements in that batch are
+ * idempotent for the same reason (upsert heartbeat, delete-then-insert history).
+ * The increment is therefore gated on the completion's own `at` and the guard
+ * row is written after it, in the same transaction.
+ */
+export function scanTriggerStatements(
+  via: ScanTrigger,
+  at: number,
+): Array<{ sql: string; args: Array<string | number | null> }> {
+  const key = SCAN_TRIGGER_COUNTER_KEYS[via];
+  return [
+    {
+      // The row must exist before the UPDATE can increment it.
+      sql: `INSERT OR IGNORE INTO worker_state (key, value) VALUES ('${key}', '0')`,
+      args: [],
+    },
+    {
+      // NULL guard (first ever completion) IS NOT the stamp -> counts; the
+      // same stamp again (the retry) -> no-op.
+      sql: `UPDATE worker_state SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+             WHERE key = '${key}'
+               AND (SELECT value FROM worker_state WHERE key = '${SCAN_TRIGGER_GUARD_KEY}') IS NOT ?`,
+      args: [String(at)],
+    },
+    {
+      sql: `INSERT INTO worker_state (key, value) VALUES ('${SCAN_TRIGGER_GUARD_KEY}', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      args: [String(at)],
+    },
+  ];
+}
+
+/**
+ * The counters out of a worker_state map (see SCAN_TRIGGER_STATE_KEYS). A
+ * missing, unparseable or negative value reads as 0 — telemetry must never
+ * make a caller throw (same discipline as parseScheduledTickRing).
+ */
+export function parseScanTriggerCounts(
+  states: Map<string, string> | null | undefined,
+): ScanTriggerCounts {
+  const read = (key: string): number => {
+    const raw = states?.get(key) ?? null;
+    if (raw === null) return 0;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  };
+  return {
+    cron: read(SCAN_TRIGGER_COUNTER_KEYS.cron),
+    http: read(SCAN_TRIGGER_COUNTER_KEYS.http),
+    manual: read(SCAN_TRIGGER_COUNTER_KEYS.manual),
+  };
+}
+
+/**
  * The cron-arrival bookkeeping that can ride a tick's claim batch (see
  * Db.scheduledTickStatements): the cron event time plus the ring to store.
  */
@@ -2784,6 +2888,14 @@ export class Db {
      * ran without a lock (fail-open claim error).
      */
     scanLockValue: string | null = null,
+    /**
+     * Which invocation ran the scan (see ScanTrigger). When given, the matching
+     * counter increments IN THIS BATCH — the attribution rides the round trip
+     * the flush already pays, and it commits in the same transaction that
+     * publishes the completion, so a completion that lands is a completion that
+     * is counted. Null = do not count (heartbeat-only flushes are not scans).
+     */
+    via: ScanTrigger | null = null,
   ): Promise<void> {
     const c = this.get();
     const ops: Array<{
@@ -2800,6 +2912,12 @@ export class Db {
         sql: "DELETE FROM worker_state WHERE key = 'scan_lock' AND value = ?",
         args: [scanLockValue],
       });
+    }
+    if (via !== null && history !== null) {
+      // Attribution rides the flush (see ScanTrigger): zero extra round trips,
+      // and only a completion that is being written is counted — keyed on its
+      // own `at` so a retried flush cannot count it twice.
+      ops.push(...scanTriggerStatements(via, history.at));
     }
     if (history) {
       // Idempotent insert: clear any row with the same timestamp first (the

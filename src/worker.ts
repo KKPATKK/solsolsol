@@ -14,10 +14,14 @@ import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
 import {
   Db,
+  SCAN_TRIGGER_STATE_KEYS,
+  parseScanTriggerCounts,
   parseScheduledTickRing,
   parseTelemetryCounter,
   parseTradeModeOverride,
   telemetryCounterUsable,
+  type ScanTrigger,
+  type ScanTriggerCounts,
   type ScheduledTickEntry,
 } from "./db";
 // Subclass with the last-good pool fallback: the method it wraps lives past
@@ -229,16 +233,40 @@ let tickDebugLastRunAt = 0;
 const BACKFILL_DEBUG_COOLDOWN_MS = 5 * 60_000;
 let backfillDebugLastRunAt = 0;
 /** Minimum gap between fallback scans triggered from the fetch path. */
-// How often the HTTP-triggered fallback scan may fire. Cron (1/min) is the
-// primary driver; 60s keeps the fallback from double-scanning during
-// healthy cron delivery while still self-healing within ~1 minute if cron
-// stops (observed 2026-08-14: cron dead for 24h+, fallback kept the bot
-// alive; observed 2026-09-03: a ~4-min cron delivery pause produced a
-// heartbeat freeze + outage alert because no request arrived in the
-// window — tightened from 120s so any webhook/monitor request rescues
-// sooner. The heartbeat-freshness check below still dedupes against
-// healthy cron, so the effective cadence stays 1/min when cron works).
+// How often the HTTP-triggered fallback may LOOK. Cron (1/min) is the primary
+// driver, and since 2026-09-27 the fallback is a RESCUE rather than a cadence
+// participant: this 60s still bounds how often a request may check, but the
+// scan itself now needs the heartbeat to be scanRescueGapMs stale — two missed
+// cadences. The old 60s heartbeat check let the fallback fire into EVERY minute
+// whose tick was merely late: measured live 05:13-05:30Z (cron ring vs
+// scan_history), 26 of 76 completions in 90 minutes were the fallback's, i.e.
+// the "cron tick" a reader sees in scan_history was one in three times an HTTP
+// invocation — and each of those scans armed the next tick's gate skip.
+//
+// WHY NOT SHORTER (the 2026-08-14 dead-cron case, and the 2026-09-03 ~4-min
+// delivery pause): a genuinely dead cron is still rescued within ~2 minutes,
+// which is the same window the outage alert uses; the cost of waiting one extra
+// cadence is bounded, and the cost of firing early is the loop above.
 const SCAN_TRIGGER_INTERVAL_MS = 60_000;
+/**
+ * The cron period both trigger expressions share (see TRACKER_CRON and
+ * wrangler.toml). Named because the cadence gate's margin
+ * must leave the gate strictly above ONE period for any interval larger than
+ * it — that is what keeps 90/120 skipping alternate ticks.
+ */
+export const SCAN_CRON_PERIOD_MS = 60_000;
+/**
+ * The fallback's rescue threshold: how stale the last COMPLETED scan must be
+ * before an HTTP request may run the scan itself. Two missed cadences, with a
+ * 120s floor so the 60s default needs 120s. "Two" is the point: a tick which
+ * is merely late (<1 cadence) still scans for itself, and the fallback only
+ * engages once that has already failed.
+ */
+export const SCAN_RESCUE_MIN_GAP_MS = 120_000;
+/** The fallback's threshold for a configured scan interval (see above). */
+export function scanRescueGapMs(scanGapMs: number): number {
+  return Math.max(SCAN_RESCUE_MIN_GAP_MS, scanGapMs * 2);
+}
 let lastScanTriggerAt = 0;
 let lastScanAt: number | null = null;
 let lastScanOk = false;
@@ -2013,6 +2041,10 @@ export const BOOT_STATE_KEYS = [
   PUSH_DEFERRAL_STATE_KEY,
   PUSH_LEDGER_STATE_KEY,
   SKIP_CAPTURE_STATE_KEY,
+  // The per-trigger scan counters ride the front statement (and this list's
+  // fallback read) so a recycled isolate can answer "cron vs fallback" before
+  // it has any reading of its own — same discipline as the three mirrors above.
+  ...SCAN_TRIGGER_STATE_KEYS,
 ];
 
 export const WEDGE_READ_KEYS = [
@@ -2062,6 +2094,17 @@ export function frontModeOverrideRead(): { raw: string | null; at: number } | nu
   if (Date.now() - seen.at > HEARTBEAT_REUSE_MS) return null;
   return { raw: seen.map.get("trade_mode_override") ?? null, at: seen.at };
 }
+
+/**
+ * The fleet-wide per-trigger scan counts (see Db.ScanTriggerCounts) as of the
+ * last completed scan this isolate knows about. Two writers keep it fresh: the
+ * per-invocation front read (`ensureInitialized`, which already asks for these
+ * keys) and the boot block's mirror prime on a cold isolate. It lags the scan
+ * being reported by exactly one completion — the increment commits with that
+ * scan's own flush batch — which is the same "as of the last confirmed write"
+ * discipline the deferral snapshot documents.
+ */
+let scanTriggerMirror: ScanTriggerCounts = { cron: 0, http: 0, manual: 0 };
 
 /**
  * What the cadence gate still has to fetch itself, given what the tick's
@@ -2234,21 +2277,43 @@ function beginPreTick(entryAt: number, owner: SubreqOwner = "unknown"): void {
  */
 const SCAN_LOCK_TTL_MS = 15_000;
 /**
- * Slack allowed between two scans beyond SCAN_INTERVAL_SECONDS when the
- * cadence gate compares against the previous tick's CLAIM time. The gate is
- * `now - heartbeat.at >= scanGapMs`, and `at` is written by the claim batch
- * ~1-4s AFTER cron fires — so a strict 60s gate measures ~56-58s on the
- * next tick and systematically skips it (live evidence 2026-09-07:
- * scan_history gaps of 121-122s, heartbeat 86s stale while a tick had
- * fired 28s earlier — every other tick silently did nothing). The margin
- * covers the claim offset + cron delivery jitter; overlap safety is the
- * scan lock's job (CAS claim, 55s TTL), not the gate's. With the margin,
- * SCAN_INTERVAL_SECONDS=60 scans on EVERY tick; 90/120 still gate to
- * every-other / every-third tick (gaps 60 < 80 < 120). Set generously:
- * a margin up to ~20s cannot double-scan (the previous scan releases the
- * lock at claim+~15s and a second trigger loses the CAS claim).
+ * The cadence gate's jitter budget: slack the configured interval gets before
+ * the gate refuses a tick. The gate is `now - heartbeat.at >= gateMs`, and
+ * `at` is the previous scan's COMPLETION (the completion flush overwrites the
+ * claim's start stamp with `flushedAt`), so what the gate measures is
+ * completion-to-entry of the next tick. The old flat 10s margin was sized for
+ * the claim offset alone (2026-09-07: a strict comparison skipped every other
+ * tick) and cannot absorb dispatch jitter: measured 2026-09-27 from the cron
+ * ring, 18 of 90 arrivals landed at :10 or later, up to :29 — and every late
+ * completion (:2x) was followed by a ~100s hole, because the next tick read
+ * age ~35-45s and skipped.
+ *
+ * WHY NOT 30s FOR EVERY INTERVAL: for an interval longer than one cron period
+ * the gate IS the cadence knob — 90s is implemented by skipping every other
+ * 1-minute tick, which needs the gate strictly above 60s (90 - 20 = 70; with a
+ * full 30s margin it would land exactly on 60 and the setting would silently
+ * become 60s). So the margin shrinks to whatever room is left above one period.
+ *
+ * Overlap safety is the scan lock's job (CAS claim + TTL), not the gate's: a
+ * margin this size can never start a scan on top of a live one.
  */
-const SCAN_GATE_MARGIN_MS = 10_000;
+export const SCAN_GATE_JITTER_MS = 30_000;
+/** Never let the gate land right on one cron period (see scanGateMs). */
+export const SCAN_GATE_MIN_MARGIN_MS = 10_000;
+/**
+ * The cadence gate's threshold for a configured scan interval: scan when the
+ * last COMPLETION is at least this old. Pure and exported so the two modes this
+ * file must keep working — "scan on every tick" at the 60s default and "skip
+ * every other tick" at 90s — are asserted in tests instead of watched live.
+ */
+export function scanGateMs(scanGapMs: number): number {
+  const interval = Math.max(SCAN_CRON_PERIOD_MS, scanGapMs);
+  if (interval === SCAN_CRON_PERIOD_MS) {
+    return interval - SCAN_GATE_JITTER_MS;
+  }
+  const room = interval - SCAN_CRON_PERIOD_MS - SCAN_GATE_MIN_MARGIN_MS;
+  return interval - Math.min(SCAN_GATE_JITTER_MS, Math.max(0, room));
+}
 /** Opaque per-isolate owner tag for scan-lock claims. */
 const SCAN_LOCK_OWNER = `iso-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 /**
@@ -2929,6 +2994,12 @@ async function ensureInitialized(env: Env): Promise<void> {
       // round trip for four keys it already has. Recorded ONLY when the read
       // landed: a timed-out front read must not be dressed up as boot rows.
       lastBootKeysRead = { map: kb, at: now };
+      // The per-trigger scan counts ride the SAME statement (see
+      // SCAN_TRIGGER_STATE_KEYS): /health reads "cron vs fallback" from a read
+      // the invocation already paid for, on every invocation, warm or cold.
+      if (kb) {
+        scanTriggerMirror = parseScanTriggerCounts(kb);
+      }
       const verdict = deadTickRebuildDecision(prevRaw, now, BACKFILL_STALE_MS);
       if (verdict.rebuild) {
         console.error(
@@ -3117,6 +3188,15 @@ async function ensureInitialized(env: Env): Promise<void> {
               skipCaptureMirror = parseSkipCaptureState(
                 bootStates.get(SKIP_CAPTURE_STATE_KEY) ?? null,
               );
+            } catch {
+              // telemetry only — never fail init over a counter read
+            }
+            // Same for the per-trigger scan counts (see SCAN_TRIGGER_STATE_KEYS
+            // / scanTriggerMirror): a recycled isolate answers "how much of the
+            // scanning is actually cron" with the durable totals instead of
+            // zeros until its front read refreshes them.
+            try {
+              scanTriggerMirror = parseScanTriggerCounts(bootStates);
             } catch {
               // telemetry only — never fail init over a counter read
             }
@@ -3496,8 +3576,23 @@ async function runScan(
    * the claim lands, and are written on their own only when it does not.
    */
   cronTick?: ScheduledTickEntry | null,
+  /**
+   * Which invocation runs this scan (see Db.ScanTrigger): "cron" for the
+   * scheduled tick, "http" for the fallback, "manual" for /debug/tick. It is
+   * stamped as `via` into both heartbeats and the completion payload, and the
+   * completion batch counts it durably (Db.scanTriggerStatements) — the ONE
+   * reading that answers "how much of the scanning is actually cron".
+   *
+   * A PARAMETER, never module state: the pass's own delivery lands on this same
+   * isolate and overwrites module-scope readings (measured 2026-09-27: a tick's
+   * done heartbeat published `subreqs.current.owner:"pass"`, the pass
+   * invocation's window). Attribution read at flush time would name the wrong
+   * owner; a local cannot.
+   */
+  via: ScanTrigger = "cron",
 ): Promise<void> {
   if (!scanner) return;
+  const scanVia: ScanTrigger = via;
   // Cross-isolate single-flight: cron and the HTTP fallback may run on
   // DIFFERENT isolates that each read the same stale heartbeat and both
   // start a scan in the same second (observed 2026-09-03 — duplicate
@@ -3602,6 +3697,9 @@ async function runScan(
   const startSkip = skipCaptureSnapshot();
   const heartbeatJson = JSON.stringify({
     at: startedAt,
+    // Which invocation ran this scan (see runScan's `via`): the /health
+    // reading that tells a fallback rescue apart from a cron tick.
+    via: scanVia,
     ok: true,
     phase: "scanning",
     ms: null,
@@ -3645,6 +3743,11 @@ async function runScan(
     // pre-race copy is the freshest one published every tick, so /health
     // always carries it.
     pushLedger: pushLedgerMirror,
+    // Fleet-wide per-trigger scan counts (see Db.scanTriggerStatements), as of
+    // this invocation's front read. The completion batch increments them, so
+    // this value is one completed scan behind — the same lag the deferral
+    // snapshot above documents.
+    scanTriggers: scanTriggerMirror,
   });
   preTick.steps.json = Date.now() - heartbeatAt;
   if (db) {
@@ -3966,6 +4069,10 @@ async function runScan(
       const buildFlushPayload = () =>
         JSON.stringify({
             at: flushedAt,
+            // Who ran this scan (see runScan's `via`) — the done heartbeat is
+            // what /health serves between ticks, so the attribution rides it
+            // too, not only the scanning row.
+            via: scanVia,
             ok: lastScanOk,
             phase: "done",
             count: scanCount,
@@ -4009,6 +4116,9 @@ async function runScan(
             // tick's `phase: scanning` heartbeat publishes the fresh copy).
             deferral: pushDeferralSnapshot,
             pushLedger: pushLedgerMirror,
+            // See the scanning heartbeat above: the counts lag one completed
+            // scan behind the row this very flush is about to write.
+            scanTriggers: scanTriggerMirror,
             summary,
           });
       const flushJson = buildFlushPayload();
@@ -4066,6 +4176,11 @@ async function runScan(
             pushed: summary?.pushed ?? null,
           },
           scanLock,
+          // Durable attribution: the counter increments in the SAME batch (zero
+          // extra round trips) and is published by the next invocation's front
+          // read — so "cron vs fallback" survives this isolate and never
+          // depends on module state (see runScan's `via`).
+          scanVia,
         ) ?? Promise.resolve();
       const flushStartedAt = Date.now();
       // Every await on the flush path is bounded by what is LEFT of the
@@ -4618,16 +4733,27 @@ async function maybeRunScanIfStale(
   markPreTickEntry(now);
   if (now - lastScanTriggerAt < SCAN_TRIGGER_INTERVAL_MS) return;
   lastScanTriggerAt = now;
-  // Dedupe against a healthy cron: skip when a scan already completed
-  // recently (the heartbeat is written at scan completion). The fallback
-  // exists to rescue a DEAD cron, not to double the scan rate — every extra
-  // scan doubles the Turso rows-read and the upstream API pressure (which
-  // is what triggers the gecko 429s). When cron delivers, this makes the
-  // effective cadence exactly the configured 60s instead of ~1.5x it.
+  // Dedupe against a healthy cron: skip unless the last COMPLETED scan is
+  // TWO missed cadences old (see scanRescueGapMs). The heartbeat's `at` is
+  // the completion time (the flush overwrites the claim's start stamp), so a
+  // tick that is merely late — the normal shape of a skipped minute — still
+  // holds the heartbeat well inside the rescue gap and scans for ITSELF.
+  // The fallback exists to rescue a DEAD cron, not to take over a late tick:
+  // at the old one-cadence threshold it did exactly that (26 of 76 completions
+  // in a measured 90-minute window), and each rescue then armed the next
+  // tick's skip.
   // The heartbeat read doubles as the backfill input for runScan (a dead
   // predecessor's stale scanning heartbeat) — pass it down so the tick
   // adds no extra round trip on the wall-clock-critical path.
   let hbRaw: string | null = null;
+  // The rescue threshold in the configured cadence (same arithmetic as the
+  // cron gate): a 90s deployment needs 180s of silence before a request takes
+  // the scan over.
+  const scanGapMs = Math.max(
+    SCAN_CRON_PERIOD_MS,
+    (cfg?.scanIntervalSeconds ?? 60) * 1000,
+  );
+  const rescueGapMs = scanRescueGapMs(scanGapMs);
   try {
     // Reuse the read ensureInitialized just paid for when it is still fresh
     // (see lastHeartbeatRead): the uptime monitor drives this path once a
@@ -4638,7 +4764,7 @@ async function maybeRunScanIfStale(
         ? cachedHb.raw
         : ((await db?.getWorkerState("scan_heartbeat")) ?? null);
     const at = hbRaw ? ((JSON.parse(hbRaw) as { at?: number } | null)?.at ?? 0) : 0;
-    if (typeof at === "number" && now - at < SCAN_TRIGGER_INTERVAL_MS) return;
+    if (typeof at === "number" && now - at < rescueGapMs) return;
   } catch {
     // heartbeat unreadable — fail open and run the fallback scan
   }
@@ -4647,7 +4773,7 @@ async function maybeRunScanIfStale(
   // above left the open window alone.
   beginSubreqWindow(now, "http");
   try {
-    await runScan(hbRaw, env);
+    await runScan(hbRaw, env, null, "http");
   } catch (err) {
     console.error(
       "[worker] fallback scan failed:",
@@ -6411,7 +6537,7 @@ export default {
         );
       }
       const t0 = Date.now();
-      await runScan(undefined, env);
+      await runScan(undefined, env, null, "manual");
       return Response.json({
         ok: lastScanOk,
         ms: Date.now() - t0,
@@ -6854,12 +6980,13 @@ export default {
     // another isolate's cron delivery). The HTTP-driven fallback
     // (maybeRunScanIfStale) still rescues a dead cron within 2 min.
     const scanGapMs = Math.max(60_000, (cfg?.scanIntervalSeconds ?? 60) * 1000);
-    // Gate against the CLAIM time minus the jitter margin (see
-    // SCAN_GATE_MARGIN_MS): the heartbeat's `at` lands 1-4s after cron
-    // fires, so a strict `scanGapMs` comparison skips every other tick at
-    // the 60s cadence (2026-09-07 live: 121s history gaps). The scan lock,
-    // not this gate, prevents overlapping scans.
-    const gateMs = scanGapMs - SCAN_GATE_MARGIN_MS;
+    // Gate against the previous COMPLETION minus the jitter budget (see
+    // scanGateMs): a strict `scanGapMs` comparison skips a tick whenever the
+    // previous scan landed late (2026-09-27 live: every :2x completion was
+    // followed by a ~100s hole), so the margin exists to let this tick CATCH
+    // UP instead of losing its minute. The scan lock, not this gate, prevents
+    // overlapping scans.
+    const gateMs = scanGateMs(scanGapMs);
     // This gate read ALSO carries the cron-tick ring: the heartbeat doubles as
     // the backfill input for runScan (a dead predecessor's stale scanning
     // heartbeat) and the outage check — pass both down so the tick adds no
@@ -6943,7 +7070,7 @@ export default {
     }
     scanRunning = true;
     try {
-      await runScan(hbRaw, env, cronTick);
+      await runScan(hbRaw, env, cronTick, "cron");
     } finally {
       scanRunning = false;
     }

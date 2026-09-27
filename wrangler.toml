@@ -55,8 +55,14 @@ crons = ["* * * * *", "*/1 * * * *"]
 # throttled to one call per ~5 min (8,640/month) — trending is off below.
 [vars]
 # Minimum gap between scans, in seconds. The cron trigger still fires every
-# minute, but the worker skips the scan when the previous one finished less
-# than this long ago (cross-isolate via the DB heartbeat). 60 = scan every
+# minute, but the worker skips the scan when the previous one COMPLETED less
+# than `scanGateMs(this)` ago — this value minus a jitter budget, cross-isolate
+# via the DB heartbeat (src/worker.ts). The budget is 30s at 60s and shrinks to
+# whatever room stays above one cron period for longer intervals, which is what
+# keeps 90 skipping every other tick instead of silently becoming 60. The
+# monitor-driven HTTP fallback is a pure RESCUE since 2026-09-27: it needs
+# max(120s, 2 x this) of silence before it scans at all, so a tick that is
+# merely late still scans for itself. 60 = scan every
 # minute — the fastest cadence the 1-min cron can drive: hot-zone push
 # latency for coins that qualify inside the age window is ~1 min. 90 = scan
 # every ~2 min, halving GeckoTerminal / DexScreener / Birdeye call volume

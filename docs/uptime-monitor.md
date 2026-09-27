@@ -115,9 +115,10 @@
 
 ## 原理（為什麼這樣能救命）
 
-- 每次 `/health` 請求 → Worker 背景跑一次完整掃描（waitUntil 保持 isolate
-  存活直到掃描完成）→ 寫入心跳。
-- 外部監控每 1 分鐘 ping → 掃描維持在 ~1 分鐘一次（cron 的 60s 間隔閘門
-  對齊 1 分鐘 cron；監控 ping 只是補充驅動，不會加速超過閘門）。
+- 每次 `/health` 請求 → Worker 背景**檢查**一次心跳（waitUntil 保持 isolate
+  存活直到完成）。自 2026-09-27 起，只有當最後一次**完成**的掃描已經隔咗
+  **兩個 cadence**（`scanRescueGapMs` = `max(120s, 2 × SCAN_INTERVAL_SECONDS)`）才會真的跑掃描：
+  遲到不足一個 cadence 的 tick 自己會掃，所以 ping 係**救援**而唔係 cadence 的一部分
+  （實測 2026-09-27：舊的 60s 門檻令 90 分鐘內 76 個 completion 有 26 個其實係 ping 跑嘅）。
 - 掃描器有 running 鎖（25s 時效自動打破）+ SCAN_INTERVAL_SECONDS=60 的
   心跳間隔閘門（跨 isolate），cron 與監控同時驅動也不會重疊或重複推送。

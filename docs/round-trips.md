@@ -2500,7 +2500,84 @@ block comment 裡面寫 cron 表達式，永遠唔好寫成星號加斜線。
 4. 冷 isolate 嘅 front 少一個 `getWorkerStates`（`subreqs.current.total` 同 hosts 嘅 `turso` 各少 1 至 2），
    而 boot 嘅 mirror（`deferral`／`pushLedger`／`skipCapture`）照樣有值 —— 佢哋係嗰個 merge 最容易讀錯嘅地方。
 
-**落線紀錄：** `docs/patches/tick-front-2026-09-27.apply.js`（19 個 edit）、
+
+### §4.40 掃描係邊個跑：fallback 60s 太早、gate margin 太窄、`via` 要落地（2026-09-27）
+
+**起點係一個我自己報錯咗嘅歸因。** §4.39 用 window owner 讀到 `[http] 21`（一個 HTTP fallback 真正掃描），
+當時寫住「dedupe 用 `scan_heartbeat.at`（scan 開始時間）」。做完 cron ring 對照之後要更正兩樣：
+
+- `scan_heartbeat.at` 係**完成時間** —— completion flush 用 `flushedAt` 覆寫咗 claim batch 嘅 start stamp
+  （live 見到 claim `05:14:06` → done `05:14:09`）。
+- 真正嘅驅動係**派送遲**：兩個 gate 用唔同 margin 打對台 ——
+
+```
+tick 完成遲 (:2x) → 下一個 tick 讀 age ~35-45s < gate 50s → skip（照樣付 init／gate／outage 嘅 front）
+→ 之後任何一個過咗自己 60s trigger gate 嘅 HTTP 請求見到 age ≥ 60s → fallback 真掃描（http window）
+→ 佢一完成，又令下一個 tick skip → 循環
+```
+
+**量度（05:13-05:30Z，唯讀）。** `scheduled_tick_ring`（handler entry，每分鐘一個，`cronAt = Date.now()`）
+對照 `scan_history`：ring 嘅 90 分鐘窗口內 76 個 completion，**26 個（34%）對唔上任何 cron arrival** ——
+12 個喺 arrival 之前完成（一定係 fallback），14 個喺 arrival 之後 12-21 秒（一個 tick 嘅 front 唔可能咁長；
+05:27:27 嗰個 completion 嘅 `subreqs.current.owner` 讀 `"http"`、total 21，最接近嘅 arrival 離 race start 19 秒）。
+全期 300 個 completion／347 分鐘（0.86/min）入面 45 個 gap 係 90-120s 嘅洞，而每個 :2x 完成後面就跟一個。
+ring 亦顯示 90 個 arrival 有 18 個 ≥ :10（最遲 :29）——即係舊嘅 10s margin 根本唔夠。
+
+**三樣改動：**
+
+1. **Fallback 變真救援。** `scanRescueGapMs(scanGapMs) = max(120s, 2 × interval)`：要**兩個 cadence** 冇完成，
+   一個 HTTP 請求才准自己掃。遲到 <1 cadence 嘅 tick 仍然係佢自己掃，fallback 只喺嗰樣都失敗之後接手；
+   舊嘅 60s 門檻正正落喺「late tick 仍然擁有」嘅窗入面。
+2. **Tick gate 用 jitter budget。** `scanGateMs(interval)`：
+   - interval ＝一個 cron period（60s）⇒ gate ＝ **30s**（ring 量到最遲 :29）。一個遲完成嘅掃描唔再令
+     下一個 tick 白白輸一分鐘 —— 佢會 catch up（同一個 scan lock 之下，唔會疊住跑）。
+   - interval > 一個 cron period ⇒ margin 縮到「一個 period 以上剩幾多 room」：90s ⇒ gate **70s**，仍然
+     skip 隔個 tick（唔會靜靜哋變成 60s）。overlap 由 scan lock 負責，唔係 gate。
+3. **`via` 落地（`cron`｜`http`｜`manual`）。** 由 handler **參數**傳入 —— 唔可以係 module state：pass 嘅
+   delivery 同一個 isolate 會覆寫 module 讀數（今次已經見到 tick 嘅 flush 出 `owner:"pass"`）。寫入**兩個**
+   heartbeat（scanning ＋ done）同 completion payload；completion batch 內加一條 read-free counter statement
+   （`scan_trigger_cron`／`_http`／`_manual`：`INSERT OR IGNORE` ＋ `CAST(CAST(value AS INTEGER) + 1 AS TEXT)`），
+   **零額外 round trip**。front statement（`WEDGE_READ_KEYS`）帶埋三條 key ⇒ `/health.heartbeat.scanTriggers`
+   ＝ `{cron, http, manual}`（滯後一次完成，同 `deferral` 一樣嘅「上次確認寫入」語意）。
+4. **一個 skip 咗嘅 tick 照樣付 front —— 呢句係觀察，同 §4.39「削 front」係同一條數。**
+   front 係 `WEDGE_READ_KEYS` 嗰**一句** read（14 條 key、1 個 subrequest、live 110-266ms），
+   而佢同時係 gate 嘅輸入（`scan_heartbeat`）同死 tick 嘅唯一證人（`tick_progress`）—— 冇得
+   「先決定唔掃、再讀」。所以 1 個 subrequest 就係「決定今分鐘掃唔掃」嘅價錢。以前呢筆錢好多係白付：
+   ~1/3 嘅 tick 讀完 front 就 skip，而每次 skip 又會引一個 HTTP fallback 真掃描（各自再付一次 front，
+   再加 ~21 個 subrequest）。兩個改動一齊令呢個比率塌落 —— gate 30s ⇒ tick 幾乎每次真掃
+   （skip 由常態變例外），rescue 120s ⇒ ping 唔再接手。**直接讀數**：
+   `scanTriggers.cron ÷ scheduled_tick_total` ＝ cron arrival 之中真正掃到嘅比例（1 − skip 率）。
+
+**測試（4 條新 ＋ 2 條改）：** `scanGateMs(60_000) === 30_000`、`scanGateMs(90_000) === 70_000`（且 > 60s）、
+`scanGateMs(300_000) === 270_000`、`scanGateMs(1_000) === scanGateMs(60_000)`；`scanRescueGapMs(60_000) === 120_000`、
+`(90_000) === 180_000`、`(300_000) === 600_000`；三個 call site 嘅 `via`（whitespace-flattened source pin）＋
+`via:scanVia,` 出現 2 次；`scanTriggerStatements`（2 條 statement、逐個 trigger 一條 row、零 bind）＋
+`parseScanTriggerCounts`（null／junk／負數 ⇒ 0）；真 DB：完成掃描計數、heartbeat-only flush 唔計、
+冇 tag 唔計、`scanTriggers` 三條 key 讀返嚟啱、heartbeat 記住 `via`。舊 pin 改成 `now-at<rescueGapMs`。
+
+**Mutation（改編譯後 dist 再還原）：** counter `+ 1` → `+ 0` ⇒ 2 條 fail；`scanGateMs` 嘅 60s 分支改返
+`interval - 10s` ⇒ 1 條 fail；`scanRescueGapMs` 由 `× 2` 改 `× 1` ⇒ 1 條 fail。
+
+**本地驗證：** `npx tsc --noEmit` 清（途中撞到 `*/` 喺 JSDoc 裡面提早收 comment —— `TRACKER_CRON` 嘅
+expression 唔可以照抄入註釋）；`node scripts/test-unit.js` ＝ **379 passed / 0 failed**；其餘 6 個 suite 全綠；
+`npx wrangler deploy --dry-run` OK。
+
+**驗收點（live，deploy 之後）：**
+
+1. `/health.heartbeat.scanTriggers` 開始有數：`cron` 隨每分鐘升，`http` 唔應該再每三分鐘追一次。
+2. `scan_history` 對 cron ring：對唔上 arrival 嘅 completion 應該由 26/76 跌到接近 0；90-120s 洞（45/299）
+   應該同步跌，因為前一分鐘遲完成唔再令下一個 tick 輸一分鐘。
+3. `/health.heartbeat.via` 喺 done 行應該讀 `"cron"`。
+4. `scanTriggers.cron ÷ scheduled_tick_total` 應該貼近 1（skip 幾乎冇），而 `scanTriggers.http`
+   應該平（rescue 只喺真死 cron 嘅時候動）—— 呢兩個數一齊就係「front 有冇白付」嘅答案。
+5. 出卡／defer 讀數不變：`push_watch_pass` 照樣 `via:"cron-pass"`、`defer-send 0`、`issueCount 0`。
+
+**落線紀錄：** `docs/patches/scan-trigger-via-2026-09-27.apply.js`（22 個 edit：db ＋ worker）、
+`docs/patches/scan-trigger-via-tests-2026-09-27.apply.js`（＋ `-test-fixes`、`-title-fix`）；
+`src/db.ts`（`ScanTrigger`／`scanTriggerStatements`／`parseScanTriggerCounts`／`persistScanCompletion(via)`）、
+`src/worker.ts`（`scanGateMs`／`scanRescueGapMs`／`runScan(via)`／`scanTriggerMirror`）、`scripts/test-unit.js`。
+
+**落線紀錄（§4.39）：** `docs/patches/tick-front-2026-09-27.apply.js`（19 個 edit）、
 `docs/patches/tick-front-scanowner-2026-09-27.apply.js` ＋ `-fix`（capture 位置）、
 `docs/patches/tick-front-tests-2026-09-27.apply.js`；`src/subreqs.ts`（`SubreqOwner` ＋ window owner）、
 `src/worker.ts`（`scanSubreqLeft(reserve)`／`BOOT_STATE_KEYS`／`lastBootKeysRead`／`beginPreTick(owner)`／
