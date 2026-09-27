@@ -12521,16 +12521,23 @@ async function main() {
     // present but neutralised (or moved out of the gate) still fails here.
     const stampCall = workerSrc.indexOf("if(shouldStampArrival(scheduledTickFinishedAt,cronAt)){");
     // The init this stamp must precede is BOUNDED now (see
-    // FRONT_INIT_BOUND_MS), so the anchor follows the recoveryAwait call.
+    // FRONT_INIT_BOUND_MS), so the anchor follows the recoveryAwait call — and
+    // it is scoped to the SCHEDULED HANDLER, because the tracker's own delivery
+    // enters through the same init prologue (runTrackerInvocation, see
+    // worker.TRACKER_CRON) and a bare indexOf would find that one first.
+    const handlerStart = workerSrc.indexOf(
+      'asyncscheduled(event:ScheduledEventLike,env:Env,ctx:ExecutionContextLike,):Promise<void>{',
+    );
     const scheduledInit = workerSrc.indexOf(
       'constinitAt=Date.now();awaitrecoveryAwait(ensureInitialized(env),FRONT_INIT_BOUND_MS,"init");',
+      handlerStart,
     );
     const flagSets = workerSrc.split("scheduledTickFinishedAt=Date.now()").length - 1;
     const applied = {
       "db (stampScheduledArrival)": dbSrc.includes("asyncstampScheduledArrival(at:number):Promise<void>{"),
       "worker (the rule)": workerSrc.includes("exportfunctionshouldStampArrival("),
       "worker (stamp BEFORE init)":
-        stampCall >= 0 && scheduledInit >= 0 && stampCall < scheduledInit,
+        handlerStart >= 0 && stampCall >= handlerStart && scheduledInit > stampCall,
       "worker (every return moves the flag)": flagSets >= 3,
       "worker (the cold-isolate fallback)": workerSrc.includes("newDb(env.TURSO_DATABASE_URL,env.TURSO_AUTH_TOKEN).stampScheduledArrival("),
       "health (the pair is published)": workerSrc.includes("scheduledArrivalUnaccounted:"),
@@ -12595,9 +12602,18 @@ async function main() {
         pushwatchSrc.includes("subreq-cut${subreqCut}"),
       "scanner (the probe is forwarded)":
         scannerSrc.includes("this.pushWatcher.runTick(deadlineMs,keepAlive,subreqLeft)"),
-      "worker (the tick supplies the counter)": workerSrc.includes(
-        "awaitscanner.runTrackerPass(Date.now()+trackerBudgetMs,holdTick?(p:Promise<unknown>)=>holdTick(p):undefined,subreqRemaining,);",
-      ),
+      "worker (the tick supplies the counter, and the fallback window)":
+        workerSrc.includes(
+          'awaitscanner.runTrackerPass(Date.now()+trackerBudgetMs,holdTick?(p:Promise<unknown>)=>holdTick(p):undefined,subreqRemaining,{peerPassFreshMs:TRACKER_PASS_FALLBACK_FRESH_MS,via:"tick",},);',
+        ),
+      "worker (the pass's own delivery runs ONE pass on its own budget)":
+        workerSrc.includes(
+          'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass"},);',
+        ),
+      "worker (the scheduled handler routes that delivery before any scan bookkeeping)":
+        workerSrc.includes(
+          "if(isTrackerCron(event.cron)){awaitrunTrackerInvocation(env);return;}",
+        ),
     };
     const done = Object.entries(applied).filter(([, v]) => v);
     if (done.length === 0) {
@@ -12679,7 +12695,13 @@ async function main() {
       "scanner (the note asks the watcher)":
         scannerSrc.includes("constdiag=this.pushWatcher.passDiag?.()??null;"),
       "scanner (the durable note is the same line)":
-        (scannerSrc.split("awaitthis.persistPassNote(errNote,startedAt);").length - 1) === 1 &&
+        // The call now carries the phase and the owner ("done", options?.via);
+        // what this check is about (ONE call site, the same errNote the log
+        // line uses) follows the call instead of pinning it back.
+        (scannerSrc.split('awaitthis.persistPassNote(errNote,startedAt,"done",options?.via);')
+          .length -
+          1) ===
+          1 &&
         !scannerSrc.includes("awaitthis.persistPassNote(`err:${msg.slice(0,140)}`,startedAt);"),
     };
     const done = Object.entries(applied).filter(([, v]) => v);
@@ -13961,6 +13983,159 @@ async function main() {
     const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
     assert.deepEqual(missing, [], `half-applied: ${missing.join(", ")}`);
   });
+  await test("passRowAgeMs: a row that cannot answer never holds the ownership window", () => {
+    const { passRowAgeMs } = require("../dist/pushwatch.js");
+    const now = 1_000_000;
+    assert.equal(
+      passRowAgeMs(JSON.stringify({ at: now - 5_000, phase: "done" }), now),
+      5_000,
+    );
+    assert.equal(
+      passRowAgeMs(JSON.stringify({ at: now - 5_000, phase: "running" }), now),
+      5_000,
+      "a pass in flight is a peer too — the window is about who owns the minute",
+    );
+    assert.equal(passRowAgeMs(null, now), null, "no row: nobody has run a pass, so the caller must run one");
+    assert.equal(passRowAgeMs("not json", now), null);
+    assert.equal(passRowAgeMs("null", now), null);
+    assert.equal(passRowAgeMs("5", now), null, "a scalar row is not a pass row");
+    assert.equal(
+      passRowAgeMs(JSON.stringify({ note: "no clock" }), now),
+      null,
+      "the clock IS the answer",
+    );
+    assert.equal(passRowAgeMs(JSON.stringify({ at: 0, phase: "done" }), now), null);
+    assert.equal(passRowAgeMs(JSON.stringify({ at: "soon", phase: "done" }), now), null);
+    assert.equal(
+      passRowAgeMs(JSON.stringify({ at: now - 5_000, phase: "skip" }), now),
+      null,
+      "a tick that ran NO pass must not hold the window — otherwise a run of skipped ticks keeps the fallback asleep while no card is announced",
+    );
+    assert.equal(
+      passRowAgeMs(JSON.stringify({ at: now + 5_000, phase: "done" }), now),
+      0,
+      "a stamp from the future reads fresh, never negative — clock skew must not open a second pass in the same minute",
+    );
+  });
+
+  await test("TRACKER_CRON: the pass's own delivery is routed, and wrangler.toml matches it character for character", () => {
+    const { isTrackerCron, TRACKER_CRON, TRACKER_PASS_FALLBACK_FRESH_MS } =
+      require("../dist/worker.js");
+    assert.equal(TRACKER_CRON, "*/1 * * * *");
+    assert.equal(isTrackerCron(TRACKER_CRON), true, "the pass's own delivery routes to the pass");
+    assert.equal(isTrackerCron(" */1 * * * * "), true, "outside whitespace is trimmed");
+    assert.equal(isTrackerCron("* * * * *"), false, "the scan trigger is NOT the pass's delivery");
+    assert.equal(
+      isTrackerCron("*/1  *  *  *  *"),
+      false,
+      "an expression that differs INSIDE is not this trigger: the platform matches character for character",
+    );
+    assert.equal(isTrackerCron(undefined), false);
+    assert.equal(isTrackerCron(null), false);
+    // The expression has to be configured, too: the platform hands over the
+    // string it was given, so a constant wrangler.toml does not carry is a
+    // delivery that never fires (survivable through the fallback, not correct).
+    const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    const block = /^\[triggers\][\s\S]*?^crons\s*=\s*\[([^\]]*)\]/m.exec(toml);
+    assert.ok(block, "wrangler.toml must carry a [triggers].crons list");
+    const list = block[1]
+      .split(",")
+      .map((s) => s.trim().replace(/^"|"$/g, ""))
+      .filter((s) => s.length > 0);
+    assert.ok(list.includes("* * * * *"), "the scan tick keeps its own expression");
+    assert.ok(
+      list.includes(TRACKER_CRON),
+      `the pass's delivery must be configured: ${TRACKER_CRON}`,
+    );
+    assert.equal(
+      isTrackerCron(list[0]),
+      false,
+      "the FIRST expression stays the scan tick — the tick's fallback assumes the pass expression is the new one",
+    );
+    assert.equal(TRACKER_PASS_FALLBACK_FRESH_MS, 120_000);
+  });
+
+  await test("Scanner.runTrackerPass: a fresh peer pass in the front makes the tick stand down, and writes nothing", async () => {
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const writes = [];
+    const db = {
+      setWorkerState: async (key, value) => {
+        writes.push({ key, value });
+      },
+    };
+    const scanner = new Scanner(
+      db, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    let ran = 0;
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      runTick: async () => {
+        ran += 1;
+        return {
+          checked: 1, alerted: 0, trips: 1,
+          note: "rows 1/30 pairs 1/1 miss 0 lost 0 trips 1",
+          undeliveredTotal: 0, recoveredUndelivered: 0,
+        };
+      },
+    };
+    scanner.lastSummary = {};
+    const startedAt = Date.now();
+    // THIS tick's front carried the pass's own cron delivery's row, four
+    // seconds old — the healthy shape (see worker.TRACKER_CRON).
+    scanner.peerPassRow = JSON.stringify({
+      at: startedAt - 4_000,
+      note: "ok:30/0 rows 30/30 pairs 30/30 miss 0 lost 0 trips 5 db 690ms",
+      trackerMs: 690,
+      phase: "done",
+      via: "cron-pass",
+    });
+    const note = await scanner.runTrackerPass(startedAt + 2_500, undefined, undefined, {
+      peerPassFreshMs: 120_000,
+      via: "tick",
+    });
+    assert.match(String(note), /^yield:peer-pass 4s\b/, "the tick says WHY it stood down");
+    assert.equal(ran, 0, "a pass already ran this minute — the tick must not run a second one");
+    assert.equal(
+      writes.length,
+      0,
+      "and it must not touch the pass row: that stamp IS the ownership clock, so a yield that re-wrote it would keep the fallback asleep forever (a dead trigger could never be noticed)",
+    );
+    assert.equal(scanner.lastSummary.pushWatch, note, "the yield is published for /health");
+    // STALE row = nobody owns this minute: the fallback runs the pass, and the
+    // row it writes says which owner served it.
+    scanner.peerPassRow = JSON.stringify({
+      at: startedAt - 180_000,
+      note: "ok:30/0 rows 30/30",
+      trackerMs: 600,
+      phase: "done",
+      via: "cron-pass",
+    });
+    const fallbackNote = await scanner.runTrackerPass(startedAt + 2_500, undefined, undefined, {
+      peerPassFreshMs: 120_000,
+      via: "tick",
+    });
+    assert.equal(ran, 1, "the fallback is one missed delivery away, not a never-again");
+    assert.match(String(fallbackNote), /^ok:1\/0/, "and it is a real pass with a real note");
+    assert.equal(writes.length, 1, "the note row is the fallback's ONE write");
+    assert.equal(writes[0].key, "push_watch_pass");
+    const row = JSON.parse(writes[0].value);
+    assert.equal(row.phase, "done");
+    assert.equal(row.via, "tick", "the row says which owner ran this pass");
+    // NO options at all is the pass's OWN delivery (and every pre-split test):
+    // the peer row must not stop it.
+    ran = 0;
+    writes.length = 0;
+    scanner.peerPassRow = JSON.stringify({ at: Date.now() - 1_000, phase: "done" });
+    const own = await scanner.runTrackerPass(Date.now() + 2_500, undefined, undefined, {
+      via: "cron-pass",
+    });
+    assert.equal(ran, 1, "the pass's own delivery owns the minute outright");
+    assert.match(String(own), /^ok:1\/0/);
+    assert.equal(JSON.parse(writes[0].value).via, "cron-pass");
+  });
+
   console.log("\n===== UNIT TESTS =====");
   for (const line of results) console.log(line);
   console.log(`\n  ${passed} passed, ${failed} failed`);

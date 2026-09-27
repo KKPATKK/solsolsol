@@ -476,7 +476,11 @@ export interface TrackerPassPulse {
   at: number;
   /** When it returned, or null while it is in flight (or was killed). */
   doneAt: number | null;
-  /** The pass's stage name: entry / setup / settle / heal / rows / holders. */
+  /**
+   * The pass's stage name: entry / setup / settle / heal / rows / holders —
+   * plus "peer-pass", the stage a tick's fallback leaves behind when it stands
+   * down for the pass's own cron delivery (see notePeerPassYield).
+   */
   stage: string;
   /** Rows evaluated so far (final once doneAt is set). */
   checked: number;
@@ -1032,6 +1036,60 @@ export const TRACKER_PASS_STATE_KEY = "push_watch_pass";
 /** The `phase:"running"` stamp: a pass in flight, before its first stage. */
 export function runningPassStamp(now = Date.now()): string {
   return JSON.stringify({ at: now, note: "running", trackerMs: 0, phase: "running" });
+}
+
+/**
+ * How long ago the durable pass row's stamp was written, or null when the row
+ * cannot answer — the reading behind a tick's decision to stand down for the
+ * pass's own cron delivery (see worker.TRACKER_PASS_FALLBACK_FRESH_MS).
+ *
+ * THREE WAYS A ROW DOES NOT ANSWER, all deliberate:
+ *  - ABSENT, unparsable or without a usable `at`: nobody has run a pass on this
+ *    database, so the caller must RUN one. Failing the other way (treating an
+ *    unknown row as fresh) is the one shape that can stop every card.
+ *  - `phase: "skip"`: the row of a tick that ran NO pass (noteTrackerSkipped).
+ *    It carries a fresh `at`, so counting it would let a run of skipped ticks
+ *    hold the ownership window forever while no card was ever announced.
+ *  - A stamp from the FUTURE reads 0 (fresh), never negative: `at` comes from
+ *    another invocation's clock, and a skew must not open the window for a
+ *    second pass in the same minute.
+ */
+export function passRowAgeMs(
+  raw: string | null | undefined,
+  now: number,
+): number | null {
+  if (!raw) return null;
+  let row: unknown;
+  try {
+    row = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (row === null || typeof row !== "object") return null;
+  const rec = row as { at?: unknown; phase?: unknown };
+  if (rec.phase === "skip") return null;
+  const at = Number(rec.at);
+  if (!Number.isFinite(at) || at <= 0) return null;
+  return Math.max(0, now - at);
+}
+
+/**
+ * Publish a pass that YIELDED to a peer: the scan tick's fallback stood down
+ * because the pass's own cron delivery had already run one inside the window
+ * (see Scanner.runTrackerPass).
+ *
+ * It starts and closes a pulse of its own rather than leaving the previous
+ * pass's pulse standing, so /health's `pushWatchLive` answers which of the two
+ * owners served this minute. Nothing is written durably — the pass row belongs
+ * to the pass that actually ran, and that row is the ownership clock.
+ */
+export function notePeerPassYield(at: number, ageMs: number): void {
+  beginPassPulse(at);
+  notePassPulse({
+    stage: "peer-pass",
+    doneAt: Date.now(),
+    note: `yield:peer-pass ${Math.round(ageMs / 1000)}s`,
+  });
 }
 
 export interface PushWatchRow {

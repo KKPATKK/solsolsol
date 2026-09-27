@@ -39,7 +39,13 @@ import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
 import { trendBandFromChats, type JupTokensClient } from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
-import { PushWatcher, liquidityIsComparable } from "./pushwatch";
+import {
+  PushWatcher,
+  TRACKER_PASS_STATE_KEY,
+  liquidityIsComparable,
+  notePeerPassYield,
+  passRowAgeMs,
+} from "./pushwatch";
 import { FlurryAnalyzer, type FlurryOutcome, type FlurryReport } from "./flurry";
 import {
   addDeferredToken,
@@ -1566,6 +1572,26 @@ function describePushError(err: unknown): PushErrorInfo {
   };
 }
 
+/**
+ * How a tracker pass was started (see Scanner.runTrackerPass, and
+ * worker.TRACKER_CRON for the two owners).
+ */
+export interface TrackerPassRunOptions {
+  /**
+   * The ownership window, in ms: a caller that SHARES the minute with the
+   * pass's own cron delivery passes it here, and then stands down when the
+   * durable pass row (captured from this tick's scan front, see peerPassRow)
+   * is younger than it. The pass's own delivery passes nothing and owns the
+   * minute outright.
+   */
+  peerPassFreshMs?: number;
+  /**
+   * Where this pass came from, recorded in the row. Omitted by a caller that
+   * does not say (every test), which keeps the row's shape unchanged.
+   */
+  via?: "cron-pass" | "tick";
+}
+
 export class Scanner {
   /**
    * Hydrate durable deferred-card obligations when an isolate is recycled
@@ -1822,6 +1848,19 @@ export class Scanner {
    * single-row read, exactly as it did before this existed.
    */
   private scanFront: ScanFront | null = null;
+  /**
+   * The tracker pass's row as THIS tick's front read it (see
+   * SCAN_FRONT_GATE_KEYS, which carries it for free — one IN-list either way).
+   *
+   * WHY ITS OWN FIELD, and not scanFront: the front is cleared at the end of
+   * the scan on purpose ("a later tick must never read a stale gate"), and the
+   * pass runs AFTER the scan. This one outlives that clear for exactly as long
+   * as the pass needs — it is overwritten by the next tick's front read, and it
+   * is the ONLY thing the fallback pass consults, so a tick that never scanned
+   * (standalone Scanner, a test) reads null and runs the pass, which is the
+   * pre-split behaviour.
+   */
+  private peerPassRow: string | null = null;
   /**
    * The `at` stamp the durable journal already carries for the last-good
    * profile list (see DEX_PROFILES_LAST_KEY /
@@ -2188,9 +2227,36 @@ export class Scanner {
     deadlineMs: number,
     keepAlive?: (promise: Promise<unknown>) => void,
     subreqLeft?: () => number,
+    options?: TrackerPassRunOptions,
   ): Promise<string | null> {
     if (!this.pushWatcher) return null;
     const startedAt = Date.now();
+    // THE OWNERSHIP WINDOW (see worker.TRACKER_CRON and its
+    // TRACKER_PASS_FALLBACK_FRESH_MS): the pass has its own cron delivery now,
+    // and a scan tick that shares the minute with it stands down when a pass
+    // ran inside the window. The reading is THIS tick's front row, so the
+    // decision costs no round trip — and, in the healthy shape, halting here is
+    // what lets the tick spend its whole subrequest budget on the scan the way
+    // it did before the pass existed.
+    const peerPassFreshMs = options?.peerPassFreshMs ?? 0;
+    if (peerPassFreshMs > 0) {
+      const ageMs = passRowAgeMs(this.peerPassRow, startedAt);
+      if (ageMs !== null && ageMs < peerPassFreshMs) {
+        const note = `yield:peer-pass ${Math.round(ageMs / 1000)}s`;
+        // Published, never persisted: the pass row's stamp IS the ownership
+        // clock, so a yield that re-wrote it would keep the fallback asleep
+        // forever — a dead trigger could then never be noticed, which is the
+        // one failure the split must not introduce (see passRowAgeMs, which
+        // also refuses to count a "skip" row for the same reason).
+        this.pushWatchNote = note;
+        if (this.lastSummary) {
+          this.lastSummary.pushWatch = note;
+          this.lastSummary.trackerMs = Date.now() - startedAt;
+        }
+        notePeerPassYield(startedAt, ageMs);
+        return note;
+      }
+    }
     // The RUNNING stamp is no longer written here: it rides the pass's ONE
     // entry request (Db.beginTrackerPass, 2026-09-26), which the pass issues
     // before it touches a row — the guarantee this call existed for (a pass
@@ -2225,7 +2291,7 @@ export class Scanner {
           this.lastSummary.pushWatch = cutNote;
           this.lastSummary.trackerMs = Date.now() - startedAt;
         }
-        await this.persistPassNote(cutNote, startedAt, "cut");
+        await this.persistPassNote(cutNote, startedAt, "cut", options?.via);
         return cutNote;
       }
       const passDbMs = this.exitTickDbLeash();
@@ -2250,7 +2316,7 @@ export class Scanner {
         );
         this.lastSummary.trackerMs = Date.now() - startedAt;
       }
-      await this.persistPassNote(note, startedAt);
+      await this.persistPassNote(note, startedAt, "done", options?.via);
       return note;
     } catch (err) {
       this.exitTickDbLeash();
@@ -2291,7 +2357,7 @@ export class Scanner {
       // indistinguishable from a tick that never reached the pass at all
       // (2026-09-21 04:03-04:05Z: fast ticks, no note, no way to tell the two
       // apart without the Cloudflare log the operator cannot read).
-      await this.persistPassNote(errNote, startedAt);
+      await this.persistPassNote(errNote, startedAt, "done", options?.via);
       return null;
     }
   }
@@ -2367,6 +2433,13 @@ export class Scanner {
      * a pass in flight from a pass that is stuck (see Db.beginTrackerPass).
      */
     phase: "done" | "skip" | "cut" = "done",
+    /**
+     * Which invocation this pass came from (see worker.TRACKER_CRON): the
+     * tracker's own cron delivery ("cron-pass") or a scan tick ("tick", the
+     * fallback). Recorded ONLY when the caller says, so the row of a caller
+     * that does not (every test, and any older caller) keeps its exact shape.
+     */
+    via?: "cron-pass" | "tick",
   ): Promise<void> {
     // AWAITED, not raced. The race this replaces resolved at its bound while the
     // write was still in flight, and an abandoned promise is CANCELLED the
@@ -2385,6 +2458,10 @@ export class Scanner {
           note,
           trackerMs: phase === "skip" ? 0 : Date.now() - startedAt,
           phase,
+          // Omitted unless the caller says where the pass came from, so the
+          // ownership clock (see passRowAgeMs) never has to parse a field it
+          // does not use and the row a test writes stays byte-for-byte the same.
+          ...(via ? { via } : {}),
         }),
       );
     } catch {
@@ -2403,7 +2480,7 @@ export class Scanner {
    * is a real reading, so it is published as one.
    */
   async noteTrackerSkipped(reason: string): Promise<void> {
-    await this.persistPassNote(`skip:${reason}`, Date.now(), "skip");
+    await this.persistPassNote(`skip:${reason}`, Date.now(), "skip", "tick");
   }
 
   /**
@@ -2757,6 +2834,10 @@ export class Scanner {
       // (Db.readScanFront issues the same SELECT listEnabledChats does).
       const front = await frontRead;
       this.scanFront = front;
+      // The pass's row, for the tick's fallback decision after this scan (see
+      // peerPassRow): read from the SAME statement the front's gates ride, so
+      // the fallback costs no round trip of its own.
+      this.peerPassRow = front.gates.get(TRACKER_PASS_STATE_KEY) ?? null;
       // The last-good profile list rides that same read (see
       // DEX_PROFILES_LAST_KEY): its row is what a refused fetch evaluates
       // instead of the make-up coins alone — the client is handed this very

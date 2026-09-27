@@ -559,6 +559,13 @@ export const SCAN_FRONT_GATE_KEYS = [
   "token_stats_last_prune",
   "birdeye_backfill_at",
   DEX_PROFILES_LAST_KEY,
+  // The tracker pass's own row (pushwatch.TRACKER_PASS_STATE_KEY, spelled as
+  // the literal because that module imports THIS one). It is READ, not gated
+  // on: a tick's fallback pass asks it whether the pass's own cron delivery
+  // already ran this minute (see worker.TRACKER_PASS_FALLBACK_FRESH_MS), and
+  // riding this statement is what makes that question cost no round trip — the
+  // IN-list is one row longer, not one request longer.
+  "push_watch_pass",
 ] as const;
 
 /**

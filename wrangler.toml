@@ -3,13 +3,43 @@ main = "src/worker.ts"
 compatibility_date = "2026-08-09"
 compatibility_flags = ["nodejs_compat"]
 
-# Cron fires every minute (the free-tier minimum); the scan itself is
-# gated by SCAN_INTERVAL_SECONDS below (60s → every tick runs a scan, the
-# fastest cadence the 1-min cron can drive). If the upstream API pressure
-# (GeckoTerminal 429s) ever returns, raise this back to 90 (every other
-# tick) — the re-eval pool + Birdeye backfill keep coverage during the gap.
+# Both expressions fire every minute (the free-tier minimum), and each one is
+# a SEPARATE invocation with its own 50-subrequest budget — which is the
+# whole point of the second string (2026-09-27):
+#
+#   "* * * * *"     the scan tick, exactly as before.
+#   "*/1 * * * *"   the tracker pass's OWN invocation (worker.TRACKER_CRON).
+#
+# WHY THE SPLIT (live 2026-09-27 01:31-01:57Z, after the claim+reservation
+# merge): the pass is the LAST stage of the scan tick, so it spends what the
+# tick has left of Workers Free's 50 subrequests — and the tick's own front
+# reads 18-39 of them BEFORE the pass is offered one (`heartbeat.subreqs`,
+# `tickProgress.postscan`). Measured: `postscan subreqs 39` with the pass then
+# reading `ok:0/0 deferred:subreq-budget trips 0` (its entry gate, no row
+# touched), and passes carrying `defer-send 6 subreq-cut 6` — every alerting
+# row refused at TRACKER_SUBREQ_RESERVE while the fast-DB and slow-DB passes
+# refused exactly the same count. One card path is 4-5 subrequests, so a
+# residual claimant holding single digits delivers 0-1 cards a minute however
+# cheap a card gets. In its own invocation the pass pays only init + its own
+# work, and the scan tick stops lending it anything.
+#
+# `event.cron` must match these strings CHARACTER FOR CHARACTER (see
+# Cloudflare's scheduled-handler docs), which is why worker.isTrackerCron
+# compares exactly and scripts/test-unit.js pins the pair against this file.
+#
+# SAFETY: if this second expression ever stops being delivered — the platform
+# has done that to this Worker before (see docs/uptime-monitor.md) — the scan
+# tick runs the pass itself again as a FALLBACK the moment the durable pass row
+# is older than worker.TRACKER_PASS_FALLBACK_FRESH_MS, so a dead trigger costs
+# the pass cadence, never the cards.
+#
+# The scan itself is still gated by SCAN_INTERVAL_SECONDS below (60s → every
+# tick runs a scan, the fastest cadence the 1-min cron can drive). If the
+# upstream API pressure (GeckoTerminal 429s) ever returns, raise this back to
+# 90 (every other tick) — the re-eval pool + Birdeye backfill keep coverage
+# during the gap.
 [triggers]
-crons = ["* * * * *"]
+crons = ["* * * * *", "*/1 * * * *"]
 
 # Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
 # TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY, COINGECKO_API_KEY) must NOT

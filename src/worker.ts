@@ -1608,6 +1608,75 @@ const TRACKER_PASS_BUDGET_MS = 5_000;
  */
 export const TRACKER_PASS_SUBREQ_RESERVE = 12;
 /**
+ * The tracker pass's OWN cron delivery — the second `[triggers].crons`
+ * expression in wrangler.toml, and the one thing that gives the pass a
+ * 50-subrequest invocation of its own.
+ *
+ * WHY A SEPARATE INVOCATION (live 2026-09-27T01:31-01:57Z, measured against
+ * the deployed claim+reservation merge): the pass shares the scan tick's
+ * allowance as its LAST stage, so it never sees more than what the tick has
+ * left — and the tick's front + scan + flush spend 18-39 of the 38 usable
+ * subrequests before the pass is offered anything (`heartbeat.subreqs.usable
+ * 38`; `tickProgress {stage: "postscan", subreqs: 39}`). The stage split then
+ * shows the pass paying for it by name: `ok:0/0 deferred:subreq-budget trips
+ * 0` on the fat ticks (its entry gate, not one row touched), and
+ * `defer-send 6 subreq-cut 6` on the thin ones — every alerting row refused at
+ * TRACKER_SUBREQ_RESERVE after the pass had already spent its slice. The
+ * refusal count tracked the SUBREQUEST counter, not the clock and not Turso's
+ * latency: `db 110ms` refused 10 rows while `db 3421ms` refused 6, and no
+ * sampled pass ever said `budget-cut`.
+ *
+ * A card costs the counter ~4-5 subrequests (the claim+reservation batch, the
+ * Telegram send, the delivery-audit read AND its write, the final check
+ * write), so a residual claimant holding single digits delivers 0-1 cards a
+ * minute however cheap one card gets — which is exactly the `alerted 0`-`1`
+ * every sampled pass read. In its own invocation the pass pays init plus its
+ * own work and nothing else: the scan stops lending it anything, and the same
+ * pass meets the same rotation with ~30 subrequests in hand instead of ~6.
+ *
+ * `event.cron` carries the trigger's expression CHARACTER FOR CHARACTER (see
+ * Cloudflare's scheduled-handler docs), so the comparison below is exact — and
+ * with two triggers configured, a string this constant does not match is a
+ * scan tick, never a silently dropped delivery (see runTrackerInvocation's
+ * fallback note).
+ */
+export const TRACKER_CRON = "*/1 * * * *";
+/**
+ * Pure: is this scheduled delivery the tracker pass's own invocation?
+ *
+ * Trims only the OUTSIDE of the string: the platform matches its configured
+ * expression exactly (so an expression whose INNER spacing differs is a
+ * trigger this Worker does not claim — and defaulting those to the pass
+ * would hand a stranger's delivery the pass's budget while the scan tick's
+ * own routing silently stopped matching.
+ */
+export function isTrackerCron(cron: string | null | undefined): boolean {
+  return typeof cron === "string" && cron.trim() === TRACKER_CRON;
+}
+/**
+ * How stale the durable pass row has to be before the SCAN TICK runs the pass
+ * itself (the fallback, see runTrackerInvocation).
+ *
+ * WHY IT EXISTS AT ALL: the platform has silently stopped delivering cron
+ * events to this Worker before (docs/uptime-monitor.md, and the community
+ * reports it links), and a pass nobody runs is the one failure the tracker
+ * cannot report on its own — the row would simply stop moving. The pass's own
+ * delivery is therefore an OWNER, not a requirement: the tick takes over
+ * whenever the row is older than this.
+ *
+ * WHY 2 MINUTES: the healthy shape is the pass delivery writing the row every
+ * ~60s, and the tick reads the row from its own scan FRONT
+ * (SCAN_FRONT_GATE_KEYS, read ~3-5s into the tick, i.e. up to one full minute
+ * older than the pass delivery's newest write). 120s is that minute plus the
+ * whole cron period, so a late tick still yields — and a dead delivery costs a
+ * pass roughly every 3 minutes, which is the fallback's degraded cadence, not
+ * a stop. Measured against the live readings this replaces: a pass that runs
+ * every 3 minutes while the trigger is down still covers the 30-row rotation
+ * (the very passes that read `rows 24-30/30`), whereas 0-1 cards a minute was
+ * the shape that made the split necessary.
+ */
+export const TRACKER_PASS_FALLBACK_FRESH_MS = 120_000;
+/**
  * The scan's view of the invocation's remaining subrequests: the counter
  * with the tracker pass's slice already taken off (see
  * TRACKER_PASS_SUBREQ_RESERVE). Pure and exported so the arithmetic is
@@ -3279,6 +3348,56 @@ async function ensureInitialized(env: Env): Promise<void> {
   }
 }
 
+/**
+ * The tracker pass's own invocation (see TRACKER_CRON and wrangler.toml).
+ *
+ * WHAT IT DOES: init, then ONE pass with the full TRACKER_PASS_BUDGET_MS and
+ * the invocation's whole subrequest window to itself. Nothing else — no scan
+ * lock, no cadence gate, no scan heartbeat, no cron-arrival bookkeeping, and
+ * none of the tick tail's telemetry (the scan tick still owns all of that, and
+ * still runs every minute). The point of the split is that this delivery
+ * spends its 38 usable subrequests on the rotation instead of lending the
+ * scan's leftovers to it: measured live, the tick's pass ran on 0-6 of them
+ * (`ok:0/0 deferred:subreq-budget`, `defer-send N subreq-cut N`).
+ *
+ * WHY THE PASS STILL HAS A FALLBACK: this trigger's expression is new, and
+ * this platform has silently stopped delivering cron events to this Worker
+ * before (docs/uptime-monitor.md). The pass's durable row IS the ownership
+ * clock — a scan tick runs the pass itself once that row is older than
+ * TRACKER_PASS_FALLBACK_FRESH_MS (see Scanner.runTrackerPass) — so the worst
+ * case is the pass cadence, never a card that nobody announces. For the same
+ * reason a failure here is only logged: the next delivery (this one or a tick)
+ * picks the pass up, and the row keeps saying when it last really ran.
+ */
+async function runTrackerInvocation(env: Env): Promise<void> {
+  const initAt = Date.now();
+  await recoveryAwait(ensureInitialized(env), FRONT_INIT_BOUND_MS, "init");
+  preTick.steps.init = Date.now() - initAt;
+  // No scanner = init failed or was cut. Nothing to record: this delivery is
+  // not a scan arrival, and the pass row is what says whether a pass ran.
+  if (!scanner) return;
+  // The tick's waitUntil hand-off, for the same reason the tick passes it (see
+  // pushwatch.holdForTick): a CUT card's delivery proof is an un-awaited promise
+  // created at the pass's tail, and an un-awaited promise is cancelled the
+  // moment the handler returns.
+  const hold = tickWaitUntil;
+  try {
+    await scanner.runTrackerPass(
+      Date.now() + TRACKER_PASS_BUDGET_MS,
+      hold ? (p: Promise<unknown>) => hold(p) : undefined,
+      subreqRemaining,
+      { via: "cron-pass" },
+    );
+  } catch (err) {
+    // A pass can also be killed mid-flight (no catch ever runs), which is why
+    // the pulse rides every heartbeat — see the tick path's own report.
+    console.error(
+      "[worker] tracker delivery pass failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
 async function runScan(
   prevHeartbeatRawArg?: string | null,
   envRef?: Env,
@@ -3981,6 +4100,18 @@ async function runScan(
             // counter in lets the pass defer by name instead, and keeps its
             // own reserve for those tail writes.
             subreqRemaining,
+            // FALLBACK ONLY (see TRACKER_CRON and runTrackerInvocation): this
+            // tick runs a pass of its own only when the pass's OWN delivery has
+            // not written the durable row inside this window. In the healthy
+            // shape that row is seconds old here, so the pass stands down and
+            // the tick keeps every subrequest it has for the scan — and if the
+            // second cron expression ever stops being delivered, this same call
+            // takes the rotation over within two minutes, so the cards never
+            // depend on the new trigger.
+            {
+              peerPassFreshMs: TRACKER_PASS_FALLBACK_FRESH_MS,
+              via: "tick",
+            },
           );
           // The pass returned: its rotation ran, so the last failure is history.
           trackerPassFailure = null;
@@ -6505,15 +6636,29 @@ export default {
   },
 
   async scheduled(
-    _event: ScheduledEventLike,
+    event: ScheduledEventLike,
     env: Env,
     ctx: ExecutionContextLike,
   ): Promise<void> {
     // Keep the invocation open for the tick's deferred writes (see
     // tickWaitUntil): a fire-and-forget drain is cancelled when the handler
-    // returns — the 100%-failure shape measured above.
+    // returns — the 100%-failure shape measured above. The tracker's own
+    // delivery enters through this same prologue on purpose: a pass needs a
+    // subrequest window of its own (beginSubreqWindow, see src/subreqs.ts) and
+    // the waitUntil that keeps a CUT card's delivery proof alive, and neither
+    // of those is scan-specific.
     beginPreTick(Date.now());
     tickWaitUntil = (promise) => ctx.waitUntil(promise);
+    // THE TRACKER'S OWN DELIVERY (see TRACKER_CRON): the pass, and nothing
+    // else. It returns BEFORE scheduledTicks, the cron-arrival stamp and the
+    // cadence gate, because all three count SCAN arrivals — the injected
+    // cadence gate and the outage check both compare them, so a delivery that
+    // never scans must not move them. This delivery's own liveness is the pass
+    // row it writes (see runTrackerInvocation, and the tick's fallback).
+    if (isTrackerCron(event.cron)) {
+      await runTrackerInvocation(env);
+      return;
+    }
     scheduledTicks++;
     // Cron-arrival bookkeeping rides the scan-lock claim (see
     // Db.scheduledTickStatements), so a normal tick pays ZERO extra round trips
