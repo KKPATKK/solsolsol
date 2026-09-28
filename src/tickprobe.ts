@@ -4,7 +4,12 @@ import { gmgnFeedStats } from "./gmgn";
 // place that sees EVERY phase the scanner marks (see src/subreqs.ts): the
 // scanner itself is past the file-sync window, and the probe already
 // intercepts its marker.
-import { markSubreqPhase, subreqRemaining } from "./subreqs";
+import {
+  SUBREQ_BUDGET_FREE,
+  SUBREQ_UNSEEN_ALLOWANCE,
+  markSubreqPhase,
+  subreqRemaining,
+} from "./subreqs";
 
 /*
  * Per-tick probe for the scan (2026-09-19).
@@ -243,6 +248,16 @@ export interface WriteDrainView {
    * a database that just refused a write. Neither drops anything.
    */
   heldForTracker: number;
+  /**
+   * Subrequests this drain left for the tracker pass behind it — the yield it
+   * respected while it walked the queue (see drainTrackerReserve), so a reader
+   * can tell a held batch from a spent one. Four readings are meaningful: 14 an
+   * unmeasured isolate (the old flat reserve, i.e. nothing has changed for it),
+   * a value between DRAIN_TRACKER_RESERVE_MIN and that ceiling a MEASURED
+   * yield, DEFERRED_FORCE_DRAIN_FLOOR a queue over the cap being drained ahead
+   * of the pass, and 0 an empty queue (nothing was held back).
+   */
+  reserve: number;
   /** Cumulative since the isolate booted, so the effect is readable either way. */
   totals: { calls: number; ms: number; failures: number };
 }
@@ -287,8 +302,56 @@ export const DEFERRED_COALESCE_MAX_PER_CALL = 40;
  * the fifteen the rotation wants on a roomy tick. Held entries are NOT failures:
  * the queue is built to keep an entry until it lands, so the next tick's drain
  * (or this one, after the pass) takes them — see WriteDrainView.heldForTracker.
+ *
+ * WHY IT IS A CEILING AND NOT A FLAT YIELD (2026-09-28): a flat 14 turned out
+ * to be a PERMANENT yield on this bot, because 14 is what a pass needs when it
+ * has room to be worth starting — and a tick whose scan has spent 24-36 of the
+ * 38 usable subrequests cannot offer it. Live (00:02-00:28Z, cadence restored
+ * to 60s): `left` was 2-14, i.e. `<= 14` on every tick, so the drain landed
+ * nothing while the queue grew 305 -> 2098 records in 26 minutes (`calls 5` ->
+ * 7 lifetime, `heldForTracker 2`, `failures 0`). The queue is bounded — it
+ * coalesces per token — and the scanner re-issues what it still needs, but the
+ * bookkeeping it exists to carry was parked, so the yield is now MEASURED
+ * (see noteTrackerPassSpend) and a queue over the cap drains first
+ * (see DEFERRED_FORCE_DRAIN_RECORDS).
  */
 export const DRAIN_TRACKER_RESERVE = 14;
+
+/**
+ * The floor the adaptive reserve may fall to (see drainTrackerReserve): the
+ * cheapest pass that is still a pass, plus the tail writes it holds back for
+ * itself — pushwatch.TRACKER_SUBREQ_FLOOR (3) + TRACKER_SUBREQ_RESERVE (6).
+ * Below it the pass cannot even reach its rotation, which is the starvation
+ * the reserve was introduced to prevent.
+ */
+export const DRAIN_TRACKER_RESERVE_MIN = 9;
+
+/**
+ * How many recent TICK-PATH pass measurements the reserve is the WORST of (see
+ * noteTrackerPassSpend). More than one because a single thin pass would
+ * otherwise license the drain to spend the room the NEXT pass needs; five
+ * smooths that without outliving the shape it measures.
+ */
+export const TRACKER_PASS_SPEND_RING = 5;
+
+/**
+ * Records owed before the queue stops waiting for the tracker pass entirely
+ * (see drainTrackerReserve): ten capped calls' worth. Below it the queue is a
+ * catch-up; above it the drain is what the invocation owes, because a
+ * bookkeeping queue nobody lands is exactly the leak coalescing was built to
+ * stop (its live reading is "owedTokens rising every tick with calls 0").
+ */
+export const DEFERRED_FORCE_DRAIN_RECORDS = DEFERRED_COALESCE_MAX_PER_CALL * 10;
+
+/**
+ * Subrequests the drain keeps for the pass's own TAIL (its note persist, the
+ * deferral-counter sync) even while it is draining a queue over the cap. NOT
+ * the full reserve: a forced drain is allowed to cost the pass its ROTATION —
+ * the pass defers that BY NAME (`deferred:subreq-budget`, pushwatch) rather
+ * than dying — but never the one write that says the pass ran at all, which is
+ * pushwatch.TRACKER_SUBREQ_RESERVE = 6.
+ */
+export const DEFERRED_FORCE_DRAIN_FLOOR = 6;
 
 /**
  * Durable worker_state key holding the last FAILED drain (see
@@ -613,6 +676,7 @@ let drain: WriteDrainView = {
   pending: 0,
   owedTokens: 0,
   heldForTracker: 0,
+  reserve: 0,
   totals: { calls: 0, ms: 0, failures: 0 },
 };
 /** DB handles already wrapped (double wrapping would double every write). */
@@ -757,6 +821,74 @@ export function deferredWriteCount(): number {
 }
 
 /**
+ * Subrequests the tracker pass actually spent the last few times it ran in a
+ * SCAN TICK's tail (see noteTrackerPassSpend), newest last.
+ *
+ * WHY MEASURED (2026-09-28): the reserve answered "what does a pass need?" with
+ * a constant, and that constant was the whole problem — a flat 14 is the need
+ * of a pass that has room, while the pass this bot actually runs defers as soon
+ * as its share runs out and so spends 5-8. Measuring turns the reserve into
+ * "what this bot's pass has needed HERE", which is the only value that can be
+ * right on both a thin rotation and a wide one.
+ *
+ * The samples come from the TICK path only (see worker.ts's pass call): the
+ * pass's own cron delivery owns its whole invocation, so what it spends there
+ * says nothing about the room a SHARED invocation leaves.
+ */
+const trackerPassSpend: number[] = [];
+
+/**
+ * Spendable subrequests in a window (src/subreqs.ts's own arithmetic, kept here
+ * so that a reading outside it can be rejected as broken rather than believed).
+ */
+const SUBREQ_USABLE = Math.max(0, SUBREQ_BUDGET_FREE - SUBREQ_UNSEEN_ALLOWANCE);
+
+/**
+ * Feed one pass's measured subrequest spend to the drain's reserve (see
+ * drainTrackerReserve). Readings outside `[0, SUBREQ_USABLE]` are DROPPED, not
+ * clamped: the counter is shared with the peer tracker delivery (see
+ * SubreqOwner), so a window opened underneath a running pass shows up as a
+ * negative or absurd delta, and a broken reading must not become a policy. Zero
+ * IS a real reading — a pass that deferred before its first round trip — and is
+ * kept, because the floor clamps it up to what a pass needs anyway.
+ */
+export function noteTrackerPassSpend(subrequests: number): void {
+  if (!Number.isFinite(subrequests)) return;
+  if (subrequests < 0 || subrequests > SUBREQ_USABLE) return;
+  trackerPassSpend.push(subrequests);
+  if (trackerPassSpend.length > TRACKER_PASS_SPEND_RING) trackerPassSpend.shift();
+}
+
+/** What the reserve computes from: the worst recent sample, or null if none. */
+export function trackerPassSpendView(): { worst: number; samples: number } | null {
+  if (trackerPassSpend.length === 0) return null;
+  return { worst: Math.max(...trackerPassSpend), samples: trackerPassSpend.length };
+}
+
+/**
+ * Subrequests this drain must leave for the tracker pass behind it.
+ *
+ * THREE ANSWERS, in order of precedence:
+ *   - the FORCED floor when the queue is over the cap: a backlog that deep is
+ *     the drain's own problem, and the pass can afford to defer by name (see
+ *     DEFERRED_FORCE_DRAIN_RECORDS);
+ *   - the CEILING while no tick-path pass has reported a spend — an unmeasured
+ *     isolate behaves exactly as it did before any of this existed;
+ *   - the WORST recent measurement, clamped to `[MIN, CEILING]`, which is what
+ *     the pass really needs here: a thin rotation then costs the drain a
+ *     thinner yield, and a wide one takes the full 14 back.
+ */
+export function drainTrackerReserve(owed: number = owedRecordCount()): number {
+  if (owed >= DEFERRED_FORCE_DRAIN_RECORDS) return DEFERRED_FORCE_DRAIN_FLOOR;
+  const measured = trackerPassSpendView();
+  if (measured === null) return DRAIN_TRACKER_RESERVE;
+  return Math.min(
+    DRAIN_TRACKER_RESERVE,
+    Math.max(DRAIN_TRACKER_RESERVE_MIN, measured.worst),
+  );
+}
+
+/**
  * Run every queued write, in call order, and report what it cost. Called by
  * the worker AFTER its completion flush: the tick's own scan race is over, so
  * this round trip can no longer delay a card's claim — it only costs the
@@ -787,6 +919,11 @@ export async function drainDeferredWrites(
   let lastError: WriteDrainView["lastError"] = null;
   // Entries this drain walked past to keep the tracker pass's slice intact.
   let heldForTracker = 0;
+  // The subrequests this drain leaves for the pass behind it — resolved once,
+  // inside the walk below (see drainTrackerReserve), and published either way.
+  // Declared with the other per-drain locals: the view is built after the
+  // `finally`, so a `const` inside the try cannot reach it.
+  let reserve = 0;
   try {
     if (owedRecordCount() === 0) {
       // Nothing was queued: report the empty batch without erasing the last
@@ -800,6 +937,8 @@ export async function drainDeferredWrites(
         pending: 0,
         owedTokens: 0,
         heldForTracker: 0,
+        // Nothing was owed, so nothing was held back for the tail.
+        reserve: 0,
       };
       // An empty queue is also the DRY half of a recovery: if this isolate left
       // a failure row behind, it now describes an incident that is over.
@@ -820,6 +959,10 @@ export async function drainDeferredWrites(
     // latency (writeDrain.pending keeps it visible while it waits).
     // One round trip per BUCKET, not per record (see DeferredBucket): the
     // backlog is measured in records (`owedTokens`) but paid for in calls.
+    // The yield is resolved ONCE for this drain (see drainTrackerReserve): a
+    // reserve that moved while the queue drained would make the batch depend on
+    // the order it happened to land in.
+    reserve = drainTrackerReserve();
     const ready = owedBuckets();
     while (ready.length > 0) {
       // The tracker pass runs BEHIND this drain in the same invocation (the
@@ -828,7 +971,7 @@ export async function drainDeferredWrites(
       // no reservation of its own — it defers by name instead. So the drain
       // yields: a held bucket is not lost, it just waits (see the queue's own
       // "an entry leaves it only once it has landed").
-      if (subreqLeft() <= DRAIN_TRACKER_RESERVE) {
+      if (subreqLeft() <= reserve) {
         heldForTracker = ready.length;
         break;
       }
@@ -883,6 +1026,7 @@ export async function drainDeferredWrites(
     pending: owedBuckets().length,
     owedTokens: owedRecordCount(),
     heldForTracker,
+    reserve,
     totals: {
       calls: drain.totals.calls + calls,
       ms: drain.totals.ms + ms,
@@ -983,6 +1127,9 @@ export function resetTickProbe(): void {
   stamps = [];
   buckets = [];
   opaqueRecords = 0;
+  // The pass measurements go with the buckets they reserve against: a test that
+  // measures a spend must not leak it into the next test's drain.
+  trackerPassSpend.length = 0;
   steps.clear();
   // The census baseline goes with the cumulative map it was copied from:
   // a stale snapshot would subtract another run's calls from this one's.
@@ -1000,6 +1147,7 @@ export function resetTickProbe(): void {
     pending: 0,
     owedTokens: 0,
     heldForTracker: 0,
+    reserve: 0,
     totals: { calls: 0, ms: 0, failures: 0 },
   };
   cardSend = { sent: 0, cut: 0, deferred: 0, lastCutAt: 0, lastCutMs: 0 };

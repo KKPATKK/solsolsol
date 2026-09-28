@@ -1275,6 +1275,8 @@ export interface ScanSummary {
     owedTokens?: number;
     /** Calls held back for the tracker pass behind the drain. */
     heldForTracker?: number;
+    /** Subrequests the drain left for the pass — its adaptive yield (tickprobe). */
+    reserve?: number;
   } | null;
   /**
    * Wall-clock ms the scan spent in tick-scoped Turso round trips (see

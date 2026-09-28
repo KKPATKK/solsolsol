@@ -58,6 +58,7 @@ import {
   writeDrainView,
   drainDeferredWrites,
   noteDuplicateCards,
+  noteTrackerPassSpend,
   WRITE_DRAIN_ERROR_KEY,
   drainErrorIsStale,
   type WriteDrainErrorRecord,
@@ -4447,6 +4448,14 @@ async function runScan(
           // marks, 0 with a proof). Nothing about the pass's decisions changes;
           // only its bookkeeping is kept alive.
           const holdTick = tickWaitUntil;
+          // WHAT THIS PASS COSTS, measured rather than assumed (see
+          // tickprobe.noteTrackerPassSpend): the write drain ahead of this
+          // stage yields a reserve, and a FLAT one yielded more than the pass
+          // needed on every tick of 2026-09-28 — live 00:02-00:28Z the queue
+          // went 305 -> 2098 owed records with `calls 0`. ONLY this call site
+          // reports: the pass's own cron delivery owns its whole subrequest
+          // window, so its spend there is not the shape the reserve is for.
+          const passSubreqBefore = subreqRemaining();
           await scanner.runTrackerPass(
             Date.now() + trackerBudgetMs,
             holdTick ? (p: Promise<unknown>) => holdTick(p) : undefined,
@@ -4472,6 +4481,7 @@ async function runScan(
               via: "tick",
             },
           );
+          noteTrackerPassSpend(passSubreqBefore - subreqRemaining());
           // The pass returned: its rotation ran, so the last failure is history.
           trackerPassFailure = null;
         } catch (err) {
