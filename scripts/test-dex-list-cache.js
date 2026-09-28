@@ -337,7 +337,7 @@ async function main() {
     for (const [what, at] of [
       ["the profiles result", order("() => profilesCall")],
       ["the boosts fetch", order("fetchBoostedTokens(this.config.dexscreenerBoostsLimit)")],
-      ["the pool phase", order("getReevalPoolCached(now")],
+      ["the pool phase", order("getReevalPoolCached(poolNow")],
     ]) {
       assert.ok(
         at > 0 && at < journal,

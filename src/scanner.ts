@@ -1287,6 +1287,16 @@ export interface ScanSummary {
   trackerMs?: number;
   /** Wall-clock ms for the re-eval pool query + rotation slice. */
   poolMs?: number;
+  /**
+   * Wall-clock ms the tick WAITED at the pool join for the read that was
+   * dispatched with the feed fan-out (2026-09-28). The read no longer runs in
+   * series after the feeds, so this is the RESIDUAL cost to the tick; read it
+   * together with poolMs (the read's own duration): poolWaitMs ≈ 0 means the
+   * overlap absorbed the read while the feeds ran, poolWaitMs ≈ poolMs means
+   * the read was still settling when the feeds finished and it remains this
+   * tick's long pole.
+   */
+  poolWaitMs?: number;
   /** Wall-clock ms for matching + candidate gate evaluation. */
   evalMs?: number;
   /**
@@ -2999,12 +3009,115 @@ export class Scanner {
       const profileFeedRow = await profileFeedSeed;
       this.dex.seedLastGoodProfiles(profileFeedRow);
       this.profileFeedStampedAt = profileFeedRow?.at ?? null;
+
       const chats = front.chats;
       if (chats.length === 0) {
         console.log("[scanner] no chats with push enabled, skipping");
         this.lastSkip = "no-chats-enabled";
         return;
       }
+
+      // Re-eval pool read + token_stats prune, dispatched HERE — with the feed
+      // fan-out rather than after it. The read depends on `chats` (read from
+      // the front above) and on nothing the feeds produce, yet it used to be
+      // awaited once the feed phase had already spent 700–900ms, so the tick
+      // paid its 300–900ms Turso round trip in series — and the prune paid
+      // another one right behind it. Both are in flight across the feeds now;
+      // the tick pays only the RESIDUAL wait at the join below (poolWaitMs).
+      //
+      // Re-evaluation pool: tokens never pushed that are nearing or inside
+      // the qualifying age window. The profiles feed only ever contains young
+      // tokens, so without this pool a coin would rotate out of the feed
+      // before reaching the minimum age (5h) and be lost forever. Bounds use
+      // the widest age window across enabled chats plus a margin, so coins
+      // are picked up shortly before they qualify and pushed the moment they
+      // do.
+      const poolNow = Date.now();
+      const poolDeadline = poolNow + POOL_FETCH_BUDGET_MS;
+      const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
+      const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
+      const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
+      const poolMaxMcapUsd = Math.max(...chats.map((c) => c.maxMarketCapUsd));
+      const poolMinLiquidityUsd = Math.min(
+        ...chats.map((c) => c.minLiquidityUsd),
+      );
+      const poolReadStartedAt = Date.now();
+      const poolRead = this.fetchFeedCapped(
+        () =>
+          // Dead-tick fix 2026-09-13: a budget-tripped tick used to keep
+          // spending its full pool race as zombie work after abort() —
+          // starting the completion flush that much later against the
+          // wall-clock kill. Skip the read when the tick is already over.
+          this.shouldStopEarly()
+            ? Promise.resolve([])
+            : this.getReevalPoolCached(poolNow, {
+        sinceMs: poolNow - RE_EVAL_WINDOW_MS,
+        minLaunchMs: poolNow - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+        maxLaunchMs: poolNow - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+        windowEntryLaunchMs: poolNow - poolMinAgeMin * 60_000,
+        limit: this.config.reevalPoolSize,
+        // Graduated rotation (see Db.getReevalPool): near slots swept every
+        // ~REEVAL_NEAR_SWEEP_MIN, far slots every ~REEVAL_FAR_SWEEP_MIN, hot
+        // zone every scan. Bands order by qualification signal and coins
+        // repeatedly seen below 60% of the market-cap gate are dropped, so
+        // the sweep budget concentrates on coins that can actually qualify.
+        // 2026-09-09: 0.5 → 0.6 (half-floor $20K → $24K) — prunes the
+        // "$20K–$24K lifelong peak" slice from every band, shortening the
+        // full sweep ~5–15% at the same tick budget. Accepted trade-off: a
+        // pruned coin stops updating max_mcap_observed, so a $23K-peak coin
+        // that later gaps straight past the gate is missed (the lenient 0.5
+        // was kept until the pool's growth made sweep latency the binding
+        // constraint).
+        nearSlots: this.config.reevalNearSlots,
+        farSlots: this.config.reevalFarSlots,
+        // Rotation period must equal the cache TTL so each expiry advances
+        // the slot (see Db.getReevalPool rotationPeriodMs).
+        rotationPeriodMs: this.config.reevalPoolCacheMs,
+        minQualifyMcap: poolMinMcapUsd * 0.6,
+        // Ceiling prune: drop coins whose historical peak already exceeded
+        // 2× the widest max-mcap gate. Under the signal ordering their huge
+        // max_mcap_observed ranks them first in every band, so pump-and-dump
+        // corpses starved live mid-cap coins out of the sweep (2026-09-10
+        // audit). Same permanent-exclusion trade-off as the floor prune.
+        maxQualifyMcap: poolMaxMcapUsd * 2,
+        // Liquidity floor prune: drop coins whose peak liquidity never
+        // reached 0.6× the widest chat's liquidity gate. Dead-liquidity
+        // corpses (mcap $100K+ over $0–$15 LP) survive the mcap floor/ceiling
+        // prunes and rank FIRST in every band under the signal ordering —
+        // live evidence 2026-09-10 13:xxZ: ~215 of ~330 evaluated coins/tick
+        // failed the liquidity gate (LAPTOP/NEMOTRON/Ggwiz/ZenoCoin…), so
+        // the 300-coin slice re-checked the same dead tape every sweep while
+        // nothing pushed since 2026-09-06. NULL max_liquidity_observed (not
+        // yet seen with pair data) is kept, exactly like the mcap prunes.
+        minQualifyLiquidity: poolMinLiquidityUsd * 0.6,
+        // Chat-aware seen exclusion: a token is dropped from the pool only
+        // when EVERY enabled chat has already received it. Without this a
+        // coin pushed to one chat (and marked seen there) vanished from the
+        // pool even when another chat's push had just failed, so the missed
+        // chat NEVER got a retry — the cross-chat push inconsistency
+        // observed between the private chat and the channel.
+          }),
+        [],
+        poolDeadline,
+      );
+      // token_stats grows with pump.fun discovery (100+ new coins per scan):
+      // prune rows older than the re-eval window that were never pushed —
+      // unreachable by the pool query and only wasting storage. Pushed coins
+      // keep their rows so /flow and cached verdicts still work. Dispatched
+      // beside the read (independent DB calls) so the tick stops paying its
+      // round trip in series too.
+      const pruneRun = this.fetchFeedCapped(
+        () =>
+          this.db.pruneOldTokenStats(poolNow - RE_EVAL_WINDOW_MS, this.scanFront),
+        undefined,
+        poolDeadline,
+      );
+      // Both are awaited at the join, which not every early return in between
+      // reaches; an unhandled rejection from a promise nobody awaits is a
+      // worker-level error, so each gets a no-op handler. This does NOT change
+      // what `await poolRead` sees — a failed read still throws there.
+      poolRead.catch(() => undefined);
+      pruneRun.catch(() => undefined);
 
       // Crime-wallet blocklist refresh (bounded by an in-memory TTL — a
       // no-op on most ticks; the first scan after a deploy fetches the
@@ -3560,92 +3673,19 @@ export class Scanner {
           );
         }
       }
-      // Re-evaluation pool: tokens never pushed that are nearing or inside
-      // the qualifying age window. The profiles feed only ever contains young
-      // tokens, so without this pool a coin would rotate out of the feed
-      // before reaching the minimum age (5h) and be lost forever. Bounds use
-      // the widest age window across enabled chats plus a margin, so coins
-      // are picked up shortly before they qualify and pushed the moment they
-      // do.
-      const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
-      const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
-      const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
-      const poolMaxMcapUsd = Math.max(...chats.map((c) => c.maxMarketCapUsd));
-      const poolMinLiquidityUsd = Math.min(
-        ...chats.map((c) => c.minLiquidityUsd),
-      );
+      // THE JOIN for the pool read and the prune dispatched with the feeds
+      // above: what is paid here is only the residual wait (poolWaitMs) — the
+      // read itself was already in flight while the feeds ran. `poolMs` keeps
+      // its old meaning (the read's own dispatch → settle duration), so the
+      // two together say whether the overlap worked: poolMs ≈ poolWaitMs means
+      // the feeds finished first and the read is still this tick's long pole.
       if (this.shouldStopEarly()) return;
-      const poolStart = Date.now();
-      const poolDeadline = Date.now() + POOL_FETCH_BUDGET_MS;
-      const recentStats = await this.fetchFeedCapped(
-        () =>
-// Dead-tick fix 2026-09-13: a budget-tripped tick used to keep
-          // spending its full 4s pool race as zombie work after abort() —
-          // starting the completion flush that much later against the
-          // wall-clock kill. Skip the read when the tick is already over.
-          this.shouldStopEarly()
-            ? Promise.resolve([])
-            : this.getReevalPoolCached(now, {
-        sinceMs: now - RE_EVAL_WINDOW_MS,
-        minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
-        maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
-        windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
-        limit: this.config.reevalPoolSize,
-        // Graduated rotation (see Db.getReevalPool): near slots swept every
-        // ~REEVAL_NEAR_SWEEP_MIN, far slots every ~REEVAL_FAR_SWEEP_MIN, hot
-        // zone every scan. Bands order by qualification signal and coins
-        // repeatedly seen below 60% of the market-cap gate are dropped, so
-        // the sweep budget concentrates on coins that can actually qualify.
-        // 2026-09-09: 0.5 → 0.6 (half-floor $20K → $24K) — prunes the
-        // "$20K–$24K lifelong peak" slice from every band, shortening the
-        // full sweep ~5–15% at the same tick budget. Accepted trade-off: a
-        // pruned coin stops updating max_mcap_observed, so a $23K-peak coin
-        // that later gaps straight past the gate is missed (the lenient 0.5
-        // was kept until the pool's growth made sweep latency the binding
-        // constraint).
-        nearSlots: this.config.reevalNearSlots,
-        farSlots: this.config.reevalFarSlots,
-        // Rotation period must equal the cache TTL so each expiry advances
-        // the slot (see Db.getReevalPool rotationPeriodMs).
-        rotationPeriodMs: this.config.reevalPoolCacheMs,
-        minQualifyMcap: poolMinMcapUsd * 0.6,
-        // Ceiling prune: drop coins whose historical peak already exceeded
-        // 2× the widest max-mcap gate. Under the signal ordering their huge
-        // max_mcap_observed ranks them first in every band, so pump-and-dump
-        // corpses starved live mid-cap coins out of the sweep (2026-09-10
-        // audit). Same permanent-exclusion trade-off as the floor prune.
-        maxQualifyMcap: poolMaxMcapUsd * 2,
-        // Liquidity floor prune: drop coins whose peak liquidity never
-        // reached 0.6× the widest chat's liquidity gate. Dead-liquidity
-        // corpses (mcap $100K+ over $0–$15 LP) survive the mcap floor/ceiling
-        // prunes and rank FIRST in every band under the signal ordering —
-        // live evidence 2026-09-10 13:xxZ: ~215 of ~330 evaluated coins/tick
-        // failed the liquidity gate (LAPTOP/NEMOTRON/Ggwiz/ZenoCoin…), so
-        // the 300-coin slice re-checked the same dead tape every sweep while
-        // nothing pushed since 2026-09-06. NULL max_liquidity_observed (not
-        // yet seen with pair data) is kept, exactly like the mcap prunes.
-        minQualifyLiquidity: poolMinLiquidityUsd * 0.6,
-        // Chat-aware seen exclusion: a token is dropped from the pool only
-        // when EVERY enabled chat has already received it. Without this a
-        // coin pushed to one chat (and marked seen there) vanished from the
-        // pool even when another chat's push had just failed, so the missed
-        // chat NEVER got a retry — the cross-chat push inconsistency
-        // observed between the private chat and the channel.
-        seenChatIds: chats.map((c) => c.chatId),
-          }),
-        [],
-        poolDeadline,
-      );
-      // token_stats grows with pump.fun discovery (100+ new coins per scan):
-      // prune rows older than the re-eval window that were never pushed —
-      // unreachable by the pool query and only wasting storage. Pushed coins
-      // keep their rows so /flow and cached verdicts still work.
+      const poolJoinStart = Date.now();
+      const recentStats = await poolRead;
+      diag.poolMs = Date.now() - poolReadStartedAt;
+      diag.poolWaitMs = Date.now() - poolJoinStart;
       try {
-        await this.fetchFeedCapped(
-          () => this.db.pruneOldTokenStats(now - RE_EVAL_WINDOW_MS, this.scanFront),
-          undefined,
-          poolDeadline,
-        );
+        await pruneRun;
       } catch (err) {
         console.error(
           "[scanner] token_stats prune failed:",
@@ -3703,7 +3743,6 @@ export class Scanner {
       );
       this.poolSliceCursor = nextCursor;
       diag.poolSliced = poolSlice.length;
-      diag.poolMs = Date.now() - poolStart;
       const evalStart = Date.now();
       const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
       // REJECT_LOG_MAX (20) is smaller than feed+slice (~90+ coins/tick), so
