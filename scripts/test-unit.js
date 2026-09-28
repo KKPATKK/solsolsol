@@ -28,7 +28,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -16277,6 +16277,56 @@ async function main() {
       // The slice is still client-side: that is WHAT makes the cap free to raise.
       assert.ok(jupSrc.includes("/recent?limit="), "the request still carries the cap");
       assert.ok(jupSrc.includes(".slice("), "and the rows are still sliced to it");
+    },
+  );
+
+  await test(
+    "pool window (2026-09-28) — the offline instruments read the scanner's constants instead of restating them",
+    () => {
+      const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+
+      // The values themselves: 30h window, 180min margin. If the scanner ever
+      // moves them, every instrument follows at once — that is the point.
+      assert.equal(RE_EVAL_WINDOW_MS, 30 * 60 * 60_000, "the tick's pool window is 30h");
+      assert.equal(RE_EVAL_AGE_MARGIN_MIN, 180, "and its age margin is 180min");
+
+      // The exports exist in the source, not just in the compiled artefact.
+      const scannerSrc = read("src/scanner.ts");
+      assert.ok(
+        scannerSrc.includes("export const RE_EVAL_WINDOW_MS"),
+        "scanner.ts exports the window so instruments can import it",
+      );
+      assert.ok(
+        scannerSrc.includes("export const RE_EVAL_AGE_MARGIN_MIN"),
+        "and the age margin",
+      );
+
+      // ...and no instrument restates them any more. A local const X = ... is
+      // the exact shape of the drift this pin prevents: cpu-profile.js measured
+      // a wider pool than the tick, silently, for as long as it existed.
+      for (const f of [
+        "scripts/cpu-profile.js",
+        "scripts/test-filters.js",
+        "scripts/pool-mcap-floor.js",
+      ]) {
+        const src = read(f);
+        assert.ok(!src.includes("const RE_EVAL_WINDOW_MS ="), f + " has no local window const");
+        assert.ok(!src.includes("const RE_EVAL_AGE_MARGIN_MIN ="), f + " has no local margin const");
+        assert.ok(src.includes("RE_EVAL_WINDOW_MS"), f + " uses the imported window");
+        assert.ok(src.includes("RE_EVAL_AGE_MARGIN_MIN"), f + " uses the imported margin");
+        assert.ok(
+          src.includes('require("../dist/scanner.js")'),
+          f + " imports them from the scanner",
+        );
+      }
+
+      // The pool size is config, not a scanner constant: test-filters must ask
+      // the loaded config rather than pin 40, or an operator who sets
+      // REEVAL_POOL_SIZE diagnoses a pool size the tick never uses.
+      assert.ok(
+        read("scripts/test-filters.js").includes("limit: cfg.reevalPoolSize,"),
+        "test-filters sizes its pool query from the config it already loads",
+      );
     },
   );
 

@@ -1082,8 +1082,13 @@ export function poolCacheView(): typeof poolCacheCounters & {
  * operator runs 30h (28h + 2h slack): coins age into the window while
  * sitting in the pool, since the DexScreener profiles feed only ever
  * contains young tokens.
+ *
+ * Exported so the offline instruments (scripts/cpu-profile.js, test-filters.js,
+ * pool-mcap-floor.js) query the tick's pool instead of restating a window:
+ * cpu-profile carried 43h/30min until 2026-09-28, i.e. it measured a wider
+ * pool than the scanner ever reads.
  */
-const RE_EVAL_WINDOW_MS = 30 * 60 * 60_000;
+export const RE_EVAL_WINDOW_MS = 30 * 60 * 60_000;
 /**
  * In-memory TTL for the re-eval pool query, from config.reevalPoolCacheMs
  * (REEVAL_POOL_CACHE_SECONDS, default 180 = 3 min). The pool only changes
@@ -1103,8 +1108,11 @@ const RE_EVAL_WINDOW_MS = 30 * 60 * 60_000;
  * Margin (minutes) around the qualifying age window: the pool also holds
  * coins that will enter the window within 3h, so they are pushed the moment
  * they qualify instead of being picked up only after a later scan.
+ *
+ * Exported for the same reason as RE_EVAL_WINDOW_MS: the offline instruments
+ * must run the tick's margins, not their own.
  */
-const RE_EVAL_AGE_MARGIN_MIN = 180;
+export const RE_EVAL_AGE_MARGIN_MIN = 180;
 /**
  * Max re-eval-pool coins whose pair data is fetched per tick (the live feed
  * is always included on top). The pair fetch is the scan's dominant cost —

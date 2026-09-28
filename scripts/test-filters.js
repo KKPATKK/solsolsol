@@ -27,10 +27,11 @@ const URL = process.env.TURSO_DATABASE_URL;
 const TOKEN = process.env.TURSO_AUTH_TOKEN;
 const BKEY = process.env.BIRDEYE_API_KEY;
 
-// Mirrors scanner.ts constants so the diagnosis runs the same bounds.
-const RE_EVAL_WINDOW_MS = 30 * 3600e3;
-const RE_EVAL_AGE_MARGIN_MIN = 180;
-const RE_EVAL_POOL_SIZE = 40;
+// The bounds come from the scanner itself, so the diagnosis runs what the tick
+// runs. These were hand-copied until 2026-09-28: this copy happened to stay
+// right at 30h/180min while the sibling copy in cpu-profile.js drifted to
+// 43h/30min, which is the whole argument for importing them.
+const { RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 
 const USD = (n) => {
   if (n === null || n === undefined) return "—";
@@ -114,7 +115,7 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
       minLaunchMs: now - (s.maxAgeMinutes + RE_EVAL_AGE_MARGIN_MIN) * 60000,
       maxLaunchMs: now - (s.minAgeMinutes - RE_EVAL_AGE_MARGIN_MIN) * 60000,
       windowEntryLaunchMs: now - s.minAgeMinutes * 60000,
-      limit: RE_EVAL_POOL_SIZE,
+      limit: cfg.reevalPoolSize,
     });
     poolTokens = recent
       .filter((st) => !profiles.some((p) => p.tokenAddress === st.token))

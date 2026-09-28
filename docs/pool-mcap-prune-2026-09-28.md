@@ -86,3 +86,46 @@ ratio 著手。
 | `/debug/pool` `eligibleInWindow` | 不變（佢係 COUNT，唔經 prune） |
 | `tokenStatsCount` | **唔應該**因為呢次改動而跌 —— 呢個 prune 係查詢裡嘅 WHERE，唔會刪行（行係 `pruneOldTokenStats` 清） |
 | `heartbeat.summary.pool` | 可能**輕微**細（每 sweep 少 3–6 行），唔係故障 |
+
+## 六、同日嘅附帶修正：離線儀器嘅窗口常數
+
+上面嘅量度暴露咗同一個病嘅第二個實例 —— **儀器自己抄常數**。
+
+`scripts/cpu-profile.js` 一直用 `RE_EVAL_WINDOW_MS = 43h` / `RE_EVAL_AGE_MARGIN_MIN = 30min`
+手抄，而 tick 係 **30h / 180min**。三者之中兩個（`test-filters.js` 30h/180、
+`pool-mcap-floor.js` 30h/180）剛好抄對，一個抄錯 —— 兩對一唔係機制，係運氣。
+而 `cpu-profile.js` 嘅 pool phase 明文要量「同 tick 一樣嘅 pool」，所以佢一直量
+一個**唔同嘅 pool**，兩邊可以永遠唔一致而無人知。
+
+修正：`src/scanner.ts` 把兩個常數 `export` 出嚟，三個儀器全部 import
+（`test-filters.js` 本身已經 require `dist/scanner.js`，所以係零成本）。順手：
+`test-filters.js` 嘅 `RE_EVAL_POOL_SIZE = 40` 亦改食 `cfg.reevalPoolSize`（pool 大小
+係 config 而唔係 scanner 常數，手抄 40 會令設了 `REEVAL_POOL_SIZE` 嘅人診斷出
+一個 tick 從來冇用過嘅 pool 大小）。
+
+### 呢個 drift 值幾多？
+
+新儀器 `node scripts/pool-window-drift.js [windowHours] [marginMin]`（唯讀，default
+43h/30min ＝ 舊抄法）同一次 `now` 之下各查一次 pool，再比較**集合**。兩個樣本
+（兩個 slot）：
+
+| slot | tick 行數 | 舊抄法行數 | 只在舊抄法出現 | 只在 tick 出現 | 只在其中一邊 |
+|---|---|---|---|---|---|
+| #1 | 875 | 705 | 108 | 279 | 387 / 984 (39%) |
+| #2 | 507 | 393 | 118 | 232 | 350 / 625 (56%) |
+
+「只在舊抄法出現」嘅 118 個幣，**冇一個**在 tick 嘅 band 之外（0 個老過、0 個後生過）
+—— 佢哋全部係 20–22h 齡、兩邊 band 都包含嘅幣。原因係兩個常數一動，band 嘅**絕對
+邊界**就跟著動，而 rotation slot 係按 band 邊界切嘅，所以 slot 窗口會落去第二個
+位置。即係話：唔係「順手多量幾隻」，係**換咗一批**（39–56% 唔重疊，slot 相關）。
+
+所以呢個修正唔係潔癖：`cpu-profile.js` 報嘅 pool 數字（行數、組成、prune 效果）
+過去係另一個 pool 嘅數字。
+
+### 驗收點
+
+| 睇 | 預期 |
+|---|---|
+| `scripts/test-unit.js` | 有 pin 釘住 `export const RE_EVAL_*`、三個儀器都唔可以再出現 `const RE_EVAL_* =`、`test-filters.js` 用 `cfg.reevalPoolSize` |
+| 三個儀器 | `grep -n "RE_EVAL"` 只應該出現 import 同使用，唔應該有本地宣告 |
+| 之後改窗口 | 改 `src/scanner.ts` 一處，三個儀器自動跟上（`cpu-profile.js` 亦因此唔再係唯一抄錯嘅例外） |

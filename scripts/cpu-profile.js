@@ -46,6 +46,8 @@ const {
   Scanner,
   POOL_LIQUIDITY_PRUNE_RATIO,
   POOL_MCAP_PRUNE_RATIO,
+  RE_EVAL_WINDOW_MS,
+  RE_EVAL_AGE_MARGIN_MIN,
 } = require("../dist/scanner.js");
 const { DexScreenerClient } = require("../dist/dexscreener.js");
 const { fmtUsd } = require("../dist/format.js");
@@ -54,8 +56,13 @@ const { parseNewPools } = require("../dist/geckoterminal.js");
 const { parseMeteoraPools } = require("../dist/meteora.js");
 const { parsePumpCoins } = require("../dist/pumpfun.js");
 
-const RE_EVAL_WINDOW_MS = 43 * 3600_000;
-const RE_EVAL_AGE_MARGIN_MIN = 30;
+// RE_EVAL_WINDOW_MS / RE_EVAL_AGE_MARGIN_MIN come from dist/scanner.js (the
+// destructure above). Until 2026-09-28 they were restated here as 43h / 30min,
+// which describes a WIDER pool than the tick reads: a 43h sinceMs reaches two
+// hours further back, and a 30min margin is tighter at both ends of the age
+// band. So this report's pool phase measured a different pool than the scanner
+// queries, and the two views could disagree without anyone noticing. There is
+// nothing left to keep in sync by hand.
 
 /** One row of the report: a phase, its bytes, its wall clock and its CPU. */
 const rows = [];

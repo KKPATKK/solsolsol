@@ -49,13 +49,14 @@ const { Db } = require("../dist/db.js");
 const {
   POOL_MCAP_PRUNE_RATIO,
   POOL_LIQUIDITY_PRUNE_RATIO,
+  RE_EVAL_WINDOW_MS,
+  RE_EVAL_AGE_MARGIN_MIN,
 } = require("../dist/scanner.js");
 const { fmtUsd } = require("../dist/format.js");
 
-// The scanner's own window constants (src/scanner.ts — RE_EVAL_WINDOW_MS and
-// RE_EVAL_AGE_MARGIN_MIN; not exported, so restated here).
-const RE_EVAL_WINDOW_MS = 30 * 60 * 60_000;
-const RE_EVAL_AGE_MARGIN_MIN = 180;
+// The scanner's own window constants, imported (the destructure above) rather
+// than restated: src/scanner.ts exports RE_EVAL_WINDOW_MS and
+// RE_EVAL_AGE_MARGIN_MIN for exactly this purpose since 2026-09-28.
 
 /** The two history points plus a ladder either side of them. */
 const LADDER = (process.argv[3] || "0.5,0.6,0.7,0.8,0.9")
