@@ -380,6 +380,12 @@ export class JupTokensClient {
     // Slice client-side: measured 2026-08-21 the lite-api returns ≥30 rows
     // regardless of the limit param, and the configured cap IS the Turso
     // rows-read budget guard (every extra row can become a token_stats one).
+    // 2026-09-28: the cap moved 20 → 30 because of exactly that measurement —
+    // the rows were already in the response, so the cap was choosing how many
+    // of them to use, not how many to ask for.
+    // 2026-09-28: the cap moved 20 → 30 because of exactly that measurement —
+    // the rows were already in the response, so the cap was choosing how many
+    // of them to use, not how many to ask for.
     return parseJupTokens(await this.get(`/recent?limit=${wanted}`)).slice(
       0,
       wanted,

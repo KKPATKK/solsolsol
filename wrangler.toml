@@ -101,7 +101,7 @@ SCAN_PROFILE_LIMIT = "200"
 # gives up when it does not. Watch /health heartbeat.summary.boosts together
 # with scanMs and subreqSkip; set this back to "0" if scanMs climbs or the leg
 # starts appearing in subreqSkip.
-DEXSCREENER_BOOSTS_LIMIT = "20"
+DEXSCREENER_BOOSTS_LIMIT = "30"
 # Re-evaluation pool: never-pushed coins nearing/inside the qualifying age
 # window that the bot keeps tracking until they qualify (code default 40,
 # max 1000). Ordered by relevance, so the closest-to-qualifying coins are

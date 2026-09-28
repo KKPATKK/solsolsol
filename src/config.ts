@@ -273,6 +273,12 @@ export interface AppConfig {
    * 19 Solana rows, ZERO overlap with the 16 the profiles feed returned in the
    * same minute, same host so no new rate-limit bucket). Rows carry no metrics
    * and no timestamps — the age comes from the pair the next batch fetches.
+   *
+   * 2026-09-28: production runs the upstream's own ceiling
+   * (DEXSCREENER_BOOSTS_LIMIT = "30" in wrangler.toml). /token-boosts/latest/v1
+   * answers 30 rows, so the previous 20 discarded 10 paid-promotion rows per
+   * tick — same host, same single request. The clamp below (30) IS that
+   * ceiling: a bigger number is a typo, not a request for more.
    */
   dexscreenerBoostsLimit: number;
   /**
@@ -358,10 +364,18 @@ export interface AppConfig {
   geckoterminalTrendingLimit: number;
   /**
    * Jupiter Token v2 recent-launches feed size per scan (JUPITER_RECENT_LIMIT,
-   * default 20, max 100, 0 = disabled). Seconds-old launchpad launches — the
+   * default 30, max 100, 0 = disabled). Seconds-old launchpad launches — the
    * free no-key replacement for the blocked pump.fun frontend-api feed.
-   * Keep modest while Turso's rows-read quota recovers: every net-new coin
-   * grows token_stats and with it the re-eval pool band scans.
+   *
+   * 2026-09-28: default 20 → 30, and the reason is that the 20 was FREE to
+   * raise. /recent answers ≥30 rows in ONE request whatever limit is asked for
+   * (measured 2026-08-21), and the client slices the parsed rows to this cap —
+   * so the cap was deciding how many rows it already held got used, not how
+   * much the upstream was asked for. Same one subrequest, same host: +10
+   * seconds-old launches per tick. The cost side is Turso (every net-new coin
+   * grows token_stats and with it the re-eval pool band scans), which is what
+   * the rows-read quota and RE_EVAL_POOL_SIZE bound — so this is the number to
+   * lower first if the pool ever outweighs the launches it finds.
    */
   jupiterRecentLimit: number;
   /**
@@ -704,9 +718,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     )
       ? Math.max(0, Math.min(Math.floor(Number(env.GECKOTERMINAL_TRENDING_LIMIT ?? 20)), 20))
       : 20,
-    jupiterRecentLimit: Number.isFinite(Number(env.JUPITER_RECENT_LIMIT ?? 20))
-      ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_RECENT_LIMIT ?? 20)), 100))
-      : 20,
+    jupiterRecentLimit: Number.isFinite(Number(env.JUPITER_RECENT_LIMIT ?? 30))
+      ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_RECENT_LIMIT ?? 30)), 100))
+      : 30,
     jupiterTrendLimit: Number.isFinite(Number(env.JUPITER_TRENDING_LIMIT ?? 100))
       ? Math.max(0, Math.min(Math.floor(Number(env.JUPITER_TRENDING_LIMIT ?? 100)), 100))
       : 100,
