@@ -637,6 +637,32 @@ installTickProbe(fakeScanner, {
     console.log("dead-tick recovery: pass");
   }
 
+  // ---------- the death-driven drain ceiling (worker.ts drainCallCeiling) ----
+  // Live 2026-09-28 00:33-00:53Z: twelve cron ticks in twenty minutes lost their
+  // completion write, and the successor tick is the one that has to prove the
+  // stretch is over — while the deferred-write drain sits behind its flush in
+  // the SAME invocation. That tick therefore drains under a LOWER ceiling, so
+  // the invocation's allowance goes to its flush, the tracker pass and the
+  // deferral sync. The rule is pure and pinned here rather than inferred from
+  // whatever /health happens to show.
+  {
+    const { drainCallCeiling, drainShedReason } = require("../dist/worker.js");
+    const {
+      DEFERRED_MAX_CALLS_PER_DRAIN,
+      DEFERRED_DEAD_PREDECESSOR_MAX_CALLS,
+    } = require("../dist/tickprobe.js");
+    assert.equal(DEFERRED_DEAD_PREDECESSOR_MAX_CALLS, 1, "one call is the shed ceiling");
+    assert.ok(
+      DEFERRED_DEAD_PREDECESSOR_MAX_CALLS < DEFERRED_MAX_CALLS_PER_DRAIN,
+      "and it must stay BELOW the normal ceiling, or a shed would mean nothing",
+    );
+    assert.equal(drainCallCeiling(true), DEFERRED_DEAD_PREDECESSOR_MAX_CALLS);
+    assert.equal(drainCallCeiling(false), DEFERRED_MAX_CALLS_PER_DRAIN);
+    assert.equal(drainShedReason(true), "dead-predecessor");
+    assert.equal(drainShedReason(false), null, "an ordinary tick publishes no reason");
+    console.log("death-driven drain ceiling: pass");
+  }
+
   // ---------- bounded recovery awaits (worker.ts recoveryAwait) ----------
   // The recovery runs BEFORE the scan, on the ticks that are already in
   // trouble — so every round trip it makes is bounded. A hung write there used

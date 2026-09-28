@@ -242,10 +242,12 @@ export interface WriteDrainView {
   owedTokens: number;
   /**
    * Entries this drain did NOT touch because the tracker pass behind it still
-   * needed the invocation's subrequest allowance (see DRAIN_TRACKER_RESERVE).
-   * Deliberately separate from `pending`, which also counts a batch stopped by
-   * a failure: `pending 3 failures 0` is a held batch, `pending 3 failures 1` is
-   * a database that just refused a write. Neither drops anything.
+   * needed the invocation's subrequest allowance (see DRAIN_TRACKER_RESERVE),
+   * or because this drain's ceiling was lowered below what the room allowed
+   * (`shed` names that case). Deliberately separate from `pending`, which also
+   * counts a batch stopped by a failure: `pending 3 failures 0` is a held
+   * batch, `pending 3 failures 1` is a database that just refused a write.
+   * Neither drops anything.
    */
   heldForTracker: number;
   /**
@@ -258,6 +260,15 @@ export interface WriteDrainView {
    * of the pass, and 0 an empty queue (nothing was held back).
    */
   reserve: number;
+  /**
+   * Non-null when this drain ran under a LOWER call ceiling than the normal one
+   * (DEFERRED_MAX_CALLS_PER_DRAIN), and the reason why — currently only
+   * "dead-predecessor" (see DEFERRED_DEAD_PREDECESSOR_MAX_CALLS). `calls` alone
+   * cannot separate the three ways a small batch happens: the room, the ceiling,
+   * or the queue being genuinely short, and the ceiling is the one an operator
+   * changes.
+   */
+  shed: string | null;
   /** Cumulative since the isolate booted, so the effect is readable either way. */
   totals: { calls: number; ms: number; failures: number };
 }
@@ -372,6 +383,24 @@ export const DEFERRED_FORCE_DRAIN_FLOOR = 6;
  * can clear a flooded queue" a true statement.
  */
 export const DEFERRED_MAX_CALLS_PER_DRAIN = 10;
+
+/**
+ * Calls ONE drain may make on a tick that just BACKFILLED a dead predecessor
+ * (see WriteDrainView.shed).
+ *
+ * WHY (2026-09-28): a tick that backfilled a death is the tick that has to
+ * prove the wave of deaths is over — its own completion flush is the write that
+ * ends the stretch — and the drain sits behind that flush in the SAME
+ * invocation. Live 2026-09-28 00:33-00:53Z: twelve cron ticks in twenty minutes
+ * died before their flush while the tick was still free to spend ten drain
+ * round trips (a spend the libsql client's own retries can multiply into two or
+ * three platform subrequests each, see docs/scan-completion-loss.md). Landing
+ * ONE slice still moves the bookkeeping forward — the queue coalesces, so what
+ * is not landed stays owed and is re-offered by the next tick — while the rest
+ * of the invocation's allowance goes to the flush, the tracker pass and the
+ * deferral sync behind it.
+ */
+export const DEFERRED_DEAD_PREDECESSOR_MAX_CALLS = 1;
 
 /**
  * Durable worker_state key holding the last FAILED drain (see
@@ -697,6 +726,7 @@ let drain: WriteDrainView = {
   owedTokens: 0,
   heldForTracker: 0,
   reserve: 0,
+  shed: null,
   totals: { calls: 0, ms: 0, failures: 0 },
 };
 /** DB handles already wrapped (double wrapping would double every write). */
@@ -922,8 +952,22 @@ export function drainTrackerReserve(owed: number = owedRecordCount()): number {
  * owns a different window — and every test — can say what "no room left"
  * means. The default reads the live counter.
  */
+/**
+ * How ONE drain is allowed to spend, for the callers that know something the
+ * queue does not — a tick that just backfilled a death lowers its ceiling (see
+ * DEFERRED_DEAD_PREDECESSOR_MAX_CALLS). Absent options are the normal ceiling,
+ * which is what every other caller wants.
+ */
+export interface DrainOptions {
+  /** Calls this drain may make (see DEFERRED_MAX_CALLS_PER_DRAIN). */
+  maxCalls?: number;
+  /** Why that ceiling is lower than the normal one (null = it is not). */
+  shed?: string | null;
+}
+
 export async function drainDeferredWrites(
   subreqLeft: () => number = subreqRemaining,
+  opts: DrainOptions = {},
 ): Promise<WriteDrainView> {
   // One drain at a time. The queue is now edited IN PLACE (see below) rather
   // than swapped out, so a second caller — a slow drain that overlaps the next
@@ -933,6 +977,11 @@ export async function drainDeferredWrites(
   const startedAt = dbClock();
   let calls = 0;
   let failures = 0;
+  // Resolved ONCE, like the reserve below: the view is built after the try (and
+  // by the empty-queue early return), so both readings have to be reachable
+  // from there.
+  const maxCalls = opts.maxCalls ?? DEFERRED_MAX_CALLS_PER_DRAIN;
+  const shed = opts.shed ?? null;
   // The most recent failed entry of THIS drain (see WriteDrainView.lastError).
   // The batch stops at the first failure, so this names the entry that stalled
   // it — the reason /health could never surface before.
@@ -959,6 +1008,8 @@ export async function drainDeferredWrites(
         heldForTracker: 0,
         // Nothing was owed, so nothing was held back for the tail.
         reserve: 0,
+        // ...and a lowered ceiling stopped nothing (see WriteDrainView.shed).
+        shed,
       };
       // An empty queue is also the DRY half of a recovery: if this isolate left
       // a failure row behind, it now describes an incident that is over.
@@ -995,10 +1046,12 @@ export async function drainDeferredWrites(
       // no reservation of its own — it defers by name instead. So the drain
       // yields: a held bucket is not lost, it just waits (see the queue's own
       // "an entry leaves it only once it has landed").
-      if (calls >= DEFERRED_MAX_CALLS_PER_DRAIN) {
-        // The drain's own ceiling (see DEFERRED_MAX_CALLS_PER_DRAIN): the room
-        // check below is what normally ends this walk, and this is what ends it
-        // when the room reading cannot be trusted to fall.
+      if (calls >= maxCalls) {
+        // The drain's own ceiling (see DEFERRED_MAX_CALLS_PER_DRAIN and
+        // DEFERRED_DEAD_PREDECESSOR_MAX_CALLS): the room check below is what
+        // normally ends this walk, and this is what ends it when the room
+        // reading cannot be trusted to fall — or when the caller lowered the
+        // ceiling because this tick has a completion to land (see `shed`).
         heldForTracker = ready.length;
         break;
       }
@@ -1062,6 +1115,7 @@ export async function drainDeferredWrites(
     owedTokens: owedRecordCount(),
     heldForTracker,
     reserve,
+    shed,
     totals: {
       calls: drain.totals.calls + calls,
       ms: drain.totals.ms + ms,
@@ -1183,6 +1237,7 @@ export function resetTickProbe(): void {
     owedTokens: 0,
     heldForTracker: 0,
     reserve: 0,
+    shed: null,
     totals: { calls: 0, ms: 0, failures: 0 },
   };
   cardSend = { sent: 0, cut: 0, deferred: 0, lastCutAt: 0, lastCutMs: 0 };
