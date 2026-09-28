@@ -1759,6 +1759,14 @@ export interface ScanSummary {
     crime: number;
     /** Deploy-slot bundle detected (Flurry forensics, last gate). */
     flurry: number;
+    /**
+     * LP-heavy shape: mcap/LP below MCAP_LIQ_RATIO_MIN (the pool still holds
+     * a quarter or more of the supply). Counted apart from the gate's HIGH
+     * side so the floor the operator tunes against has its own reading.
+     */
+    liqRatio: number;
+    /** Jupiter's own suspicion flag (audit.isSus) blocked the push. */
+    sus: number;
     other: number;
   };
   /** Flurry forensics verdicts produced this scan (0 when disabled). */
@@ -1842,14 +1850,63 @@ export function mcapRatioBlockReason(
   marketCap: number,
   liquidityUsd: number,
   ratioMax: number,
+  ratioMin = 0,
 ): string | null {
-  if (!(ratioMax > 0)) return null;
   if (!(marketCap > 0) || !(liquidityUsd > 0)) return null;
   const ratio = marketCap / liquidityUsd;
-  return ratio > ratioMax
-    ? `市值/LP 比率 ${ratio.toFixed(1)}x > ${ratioMax}x（估值遠超池深：價格可操縱、難以出場）`
-    : null;
+  if (ratioMax > 0 && ratio > ratioMax) {
+    return `市值/LP 比率 ${ratio.toFixed(1)}x > ${ratioMax}x（估值遠超池深：價格可操縱、難以出場）`;
+  }
+  // The OTHER side of the band (2026-09-28, MCAP_LIQ_RATIO_MIN). For a
+  // constant-product pool the two sides are the same quantity read from
+  // opposite ends: LP/mcap = 2 × (tokens in the pool ÷ total supply), so a
+  // LOW mcap/LP means the supply is still (mostly) unsold INSIDE the pool and
+  // its SOL side is the exit one or two wallets can take.
+  //
+  // Why a LOW ratio is the danger, from the ring that found it: on 2026-09-28
+  // the pushed QNT (LP/mcap 0.70 = ~35% of supply still pooled, dev + one
+  // wallet holding 45%) had its pool sold empty within 1h34m; across the
+  // 48-token push ring the shape separated cleanly — the four pushes below
+  // 2.0x all had their liquidity pulled, none of the 35 above 2.9x did. See
+  // docs/suspicious-token-gates.md.
+  if (ratioMin > 0 && ratio < ratioMin) {
+    const poolSupplyPct = Math.round(100 / (2 * ratio));
+    return `市值/LP 比率 ${ratio.toFixed(1)}x < ${ratioMin}x（LP/市值 ${(1 / ratio).toFixed(2)}：池內仍壓住約 ${poolSupplyPct}% 供應，價格只是未賣出的存量）`;
+  }
+  return null;
 }
+
+/**
+ * Jupiter suspicion-flag gate (Jupiter Token v2 `audit.isSus`).
+ *
+ * Presence-only by Jupiter's own documentation ("isSus is only present when a
+ * token has been flagged"), so the flag means "flagged"; its absence is NOT a
+ * clean bill of health and must never be judged either way. The caller
+ * therefore only ever hands this a boolean — a missing reading stays false
+ * (fail-open, the same stance every other gate takes on missing data).
+ *
+ * Calibrated on the 2026-09-28 push ring (48 tokens / 13 liquidity pulls in
+ * 6.5h, read from the bot's own audit ring): all 5 flagged coins had their
+ * liquidity pulled and NONE of the 35 unflagged did — no false positive was
+ * observed, so the gate costs recall (5 of 13 pulls caught), not precision.
+ * Worth stating plainly: the flag is Jupiter's and its latency is unknown, so
+ * a fast rug can still be pushed before it appears, and the measurement is the
+ * flag's value NOW (no snapshot is stored at push time).
+ *
+ * `devBalancePct` is carried into the reason only — it is not a gate.
+ */
+export function jupSusBlockReason(
+  sus: boolean,
+  devBalancePct: number | null,
+): string | null {
+  if (!sus) return null;
+  const dev =
+    devBalancePct !== null && Number.isFinite(devBalancePct)
+      ? `，dev 持倉 ${devBalancePct.toFixed(1)}%`
+      : "";
+  return `Jupiter 標記可疑（audit.isSus${dev}）`;
+}
+
 /**
  * The liquidity reading a USD-level rule HERE may judge, or null when the pair
  * did not come from the leg those rules are calibrated on.
@@ -3192,6 +3249,8 @@ export class Scanner {
         flow: 0,
         crime: 0,
         flurry: 0,
+        liqRatio: 0,
+        sus: 0,
         other: 0,
       },
       flurryAnalyzed: 0,
@@ -4740,7 +4799,11 @@ export class Scanner {
         if (arkham) diag.arkham++;
         // organic has no counter line here: its late-bound slot (see above)
         // owns the increment, so a reading that has not landed yet can never
-        // be counted as "this tick had one".
+        // be counted as "this tick had one". The Jupiter SUSPICION gate
+        // below is the one reader that does await that slot (see its note);
+        // the slot, not this line, still owns the counter. The Jupiter SUSPICION gate
+        // below is the one reader that does await that slot (see its note);
+        // the slot, not this line, still owns the counter.
         if (
           this.gmgn &&
           this.config.gmgnBlockWashTrading &&
@@ -4750,6 +4813,38 @@ export class Scanner {
           this.addReject(diag, coin, "GMGN 標記為 wash trading");
           console.log(
             `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (GMGN wash-trading flag)`,
+          );
+          continue;
+        }
+        // Jupiter suspicion gate (audit.isSus) — the only vendor-supplied
+        // suspicion flag this bot has, and FREE: it rides the payload the 🌱
+        // 有機度 slot above already fetched for the card, so this gate adds no
+        // request, no key and no provider. Absent flag = not flagged = pass
+        // (Jupiter sets the field only when it has flagged the token).
+        //
+        // It AWAITS that slot, which is a deliberate change to a slot whose
+        // contract was strictly display-only: the flag is a reason NOT to
+        // push, so it has to be read BEFORE the send. The wait is bounded by
+        // chainDeadline (never the push reserve) and the call was dispatched in
+        // front of RugCheck, so the whole serial chain behind it (RugCheck +
+        // crime + Axiom + the display batch) has already given it its window; a
+        // slot that still misses degrades to null and the coin pushes, which is
+        // the fail-open every other gate uses.
+        //
+        // Sited before the wallet analysis and the Flurry gate on purpose: a
+        // flagged coin then saves the chain's two most expensive legs.
+        const susReading = this.config.jupSusBlock
+          ? await this.bestEffort(() => organicSlot, chainDeadline, null)
+          : null;
+        const susReason = jupSusBlockReason(
+          susReading?.sus ?? false,
+          susReading?.devBalancePct ?? null,
+        );
+        if (susReason) {
+          diag.fails.sus++;
+          this.addReject(diag, coin, susReason);
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (Jupiter audit.isSus)`,
           );
           continue;
         }
@@ -5968,18 +6063,30 @@ export class Scanner {
         // null = the coin came from a leg this ratio cannot judge (see
         // gateLiquidityUsd); stay fail-open rather than block a healthy coin
         // on a number that is a different metric of the same pool.
-        const ratioReason =
-          liquidityUsd === null
-            ? null
-            : mcapRatioBlockReason(
-                pair.marketCap,
-                liquidityUsd,
-                this.config.mcapLiqRatioMax,
-              );
-        if (ratioReason) {
-          fails.other++;
-          reject(ratioReason);
-          continue;
+        if (liquidityUsd !== null) {
+          const ratioReason = mcapRatioBlockReason(
+            pair.marketCap,
+            liquidityUsd,
+            this.config.mcapLiqRatioMax,
+            this.config.mcapLiqRatioMin,
+          );
+          if (ratioReason) {
+            // Route the counter to the side that fired. The decision itself
+            // stays the helper's (one source of truth); this extra division
+            // only picks the reading, because the two floors are tuned
+            // independently — the HIGH side is the Nudaeng shape this gate has
+            // always had, the LOW side is the LP-heavy shape added 2026-09-28.
+            if (
+              this.config.mcapLiqRatioMin > 0 &&
+              pair.marketCap / liquidityUsd < this.config.mcapLiqRatioMin
+            ) {
+              fails.liqRatio++;
+            } else {
+              fails.other++;
+            }
+            reject(ratioReason);
+            continue;
+          }
         }
         if (ageMs < chat.minAgeMinutes * 60_000) {
           fails.age++;

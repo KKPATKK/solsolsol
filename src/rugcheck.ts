@@ -18,7 +18,18 @@ class Throttle {
 }
 
 export interface RugcheckReport {
-  /** Share of total supply held by insider/bundler networks, in percent. */
+  /**
+   * Share of total supply held by insider/bundler networks, in percent.
+   *
+   * A REAL 0 is possible and is NOT the same reading as null: `0` means
+   * RugCheck answered (its `insiderNetworks` array is present and the sum is
+   * zero — nobody bundled), while `null` means RugCheck has no answer at all
+   * (`insiderNetworks` absent, or a supply it cannot divide by). The card
+   * prints those two states differently, because rendering "未检测到捆绑网络"
+   * over missing data is a reassurance built out of nothing — live 2026-09-28,
+   * the QNT push carried exactly that line while the report had
+   * `insiderNetworks: null` (see docs/suspicious-token-gates.md).
+   */
   bundlerPct: number | null;
   /**
    * Combined share of the top 10 REAL holders, in percent — the liquidity
@@ -102,13 +113,17 @@ export class RugcheckClient {
     const supply = Number(data?.token?.supply ?? 0);
     const networks = data?.insiderNetworks;
     let bundlerPct: number | null = null;
-    if (Array.isArray(networks) && networks.length > 0 && supply > 0) {
+    // The ARRAY's presence — not its length — is what makes the reading real:
+    // RugCheck ran the insider analysis and reported its answer, which may
+    // legitimately be an empty set (0%). A missing/absent field stays null
+    // (unknown) so the card can say "未检测" instead of inventing a 0.
+    if (Array.isArray(networks) && supply > 0) {
       let bundled = 0;
       for (const network of networks) {
         bundled += Number(network.tokenAmount ?? 0);
       }
       const pct = (bundled / supply) * 100;
-      bundlerPct = Number.isFinite(pct) && pct > 0 ? pct : null;
+      if (Number.isFinite(pct)) bundlerPct = pct > 0 ? pct : 0;
     }
 
     // Top-10 holder concentration, excluding the liquidity pool.

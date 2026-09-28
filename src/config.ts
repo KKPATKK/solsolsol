@@ -575,6 +575,29 @@ export interface AppConfig {
    * runs on a sliver of liquidity — trivially wickable, nearly un-exitable.
    * 0 = disabled. See MCAP_LIQ_RATIO_MAX in wrangler.toml. */
   mcapLiqRatioMax: number;
+  /**
+   * MIN market-cap/liquidity ratio for push candidates — the other side of
+   * the band above, and the same number read the other way round: since
+   *
+   *     LP/mcap ≈ 2 × (tokens in the pool ÷ total supply)
+   *
+   * an mcap/LP BELOW this floor means the pool still holds more than a
+   * QUARTER of the supply (LP/mcap above 0.5), i.e. much of the "market cap"
+   * is tokens nobody has bought yet, sitting in a pool whose SOL side one or
+   * two wallets can still take out.
+   * MCAP_LIQ_RATIO_MIN = 2 is exactly the operator's "LP/mcap ≥ 0.50 blocks".
+   * Calibrated 2026-09-28 on the push ring (see docs/suspicious-token-gates.md):
+   * every push under 2.0x that later had its liquidity pulled is in this band
+   * and no push above 2.9x was. 0 = disabled. */
+  mcapLiqRatioMin: number;
+  /**
+   * Block pushes Jupiter has flagged as suspicious (audit.isSus on the token
+   * payload the organic-score line already fetches). Presence-only: Jupiter
+   * sets the field ONLY when it has flagged the token, so absent = "not
+   * flagged", never "verified safe". Fail-open on a missing reading. See the
+   * helper's calibration notes (JUP_SUS_BLOCK in wrangler.toml).
+   */
+  jupSusBlock: boolean;
   /** Crime-wallet blocklist (community list — see CrimeWalletClient). */
   crimeWallets: CrimeWalletsConfig;
   /** Pushed-coin wallet analysis (creator profile + holder ages + clustering). */
@@ -894,6 +917,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       const v = Number(env.MCAP_LIQ_RATIO_MAX ?? 10);
       return Number.isFinite(v) && v > 0 ? v : 0;
     })(),
+    mcapLiqRatioMin: (() => {
+      // Same stance as the ceiling: 0 disables, and anything unparseable
+      // falls back to the shipped floor rather than to NaN (NaN would pass
+      // every comparison and silently disable the gate).
+      const v = Number(env.MCAP_LIQ_RATIO_MIN ?? 2);
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    })(),
+    jupSusBlock: (env.JUP_SUS_BLOCK ?? "true") !== "false",
     crimeWallets: {
       enabled: (env.CRIME_WALLETS_ENABLED ?? "true") !== "false",
       url: env.CRIME_WALLETS_URL || DEFAULT_CRIME_WALLETS_URL,

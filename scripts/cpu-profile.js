@@ -523,7 +523,13 @@ async function main() {
     // agedEval), and a shared one would make the second reading differ from the
     // first for reasons that are not CPU.
     const runEval = (list) => {
-      const fails = { mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, flurry: 0, other: 0 };
+      // Kept in lockstep with ScanSummary["fails"] in src/scanner.ts: matchCoins
+      // increments these by key, so a missing key here would silently record
+      // NaN for every gate that fired (2026-09-28: liqRatio + sus added).
+      const fails = {
+        mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, flurry: 0,
+        liqRatio: 0, sus: 0, other: 0,
+      };
       const rejects = [];
       const agedEval = { count: 0 };
       const out = scanner.matchCoins(

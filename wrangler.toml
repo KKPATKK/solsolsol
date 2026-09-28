@@ -422,6 +422,41 @@ WALLET_NEW_MIN_CHECKED = "5"
 # 0 disables that side.
 TOP10_PCT_MIN = "10"
 TOP10_PCT_MAX = "90"
+# LP-heavy (low mcap/LP) floor — the OTHER side of the same ratio the
+# MCAP_LIQ_RATIO_MAX ceiling above caps at 10x, and the only gate here whose
+# subject is the EXPLOIT that prompted it (2026-09-28):
+#
+#   Quant (QNT, EnQbyi2f…) was pushed at $81.6K mcap on $57.1K of LP
+#   (= 1.43x, LP/mcap 0.70), with the creator holding 25% of supply and one
+#   more wallet 20%. Its pool was sold empty 1h34m later, after the bot's own
+#   💧 drain card. The pool still held ~35% of the supply at push, and for a
+#   constant-product pool LP/mcap = 2 × (tokens in the pool ÷ supply), so this
+#   single ratio IS the unsold-float measure.
+#
+# Calibrated on that day's 48-token push ring (13 liquidity pulls in 6.5h):
+# every push above 2.9x was fine, and the four below 2.0x all had their
+# liquidity pulled. 2 = the operator's "LP/mcap ≥ 0.50 blocks", i.e. the pool
+# holding more than a quarter of the supply. Missing data never judges: a
+# pair whose liquidity reading is not DexScreener's (see gateLiquidityUsd) is
+# left unjudged rather than compared against a different metric of the same
+# pool. 0 disables. Watch fails.liqRatio in /health.heartbeat.summary — it
+# counts THIS side only, so the floor can be tuned from live numbers.
+MCAP_LIQ_RATIO_MIN = "2"
+# Jupiter's own suspicion flag (Tokens v2 `audit.isSus`, read from the same
+# response the card's 🌱 有機度 line already fetches — no extra request, key
+# or provider). "true" blocks the push; "false" leaves the flag on the card's
+# reading only.
+#
+# Presence-only BY DESIGN: Jupiter sets the field only when it has flagged the
+# token, so absent = not flagged, never "verified safe". The gate therefore
+# fails open on a missing reading, like every other gate does on missing data.
+#
+# Calibrated on the same 48-token ring: all 5 flagged coins had their
+# liquidity pulled within the window and NONE of the 35 unflagged did — no
+# false positive observed, so this costs recall (5 of 13 pulls caught), not
+# precision. It is Jupiter's flag and its latency is unknown, so a fast rug can
+# still be pushed before the flag appears. Watch fails.sus.
+JUP_SUS_BLOCK = "true"
 # Arkham Intelligence (requires ARKHAM_API_KEY, a SECRET — set in the
 # Cloudflare dashboard, never here): smart-money attribution on push cards.
 # Each qualifying coin's top-100 holders are checked for entity types in

@@ -134,10 +134,20 @@ export function renderMessage(
   const now = Date.now();
   const ageMs = now - pair.pairCreatedAt;
 
+  // Three states, not two (2026-09-28): a REAL 0% keeps the reassuring
+  // "未检测到捆绑网络", while a null reading (RugCheck has no insider analysis
+  // for this mint) prints "未检测" — the same honest placeholder the Top10 line
+  // uses. Rendering null as "0.0% 未检测到捆绑网络" made the card assert an
+  // all-clear it had no data for: live, the pushed QNT card said exactly that
+  // while its report carried `insiderNetworks: null`, and 17 of the 48 tokens
+  // in that day's push ring were in the same state (see
+  // docs/suspicious-token-gates.md).
   const bundlerLine =
     bundlerPct === null
-      ? "🛡 Bundler: 0.0%（未检测到捆绑网络）"
-      : `🛡 Bundler: ${bundlerPct.toFixed(1)}%`;
+      ? "🛡 Bundler: —（未检测）"
+      : bundlerPct === 0
+        ? "🛡 Bundler: 0.0%（未检测到捆绑网络）"
+        : `🛡 Bundler: ${bundlerPct.toFixed(1)}%`;
   const top10Line =
     top10Pct === null
       ? "👥 Top10 持仓: —（未检测）"

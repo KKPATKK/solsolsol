@@ -338,7 +338,19 @@ export class JupTokensClient {
    * Organic-quality snapshot for a single mint (push-card enrichment):
    * Jupiter's organicScore separates real retail participation from
    * wash/coordinated volume (calibrated 2026-08-22: CONK 79 / 40M 75 /
-   * BLC 61 vs DOTE 40 / BAOJIN 0 / Nudaeng 0). Display-only today.
+   * BLC 61 vs DOTE 40 / BAOJIN 0 / Nudaeng 0).
+   *
+   * The same response carries Jupiter's own AUDIT block, and its `isSus` is
+   * the only vendor-supplied suspicion flag this bot has (2026-09-28):
+   * Jupiter's docs describe it as presence-only — "isSus is only present when
+   * a token has been flagged" — so absent means NOT FLAGGED, never verified
+   * safe. Reading it here costs nothing: same request, same parse, and the
+   * scanner gates on it (scanner.jupSusBlockReason). `devBalancePct` rides
+   * along for the reject reason and is display-only.
+   *
+   * Both audit numbers are null when the field is absent (unflagged) rather
+   * than 0, so a caller can tell "Jupiter says nobody" from "Jupiter says
+   * nothing" — the same distinction the bundler line makes.
    *
    * Trader count window fallback: Jupiter OMITS stats1h.numTraders
    * entirely when the trailing hour has zero trades (ARMY at push time —
@@ -354,6 +366,10 @@ export class JupTokensClient {
     label: string | null;
     tradersH1: number | null;
     tradersWindow: "1h" | "6h" | "24h" | null;
+    /** Jupiter flagged this token as suspicious (audit.isSus present+true). */
+    sus: boolean;
+    /** Deployer's share of supply, in percent (audit.devBalancePercentage). */
+    devBalancePct: number | null;
   } | null> {
     const data = await this.get(`/search?query=${mint}`);
     if (!Array.isArray(data)) return null;
@@ -385,12 +401,26 @@ export class JupTokensClient {
         if (tradersH1 !== null) tradersWindow = "24h";
       }
     }
-    if (score === null && tradersH1 === null) return null;
+    // Audit block — present only when Jupiter has something to say about the
+    // mints' safety. `isSus` is the flag the push gate reads; the dev balance
+    // is carried for its reject reason. Absent fields stay null/false, never
+    // coerced into a reassuring 0.
+    const audit = (entry.audit ?? {}) as Record<string, unknown>;
+    const sus = audit.isSus === true;
+    const devRaw = audit.devBalancePercentage;
+    const devBalancePct =
+      typeof devRaw === "number" && Number.isFinite(devRaw) ? devRaw : null;
+    // The flag ALONE is a reason to return a reading: a flagged token whose
+    // organic score and trader count are both missing must still reach the
+    // gate, or the gate would fail open exactly where it matters most.
+    if (score === null && tradersH1 === null && !sus) return null;
     return {
       score,
       label: typeof entry.organicScoreLabel === "string" ? entry.organicScoreLabel : null,
       tradersH1,
       tradersWindow,
+      sus,
+      devBalancePct,
     };
   }
 
