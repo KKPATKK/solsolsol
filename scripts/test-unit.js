@@ -8400,8 +8400,11 @@ async function main() {
       "registration lands first and keeps the FIRST sight (A's firstSeenAt stays 100, not the second tick's 900); the raise keeps the MAX on both columns (a finite liquidity survives a record without one)",
     );
 
-    // The cap: a backlog longer than one call may carry drains in chunks, and
-    // what did not fit stays owed.
+    // The cap: one call never carries more than the statement may, and a
+    // backlog drains in SLICES of that size — inside the SAME drain while it has
+    // room (2026-09-28: one slice per method per tick could not keep up with the
+    // ~150 records/tick the scanner queues, so the backlog still grew; see
+    // DEFERRED_MAX_CALLS_PER_DRAIN).
     calls.length = 0;
     await tick(async () => {
       for (let i = 0; i < DEFERRED_COALESCE_MAX_PER_CALL + 3; i += 1) {
@@ -8414,16 +8417,14 @@ async function main() {
       "every record is owed",
     );
     const first = await drainDeferredWrites(() => 50);
-    assert.equal(first.calls, 1, "one call");
+    assert.equal(first.calls, 2, "the room is spent as whole slices");
     assert.equal(
       calls[0].tokens.length,
       DEFERRED_COALESCE_MAX_PER_CALL,
-      "capped at what one statement may carry",
+      "the first slice is capped at what one statement may carry",
     );
-    assert.equal(deferredWriteCount(), 3, "the rest stays owed");
-    const second = await drainDeferredWrites(() => 50);
-    assert.equal(calls[1].tokens.length, 3, "the next drain takes the remainder");
-    assert.equal(second.owedTokens, 0, "and the backlog is empty");
+    assert.equal(calls[1].tokens.length, 3, "and the remainder rides the next one");
+    assert.equal(first.owedTokens, 0, "so one roomy drain empties the backlog");
 
     // The failure count is for CONSECUTIVE failures (the old per-entry rule):
     // a landed batch resets it, so a bucket that failed twice and recovered
@@ -8517,6 +8518,7 @@ async function main() {
       DEFERRED_FORCE_DRAIN_RECORDS,
       DEFERRED_FORCE_DRAIN_FLOOR,
       DEFERRED_COALESCE_MAX_PER_CALL,
+      DEFERRED_MAX_CALLS_PER_DRAIN,
     } = require("../dist/tickprobe.js");
     const mkDb = () => {
       const calls = [];
@@ -8621,6 +8623,33 @@ async function main() {
     assert.equal(under.calls, 0, "under the cap that room is the pass's, as before");
     assert.equal(under.reserve, DRAIN_TRACKER_RESERVE);
     assert.equal(under.owedTokens, 2, "and the records stay owed");
+
+    // (6) SLICES: a deep queue catches up INSIDE one drain — the room above the
+    //     reserve is spent as whole 40-record slices, up to the drain's own cap.
+    //     This is the rule the live numbers asked for: ~150 records are queued
+    //     per tick, so one slice per method per tick could never break even.
+    resetTickProbe();
+    const deep = mkDb();
+    await queue(deep, Array.from({ length: 90 }, (_, i) => `D${i}`));
+    deep.calls.length = 0;
+    const drained = await drainDeferredWrites(() => 50);
+    assert.equal(drained.calls, 3, "40 + 40 + 10, all inside one drain");
+    assert.deepEqual(deep.calls, [40, 40, 10], "one slice per call, each capped at 40");
+    assert.equal(drained.owedTokens, 0, "so the backlog is empty");
+    assert.equal(drained.heldForTracker, 0, "and nothing was held");
+    // The drain's own ceiling: a queue longer than the cap can carry keeps the
+    // rest owed, so a broken room reading cannot walk an unbounded number of
+    // calls in one invocation.
+    resetTickProbe();
+    const huge = mkDb();
+    await queue(
+      huge,
+      Array.from({ length: DEFERRED_MAX_CALLS_PER_DRAIN * DEFERRED_COALESCE_MAX_PER_CALL + 5 }, (_, i) => `H${i}`),
+    );
+    const capped = await drainDeferredWrites(() => 50);
+    assert.equal(capped.calls, DEFERRED_MAX_CALLS_PER_DRAIN, "the drain stops at its cap");
+    assert.equal(capped.owedTokens, 5, "with the remainder still owed");
+    assert.equal(capped.heldForTracker, 1, "named as held, not lost");
 
     // WIRING: only the TICK path reports a spend. The pass's own cron delivery
     // owns its whole invocation, so what it spends there is not the shape this

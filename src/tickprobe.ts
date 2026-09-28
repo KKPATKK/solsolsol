@@ -354,6 +354,26 @@ export const DEFERRED_FORCE_DRAIN_RECORDS = DEFERRED_COALESCE_MAX_PER_CALL * 10;
 export const DEFERRED_FORCE_DRAIN_FLOOR = 6;
 
 /**
+ * Calls ONE drain may make, whatever the room says.
+ *
+ * WHY IT EXISTS (live 2026-09-28, right after the force rule landed): landing
+ * ONE slice per bucket per tick was not enough, because the queue's inflow is
+ * per-tick too — `owedTokens` read 356 -> 424 -> 477 -> 548 on consecutive ticks
+ * with `calls 2` and `heldForTracker 0`, i.e. ~150 records were queued per tick
+ * while at most two 40-record slices (one per method) landed. A bucket that
+ * still owes records now goes to the BACK of this drain's rotation (fair
+ * between the two methods), so the surplus room above the reserve is spent as
+ * whole slices.
+ *
+ * The room check is the REAL bound — every call spends one subrequest, and the
+ * drain stops at its reserve — so this cap is the belt to that braces: a room
+ * reading that never falls must not turn one invocation into an unbounded walk.
+ * Ten slices = 400 records, the queue's own cap, which is what makes "one drain
+ * can clear a flooded queue" a true statement.
+ */
+export const DEFERRED_MAX_CALLS_PER_DRAIN = 10;
+
+/**
  * Durable worker_state key holding the last FAILED drain (see
  * WriteDrainView.lastError and persistDrainError). Named here, next to the
  * drain that writes it, so the /health reader (worker.ts) and any debug route
@@ -963,6 +983,10 @@ export async function drainDeferredWrites(
     // reserve that moved while the queue drained would make the batch depend on
     // the order it happened to land in.
     reserve = drainTrackerReserve();
+    // A WORKLIST, not one pass over the buckets: a bucket that still owes
+    // records after its slice goes to the back (see
+    // DEFERRED_MAX_CALLS_PER_DRAIN), so the room above the reserve is spent as
+    // whole slices instead of one slice per method per tick.
     const ready = owedBuckets();
     while (ready.length > 0) {
       // The tracker pass runs BEHIND this drain in the same invocation (the
@@ -971,6 +995,13 @@ export async function drainDeferredWrites(
       // no reservation of its own — it defers by name instead. So the drain
       // yields: a held bucket is not lost, it just waits (see the queue's own
       // "an entry leaves it only once it has landed").
+      if (calls >= DEFERRED_MAX_CALLS_PER_DRAIN) {
+        // The drain's own ceiling (see DEFERRED_MAX_CALLS_PER_DRAIN): the room
+        // check below is what normally ends this walk, and this is what ends it
+        // when the room reading cannot be trusted to fall.
+        heldForTracker = ready.length;
+        break;
+      }
       if (subreqLeft() <= reserve) {
         heldForTracker = ready.length;
         break;
@@ -985,6 +1016,10 @@ export async function drainDeferredWrites(
         // bucket that failed twice hours ago would be DROPPED — the whole
         // backlog and all — by a single new failure today.
         bucket.attempts = 0;
+        // Still owing records? Its slice is capped at 40, so the rest goes to
+        // the back of the rotation: a deep queue catches up INSIDE this tick
+        // instead of one slice per method per tick.
+        if (bucket.owed.size > 0) ready.push(bucket);
       } catch (err) {
         failures += 1;
         bucket.attempts += 1;

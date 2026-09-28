@@ -1,21 +1,25 @@
 #!/usr/bin/env node
 /*
- * MUTATION CHECK for docs/patches/drain-reserve-2026-09-28.apply.js.
+ * MUTATION CHECK for the drain changes of 2026-09-28:
+ *   docs/patches/drain-reserve-2026-09-28.apply.js   (adaptive yield + force rule)
+ *   docs/patches/drain-slices-2026-09-28.apply.js    (multi-slice walk + cap)
  *
- * Each mutation breaks ONE rule the new test claims to pin, rebuilds, and runs
- * the suite. The new test MUST fail; anything else means it is not the guard it
- * claims to be. The mutated file is restored byte-for-byte (cmp) afterwards, and
- * the script REFUSES to start unless the tree carries the pristine anchors — so
- * a run killed mid-way can never leave a mutation behind or compound one.
+ * Each mutation breaks ONE rule the new tests claim to pin, rebuilds, and runs
+ * the suite. The targeted test MUST fail; anything else means it is not the
+ * guard it claims to be. The mutated file is restored byte-for-byte afterwards,
+ * and the script REFUSES to start unless the tree carries the pristine anchors —
+ * so a run killed mid-way can never leave a mutation behind or compound one.
  *
- * Usage:  node docs/patches/drain-reserve-mutation-2026-09-28.check.js <1..6|verify>
+ * Usage:  node docs/patches/drain-reserve-mutation-2026-09-28.check.js <1..8|verify>
  *
  *   1  drop the FORCE rule (a flooded queue never drains ahead of the pass)
  *   2  newest sample instead of the WORST of the recent ones
  *   3  drop the floor clamp (a thin pass licenses a thin yield)
  *   4  believe an impossible reading (the shared counter's broken delta)
- *   5  gate on the flat constant again (the bug this change fixes)
+ *   5  gate on the flat constant again (the bug the adaptive yield fixes)
  *   6  stop measuring in the tick path (the seam itself)
+ *   7  drop the re-queue (one slice per bucket per tick — the queue grows again)
+ *   8  cap the walk at one call (same outcome, via the ceiling)
  */
 
 const fs = require("fs");
@@ -68,6 +72,18 @@ const MUTATIONS = [
     from: `          noteTrackerPassSpend(passSubreqBefore - subreqRemaining());\n`,
     to: ``,
   },
+  {
+    label: "drop the re-queue",
+    file: PROBE,
+    from: `        if (bucket.owed.size > 0) ready.push(bucket);\n`,
+    to: ``,
+  },
+  {
+    label: "cap the walk at one call",
+    file: PROBE,
+    from: `      if (calls >= DEFERRED_MAX_CALLS_PER_DRAIN) {`,
+    to: `      if (calls >= 1) {`,
+  },
 ];
 
 const PRISTINE = [
@@ -79,8 +95,11 @@ const PRISTINE = [
     DRAIN_TRACKER_RESERVE,
     Math.max(DRAIN_TRACKER_RESERVE_MIN, measured.worst),
   );`],
+  [PROBE, `        if (bucket.owed.size > 0) ready.push(bucket);`],
+  [PROBE, `      if (calls >= DEFERRED_MAX_CALLS_PER_DRAIN) {`],
   [WORKER, `noteTrackerPassSpend(passSubreqBefore - subreqRemaining());`],
   [TEST, `noteTrackerPassSpend(passSubreqBefore - subreqRemaining())`],
+  [TEST, `assert.deepEqual(deep.calls, [40, 40, 10]`],
 ];
 
 const read = (file) => fs.readFileSync(file, "utf8");
@@ -112,9 +131,11 @@ function assertPristine() {
 
 function testVerdict(output) {
   const line = output.split("\n").find((l) => l.includes(TEST_NAME));
-  if (!line) return { ok: false, line: `(the new test did not run — total: ${
-    (output.match(/\d+ passed, \d+ failed/) ?? ["?"])[0]})` };
-  return { ok: line.includes("✅"), line: line.trim() };
+  const totals = (output.match(/\d+ passed, \d+ failed/) ?? ["(no totals)"])[0];
+  if (!line) {
+    return { ok: false, line: `(the new test did not run — ${totals})` };
+  }
+  return { ok: line.includes("✅"), line: line.trim(), totals };
 }
 
 function main() {
@@ -125,7 +146,7 @@ function main() {
     console.log("rebuilding the PRISTINE tree and running the suite…");
     run("npm", ["run", "build"], 600_000);
     const verdict = testVerdict(run("node", ["scripts/test-unit.js"], 600_000));
-    console.log(`  ${verdict.ok ? "✅" : "❌"} ${verdict.line}`);
+    console.log(`  ${verdict.ok ? "✅" : "❌"} ${verdict.line}   [${verdict.totals}]`);
     console.log(verdict.ok ? "\nbaseline is GREEN" : "\n✗ baseline is not green");
     process.exit(verdict.ok ? 0 : 1);
   }
@@ -140,8 +161,7 @@ function main() {
   const original = read(mutation.file);
   const restore = () => {
     write(mutation.file, original);
-    const back = path.join("/tmp", `${path.basename(mutation.file)}.mut.bak`);
-    fs.writeFileSync(back, original);
+    fs.writeFileSync(path.join("/tmp", `${path.basename(mutation.file)}.mut.bak`), original);
   };
   process.on("SIGINT", () => { restore(); process.exit(130); });
   process.on("SIGTERM", () => { restore(); process.exit(143); });
@@ -154,15 +174,10 @@ function main() {
 
   console.log(`mutation ${index}: ${mutation.label} (${path.basename(mutation.file)})`);
   write(mutation.file, original.replace(mutation.from, mutation.to));
-  const buildOut = run("npm", ["run", "build"], 600_000);
-  if (!/\bsrc\/|^$/m.test(buildOut) && buildOut.includes("error TS")) {
-    console.log("  build failed (the mutation is not type-clean):");
-    console.log(`  ${buildOut.split("\n")[0]}`);
-  }
+  run("npm", ["run", "build"], 600_000);
   const output = run("node", ["scripts/test-unit.js"], 600_000);
   const verdict = testVerdict(output);
-  const totals = (output.match(/\d+ passed, \d+ failed/) ?? ["(no totals)"])[0];
-  console.log(`  ${verdict.line}   [${totals}]`);
+  console.log(`  ${verdict.line}   [${verdict.totals ?? ""}]`);
   const caught = !verdict.ok;
   console.log(caught ? "  ✅ CAUGHT by the new test" : "  ✗ ESCAPED — the test does not pin this");
 
