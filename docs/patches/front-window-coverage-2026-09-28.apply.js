@@ -23,6 +23,13 @@
  * SCAN_PROFILE_LIMIT 100 → 200 (headroom only — the profiles page carries
  * ~20–30 Solana rows, so neither cap binds; recorded for honesty).
  *
+ * SUPERSEDED IN PART (2026-09-28, later the same day): the RE_EVAL_PER_TICK_MAX
+ * raise below was run live, MEASURED and reverted — it bought judgments of the
+ * pool's dead-liquidity tail, not candidates. Run
+ * docs/patches/pool-slice-measurement-revert-2026-09-28.apply.js after this one
+ * to reach the delivered state; the caps it raises (FEED / POOL / PAIRS) and the
+ * profile limit stay.
+ *
  * Idempotent and verify-then-write: run it twice, the second run prints `=`
  * for every edit and changes nothing. Exits non-zero if any anchor is missing
  * or ambiguous, so a stale checkout fails loudly instead of half-applying.

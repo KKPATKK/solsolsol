@@ -259,9 +259,15 @@ JUPITER_TRENDING_LIMIT = "100"
 # the same Turso rows read (the slice was raised to 160 to match).
 #
 # 2026-09-28 (Workers Paid): the pair window is PAIRS_FETCH_BUDGET_MS 2,000
-# now, not 1,000 — 8 dispatch slots at THIS spacing = 240 addresses, sized
-# against the doubled rotation slice (scanner.RE_EVAL_PER_TICK_MAX 90 → 180
-# plus the feed's ~22). The 2026-09-19 cut to 1,000 existed to hand the free
+# now, not 1,000, and the reason is measured rather than theoretical. The
+# request is ~112 addresses (the 90-coin rotation slice plus the feed's ~22)
+# = 4 batches of 30, and at this spacing the fourth batch cannot START before
+# ~750ms and then has to answer — which is why the live `pairs` reading was
+# 83 of ~112 while the phase rode its 1,000ms cap. 2,000 gives the phase 8
+# slots (240 addresses) so the request is fetched WHOLE, and it doubles as
+# headroom for the tracker head and for any future slice raise (the 180-coin
+# slice was tried on 2026-09-28 and reverted — see scanner.
+# RE_EVAL_PER_TICK_MAX). The 2026-09-19 cut to 1,000 existed to hand the free
 # plan's 3550ms claim gate its time; the chain deadline is 6_500ms now. This is the
 # shared egress IP's rate limit, so it is measured, not assumed: /health →
 # heartbeat.dex reports intervalMs / http429 / blockedForMs per tick, and the

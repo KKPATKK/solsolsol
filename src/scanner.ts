@@ -163,16 +163,21 @@ const SCAN_TIMEOUT_MS = 25_000;
  * POOL_FETCH_BUDGET_MS 1_600 + PAIRS_FETCH_BUDGET_MS 1_000 = 3_500) now fits
  * inside it with room to spare, where the 2_600ms window could leave the pair
  * phase as little as 100ms once the feeds and the pool read rode their own
-
+ * caps. The gate chain — the only phase that can push a coin — is the
+ * beneficiary: it keeps its 1_600ms reserve and gains the front phases' slack.
  *
  * 2026-09-28 (later, same day): that slack is then deliberately SPENT on
  * coverage instead of left unused — FEED_DEADLINE_MS 900 → 1_600,
  * POOL_FETCH_BUDGET_MS 1_600 → 2_400, PAIRS_FETCH_BUDGET_MS 1_000 → 2_000
- * (sum 6_000 of the 6_400ms window) and RE_EVAL_PER_TICK_MAX 90 → 180.
- * Each cap keeps its documented meaning — a ceiling for a SLOW phase, never
- * a cost on a healthy one — so this is not a trade against the gates: it
+ * (sum 6_000 of the 6_400ms window). Each cap keeps its documented meaning —
+ * a ceiling for a SLOW phase, never a cost on a healthy one — so this is not a
+ * trade against the gates: it
  * changes only what happens on the ticks where an upstream was slow enough
  * that the cap was being hit and the coins behind it were dropped.
+ *
+ * 2026-09-28 (measured, same day): the rotation slice was doubled alongside
+ * these caps and REVERTED — it bought judgments of the pool's dead-liquidity
+ * tail, not candidates (see the RE_EVAL_PER_TICK_MAX note for the numbers).
  */
 export const SCAN_TICK_DEADLINE_MS = 8_000;
 /**
@@ -927,10 +932,11 @@ const FEED_DEADLINE_MS = 1_600;
  * 2026-09-28 (1_600 → 2_400, Workers Paid): live `summary.poolMs` reads
  * 159–518ms, so this is not what a healthy tick spends — it is the ceiling a
  * COLD isolate's read hits (the 90s query cache is cold on most cron ticks)
- * and, now, the ceiling for a BIGGER read: the rotation slice doubled
- * (RE_EVAL_PER_TICK_MAX 90 → 180) out of the same RE_EVAL_POOL_SIZE 1_000-row
- * query. Keeping it comfortably above the DB layer's 1_440ms hard wall is
- * what makes a failed read arrive as an ERROR that can be answered with the
+ * and the ceiling for the deeper read a bigger rotation slice would need (see
+ * the RE_EVAL_PER_TICK_MAX note: that slice was doubled experimentally on
+ * 2026-09-28 and reverted, so this cap is headroom today). Keeping it
+ * comfortably above the DB layer's 1_440ms hard wall is what makes a failed
+ * read arrive as an ERROR that can be answered with the
  * last good pool (see src/poolfallback.ts) instead of degrading to feed-only.
  */
 const POOL_FETCH_BUDGET_MS = 2_400;
@@ -1105,23 +1111,37 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * the feed). Raise it back only with a way to fetch more per second, and only
  * after the delivery rate is healthy again.
  *
- * 2026-09-28 (90 → 180, Workers Paid): BOTH conditions that note set are now
- * met. "A way to fetch more per second" is the pair window, doubled for this
- * purpose (dexscreener.PAIRS_FETCH_BUDGET_MS 1_000 → 2_000 = 8 dispatch slots
- * at the 250ms spacing = 240 addresses, which covers 180 + the feed's ~22),
- * and "the delivery rate is healthy again" is the paid plan: the 3550ms claim
- * gate that forced the cut is a free-plan number, while the chain deadline is
- * now tickDeadline − CANDIDATE_PUSH_RESERVE_MS = 6_500ms.
+ * 2026-09-28 (90 → 180: TRIED, MEASURED, REVERTED to 90). The reasoning for the
+ * raise was sound on paper — the paid plan removed the 3550ms claim gate that
+ * forced the 2026-09-19 cut, the chain deadline is 6_500ms now, and the pair
+ * window was doubled to feed a bigger slice — and it was run live for 20
+ * minutes. The measurement says this constant is NOT what bounds coins-per-tick:
  *
- * Coverage, live before this change (09:11–09:14Z): the slice was 90 of a
- * 330–524-row pool read and only 6–7 of those coins passed the age gate per
- * tick (`summary.agedEval`) with `pairs` 83 — i.e. each tick judged about a
- * tenth of the pool it had just read. This slice is the knob that raises
- * coins-per-tick directly; the sweep it lengthens is the point, not a cost
- * (every coin still rides the feed make-up lane, the hot zone is still
- * evaluated every scan, and leftovers keep their rotation slot).
+ *   reading          slice 90 (09:11–09:14Z)   slice 180 (09:20–09:28Z)
+ *   poolSliced       90                        180
+ *   agedEval         6–7                       7
+ *   candidates       0–1                       0
+ *   evalMs           968–1_082                 1_987–2_109
+ *   heartbeat ms     1_780–2_539               3_400–3_737
+ *   fails.other      119–162                   148–200
+ *
+ * The extra 90 judgments land almost entirely in `fails.other` — the liquidity
+ * and 24h-volume gates. The pool read is dominated by coins whose liquidity has
+ * already collapsed below the gate, and an old coin dies on that FIRST gate,
+ * before the age check and before the momentum gates. In-window coins are
+ * already served every scan by the SQL rotation bands (the hot zone), which is
+ * why agedEval does not move with this number: the wider slice buys judgments of
+ * dust, not candidates, and pays ~1s of CPU per tick (evalMs) plus ~1.2s of tick
+ * wall clock for them. Reverted — the constant is back at 90.
+ *
+ * Where this measurement points instead is the pool's COIN MIX, not the window:
+ * /debug/pool reports 16.8K never-pushed coins eligible in the age window while
+ * one tick reads ~350–520 of them and only ~7 of the ~200 it judges reach the
+ * age + momentum gates. The liquidity prune (minQualifyLiquidity), the band
+ * limits and RE_EVAL_POOL_SIZE are the levers denominated in that gap — move
+ * one of them with a measurement like this one, not this slice again.
  */
-const RE_EVAL_PER_TICK_MAX = 180;
+const RE_EVAL_PER_TICK_MAX = 90;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline
