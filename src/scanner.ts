@@ -4,6 +4,7 @@ import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import {
   DEX_PROFILES_LAST_KEY,
+  GECKO_DISCOVERY_AT_KEY,
   SCAN_FRONT_GATE_KEYS,
   poolRotationSlot,
   type Db,
@@ -1279,6 +1280,45 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
 const RE_EVAL_PER_TICK_MAX = 90;
 
 /**
+ * The liquidity floor the re-eval pool prunes on, as a fraction of the widest
+ * enabled chat's liquidity gate (`minQualifyLiquidity` in the pool query).
+ *
+ * 0.6 → 0.8 (2026-09-28). The prune is one-way and permanent — a coin dropped
+ * here can never be pushed — which is why it sits BELOW the gate itself, and
+ * why the raise is only safe in one direction: a coin whose peak liquidity
+ * never reached 0.8 × the floor could never have passed the gate it is pruned
+ * against, so no coin that could have been pushed is lost, while the dust that
+ * occupied every band's LIMIT (measured 2026-09-10: ~215 of ~330 judged
+ * coins/tick failed the liquidity gate) is dropped a little further out of the
+ * sweep. Exported so a test pins the ratio instead of copying it.
+ */
+export const POOL_LIQUIDITY_PRUNE_RATIO = 0.8;
+
+/**
+ * Whether the launch slot's GeckoTerminal new-pools leg may spend a fetch this
+ * tick (pure — unit-tested). `intervalMs` is
+ * AppConfig.geckoterminalDiscoveryIntervalMs, 0 = no gate.
+ *
+ * FAIL-OPEN on every reading it cannot trust, the same discipline the push
+ * gates keep for missing data: an absent row (a fresh deploy, a brand-new
+ * key), a non-numeric row, or a stamp in the FUTURE (clock skew, or a row
+ * written by an isolate whose clock ran ahead) all say DUE. The cost of that is
+ * one extra fetch; the cost of the other direction is a discovery leg that
+ * silently stops for the length of the skew.
+ */
+export function geckoDiscoveryDue(
+  lastAttemptMs: number,
+  nowMs: number,
+  intervalMs: number,
+): boolean {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return true;
+  if (!Number.isFinite(lastAttemptMs) || lastAttemptMs <= 0) return true;
+  const age = nowMs - lastAttemptMs;
+  if (age < 0) return true;
+  return age >= intervalMs;
+}
+
+/**
  * Pure rotation-slice over the pool-only token list (exported for offline
  * unit tests). Returns the ≤ maxPerTick window starting at `cursor` plus the
  * next cursor; pools at or below maxPerTick are taken whole with the cursor
@@ -1360,22 +1400,35 @@ export interface ScanSummary {
   /** pump.fun discovery feed size this scan (0 when blocked/unconfigured). */
   pump: number;
   /**
-   * True when that pump.fun batch came from the GECKO FALLBACK slot (gecko's
-   * new_pools was paused, so the launch feed filled it — see
-   * pumpfunDiscoveryLimit). Distinguishes "gecko is down and pump.fun is
-   * carrying the launch slot" from "pump.fun ran as its own always-on feed".
+   * True when that pump.fun batch came from the GECKO FALLBACK slot (see
+   * pumpfunDiscoveryLimit). LEGACY as of 2026-09-28: production runs
+   * PUMPFUN_PROFILE_LIMIT=20, i.e. the always-on branch, so this flag is only
+   * ever set by a configuration that still routes gecko through the pump
+   * fallback (always-on limit 0 + a fallback size > 0).
    */
   pumpFallback?: boolean;
   /**
    * Meteora Data API discovery feed size this scan (METEORA_FALLBACK_LIMIT,
-   * 0 when disabled/unconfigured). This layer only ever runs as the launch
-   * slot's LAST resort — gecko's new_pools AND pump.fun both delivered nothing
-   * — so a non-zero count is itself the proof that the two layers ahead of it
-   * failed (see src/meteora.ts).
+   * 0 when disabled/unconfigured). Since 2026-09-28 this layer is GECKO'S
+   * COVER, so a non-zero count is the proof that gecko delivered nothing this
+   * tick — either because the cadence gate held it back (see `geoDue`) or
+   * because the fetch it was allowed came back empty or refused. See the
+   * launch-slot chain in src/scanner.ts.
    */
   meteora: number;
-  /** GeckoTerminal new-pools feed size this scan (0 when blocked/unconfigured). */
+  /**
+   * GeckoTerminal new-pools feed size this scan (0 when blocked, held back by
+   * the cadence, or unconfigured). Read together with `geoDue`: `geo 0` with
+   * `geoDue false` is the cadence doing its job, `geo 0` with `geoDue true` is
+   * a fetch that came back with nothing.
+   */
   geo: number;
+  /**
+   * Whether the new-pools cadence gate allowed a fetch on this tick
+   * (GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS + Db.GECKO_DISCOVERY_AT_KEY).
+   * false = the tick was inside the window, so the leg cost nothing at all.
+   */
+  geoDue?: boolean;
   /** GeckoTerminal trending-pools feed size this scan (momentum, 0 when disabled). */
   geoTrend: number;
   /** Jupiter recent-launchpad feed size this scan (0 when disabled/blocked). */
@@ -3229,7 +3282,8 @@ export class Scanner {
         // audit). Same permanent-exclusion trade-off as the floor prune.
         maxQualifyMcap: poolMaxMcapUsd * 2,
         // Liquidity floor prune: drop coins whose peak liquidity never
-        // reached 0.6× the widest chat's liquidity gate. Dead-liquidity
+        // reached POOL_LIQUIDITY_PRUNE_RATIO (0.8 since 2026-09-28, up from
+        // 0.6) × the widest chat's liquidity gate. Dead-liquidity
         // corpses (mcap $100K+ over $0–$15 LP) survive the mcap floor/ceiling
         // prunes and rank FIRST in every band under the signal ordering —
         // live evidence 2026-09-10 13:xxZ: ~215 of ~330 evaluated coins/tick
@@ -3237,7 +3291,8 @@ export class Scanner {
         // the 300-coin slice re-checked the same dead tape every sweep while
         // nothing pushed since 2026-09-06. NULL max_liquidity_observed (not
         // yet seen with pair data) is kept, exactly like the mcap prunes.
-        minQualifyLiquidity: poolMinLiquidityUsd * 0.6,
+        minQualifyLiquidity:
+          poolMinLiquidityUsd * POOL_LIQUIDITY_PRUNE_RATIO,
         // Chat-aware seen exclusion: a token is dropped from the pool only
         // when EVERY enabled chat has already received it. Without this a
         // coin pushed to one chat (and marked seen there) vanished from the
@@ -3334,31 +3389,62 @@ export class Scanner {
       const profiles = profilesOutcome.list;
       diag.profilesSettled = profilesOutcome.settled;
       diag.profiles = profiles.length;
-      // The launch-slot fallback CHAIN (gecko → pump.fun → Meteora) is built
-      // after the gecko job BELOW, and that placement is load-bearing: each
-      // layer awaits the promise of the layer before it, and a layer placed
-      // above its producer reads `null` — an async IIFE runs synchronously up
-      // to its first await, so `if (geckoJob !== null) await geckoJob` in a
-      // block that precedes the gecko job is ALWAYS false. Measured 2026-09-21:
-      // that is how the previous "gecko fallback" silently became an always-on
-      // feed (`pump 20` + `pumpFallback true` on ticks where gecko was healthy
-      // too, and gecko's own `geo 0` never gated anything). geckoJob lives here
-      // only so the gecko block below can hand its promise over.
+      // Meteora's decision reads the gecko JOB, so the gecko job has to be
+      // declared BEFORE its producer — and that placement is load-bearing: an
+      // async IIFE runs synchronously up to its first await, so `if (geckoJob
+      // !== null) await geckoJob` in a block that precedes the gecko job is
+      // ALWAYS false. Measured 2026-09-21: that is how the previous "gecko
+      // fallback" silently became an always-on feed (`pump 20` + `pumpFallback
+      // true` on ticks where gecko was healthy too, and gecko's own `geo 0`
+      // never gated anything). geckoJob lives here only so the gecko block
+      // below can hand its promise over, and stays NULL on a tick the cadence
+      // gate skips — which is how Meteora learns it may dispatch immediately.
       let geckoJob: Promise<void> | null = null;
-      // GeckoTerminal new-pools feed — the free (no-key) discovery source
-      // covering every Solana DEX incl. pump.fun graduates, replacing the
-      // CU-expensive Birdeye new_listing for live discovery. Pools are
-      // registered by their pool_created_at (≈ graduation time, matching
-      // how DexScreener pairs age coins), so they enter the re-eval pool
-      // and are evaluated once they reach the qualifying age window.
+      // GeckoTerminal new-pools feed — the discovery source covering every
+      // Solana DEX incl. pump.fun graduates, replacing the CU-expensive
+      // Birdeye new_listing for live discovery. Pools are registered by their
+      // pool_created_at (≈ graduation time, matching how DexScreener pairs age
+      // coins), so they enter the re-eval pool and are evaluated once they
+      // reach the qualifying age window. Since 2026-09-28 it is a KEYED leg
+      // (CoinGecko key) and therefore a 5-MINUTE one — see the cadence gate
+      // below — and both halves of what it does are idempotent (the mint
+      // dedupe and the pool registration), so registering a coin minutes late
+      // costs it nothing.
       let geckoProfiles: TokenProfile[] = [];
       if (this.shouldStopEarly()) {
         await Promise.all(feedJobs);
         return;
       }
-      if (this.gecko) {
+      // The CADENCE GATE (see geckoterminalDiscoveryIntervalMs and
+      // Db.GECKO_DISCOVERY_AT_KEY): a keyed new-pools leg is quota-bound, so it
+      // is fetched at most once per window across the WHOLE fleet. The row rides
+      // the front's single read above and its single write below, so the gate
+      // costs no round trip of its own. A skipped tick deliberately leaves
+      // `geckoJob` null and `diag.geo` 0 — exactly the reading the Meteora
+      // layer below is built to cover.
+      const geckoLastAt = Number(front.gates.get(GECKO_DISCOVERY_AT_KEY) ?? 0);
+      const geckoDue =
+        this.gecko !== null &&
+        geckoDiscoveryDue(
+          geckoLastAt,
+          Date.now(),
+          this.config.geckoterminalDiscoveryIntervalMs,
+        );
+      diag.geoDue = geckoDue;
+      if (this.gecko && geckoDue) {
         const geckoPromise = this.fetchFeedCapped(
             async () => {
+              // Stamped HERE rather than at the gate above: fetchFeedCapped
+              // refuses to call this closure when the feed window has nothing
+              // left, and a tick that never reached the network must not burn
+              // the window — that would cost five minutes of discovery for a
+              // request nobody made. Stamped at DISPATCH rather than on success
+              // for the opposite reason: an attempt that fails (429, a refusal)
+              // may still have been billed, and retrying it every tick until
+              // one succeeds is exactly the spend the window exists to stop.
+              // The ticks it is not retried on are covered by pump.fun and
+              // Meteora.
+              await this.stampFront(GECKO_DISCOVERY_AT_KEY, String(Date.now()));
               const pools = [];
               for (
                 let page = 1;
@@ -3392,30 +3478,51 @@ export class Scanner {
         geckoJob = geckoPromise;
         feedJobs.push(geckoPromise);
       }
-      // LAUNCH-SLOT FALLBACK CHAIN: gecko's new_pools is the primary keyless
-      // launch feed, and a tick where it delivers nothing would leave the
-      // brand-new-coin slot empty — so two more keyless sources stand behind
-      // it, in measured order of freshness (both measured from the WORKER's own
-      // egress, the only placement that counts — see /debug/pool-source):
+      // THE LAUNCH SLOT (2026-09-28): three keyless non-DexScreener sources, and
+      // the shape BETWEEN them changed the day gecko got a key. Before, gecko's
+      // new_pools was the primary and the other two stood behind it as
+      // fallbacks, because that leg was called every tick and was usually
+      // 429ed. A key moves the limiter off the shared egress IP and onto the
+      // key — QUOTA-bound (10K calls/month on the demo plan) rather than
+      // rate-bound — so gecko became a 5-MINUTE leg behind
+      // Db.GECKO_DISCOVERY_AT_KEY, and the other two are no longer a fallback
+      // chain behind it:
       //
-      //   1. pump.fun v3 /coins      — newest coin ~2s old, one request
-      //   2. Meteora DAMM v2 /pools  — newest pool ~32s old, sorted server-side
-      //      by pool_created_at (see src/meteora.ts — Raydium and Orca cannot
-      //      answer "newest pools" at all: neither exposes a creation order)
+      //   pump.fun v3 /coins      ALWAYS ON (PUMPFUN_PROFILE_LIMIT = 20): one
+      //                           paginated batch per tick, newest coin ~2s
+      //                           old. The one source whose freshness makes a
+      //                           per-tick cadence worth its cost.
+      //   gecko new_pools         ONE FETCH PER DISCOVERY INTERVAL (~5 min).
+      //                           Quota-bound, and freshness does not matter to
+      //                           it: a launch pool is only judged once it ages
+      //                           into the 30h qualifying window, so a coin
+      //                           registered 5 minutes late is judged on the
+      //                           same tick.
+      //   Meteora DAMM v2 /pools  GECKO'S COVER: fetched on every tick gecko
+      //                           delivered nothing — the four in five its
+      //                           cadence holds back, plus a due tick whose
+      //                           fetch came back empty or refused. Newest pool
+      //                           ~32s old, sorted server-side by
+      //                           pool_created_at (see src/meteora.ts — Raydium
+      //                           and Orca cannot answer "newest pools" at all:
+      //                           neither exposes a creation order).
       //
-      // A layer awaits the one before it and returns the moment that layer
-      // delivered, so a healthy gecko tick pays NOTHING, a tick pump.fun fills
-      // never reaches Meteora, and only a tick where every layer ahead came
-      // back empty walks the whole chain. The wait sits INSIDE the feed window
-      // (fetchFeedCapped's floor): a layer that starts with no window left
-      // returns [] without dispatching, so a hung layer cannot drag the chain
-      // past the deadline.
+      // All three ride the same feed fan-out and are bounded by the feed window
+      // (fetchFeedCapped's floor): a leg that starts with no window left
+      // returns [] without dispatching, so a hung upstream cannot drag the
+      // phase past the deadline. Meteora awaits the gecko JOB before deciding,
+      // and a SKIPPED gecko tick leaves that job null — i.e. it dispatches
+      // immediately instead of waiting for a request nobody made.
       let pumpProfiles: TokenProfile[] = [];
-      let pumpJob: Promise<void> | null = null;
       const pumpAlwaysLimit = this.config.pumpfunProfileLimit;
       const pumpFallbackLimit = this.config.pumpfunFallbackLimit;
       if (this.pumpfun && (pumpAlwaysLimit > 0 || pumpFallbackLimit > 0)) {
         const pumpPromise = (async () => {
+          // The legacy shape, kept for a configuration that leaves the
+          // always-on limit at 0: only then is pump.fun a fallback for gecko,
+          // and only then does a chain order exist at all. Production
+          // (PUMPFUN_PROFILE_LIMIT = 20) never enters this branch — it fetches
+          // on every tick, in parallel with every other feed.
           if (pumpAlwaysLimit <= 0) {
             if (geckoJob !== null) await geckoJob;
             if (diag.geo > 0) return; // gecko delivered — nothing to fill
@@ -3436,24 +3543,27 @@ export class Scanner {
             err instanceof Error ? err.message : err,
           );
         });
-        pumpJob = pumpPromise;
+        // Pushed straight onto the fan-out: nothing downstream waits on a
+        // pump job any more (Meteora waits on the GECKO job — see below).
         feedJobs.push(pumpPromise);
       }
-      // Meteora DAMM v2 — the chain's LAST resort (see src/meteora.ts). Reached
-      // only when gecko AND pump.fun both delivered nothing, which is exactly
-      // the case this layer exists for: pump.fun blocks datacenter IPs on and
-      // off, and an independent provider is what keeps the slot filled when it
-      // does. Sized by METEORA_FALLBACK_LIMIT (0 = off).
+      // Meteora DAMM v2 — GECKO'S COVER (see src/meteora.ts). It is an
+      // independent provider precisely for the ticks gecko's 5-minute cadence
+      // holds back, and for a due tick whose fetch came back empty or refused:
+      // the DEX-side launch slot stays filled either way, while pump.fun covers
+      // pump.fun launches of its own accord (it is an ALWAYS-ON feed now, so it
+      // neither gates nor is gated by this layer — see the chain comment above).
+      // Sized by METEORA_FALLBACK_LIMIT (0 = off).
       let meteoraProfiles: TokenProfile[] = [];
       if (this.meteora && this.config.meteoraFallbackLimit > 0 && !dropOptionalLeg("meteora")) {
         feedJobs.push(
           (async () => {
-            if (pumpJob !== null) await pumpJob;
-            // An EARLIER layer filling the slot stops the chain. Testing
-            // `diag.pump` alone is not enough: when gecko delivered, the pump
-            // layer returns from its skip branch WITHOUT setting `diag.pump`,
-            // so this layer would go to the network on a tick gecko covered.
-            if (diag.geo > 0 || diag.pump > 0) return;
+            if (geckoJob !== null) await geckoJob;
+            // A gecko tick that DELIVERED stops the chain — no reason to pay
+            // for a second DEX launch list. Do not read `diag.geo` before the
+            // await above: on a tick whose gecko fetch is still in flight it is
+            // the not-yet-decided 0.
+            if (diag.geo > 0) return;
             meteoraProfiles = await this.fetchFeedCapped(
               () =>
                 this.meteora!.fetchNewestPools(this.config.meteoraFallbackLimit),
@@ -4083,7 +4193,7 @@ export class Scanner {
         )
           continue;
         // Comparable-only (see gateLiquidityUsd): this column feeds the re-eval
-        // pool's `minQualifyLiquidity` prune (0.6 × the widest chat's floor,
+        // pool's `minQualifyLiquidity` prune (POOL_LIQUIDITY_PRUNE_RATIO,
         // DexScreener-calibrated), and the raise is one-way — a Jupiter/Gecko
         // reading is a different metric of the same pool (~half), so feeding it
         // in can only leave the coin's high-water mark short of the truth and

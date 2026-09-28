@@ -539,9 +539,16 @@ async function subreqFloorTest() {
     // Every OPTIONAL leg armed (the live worker sets the same vars in
     // wrangler.toml), and the pump.fun fallback off so the launch chain is
     // exactly gecko → meteora in this test.
+    //
+    // GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS=0 on purpose: this test drives
+    // SEVERAL consecutive ticks over one DB to exercise the SUBREQUEST FLOOR,
+    // and the production 300s cadence would make the second tick skip gecko for
+    // a reason that has nothing to do with the floor (the stamp is durable and
+    // the ticks are milliseconds apart). One axis at a time.
     const cfg = loadConfig({
       METEORA_FALLBACK_LIMIT: "20",
       GECKOTERMINAL_TRENDING_LIMIT: "20",
+      GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS: "0",
       JUPITER_TRENDING_LIMIT: "100",
       PUMPFUN_PROFILE_LIMIT: "0",
       PUMPFUN_FALLBACK_LIMIT: "0",

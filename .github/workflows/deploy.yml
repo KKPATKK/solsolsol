@@ -90,4 +90,29 @@ jobs:
             echo "::warning::JUPITER_API_KEY not set as a GitHub Actions secret — skipping (keyless 0.5 RPS is fine)"
           fi
 
+      # Optional COINGECKO_API_KEY (CoinGecko Demo/Pro key, sent as
+      # x-cg-demo-api-key / x-cg-pro-api-key) — the ONLY route back to
+      # GeckoTerminal's new_pools, whose keyless quota is shared across
+      # Cloudflare's whole egress fleet (see docs/gecko-429.md). With the key
+      # configured the discovery leg is quota-bound, so it is gated to one
+      # fetch per GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS (wrangler.toml: 5 min
+      # = 8,640 calls/month against the demo plan's 10K). Best-effort by
+      # design: unset just leaves the leg keyless (`geo 0`) with the launch
+      # slot carried by pump.fun + Meteora — never block a release on it.
+      - name: Set COINGECKO_API_KEY worker secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: |
+          if [ -n "$COINGECKO_API_KEY" ]; then
+            if echo "$COINGECKO_API_KEY" | npx wrangler secret put COINGECKO_API_KEY; then
+              echo "::notice::COINGECKO_API_KEY written to Worker secret"
+            else
+              echo "::warning::COINGECKO_API_KEY secret update failed — continuing keyless (the launch slot is covered by pump.fun + Meteora)"
+            fi
+          else
+            echo "::warning::COINGECKO_API_KEY not set as a GitHub Actions secret — skipping (the gecko discovery leg stays at geo 0)"
+          fi
+
 

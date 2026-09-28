@@ -658,11 +658,30 @@ export const DEX_PROFILES_LAST_KEY = "dex_profiles_last";
  * read, not gated on). Every one of them is a row the front's own work needs
  * once per tick, read in ONE statement.
  */
+/**
+ * worker_state row: the epoch (ms) of the launch slot's last GeckoTerminal
+ * new-pools FETCH ATTEMPT (see Scanner's launch-slot chain + geckoDiscoveryDue).
+ *
+ * WHY DURABLE AND NOT module state: the gecko leg is now quota-bound rather
+ * than rate-bound (a CoinGecko key moves the limiter off the shared egress IP
+ * onto the key — 10K calls/month on the demo plan), so the thing worth
+ * enforcing is "at most one origin fetch per GECKOTERMINAL_DISCOVERY_INTERVAL"
+ * across the WHOLE fleet. This Worker's isolates churn every ~30s, so a
+ * per-isolate timestamp would reset long before the window elapsed and spend
+ * the key's quota at the tick rate. The row rides the front's ONE read and ONE
+ * write (SCAN_FRONT_GATE_KEYS below), so the gate costs zero extra round trips.
+ */
+export const GECKO_DISCOVERY_AT_KEY = "gecko_discovery_at";
+
 export const SCAN_FRONT_GATE_KEYS = [
   "schema_alter_v2_done",
   "token_stats_last_prune",
   "birdeye_backfill_at",
   DEX_PROFILES_LAST_KEY,
+  // The gecko discovery cadence stamp (GECKO_DISCOVERY_AT_KEY above): read to
+  // decide whether this tick may spend a gecko fetch, written on the ticks
+  // that do. One row on an IN-list that is already paid for.
+  GECKO_DISCOVERY_AT_KEY,
   // The tracker pass's own row (pushwatch.TRACKER_PASS_STATE_KEY, spelled as
   // the literal because that module imports THIS one). It is READ, not gated
   // on: a tick's fallback pass asks it whether the pass's own cron delivery

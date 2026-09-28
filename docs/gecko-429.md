@@ -2,6 +2,12 @@
 
 > 相關：`docs/push-baseline-ledger.md`（feed 預算／DexScreener profiles 嘅 429 線）、
 > `docs/scan-completion-loss.md`（`writeDrain` 100% 失敗，同日處理）。
+>
+> **更新（2026-09-28）**：鑰匙已入手（`COINGECKO_API_KEY`，demo plan），
+> `new_pools` 因此改成 **每 5 分鐘一次**嘅 DURABLE 閘——鑰匙係 quota-bound
+> （10K/月，而每 tick 一次係 ~43K/月）。launch slot 由 pump.fun（每 tick）
+> ＋ Meteora（gecko 未交貨嘅 tick）補位，見
+> `docs/gecko-key-launch-chain-2026-09-28.md`。
 
 ## 量度（同一分鐘，兩個方向）
 

@@ -45,14 +45,24 @@ crons = ["* * * * *", "*/1 * * * *"]
 # TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY, COINGECKO_API_KEY) must NOT
 # live here — set them in the Cloudflare dashboard (Workers > solana-meme-bot >
 # Settings > Variables and Secrets) or via `wrangler secret put <NAME>`.
-# COINGECKO_API_KEY (optional, with COINGECKO_API_PLAN=demo|pro) moves the
+# COINGECKO_API_KEY (with COINGECKO_API_PLAN=demo|pro) moves the
 # GeckoTerminal/CoinGecko rate limit from the shared Worker egress IP onto the
 # key — see docs/gecko-429.md. Measured 2026-09-25: keyless is ~5 req/min per
 # source IP and the Worker's shared IP never gets them, so the key is the ONLY
 # route back to gecko. It is quota-bound, not rate-bound: the demo plan is
 # 100 calls/min + 10K calls/month, and this bot's new_pools leg alone at one
 # call per tick is ~43K/month, so a key only pays off with the discovery leg
-# throttled to one call per ~5 min (8,640/month) — trending is off below.
+# throttled to one call per ~5 min (8,640/month). Trending stays off below.
+#
+# 2026-09-28: a key is CONFIGURED, so this is the live path rather than an
+# option. The throttling it needs is now enforced in code —
+# GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS below — and the launch slot is
+# carried between gecko fetches by pump.fun (always on) and Meteora. The key is
+# a Worker SECRET: the deploy workflow writes it from the GitHub Actions secret
+# COINGECKO_API_KEY (see .github/workflows/deploy.yml), which is also the only
+# place it should ever be typed. A keyless deploy still runs — the leg simply
+# stays at `geo 0` (summary.geoDue is still true; it is the fetch that comes
+# back refused) and the two keyless sources carry the slot.
 [vars]
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one COMPLETED less
@@ -149,49 +159,65 @@ REEVAL_FAR_SWEEP_MIN = "18"
 # sweep/TTL alignment, not more ticks. Raise TTL (e.g. 300) to cut rows-read
 # back.
 REEVAL_POOL_CACHE_SECONDS = "90"
-# pump.fun discovery as an ALWAYS-ON feed: DISABLED (0) — the legacy host
-# (frontend-api.pump.fun) 530-blocks Worker egress (CF error 1016, origin DNS
-# gone since ~2026-08-20), so each tick only burned a doomed request. The v3
-# host is alive (measured 2026-09-21: HTTP 200, newest coins ~2s old at
-# offset 0), so the feed is now wired as the GECKO FALLBACK below instead of
-# running every tick.
+# pump.fun discovery as an ALWAYS-ON feed: ENABLED at 20 (2026-09-28).
 #
-# NOTE (2026-09-21): this 0 did NOT disable anything until now — loadConfig's
-# `> 0 ? clamp : 100` turned it into 100, so the "disabled" feed ran at five
-# paged requests per tick and the fallback branch below never engaged (live
-# `/debug/tick` showed `pump 0` with no `pumpFallback`). 0 now means OFF.
-PUMPFUN_PROFILE_LIMIT = "0"
-# GECKO FALLBACK size: how many pump.fun newest coins to fetch while
-# GeckoTerminal's new_pools is PAUSED (429 or a hard refusal — its live state
-# since 2026-09-21, which leaves `geo 0` and the brand-new-coin slot empty).
-# It is a batch size, not a switch: 0 = off, and it costs nothing while gecko is
-# healthy. See pumpfunDiscoveryLimit in src/pumpfun.ts.
-# ENABLED at 20 (the same batch size as the gecko feed it stands in for) after
-# `/debug/pool-source` proved the v3 host from the WORKER's own egress on
-# 2026-09-21: `pumpfun-v3 status 200 bytes 39112 count 20 newestAgeS 2` while
-# the legacy host answered 530/CF-1016. Seconds old is fresher than gecko's
-# new_pools ever was, and the cost is bounded to gecko's outage.
+# History: the legacy host (frontend-api.pump.fun) 530-blocks Worker egress
+# (CF error 1016, origin DNS gone since ~2026-08-20), so the feed sat at 0 and
+# the v3 host (frontend-api-v3.pump.fun) was wired as gecko's FALLBACK instead
+# of an always-on feed. The chain flipped the day gecko got a key (see
+# COINGECKO_API_KEY above): gecko's new_pools became a QUOTA-BOUND 5-minute leg
+# (GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS below), and the per-tick freshness
+# the launch slot actually wants is pump.fun's — ~2s old at offset 0, measured
+# from the WORKER's own egress: `pumpfun-v3 status 200 bytes 39112 count 20
+# newestAgeS 2`. The two no longer gate each other: pump.fun fetches its batch
+# on EVERY tick and Meteora covers the ticks gecko's cadence skips.
 #
-# CHAIN ORDER (src/scanner.ts): gecko new_pools → this feed → METEORA_FALLBACK_LIMIT
-# below. Each layer awaits the one before it, so this one is only paid for on a
-# tick where gecko delivered nothing, and the Meteora layer only on a tick where
-# BOTH of them did.
-PUMPFUN_FALLBACK_LIMIT = "20"
-# Meteora Data API newest-pools feed — the launch slot's LAST keyless source,
-# reached only when gecko's new_pools AND pump.fun both delivered nothing (0 =
-# off). ENABLED after `/debug/pool-source` proved it from the WORKER's own
-# egress on 2026-09-21: `meteora-damm-v2 status 200 count 10 newestAgeS 32`
-# with `sort_by=pool_created_at:desc` and both pool sides on every row.
+# Cost: one paginated batch (20 coins = 1 request) per tick on the host that
+# already serves this feed. 0 = the leg is off again; an UNSET variable keeps
+# the historic 100-coin default.
+PUMPFUN_PROFILE_LIMIT = "20"
+# GECKO FALLBACK size — LEGACY as of 2026-09-28, and set to 0 because the
+# ALWAYS-ON limit above now covers every tick. It is the "fill gecko's slot"
+# branch of pump.fun's feed: a batch size, not a switch (0 = off), paid only on
+# a tick where gecko delivered nothing — see pumpfunDiscoveryLimit, which only
+# reaches this value while PUMPFUN_PROFILE_LIMIT is 0. With the always-on limit
+# at 20 that branch is unreachable, so the old chain (gecko → pump.fun →
+# Meteora) is gone: the slot is filled by pump.fun on every tick and by Meteora
+# on the ticks gecko's 5-minute cadence skips. Leave this at 0 unless the
+# always-on feed is deliberately turned off again.
+PUMPFUN_FALLBACK_LIMIT = "0"
+# Meteora Data API newest-pools feed — GECKO'S COVER (2026-09-28), the
+# launch slot's second keyless DEX-side source. It is now reached on every tick
+# gecko delivered nothing: the four in five that
+# GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS holds gecko back, plus a due tick
+# whose fetch came back empty or refused. 0 = off. ENABLED at 20 after
+# /debug/pool-source proved it from the WORKER's own egress on 2026-09-21:
+# `meteora-damm-v2 status 200 count 10 newestAgeS 32` with
+# `sort_by=pool_created_at:desc` and both pool sides on every row.
 # A DIFFERENT provider, not a second URL for pump.fun — which is the point:
-# pump.fun blocks datacenter IPs on and off, and this keeps the slot filled when
-# it does. Earlier notes said "Meteora cannot serve a time-ordered pool list at
-# all"; that was measured against `dlmm-api.meteora.ag`, which now 404s every
-# path root-included. Meteora's current hosts (dlmm.datapi.meteora.ag /
-# damm-v2.datapi.meteora.ag) do sort by creation time. Raydium and Orca still
-# cannot — Raydium's `sortField` enum is liquidity/volume/fee/apr (and the
-# look-alike `poolSortField` is silently ignored), Orca's pools carry no
-# creation field. One request when reached. See src/meteora.ts.
+# pump.fun covers pump.fun launches and blocks datacenter IPs on and off, this
+# covers the other DEXes. Earlier notes said "Meteora cannot serve a
+# time-ordered pool list at all"; that was measured against
+# `dlmm-api.meteora.ag`, which now 404s every path root-included. Meteora's
+# current hosts (dlmm.datapi.meteora.ag / damm-v2.datapi.meteora.ag) do sort by
+# creation time. Raydium and Orca still cannot — Raydium's `sortField` enum is
+# liquidity/volume/fee/apr (and the look-alike `poolSortField` is silently
+# ignored), Orca's pools carry no creation field. One request when reached.
+# See src/meteora.ts.
 METEORA_FALLBACK_LIMIT = "20"
+# Minimum spacing between GeckoTerminal new-pools FETCHES, in seconds (code
+# default 300 = one fetch per 5 min; 0 = no gate, one per tick). This is the
+# cadence the KEYED leg is spent at: the demo plan is 10K calls/month, one call
+# per 5 minutes is 8,640/month, and the discovery loss is nil because a launch
+# pool is only judged once it ages into the 30h qualifying window. 0 would be
+# ~43K/month and would burn the key in a week.
+#
+# The gate is DURABLE (worker_state `gecko_discovery_at`, riding the scan
+# front's single read + single write), because this Worker's isolates churn
+# every ~30s: a per-isolate window would never elapse and the quota arithmetic
+# above would not hold. On a tick the gate skips, `summary.geoDue` is false
+# and Meteora fills the slot (see the launch-slot chain in src/scanner.ts).
+GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS = "300"
 # GeckoTerminal trending-pools feed size per scan (code default 20 when unset;
 # 0 = the leg is off — scanner.ts only builds it while this is > 0).
 # DISABLED (2026-09-25): the keyless quota is ~5 requests/minute PER SOURCE IP

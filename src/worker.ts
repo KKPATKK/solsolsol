@@ -3689,12 +3689,15 @@ async function ensureInitialized(env: Env): Promise<void> {
           new RugcheckClient(config),
           helius,
           trade ?? undefined,
-          // pump.fun discovery widens coverage beyond the DexScreener
-          // profiles feed (best-effort — blocked/degraded feeds return []).
+          // pump.fun discovery — the launch slot's ALWAYS-ON feed since
+          // 2026-09-28 (PUMPFUN_PROFILE_LIMIT=20), on every tick; best-effort,
+          // a blocked/degraded feed returns [].
           new PumpFunClient(config),
-          // GeckoTerminal new-pools discovery — free (no key), covers every
-          // Solana DEX incl. pump.fun graduates (best-effort — blocked or
-          // degraded feeds return [] and the scan continues on the others).
+          // GeckoTerminal new-pools discovery — keyed (COINGECKO_API_KEY) and
+          // therefore a 5-MINUTE leg, covers every Solana DEX incl. pump.fun
+          // graduates; best-effort — blocked or degraded feeds return [] and
+          // the scan continues on the others (see the cadence gate + the
+          // launch-slot chain in src/scanner.ts).
           new GeckoTerminalClient(config),
           // Jupiter Token v2 discovery — recent launchpad launches (the
           // pump.fun frontend-api replacement) + 24h trending (null when
@@ -3721,9 +3724,10 @@ async function ensureInitialized(env: Env): Promise<void> {
           // Flurry launch forensics — deploy-slot bundle gate + funding
           // lineage (null when disabled). Last gate before each push.
           flurryAnalyzer ?? undefined,
-          // Meteora Data API newest-pools discovery — the launch slot's third
-          // and last keyless source (best-effort; reached only when gecko's
-          // new_pools AND pump.fun both came back empty — see src/meteora.ts).
+          // Meteora Data API newest-pools discovery — GECKO'S COVER since
+          // 2026-09-28: reached on every tick gecko's 5-minute cadence holds
+          // back, and on a due tick whose fetch came back empty or refused
+          // (best-effort; see src/meteora.ts).
           new MeteoraClient(config),
         );
         // Capture every early-return reason the scanner records: it sets

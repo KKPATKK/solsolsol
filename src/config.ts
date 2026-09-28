@@ -359,6 +359,29 @@ export interface AppConfig {
    * graduates, the zero-CU replacement for Birdeye new_listing.
    */
   geckoterminalPoolPages: number;
+  /**
+   * Minimum spacing between GeckoTerminal new-pools FETCHES, in ms
+   * (GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS, default 300 = one fetch per
+   * 5 min, 0 = no gate).
+   *
+   * WHY THE GATE EXISTS (2026-09-28): the new_pools leg used to be called on
+   * every tick. That was free while the caller had no key — the shared Worker
+   * egress IP was over GeckoTerminal's IP quota anyway, so an attempt bought
+   * nothing and cost nothing. A key (COINGECKO_API_KEY) moves the limiter onto
+   * the key instead, which is QUOTA-bound rather than rate-bound: the demo
+   * plan is 10K calls/month, and one call per tick is ~43K/month, i.e. the key
+   * would be burned in a week and then the leg would 429 again. One call per 5
+   * minutes is 8,640/month, which fits — and the discovery loss is nil, because
+   * a coin is only judged once it ages into the qualifying window (30h wide),
+   * so a launch pool registered up to 5 minutes late is judged on exactly the
+   * same tick. The in-between ticks are covered by pump.fun (always on) and
+   * Meteora (see the launch-slot chain in src/scanner.ts).
+   *
+   * The gate is DURABLE (Db.GECKO_DISCOVERY_AT_KEY), not per-isolate, because
+   * isolates churn every ~30s — a per-isolate window would never elapse and
+   * the quota math above would not hold.
+   */
+  geckoterminalDiscoveryIntervalMs: number;
   /** Minimum spacing between GeckoTerminal HTTP requests (rate limiting). */
   geckoterminalRequestIntervalMs: number;
   /**
@@ -614,6 +637,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawFarSweepMin = Number(env.REEVAL_FAR_SWEEP_MIN ?? 18);
   const rawPumpfunLimit = Number(env.PUMPFUN_PROFILE_LIMIT ?? 100);
   const rawGeoPages = Number(env.GECKOTERMINAL_POOL_PAGES ?? 1);
+  const rawGeoDiscoverySec = Number(
+    env.GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS ?? 300,
+  );
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
   const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
   const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
@@ -714,6 +740,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       Number.isFinite(rawGeoPages) && rawGeoPages > 0
         ? Math.min(Math.floor(rawGeoPages), 2)
         : 1,
+    // 0 = no gate (every tick). A junk value fails CLOSED to the 300s default
+    // rather than open to every tick: an unparseable knob must not silently
+    // become a 43K/month spend on somebody's key.
+    geckoterminalDiscoveryIntervalMs:
+      Number.isFinite(rawGeoDiscoverySec) && rawGeoDiscoverySec > 0
+        ? Math.floor(rawGeoDiscoverySec) * 1000
+        : env.GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS === "0"
+          ? 0
+          : 300_000,
     geckoterminalRequestIntervalMs: Number.isFinite(
       Number(env.GECKOTERMINAL_REQUEST_INTERVAL_MS ?? 1000),
     )
