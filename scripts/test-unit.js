@@ -16009,8 +16009,12 @@ async function main() {
       const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
       const jupSrc = fs.readFileSync(path.join(__dirname, "..", "src", "jupfeeds.ts"), "utf8");
 
-      // 7 — boosts: production runs the ceiling, because the request answers
-      // 30 rows whatever we ask for.
+      // 7 — boosts: production runs the upstream's ceiling (30 rows, the
+      // clamp). MEASURED 2026-09-28: raising it from 20 changed nothing —
+      // `boosts 17` before and after — because the upstream's 30 rows are
+      // cross-chain and the client filters to solana before slicing, so the
+      // Solana subset was already under 20. This pin holds the DEPLOYED value
+      // honest; it is not evidence of a gain.
       assert.ok(
         toml.includes('DEXSCREENER_BOOSTS_LIMIT = "30"'),
         "wrangler.toml runs the boosts leg at the upstream's 30-row ceiling",

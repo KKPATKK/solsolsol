@@ -275,10 +275,16 @@ export interface AppConfig {
    * and no timestamps — the age comes from the pair the next batch fetches.
    *
    * 2026-09-28: production runs the upstream's own ceiling
-   * (DEXSCREENER_BOOSTS_LIMIT = "30" in wrangler.toml). /token-boosts/latest/v1
-   * answers 30 rows, so the previous 20 discarded 10 paid-promotion rows per
-   * tick — same host, same single request. The clamp below (30) IS that
-   * ceiling: a bigger number is a typo, not a request for more.
+   * (DEXSCREENER_BOOSTS_LIMIT = "30" in wrangler.toml), and the measurement
+   * that came with it is a NEGATIVE result worth keeping: this was raised from
+   * 20 expecting +10 rows and the leg still reads 17. /token-boosts/latest/v1
+   * answers 30 rows ACROSS CHAINS and the client filters to solana BEFORE it
+   * slices, so the Solana subset — the only rows this feed can ever return —
+   * was already under 20. The dial stays at the clamp because it costs the same
+   * single request either way, but a future reader should not expect a gain
+   * from it: the binding constraint here is how many Solana boosts exist, not
+   * the number asked for. The clamp below (30) IS the upstream's row ceiling: a
+   * bigger number is a typo, not a request for more.
    */
   dexscreenerBoostsLimit: number;
   /**
