@@ -73,7 +73,7 @@ SCAN_INTERVAL_SECONDS = "60"
 # Max coverage: inspect the newest 100 Solana token profiles per scan
 # (the code caps this at 100). Deferred candidates stay in the re-eval
 # pool, so nothing is lost when a tick runs out of budget.
-SCAN_PROFILE_LIMIT = "20"
+SCAN_PROFILE_LIMIT = "100"
 # DexScreener /token-boosts/latest/v1 feed size per scan (code default 0 =
 # disabled, max 30 — the upstream list is 30 rows).
 # The newest PAID promotion slots: measured 2026-09-25 from the sandbox and
@@ -93,12 +93,12 @@ SCAN_PROFILE_LIMIT = "20"
 # gives up when it does not. Watch /health heartbeat.summary.boosts together
 # with scanMs and subreqSkip; set this back to "0" if scanMs climbs or the leg
 # starts appearing in subreqSkip.
-DEXSCREENER_BOOSTS_LIMIT = "0"
+DEXSCREENER_BOOSTS_LIMIT = "20"
 # Re-evaluation pool: never-pushed coins nearing/inside the qualifying age
 # window that the bot keeps tracking until they qualify (code default 40,
 # max 1000). Ordered by relevance, so the closest-to-qualifying coins are
 # always checked first; leftovers simply defer to the next tick.
-RE_EVAL_POOL_SIZE = "0"
+RE_EVAL_POOL_SIZE = "1000"
 # Graduated re-eval pool rotation (see src/db.ts): everything older than the
 # hot zone (window entry ± margin, evaluated EVERY scan) is swept in two
 # tiers. NEAR tier = the first 6h inside the age window — the coins most
@@ -168,7 +168,7 @@ PUMPFUN_PROFILE_LIMIT = "0"
 # below. Each layer awaits the one before it, so this one is only paid for on a
 # tick where gecko delivered nothing, and the Meteora layer only on a tick where
 # BOTH of them did.
-PUMPFUN_FALLBACK_LIMIT = "0"
+PUMPFUN_FALLBACK_LIMIT = "20"
 # Meteora Data API newest-pools feed — the launch slot's LAST keyless source,
 # reached only when gecko's new_pools AND pump.fun both delivered nothing (0 =
 # off). ENABLED after `/debug/pool-source` proved it from the WORKER's own
@@ -183,7 +183,7 @@ PUMPFUN_FALLBACK_LIMIT = "0"
 # cannot — Raydium's `sortField` enum is liquidity/volume/fee/apr (and the
 # look-alike `poolSortField` is silently ignored), Orca's pools carry no
 # creation field. One request when reached. See src/meteora.ts.
-METEORA_FALLBACK_LIMIT = "0"
+METEORA_FALLBACK_LIMIT = "20"
 # GeckoTerminal trending-pools feed size per scan (code default 20 when unset;
 # 0 = the leg is off — scanner.ts only builds it while this is > 0).
 # DISABLED (2026-09-25): the keyless quota is ~5 requests/minute PER SOURCE IP
@@ -242,7 +242,7 @@ JUPITER_REQUEST_INTERVAL_MS = "500"
 # band filter runs at parse time, so the extra entries never reach the pair
 # phase (see jupfeeds.parseJupTrendTokens + docs/profiles-feed-zeros.md).
 # 0 = the leg is off entirely.
-JUPITER_TRENDING_LIMIT = "0"
+JUPITER_TRENDING_LIMIT = "100"
 # DexScreener dispatch spacing, ms (code default 350). 2026-09-15: 350 → 250.
 # The pair phase is a fixed 1.5s window (PAIRS_FETCH_BUDGET_MS) and the shared
 # throttle spaces every request START, so the window held 5 dispatch slots at
