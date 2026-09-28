@@ -163,8 +163,16 @@ const SCAN_TIMEOUT_MS = 25_000;
  * POOL_FETCH_BUDGET_MS 1_600 + PAIRS_FETCH_BUDGET_MS 1_000 = 3_500) now fits
  * inside it with room to spare, where the 2_600ms window could leave the pair
  * phase as little as 100ms once the feeds and the pool read rode their own
- * caps. The gate chain — the only phase that can push a coin — is the
- * beneficiary: it keeps its 1_600ms reserve and gains the front phases' slack.
+
+ *
+ * 2026-09-28 (later, same day): that slack is then deliberately SPENT on
+ * coverage instead of left unused — FEED_DEADLINE_MS 900 → 1_600,
+ * POOL_FETCH_BUDGET_MS 1_600 → 2_400, PAIRS_FETCH_BUDGET_MS 1_000 → 2_000
+ * (sum 6_000 of the 6_400ms window) and RE_EVAL_PER_TICK_MAX 90 → 180.
+ * Each cap keeps its documented meaning — a ceiling for a SLOW phase, never
+ * a cost on a healthy one — so this is not a trade against the gates: it
+ * changes only what happens on the ticks where an upstream was slow enough
+ * that the cap was being hit and the coins behind it were dropped.
  */
 export const SCAN_TICK_DEADLINE_MS = 8_000;
 /**
@@ -845,8 +853,19 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  *      `empty`, so a tick whose call is short-circuited or raced away still
  *      evaluates the deferred lane instead of nothing — with
  *      `profilesSettled: false` saying that is what happened.
+ *
+ * 2026-09-28 (900 → 1_600, Workers Paid): every entry above cut this number
+ * because the tick could not afford a slow feed — 900 was sized so the feed
+ * fan-out and the pool read together fit the old 2_600ms front window. On the
+ * paid plan that window is 6_400ms (see SCAN_TICK_DEADLINE_MS), so this is no
+ * longer a budget trade: it only bounds genuinely hung feeds. What it buys is
+ * measured, not theoretical — live `summary.feedsMs` sat at 754–780ms
+ * against the 900ms cap on every sampled tick, i.e. the fan-out was being CUT
+ * nearly every minute, and the legs that lose that race are the slower
+ * momentum ones (jupTrend / geoTrend / boosts), so partial feed counts were
+ * the routine reading rather than the exception.
  */
-const FEED_DEADLINE_MS = 900;
+const FEED_DEADLINE_MS = 1_600;
 /**
  * Wall-clock cap for the re-eval pool DB read and the token_stats prune
  * (both race against this deadline; see the call sites). Evidence
@@ -902,10 +921,19 @@ const FEED_DEADLINE_MS = 900;
  * the whole failure this raise exists to remove; above it, a failed read
  * arrives as an ERROR and can be answered with the last good pool (see
  * src/poolfallback.ts) instead of costing the tick. The worst case still fits
- * the front window (FEED_DEADLINE_MS 900 + 1600 = 2500 < FRONT_PHASE_WINDOW_MS
- * 2600), so it cannot eat the 1600ms gate reserve the way the retired 2200 did.
+ * the front window (FEED_DEADLINE_MS 1_600 + 2_400 = 4_000 <
+ * FRONT_PHASE_WINDOW_MS 6_400), so it cannot eat the 1_600ms gate reserve.
+ *
+ * 2026-09-28 (1_600 → 2_400, Workers Paid): live `summary.poolMs` reads
+ * 159–518ms, so this is not what a healthy tick spends — it is the ceiling a
+ * COLD isolate's read hits (the 90s query cache is cold on most cron ticks)
+ * and, now, the ceiling for a BIGGER read: the rotation slice doubled
+ * (RE_EVAL_PER_TICK_MAX 90 → 180) out of the same RE_EVAL_POOL_SIZE 1_000-row
+ * query. Keeping it comfortably above the DB layer's 1_440ms hard wall is
+ * what makes a failed read arrive as an ERROR that can be answered with the
+ * last good pool (see src/poolfallback.ts) instead of degrading to feed-only.
  */
-const POOL_FETCH_BUDGET_MS = 1_600;
+const POOL_FETCH_BUDGET_MS = 2_400;
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the
@@ -1076,8 +1104,24 @@ const RE_EVAL_AGE_MARGIN_MIN = 180;
  * the hot zone is still evaluated every scan and a deferred coin still rides
  * the feed). Raise it back only with a way to fetch more per second, and only
  * after the delivery rate is healthy again.
+ *
+ * 2026-09-28 (90 → 180, Workers Paid): BOTH conditions that note set are now
+ * met. "A way to fetch more per second" is the pair window, doubled for this
+ * purpose (dexscreener.PAIRS_FETCH_BUDGET_MS 1_000 → 2_000 = 8 dispatch slots
+ * at the 250ms spacing = 240 addresses, which covers 180 + the feed's ~22),
+ * and "the delivery rate is healthy again" is the paid plan: the 3550ms claim
+ * gate that forced the cut is a free-plan number, while the chain deadline is
+ * now tickDeadline − CANDIDATE_PUSH_RESERVE_MS = 6_500ms.
+ *
+ * Coverage, live before this change (09:11–09:14Z): the slice was 90 of a
+ * 330–524-row pool read and only 6–7 of those coins passed the age gate per
+ * tick (`summary.agedEval`) with `pairs` 83 — i.e. each tick judged about a
+ * tenth of the pool it had just read. This slice is the knob that raises
+ * coins-per-tick directly; the sweep it lengthens is the point, not a cost
+ * (every coin still rides the feed make-up lane, the hot zone is still
+ * evaluated every scan, and leftovers keep their rotation slot).
  */
-const RE_EVAL_PER_TICK_MAX = 90;
+const RE_EVAL_PER_TICK_MAX = 180;
 
 /**
  * Pure rotation-slice over the pool-only token list (exported for offline

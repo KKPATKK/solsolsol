@@ -637,7 +637,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 300,
     port: Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 3000,
     scanProfileLimit:
-      Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 40,
+      // 2026-09-28: clamp 100 → 200 (Workers Paid). Headroom, not a lever:
+      // the DexScreener profiles page carries ~20–30 Solana rows per tick,
+      // so neither cap binds. Coins-per-tick is bounded by the re-eval
+      // rotation slice (scanner.RE_EVAL_PER_TICK_MAX) and its pair fetch.
+      Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 40,
     // Off by default: the boosts leg is an OPTIONAL feed (it is dropped first
     // when the tick runs low on subrequests or on time), so enabling it is a
     // measurement, not a guess — wrangler.toml starts at "0".

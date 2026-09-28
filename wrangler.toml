@@ -70,10 +70,18 @@ crons = ["* * * * *", "*/1 * * * *"]
 # 429s — restore it if those return; the gecko client's 5-min backoff and
 # the Birdeye backfill are the safety nets at the 60s cadence).
 SCAN_INTERVAL_SECONDS = "60"
-# Max coverage: inspect the newest 100 Solana token profiles per scan
-# (the code caps this at 100). Deferred candidates stay in the re-eval
+# Max coverage: inspect the newest 200 Solana token profiles per scan
+# (the code caps this at 200). Deferred candidates stay in the re-eval
 # pool, so nothing is lost when a tick runs out of budget.
-SCAN_PROFILE_LIMIT = "100"
+#
+# 2026-09-28: 100 → 200 on the Workers Paid plan (see worker.SCAN_TICK_BUDGET_MS).
+# This is HEADROOM, not a live lever, and the note is honest about it: the
+# /token-profiles/latest/v1 page carries ~20–30 Solana rows per tick (live
+# `summary.profiles` read 19–23 all week), so the slice never bound at 100
+# and will not bind at 200. What actually bounds coins-per-tick is the re-eval
+# rotation slice (scanner.RE_EVAL_PER_TICK_MAX, 90 → 180) together with the
+# pair fetch that feeds it (dexscreener.PAIRS_FETCH_BUDGET_MS, 1_000 → 2_000).
+SCAN_PROFILE_LIMIT = "200"
 # DexScreener /token-boosts/latest/v1 feed size per scan (code default 0 =
 # disabled, max 30 — the upstream list is 30 rows).
 # The newest PAID promotion slots: measured 2026-09-25 from the sandbox and
@@ -248,7 +256,13 @@ JUPITER_TRENDING_LIMIT = "100"
 # throttle spaces every request START, so the window held 5 dispatch slots at
 # 350ms and holds 6 at 250ms — one more 30-address batch per tick, i.e. ~30
 # more coins actually fetched/evaluated per scan for the same wall clock and
-# the same Turso rows read (the slice was raised to 160 to match). This is the
+# the same Turso rows read (the slice was raised to 160 to match).
+#
+# 2026-09-28 (Workers Paid): the pair window is PAIRS_FETCH_BUDGET_MS 2,000
+# now, not 1,000 — 8 dispatch slots at THIS spacing = 240 addresses, sized
+# against the doubled rotation slice (scanner.RE_EVAL_PER_TICK_MAX 90 → 180
+# plus the feed's ~22). The 2026-09-19 cut to 1,000 existed to hand the free
+# plan's 3550ms claim gate its time; the chain deadline is 6_500ms now. This is the
 # shared egress IP's rate limit, so it is measured, not assumed: /health →
 # heartbeat.dex reports intervalMs / http429 / blockedForMs per tick, and the
 # heartbeat's dex429Total plus the Turso row behind db.bumpDex429 count every

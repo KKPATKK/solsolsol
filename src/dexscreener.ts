@@ -636,8 +636,24 @@ class Throttle {
  * its cap and the gates gain the difference. Same rule as every entry above:
  * skipped tokens keep their pool slot and are re-read on the next rotation
  * slot — the cost is latency (and a ~1.4× longer sweep), never coverage.
+ *
+ * 2026-09-28 (1_000 → 2_000, Workers Paid): the 2026-09-19 cut above existed
+ * only to hand the claim its 3550ms — a free-plan number. The pair window is
+ * now the front window (SCAN_TICK_DEADLINE_MS 8_000 − SCAN_GATE_RESERVE_MS
+ * 1_600 = 6_400ms) and the claim deadline is 6_500ms, so the extra dispatch
+ * slots are affordable: 2_000ms ÷ 250ms = 8 slots = 240 addresses, sized
+ * against the rotation slice this was raised with (scanner.
+ * RE_EVAL_PER_TICK_MAX 90 → 180 plus the feed's ~22 = ~202).
+ *
+ * The wire count does NOT simply double: the pair cache (PAIR_CACHE_TTL_MS
+ * 180s) serves repeat coins for free, and the faster rotation (180 per tick
+ * over a 330–524-row pool ≈ 2.6 ticks ≈ 2.6 min) is now SHORTER than that
+ * TTL, so a larger share of each slice is a cache HIT. The counters to watch
+ * are still `dex.http429` / `blockedForMs` / `budgetDrops` (see
+ * DEX_REQUEST_INTERVAL_MS): a rising counter means the shared egress IP is
+ * being rate-limited again and this value is the first thing to take back.
  */
-const PAIRS_FETCH_BUDGET_MS = 1_000;
+const PAIRS_FETCH_BUDGET_MS = 2_000;
 /**
  * Pair-data cache TTL. The re-eval pool rotates slowly (same coins swept
  * minute after minute), so re-fetching all ~550 addresses every tick burns
