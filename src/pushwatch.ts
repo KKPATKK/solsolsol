@@ -924,6 +924,54 @@ export function resumeTrackingKeyboard(token: string): {
   };
 }
 /**
+ * The coin's ticker inside a card body, as a `<code>` span.
+ *
+ * WHY code AND NOT A BUTTON: a Telegram message body is INERT text — there is
+ * no tap target inside it — so the only way to make the ticker copyable is to
+ * change what it IS. A `code` entity renders as a monospace chip that ONE
+ * long-press selects whole (and copies) instead of dragging a selection across
+ * the line around it, which is the trade the operator chose (2026-09-28). The
+ * single-tap alternative is an inline-keyboard button carrying the Bot API's
+ * copy-text payload; it was removed on purpose, because it cost a row of
+ * buttons under EVERY follow-up card.
+ *
+ * WHERE the span goes: the FIRST occurrence of the ticker, which by
+ * construction is the card's header (`🚀 續漲 REGULARS | …`, `🏁 結案報告
+ * REGULARS | …`) — every builder names `symbol` there and nowhere else, so this
+ * needs no per-card knowledge. A body that does NOT carry the ticker (a
+ * rewrite, or a row with no symbol) is returned untouched rather than
+ * mis-marked: degrading to no chip is the quiet failure, and pasting the wrong
+ * text is the loud one.
+ *
+ * HTML mode is what carries a body entity at all, so every caller sends in it —
+ * and that mode reads `&`, `<` and `>` as MARKUP. The whole body is therefore
+ * escaped here, not just the span: the builders write plain text, and the 💧
+ * drain card's `（< $9.00K，連續 2 次檢查）` proves a bare `<` reaches a live
+ * card. Unescaped it is either swallowed as a broken tag or rejected outright
+ * (cannot parse entities), and a rejected body costs the FOLLOW-UP, not just
+ * the formatting. Escaping on the one path every card body takes is what keeps
+ * that from depending on each future edit to a builder.
+ */
+export function withCopyableTicker(
+  text: string,
+  symbol: string | null | undefined,
+): string {
+  const escaped = escapeHtml(text);
+  const ticker = escapeHtml((symbol ?? "").trim());
+  if (ticker.length === 0) return escaped;
+  const at = escaped.indexOf(ticker);
+  if (at < 0) return escaped;
+  return `${escaped.slice(0, at)}<code>${ticker}</code>${escaped.slice(at + ticker.length)}`;
+}
+
+/** The three characters Telegram's HTML mode treats as markup. */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+/**
  * The only liquidity reading a USD-level rule may judge: DexScreener's.
  *
  * This floor (and LIQ_CRASH_RATIO below, and the row's stored baseline) is
@@ -2195,7 +2243,16 @@ export class PushWatcher {
       sendMessage(
         chatId: string,
         text: string,
-        opts?: { reply_markup?: unknown },
+        /**
+         * `parse_mode` joined this shape when the follow-up cards started
+         * sending HTML (see withCopyableTicker): the card body carries a
+         * <code> span around the ticker, and Telegram only reads an entity
+         * when the body is declared as HTML.
+         */
+        opts?: {
+          reply_markup?: unknown;
+          parse_mode?: "HTML" | "MarkdownV2" | "Markdown";
+        },
       ): Promise<unknown>;
     };
   },
@@ -2693,7 +2750,14 @@ export class PushWatcher {
           // card at worst — never a follow-up.
           const recapCard: Promise<unknown> = this.bot.api.sendMessage(
             expiring[i].chatId,
-            recapMessage(expiring[i]),
+            // The ticker the card PRINTS is the one to mark, so the fallback
+            // here mirrors recapMessage's own header (symbol, else the mint
+            // prefix) instead of guessing with a name the card never wrote.
+            withCopyableTicker(
+              recapMessage(expiring[i]),
+              expiring[i].symbol ?? expiring[i].token.slice(0, 6),
+            ),
+            { parse_mode: "HTML" },
           );
           this.holdForTick(recapCard);
           await this.bounded(recapCard, TRACKER_SEND_CAP_MS, undefined);
@@ -3852,7 +3916,11 @@ export class PushWatcher {
             // success deserves, and that entry is the ONLY proof the next pass
             // can use to refuse the duplicate, because the rollback restores
             // this pass's marks and leaves nothing else behind.
-            const inFlight = this.bot.api.sendMessage(row.chatId, a.text);
+            const inFlight = this.bot.api.sendMessage(
+              row.chatId,
+              withCopyableTicker(a.text, row.symbol),
+              { parse_mode: "HTML" },
+            );
             sent = (await this.bounded(
               inFlight,
               sendLeft,
@@ -4165,9 +4233,17 @@ export class PushWatcher {
     // The keyboard rides the terminal card only (see resumeTrackingKeyboard):
     // every other follow-up card re-derives itself on the next pass, so the
     // user has nothing to undo.
-    const inFlight = this.bot.api.sendMessage(row.chatId, text, {
-      reply_markup: resumeTrackingKeyboard(row.token),
-    });
+    const inFlight = this.bot.api.sendMessage(
+      row.chatId,
+      withCopyableTicker(text, row.symbol),
+      {
+        // HTML is what carries the <code> span around the ticker (see
+        // withCopyableTicker) — every follow-up send asks for it, and this
+        // card's 🔁 恢復追蹤 row is untouched by it.
+        parse_mode: "HTML",
+        reply_markup: resumeTrackingKeyboard(row.token),
+      },
+    );
     // `settled` never rejects: a rejection is a FACT ("Telegram said no") while
     // the timeout is the ABSENCE of one, and not conflating the two is the
     // entire fix (see TerminalSendOutcome).

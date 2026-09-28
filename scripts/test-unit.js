@@ -20,7 +20,8 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterM
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
-const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
+const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
+const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX } = require("../dist/worker.js");
@@ -850,6 +851,81 @@ async function main() {
     assert.equal(terminalRowRepair(["unarmed_alert_clock", "measurement_above_floor"], false), "re_arm_row");
     assert.equal(terminalRowRepair(["lost_completion_write", "measurement_above_floor"], true), "restamp_completion");
     assert.equal(terminalRowRepair(["lost_completion_write", "measurement_above_floor"], false), "re_arm_row");
+  });
+
+  // ---------- follow-up cards: the ticker is a <code> span you can copy ----------
+  //
+  // Every follow-up card is read for ONE name — "🚀 續漲 REGULARS | …" — and the
+  // operator's next move is to paste that ticker into a search box. A message
+  // BODY has no tap target, so the affordance is the ENTITY: the ticker goes out
+  // as an HTML `code` span, which one long-press selects whole. (The single-tap
+  // alternative is an inline-keyboard copy-text button, and it was removed on
+  // purpose — 2026-09-28 — because it cost a row of buttons under every card.)
+  await test("follow-up cards: the ticker goes out as a code span, and the body is escaped", () => {
+    // The header is where every builder names the coin, and it is the FIRST
+    // occurrence — so the span lands there and nowhere else.
+    assert.equal(
+      withCopyableTicker("🚀 續漲 REGULARS | 推送時 $10.00K → $30.00K (+200%)", "REGULARS"),
+      "🚀 續漲 <code>REGULARS</code> | 推送時 $10.00K → $30.00K (+200%)",
+    );
+    // Only the FIRST: a later mention in the body is not turned into a second
+    // chip (a card that quoted its own ticker would otherwise get two).
+    assert.equal(
+      withCopyableTicker("🚀 續漲 X | 峰值回撤 12% — X 仍在", "X"),
+      "🚀 續漲 <code>X</code> | 峰值回撤 12% — X 仍在",
+    );
+    // HTML mode reads &, < and > as markup, and a real card writes `（< $9.00K…`:
+    // an unescaped `<` there is a 400 that costs the whole follow-up, not just
+    // the formatting. So the WHOLE body is escaped, the span included.
+    assert.equal(
+      withCopyableTicker("💧 流動性枯竭 Lobby | LP 僅剩 $7.95K（< $9.00K）& 停止追蹤", "Lobby"),
+      "💧 流動性枯竭 <code>Lobby</code> | LP 僅剩 $7.95K（&lt; $9.00K）&amp; 停止追蹤",
+    );
+    // A ticker carrying markup characters is escaped INSIDE the span: the
+    // search-and-insert runs on the escaped text, so it can neither double
+    // escape nor paste a half-written tag.
+    assert.equal(
+      withCopyableTicker("🚀 續漲 A<B&C | x", "A<B&C"),
+      "🚀 續漲 <code>A&lt;B&amp;C</code> | x",
+    );
+    // No symbol, a blank one, or a ticker the body does not contain: the body
+    // comes back escape-only. No chip is the quiet failure; a mis-placed span
+    // would paste the wrong text.
+    assert.equal(withCopyableTicker("🏁 結案報告 | 判定：橫盤", null), "🏁 結案報告 | 判定：橫盤");
+    assert.equal(withCopyableTicker("🏁 結案報告 | 判定：橫盤", "   "), "🏁 結案報告 | 判定：橫盤");
+    assert.equal(withCopyableTicker("🚀 續漲 REGULARS | x", "OTHER"), "🚀 續漲 REGULARS | x");
+    // ...and a body with no ticker at all is still escaped, because the
+    // escaping is the send's, not the chip's.
+    assert.equal(withCopyableTicker("a < b & c", null), "a &lt; b &amp; c");
+  });
+
+  await test("follow-up cards: all three card sends ask for HTML and mark the ticker (source pin)", () => {
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const src = read("src/pushwatch.ts");
+    // Whitespace-stripped, so what is pinned is the CALL, not the wrapping.
+    const flat = src.replace(/\s+/g, "");
+    const wanted = {
+      "alert card": "withCopyableTicker(a.text,row.symbol)",
+      "terminal card (keeps its resume row)": "withCopyableTicker(text,row.symbol)",
+      "recap card":
+        "withCopyableTicker(recapMessage(expiring[i]),expiring[i].symbol??expiring[i].token.slice(0,6),)",
+    };
+    const missing = Object.entries(wanted)
+      .filter(([, v]) => !flat.includes(v))
+      .map(([k]) => k);
+    assert.equal(missing.length, 0, `ticker not marked on: ${missing.join(", ")}`);
+    // Each of them must ALSO switch that send into HTML mode, or the span
+    // prints as literal tags: three sends, three parse modes.
+    assert.equal(
+      flat.split('parse_mode:"HTML"').length - 1,
+      3,
+      "every follow-up send asks for HTML mode",
+    );
+    // The terminal card keeps the ONE keyboard it had before any of this.
+    assert.ok(flat.includes("reply_markup:resumeTrackingKeyboard(row.token),"));
+    // ...and the per-card copy BUTTON is gone for good: it is what the operator
+    // rejected, so its reappearance is a regression rather than a refactor.
+    assert.ok(!flat.includes("copy_text"), "the per-card copy button is gone");
   });
 
   await test("terminal-row hygiene patch: rules, db method and endpoint land together", () => {
