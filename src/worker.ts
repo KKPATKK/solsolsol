@@ -1561,8 +1561,20 @@ const OUTAGE_ALERT_COOLDOWN_MS = 30 * 60_000;
  * heartbeat: `ms 2149`/`2201`/`2358` at flush), so the pass is funded from
  * the tail that was already going unused. Never widen this number to make
  * room for a new tail stage — the tail IS what is left after the flush.
+ *
+ * RAISED 9_500 → 20_000 on 2026-09-28, with the account on Workers Paid.
+ * Every cut documented above was bought against the Free plan's 10ms CPU wall:
+ * the kill that seemed to move between ~9.6s and ~24s WAS that wall landing
+ * mid-invocation rather than a wall-clock limit (docs/cpu-10ms-root-cause.md —
+ * dead invocations pin at exactly cpuTime 10,000us). This tick measures ~33ms
+ * of CPU: ~3x the Free wall and ~1/900th of the paid 30s, so on this plan the
+ * only constraint left is the cron minute itself, and 20s of it leaves the
+ * next tick ~40s of clear air while the flush reserve (unchanged) still starts
+ * the completion write ~15.5s in. What keeps a HEALTHY tick short is the
+ * scan's own deadline (SCAN_TICK_DEADLINE_MS); this number now only decides
+ * how much of a SLOW tick may finish instead of being cut.
  */
-export const SCAN_TICK_BUDGET_MS = 9_500;
+export const SCAN_TICK_BUDGET_MS = 20_000;
 
 /**
  * The last tracker pass that THREW, with the isolate's own pulse of what it
@@ -2394,8 +2406,14 @@ function beginPreTick(entryAt: number, owner: SubreqOwner = "unknown"): void {
  * a live scan keeps its lease while a dead holder frees it well inside one
  * cron period (the previous fix in this file — the takeover branch below —
  * then re-claims it and the scan proceeds).
+ *
+ * 2026-09-28 (15_000 → 30_000): the tick envelope went to 20s on Workers Paid
+ * (see SCAN_TICK_BUDGET_MS), so the lease has to outlive it again — 1.5x the
+ * honest envelope is the ratio this constant was last sized at. A dead holder
+ * still frees the lease long inside the external monitor's rescue gate, which
+ * needs max(120s, 2 x SCAN_INTERVAL_SECONDS) of silence before it will scan.
  */
-const SCAN_LOCK_TTL_MS = 15_000;
+const SCAN_LOCK_TTL_MS = 30_000;
 /**
  * The cadence gate's jitter budget: slack the configured interval gets before
  * the gate refuses a tick. The gate is `now - heartbeat.at >= gateMs`, and

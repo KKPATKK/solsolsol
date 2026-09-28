@@ -27,7 +27,7 @@ const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedge
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX } = require("../dist/worker.js");
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
-const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
+const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
 const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
@@ -119,20 +119,29 @@ async function main() {
     // the reserve is the flush's, never the scan's.
     assert.equal(scanRaceWindowMs(0), SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS);
     // Live witness 10:01:06Z — the completion row quotes
-    // "scan exceeded its 4386ms race window", which is exactly 614ms of
-    // pre-race taken off the unencumbered window.
-    assert.equal(scanRaceWindowMs(614), 4386);
-    assert.equal(SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 614, 4386);
+    // "scan exceeded its 4386ms race window", which was exactly 614ms of
+    // pre-race taken off the 5_000ms window the FREE envelope left (9_500 -
+    // 4_500). The RELATIONSHIP is what is pinned; the envelope moved to 20_000
+    // on Workers Paid (2026-09-28), so the same front now leaves 14_886ms.
+    assert.equal(
+      scanRaceWindowMs(614),
+      SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 614,
+    );
+    assert.equal(SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 614, 14_886);
     // 1:1 in between, i.e. the pre-race phase cannot hide in a rounding step.
     assert.equal(scanRaceWindowMs(1_000), SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 1_000);
     // NO FLOOR (2026-09-25): 10:53:10Z quotes "scan exceeded its 2500ms race
     // window" (and that tick went on to run 11.5s, losing its flush) — the
     // floor it was clamped to was itself the cause (preRace + 2500 + 4500 >
-    // 9500). The window now drains 1:1 to zero, so a slow front costs the
-    // SCAN and never the completion flush.
-    assert.equal(scanRaceWindowMs(2_500), 2_500);
-    assert.equal(scanRaceWindowMs(5_000), 0);
-    assert.equal(scanRaceWindowMs(9_000), 0);
+    // 9500). The window drains 1:1 to zero, so a slow front costs the SCAN and
+    // never the completion flush — and it drains from whatever the envelope
+    // leaves today (15_500ms), not only from the pre-raise figure.
+    assert.equal(
+      scanRaceWindowMs(2_500),
+      SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - 2_500,
+    );
+    assert.equal(scanRaceWindowMs(SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS), 0);
+    assert.equal(scanRaceWindowMs(SCAN_TICK_BUDGET_MS), 0);
     // A negative pre-race spend (clock skew, a bogus caller value) cannot
     // inflate the window past the unencumbered one.
     assert.equal(
@@ -141,11 +150,11 @@ async function main() {
     );
     // The scan's own deadline (SCAN_TICK_DEADLINE_MS) is what a healthy tick
     // is actually bounded by, so the headroom between the two is the pre-race
-    // budget: 800ms today. Past that, the race — not the scan's deadline —
-    // decides where the sweep stops.
+    // budget: 800ms under the free envelope, 7_500ms under the paid one. Past
+    // that, the race — not the scan's deadline — decides where the sweep stops.
     assert.equal(
       SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - SCAN_TICK_DEADLINE_MS,
-      800,
+      7_500,
     );
   });
 
@@ -181,10 +190,17 @@ async function main() {
       SCAN_RACE_MIN_USEFUL_MS < scanRaceWindowMs(0),
       "the floor must sit below the unencumbered window",
     );
-    // The live witness: preRace 4320ms is exactly the front the 680ms window
-    // came off, and the arithmetic itself must not have moved.
-    assert.equal(scanRaceWindowMs(4_320), 680);
-    assert.equal(scanRaceShedReason(scanRaceWindowMs(4_320)), SCAN_RACE_SHED_REASON);
+    // The live witness, re-read against today's envelope: preRace 4320ms is
+    // exactly the front the 680ms window came off (4_320 + 680 + 4_500 = 9_500,
+    // the free envelope), and the same front now leaves 11_180ms — which is the
+    // point of the 2026-09-28 raise: a front that slow no longer sheds, it
+    // scans.
+    assert.equal(scanRaceWindowMs(4_320), 11_180);
+    assert.equal(scanRaceShedReason(scanRaceWindowMs(4_320)), null);
+    // The shed still fires one pre-race budget further out: the window has to
+    // drain past 14_000ms before it lands under the 1_500ms floor.
+    assert.equal(scanRaceWindowMs(14_500), 1_000);
+    assert.equal(scanRaceShedReason(scanRaceWindowMs(14_500)), SCAN_RACE_SHED_REASON);
     // ...and the call site has to ACT on it: zero the window (0 = the
     // documented no-scan branch) and record why, or a shed is indistinguishable
     // from a cut in the row the operator reads.
@@ -5474,24 +5490,32 @@ async function main() {
 
   await test("cardSendDeadline: a healthy send keeps the internal deadline, a late one is refused", () => {
     const t0 = 1_000_000;
+    // CARD_SEND_TAIL_MS is SCAN_TICK_DEADLINE_MS + 200 (scanner.ts): a send may
+    // run 200ms past the tick's internal deadline and no further. Both numbers
+    // are read off the constant here rather than copied, so the 2026-09-28
+    // raise to 8_000 moves this test with it instead of breaking it.
+    const tail = t0 + SCAN_TICK_DEADLINE_MS + 200;
     // Healthy: unchanged from the pre-fix behaviour — the send still runs to
-    // the tick's own internal deadline (4.2s), because the floor is only a
-    // minimum slice, not a cap.
-    assert.equal(cardSendDeadline(t0, t0 + 2_000), t0 + 4_200);
-    assert.equal(cardSendDeadline(t0, t0 + 3_000), t0 + 4_200);
+    // the tick's own internal deadline, because the floor is only a minimum
+    // slice, not a cap.
+    assert.equal(cardSendDeadline(t0, t0 + 2_000), t0 + SCAN_TICK_DEADLINE_MS);
+    assert.equal(cardSendDeadline(t0, t0 + 3_000), t0 + SCAN_TICK_DEADLINE_MS);
     // Late but still usable: clamped by the tail, not by `now + floor`.
-    assert.equal(cardSendDeadline(t0, t0 + 4_000), t0 + 4_400);
+    assert.equal(cardSendDeadline(t0, tail - 400), tail);
     // The live 2026-09-18 03:44:18Z shape — the send started 4309ms in while
-    // that tick's race window was 4742ms. The old `max(tickDeadline, now +
+    // that tick's race window was 4742ms: the old `max(tickDeadline, now +
     // 600)` granted it until 4909ms, past the window, and the tick died at
-    // 5000ms with the second candidate unsent; now it is refused instead.
-    assert.equal(cardSendDeadline(t0, t0 + 4_309), null);
+    // 5000ms with the second candidate unsent. Under the free envelope
+    // (deadline 4_200, tail 4_400) it was refused — 91ms of slice left — and
+    // under the paid one the same start is inside the deadline.
+    assert.equal(cardSendDeadline(t0, t0 + 4_309), t0 + SCAN_TICK_DEADLINE_MS);
     // Boundary: exactly the minimum slice is still attempted, one ms more is
     // not (the card is deferred, not dropped).
-    assert.equal(cardSendDeadline(t0, t0 + 4_150), t0 + 4_400);
-    assert.equal(cardSendDeadline(t0, t0 + 4_151), null);
+    assert.equal(cardSendDeadline(t0, tail - 250), tail);
+    assert.equal(cardSendDeadline(t0, tail - 249), null);
     // A tick already past the tail can never start one.
     assert.equal(cardSendDeadline(t0, t0 + 9_000), null);
+    assert.equal(cardSendDeadline(t0, tail + 1), null);
   });
 
   await test("cardClaimDeadline: the claim needs room for itself AND the send", () => {
@@ -5502,15 +5526,18 @@ async function main() {
     // (least send).
     assert.equal(cardClaimDeadline(t0, t0 + 3_500), t0 + 3_900);
     // Boundary: exactly 650ms of tail, one ms less is refused.
-    assert.equal(cardClaimDeadline(t0, t0 + 3_550), t0 + 3_950);
-    assert.equal(cardClaimDeadline(t0, t0 + 3_551), null);
+    // Same 200ms tail as the send pair above, read off the constant.
+    const tail = t0 + SCAN_TICK_DEADLINE_MS + 200;
+    // Boundary: exactly 650ms of tail, one ms less is refused.
+    assert.equal(cardClaimDeadline(t0, tail - 850), tail - 850 + 400);
+    assert.equal(cardClaimDeadline(t0, tail - 849), null);
     // The live shape this exists for (2026-09-18 04:32:18Z): the chain
     // reached the claim at 3.79s with 608ms of tail left, the claim's own
     // cap is 1200ms, and the tick died at 5000ms with `pushPhase
-    // send:claim`. It is now deferred before anything is written.
-    assert.equal(cardClaimDeadline(t0, t0 + 3_792), null);
-    // Past the send tail as well.
-    assert.equal(cardClaimDeadline(t0, t0 + 4_200), null);
+    // send:claim`. The free envelope refused that start (608 < 650 + 400);
+    // the paid one leaves it room, so the refusal now lives only in the
+    // send tail's last 850ms.
+    assert.equal(cardClaimDeadline(t0, t0 + 3_792), t0 + 4_192);
     assert.equal(cardClaimDeadline(t0, t0 + 9_000), null);
   });
 
@@ -13080,9 +13107,14 @@ async function main() {
   // ---------- Subrequest counter (src/subreqs.ts) ----------
 
   await test("subreqs: the budget and the ring sizes are the platform facts", async () => {
-    // 50 subrequests per invocation is Workers Free's documented cap and the
-    // number every reading in /health.heartbeat.subreqs is spent against; the
-    // runtime's throw is what kills a tick before its completion flush.
+    // 1,000 subrequests per invocation is the Workers Paid allowance the
+    // Worker runs on since 2026-09-28, and the number every reading in
+    // /health.heartbeat.subreqs is spent against; the runtime's throw is what
+    // kills a tick before its completion flush, and at this size what a tick
+    // drops is decided by the scan's own floors rather than by the platform.
+    assert.equal(SUBREQ_BUDGET, 1_000);
+    // 50 is Workers Free's documented cap, kept as the reference every reading
+    // taken before that date was measured against.
     assert.equal(SUBREQ_BUDGET_FREE, 50);
     // The ring keeps the NEWEST phase points (the dead window's tail).
     assert.equal(SUBREQ_PHASE_RING, 8);
@@ -13119,22 +13151,39 @@ async function main() {
     resetSubreqWindows();
     beginSubreqWindow(1_000);
     const view = subreqView();
-    assert.equal(view.budget, 50, "the platform fact is still published as-is");
+    assert.equal(view.budget, SUBREQ_BUDGET, "the platform fact is still published as-is");
     assert.equal(view.unseenAllowance, 12, "and so is the reserve, so the arithmetic is auditable");
-    assert.equal(view.usable, 38, "the ceiling a tick actually spends against");
+    assert.equal(
+      view.usable,
+      SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE,
+      "the ceiling a tick actually spends against",
+    );
     assert.equal(
       subreqRemaining(),
-      38,
-      "a fresh window reports the USABLE ceiling, not 50 — a caller must not believe it has 12 more than it does",
+      SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE,
+      "a fresh window reports the USABLE ceiling, not the raw budget — a caller must not believe it has 12 more than it does",
     );
     for (let i = 0; i < 30; i += 1) countSubreq();
-    assert.equal(subreqRemaining(), 8, "spendable room falls with the counted calls");
+    assert.equal(
+      subreqRemaining(),
+      SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE - 30,
+      "spendable room falls with the counted calls",
+    );
     // The exact tick that died: 38 counted, 12 the counter still believed were
     // free. With the reserve it is 0, which is what the row and stage gates
     // needed to see.
     for (let i = 30; i < 38; i += 1) countSubreq();
     assert.equal(subreqView().current.total, 38, "the counted total is unchanged — only the ceiling moved");
-    assert.equal(subreqRemaining(), 0, "so the pass would have been refused before it could overrun");
+    assert.equal(
+      subreqRemaining(),
+      SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE - 38,
+      "so the pass is nowhere near a refusal on the plan budget",
+    );
+    // The reading the reserve was SIZED from, kept as arithmetic: on the free
+    // allowance the same 38 counted calls left exactly 0, which is what the
+    // row and stage gates needed to see. On the paid allowance they leave 950.
+    assert.equal(SUBREQ_BUDGET_FREE - SUBREQ_UNSEEN_ALLOWANCE - 38, 0);
+    assert.equal(SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE - 38, 950);
     resetSubreqWindows();
   });
 
@@ -13466,7 +13515,7 @@ async function main() {
     const workerSrc = read("src/worker.ts");
     const applied = {
       "subreqs (the probe exists)": subreqsSrc.includes(
-        "exportfunctionsubreqRemaining(budget:number=SUBREQ_BUDGET_FREE):number{",
+        "exportfunctionsubreqRemaining(budget:number=SUBREQ_BUDGET):number{",
       ),
       "pushwatch (both ceilings are named)":
         pushwatchSrc.includes("constTRACKER_SUBREQ_FLOOR=3;") &&
@@ -13626,7 +13675,7 @@ async function main() {
         subreqsSrc.includes("returnMath.max(0,budget-SUBREQ_UNSEEN_ALLOWANCE-current.total);"),
       "subreqs (the view publishes both)":
         subreqsSrc.includes("unseenAllowance:SUBREQ_UNSEEN_ALLOWANCE,") &&
-        subreqsSrc.includes("usable:Math.max(0,SUBREQ_BUDGET_FREE-SUBREQ_UNSEEN_ALLOWANCE),"),
+        subreqsSrc.includes("usable:Math.max(0,SUBREQ_BUDGET-SUBREQ_UNSEEN_ALLOWANCE),"),
       "subreqs (the raw headroom is gone)":
         !subreqsSrc.includes("returnMath.max(0,budget-current.total);"),
       "scanner (the note is published to memory)":

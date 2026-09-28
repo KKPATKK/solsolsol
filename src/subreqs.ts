@@ -51,10 +51,29 @@
  */
 
 /**
- * The runtime's per-invocation subrequest allowance on Workers Free. Pinned
- * here because every reading this counter produces is only meaningful against
- * it, and because the number is a platform fact rather than a tuning knob:
- * exceeding it throws mid-tick, wherever the next call happens to be.
+ * The runtime's per-invocation subrequest allowance on the plan this Worker
+ * runs on. Pinned here because every reading this counter produces is only
+ * meaningful against it, and because the number is a platform fact rather
+ * than a tuning knob: exceeding it throws mid-tick, wherever the next call
+ * happens to be.
+ *
+ * 2026-09-28: the account moved to Workers Paid, whose allowance is 1,000 —
+ * twenty times the Free plan this bot was built on. Nothing else about the
+ * counter changes: the gates that spend against it (SCAN_SUBREQ_FLOOR,
+ * TRACKER_SUBREQ_FLOOR/_RESERVE, TRACKER_PASS_SUBREQ_RESERVE, CHAIN_SUBREQ_FLOOR)
+ * are ABSOLUTE reserves sized for a 50-subrequest invocation, so on this
+ * budget they stop binding — the scan no longer stands down its optional legs
+ * and the tracker pass no longer refuses alerting rows to keep a tail intact.
+ * They are deliberately left at their sizes rather than re-scaled: a reserve
+ * that cannot bind costs nothing, while re-scaling them would re-arm exactly
+ * the refusals the wider allowance exists to remove.
+ */
+export const SUBREQ_BUDGET = 1_000;
+/**
+ * The Workers Free allowance (50) this counter was designed against. Kept as
+ * the REFERENCE for every reading taken before 2026-09-28: /health and the
+ * /debug pages quote raw window totals, and those totals were measured
+ * against this number, not against the current one.
  */
 export const SUBREQ_BUDGET_FREE = 50;
 /**
@@ -174,7 +193,7 @@ export interface SubreqWindowView {
 }
 
 export interface SubreqView {
-  /** The allowance every window is spent against (SUBREQ_BUDGET_FREE). */
+  /** The allowance every window is spent against (SUBREQ_BUDGET). */
   budget: number;
   /**
    * Subrequests the counter cannot see (SUBREQ_UNSEEN_ALLOWANCE), reserved
@@ -185,8 +204,8 @@ export interface SubreqView {
    * `budget - unseenAllowance`: the ceiling a tick may actually spend
    * against. Published beside `budget` so the reservation is visible in
    * /health rather than buried in the arithmetic — a reader comparing a
-   * window's `total` against 50 would otherwise be reading against a number
-   * the tick never spends to.
+   * window's `total` against the budget would otherwise be reading against a
+   * number the tick never spends to.
    */
   usable: number;
   /** The window being spent right now (this invocation). */
@@ -316,9 +335,9 @@ export function subreqView(): SubreqView {
     hosts: hostRows(w.hosts),
   });
   return {
-    budget: SUBREQ_BUDGET_FREE,
+    budget: SUBREQ_BUDGET,
     unseenAllowance: SUBREQ_UNSEEN_ALLOWANCE,
-    usable: Math.max(0, SUBREQ_BUDGET_FREE - SUBREQ_UNSEEN_ALLOWANCE),
+    usable: Math.max(0, SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE),
     current: flat(current),
     recent: recent.map(flat),
     windows,
@@ -353,9 +372,9 @@ export function subreqView(): SubreqView {
  * test that does not install the probe) sees room, never a false zero.
  *
  * Optional `budget` override exists for the probe seam only; the tick path
- * spends against SUBREQ_BUDGET_FREE, which is a platform fact.
+ * spends against SUBREQ_BUDGET, which is a platform fact.
  */
-export function subreqRemaining(budget: number = SUBREQ_BUDGET_FREE): number {
+export function subreqRemaining(budget: number = SUBREQ_BUDGET): number {
   if (!Number.isFinite(budget)) return Number.POSITIVE_INFINITY;
   return Math.max(0, budget - SUBREQ_UNSEEN_ALLOWANCE - current.total);
 }

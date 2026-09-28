@@ -154,8 +154,19 @@ const SCAN_TIMEOUT_MS = 25_000;
  * far past the tick). Every step now races its own chain deadline (see
  * CANDIDATE_PUSH_RESERVE_MS / bestEffort), so the coin that cleared its
  * gates always reaches the send.
+ *
+ * 2026-09-28 (4_200 → 8_000): the worker's envelope went to 20s on Workers
+ * Paid (see SCAN_TICK_BUDGET_MS), so this deadline no longer races a 10ms CPU
+ * wall — it races the race window, which is now ~15.5s. 8_000 keeps ~7.5s of
+ * margin against it and, with SCAN_GATE_RESERVE_MS unchanged, widens the front
+ * window to 6_400ms: the front caps' worst case (FEED_DEADLINE_MS 900 +
+ * POOL_FETCH_BUDGET_MS 1_600 + PAIRS_FETCH_BUDGET_MS 1_000 = 3_500) now fits
+ * inside it with room to spare, where the 2_600ms window could leave the pair
+ * phase as little as 100ms once the feeds and the pool read rode their own
+ * caps. The gate chain — the only phase that can push a coin — is the
+ * beneficiary: it keeps its 1_600ms reserve and gains the front phases' slack.
  */
-export const SCAN_TICK_DEADLINE_MS = 4_200;
+export const SCAN_TICK_DEADLINE_MS = 8_000;
 /**
  * Subrequests the scan refuses to spend on OPTIONAL work, so the tick's tail
  * still fits (`SCAN_SUBREQ_FLOOR`).
