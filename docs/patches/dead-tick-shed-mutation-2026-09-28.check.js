@@ -16,8 +16,8 @@
  *                                             -> test-tick-path (ceiling rule)
  *   M4  worker: drainShedReason always returns null
  *                                             -> test-tick-path (ceiling rule)
- *   M5  worker: the drain is fired from onTickEnd again (the pre-fix shape, i.e.
- *       before the completion flush)          -> test-unit (flush ordering guard)
+ *   M5  worker: the shed never reaches the drain's call site (the wiring is
+ *       dropped, the ceiling rule stays intact) -> test-unit (wiring guard)
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -60,19 +60,24 @@ const MUTATIONS = [
     id: "M4",
     what: "worker: drainShedReason never names the reason",
     file: "worker",
-    from: `  return deadPredecessor ? "dead-predecessor" : null;`,
-    to: "  return null;",
+    // The whole function, so the `to` text is unique enough to undo a run that
+    // was killed before its own restore (see restoreLeftovers).
+    from:
+      'export function drainShedReason(deadPredecessor: boolean): string | null {\n' +
+      '  return deadPredecessor ? "dead-predecessor" : null;\n' +
+      "}",
+    to:
+      'export function drainShedReason(deadPredecessor: boolean): string | null {\n' +
+      "  return null;\n" +
+      "}",
     test: "scripts/test-tick-path.js",
   },
   {
     id: "M5",
-    what: "worker: the drain is fired from onTickEnd again (before the flush)",
+    what: "worker: the shed never reaches the drain's call site",
     file: "worker",
-    from: "            view.pushWatchFail = trackerPassFailure;\n",
-    to:
-      "            view.pushWatchFail = trackerPassFailure;\n" +
-      "            const drained = drainDeferredWrites();\n" +
-      "            void drained;\n",
+    from: "        shed: drainShedReason(deadPredecessorThisTick),",
+    to: "        shed: null,",
     test: "scripts/test-unit.js",
   },
 ];
@@ -81,6 +86,19 @@ const wanted = process.argv.slice(2);
 const picked = wanted.length
   ? MUTATIONS.filter((m) => wanted.includes(m.id))
   : MUTATIONS;
+
+// A run killed by the shell's timeout cannot restore inside its own process
+// (2026-09-28: that is exactly how a leftover `shed: null` reached a build), so
+// every run first undoes any mutation whose `to` text is still on disk. The
+// `to` strings are unique by construction (M4 carries its signature for this).
+for (const m of MUTATIONS) {
+  const file = SRC[m.file];
+  const src = fs.readFileSync(file, "utf8");
+  if (src.includes(m.to)) {
+    fs.writeFileSync(file, src.replace(m.to, m.from));
+    console.log(`! restored a leftover ${m.id} mutation in ${m.file}`);
+  }
+}
 
 let escaped = 0;
 for (const m of picked) {

@@ -2353,22 +2353,16 @@ async function main() {
       false,
       "the fire-and-forget drain must be replaced, not kept alongside the held one",
     );
-    // ...and since 2026-09-28 its call site sits AFTER the completion flush in
-    // program order. It used to live in tickprobe's onTickEnd hook, which runs
-    // BEFORE `db?.persistScanCompletion(...)` (that hook is the scanner's
-    // runOnce wrapper's `finally`, and the flush payload is only built once
-    // runOnce returns) — so up to DEFERRED_MAX_CALLS_PER_DRAIN bookkeeping round
-    // trips were spent in front of the one write a tick cannot lose.
-    const drainAt = workerSrc.indexOf("constdrained=drainDeferredWrites(");
-    const flushAt = workerSrc.indexOf("db?.persistScanCompletion(");
-    assert.ok(flushAt !== -1, "the completion flush is still a call site here");
+    // ...and the death-driven ceiling REACHES that call site (2026-09-28): the
+    // same marker that pins the slot would keep passing if the wiring were
+    // dropped and the drain went back to the normal ten-call ceiling on every
+    // tick — which is the whole regression, since the drain's own unit test
+    // exercises drainDeferredWrites directly and the rule test only checks the
+    // two pure helpers.
     assert.ok(
-      drainAt !== -1,
-      "the held drain call site is still here",
-    );
-    assert.ok(
-      drainAt > flushAt,
-      "the drain must be fired AFTER the completion flush",
+      workerSrc.includes("maxCalls:drainCallCeiling(deadPredecessorThisTick)") &&
+        workerSrc.includes("shed:drainShedReason(deadPredecessorThisTick)"),
+      "the shed must reach the drain's call site",
     );
     console.log("  ℹ writeDrain waitUntil patch present - the cron drain is held");
   });

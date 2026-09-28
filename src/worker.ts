@@ -3591,19 +3591,53 @@ async function ensureInitialized(env: Env): Promise<void> {
             // database just refused (live 2026-09-25).
             view.pushWatchLive = trackerPassPulse();
             view.pushWatchFail = trackerPassFailure;
-            // The deferral drain is deliberately NOT fired here (moved
-            // 2026-09-28 to the tick's tail — see the tracker pass below).
-            // This hook runs BEFORE the worker's completion flush: it is the
-            // scanner's runOnce wrapper's `finally`, and the flush payload is
-            // only built once runOnce returns. Firing here therefore put up to
-            // DEFERRED_MAX_CALLS_PER_DRAIN bookkeeping round trips IN FRONT of
-            // the one write a tick cannot lose, while the drain's own contract
-            // said "called by the worker AFTER its completion flush". Live
-            // 2026-09-28 00:33-00:53Z: twelve cron ticks in twenty minutes
-            // lost their completion while this hook was free to spend ten
-            // calls behind each of them. `writeDrain` above still describes
-            // the drain that ran after the PREVIOUS tick, unchanged by the
-            // move.
+            // Fire the drain WITHOUT awaiting it — and, on a tick that
+            // backfilled a death, under a ONE-CALL ceiling: the tick's budget
+            // is done with these writes (that is the whole point of deferring
+            // them), so the invocation tail must not pay for them either. The
+            // queue is module state, so an isolate recycled before the drain
+            // lands simply hands the same calls to the next tick's drain -- in
+            // call order, which is the order the scanner wrote them in (the
+            // registration insert first, then the max-mcap UPDATE). Same
+            // pattern the deferral-counter sync already relies on ("its
+            // promise is left running -- an idempotent write is welcome to
+            // land late").
+            //
+            // THIS HOOK RUNS BEFORE THE COMPLETION FLUSH (it is the scanner's
+            // runOnce wrapper `finally`), so these round trips do sit in front
+            // of the one write a tick cannot lose, and that is deliberate:
+            // moving the drain behind the flush was shipped 2026-09-28 02:21Z
+            // and reverted within the hour, because post-flush there is NO
+            // room left — the check below is `subreqRemaining() <= reserve`
+            // and the flush has already spent its share, so the queue stopped
+            // draining outright (`calls 0` on every tick, `owedTokens`
+            // 124 -> 244 -> 293 -> 344 -> 420 pinned at the force cap) against
+            // `calls 1-4` with a queue that fell again on the build before it.
+            // What protects the flush instead is the death-driven shed: the
+            // tick that backfilled a death — the one that has to land a
+            // completion to end the stretch — spends ONE call here instead of
+            // up to DEFERRED_MAX_CALLS_PER_DRAIN. Moving the drain safely
+            // would need a real budget SPLIT (an explicit share for the drain,
+            // the flush and the pass) rather than one reserve they take turns
+            // measuring against.
+            const drained = drainDeferredWrites(subreqRemaining, {
+              maxCalls: drainCallCeiling(deadPredecessorThisTick),
+              shed: drainShedReason(deadPredecessorThisTick),
+            }).then(() => flushObservedLiquidity());
+            // Keep the isolate alive for it when the handler handed us a
+            // waitUntil (see tickWaitUntil): an un-awaited promise is
+            // cancelled the instant the handler returns, which is exactly
+            // why these writes never landed on the cron path.
+            if (tickWaitUntil) {
+              try {
+                tickWaitUntil(drained);
+              } catch {
+                // A stale context must never break the tick's tail.
+                void drained;
+              }
+            } else {
+              void drained;
+            }
           },
           db,
           deferWrites: true,
@@ -4442,39 +4476,7 @@ async function runScan(
         }
         }
       }
-      // Deferred-write drain (with the observed-liquidity persist chained
-      // behind it): the tick's bookkeeping, fired AFTER the completion flush
-      // above — the order its own contract always claimed, and the reason it
-      // moved out of tickprobe's onTickEnd (that hook runs before this flush,
-      // so it used to spend up to DEFERRED_MAX_CALLS_PER_DRAIN round trips in
-      // front of the one write a tick cannot lose).
-      //
-      // Fired WITHOUT awaiting it, held by waitUntil: the invocation tail must
-      // not pay for these writes, and the queue is module state, so an isolate
-      // recycled before the batch lands hands the same calls — in the same
-      // order — to the next tick's drain (the registration insert first, then
-      // the max-mcap UPDATE).
-      //
-      // ONE call when this tick backfilled a dead predecessor
-      // (DEFERRED_DEAD_PREDECESSOR_MAX_CALLS): that tick is the one that has to
-      // prove the deaths are over, so the invocation's remaining allowance goes
-      // to the pass below and to the deferral sync behind it — and whatever
-      // this drain does not land stays owed, because the queue coalesces.
-      const drained = drainDeferredWrites(subreqRemaining, {
-        maxCalls: drainCallCeiling(deadPredecessorThisTick),
-        shed: drainShedReason(deadPredecessorThisTick),
-      }).then(() => flushObservedLiquidity());
-      if (tickWaitUntil) {
-        try {
-          tickWaitUntil(drained);
-        } catch {
-          // A stale context must never break the tick's tail.
-          void drained;
-        }
-      } else {
-        void drained;
-      }
-      // Post-push tracker pass — the tick's LARGEST tail work, funded by the
+      // Post-push tracker pass — the tick's FIRST tail work, funded by the
       // budget the scan left over (see TRACKER_PASS_BUDGET_MS). It runs after
       // the completion flush on purpose (the flush is the one write a tick
       // cannot lose, and the pass bounds every stage of its own) and BEFORE

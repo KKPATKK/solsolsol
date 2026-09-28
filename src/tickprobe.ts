@@ -390,11 +390,13 @@ export const DEFERRED_MAX_CALLS_PER_DRAIN = 10;
  *
  * WHY (2026-09-28): a tick that backfilled a death is the tick that has to
  * prove the wave of deaths is over — its own completion flush is the write that
- * ends the stretch — and the drain sits behind that flush in the SAME
- * invocation. Live 2026-09-28 00:33-00:53Z: twelve cron ticks in twenty minutes
- * died before their flush while the tick was still free to spend ten drain
- * round trips (a spend the libsql client's own retries can multiply into two or
- * three platform subrequests each, see docs/scan-completion-loss.md). Landing
+ * ends the stretch — and the drain is fired from that same tick, in front of
+ * that flush (see the worker's onTickEnd hook: moving it behind the flush was
+ * measured and reverted on 2026-09-28, see docs/round-trips.md §4.45). Live
+ * 2026-09-28 00:33-00:53Z: twelve cron ticks in twenty minutes died before their
+ * flush while the tick was still free to spend ten drain round trips (a spend
+ * the libsql client's own retries can multiply into two or three platform
+ * subrequests each, see docs/scan-completion-loss.md). Landing
  * ONE slice still moves the bookkeeping forward — the queue coalesces, so what
  * is not landed stays owed and is re-offered by the next tick — while the rest
  * of the invocation's allowance goes to the flush, the tracker pass and the
