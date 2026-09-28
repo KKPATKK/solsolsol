@@ -148,6 +148,67 @@ async function main() {
     );
   });
 
+  // ---------- a window too small to scan in is refused, not spent ----------
+  // Live 2026-09-28 03:50-04:18Z: 26 consecutive ticks completed with
+  // "scan exceeded its 680ms race window … preRace 4320ms" and
+  // profiles 0 / pool 0 / candidates 0, every one of them on a minute that also
+  // carried an exceededResources at 10,000-21,752us. The scan was granted a
+  // window it could do nothing in. The rule is pure and pinned here rather than
+  // inferred from whatever /health happens to show.
+  await test("race window shed: a window under the pair-phase floor is refused, not spent", () => {
+    const {
+      scanRaceShedReason,
+      SCAN_RACE_MIN_USEFUL_MS,
+      SCAN_RACE_SHED_REASON,
+      scanRaceWindowMs,
+    } = require("../dist/worker.js");
+    // The boundary, both sides of it.
+    assert.equal(
+      scanRaceShedReason(SCAN_RACE_MIN_USEFUL_MS - 1),
+      SCAN_RACE_SHED_REASON,
+      "one millisecond under the floor is a shed",
+    );
+    assert.equal(scanRaceShedReason(SCAN_RACE_MIN_USEFUL_MS), null, "at the floor it scans");
+    assert.equal(SCAN_RACE_SHED_REASON, "race-window-shed");
+    // The two live shapes that named the number.
+    assert.equal(scanRaceShedReason(680), SCAN_RACE_SHED_REASON, "the 680ms no-op window");
+    assert.equal(scanRaceShedReason(3_430), null, "the 3430ms tick that landed profiles 25");
+    // A HEALTHY tick can never be shed: the floor has to stay under the window
+    // an unencumbered front gets, or it would refuse windows that today carry
+    // the whole sweep.
+    assert.ok(
+      SCAN_RACE_MIN_USEFUL_MS < scanRaceWindowMs(0),
+      "the floor must sit below the unencumbered window",
+    );
+    // The live witness: preRace 4320ms is exactly the front the 680ms window
+    // came off, and the arithmetic itself must not have moved.
+    assert.equal(scanRaceWindowMs(4_320), 680);
+    assert.equal(scanRaceShedReason(scanRaceWindowMs(4_320)), SCAN_RACE_SHED_REASON);
+    // ...and the call site has to ACT on it: zero the window (0 = the
+    // documented no-scan branch) and record why, or a shed is indistinguishable
+    // from a cut in the row the operator reads.
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const workerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8"),
+    );
+    assert.ok(
+      workerSrc.includes("constscanRaceMs=raceShedReason?0:grantedRaceMs;"),
+      "the shed must zero the granted window",
+    );
+    assert.ok(
+      workerSrc.includes("if(raceShedReason)noteSkipReason(raceShedReason);"),
+      "and must record the reason, or a shed reads as a timeout",
+    );
+    assert.ok(
+      workerSrc.includes("scanshed:thefrontlefta"),
+      "the row must say shed, not exceeded",
+    );
+  });
+
   // ---------- the scan yields the tracker pass its subrequests -------------
   //
   // The pass runs LAST and is the residual claimant of the invocation's 50;

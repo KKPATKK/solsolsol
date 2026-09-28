@@ -689,6 +689,32 @@ installTickProbe(fakeScanner, {
     console.log("death-driven drain ceiling: pass");
   }
 
+  // ---------- the race-window shed floor (worker.ts scanRaceShedReason) ------
+  // The tick-level counterpart of the drain ceiling above, and the same shape: a
+  // pure rule returning null for the ordinary case. Live 2026-09-28 03:50-04:18Z
+  // 26 consecutive ticks landed profiles 0 behind race windows of 680ms while the
+  // isolate was CPU-starved (an exceededResources on every one of those minutes).
+  // A window that cannot reach the scan's pair phase — a FIXED 1,000ms behind a
+  // ~541ms feed — cannot evaluate a single coin, so the scan is SHED: the
+  // completion still lands, the scan does not run.
+  {
+    const { scanRaceShedReason, SCAN_RACE_MIN_USEFUL_MS, scanRaceWindowMs } =
+      require("../dist/worker.js");
+    assert.equal(
+      scanRaceShedReason(SCAN_RACE_MIN_USEFUL_MS - 1),
+      "race-window-shed",
+      "one millisecond under the floor is a shed",
+    );
+    assert.equal(scanRaceShedReason(SCAN_RACE_MIN_USEFUL_MS), null, "at the floor it scans");
+    assert.equal(scanRaceShedReason(680), "race-window-shed", "the live no-op window");
+    assert.equal(
+      scanRaceShedReason(scanRaceWindowMs(0)),
+      null,
+      "a healthy front is never shed",
+    );
+    console.log("race-window shed floor: pass");
+  }
+
   // ---------- bounded recovery awaits (worker.ts recoveryAwait) ----------
   // The recovery runs BEFORE the scan, on the ticks that are already in
   // trouble — so every round trip it makes is bounded. A hung write there used

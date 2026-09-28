@@ -110,10 +110,15 @@ async function main() {
       );
     }
     if (prog) {
+      // `front` is the split this stamp was written with (2026-09-28, change A):
+      // on the admission stamp it is the preStart half alone, on a phase or
+      // postscan stamp the whole `front = preStart + preRace` line.
       console.log(
         `tick_progress: stage ${prog.stage} at ${iso(prog.at)} +${prog.ms}ms ` +
-          `subreqs ${prog.subreqs} err ${prog.err ?? "-"}`,
+          `subreqs ${prog.subreqs}`,
       );
+      if (prog.front) console.log(`  front: ${prog.front}`);
+      if (prog.err) console.log(`  err: ${prog.err}`);
     }
     if (sub) {
       console.log(

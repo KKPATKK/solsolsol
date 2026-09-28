@@ -1946,6 +1946,11 @@ export function buildPreTickSplit(input: {
  * `scanner.abort()` stops the scan at its next phase boundary, and the row
  * that lands says so. A completed 0s scan (candidate deferred, re-offered
  * next tick) beats a dead tick that evaluates nothing.
+ *
+ * THE SHED FLOOR IS NOT A GRANT FLOOR (2026-09-28): the arithmetic below still
+ * drains 1:1 to zero and still returns 0 rather than a minimum, so nothing HERE
+ * changed. What changed is what the CALLER does with a window this small — see
+ * SCAN_RACE_MIN_USEFUL_MS and scanRaceShedReason.
  */
 export function scanRaceWindowMs(preRaceSpendMs: number): number {
   return Math.max(
@@ -1955,6 +1960,59 @@ export function scanRaceWindowMs(preRaceSpendMs: number): number {
       SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - preRaceSpendMs,
     ),
   );
+}
+
+/**
+ * The smallest race window a scan can still be GRANTED — below it the tick's
+ * scan is SHED instead (see scanRaceShedReason).
+ *
+ * WHY A FLOOR IS RIGHT HERE even though granting one is not (2026-09-28): the
+ * floor removed from the GRANT in 2026-09-25 clamped the window UPWARDS, which
+ * broke `preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS` and killed the very
+ * tick it was meant to protect. This one clamps nothing: it only decides whether
+ * a window that is ALREADY too small gets spent on a scan at all, so it can
+ * never lengthen a tick.
+ *
+ * WHERE THE NUMBER COMES FROM (measured, not chosen). The scan's own front is
+ * the feed phase — live /health 2026-09-28 04:54Z read `feedsMs 541` — and the
+ * pair phase behind it is a FIXED 1,000ms window (PAIRS_FETCH_BUDGET_MS), so a
+ * granted window under ~1,541ms cannot reach the pair phase and cannot evaluate
+ * a single coin, which is the only way a tick can push. The live readings sit
+ * on either side of that line: ticks cut at a 680ms window landed
+ * `profiles 0 pool 0 candidates 0` for 26 minutes straight (03:50-04:18Z,
+ * while the isolate was CPU-starved), while ticks cut at 3,430ms and 3,629ms
+ * landed `profiles 25` and `profiles 31` with candidates beside them. 1,500
+ * keeps the line between the two with room on both sides.
+ *
+ * WHAT A SHED TICK COSTS: one rotation turn of evaluation, exactly like every
+ * other budget cut — the re-eval pool re-offers the candidate next tick. What it
+ * saves is the whole scan: in the 680ms case the feeds, the pool query and the
+ * scan's CPU were all spent to produce a row that says `profiles 0`.
+ */
+export const SCAN_RACE_MIN_USEFUL_MS = 1_500;
+
+/**
+ * The skip reason a tick records when its granted race window is too small to
+ * scan in (see SCAN_RACE_MIN_USEFUL_MS), or null when the window is usable.
+ *
+ * Same shape as drainShedReason's rule: a pure function returning null for the
+ * ordinary case, exported so the boundary is pinned by a test rather than by a
+ * comment. The caller ZEROES the window when this is non-null, which reuses the
+ * already-tested `scanRaceMs === 0` branch — the timeout fires at once,
+ * abort() stops the scan at its next phase boundary, and the completion row (the
+ * tick's mandatory half, and the only thing the no-completion alert reads) still
+ * lands.
+ *
+ * Recording the reason as well is what makes a shed COUNTABLE: in scan_history
+ * a shed tick looks like any other timeout, and a shed and a genuine cut have
+ * different fixes.
+ */
+export const SCAN_RACE_SHED_REASON = "race-window-shed";
+
+export function scanRaceShedReason(grantedRaceMs: number): string | null {
+  return grantedRaceMs < SCAN_RACE_MIN_USEFUL_MS
+    ? SCAN_RACE_SHED_REASON
+    : null;
 }
 
 /**
@@ -4240,7 +4298,16 @@ async function runScan(
       // preRace + scanRace + flush <= SCAN_TICK_BUDGET_MS no matter how slow
       // the pre-race phase was, so there is always time left to land the
       // flush before Cloudflare kills the invocation.
-      const scanRaceMs = scanRaceWindowMs(Date.now() - startedAt);
+      const grantedRaceMs = scanRaceWindowMs(Date.now() - startedAt);
+      // A window the scan cannot reach its pair phase in is SHED, not granted
+      // (2026-09-28): the tick keeps its completion flush — the mandatory half,
+      // and the only thing the no-completion alert reads — and gives up a scan
+      // that could only land `profiles 0`. Zeroing the window reuses the
+      // documented `scanRaceMs === 0` branch below, and the reason is recorded
+      // so the shed shows up in the skip counters instead of reading as a cut.
+      const raceShedReason = scanRaceShedReason(grantedRaceMs);
+      if (raceShedReason) noteSkipReason(raceShedReason);
+      const scanRaceMs = raceShedReason ? 0 : grantedRaceMs;
       // Publish the split BEFORE the race runs: a tick the race cuts must
       // still say how much of its window the pre-race phase took (see
       // PreTickView — this is the number the race arithmetic uses).
@@ -4338,10 +4405,16 @@ async function runScan(
       // separates a CPU-heavy payload from a slow claim round trip, which
       // have different fixes.
       lastScanError = timedOut
-        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, ${frontSplitNote(preTick)})`
+        ? raceShedReason
+          ? `scan shed: the front left a ${grantedRaceMs}ms window, under the ${SCAN_RACE_MIN_USEFUL_MS}ms floor it takes to reach the pair phase (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, ${frontSplitNote(preTick)})`
+          : `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, ${frontSplitNote(preTick)})`
         : null;
       if (timedOut) {
-        console.error(`[worker] scan ran past its ${scanRaceMs}ms race window — completion written with timeout flag`);
+        console.error(
+          raceShedReason
+            ? `[worker] scan shed: only ${grantedRaceMs}ms of race window is under the ${SCAN_RACE_MIN_USEFUL_MS}ms floor — completion written without scanning`
+            : `[worker] scan ran past its ${scanRaceMs}ms race window — completion written with timeout flag`,
+        );
       }
     } catch (err) {
       lastScanOk = false;
