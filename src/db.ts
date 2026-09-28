@@ -756,6 +756,25 @@ export function schemaFingerprint(statements: readonly string[]): string {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
+/**
+ * The graduated-rotation slot for a clock reading — the ONE computation behind
+ * both pool queries AND the edge-cache key that fronts them (2026-09-28).
+ *
+ * It was two identical inline expressions (getReevalPool and
+ * getReevalPoolBatched) until the pool snapshot cache needed the same slot in
+ * its URL. A third copy is the kind of drift that turns into "the cache
+ * answered for the wrong window", so it lives here now. Callers must pass the
+ * same rotationPeriodMs they pass in the query opts — production uses the
+ * configured REEVAL_POOL_CACHE_SECONDS, which is also the cache TTL, so each
+ * expiry advances to the next slot.
+ */
+export function poolRotationSlot(
+  now: number,
+  rotationPeriodMs: number = POOL_ROTATION_PERIOD_MS,
+): number {
+  return Math.floor(now / rotationPeriodMs);
+}
+
 export class Db {
   /**
    * Entries kept in the shared delivery ring (see recordPushDelivery).
@@ -1338,7 +1357,7 @@ export class Db {
         Math.min(rotLimit, Math.round(rotLimit * POOL_NEAR_LIMIT_SHARE)),
       );
       const farLimit = Math.max(0, rotLimit - nearLimit);
-      const slot = Math.floor(now / (opts.rotationPeriodMs ?? POOL_ROTATION_PERIOD_MS));
+      const slot = poolRotationSlot(now, opts.rotationPeriodMs);
       if (rotHi > nearLo && nearLimit > 0) {
         const slotW = (rotHi - nearLo) / nearSlots;
         const s = slot % nearSlots;
@@ -3535,7 +3554,7 @@ export class Db {
       Math.min(rotLimit, Math.round(rotLimit * POOL_NEAR_LIMIT_SHARE)),
     );
     const farLimit = Math.max(0, rotLimit - nearLimit);
-    const slot = Math.floor(now / (opts.rotationPeriodMs ?? POOL_ROTATION_PERIOD_MS));
+    const slot = poolRotationSlot(now, opts.rotationPeriodMs);
     // Near zone: entry → entry + POOL_NEAR_WINDOW_MS of age — fresh
     // in-window coins, most likely to cross the gates → frequent sweep.
     if (rotHi > nearLo && nearLimit > 0) {
