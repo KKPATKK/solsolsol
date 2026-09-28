@@ -3159,3 +3159,15 @@ tracker pass 自己嗰個 cron 落喺同一個 isolate，會**截斷** scan 嗰�
 - 證據要留住：Cloudflare 分析 API 嘅 Free 保留期短，`scripts/cf-invocations.mjs` 繼續留（Paid 之後一樣可以
   當佢係「有冇 tick 又封頂」嘅探針）；`.github/workflows/cf-invocations.yml` 個 `schedule:` 就係為咗呢件事
   而暫時存在。
+
+---
+
+## 唔屬於呢條線：同日嘅兩個 feed dial（2026-09-28 Tier 2）
+
+同日另一批改動係兩個 discovery feed 嘅 cap：`JUPITER_RECENT_LIMIT` 20 → 30（生效，`jup 30`）同
+`DEXSCREENER_BOOSTS_LIMIT` 20 → 30（量出嚟係 no-op，`boosts 17` 改前改後一樣）。
+
+**佢哋同 round trip 無關，所以唔屬於上面任何一節**：兩個 list 本來就每 tick 都抓，改 cap 唔加 request、
+唔加 host、唔加 rate-limit bucket（實測 `dex.http429` 0、`budgetDrops` 0、`blockedForMs` 0）。
+完整量度（成本表、p50、以及 boosts 嗰個**負面結果**嘅成因：上游 30 行係跨鏈，client 先 filter `solana`
+後 slice）記錄喺 `docs/tier2-2026-09-28.md`。
