@@ -42,7 +42,11 @@ const { loadConfig } = require("../dist/config.js");
 const { Db, COLUMN_PROBE_TABLES } = require("../dist/db.js");
 // The eval phase's own code (see the eval legs): the tick's per-coin work is
 // measured by CALLING the function the tick calls, never by re-implementing it.
-const { Scanner, POOL_LIQUIDITY_PRUNE_RATIO } = require("../dist/scanner.js");
+const {
+  Scanner,
+  POOL_LIQUIDITY_PRUNE_RATIO,
+  POOL_MCAP_PRUNE_RATIO,
+} = require("../dist/scanner.js");
 const { DexScreenerClient } = require("../dist/dexscreener.js");
 const { fmtUsd } = require("../dist/format.js");
 const { parseJupTrendTokens } = require("../dist/jupfeeds.js");
@@ -382,7 +386,10 @@ async function main() {
       nearSlots: config.reevalNearSlots,
       farSlots: config.reevalFarSlots,
       rotationPeriodMs: config.reevalPoolCacheMs,
-      minQualifyMcap: poolMinMcapUsd * 0.6,
+      // The scanner's own constants, so this profile can never measure a
+      // pool the tick would not have read (2026-09-28: both floors went to
+      // 0.8 — POOL_LIQUIDITY_PRUNE_RATIO below, POOL_MCAP_PRUNE_RATIO here).
+      minQualifyMcap: poolMinMcapUsd * POOL_MCAP_PRUNE_RATIO,
       maxQualifyMcap: poolMaxMcapUsd * 2,
       // The scanner's own constant, so this profile can never measure a
       // pool the tick would not have read (2026-09-28: 0.6 → 0.8).

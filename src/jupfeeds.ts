@@ -100,11 +100,31 @@ export interface TrendBand {
 }
 
 /**
+ * The trending band's own market-cap floor, as a fraction of the widest chat's
+ * min-market-cap gate.
+ *
+ * STAYS 0.6 while the pool's floor (scanner.POOL_MCAP_PRUNE_RATIO) went to 0.8
+ * on 2026-09-28 — on purpose, and the divergence is the safe direction:
+ *
+ *   - the pool's floor is a PRUNE. A coin it drops is already in token_stats;
+ *     it stops being re-measured, but a later feed appearance re-registers it.
+ *   - this is a DISCOVERY filter. A trending token it rejects is never
+ *     inserted at all, so nothing downstream can recover it.
+ *
+ * Tightening discovery to match the pool would therefore make the band the
+ * binding constraint on coverage, which is exactly what the pool's own
+ * docstring forbids ("the discovery filter must not be tighter than the
+ * pool's own prune bounds"). Keeping a WIDER net than the pool costs a few
+ * registrations the pool will not sweep and nothing else.
+ */
+const TREND_BAND_MCAP_FLOOR_RATIO = 0.6;
+
+/**
  * Build the trending leg's band from the enabled chats' qualifying windows,
- * using the re-eval pool's own lenient margins (floor × 0.6, ceiling × 2,
- * age ± margin): a coin slightly below the floor now can rise into it, and the
- * pool would keep it for exactly that reason — so the discovery filter must
- * not be tighter than the pool's own prune bounds.
+ * using the re-eval pool's lenient margins (floor × TREND_BAND_MCAP_FLOOR_RATIO,
+ * ceiling × 2, age ± margin): a coin slightly below the floor now can rise into
+ * it, and the pool would keep it for exactly that reason — so the discovery
+ * filter must not be tighter than the pool's own prune bounds.
  */
 export function trendBandFromChats(
   chats: Array<{
@@ -120,7 +140,7 @@ export function trendBandFromChats(
   return {
     minAgeMs: Math.max(0, Math.min(...chats.map((c) => c.minAgeMinutes)) * 60_000 - margin),
     maxAgeMs: Math.max(...chats.map((c) => c.maxAgeMinutes)) * 60_000 + margin,
-    minMcapUsd: Math.min(...chats.map((c) => c.minMarketCapUsd)) * 0.6,
+    minMcapUsd: Math.min(...chats.map((c) => c.minMarketCapUsd)) * TREND_BAND_MCAP_FLOOR_RATIO,
     maxMcapUsd: Math.max(...chats.map((c) => c.maxMarketCapUsd)) * 2,
   };
 }

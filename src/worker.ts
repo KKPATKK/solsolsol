@@ -50,7 +50,12 @@ import {
 } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
-import { Scanner, forgetDeferredTokens } from "./scanner";
+import {
+  Scanner,
+  forgetDeferredTokens,
+  POOL_MCAP_PRUNE_RATIO,
+  POOL_LIQUIDITY_PRUNE_RATIO,
+} from "./scanner";
 import { deferralRegistryView, deferredPushTokens, feedMakeupView } from "./deferredmakeup";
 import {
   installTickProbe,
@@ -7267,10 +7272,27 @@ export default {
       const hist = await probe.getPoolHistogram(now, seenChatIds);
       let poolQueryBuckets: Record<string, number> | null = null;
       let poolQueryCount = 0;
+      // The floors this probe applies — computed once, ECHOED in the response
+      // (2026-09-28). Until then the probe pruned at minMcap / 2 (half the
+      // scanner's ratio) with no liquidity floor and no ceiling, so its
+      // poolQueryCount was an inflated upper bound and no floor change could be
+      // read off this endpoint at all. It now mirrors the scanner's pool query
+      // and names the floors it used, which is what makes a live reading
+      // checkable against src/scanner.ts instead of taken on trust.
+      // (Empty chat list → 0 = "no floor", rather than Math.min of nothing.)
+      const poolMinMcapUsd = chats.length
+        ? Math.min(...chats.map((c) => c.minMarketCapUsd))
+        : 0;
+      const poolMaxMcapUsd = chats.length
+        ? Math.max(...chats.map((c) => c.maxMarketCapUsd))
+        : 0;
+      const poolMinLiquidityUsd = chats.length
+        ? Math.min(...chats.map((c) => c.minLiquidityUsd))
+        : 0;
       try {
         const minAge = Math.min(...chats.map((c) => c.minAgeMinutes));
         const maxAge = Math.max(...chats.map((c) => c.maxAgeMinutes));
-        const minMcap = Math.min(...chats.map((c) => c.minMarketCapUsd));
+        const minMcap = poolMinMcapUsd;
         const pool = await probe.getReevalPool({
           sinceMs: now - 30 * 3600_000,
           minLaunchMs: now - (maxAge + 180) * 60_000,
@@ -7284,7 +7306,18 @@ export default {
           nearSlots: cfg?.reevalNearSlots ?? 2,
           farSlots: cfg?.reevalFarSlots ?? 6,
           rotationPeriodMs: cfg?.reevalPoolCacheMs,
-          minQualifyMcap: minMcap / 2,
+          // The scanner's OWN ratio (2026-09-28). This probe used
+          // minMcap / 2 — a LOOSER floor than production's, so its
+          // poolQueryCount over-reported the rows the tick could reach and no
+          // floor change could be read off this endpoint. It mirrors now.
+          minQualifyMcap: minMcap * POOL_MCAP_PRUNE_RATIO,
+          // The scanner's other two pool filters, mirrored so this count is
+          // comparable to the tick's: the ceiling (its literal 2, matching
+          // src/scanner.ts's maxQualifyMcap) drops the pump-and-dump corpses
+          // that rank FIRST under the signal ordering, and the liquidity floor
+          // drops the dead-liquidity ones — both otherwise inflate this count.
+          maxQualifyMcap: poolMaxMcapUsd * 2,
+          minQualifyLiquidity: poolMinLiquidityUsd * POOL_LIQUIDITY_PRUNE_RATIO,
           seenChatIds,
         });
         poolQueryCount = pool.length;
@@ -7329,6 +7362,13 @@ export default {
         poolLimit: 1000,
         poolQueryCount,
         poolQueryBuckets,
+        // Which floors produced poolQueryCount (see the comment above them):
+        // a live reading shows the ratios the DEPLOYED code is pruning at.
+        mcapPruneRatio: POOL_MCAP_PRUNE_RATIO,
+        mcapFloorUsd: poolMinMcapUsd * POOL_MCAP_PRUNE_RATIO,
+        mcapCeilingUsd: poolMaxMcapUsd * 2,
+        liquidityPruneRatio: POOL_LIQUIDITY_PRUNE_RATIO,
+        liquidityFloorUsd: poolMinLiquidityUsd * POOL_LIQUIDITY_PRUNE_RATIO,
       });
     }
 

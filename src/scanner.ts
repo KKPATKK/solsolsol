@@ -1295,6 +1295,44 @@ const RE_EVAL_PER_TICK_MAX = 90;
 export const POOL_LIQUIDITY_PRUNE_RATIO = 0.8;
 
 /**
+ * The MARKET-CAP floor the re-eval pool prunes on, as a fraction of the widest
+ * enabled chat's min-market-cap gate (`minQualifyMcap` in the pool query).
+ * 0.6 → 0.8 (2026-09-28), the sibling of POOL_LIQUIDITY_PRUNE_RATIO above.
+ *
+ * The two constants exist to kill ONE confusion: 0.6 used to be the value of
+ * BOTH floors, so "the 0.6 prune" named neither. Each is now named for the
+ * gate it scales — $40K gate → $32K floor here, $10K gate → $8K there (the
+ * LIVE chat gates $60K, so its floor is $48K; the gate is per-chat, so quote
+ * the ratio, not a dollar figure, when the ratio is the thing being changed).
+ *
+ * Same one-way semantics and the same safety argument as its sibling: a coin
+ * whose PEAK market cap never reached 0.8 × the gate could never have passed
+ * that gate, so no coin that could have been pushed is lost. The COST is
+ * larger than the liquidity sibling's, though: a dropped coin stops updating
+ * max_mcap_observed, and market cap is the volatile dimension (a $26K coin
+ * gapping past a $40K gate is the very shape this bot hunts) while pool depth
+ * moves a few percent at a time. MEASURED before the raise, on this pool
+ * (scripts/pool-mcap-floor.js: two runs, 3 + 4 rotation slots, with
+ * wrangler [vars] overlaid so the bands are production's):
+ * the raise stops re-measuring 4-8 rows per sweep (mean 5.4 over the seven
+ * slots sampled) out of the 600-730 the pool returns — 0.5-1% — every one of
+ * them peaking at 61-79% of the gate; the net pool falls by 3-6 rows, because a
+ * band's freed LIMIT backfills 1-2 rows from the same window.
+ *
+ * The same run found what actually spreads this sweep thin, and it is not this
+ * ratio: 86-89% of the rows the pool returns have NO peak mcap at all, and
+ * NULL is KEPT (fail-open), so no ratio reaches them — 0.5 through 0.9 moves
+ * the whole pool by ten rows. Backfilling max_mcap_observed at registration, or pruning NULL
+ * rows after a grace, is that lever.
+ *
+ * Deliberately NOT propagated to jupfeeds.TREND_BAND_MCAP_FLOOR_RATIO: that
+ * band is a DISCOVERY filter and a token it rejects never enters token_stats
+ * at all, so it stays LOOSER than this floor on purpose — the safe direction
+ * for a filter no later sweep can undo.
+ */
+export const POOL_MCAP_PRUNE_RATIO = 0.8;
+
+/**
  * Whether the launch slot's GeckoTerminal new-pools leg may spend a fetch this
  * tick (pure — unit-tested). `intervalMs` is
  * AppConfig.geckoterminalDiscoveryIntervalMs, 0 = no gate.
@@ -3260,8 +3298,9 @@ export class Scanner {
         // Graduated rotation (see Db.getReevalPool): near slots swept every
         // ~REEVAL_NEAR_SWEEP_MIN, far slots every ~REEVAL_FAR_SWEEP_MIN, hot
         // zone every scan. Bands order by qualification signal and coins
-        // repeatedly seen below 60% of the market-cap gate are dropped, so
-        // the sweep budget concentrates on coins that can actually qualify.
+        // repeatedly seen below POOL_MCAP_PRUNE_RATIO of the market-cap gate
+        // are dropped, so the sweep budget concentrates on coins that can
+        // actually qualify.
         // 2026-09-09: 0.5 → 0.6 (half-floor $20K → $24K) — prunes the
         // "$20K–$24K lifelong peak" slice from every band, shortening the
         // full sweep ~5–15% at the same tick budget. Accepted trade-off: a
@@ -3274,7 +3313,12 @@ export class Scanner {
         // Rotation period must equal the cache TTL so each expiry advances
         // the slot (see Db.getReevalPool rotationPeriodMs).
         rotationPeriodMs: this.config.reevalPoolCacheMs,
-        minQualifyMcap: poolMinMcapUsd * 0.6,
+        // 2026-09-28: 0.6 → 0.8 ($24K → $32K at the default $40K gate, $36K
+        // → $48K on the live $60K gate) — the same raise the liquidity floor
+        // above got, measured at 4-8 rows per sweep (0.5-1% of the pool).
+        // POOL_MCAP_PRUNE_RATIO carries the full reading, including why the
+        // ratio is the wrong lever for what actually spreads this sweep thin.
+        minQualifyMcap: poolMinMcapUsd * POOL_MCAP_PRUNE_RATIO,
         // Ceiling prune: drop coins whose historical peak already exceeded
         // 2× the widest max-mcap gate. Under the signal ordering their huge
         // max_mcap_observed ranks them first in every band, so pump-and-dump

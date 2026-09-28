@@ -12755,6 +12755,67 @@ async function main() {
       profileSrc.includes("minQualifyLiquidity:poolMinLiquidityUsd*POOL_LIQUIDITY_PRUNE_RATIO,"),
       "cpu-profile.js must measure the same pool the tick reads",
     );
+    // The MARKET-CAP floor is the sibling of the liquidity one, and 0.6 used
+    // to be the value of BOTH: these pin that each floor now names its own
+    // constant, that the bare 0.6 is gone from both places that read it, and
+    // that the two worlds that quote it (the probe's endpoint and the offline
+    // profiler) cannot drift back to a literal.
+    assert.equal(
+      require("../dist/scanner.js").POOL_MCAP_PRUNE_RATIO,
+      0.8,
+      "the pool's market-cap prune ratio (0.6 -> 0.8)",
+    );
+    assert.ok(
+      scannerSrc.includes("minQualifyMcap:poolMinMcapUsd*POOL_MCAP_PRUNE_RATIO,"),
+      "the pool query must prune on the mcap constant, not on a literal ratio",
+    );
+    assert.ok(
+      !scannerSrc.includes("minQualifyMcap:poolMinMcapUsd*0.6,"),
+      "the 0.6 mcap ratio must be gone — raising that prune is the point",
+    );
+    assert.ok(
+      profileSrc.includes("minQualifyMcap:poolMinMcapUsd*POOL_MCAP_PRUNE_RATIO,"),
+      "cpu-profile.js must mirror the mcap floor too, or it measures a wider pool",
+    );
+    const workerSrc = read("src/worker.ts");
+    assert.ok(
+      workerSrc.includes("minQualifyMcap:minMcap*POOL_MCAP_PRUNE_RATIO,"),
+      "/debug/pool must report the pool the tick reads, not a looser one",
+    );
+    assert.ok(
+      !workerSrc.includes("minQualifyMcap:minMcap/2,"),
+      "the probe's old minMcap/2 floor (looser than production) must be gone",
+    );
+    // The probe's count is only comparable to the tick's if it applies the same
+    // three filters the scanner does, and only checkable if it says so.
+    assert.ok(
+      workerSrc.includes("maxQualifyMcap:poolMaxMcapUsd*2,") &&
+        workerSrc.includes(
+          "minQualifyLiquidity:poolMinLiquidityUsd*POOL_LIQUIDITY_PRUNE_RATIO,",
+        ),
+      "/debug/pool must mirror the ceiling and the liquidity floor too, not just the mcap floor",
+    );
+    assert.ok(
+      workerSrc.includes("mcapPruneRatio:POOL_MCAP_PRUNE_RATIO,") &&
+        workerSrc.includes("mcapFloorUsd:poolMinMcapUsd*POOL_MCAP_PRUNE_RATIO,") &&
+        workerSrc.includes(
+          "liquidityFloorUsd:poolMinLiquidityUsd*POOL_LIQUIDITY_PRUNE_RATIO,",
+        ),
+      "the endpoint must echo the floors it applied, or a live reading cannot be checked",
+    );
+    assert.ok(
+      profileSrc.includes("POOL_MCAP_PRUNE_RATIO,"),
+      "cpu-profile.js must import the mcap ratio, not restate it",
+    );
+    // The trending band is a DISCOVERY filter, so it deliberately stays at the
+    // pre-raise floor: tighter than the pool's prune would drop tokens before
+    // they are ever registered, which no later sweep can undo.
+    const jupSrc = read("src/jupfeeds.ts");
+    assert.ok(
+      jupSrc.includes("constTREND_BAND_MCAP_FLOOR_RATIO=0.6;") &&
+        jupSrc.includes("minMcapUsd:Math.min(...chats.map((c)=>c.minMarketCapUsd))*TREND_BAND_MCAP_FLOOR_RATIO,"),
+      "the trending band stays looser than the pool floor, and says so in a named constant",
+    );
     assert.ok(
       scannerSrc.includes(
         "geckoDiscoveryDue(geckoLastAt,Date.now(),this.config.geckoterminalDiscoveryIntervalMs,)",

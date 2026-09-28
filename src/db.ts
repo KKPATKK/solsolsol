@@ -3516,7 +3516,12 @@ export class Db {
      * Liquidity pre-qualification floor: when set, coins whose
      * max_liquidity_observed is known and below this value are dropped from
      * every band (NULL = never seen with pair data → kept). The scanner
-     * passes 0.6× the widest chat's minLiquidityUsd. Dead-liquidity
+     * passes POOL_LIQUIDITY_PRUNE_RATIO × the widest chat's
+     * minLiquidityUsd (0.8 since 2026-09-28, up from 0.6 — the ratio lives in
+     * that one exported constant in src/scanner.ts so this note cannot drift
+     * from the value again). This is the LIQUIDITY floor; the MARKET-CAP
+     * floor two docstrings up is a separate ratio and is unchanged by that
+     * raise. Dead-liquidity
      * corpses (ZenoCoin/NEMOTRON/Ggwiz — mcap $100K+ over $0–$15 LP)
      * never had real liquidity, so the mcap prunes cannot remove them; their
      * huge max_mcap_observed ranks them FIRST in every band and ~215 of
