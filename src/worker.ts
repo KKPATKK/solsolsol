@@ -1957,6 +1957,57 @@ export function scanRaceWindowMs(preRaceSpendMs: number): number {
   );
 }
 
+/**
+ * The handler's pre-scan steps in one line (see PreTickSteps).
+ *
+ * `rest` is the part of the window the NAMED steps do not account for, printed
+ * for the same reason the front split below prints its own remainder: a big
+ * `rest` is work nobody measured, and a big `init` is the cold rebuild that
+ * pays it (see deadTickRebuildDecision). Pure and exported so the arithmetic is
+ * pinned by a test rather than by this comment.
+ */
+export function preStartSplitNote(
+  entryAt: number,
+  startedAt: number,
+  steps: PreTickSteps,
+): string {
+  const total = entryAt > 0 && startedAt >= entryAt ? startedAt - entryAt : 0;
+  const named = steps.bump + steps.init + steps.gate + steps.outage;
+  return (
+    `preStart ${total}ms [bump ${steps.bump} init ${steps.init} ` +
+    `gate ${steps.gate} outage ${steps.outage} rest ${Math.max(0, total - named)}]`
+  );
+}
+
+/**
+ * The FRONT SPLIT in one line (see PreTickView): handler entry -> race start,
+ * named part by part, with each half's remainder named too.
+ *
+ * WHY IT EXISTS (2026-09-28, live). The race-window error used to print only
+ * `preRace 4320ms = json 0 + claim 1440` — a third of the number a reader opens
+ * it for. The other 2880ms (the cold `init` above all) had to be reconstructed
+ * by subtraction, and could not be reconstructed AT ALL for a tick that died
+ * before the race: its only durable stamp is the admission record, which rides
+ * the claim, and at that moment `preRaceMs` does not exist yet. So the split is
+ * published in TWO places — whole, in the race-window error, and as far as it
+ * is known, on every durable stamp (see TickProgressRecord.front).
+ *
+ * `front = preStart + preRace` is the whole envelope the scan's race window is
+ * granted inside (see scanRaceWindowMs), so the two things a reader needs are
+ * the total and which named step owns it.
+ */
+export function frontSplitNote(v: PreTickView | null | undefined): string {
+  if (!v || v.preStartMs === null || v.preRaceMs === null) return "front n/a";
+  const preStart = v.preStartMs;
+  const preRace = v.preRaceMs;
+  const rest = Math.max(0, preRace - v.steps.json - v.steps.claim);
+  return (
+    `front ${preStart + preRace}ms = ` +
+    `${preStartSplitNote(v.at, v.at + preStart, v.steps)} + ` +
+    `preRace ${preRace}ms [json ${v.steps.json} claim ${v.steps.claim} rest ${rest}]`
+  );
+}
+
 /** Latest pre-scan split, module state like every other per-isolate counter. */
 let preTick: PreTickView = {
   at: 0,
@@ -2402,6 +2453,17 @@ export interface TickProgressRecord {
   scanMs: number;
   /** The front split (`preTick.preRaceMs`) — the cold-front reading. */
   preRaceMs: number;
+  /**
+   * The front split as far as it was KNOWN when this stamp was written (see
+   * preStartSplitNote / frontSplitNote) — a durable STRING because this row is
+   * the only witness a killed tick leaves.
+   *
+   * Two shapes, and the shape is part of the reading: at the ADMISSION stamp
+   * (which rides the claim) the pre-race phase is still running, so the value
+   * is the `preStart` half alone — enough to name a cold `init`; every stamp
+   * from the race onwards carries the whole `front = preStart + preRace` line.
+   */
+  front: string | null;
   /** Subrequests counted so far in the invocation (see src/subreqs.ts). */
   subreqs: number;
   /** Whether the scan race cut this tick (`timedOut`). */
@@ -2410,8 +2472,21 @@ export interface TickProgressRecord {
   err: string | null;
 }
 
-/** How much of a failure reason the record keeps (it is read, not parsed). */
-export const TICK_PROGRESS_ERR_MAX = 160;
+/**
+ * How much of a failure reason the record keeps (it is read, not parsed).
+ *
+ * RAISED 160 -> 320 (2026-09-28): the race-window error now carries the whole
+ * front split (~190 chars), and the number a reader opens that message for is
+ * the remainder at its END — a 160-char cap cut off exactly the reading the
+ * message was extended to provide.
+ */
+export const TICK_PROGRESS_ERR_MAX = 320;
+/**
+ * How much of the front split the record keeps. Sized for the longest line the
+ * two formatters can produce (the whole front, every step named 0-99999), so a
+ * stamp never reports a split with its tail cut off.
+ */
+export const TICK_PROGRESS_FRONT_MAX = 220;
 
 /**
  * What one stamp carries. `at` is the tick's startedAt — the value that keys
@@ -2424,6 +2499,8 @@ export interface TickProgressFields {
   payloadBytes: number;
   scanMs: number;
   preRaceMs: number;
+  /** The front split so far (see TickProgressRecord.front); null = not known. */
+  front?: string | null;
   subreqs: number;
   cut: boolean;
   err: string | null;
@@ -2444,6 +2521,7 @@ export function tickProgressRecord(fields: TickProgressFields): string {
     payloadBytes: whole(fields.payloadBytes),
     scanMs: whole(fields.scanMs),
     preRaceMs: whole(fields.preRaceMs),
+    front: fields.front ? String(fields.front).slice(0, TICK_PROGRESS_FRONT_MAX) : null,
     subreqs: whole(fields.subreqs),
     cut: fields.cut === true,
     err: fields.err ? String(fields.err).slice(0, TICK_PROGRESS_ERR_MAX) : null,
@@ -2572,6 +2650,7 @@ export function parseTickProgress(
     payloadBytes: num(rec.payloadBytes),
     scanMs: num(rec.scanMs),
     preRaceMs: num(rec.preRaceMs),
+    front: typeof rec.front === "string" ? rec.front : null,
     subreqs: num(rec.subreqs),
     cut: rec.cut === true,
     err: typeof rec.err === "string" ? rec.err : null,
@@ -2619,6 +2698,11 @@ export function tickProgressNote(
   // stamp, which rides the claim — see Db.claimScanLock): printing it as
   // "0ms" would read as a pre-race phase that cost nothing.
   bits.push(`subreqs ${rec.subreqs}`, `preRace ${rec.preRaceMs > 0 ? `${rec.preRaceMs}ms` : "n/a"}`);
+  // The front split, printed BEFORE cut/err on purpose: this note is bounded,
+  // and the split is the reading that says WHY the tick ran out of window — a
+  // truncated tail must lose the error text, never this (it is also why the
+  // err copy is placed last).
+  if (rec.front) bits.push(rec.front);
   if (rec.cut) bits.push("cut");
   if (rec.err) bits.push(`err:${rec.err}`);
   return ` [${bits.join(" ")}]`.slice(0, limit);
@@ -2798,6 +2882,30 @@ export function heartbeatRebuiltAt(raw: string | null | undefined): number | nul
     return null;
   }
 }
+
+/**
+ * The rebuild marker THIS tick's claim heartbeat must republish (see
+ * deadTickRebuildDecision).
+ *
+ * WHY IT IS MODULE STATE AND NOT A LOCAL (2026-09-28, live). The recovery used
+ * to announce itself ONLY in its own heartbeat row, and the claim that follows
+ * in the same tick — the row every later tick actually reads — did not carry
+ * the marker. So the recovering tick's own `phase: scanning` heartbeat (stale
+ * by construction, because a stretching tick never flushes) read as ANOTHER
+ * death, and every later tick of the same stretch rebuilt again: a cold re-init
+ * (new PoolFallbackDb + db.init() + the boot reads) on the one tick whose whole
+ * problem is that its front is too expensive. Measured live 2026-09-28
+ * 03:17-03:38Z: `rebuiltAt` re-appearing at 03:31:04.95 in the middle of a
+ * 21-minute stretch, with `init-no-scanner` recorded at 03:39:13.21 — an
+ * invocation that reached the end of a bounded init with no scanner at all.
+ *
+ * Set in ensureInitialized's recovery block BEFORE runScan builds the claim:
+ * a rebuild sets it now, a tick whose predecessor is still dead CARRIES the
+ * published one (the death has already been answered), and a tick whose
+ * predecessor is healthy CLEARS it (the stretch is over, so a later death earns
+ * a fresh rebuild). null = no rebuild is in force.
+ */
+let rebuildMarker: number | null = null;
 
 /**
  * The successor's rebuild verdict, as a pure function so the recovery rule is
@@ -3116,7 +3224,21 @@ async function ensureInitialized(env: Env): Promise<void> {
       if (kb) {
         scanTriggerMirror = parseScanTriggerCounts(kb);
       }
+      // Is the predecessor PROVEN dead (see deadTickBackfillInfo)? Asked ONCE
+      // here, because two consumers in this block need the same answer: the
+      // recovery verdict, and the no-completion stretch below.
+      const deadNow = prevRaw ? deadTickBackfillInfo(prevRaw, now, BACKFILL_STALE_MS) : null;
       const verdict = deadTickRebuildDecision(prevRaw, now, BACKFILL_STALE_MS);
+      // What the claim below must republish (see rebuildMarker). Three cases,
+      // and the distinction is the whole point of the fix:
+      //   - this tick rebuilt       -> a NEW marker, now;
+      //   - predecessor still dead  -> CARRY the published one: this death has
+      //                                already been answered and the stretch
+      //                                is still running, so rebuilding again
+      //                                would pay a cold boot per tick;
+      //   - predecessor healthy     -> CLEAR it: the stretch is over.
+      rebuildMarker =
+        verdict.rebuild ? now : deadNow !== null ? heartbeatRebuiltAt(prevRaw) : null;
       if (verdict.rebuild) {
         console.error(
           `[worker] predecessor tick died before its completion flush (started ${new Date(
@@ -3171,8 +3293,7 @@ async function ensureInitialized(env: Env): Promise<void> {
       // only one that can keep the durable record. Dead-only: a heartbeat this
       // tick can read as healthy means a completion landed, which is what ends
       // the stretch (the row's own continuity test is what retires it).
-      const dead = prevRaw ? deadTickBackfillInfo(prevRaw, now, BACKFILL_STALE_MS) : null;
-      if (dead) {
+      if (deadNow) {
         // Bounded for the same reason as the announce write: the alert is the
         // LAST thing this tick needs, and a hung wedge read/write here would
         // spend the successor's front window on bookkeeping — the
@@ -3180,7 +3301,7 @@ async function ensureInitialized(env: Env): Promise<void> {
         // chains of 5+ dead ticks. The stretch stays open, so a bounded-away
         // alert is late, never lost.
         await recoveryAwait(
-          trackNoCompletionStretch(dead.at, now),
+          trackNoCompletionStretch(deadNow.at, now),
           RECOVERY_DB_BOUND_MS,
           "no-completion alert",
         );
@@ -3886,6 +4007,14 @@ async function runScan(
     via: scanVia,
     ok: true,
     phase: "scanning",
+    // The rebuild marker this tick inherited or set (see rebuildMarker). It
+    // MUST ride the claim and not only the rebuild's own announce write: the
+    // claim is the row every later tick reads, so a marker that lives only in
+    // the announce is erased the moment the recovering tick wins its claim —
+    // and that tick's own stale heartbeat then reads as another death on every
+    // later tick, rebuilding forever while never scanning, which is the exact
+    // failure the marker exists to prevent.
+    rebuiltAt: rebuildMarker,
     ms: null,
     err: null,
     skip: startSkip?.reason ?? null,
@@ -3950,6 +4079,11 @@ async function runScan(
       payloadBytes: 0,
       scanMs: 0,
       preRaceMs: 0,
+      // The pre-race phase is still RUNNING here (this stamp rides the claim),
+      // so the split is the handler half alone: `preStart` with `init` named.
+      // That is the reading a stretch needs for a tick killed between the claim
+      // and the race, whose only durable stamp is this one.
+      front: preStartSplitNote(preTickEntryAt, startedAt, preTick.steps),
       subreqs: subreqView().current.total,
       cut: false,
       err: null,
@@ -4130,6 +4264,7 @@ async function runScan(
           payloadBytes: 0,
           scanMs: 0,
           preRaceMs: preTick?.preRaceMs ?? 0,
+          front: frontSplitNote(preTick),
           subreqs: subreqView().current.total,
           cut: false,
           err: null,
@@ -4203,7 +4338,7 @@ async function runScan(
       // separates a CPU-heavy payload from a slow claim round trip, which
       // have different fixes.
       lastScanError = timedOut
-        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, preRace ${preTick.preRaceMs}ms = json ${preTick.steps.json} + claim ${preTick.steps.claim})`
+        ? `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, ${frontSplitNote(preTick)})`
         : null;
       if (timedOut) {
         console.error(`[worker] scan ran past its ${scanRaceMs}ms race window — completion written with timeout flag`);
@@ -4328,6 +4463,7 @@ async function runScan(
           payloadBytes: flushJson.length,
           scanMs: flushedMs,
           preRaceMs: preTick?.preRaceMs ?? 0,
+          front: frontSplitNote(preTick),
           subreqs: subreqView().current.total,
           cut: timedOut,
           err: why ?? lastScanError,

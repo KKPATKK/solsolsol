@@ -23,7 +23,7 @@ const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquid
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
-const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS } = require("../dist/worker.js");
+const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX } = require("../dist/worker.js");
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
@@ -15306,6 +15306,166 @@ async function main() {
     } finally {
       await t.cleanup();
     }
+  });
+
+  await test("front split (A): the whole pre-scan envelope is named, remainder included", () => {
+    // The live 2026-09-28 reading this note exists for: preRace 4320ms printed
+    // as "json 0 + claim 1440" — a third of the number a reader opens it for.
+    // The other 2880ms WAS the reading, and it had no name at all.
+    const live = buildPreTickSplit({
+      entryAt: 1_000_000,
+      steps: { bump: 0, init: 0, gate: 0, outage: 0, json: 0, claim: 1_440 },
+      startedAt: 1_000_000,
+      raceAt: 1_004_320,
+      raceMs: scanRaceWindowMs(4_320),
+    });
+    const note = frontSplitNote(live);
+    assert.match(note, /^front 4320ms = /);
+    assert.match(note, /preStart 0ms \[bump 0 init 0 gate 0 outage 0 rest 0\]/);
+    assert.match(note, /preRace 4320ms \[json 0 claim 1440 rest 2880\]/);
+    assert.match(note, /rest 2880/, "the unattributed remainder is the reading");
+    // The shape a death-driven COLD REBUILD produces: `init` named on the
+    // preStart half — the half the ADMISSION stamp can carry, and that stamp is
+    // the only durable one a tick killed before the race ever leaves.
+    const cold = buildPreTickSplit({
+      entryAt: 1_000_000,
+      steps: { bump: 0, init: 2_880, gate: 240, outage: 0, json: 0, claim: 1_440 },
+      startedAt: 1_003_120,
+      raceAt: 1_007_440,
+      raceMs: scanRaceWindowMs(4_320),
+    });
+    assert.match(frontSplitNote(cold), /^front 7440ms = /);
+    assert.match(
+      frontSplitNote(cold),
+      /preStart 3120ms \[bump 0 init 2880 gate 240 outage 0 rest 0\]/,
+    );
+    assert.equal(
+      preStartSplitNote(1_000_000, 1_003_120, {
+        bump: 0,
+        init: 2_880,
+        gate: 240,
+        outage: 0,
+        json: 0,
+        claim: 0,
+      }),
+      "preStart 3120ms [bump 0 init 2880 gate 240 outage 0 rest 0]",
+    );
+    // Unmeasured is reported as unmeasured, never as a zero-cost front.
+    assert.equal(frontSplitNote(null), "front n/a");
+    assert.equal(frontSplitNote(undefined), "front n/a");
+    assert.equal(
+      frontSplitNote({
+        at: 0,
+        steps: PRE_TICK_ZERO_STEPS,
+        preStartMs: null,
+        preRaceMs: null,
+        raceMs: null,
+      }),
+      "front n/a",
+    );
+    // A remainder can never read as negative: a step measured longer than the
+    // window it sits in must not print "-40ms".
+    assert.match(
+      preStartSplitNote(0, 1_000, {
+        bump: 0,
+        init: 1_400,
+        gate: 0,
+        outage: 0,
+        json: 0,
+        claim: 0,
+      }),
+      /rest 0\]$/,
+    );
+  });
+
+  await test("front split (A): it survives into the record, and the note prints it before cut/err", () => {
+    const at = 1_700_000_000_000;
+    const shape = {
+      at,
+      stage: "scan",
+      payloadBytes: 0,
+      scanMs: 0,
+      preRaceMs: 0,
+      subreqs: 4,
+      cut: false,
+      err: null,
+    };
+    const front =
+      "front 4320ms = preStart 0ms [bump 0 init 0 gate 0 outage 0 rest 0] + " +
+      "preRace 4320ms [json 0 claim 1440 rest 2880]";
+    const raw = tickProgressRecord({ ...shape, front });
+    assert.equal(
+      parseTickProgress(raw).front,
+      front,
+      "the split round-trips through the durable row",
+    );
+    assert.match(tickProgressNote(raw, at), /rest 2880/);
+    // A record written before the split existed stays honest: null, and simply
+    // omitted — never dressed up as a front that cost nothing.
+    const old = tickProgressRecord(shape);
+    assert.equal(parseTickProgress(old).front, null);
+    assert.doesNotMatch(tickProgressNote(old, at), /front /);
+    // Bounded on both ends, and the SPLIT is the survivor: a capped split plus
+    // a capped error text must still leave the split inside the note's limit.
+    const hugeRaw = tickProgressRecord({
+      ...shape,
+      stage: "postscan",
+      payloadBytes: 12_000,
+      scanMs: 5_000,
+      preRaceMs: 4_320,
+      subreqs: 38,
+      cut: true,
+      front: "x".repeat(500),
+      err: "y".repeat(400),
+    });
+    const huge = parseTickProgress(hugeRaw);
+    assert.equal(huge.front.length, TICK_PROGRESS_FRONT_MAX, "the field is capped");
+    assert.equal(huge.err.length, TICK_PROGRESS_ERR_MAX, "the err cap is what was raised");
+    assert.ok(TICK_PROGRESS_ERR_MAX > 185, "and it fits the race-window message it was raised for");
+    const note = tickProgressNote(hugeRaw, at);
+    assert.ok(note.length <= 240, "the note is still bounded");
+    assert.match(note, /xxxx/, "the split survives the truncation; the err text does not");
+  });
+
+  await test("wiring (A + C): the split reaches the record, the marker reaches the CLAIM", () => {
+    const workerSrc = fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8");
+    // A: both halves are published — the whole envelope in the error a reader
+    // opens, and as far as it is known on every durable stamp.
+    assert.ok(
+      workerSrc.includes("ms, ${frontSplitNote(preTick)})`"),
+      "the race-window err carries the whole front split, not just json+claim",
+    );
+    assert.ok(
+      !workerSrc.includes("preRace ${preTick.preRaceMs}ms = json ${preTick.steps.json}"),
+      "the two-part form (which hid two thirds of a 4.3s front) is gone",
+    );
+    assert.ok(
+      workerSrc.includes("front: frontSplitNote(preTick),"),
+      "the phase and postscan stamps carry the whole split",
+    );
+    assert.ok(
+      workerSrc.includes("front: preStartSplitNote(preTickEntryAt, startedAt, preTick.steps),"),
+      "the admission stamp carries the preStart half a killed tick can leave",
+    );
+    assert.ok(
+      workerSrc.includes("if (rec.front) bits.push(rec.front);"),
+      "the successor's note prints it, before cut/err",
+    );
+    // C: the marker must ride the CLAIM. Written only by the rebuild's own
+    // announce, it is erased by the very next claim — and then the recovering
+    // tick's own stale heartbeat reads as another death on every later tick of
+    // the same stretch, each one paying a cold re-init.
+    assert.ok(workerSrc.includes("let rebuildMarker: number | null = null;"), "the mirror exists");
+    assert.ok(
+      workerSrc.includes(
+        "verdict.rebuild ? now : deadNow !== null ? heartbeatRebuiltAt(prevRaw) : null",
+      ),
+      "set on a rebuild, carried while the death stands, cleared when it does not",
+    );
+    assert.ok(
+      workerSrc.includes("rebuiltAt: rebuildMarker,"),
+      "the claim heartbeat republishes it",
+    );
   });
 
   console.log("\n===== UNIT TESTS =====");

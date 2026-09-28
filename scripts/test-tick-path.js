@@ -603,6 +603,32 @@ installTickProbe(fakeScanner, {
       rebuiltAt: now - 59_500,
     });
     assert.deepEqual(deadTickRebuildDecision(marked, now, stale), { rebuild: false });
+    // THE SHAPE THE FIX SHIPS (2026-09-28, change C): the CLAIM heartbeat now
+    // republishes the marker, so the row a later tick reads after a stretch is
+    // still marked. Written only by the rebuild's own announce, the marker was
+    // erased by the very next claim — and the recovering tick's own stale
+    // heartbeat then read as a NEW death on every later tick, paying a cold
+    // re-init per tick for the whole length of the stretch.
+    const claimAfterRebuild = JSON.stringify({
+      at: now - 60_000,
+      via: "cron",
+      ok: true,
+      phase: "scanning",
+      ms: null,
+      rebuiltAt: now - 59_500,
+    });
+    assert.deepEqual(deadTickRebuildDecision(claimAfterRebuild, now, stale), { rebuild: false });
+    // ...and the CLEARED shape (a claim whose predecessor was healthy) still
+    // earns a rebuild: the marker is scoped to a stretch, not permanent, so it
+    // can never wedge the recovery off for good.
+    assert.deepEqual(
+      deadTickRebuildDecision(
+        JSON.stringify({ at: now - 60_000, ok: true, phase: "scanning", rebuiltAt: null }),
+        now,
+        stale,
+      ),
+      { rebuild: true, deadAt: now - 60_000 },
+    );
     // A landed completion flush is proof of life, however old the row is.
     assert.deepEqual(
       deadTickRebuildDecision(JSON.stringify({ at: now - 600_000, phase: "done" }), now, stale),
