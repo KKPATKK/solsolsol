@@ -217,6 +217,15 @@ METEORA_FALLBACK_LIMIT = "20"
 # every ~30s: a per-isolate window would never elapse and the quota arithmetic
 # above would not hold. On a tick the gate skips, `summary.geoDue` is false
 # and Meteora fills the slot (see the launch-slot chain in src/scanner.ts).
+#
+# 2026-09-28 (B1): the gate is charged at DISPATCH, and a fetch that comes back
+# REFUSED re-arms it to the moment the client's own 429 pause is over
+# (scanner.geckoDiscoveryRetryStamp + GeckoTerminalClient.pauseEndsAt), never
+# past the interval. A transient 429 therefore costs the feed its PAUSE rather
+# than a whole window: 60s on the keyed ladder instead of 5 minutes, while a
+# keyless feed (whose pause IS the interval, and escalates past it) keeps
+# exactly the cadence it had. `summary.geoRetryAt` is the reading that proves a
+# retry was scheduled, and `summary.gecko.http429` is where it came from.
 GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS = "300"
 # GeckoTerminal trending-pools feed size per scan (code default 20 when unset;
 # 0 = the leg is off — scanner.ts only builds it while this is > 0).

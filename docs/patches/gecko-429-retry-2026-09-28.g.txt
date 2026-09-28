@@ -1,0 +1,14 @@
+            .then(async (p) => {
+              geckoProfiles = p;
+              diag.geo = p.length;
+              // A REFUSAL MUST NOT BURN THE WHOLE WINDOW (see
+              // geckoDiscoveryRetryStamp): the dispatch stamp above is right
+              // for a success and too expensive for a refusal — the client has
+              // already armed its own pause, and a keyed feed resumes in 60s,
+              // not 5 min. Re-armed HERE, with the pools already in hand, so
+              // nothing this can do is able to discard a delivery; and AWAITED,
+              // so the retry rides this tick's ONE front write instead of
+              // landing after it.
+              const geckoRetryAt = await this.rearmGeckoDiscovery(Date.now());
+              if (geckoRetryAt !== null) diag.geoRetryAt = geckoRetryAt;
+            })

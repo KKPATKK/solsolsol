@@ -1,0 +1,19 @@
+  /**
+   * Epoch the feed's current 429 pause ends at, or 0 when it is not paused.
+   *
+   * WHY THE SCANNER NEEDS THIS (2026-09-28): the durable cadence gate
+   * (Db.GECKO_DISCOVERY_AT_KEY) is charged at DISPATCH, so a fetch that comes
+   * back refused still costs a whole interval — and the pause this client arms
+   * is what decides when a retry could actually answer. Asked this instead, the
+   * scanner re-arms its gate to the pause end (see
+   * Scanner.rearmGeckoDiscovery), which turns a refused window into a one-tick
+   * loss instead of a full interval.
+   *
+   * Deliberately NOT read from `stats()`: those fields are the /health
+   * surface and are documented as never read by a decision, and this one is a
+   * decision. Both answer from the same `rateLimitedUntil`, so they can never
+   * disagree about whether the feed is paused.
+   */
+  pauseEndsAt(now = Date.now()): number {
+    return now < this.rateLimitedUntil ? this.rateLimitedUntil : 0;
+  }

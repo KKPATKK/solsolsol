@@ -1,0 +1,26 @@
+  /**
+   * Re-arm the durable gate after a REFUSED gecko fetch (see
+   * geckoDiscoveryRetryStamp). Rides the front's ONE write, exactly like the
+   * dispatch stamp it replaces, so the retry costs no round trip of its own.
+   * Returns the epoch it aimed at, or null when it left the dispatch stamp
+   * alone.
+   *
+   * A no-op whenever the client could be asked again right now — a keyless feed
+   * whose alternate host is still usable, a failure that armed no host pause —
+   * which is what keeps the keyless cadence and the per-tick spend exactly as
+   * they were. Best-effort by construction: the dispatch stamp is already
+   * queued, so anything that goes wrong here degrades to the old
+   * full-interval behaviour.
+   */
+  private async rearmGeckoDiscovery(now: number): Promise<number | null> {
+    if (!this.gecko) return null;
+    const usableAt = this.gecko.nextUsableAt(now);
+    const stamp = geckoDiscoveryRetryStamp(
+      usableAt,
+      now,
+      this.config.geckoterminalDiscoveryIntervalMs,
+    );
+    if (stamp === null) return null;
+    await this.stampFront(GECKO_DISCOVERY_AT_KEY, String(stamp));
+    return usableAt;
+  }

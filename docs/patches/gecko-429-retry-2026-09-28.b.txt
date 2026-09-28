@@ -1,0 +1,8 @@
+  /**
+   * Epoch the durable gate was re-armed to after this tick's gecko fetch came
+   * back REFUSED, so the leg is due again the moment the host's own pause
+   * expires (see geckoDiscoveryRetryStamp). Absent on a tick that was held
+   * back, succeeded, or failed without arming a pause — so `geoRetryAt` is the
+   * reading that says a 429 cost the feed its pause instead of its interval.
+   */
+  geoRetryAt?: number;

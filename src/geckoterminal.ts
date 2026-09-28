@@ -19,6 +19,36 @@ const BASE_URL = "https://api.geckoterminal.com/api/v2";
  * decays to one probe an hour instead of twelve while staying self-healing.
  */
 export const GECKO_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+/**
+ * The same base for a KEYED feed — 60s instead of 5 min (2026-09-28).
+ *
+ * The 5-minute base above was sized for one specific failure: the Worker's
+ * shared egress IP over quota, where EVERY attempt is 429ed, so a probe before
+ * the window turns over is a request paid for nothing. A CoinGecko key moves
+ * the limit off that IP and onto the key, which changes what a 429 MEANS.
+ * Measured live on the keyed feed (2026-09-28, `heartbeat.summary.gecko`
+ * 14:00-16:00Z): 22 requests, 5 of them 429, and `consecutive429` never above
+ * 1 — every 429 was an isolated transient, not a wall — while all 16 successes
+ * came back `cf-cache-status: HIT` from the colo edge cache. The arithmetic
+ * agrees: the demo plan is 100 calls/min and this leg asks once per 5 min, so
+ * the key's own rate limit is never the thing refusing.
+ *
+ * What 5 minutes costs there is discovery: the pause is armed at the moment of
+ * the 429, and the durable cadence gate (Db.GECKO_DISCOVERY_AT_KEY) is charged
+ * at dispatch, so one transient 429 used to zero the leg for a whole 5-minute
+ * window — four ticks of `geo 0` that pump.fun and Meteora had to cover.
+ *
+ * The escalation is UNCHANGED, which is what keeps this safe: `consecutive429`
+ * now doubles from 60s (60 → 120 → 240 → … → the 60 min ceiling), so a genuine
+ * wall still decays to roughly one probe an hour. It just costs ~6 extra
+ * requests during the first hour of a wall — one per failed attempt, against a
+ * 10K/month key budget that this leg spends 8,640 of.
+ *
+ * KEYLESS stays at the 5-minute base: that failure mode is exactly the one the
+ * long window was measured for, and it is still the live one when no key is
+ * configured (see docs/gecko-429.md).
+ */
+export const GECKO_KEYED_429_BACKOFF_MS = 60_000;
 /** Ceiling the doubling stops at (1 h). */
 export const GECKO_BACKOFF_MAX_MS = 60 * 60_000;
 /** Absolute ceiling, so an upstream Retry-After cannot park the feed for days. */
@@ -191,24 +221,30 @@ export function parseRetryAfterMs(
  * How long to pause the feed after a 429 (pure — the escalation is asserted in
  * scripts/test-unit.js instead of being inferred from a live 429).
  *
- * `consecutive429` is 1 for the first 429, so the first window is still
- * GECKO_RATE_LIMIT_BACKOFF_MS (5 min — the behaviour the existing unit test and
- * the docs pin), and every further 429 in the same streak doubles it up to
- * GECKO_BACKOFF_MAX_MS. A Retry-After the API explicitly asked for wins, up to
- * the 6h hard ceiling. Jitter spreads the fleet's next probe.
+ * `consecutive429` is 1 for the first 429, so the first window is the BASE —
+ * GECKO_RATE_LIMIT_BACKOFF_MS (5 min) keyless, GECKO_KEYED_429_BACKOFF_MS (60s)
+ * when `keyed` — and every further 429 in the same streak doubles it up to
+ * `capMs`. A Retry-After the API explicitly asked for wins, up to the 6h hard
+ * ceiling. Jitter spreads the fleet's next probe.
+ *
+ * `keyed` changes only the base, never the escalation: the doubled ladder and
+ * both ceilings are the same numbers on both paths, so a wall still decays to
+ * one probe an hour (see GECKO_KEYED_429_BACKOFF_MS for why the base differs).
  */
 export function geckoBackoffMs(
   consecutive429: number,
   retryAfterMs: number | null = null,
   random: () => number = Math.random,
+  keyed = false,
 ): number {
   const step = Math.max(1, Math.floor(consecutive429));
+  const baseMs = keyed ? GECKO_KEYED_429_BACKOFF_MS : GECKO_RATE_LIMIT_BACKOFF_MS;
   // 2**8 caps the shift; the min() below caps the value anyway.
-  const doubled = GECKO_RATE_LIMIT_BACKOFF_MS * 2 ** Math.min(step - 1, 8);
-  const base = Math.min(
-    GECKO_BACKOFF_MAX_MS,
-    Math.max(GECKO_RATE_LIMIT_BACKOFF_MS, doubled),
-  );
+  const doubled = baseMs * 2 ** Math.min(step - 1, 8);
+  // The floor is the BASE, not GECKO_RATE_LIMIT_BACKOFF_MS: a keyed ladder
+  // starts at its own 60s (see GECKO_KEYED_429_BACKOFF_MS) and climbs from
+  // there. Keyless is unchanged — its base IS the 5-minute floor.
+  const base = Math.min(GECKO_BACKOFF_MAX_MS, Math.max(baseMs, doubled));
   const asked =
     retryAfterMs !== null && Number.isFinite(retryAfterMs) && retryAfterMs > base
       ? retryAfterMs
@@ -540,6 +576,26 @@ export class GeckoTerminalClient {
   }
 
   /**
+   * Epoch the feed's current 429 pause ends at, or 0 when it is not paused.
+   *
+   * WHY THE SCANNER NEEDS THIS (2026-09-28): the durable cadence gate
+   * (Db.GECKO_DISCOVERY_AT_KEY) is charged at DISPATCH, so a fetch that comes
+   * back refused still costs a whole interval — and the pause this client arms
+   * is what decides when a retry could actually answer. Asked this instead, the
+   * scanner re-arms its gate to the pause end (see
+   * Scanner.rearmGeckoDiscovery), which turns a refused window into a one-tick
+   * loss instead of a full interval.
+   *
+   * Deliberately NOT read from `stats()`: those fields are the /health
+   * surface and are documented as never read by a decision, and this one is a
+   * decision. Both answer from the same `rateLimitedUntil`, so they can never
+   * disagree about whether the feed is paused.
+   */
+  pauseEndsAt(now = Date.now()): number {
+    return now < this.rateLimitedUntil ? this.rateLimitedUntil : 0;
+  }
+
+  /**
    * Fetch init for every GeckoTerminal call: JSON, a descriptive User-Agent
    * (see GECKO_USER_AGENT — without it CoinGecko 403s the Worker's egress), a
    * 10s transport cap, and the Cloudflare edge cache (see GECKO_CACHE_TTL_S).
@@ -665,7 +721,15 @@ export class GeckoTerminalClient {
         }
         this.http429 += 1;
         this.consecutive429 += 1;
-        this.backoffMs = geckoBackoffMs(this.consecutive429, asked);
+        this.backoffMs = geckoBackoffMs(
+          this.consecutive429,
+          asked,
+          Math.random,
+          // A keyed feed pauses 60s on its first 429, not 5 min — see
+          // GECKO_KEYED_429_BACKOFF_MS. The alternate host keeps the keyless
+          // base (see armAltPause): its refusal is not a rate limit at all.
+          this.apiKey !== null,
+        );
         this.rateLimitedUntil = now + this.backoffMs;
         console.warn(
           `[gecko] 429 #${this.consecutive429} on ${path} — pausing the feed ${Math.round(

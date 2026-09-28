@@ -569,6 +569,10 @@ async function subreqFloorTest() {
       const gecko = {
         fetchNewPools: async () => { asked.push("geo"); return []; },
         fetchTrendingPools: async () => { asked.push("geoTrend"); return []; },
+        // The client's 429-pause surface (see pauseEndsAt): the scanner's
+        // re-arm reads it after every gecko fetch, so a double that omits it
+        // would make the leg log a failure on a tick that succeeded.
+        pauseEndsAt: () => 0,
       };
       const jupiter = {
         fetchRecentTokens: async () => { asked.push("jup"); return []; },

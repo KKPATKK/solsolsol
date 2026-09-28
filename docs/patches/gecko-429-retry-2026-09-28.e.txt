@@ -1,0 +1,32 @@
+  /**
+   * When the next discovery call could actually REACH A USABLE HOST — the
+   * epoch of the pause that has to expire first, or 0 when a call right now
+   * would go out.
+   *
+   * WHY THE SCANNER NEEDS THIS (2026-09-28): the durable cadence gate
+   * (Db.GECKO_DISCOVERY_AT_KEY) is charged at DISPATCH, so a fetch that comes
+   * back refused still costs a whole interval — and the client's own pause is
+   * armed for almost exactly that long, so the retry used to land ON the pause
+   * boundary and resume only by the tick's own front overhead (live: a 429 at
+   * 16:01:06Z, `geo 20` again at 16:06:50Z). Asked this instead, the scanner
+   * re-arms its gate to the moment the pause is over, which turns a refused
+   * window into a one-tick loss.
+   *
+   * A USABLE ALTERNATE MEANS "NOW": `get` diverts to the alternate host while
+   * the primary is paused, so a primary pause alone is not a reason to hold the
+   * leg back — returning 0 there keeps the keyless behaviour exactly as it was
+   * (probe the alternate on the normal interval). The primary's pause is only
+   * reported when the alternate is also paused, which is the state where a
+   * retry before the primary heals could not reach anything but a refused host
+   * (keyed: the alternate answers this key with 401 — see geckoAltEligible).
+   *
+   * The path is the one this method exists for (new_pools — the discovery leg's
+   * only request); `geckoAltEligible` is asked about it, not about a trend path.
+   */
+  nextUsableAt(now = Date.now()): number {
+    if (now >= this.rateLimitedUntil) return 0;
+    const altUsable =
+      geckoAltEligible(ALT_ELIGIBLE_PREFIX, this.apiKey !== null) &&
+      now >= this.altRateLimitedUntil;
+    return altUsable ? 0 : this.rateLimitedUntil;
+  }

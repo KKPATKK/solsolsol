@@ -8,6 +8,10 @@
 > （10K/月，而每 tick 一次係 ~43K/月）。launch slot 由 pump.fun（每 tick）
 > ＋ Meteora（gecko 未交貨嘅 tick）補位，見
 > `docs/gecko-key-launch-chain-2026-09-28.md`。
+>
+> **同日（B1）**：一次 429 只應該蝕「暫停」而唔係「成個窗口」——
+> keyed 嘅暫停底數降到 60 秒，被拒嘅 fetch 會把 DURABLE 閘重新校準到暫停結束。
+> 見第九節。
 
 ## 量度（同一分鐘，兩個方向）
 
@@ -488,3 +492,32 @@ curl -s .../health | jq '.heartbeat.summary | {geo, geoTrend, gecko: .gecko.keye
 
 若果 `keyed true` 但 `lastStatus 429` 兼 `requests` 每 tick 照加 ⇒ v2 host 唔認 key，轉 v3
 （或者確認 Demo quota 係咪只計 v3，咁就要將 gecko 整條腿搬去 alt host）。
+
+### 九、一次 429 唔應該食成個窗口（B1，2026-09-28）
+
+**問題**：閘係喺 **dispatch 時**蓋章，而 client 喺 429 之後自己暫停 5 分鐘
+（`GECKO_RATE_LIMIT_BACKOFF_MS`）。兩個 5 分鐘由同一刻開始計，所以下一個 due tick
+剛好落在「暫停結束」嘅邊界上——佢之所以通常成功，係靠 tick 自己前端嘅 ~0.4–1s 開銷
+剛好推過條線。量度（2026-09-28 14:00–16:00Z）：**22 次請求之中 5 次 429**（23%），而
+`consecutive429` **從未高過 1** —— 每次 429 都係獨立瞬態，唔係 keyless 年代「IP 被毒」
+嗰種持續牆；16 次成功**全部係 edge cache HIT**。每一次瞬態 429 ＝ 一整個 5 分鐘窗口
+（4 個 tick）`geo 0`，全部要靠 pump.fun／Meteora 補。
+
+**改咗兩樣**：
+
+| 位置 | 改動 | 為何安全 |
+|---|---|---|
+| `geckoterminal.geckoBackoffMs(…, keyed)` | keyed 嘅**底數** 5 分鐘 → **60 秒**；倍升階梯（60→120→240…→60 分鐘上限）完全不變 | 真牆仍然衰減到「每小時探一次」；代價只係牆嘅第一小時多 ~6 次請求（每次失敗一次），而呢條腿一個月只花 8,640／10,000 |
+| `scanner.geckoDiscoveryRetryStamp` ＋ `rearmGeckoDiscovery` | 被拒嘅 fetch 把閘**重新校準到 client 暫停結束**（用 `pauseEndsAt`），並且騎同一個 front 寫入 | `Math.min(pauseEnd, now + interval)` 只會令條腿**更早** due；keyless 嘅暫停本身就係 interval（而且會升級），校準結果同今日一模一樣 —— **keyless 零改動** |
+
+校準**瞄準暫停結束本身**、唔加 margin：tick 相隔一分鐘，遲幾秒就會令下一個 tick 錯過窗口、
+要再等多一分鐘；早幾秒只係多花同一分鐘，而暫停中嘅 client **唔會發請求**
+（`requests` 只計真正發出嘅），所以早到永遠唔會係「白付一次請求」。
+
+**唔會變嘅情形**：空頁（200 但 0 pools）同 5xx **冇**武裝任何暫停 ⇒
+`geckoDiscoveryRetryStamp` 回 `null`，dispatch 蓋章照舊。即係「唔係 429」嘅失敗
+仍然食一整個 interval —— 唯一例外係 client 自己話有暫停嘅時候。
+
+**驗收讀數**：429 之後嗰個 tick 應該出現 `summary.geoRetryAt`（＝瞄準嘅時刻），而
+**下一個** tick（~60s 後）就 `geoDue true`。若果見到 `geoRetryAt` 而 `geo` 仍然 0，
+睇 `summary.gecko.consecutive429`：>1 即係真牆，倍升階梯正當運作（預期行為，唔算故障）。

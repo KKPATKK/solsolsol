@@ -1,0 +1,125 @@
+  await test("GeckoTerminalClient: a KEYED 429 pauses 60s, not the keyless 5 minutes", async () => {
+    // The pause is what decides how much discovery one 429 costs: the durable
+    // cadence gate is charged at dispatch, so a refusal used to zero the leg
+    // for a whole 5-minute window (live 2026-09-28: 5 of 22 requests refused,
+    // `consecutive429` never above 1 — a transient, not the poisoned egress the
+    // keyless base was measured for).
+    const origFetch = global.fetch;
+    global.fetch = async () =>
+      new Response(JSON.stringify({ status: { error_code: 429 } }), { status: 429 });
+    try {
+      const client = new GeckoTerminalClient({
+        geckoterminalRequestIntervalMs: 0,
+        coingeckoApiKey: "CG-test",
+      });
+      const t0 = Date.now();
+      await client.fetchNewPools(1);
+      const s = client.stats();
+      assert.equal(s.keyed, true);
+      assert.equal(s.http429, 1);
+      const pause = s.backoffUntil - t0;
+      assert.ok(
+        pause >= GECKO_KEYED_429_BACKOFF_MS * 0.85 &&
+          pause <= GECKO_KEYED_429_BACKOFF_MS * 1.15,
+        `a keyed first 429 arms the 60s base (got ${pause}ms)`,
+      );
+      assert.ok(
+        pause < GECKO_RATE_LIMIT_BACKOFF_MS * 0.5,
+        "and specifically NOT the keyless 5-minute base",
+      );
+      // This is the reading the scanner's re-arm aims at.
+      assert.equal(
+        client.pauseEndsAt(),
+        s.backoffUntil,
+        "the pause end is what the durable gate is re-armed to",
+      );
+      assert.equal(client.pauseEndsAt(s.backoffUntil), 0, "over the pause -> nothing to wait for");
+      assert.equal(client.pauseEndsAt(s.backoffUntil - 1), s.backoffUntil, "still inside it");
+      // The escalation itself is shared with the keyless ladder: only the base
+      // moves, so a real wall still decays to one probe an hour.
+      assert.equal(geckoBackoffMs(2, null, () => 0.5, true), GECKO_KEYED_429_BACKOFF_MS * 2);
+      assert.equal(geckoBackoffMs(3, null, () => 0.5, true), GECKO_KEYED_429_BACKOFF_MS * 4);
+      assert.equal(
+        geckoBackoffMs(9, null, () => 0.5, true),
+        GECKO_BACKOFF_MAX_MS,
+        "and caps at the same hour",
+      );
+      // A keyed Retry-After still wins over both bases, up to the hard cap.
+      assert.equal(geckoBackoffMs(1, 20 * 60_000, () => 0.5, true), 20 * 60_000);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("geckoDiscoveryRetryStamp: a refusal is charged the pause, never more than the interval", () => {
+    const { geckoDiscoveryDue, geckoDiscoveryRetryStamp } = require("../dist/scanner.js");
+    const now = Date.UTC(2026, 8, 28, 16, 0, 0);
+    const I = 5 * MIN; // GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS = 300
+    // B1's whole gain: the client's pause ends in a minute, so the leg is due on
+    // the next tick instead of 5 minutes later.
+    const keyed = geckoDiscoveryRetryStamp(now + 60_000, now, I);
+    assert.equal(keyed, now + 60_000 - I, "the stamp is expressed against the interval");
+    assert.equal(
+      geckoDiscoveryDue(keyed, now + 59_000, I),
+      false,
+      "not due before the pause is over — the retry must not land inside it",
+    );
+    assert.equal(
+      geckoDiscoveryDue(keyed, now + 60_000, I),
+      true,
+      "due exactly at the pause end, which is the tick that can actually answer",
+    );
+    // THE CLAMP: a pause at or past the interval re-arms the ordinary gate, so
+    // the keyless path (5-minute base, escalating past it) keeps the cadence and
+    // the alternate-host probe it already had.
+    assert.equal(geckoDiscoveryRetryStamp(now + 3_600_000, now, I), now);
+    assert.equal(geckoDiscoveryDue(now, now + I - 1, I), false);
+    assert.equal(geckoDiscoveryDue(now, now + I, I), true);
+    // Not paused, or a reading it cannot trust -> the dispatch stamp stands.
+    assert.equal(geckoDiscoveryRetryStamp(0, now, I), null, "not paused");
+    assert.equal(geckoDiscoveryRetryStamp(now, now, I), null, "the pause is already over");
+    assert.equal(geckoDiscoveryRetryStamp(now + 1_000, now, 0), null, "no gate configured");
+    assert.equal(geckoDiscoveryRetryStamp(Number.NaN, now, I), null);
+    assert.equal(geckoDiscoveryRetryStamp(now + 1_000, Number.NaN, I), null);
+  });
+
+  await test("B1 wiring: the refusal re-arms the gate, and only the keyed base moves", () => {
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const flat = (p) => read(p).replace(/\s+/g, "");
+    const scannerSrc = flat("src/scanner.ts");
+    const geckoSrc = flat("src/geckoterminal.ts");
+    assert.ok(
+      scannerSrc.includes("awaitthis.rearmGeckoDiscovery(Date.now())"),
+      "the gecko closure must re-arm after its page loop, or a refusal still burns the interval",
+    );
+    assert.ok(
+      scannerSrc.includes("this.gecko.pauseEndsAt(now)"),
+      "and it must aim at the client's OWN pause, not a copy of it",
+    );
+    assert.ok(
+      scannerSrc.includes("String(stamp)") &&
+        scannerSrc.includes("awaitthis.stampFront(GECKO_DISCOVERY_AT_KEY,"),
+      "the retry rides the scan front's single write, like the dispatch stamp it replaces",
+    );
+    assert.ok(
+      geckoSrc.includes("baseMs=keyed?GECKO_KEYED_429_BACKOFF_MS:GECKO_RATE_LIMIT_BACKOFF_MS"),
+      "the base is selected by keyed-ness",
+    );
+    assert.ok(
+      geckoSrc.includes("Math.max(baseMs,doubled)"),
+      "and the ladder floors at that base — flooring at the 5-minute constant would undo it",
+    );
+    assert.ok(
+      geckoSrc.includes("this.apiKey!==null,") &&
+        geckoSrc.includes("geckoBackoffMs(this.consecutive429,asked,Math.random,this.apiKey!==null,)"),
+      "the primary's 429 must pass keyed-ness through",
+    );
+    assert.ok(
+      geckoSrc.includes("geckoBackoffMs(this.altFailures,retryAfterMs)"),
+      "the alternate host keeps the keyless base: its refusal is not a rate limit",
+    );
+    assert.ok(
+      !geckoSrc.includes("nextUsableAt"),
+      "the superseded alt-aware rule is gone — it made the re-arm a no-op while the alt was unpaused",
+    );
+  });

@@ -1365,6 +1365,55 @@ export function geckoDiscoveryDue(
 }
 
 /**
+ * The durable stamp a REFUSED fetch should leave, so the leg is due again when
+ * the host's own pause is over instead of a full interval later (pure —
+ * unit-tested; null = leave the dispatch stamp alone).
+ *
+ * The gate above compares `now - stamp >= intervalMs`, so "due at T" is
+ * expressed as `T - intervalMs`.
+ *
+ * THE MIN() IS THE SAFETY ARGUMENT, not a detail: the retry is aimed at the
+ * pause end but never past `now + interval`, so this can only ever make the leg
+ * due EARLIER than the cadence already allowed. A keyless feed is the case that
+ * matters — its 429 pause is the full 5-minute interval and escalates past it,
+ * so the clamp returns the ordinary gate unchanged and the alternate-host probe
+ * cadence is exactly what it was (live before this change: the primary's pause
+ * and the gate expired together, which is why the retry resumed at all). A
+ * keyed feed pauses 60s on a transient 429 (see GECKO_KEYED_429_BACKOFF_MS),
+ * and that is the whole gain: one tick of lost discovery instead of five.
+ *
+ * Aimed AT the pause end and not a margin past it, because ticks arrive one
+ * minute apart: a stamp a few seconds late makes the next tick miss its window
+ * and pushes the retry out a further minute, while a stamp a hair early only
+ * costs that same minute — a paused host answers without spending a request
+ * (see GeckoTerminalClient.get), so an early retry is never a request paid for
+ * nothing.
+ *
+ * WHY THIS EXISTS (live 2026-09-28): the dispatch stamp is right — a failed
+ * attempt may still have been billed, and retrying every tick until one
+ * succeeds is exactly the spend the window exists to stop — but charging a
+ * REFUSAL a full interval made one transient 429 zero the leg for a whole
+ * window: 5 of 22 requests were refused, `consecutive429` never above 1, and
+ * the retry only resumed because the tick's own front overhead happened to
+ * carry it past the pause boundary.
+ *
+ * A failure that armed no pause at all (an empty page, a 5xx) returns null and
+ * leaves the full interval in place — the same rule the client keeps for the
+ * hosts themselves.
+ */
+export function geckoDiscoveryRetryStamp(
+  pauseEndMs: number,
+  nowMs: number,
+  intervalMs: number,
+): number | null {
+  if (!Number.isFinite(pauseEndMs) || !Number.isFinite(nowMs)) return null;
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return null;
+  if (pauseEndMs <= nowMs) return null;
+  const retryAt = Math.min(pauseEndMs, nowMs + intervalMs);
+  return Math.round(retryAt - intervalMs);
+}
+
+/**
  * Pure rotation-slice over the pool-only token list (exported for offline
  * unit tests). Returns the ≤ maxPerTick window starting at `cursor` plus the
  * next cursor; pools at or below maxPerTick are taken whole with the cursor
@@ -1475,6 +1524,14 @@ export interface ScanSummary {
    * false = the tick was inside the window, so the leg cost nothing at all.
    */
   geoDue?: boolean;
+  /**
+   * Epoch the durable gate was re-armed to after this tick's gecko fetch came
+   * back REFUSED, so the leg is due again the moment the host's own pause
+   * expires (see geckoDiscoveryRetryStamp). Absent on a tick that was held
+   * back, succeeded, or failed without arming a pause — so `geoRetryAt` is the
+   * reading that says a 429 cost the feed its pause instead of its interval.
+   */
+  geoRetryAt?: number;
   /** GeckoTerminal trending-pools feed size this scan (momentum, 0 when disabled). */
   geoTrend: number;
   /** Jupiter recent-launchpad feed size this scan (0 when disabled/blocked). */
@@ -2095,6 +2152,31 @@ export class Scanner {
       return;
     }
     await this.db.setWorkerState(key, value);
+  }
+  /**
+   * Re-arm the durable gate after a REFUSED gecko fetch (see
+   * geckoDiscoveryRetryStamp). Rides the front's ONE write, exactly like the
+   * dispatch stamp it replaces, so the retry costs no round trip of its own.
+   * Returns the epoch it aimed at, or null when it left the dispatch stamp
+   * alone.
+   *
+   * A no-op whenever the client is not paused — a success, an empty page, a
+   * hard refusal — which is what keeps every non-429 path on the cadence it
+   * already had. Best-effort by construction: the dispatch stamp is already
+   * queued, so anything that goes wrong here degrades to the old
+   * full-interval behaviour.
+   */
+  private async rearmGeckoDiscovery(now: number): Promise<number | null> {
+    if (!this.gecko) return null;
+    const pauseEnd = this.gecko.pauseEndsAt(now);
+    const stamp = geckoDiscoveryRetryStamp(
+      pauseEnd,
+      now,
+      this.config.geckoterminalDiscoveryIntervalMs,
+    );
+    if (stamp === null) return null;
+    await this.stampFront(GECKO_DISCOVERY_AT_KEY, String(stamp));
+    return Math.min(pauseEnd, now + this.config.geckoterminalDiscoveryIntervalMs);
   }
 
   /**
@@ -3517,9 +3599,19 @@ export class Scanner {
             [],
             feedDeadline,
           )
-            .then((p) => {
+            .then(async (p) => {
               geckoProfiles = p;
               diag.geo = p.length;
+              // A REFUSAL MUST NOT BURN THE WHOLE WINDOW (see
+              // geckoDiscoveryRetryStamp): the dispatch stamp above is right
+              // for a success and too expensive for a refusal — the client has
+              // already armed its own pause, and a keyed feed resumes in 60s,
+              // not 5 min. Re-armed HERE, with the pools already in hand, so
+              // nothing this can do is able to discard a delivery; and AWAITED,
+              // so the retry rides this tick's ONE front write instead of
+              // landing after it.
+              const geckoRetryAt = await this.rearmGeckoDiscovery(Date.now());
+              if (geckoRetryAt !== null) diag.geoRetryAt = geckoRetryAt;
             })
             .catch((err: unknown) => {
               console.error(

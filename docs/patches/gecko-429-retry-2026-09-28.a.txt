@@ -1,0 +1,37 @@
+/**
+ * The durable stamp a REFUSED fetch should leave, so the leg is due again at
+ * `usableAtMs` instead of a full interval later (pure — unit-tested; null =
+ * leave the dispatch stamp alone).
+ *
+ * The gate above compares `now - stamp >= intervalMs`, so "due at T" is
+ * expressed as `T - intervalMs`. Aimed exactly at the host's own pause end and
+ * not a margin past it, because the ticks arrive one minute apart: a stamp a
+ * few seconds late makes the next tick miss its window and pushes the retry
+ * out by a further minute, while a stamp a hair early only costs that same
+ * minute — a paused host answers without spending a request (see
+ * GeckoTerminalClient.get), so an early retry is never a request paid for
+ * nothing.
+ *
+ * WHY THIS EXISTS (2026-09-28, see GECKO_KEYED_429_BACKOFF_MS): the dispatch
+ * stamp is right — a failed attempt may still have been billed, and retrying
+ * every tick until one succeeds is exactly the spend the window exists to stop
+ * — but charging a REFUSAL a full interval made one transient 429 zero the leg
+ * for a whole 5-minute window (live: 5 of 22 requests refused, `consecutive429`
+ * never above 1, and the retry only resumed because the tick's own front
+ * overhead happened to carry it past the pause boundary).
+ *
+ * Only ever SHORTENS: a `usableAtMs` at or before now returns null, and a
+ * failure that armed no host pause (an empty page, a 5xx) leaves the full
+ * interval in place — the same rule the client keeps for the hosts themselves.
+ */
+export function geckoDiscoveryRetryStamp(
+  usableAtMs: number,
+  nowMs: number,
+  intervalMs: number,
+): number | null {
+  if (!Number.isFinite(usableAtMs) || !Number.isFinite(nowMs)) return null;
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return null;
+  if (usableAtMs <= nowMs) return null;
+  return Math.round(usableAtMs - intervalMs);
+}
+

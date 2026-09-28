@@ -1,0 +1,8 @@
+              // A REFUSAL MUST NOT BURN THE WHOLE WINDOW (see
+              // geckoDiscoveryRetryStamp): the stamp above is charged at
+              // DISPATCH, which is right for a success and too expensive for a
+              // refusal — the client has already armed its own pause, and a
+              // keyed feed resumes in 60s, not 5 min. Re-armed here so this
+              // tick's ONE write carries the retry, not the interval.
+              const geckoRetryAt = await this.rearmGeckoDiscovery(Date.now());
+              if (geckoRetryAt !== null) diag.geoRetryAt = geckoRetryAt;
