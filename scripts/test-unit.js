@@ -4229,6 +4229,127 @@ async function main() {
     );
   });
 
+  await test("chain reject ring: the push-stage gates get their own 5 slots", () => {
+    // WHY: the eval phase fills the 20-slot `rejects` ring (100+ market-cap
+    // rejects per tick, measured 2026-09-29), so every push-stage addReject hit
+    // the cap and returned — `fails.sus` could count a blocked coin and never
+    // name it, in every sampled tick.
+    const { Scanner, CHAIN_REJECT_LOG_MAX } = require("../dist/scanner.js");
+    assert.equal(CHAIN_REJECT_LOG_MAX, 5, "one slot per chain gate");
+    const cfg = loadConfig({});
+    const scanner = new Scanner(
+      { setWorkerState: async () => {} },
+      { api: { sendMessage: async () => ({}) } },
+      null,
+      cfg,
+      null,
+      null,
+      null,
+    );
+    const diag = { rejects: [], chainRejects: [] };
+    const coin = {
+      profile: { symbol: "AAA", tokenAddress: "T" },
+      pair: {
+        baseToken: { symbol: "AAA" },
+        pairCreatedAt: Date.now() - 90_000,
+        marketCap: 12_345,
+        volume: { m5: 999 },
+        priceChange: { m5: 1.5 },
+      },
+    };
+    for (let i = 0; i < CHAIN_REJECT_LOG_MAX + 4; i++) {
+      scanner.addReject(diag, coin, `r${i}`);
+    }
+    assert.equal(diag.chainRejects.length, CHAIN_REJECT_LOG_MAX, "bounded at its own cap");
+    assert.deepEqual(
+      diag.chainRejects.map((r) => r.reason),
+      ["r0", "r1", "r2", "r3", "r4"],
+      "and it keeps the FIRST ones, so the earliest gate to fire is the one that survives",
+    );
+    assert.equal(diag.rejects.length, 0, "the eval ring is untouched — that is the whole point");
+    assert.equal(diag.chainRejects[0].symbol, "AAA");
+    assert.equal(diag.chainRejects[0].mcapUsd, 12_345);
+    assert.equal(diag.chainRejects[0].ageMin, 2, "1.5 minutes rounds to 2");
+    // The ring only exists if the tick's summary carries it.
+    const scannerSrc = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    assert.ok(scannerSrc.includes("chainRejects: [],"), "the summary must initialise the ring");
+    assert.ok(
+      scannerSrc.includes("diag.chainRejects.length >= CHAIN_REJECT_LOG_MAX"),
+      "addReject must be the ring's only writer, at its own cap",
+    );
+  });
+
+  await test("mcapRatioLowBlockReason: the low side on its own, one message with the band", () => {
+    // The chain gate owns only the low end (the eval passes 0 for it), so it
+    // needs its own entry point — and it has to say exactly what the band says,
+    // or the card, the log and the reject ring describe one reading three ways.
+    const { mcapRatioLowBlockReason, mcapRatioBlockReason } = require("../dist/scanner.js");
+    assert.equal(mcapRatioLowBlockReason(81_566, 57_144, 0), null, "0 disables the low side");
+    assert.equal(mcapRatioLowBlockReason(81_566, 57_144, -1), null);
+    assert.equal(
+      mcapRatioLowBlockReason(100_000, 50_000, 2),
+      null,
+      "2.0x is AT the floor, not below it",
+    );
+    assert.equal(mcapRatioLowBlockReason(100_001, 50_000, 2), null, "and just above it");
+    const low = mcapRatioLowBlockReason(100_000, 60_000, 2);
+    assert.ok(low.includes("1.7x < 2x"), "the ratio is printed to one decimal, like the band");
+    assert.ok(low.includes("LP/市值 0.60"));
+    assert.ok(low.includes("約 30% 供應"), "and the pooled-supply share is derived, not stored");
+    assert.equal(
+      low,
+      mcapRatioBlockReason(100_000, 60_000, 10, 2),
+      "one message, whichever entry point is asked",
+    );
+    // Fail-open on anything it cannot judge — the same discipline as every
+    // other gate, and the reason the chain hands it 0 for an unjudgeable leg.
+    assert.equal(mcapRatioLowBlockReason(0, 60_000, 2), null);
+    assert.equal(mcapRatioLowBlockReason(100_000, 0, 2), null);
+    assert.equal(mcapRatioLowBlockReason(NaN, 60_000, 2), null);
+    assert.equal(mcapRatioLowBlockReason(100_000, NaN, 2), null);
+    // It must NEVER fire on the high side: that is still the eval's rule.
+    assert.equal(mcapRatioLowBlockReason(297_569, 16_510, 2), null);
+    // ... and the band still reports the high side first, with the low end off
+    // or on, exactly as before this change.
+    assert.ok(mcapRatioBlockReason(297_569, 16_510, 10, 2).includes("> 10x"));
+  });
+
+  await test("liqRatio gate: a per-TOKEN chain gate now, and the eval judges only the high side", () => {
+    // Live 2026-09-29 (14 sampled ticks): in the eval the counter read "cleared
+    // the market-cap band" — 9 hits, none able to say whether the coin would
+    // have passed the age and momentum gates. It is a chain gate now: it runs
+    // only for a coin this tick would deliver, and its reason lands in
+    // chainRejects, which can name it. The slot IS the meaning, so pin the slot.
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    // One declaration and one call site each; the eval's call switches the low
+    // side off (0) so the chain gate is its only judge.
+    assert.equal(src.split("mcapRatioBlockReason(").length - 1, 2, "one declaration, one eval call");
+    assert.equal(
+      src.split("mcapRatioLowBlockReason(").length - 1,
+      3,
+      "one declaration, the band's delegation, and the chain's call",
+    );
+    assert.ok(
+      src.includes("this.config.mcapLiqRatioMax,\n            // 0 = the LOW side is OFF here"),
+      "the eval must pass 0 for the low side, or the chain gate is unreachable",
+    );
+    assert.ok(
+      !src.includes("this.config.mcapLiqRatioMax,\n            this.config.mcapLiqRatioMin,"),
+      "and must not judge the low side twice",
+    );
+    // The slot in the chain: after the per-token seen-dedupe (so the coin is one
+    // this tick would deliver) and before the first leg that costs a request.
+    const seen = src.indexOf("if (unseen.length === 0) continue;");
+    const gate = src.indexOf("mcapRatioLowBlockReason(\n          coin.pair.marketCap,");
+    const flow = src.indexOf("await this.resolveSupplyFlow(coin, chainDeadline);");
+    const named = src.indexOf("this.addReject(diag, coin, liqRatioLow);");
+    assert.ok(seen > 0, "the chain's per-token dedupe anchor must exist");
+    assert.ok(gate > seen, "the gate runs per TOKEN, after the dedupe");
+    assert.ok(flow > gate, "and before the supply-flow leg, and everything behind it");
+    assert.ok(named > gate, "and names the coin through the push-stage ring");
+    assert.equal(src.split("fails.liqRatio++").length - 1, 1, "one writer for the counter");
+  });
+
   await test("boosts dial: off by default, clamped to the 30-row upstream", () => {
     // The leg ships DISABLED as a DEFAULT (0), and production turns it on in
     // wrangler.toml — 30, the upstream's own ceiling, since 2026-09-28: the

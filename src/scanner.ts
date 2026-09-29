@@ -1931,8 +1931,18 @@ export interface ScanSummary {
   maintFresh?: boolean;
   /** Age of the maintenance pass row in ms, or null when absent/unreadable. */
   maintAgeMs?: number | null;
-  /** Per-coin rejection trace for the last scan (bounded). */
+  /** Per-coin rejection trace for the last scan, EVAL stage (bounded — see
+   * REJECT_LOG_MAX). Filled first, so the push-stage reasons are in their own
+   * ring below rather than competing with it. */
   rejects: RejectionEntry[];
+  /**
+   * The PUSH-STAGE rejections (see CHAIN_REJECT_LOG_MAX): the coins that got
+   * as far as the push chain — past the per-chat dedupe and the tick's gates —
+   * and were stopped there. Separate from `rejects` on purpose, and the reason
+   * a gate that now blocks nothing cannot be told apart from a gate that is
+   * never reached is exactly what this ring answers.
+   */
+  chainRejects: RejectionEntry[];
 }
 
 /**
@@ -1950,6 +1960,27 @@ export interface ScanSummary {
  * failures) at ~2KB.
  */
 const REJECT_LOG_MAX = 20;
+
+/**
+ * Slots for the PUSH-STAGE rejections, in their OWN ring (ScanSummary.
+ * chainRejects). Five, one per chain gate that can block a coin — RugCheck's
+ * bot flag, GMGN wash trading, the Jupiter suspicion flag, the brand-new-wallet
+ * rule and the top-10 concentration rule — plus flurry; the point is to be able
+ * to NAME the coins a gate stopped, and one slot per gate is enough to see
+ * which gate is doing the blocking.
+ *
+ * WHY IT IS NOT THE 20-SLOT RING ABOVE (measured 2026-09-29). That ring is
+ * filled by the EVAL phase, which runs first and rejects 100+ coins a tick on
+ * the market-cap band alone, so every `addReject` from the chain hit the cap
+ * and returned: a coin blocked by the Jupiter audit flag was COUNTED
+ * (`fails.sus`) and never named, in every sampled tick. The two phases now
+ * have a ring each, so the chain's five slots survive whatever the eval does.
+ *
+ * SIZE: five entries serialize to ~0.5KB (the reasons differ in length — the
+ * flurry line is the long one) on a completion batch that is already ~2KB of
+ * rejects and 12.4KB in total, so this is the cheapest reading in the batch.
+ */
+export const CHAIN_REJECT_LOG_MAX = 5;
 
 /**
  * Market-cap-to-liquidity sanity gate (Nudaeng lesson, 2026-08-22: pushed at
@@ -1982,6 +2013,40 @@ export function flurryBlockReason(report: FlurryReport | null): string | null {
   return `Launch 捆綁: ${report.deploySlotWallets}個錢包在創建同一slot買入 ${report.deploySlotSupplyPct}%供應${lineage}（Jito bundle 特徵）`;
 }
 
+/**
+ * The LOW side of the mcap/LP band on its own — the LP-heavy shape added
+ * 2026-09-28, judged as a per-TOKEN gate in the push chain rather than as a
+ * per-chat eval rule.
+ *
+ * WHY IT IS ITS OWN ENTRY POINT. `mcapRatioBlockReason` below answers "is this
+ * pair outside the band" for a caller that owns both ends; the chain gate owns
+ * only the low end and has to run by itself, because the eval passes 0 for the
+ * low end now (the chain is the only place that knows the coin is about to be
+ * delivered). The message is built HERE only, so the card, the log and the
+ * reject ring can never describe the same reading two ways.
+ */
+export function mcapRatioLowBlockReason(
+  marketCap: number,
+  liquidityUsd: number,
+  ratioMin: number,
+): string | null {
+  if (!(marketCap > 0) || !(liquidityUsd > 0) || !(ratioMin > 0)) return null;
+  const ratio = marketCap / liquidityUsd;
+  if (ratio >= ratioMin) return null;
+  const poolSupplyPct = Math.round(100 / (2 * ratio));
+  return (
+    "市值/LP 比率 " +
+    ratio.toFixed(1) +
+    "x < " +
+    ratioMin +
+    "x（LP/市值 " +
+    (1 / ratio).toFixed(2) +
+    "：池內仍壓住約 " +
+    poolSupplyPct +
+    "% 供應，價格只是未賣出的存量）"
+  );
+}
+
 export function mcapRatioBlockReason(
   marketCap: number,
   liquidityUsd: number,
@@ -1993,11 +2058,13 @@ export function mcapRatioBlockReason(
   if (ratioMax > 0 && ratio > ratioMax) {
     return `市值/LP 比率 ${ratio.toFixed(1)}x > ${ratioMax}x（估值遠超池深：價格可操縱、難以出場）`;
   }
-  // The OTHER side of the band (2026-09-28, MCAP_LIQ_RATIO_MIN). For a
-  // constant-product pool the two sides are the same quantity read from
-  // opposite ends: LP/mcap = 2 × (tokens in the pool ÷ total supply), so a
-  // LOW mcap/LP means the supply is still (mostly) unsold INSIDE the pool and
-  // its SOL side is the exit one or two wallets can take.
+  // The OTHER side of the band (2026-09-28, MCAP_LIQ_RATIO_MIN) — see
+  // mcapRatioLowBlockReason above for the calibrated shape and the message.
+  // This branch survives for a caller that hands both ends (the eval passes 0
+  // for the low end now). For a constant-product pool the two sides are the
+  // same quantity read from opposite ends: LP/mcap = 2 × (tokens in the pool ÷
+  // total supply), so a LOW mcap/LP means the supply is still (mostly) unsold
+  // INSIDE the pool and its SOL side is the exit one or two wallets can take.
   //
   // Why a LOW ratio is the danger, from the ring that found it: on 2026-09-28
   // the pushed QNT (LP/mcap 0.70 = ~35% of supply still pooled, dev + one
@@ -2006,8 +2073,7 @@ export function mcapRatioBlockReason(
   // 2.0x all had their liquidity pulled, none of the 35 above 2.9x did. See
   // docs/suspicious-token-gates.md.
   if (ratioMin > 0 && ratio < ratioMin) {
-    const poolSupplyPct = Math.round(100 / (2 * ratio));
-    return `市值/LP 比率 ${ratio.toFixed(1)}x < ${ratioMin}x（LP/市值 ${(1 / ratio).toFixed(2)}：池內仍壓住約 ${poolSupplyPct}% 供應，價格只是未賣出的存量）`;
+    return mcapRatioLowBlockReason(marketCap, liquidityUsd, ratioMin);
   }
   return null;
 }
@@ -3497,6 +3563,7 @@ export class Scanner {
       deferPruned: this.deferredPushes.pruned,
       deferObserved: 0,
       rejects: [],
+      chainRejects: [],
     };
     // LOW-WATER GATE (see SCAN_SUBREQ_FLOOR). The invocation's allowance is
     // shared with the tick's tail, and the scan is the only phase whose work is
@@ -4845,6 +4912,40 @@ export class Scanner {
         }
         if (unseen.length === 0) continue;
         const coin = unseen[0];
+        // MCAP/LP LOW-SIDE GATE (MCAP_LIQ_RATIO_MIN): a pool still holding most
+        // of the supply is an exit one or two wallets can take (see the
+        // helper's calibration notes). It is the FIRST thing the chain does
+        // with a coin, because it is a pure computation on a pair the chain
+        // already holds: `unseen.length === 0` above has already established
+        // that this tick would DELIVER the coin to somebody, and nothing behind
+        // this line has to be spent on one the ratio rejects. A leg that cannot
+        // judge the pair (see gateLiquidityUsd) hands it 0 and fails open, like
+        // every other gate here.
+        //
+        // WHY IT LIVES HERE AND NOT IN THE EVAL — the whole reason it moved
+        // twice in one day (measured 2026-09-29): the eval runs per CHAT and
+        // before the age and momentum gates, so a hit there said only "cleared
+        // the market-cap band". Here it runs after the per-chat dedupe and after
+        // every eval gate, so a hit means the coin would have been delivered,
+        // and the reason reaches addReject — the ring that can NAME it, which
+        // the eval's ring never had room to do.
+        const liqRatioLow = mcapRatioLowBlockReason(
+          coin.pair.marketCap,
+          gateLiquidityUsd(coin.pair) ?? 0,
+          this.config.mcapLiqRatioMin,
+        );
+        if (liqRatioLow) {
+          diag.fails.liqRatio++;
+          this.addReject(diag, coin, liqRatioLow);
+          console.log(
+            "[scanner] blocked " +
+              (coin.profile.symbol ?? coin.pair.baseToken.symbol) +
+              " (市值/LP 低於 " +
+              this.config.mcapLiqRatioMin +
+              "x)",
+          );
+          continue;
+        }
         // Supply-flow (rug/distribution) check — run before the expensive
         // display lookups so a flagged coin never wastes the tick. Only a
         // confirmed flag blocks the push; a pending/incomplete analysis
@@ -5816,16 +5917,21 @@ export class Scanner {
     }
   }
 
-  /** Append a post-match rejection to the scan summary (bounded). */
+  /**
+   * Append a PUSH-STAGE rejection to the scan summary (bounded — see
+   * CHAIN_REJECT_LOG_MAX). Never the eval ring: that one is full by the time
+   * the chain runs, which is how every gate here became countable but
+   * nameless.
+   */
   private addReject(
     diag: ScanSummary,
     coin: QualifyingCoin,
     reason: string,
   ): void {
-    if (diag.rejects.length >= REJECT_LOG_MAX) return;
+    if (diag.chainRejects.length >= CHAIN_REJECT_LOG_MAX) return;
     const pair = coin.pair;
     const ageMs = Date.now() - pair.pairCreatedAt;
-    diag.rejects.push({
+    diag.chainRejects.push({
       symbol: pair.baseToken.symbol || coin.profile.symbol || "?",
       ageMin: Math.round(ageMs / 60_000),
       mcapUsd: Math.round(pair.marketCap),
@@ -6334,37 +6440,11 @@ export class Scanner {
           reject(`市值 ${fmtUsd(pair.marketCap)} > ${fmtUsd(chat.maxMarketCapUsd)}`);
           continue; // too big — mid-cap range only
         }
-        // Valuation vs pool depth sanity: a price that ran up far beyond its
-        // pooled liquidity is manipulable and nearly un-exitable (see the
-        // helper's calibration notes). Global knob, 0 = off.
-        // null = the coin came from a leg this ratio cannot judge (see
-        // gateLiquidityUsd); stay fail-open rather than block a healthy coin
-        // on a number that is a different metric of the same pool.
-        if (liquidityUsd !== null) {
-          const ratioReason = mcapRatioBlockReason(
-            pair.marketCap,
-            liquidityUsd,
-            this.config.mcapLiqRatioMax,
-            this.config.mcapLiqRatioMin,
-          );
-          if (ratioReason) {
-            // Route the counter to the side that fired. The decision itself
-            // stays the helper's (one source of truth); this extra division
-            // only picks the reading, because the two floors are tuned
-            // independently — the HIGH side is the Nudaeng shape this gate has
-            // always had, the LOW side is the LP-heavy shape added 2026-09-28.
-            if (
-              this.config.mcapLiqRatioMin > 0 &&
-              pair.marketCap / liquidityUsd < this.config.mcapLiqRatioMin
-            ) {
-              fails.liqRatio++;
-            } else {
-              fails.other++;
-            }
-            reject(ratioReason);
-            continue;
-          }
-        }
+        // The valuation-vs-pool-depth gate is not judged here: the HIGH side is
+        // checked below (past the momentum gate, before out.push) and the LOW
+        // side is a per-TOKEN gate at the head of the push chain, where a hit
+        // means the coin was about to be DELIVERED rather than merely clearing
+        // this band. See mcapRatioLowBlockReason and fails.liqRatio.
         if (ageMs < chat.minAgeMinutes * 60_000) {
           fails.age++;
           reject(`上線 ${Math.round(ageMs / 60_000)}m < ${chat.minAgeMinutes}m`);
@@ -6397,6 +6477,35 @@ export class Scanner {
             `1h路徑[量${mark(vol1hOk)} ${fmtUsd(pair.volume.h1)} 漲${mark(chg1hOk)} ${pair.priceChange.h1.toFixed(0)}%]`,
           );
           continue;
+        }
+        // Valuation vs pool depth sanity: a price that ran up far beyond its
+        // pooled liquidity is manipulable and nearly un-exitable (see the
+        // helper's calibration notes). Global knob, 0 = off.
+        // null = the coin came from a leg this ratio cannot judge (see
+        // gateLiquidityUsd); stay fail-open rather than block a healthy coin
+        // on a number that is a different metric of the same pool.
+        if (liquidityUsd !== null) {
+          const ratioReason = mcapRatioBlockReason(
+            pair.marketCap,
+            liquidityUsd,
+            this.config.mcapLiqRatioMax,
+            // 0 = the LOW side is OFF here, and judged once per TOKEN in the
+            // push chain instead (see mcapRatioLowBlockReason's call site).
+            // Measured 2026-09-29, the reason it moved: judged HERE it counted
+            // coins that had cleared this band and nothing else — 9 hits in 14
+            // sampled ticks, none of which could be called "a coin that would
+            // have been pushed", because the age, momentum, seen and chain
+            // gates all still lay in front of it.
+            0,
+          );
+          if (ratioReason) {
+            // The high side (the Nudaeng shape this gate has always had) is
+            // the one counter left here: `other` means "over-valued against
+            // its own pool depth after passing momentum".
+            fails.other++;
+            reject(ratioReason);
+            continue;
+          }
         }
         out.push({
           chatId: chat.chatId,
