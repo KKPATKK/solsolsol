@@ -4484,7 +4484,6 @@ export class Scanner {
       const recentStats = await poolRead;
       diag.poolMs = poolReadMs;
       diag.poolCache = poolCacheView();
-      diag.poolCache = poolCacheView();
       diag.poolWaitMs = Date.now() - poolJoinStart;
       try {
         await pruneRun;
