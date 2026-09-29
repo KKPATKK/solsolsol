@@ -697,6 +697,12 @@ export const SCAN_FRONT_GATE_KEYS = [
   // this tick (see worker.MAINTENANCE_CRON and scanner.maintenancePassFresh).
   // Riding this statement is what makes that question cost no round trip.
   "maintenance_pass_at",
+  // The FLEET-WIDE DexScreener spacing row (dexscreener.DEX_SPACING_STATE_KEY,
+  // spelled as the literal for the same import-direction reason as the two
+  // rows above). READ to inherit the raises an earlier isolate earned from a
+  // 429, WRITTEN only on a tick whose step count actually moved, so joining
+  // this list costs the tick an IN-list entry and never a round trip.
+  "dex_spacing",
 ] as const;
 
 /**

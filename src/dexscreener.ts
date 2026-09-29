@@ -596,6 +596,103 @@ export const DEX_ADAPTIVE_GROWTH = 1.6;
 export const DEX_ADAPTIVE_RECOVER_SUCCESSES = 6;
 
 /**
+ * The durable, FLEET-WIDE spacing row (worker_state). JSON `DexSpacingStamp`.
+ *
+ * WHY DURABLE (2026-09-29). AdaptiveSpacing above is per-isolate, and this
+ * Worker's isolates churn every ~30s — so the per-isolate version loses the
+ * raise at the moment it starts to matter. Live 2026-09-29T00:57Z measured
+ * exactly that: three refusals inside one isolate read `intervalMs 1024 /
+ * spacingSteps 3 / http429 3`, while the tick two minutes later (a different
+ * isolate) read `250 / 0` — the fleet had been refused three times in two
+ * minutes and the next isolate walked into the same burst at full rate. The
+ * row carries the raise ACROSS the churn, so "the shared egress IP is
+ * refusing us right now" is one fact about the fleet rather than one fact per
+ * isolate.
+ *
+ * It rides the scan front's ONE read and ONE write (db.SCAN_FRONT_GATE_KEYS,
+ * spelled as a literal there for the import direction that list documents), so
+ * the fleet reading costs the tick no round trip of its own — the IN-list is
+ * one row longer — and the row is only ever WRITTEN on a tick whose step count
+ * actually moved (see DexScreenerClient.durableSpacingWrite): a healthy fleet
+ * writes nothing at all, forever.
+ */
+export const DEX_SPACING_STATE_KEY = "dex_spacing";
+
+/**
+ * How long one fleet-wide step of spacing survives without another refusal.
+ *
+ * THE ARITHMETIC: the in-isolate walk-back needs DEX_ADAPTIVE_RECOVER_SUCCESSES
+ * (6) consecutive 2xx, i.e. 1.5s of dispatch at the base and 7.2s at the
+ * ceiling — so "six answers worth of quiet" is a few seconds, and 15s is that
+ * same evidence with room for the tick's phase gaps. Three refusals therefore
+ * hold the fleet at the ceiling for ~45s and then hand the spacing back.
+ *
+ * WHAT IT DELIBERATELY DOES NOT COVER: PAIR_BATCH_BACKOFF_MS (90s). The block
+ * already forces cache-only for its whole length, so the moment the deferred
+ * legs all want a request at once is AFTER it — and a fleet row that stayed at
+ * 1200ms until then would charge every tick of a recovered endpoint seconds it
+ * will not get back (the tick's pair phase is one of its bounded legs). The
+ * row is a memory of the burst, not a second backoff: if the burst is real, the
+ * refusals keep refreshing `at` and the spacing never comes down at all.
+ */
+export const DEX_ADAPTIVE_FLEET_DECAY_MS = 15_000;
+
+/** What DEX_SPACING_STATE_KEY holds (JSON). */
+export interface DexSpacingStamp {
+  /** Epoch ms at which `steps` was established (a refusal, or a walk-back). */
+  at: number;
+  /** Raises in force at `at`. 0 is a REAL reading (the fleet recovered) — 
+   * see parseDexSpacingStamp. */
+  steps: number;
+}
+
+/**
+ * Parse the durable spacing row. Null for absent, empty or unreadable, which
+ * every caller must treat as "no fleet reading" rather than as zero — the two
+ * are the same answer to `dexSpacingDecaySteps` by construction, but only the
+ * former may be re-written without knowing what the row said.
+ *
+ * A `steps: 0` row IS valid and is the one worth keeping: it is the record of
+ * an isolate that walked the spacing all the way back down, and without it the
+ * next isolate would re-inherit an older, higher row and re-pay the episode.
+ */
+export function parseDexSpacingStamp(
+  raw: string | null | undefined,
+): DexSpacingStamp | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null || typeof parsed !== "object") return null;
+    const row = parsed as Record<string, unknown>;
+    const at = typeof row.at === "number" && Number.isFinite(row.at) ? row.at : null;
+    const steps =
+      typeof row.steps === "number" && Number.isFinite(row.steps) ? row.steps : null;
+    if (at === null || steps === null || at <= 0 || steps < 0) return null;
+    return { at: Math.floor(at), steps: Math.floor(steps) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The steps still in force `now`: one step back per
+ * DEX_ADAPTIVE_FLEET_DECAY_MS of fleet-wide quiet since the row was written.
+ *
+ * A future `at` (clock skew between isolates) yields the FULL count, not a
+ * negative age: the row was written by an isolate that believed it was later
+ * than this one, and the safe reading of that is "it just happened".
+ */
+export function dexSpacingDecaySteps(
+  stamp: DexSpacingStamp | null,
+  now: number,
+): number {
+  if (!stamp) return 0;
+  const age = now - stamp.at;
+  if (!Number.isFinite(age) || age <= 0) return stamp.steps;
+  return Math.max(0, stamp.steps - Math.floor(age / DEX_ADAPTIVE_FLEET_DECAY_MS));
+}
+
+/**
  * The 429-driven dispatch-spacing controller.
  *
  * WHY IT EXISTS (2026-09-29). The spacing used to be one config constant
@@ -612,10 +709,21 @@ export const DEX_ADAPTIVE_RECOVER_SUCCESSES = 6;
  * returns every millisecond of that as soon as the endpoint serves again — so a
  * healthy day reads `intervalMs === DEX_REQUEST_INTERVAL_MS` exactly as before.
  *
- * STATE IS PER-ISOLATE, deliberately: the durable evidence of a rate-limit
- * episode is the 429 ring the worker keeps (`dex.http429` / `last429At`), and
- * a fresh isolate starting at the configured base is the safe default — the
- * backoff block, not the spacing, is what protects a cold isolate's first tick.
+ * TWO LAYERS, and the split is the point. THIS class is the in-isolate
+ * controller: it is the only thing that can give a step back (it counts the
+ * contiguous 2xx streak the fleet cannot see) and it reacts within the request
+ * that was refused. The durable row beside it (DEX_SPACING_STATE_KEY, adopted
+ * through adoptSteps below) is the FLEET memory: without it the raise died with
+ * the isolate — measured live 2026-09-29T00:57Z, `intervalMs 1024 /
+ * spacingSteps 3` in the isolate that was refused, `250 / 0` in the next one.
+ *
+ * `adoptSteps` can only ever RAISE, never lower. That is not a shortcut: the
+ * profiles fetch is dispatched before the front row that carries the fleet
+ * reading is even awaited (see the dispatch in runScan), so a refusal can land
+ * BEFORE this isolate's own, fresher evidence exists — and letting a stale row
+ * walk that back down would erase exactly the refusal that just happened.
+ * Walking down is noteServed's job, per isolate, and the result is written back
+ * to the row so the next isolate inherits the recovery too.
  */
 export class AdaptiveSpacing {
   private current: number;
@@ -652,6 +760,16 @@ export class AdaptiveSpacing {
   noteRefused(): void {
     if (this.base <= 0) return;
     this.healthy = 0;
+    this.growOnce();
+  }
+
+  /**
+   * One raise, the body noteRefused and adoptSteps share so the two can never
+   * compute a different spacing for the same number of steps. `steps` counts
+   * RAISES, not refusals: at the ceiling the spacing stays where it is and the
+   * count does not move, or a burst of refusals would read as progress.
+   */
+  private growOnce(): void {
     const grown = Math.round(this.current * DEX_ADAPTIVE_GROWTH);
     const next = Math.min(DEX_ADAPTIVE_MAX_MS, Math.max(this.base, grown));
     if (next > this.current) {
@@ -662,6 +780,35 @@ export class AdaptiveSpacing {
       // be mistaken for progress (steps counts RAISES, not refusals).
       this.current = Math.max(this.base, next);
     }
+  }
+
+  /**
+   * Raise the spacing to the FLEET's step count (see DEX_SPACING_STATE_KEY),
+   * raising only — never lowering, for the reason the class doc gives. Returns
+   * true when the spacing actually moved, which is the reading the caller
+   * publishes as "this isolate inherited a raise".
+   *
+   * The loop is what keeps the two layers consistent: the spacing is grown by
+   * the SAME growOnce the refusals use, so `8 steps` means the same 1200ms
+   * whether it was reached by three live refusals or adopted from the row —
+   * and a ceiling that cannot raise any further stops the loop instead of
+   * counting phantom steps.
+   */
+  adoptSteps(target: number): boolean {
+    if (this.base <= 0) return false;
+    const want = Math.max(0, Math.floor(target));
+    if (want <= this.steps) return false;
+    const before = this.steps;
+    this.healthy = 0;
+    while (this.steps < want) {
+      const at = this.steps;
+      this.growOnce();
+      if (this.steps === at) break;
+    }
+    // "Actually moved" is the honest return: a row that asks for more raises
+    // than the ceiling holds stops the loop, and the caller must not read that
+    // as an inheritance it never got.
+    return this.steps > before;
   }
 
   /**
@@ -851,6 +998,22 @@ export class DexScreenerClient {
    * can never disagree about the rate the queue is running at.
    */
   private readonly spacing: AdaptiveSpacing;
+  /**
+   * The durable fleet row's step count as this isolate last READ it, after
+   * decay (see adoptDurableSpacing). Published so "the fleet is running wide"
+   * is readable from /health — and so is the reading that proves a raise
+   * crossed an isolate boundary rather than dying with one.
+   */
+  private fleetSteps = 0;
+  /** How old that row was when it was read, or null when there was none. */
+  private fleetAgeMs: number | null = null;
+  /**
+   * The step count the durable row is BELIEVED to hold — the value adopted
+   * from it, updated on every write. `durableSpacingWrite` compares it against
+   * the live spacing, which is what keeps a healthy tick from spending a write
+   * to say "nothing changed". Null until the row has been read at all.
+   */
+  private persistedSteps: number | null = null;
   /** Fresh pair data by token (see PAIR_CACHE_TTL_MS). Insertion-ordered. */
   private readonly pairCache = new Map<
     string,
@@ -909,6 +1072,79 @@ export class DexScreenerClient {
   }
 
   /**
+   * Adopt the FLEET's durable spacing row (see DEX_SPACING_STATE_KEY) — the
+   * one piece of 429 state that survives this isolate.
+   *
+   * Called once per scan, from the front row the tick already read (so it costs
+   * no round trip), and RAISE-ONLY (see AdaptiveSpacing.adoptSteps): a refusal
+   * that landed before the front came back is this isolate's own, fresher
+   * evidence and must never be overwritten by an older row.
+   *
+   * The returned `steps` is what the ROW carried after decay — the honest
+   * "what the fleet knew" reading, published on the summary as
+   * `spacingFleetSteps` — while `intervalMs` is the rate this isolate is
+   * actually running, which is the same number only when the adoption (or a
+   * refusal of its own) is what moved it. `getStats()` publishes both, so a
+   * live sample can tell the two layers apart.
+   */
+  adoptDurableSpacing(
+    raw: string | null,
+    now: number = Date.now(),
+  ): {
+    /** The row's step count after decay. 0 = no row, or a fully decayed one. */
+    steps: number;
+    /** Age of the row when read, or null when there was none. */
+    ageMs: number | null;
+    /** Whether the adoption actually widened this isolate's queue. */
+    raised: boolean;
+    /** The spacing this isolate is running after adoption (ms). */
+    intervalMs: number;
+  } {
+    const stamp = parseDexSpacingStamp(raw);
+    const steps = dexSpacingDecaySteps(stamp, now);
+    this.fleetSteps = steps;
+    this.fleetAgeMs = stamp === null ? null : Math.max(0, now - stamp.at);
+    // What the row says, whether or not this isolate had already grown past it:
+    // the comparison durableSpacingWrite makes is against the row, not against
+    // the adoption's effect.
+    this.persistedSteps = steps;
+    const raised = this.spacing.adoptSteps(steps);
+    if (raised) this.throttle.setIntervalMs(this.spacing.currentMs);
+    return {
+      steps,
+      ageMs: this.fleetAgeMs,
+      raised,
+      intervalMs: this.spacing.currentMs,
+    };
+  }
+
+  /**
+   * The row to write back, or null when the durable value already agrees with
+   * this isolate — the common case, and the reason a healthy day costs no
+   * writes at all.
+   *
+   * `at` is the moment `steps` was established, and every write resets it: the
+   * row is "as of `at`, the fleet was at `steps` raises", and decay is measured
+   * from there. Writing a walked-back count with the OLD refusal's `at` would
+   * make a later isolate decay it twice, which is why the timestamp travels
+   * with the count rather than with the episode.
+   *
+   * A null `persistedSteps` (the row was never read — a standalone Scanner)
+   * still writes a non-zero count: a raise nobody recorded is the one state
+   * worth a write even when there is nothing to compare against.
+   */
+  durableSpacingWrite(now: number = Date.now()): DexSpacingStamp | null {
+    const steps = this.spacing.growthSteps;
+    if (this.persistedSteps !== null) {
+      if (steps === this.persistedSteps) return null;
+    } else if (steps <= 0) {
+      return null;
+    }
+    this.persistedSteps = steps;
+    return { at: now, steps };
+  }
+
+  /**
    * Live rate-limit telemetry for /health: the configured dispatch spacing
    * (DEX_REQUEST_INTERVAL_MS), how often the shared egress IP has been 429'd
    * since this isolate booted, and how long the cache-only backoff still has
@@ -924,6 +1160,13 @@ export class DexScreenerClient {
     configuredIntervalMs: number;
     /** How many raises are in force since the last full recovery (0 = at base). */
     spacingSteps: number;
+    /** The FLEET row's raises as this isolate last read them, after decay (see
+     * DEX_SPACING_STATE_KEY). Non-zero on an isolate this one inherited from:
+     * `spacingSteps > spacingFleetSteps` means the raises are this isolate's
+     * own, `spacingFleetSteps > 0` means they crossed an isolate boundary. */
+    spacingFleetSteps: number;
+    /** Age of that row when it was read, or null when there was none. */
+    spacingFleetAgeMs: number | null;
     http429: number;
     last429At: number | null;
     blockedForMs: number;
@@ -956,6 +1199,8 @@ export class DexScreenerClient {
       intervalMs: this.spacing.currentMs,
       configuredIntervalMs: this.config.dexRequestIntervalMs,
       spacingSteps: this.spacing.growthSteps,
+      spacingFleetSteps: this.fleetSteps,
+      spacingFleetAgeMs: this.fleetAgeMs,
       http429: this.http429Total,
       last429At: this.last429At,
       blockedForMs: Math.max(0, this.batchBlockedUntil - Date.now()),

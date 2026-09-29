@@ -354,6 +354,33 @@ JUPITER_TRENDING_LIMIT = "100"
 # minute", never a hammering loop. Watch http429/blockedForMs here: they are
 # the signal for the CONCURRENCY (PAIR_BATCH_CONCURRENCY), not this value.
 DEX_REQUEST_INTERVAL_MS = "250"
+# ADAPTIVE SPACING (2026-09-29) — this value is now the BASE, not the rate.
+# Two layers raise it on a counted 429 and walk it back down on a healthy
+# streak, and neither can ever take it BELOW this number:
+#
+#   dexscreener.AdaptiveSpacing        per isolate. x1.6 per refusal up to
+#                                      DEX_ADAPTIVE_MAX_MS (1200), one step back
+#                                      per 6 consecutive 2xx. Reacts within the
+#                                      refused request, dies with the isolate.
+#   worker_state "dex_spacing"         the FLEET row. {at, steps}; a new isolate
+#                                      adopts it, decaying one step per
+#                                      DEX_ADAPTIVE_FLEET_DECAY_MS (15s) of
+#                                      quiet. Raise-only on adoption.
+#
+# WHY THE ROW EXISTS (measured 2026-09-29T00:57Z): the per-isolate layer alone
+# lost its raise at the moment it mattered — the refused isolate read
+# intervalMs 1024 / spacingSteps 3 while the tick two minutes later, a different
+# isolate, read 250 / 0 and walked into the same burst at full rate. Isolates
+# churn every ~30s, so a per-isolate 429 reaction is mostly a per-isolate
+# memory. The row rides the scan front's ONE read and ONE write
+# (db.SCAN_FRONT_GATE_KEYS) and is written ONLY on a tick whose step count
+# moved, so a healthy fleet pays nothing for it.
+#
+# READ IT FROM /health or /debug/tick: heartbeat.dex now carries intervalMs
+# (live), configuredIntervalMs (this value), spacingSteps (this isolate) and
+# spacingFleetSteps / spacingFleetAgeMs (the row, after decay).
+# spacingFleetSteps > 0 is the proof that a raise outlived an isolate, which is
+# the only thing this change can claim.
 # Supply-flow (rug/distribution) check — OFF as of 2026-09-26.
 #
 # WHY: the check's only product was ONE card line (on the legacy enrichment

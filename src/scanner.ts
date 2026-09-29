@@ -19,6 +19,7 @@ import {
   DEX_LIST_CACHE_HITS_KEY,
   DEX_LIST_CACHE_LAST_KEY,
   DEX_LIST_CACHE_MISSES_KEY,
+  DEX_SPACING_STATE_KEY,
   type PairInfo,
   type TokenProfile,
 } from "./dexscreener";
@@ -1905,6 +1906,13 @@ export interface ScanSummary {
     configuredIntervalMs: number;
     /** Raises in force since the last full recovery — 0 = running at base. */
     spacingSteps: number;
+    /** The FLEET spacing row as this tick read it, after decay (see
+     * DEX_SPACING_STATE_KEY). 0 with a null age means there was no row at all,
+     * so the raises in `spacingSteps` are this isolate's own; a non-zero
+     * value here is a raise that crossed an isolate boundary. */
+    spacingFleetSteps: number;
+    /** Age of that row when it was read, or null when there was none. */
+    spacingFleetAgeMs: number | null;
     http429: number;
     last429At: number | null;
     blockedForMs: number;
@@ -3583,6 +3591,21 @@ export class Scanner {
       // peerPassRow): read from the SAME statement the front's gates ride, so
       // the fallback costs no round trip of its own.
       this.peerPassRow = front.gates.get(TRACKER_PASS_STATE_KEY) ?? null;
+      // THE FLEET'S 429 MEMORY (see DEX_SPACING_STATE_KEY): the raises an
+      // earlier isolate already earned from the shared egress IP's refusals,
+      // adopted onto this isolate's spacing. Same slot as the row above and for
+      // the same reason — it rides the front's ONE read, so it costs no round
+      // trip — and RAISE-ONLY, because the profiles fetch was dispatched above
+      // this await, so a refusal that landed in the meantime is this isolate's
+      // own and fresher evidence (see AdaptiveSpacing.adoptSteps). Written back
+      // on the front's ONE write, from the scan's `finally` below.
+      const fleetSpacing = this.dex.adoptDurableSpacing(
+        front.gates.get(DEX_SPACING_STATE_KEY) ?? null,
+      );
+      if (diag.dex) {
+        diag.dex.spacingFleetSteps = fleetSpacing.steps;
+        diag.dex.spacingFleetAgeMs = fleetSpacing.ageMs;
+      }
       // The last-good profile list rides that same read (see
       // DEX_PROFILES_LAST_KEY): its row is what a refused fetch evaluates
       // instead of the make-up coins alone — the client is handed this very
@@ -5445,6 +5468,18 @@ export class Scanner {
         err instanceof Error ? err.message : err,
       );
     } finally {
+      // THE FLEET SPACING ROW (see DEX_SPACING_STATE_KEY) is queued HERE, on the
+      // write the front already owes. The slot is the point: this is past every
+      // DexScreener leg of the tick (the profiles and boosts feeds above, the
+      // pair fetches in the candidate phase), so the count it carries is the one
+      // this tick actually earned — and it is in the `finally`, so the
+      // early-return paths that still spent requests (a subrequest-floor cut, a
+      // stop check) record it too. NULL on a tick whose count did not move,
+      // which is nearly every tick: a healthy fleet never re-writes the row.
+      const spacingOut = this.dex.durableSpacingWrite();
+      if (spacingOut !== null) {
+        await this.stampFront(DEX_SPACING_STATE_KEY, JSON.stringify(spacingOut));
+      }
       // A path that left the scan early (a subrequest floor cut, a stop check,
       // an empty pool) still owes the front's queued bookkeeping — the normal
       // path already landed it right after the pool phase, so this is a no-op
