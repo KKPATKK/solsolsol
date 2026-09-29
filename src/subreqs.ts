@@ -172,7 +172,14 @@ export interface SubreqHostCount {
  * "unknown" is the honest default: an isolate's first request, a probe, or any
  * caller that does not say. Nothing is guessed.
  */
-export type SubreqOwner = "scan" | "pass" | "http" | "unknown";
+export type SubreqOwner =
+  | "scan"
+  | "pass"
+  /** The maintenance invocation (worker.MAINTENANCE_CRON): its own window, and
+   * the tag that keeps its spend from being read as the scan front's. */
+  | "maint"
+  | "http"
+  | "unknown";
 
 /** One invocation's counter state. */
 export interface SubreqWindowView {

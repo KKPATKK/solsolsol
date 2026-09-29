@@ -689,6 +689,14 @@ export const SCAN_FRONT_GATE_KEYS = [
   // riding this statement is what makes that question cost no round trip — the
   // IN-list is one row longer, not one request longer.
   "push_watch_pass",
+  // The maintenance invocation's own row (scanner.MAINTENANCE_PASS_STATE_KEY,
+  // spelled as the literal for exactly the import direction the pass row above
+  // documents). READ, not gated on: a scan tick asks it whether the two
+  // interval-gated side-effect legs (the Birdeye backfill and the crime-wallet
+  // refresh) are still owned by the maintenance trigger or have fallen back to
+  // this tick (see worker.MAINTENANCE_CRON and scanner.maintenancePassFresh).
+  // Riding this statement is what makes that question cost no round trip.
+  "maintenance_pass_at",
 ] as const;
 
 /**

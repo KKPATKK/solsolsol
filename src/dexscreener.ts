@@ -514,7 +514,23 @@ class Throttle {
    * before it spends a slot (see getJson's drop check).
    */
   private plannedAt = 0;
-  constructor(private readonly intervalMs: number) {}
+  /**
+   * Dispatch spacing in ms. MUTABLE (2026-09-29, see AdaptiveSpacing): the 429
+   * controller raises it while the shared egress IP is being refused and walks
+   * it back down after a healthy streak. Every read below goes through the
+   * field, so a raised spacing applies to the requests already queued behind
+   * the one that was refused — which is exactly the burst that re-triggers a
+   * 429 the moment the cache-only block expires.
+   */
+  private intervalMs: number;
+  constructor(intervalMs: number) {
+    this.intervalMs = intervalMs;
+  }
+
+  /** Re-space the queue (see AdaptiveSpacing). Never negative. */
+  setIntervalMs(intervalMs: number): void {
+    this.intervalMs = Math.max(0, Math.round(intervalMs));
+  }
 
   /**
    * When an item enqueued NOW would actually start.
@@ -553,6 +569,134 @@ class Throttle {
     });
     this.tail = dispatched;
     return dispatched.then(() => fn());
+  }
+}
+
+/** Ceiling the adaptive spacing can reach, in ms (see AdaptiveSpacing). */
+export const DEX_ADAPTIVE_MAX_MS = 1_200;
+/**
+ * How much the spacing grows per refused response. 1.6 is chosen against the
+ * observed shape of the shared egress IP's limits (docs and /debug/dex429:
+ * 429s arrive in bursts of 1-3, then nothing for minutes), so ONE refusal
+ * already buys 150ms of extra room (250 → 400) and three buy the ceiling —
+ * enough to stop a burst re-arming itself without costing the phase seconds it
+ * will not get back.
+ */
+export const DEX_ADAPTIVE_GROWTH = 1.6;
+/**
+ * Consecutive 2xx responses needed to give one step of spacing back.
+ *
+ * WHY NOT DECAY IMMEDIATELY: the expiry of the cache-only block
+ * (PAIR_BATCH_BACKOFF_MS) is exactly when the queue is hottest — every leg
+ * that was deferred wants its request at once. Returning to 250ms on the first
+ * answer would rebuild the burst that caused the episode. Six answers ≈ one
+ * pair batch's worth of calls, i.e. the spacing only relaxes once the endpoint
+ * has demonstrably served a real round of work.
+ */
+export const DEX_ADAPTIVE_RECOVER_SUCCESSES = 6;
+
+/**
+ * The 429-driven dispatch-spacing controller.
+ *
+ * WHY IT EXISTS (2026-09-29). The spacing used to be one config constant
+ * (DEX_REQUEST_INTERVAL_MS, 250ms) and the only reaction to a 429 was a 90s
+ * cache-only block (PAIR_BATCH_BACKOFF_MS) plus a telemetry counter. That is a
+ * binary answer to a graded problem: the block ends, the queue is still at
+ * 250ms, and the next tick's batches walk straight back into the same refusal
+ * — the live reading is a steady `dex.http429 ~11/hour` with the IP never
+ * actually being asked to slow down.
+ *
+ * WHAT IT IS NOT: it is NOT a substitute for the 429's own block, and it never
+ * lowers the spacing below the configured base. It only ever spends wall clock
+ * when the upstream has PROVEN it is refusing (a counted 429 response), and it
+ * returns every millisecond of that as soon as the endpoint serves again — so a
+ * healthy day reads `intervalMs === DEX_REQUEST_INTERVAL_MS` exactly as before.
+ *
+ * STATE IS PER-ISOLATE, deliberately: the durable evidence of a rate-limit
+ * episode is the 429 ring the worker keeps (`dex.http429` / `last429At`), and
+ * a fresh isolate starting at the configured base is the safe default — the
+ * backoff block, not the spacing, is what protects a cold isolate's first tick.
+ */
+export class AdaptiveSpacing {
+  private current: number;
+  private healthy = 0;
+  private steps = 0;
+  private readonly base: number;
+
+  constructor(baseMs: number) {
+    this.base = Math.max(0, Math.round(baseMs));
+    this.current = this.base;
+  }
+
+  /** The spacing in force right now (ms). */
+  get currentMs(): number {
+    return this.current;
+  }
+
+  /** The spacing the queue returns to (DEX_REQUEST_INTERVAL_MS). */
+  get baseMs(): number {
+    return this.base;
+  }
+
+  /** How many raises are in force since the last full recovery. */
+  get growthSteps(): number {
+    return this.steps;
+  }
+
+  /**
+   * A refused response (429) — grow the spacing. A no-op when the spacing is
+   * disabled (`DEX_REQUEST_INTERVAL_MS = 0`): a caller that asked for no
+   * spacing asked for no spacing, and inventing one would change the request
+   * rate of a configuration nobody measured.
+   */
+  noteRefused(): void {
+    if (this.base <= 0) return;
+    this.healthy = 0;
+    const grown = Math.round(this.current * DEX_ADAPTIVE_GROWTH);
+    const next = Math.min(DEX_ADAPTIVE_MAX_MS, Math.max(this.base, grown));
+    if (next > this.current) {
+      this.current = next;
+      this.steps += 1;
+    } else {
+      // Already at the cap: stay there, and do not let the streak of refusals
+      // be mistaken for progress (steps counts RAISES, not refusals).
+      this.current = Math.max(this.base, next);
+    }
+  }
+
+  /**
+   * A served (2xx) response — give one step back after
+   * DEX_ADAPTIVE_RECOVER_SUCCESSES of them.
+   */
+  noteServed(): void {
+    if (this.base <= 0 || this.current <= this.base) {
+      this.healthy = 0;
+      return;
+    }
+    this.healthy += 1;
+    if (this.healthy < DEX_ADAPTIVE_RECOVER_SUCCESSES) return;
+    this.healthy = 0;
+    const relaxed = Math.round(this.current / DEX_ADAPTIVE_GROWTH);
+    this.current = Math.max(this.base, relaxed);
+    if (this.current <= this.base) {
+      this.current = this.base;
+      this.steps = 0;
+    } else {
+      this.steps = Math.max(0, this.steps - 1);
+    }
+  }
+
+  /**
+   * Whether the last outcome was a refusal under an open block — the reading
+   * the pair loop uses to decide it is worth trying the wire at all.
+   */
+  view(): { baseMs: number; currentMs: number; steps: number; healthy: number } {
+    return {
+      baseMs: this.base,
+      currentMs: this.current,
+      steps: this.steps,
+      healthy: this.healthy,
+    };
   }
 }
 
@@ -701,6 +845,12 @@ export interface DexScreenerHooks {
 
 export class DexScreenerClient {
   private readonly throttle: Throttle;
+  /**
+   * The 429-driven spacing controller (see AdaptiveSpacing). The throttle is
+   * re-spaced from it on every refusal and every served response, so the two
+   * can never disagree about the rate the queue is running at.
+   */
+  private readonly spacing: AdaptiveSpacing;
   /** Fresh pair data by token (see PAIR_CACHE_TTL_MS). Insertion-ordered. */
   private readonly pairCache = new Map<
     string,
@@ -754,7 +904,8 @@ export class DexScreenerClient {
     private readonly config: AppConfig,
     private readonly hooks: DexScreenerHooks = {},
   ) {
-    this.throttle = new Throttle(config.dexRequestIntervalMs);
+    this.spacing = new AdaptiveSpacing(config.dexRequestIntervalMs);
+    this.throttle = new Throttle(this.spacing.currentMs);
   }
 
   /**
@@ -765,7 +916,14 @@ export class DexScreenerClient {
    * every tick is serving cache-only until it clears.
    */
   getStats(): {
+    /** The spacing dispatch is running at RIGHT NOW (see AdaptiveSpacing): the
+     * configured base until the endpoint refuses, then raised, then walked back
+     * down. `configuredIntervalMs` is the same number on a healthy day. */
     intervalMs: number;
+    /** The configured base (DEX_REQUEST_INTERVAL_MS) the spacing returns to. */
+    configuredIntervalMs: number;
+    /** How many raises are in force since the last full recovery (0 = at base). */
+    spacingSteps: number;
     http429: number;
     last429At: number | null;
     blockedForMs: number;
@@ -795,7 +953,9 @@ export class DexScreenerClient {
     lastDropLeg: DexFeedLeg | null;
   } {
     return {
-      intervalMs: this.config.dexRequestIntervalMs,
+      intervalMs: this.spacing.currentMs,
+      configuredIntervalMs: this.config.dexRequestIntervalMs,
+      spacingSteps: this.spacing.growthSteps,
       http429: this.http429Total,
       last429At: this.last429At,
       blockedForMs: Math.max(0, this.batchBlockedUntil - Date.now()),
@@ -871,6 +1031,13 @@ export class DexScreenerClient {
     this.http429Total++;
     this.last429At = now;
     this.batchBlockedUntil = now + PAIR_BATCH_BACKOFF_MS;
+    // The spacing follows the refusal (see AdaptiveSpacing). Counted on EVERY
+    // 429 response, not once per episode: an episode is 3 retry attempts × N
+    // batches, and it is the LAST of them that must leave the queue slower than
+    // the first — resting the spacing on the episode start would return the
+    // queue to 250ms while the storm was still arriving.
+    this.spacing.noteRefused();
+    this.throttle.setIntervalMs(this.spacing.currentMs);
     if (!episodeStart) return;
     try {
       this.hooks.onBatch429?.(now);
@@ -996,6 +1163,12 @@ export class DexScreenerClient {
         if (!res.ok) {
           return null; // deterministic client error — retrying won't help
         }
+        // A 2xx is the ONLY reading that relaxes the spacing (see
+        // AdaptiveSpacing): a 404 for a delisted token is "not refused", not
+        // "healthy", and counting it would return the queue to the base
+        // spacing while the endpoint was still limiting the real traffic.
+        this.spacing.noteServed();
+        this.throttle.setIntervalMs(this.spacing.currentMs);
         return await res.json();
       } catch (err) {
         lastError = err;
@@ -1021,7 +1194,12 @@ export class DexScreenerClient {
         // ENDS here instead of looping into an attempt nobody can win — and a
         // 429 always ends it: note429 has just armed the 90s backoff, so no
         // second request inside this window could succeed anyway.
-        const retryHeadroomMs = this.config.dexRequestIntervalMs + RETRY_MIN_ATTEMPT_MS;
+        // The LIVE spacing, not the configured one: once the adaptive
+        // controller has widened the queue (see AdaptiveSpacing) the gap
+        // between two attempts IS the wider number, so the room a retry needs
+        // is too — sizing it from the base would admit a retry whose throttle
+        // wait alone outlives the caller's window.
+        const retryHeadroomMs = this.spacing.currentMs + RETRY_MIN_ATTEMPT_MS;
         if (attempt >= 3 || rateLimited || left < retryHeadroomMs) break;
         await sleep(Math.min(attempt * 2000, left - retryHeadroomMs));
       }

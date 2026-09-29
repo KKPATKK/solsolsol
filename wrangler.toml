@@ -38,8 +38,37 @@ compatibility_flags = ["nodejs_compat"]
 # upstream API pressure (GeckoTerminal 429s) ever returns, raise this back to
 # 90 (every other tick) — the re-eval pool + Birdeye backfill keep coverage
 # during the gap.
+#
+# "*/5 * * * *"  the MAINTENANCE delivery's OWN invocation (worker.
+#                MAINTENANCE_CRON, 2026-09-29): the interval-gated,
+#                side-effect-only legs — the Birdeye periodic backfill and the
+#                crime-wallet list refresh — which used to run inside the scan
+#                tick's front phase.
+#
+# WHY THE SPLIT (measured 2026-09-29): the account is on Workers Paid now
+# (subrequest budget 1000, live `heartbeat.subreqs` = 38 used), so neither leg
+# was being DROPPED any more — they were being PAID FOR in the wrong place.
+# The backfill walks up to ~4 six-hour Birdeye chunks on the hour it is due and
+# then writes a batch of token rows, all inside the front phase the pair fetch
+# and the gates share; the crime refresh downloads ~4.8K addresses on the first
+# tick after a recycle (it used to be `crime-refresh` in the old subreqSkip
+# list for the same reason). Neither result is read by the invocation that
+# produces it — the backfill seeds token_stats, the crime list persists for the
+# fleet to hydrate — so the only change is WHICH invocation pays their wall
+# clock, and it is now the one whose latency nobody waits on.
+#
+# The GeckoTerminal discovery leg deliberately does NOT move: its pools are the
+# tick's candidate list for that minute, not a side effect, so moving the fetch
+# would need a durable feed channel the tick reads — a separate change with its
+# own measurement.
+#
+# SAFETY: a missed delivery costs freshness, never a leg. The scan tick runs
+# both legs itself whenever scanner.MAINTENANCE_PASS_STATE_KEY is older than
+# scanner.MAINTENANCE_PASS_FALLBACK_FRESH_MS (11 minutes = two cron periods
+# plus jitter, the same arithmetic the pass's fallback uses), and the leg's own
+# interval gate still decides whether it actually does anything.
 [triggers]
-crons = ["* * * * *", "*/1 * * * *"]
+crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 
 # Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
 # TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY, COINGECKO_API_KEY) must NOT
