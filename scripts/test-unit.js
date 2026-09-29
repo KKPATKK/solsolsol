@@ -4208,11 +4208,18 @@ async function main() {
     const lastFlush = scannerSrc.lastIndexOf("await this.flushScanFront();");
     assert.ok(writeAt > 0, "the tick must write its count back");
     assert.ok(writeAt < lastFlush, "and queue it before the flush that carries it");
-    assert.ok(
-      scannerSrc.includes("diag.dex.spacingFleetSteps = fleetSpacing.steps"),
-      "the fleet reading must be published, or a raise crossing an isolate is invisible",
+    // The WHOLE dex block is refreshed after the adoption, not just the two
+    // fleet fields: the block is snapshotted above the front read, so a partial
+    // write leaves a summary whose fleet reading disagrees with the live one
+    // beside it (measured on the first live sample after this shipped:
+    // `spacingFleetSteps 3` beside `intervalMs 250 / spacingSteps 0`).
+    const refresh = scannerSrc.indexOf("diag.dex = this.dex.getStats();");
+    assert.ok(refresh > adopt, "the dex block must be refreshed after the adoption");
+    assert.equal(
+      (scannerSrc.match(/diag\.dex = this\.dex\.getStats\(\)/g) || []).length,
+      1,
+      "exactly one refresh site",
     );
-    assert.ok(scannerSrc.includes("diag.dex.spacingFleetAgeMs = fleetSpacing.ageMs"));
     // One writer only: a second write site would be a second round trip on a
     // tick that already has one, and the two could disagree.
     assert.equal(

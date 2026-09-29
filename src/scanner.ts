@@ -3599,13 +3599,19 @@ export class Scanner {
       // this await, so a refusal that landed in the meantime is this isolate's
       // own and fresher evidence (see AdaptiveSpacing.adoptSteps). Written back
       // on the front's ONE write, from the scan's `finally` below.
-      const fleetSpacing = this.dex.adoptDurableSpacing(
-        front.gates.get(DEX_SPACING_STATE_KEY) ?? null,
-      );
-      if (diag.dex) {
-        diag.dex.spacingFleetSteps = fleetSpacing.steps;
-        diag.dex.spacingFleetAgeMs = fleetSpacing.ageMs;
-      }
+      // The return value is deliberately dropped: what the row carried is
+      // published by the getStats() refresh just below, and a second copy of it
+      // here is the drift that refresh exists to prevent.
+      this.dex.adoptDurableSpacing(front.gates.get(DEX_SPACING_STATE_KEY) ?? null);
+      // Refreshed WHOLE, not just the two fleet fields: the adoption moves
+      // `intervalMs`/`spacingSteps` as well, and the page's `dex:` snapshot is
+      // built above the front read — so writing the fleet reading into it alone
+      // left a block whose halves came from different moments. The live sample
+      // right after this shipped read `spacingFleetSteps 3` beside
+      // `intervalMs 250 / spacingSteps 0` on a tick that had just inherited
+      // three raises: both halves true, together uncheckable. getStats() is a
+      // read of local state, so the refresh costs nothing.
+      diag.dex = this.dex.getStats();
       // The last-good profile list rides that same read (see
       // DEX_PROFILES_LAST_KEY): its row is what a refused fetch evaluates
       // instead of the make-up coins alone — the client is handed this very
