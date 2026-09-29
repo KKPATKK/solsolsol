@@ -7505,7 +7505,11 @@ export default {
           minLaunchMs: now - (maxAge + 180) * 60_000,
           maxLaunchMs: now - (minAge - 180) * 60_000,
           windowEntryLaunchMs: now - minAge * 60_000,
-          limit: 1000,
+          // The scanner's OWN budget, from config (2026-09-29). This was a
+          // hardcoded 1000, which made the probe count a smaller pool than the
+          // tick reads the moment RE_EVAL_POOL_SIZE moved — and the whole point
+          // of the endpoint is that its `poolQueryCount` is the tick's reach.
+          limit: cfg?.reevalPoolSize ?? 1000,
           // Mirror the scanner's configured tiered rotation (near slots
           // swept every ~10 min, far slots every ~30 min, plus the
           // pre-qualification filter) so the probe's age histogram matches
@@ -7566,7 +7570,9 @@ export default {
         neverPushed: hist.neverPushed,
         buckets: hist.buckets,
         eligibleInWindow: hist.eligibleInWindow,
-        poolLimit: 1000,
+        // The budget the query above actually ran with (see its `limit`):
+        // echoing a literal here reported a pool the tick no longer reads.
+        poolLimit: cfg?.reevalPoolSize ?? 1000,
         poolQueryCount,
         poolQueryBuckets,
         // Which floors produced poolQueryCount (see the comment above them):

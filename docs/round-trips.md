@@ -3362,3 +3362,7 @@ near 由 116 修正為 **19**。已修：兩條路徑而家都帶 clause。
   擴大 slice 唔係今次範圍（2026-09-28 已試 90 → 180 並回退，見 `src/scanner.ts` 註解）。
 - 順手修嘅 `DEAD_POOL_CLAUSE` 對**生產 tick 行為零影響**（生產走 batched，本來就有 clause），
   影響嘅係 fallback 路徑同所有離線儀器嘅讀數。
+- **部署後驗證即刻揭到嘅一件事**：`/debug/pool` 嘅 `poolLimit`（回傳值）同佢自己打嘅查詢
+  `limit` 都係 `src/worker.ts` 裡面寫死嘅 `1000`。deploy log 明明寫住 `env.RE_EVAL_POOL_SIZE
+  ("1200")`，端點仍然報 1000 —— 呢個端點正正係用嚟睇 LIMIT 有冇 starve 嘅工具，寫死即係
+  由改動一刻起就量細過 tick 實際讀嘅 pool。兩處已改成讀 `cfg.reevalPoolSize`。
