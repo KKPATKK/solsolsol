@@ -4168,7 +4168,24 @@ async function main() {
     const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
     const scannerSrc = read("src/scanner.ts");
     const dbSrc = read("src/db.ts");
-    const { DEX_SPACING_STATE_KEY } = require("../dist/dexscreener.js");
+    const { DEX_SPACING_STATE_KEY, DEX_ADAPTIVE_FLEET_DECAY_MS } =
+      require("../dist/dexscreener.js");
+    // The decay window MUST be at least one scan tick, or the row is written
+    // and spent before the next tick can read it. Measured live 2026-09-29 at
+    // the first cut's 15s: the row written by a refused tick read 0 steps 31s
+    // later, i.e. the whole fleet memory was inert and nothing said so. No
+    // single-isolate test can see that, so the window is pinned against the
+    // DEPLOYED cadence (wrangler.toml), which is what the row is read at.
+    const wranglerToml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    const cadenceSec = Number((wranglerToml.match(/^SCAN_INTERVAL_SECONDS = "(\d+)"/m) || [])[1]);
+    assert.ok(
+      Number.isFinite(cadenceSec) && cadenceSec > 0,
+      "wrangler.toml must carry SCAN_INTERVAL_SECONDS for this pin to mean anything",
+    );
+    assert.ok(
+      DEX_ADAPTIVE_FLEET_DECAY_MS >= cadenceSec * 1000,
+      `the fleet spacing window (${DEX_ADAPTIVE_FLEET_DECAY_MS}ms) must last at least one scan tick (${cadenceSec}s)`,
+    );
     // The row is read off the SAME statement the other gates ride, so the fleet
     // reading costs the tick no round trip of its own.
     assert.ok(

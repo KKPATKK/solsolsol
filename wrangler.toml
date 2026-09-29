@@ -362,10 +362,10 @@ DEX_REQUEST_INTERVAL_MS = "250"
 #                                      DEX_ADAPTIVE_MAX_MS (1200), one step back
 #                                      per 6 consecutive 2xx. Reacts within the
 #                                      refused request, dies with the isolate.
-#   worker_state "dex_spacing"         the FLEET row. {at, steps}; a new isolate
-#                                      adopts it, decaying one step per
-#                                      DEX_ADAPTIVE_FLEET_DECAY_MS (15s) of
-#                                      quiet. Raise-only on adoption.
+#   worker_state "dex_spacing"         the FLEET row. {at, steps}; the next
+#                                      tick adopts it, decaying one step per
+#                                      DEX_ADAPTIVE_FLEET_DECAY_MS (60s = one
+#                                      tick) of quiet. Raise-only on adoption.
 #
 # WHY THE ROW EXISTS (measured 2026-09-29T00:57Z): the per-isolate layer alone
 # lost its raise at the moment it mattered — the refused isolate read
@@ -381,6 +381,15 @@ DEX_REQUEST_INTERVAL_MS = "250"
 # spacingFleetSteps / spacingFleetAgeMs (the row, after decay).
 # spacingFleetSteps > 0 is the proof that a raise outlived an isolate, which is
 # the only thing this change can claim.
+#
+# SIZING THE DECAY (measured 2026-09-29T01:24-01:26Z): the first cut of the
+# window was 15s, sized against the in-isolate walk-back (6 consecutive 2xx =
+# 1.5s of dispatch at the base), and it was inert — the scan is what reads the
+# row and it runs once a minute, so the row was written at 01:24:32 (a real 429
+# at 01:24:30) and read `spacingFleetSteps 0` at 01:25:04. A memory shorter than
+# the cadence of its only reader is not a memory; the unit is therefore one
+# TICK. A test pins DEX_ADAPTIVE_FLEET_DECAY_MS >= SCAN_INTERVAL_SECONDS so the
+# two cannot drift apart silently again.
 # Supply-flow (rug/distribution) check — OFF as of 2026-09-26.
 #
 # WHY: the check's only product was ONE card line (on the legacy enrichment

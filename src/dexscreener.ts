@@ -621,21 +621,33 @@ export const DEX_SPACING_STATE_KEY = "dex_spacing";
 /**
  * How long one fleet-wide step of spacing survives without another refusal.
  *
- * THE ARITHMETIC: the in-isolate walk-back needs DEX_ADAPTIVE_RECOVER_SUCCESSES
- * (6) consecutive 2xx, i.e. 1.5s of dispatch at the base and 7.2s at the
- * ceiling — so "six answers worth of quiet" is a few seconds, and 15s is that
- * same evidence with room for the tick's phase gaps. Three refusals therefore
- * hold the fleet at the ceiling for ~45s and then hand the spacing back.
+ * SIZED AGAINST THE TICK, NOT AGAINST THE ISOLATE. The in-isolate walk-back
+ * counts DEX_ADAPTIVE_RECOVER_SUCCESSES (6) consecutive 2xx, which is 1.5s of
+ * dispatch at the base and 7.2s at the ceiling — so the first cut of this
+ * window was 15s, on the reasoning that "six answers worth of quiet" is a few
+ * seconds. That was MEASURED WRONG the same hour it shipped: the scan is what
+ * reads the row and it runs once a minute, so a 15s window decayed the row to
+ * zero long before the next tick could inherit anything — live
+ * 2026-09-29T01:24:32Z wrote the row (a real 429 landed at 01:24:30) and the
+ * sample at 01:25:04Z already read `spacingFleetSteps 0`. A fleet memory
+ * shorter than the cadence of the thing that reads it is not a memory.
+ *
+ * So the unit is the tick: one clean tick (a scan that met no refusal, i.e. the
+ * same evidence as a 6-success streak, at tick scale) buys one step back, with
+ * the window set to the scan cadence so a row written by one tick is still
+ * readable by the next. Measured on the 2026-09-29 ring, refusals arrive as a
+ * drip rather than a burst (01:01, 01:12, 01:18, 01:24, 01:27 — minutes apart),
+ * so in practice each one widens the NEXT tick or two and then the base is
+ * handed back: a real wall keeps refreshing `at` and never comes down at all.
  *
  * WHAT IT DELIBERATELY DOES NOT COVER: PAIR_BATCH_BACKOFF_MS (90s). The block
  * already forces cache-only for its whole length, so the moment the deferred
  * legs all want a request at once is AFTER it — and a fleet row that stayed at
  * 1200ms until then would charge every tick of a recovered endpoint seconds it
  * will not get back (the tick's pair phase is one of its bounded legs). The
- * row is a memory of the burst, not a second backoff: if the burst is real, the
- * refusals keep refreshing `at` and the spacing never comes down at all.
+ * row is a memory of the refusal, not a second backoff.
  */
-export const DEX_ADAPTIVE_FLEET_DECAY_MS = 15_000;
+export const DEX_ADAPTIVE_FLEET_DECAY_MS = 60_000;
 
 /** What DEX_SPACING_STATE_KEY holds (JSON). */
 export interface DexSpacingStamp {
