@@ -7295,8 +7295,26 @@ export default {
       });
     }
 
+    // An unrouted /debug path is a 404, answered BEFORE the webhook fallback
+    // below. That fallback is handed every request the router did not claim,
+    // and grammY's cloudflare-mod adapter throws on a non-POST, so an unknown
+    // debug path came back as a Cloudflare 1101 ("Worker threw a JavaScript
+    // exception") — which reads exactly like the Worker crashing. The whole
+    // namespace is covered, bare /debug included; none of it can ever be the
+    // webhook, which is registered at /webhook (see /debug/webhook?set=1).
+    if (url.pathname === "/debug" || url.pathname.startsWith("/debug/")) {
+      return Response.json(
+        { ok: false, error: `unknown debug endpoint: ${url.pathname}` },
+        { status: 404 },
+      );
+    }
+
     // Telegram webhook (grammY registers commands on this bot instance).
-    if (webhook) {
+    // POST-only on purpose: Telegram never sends anything else, and this gate
+    // is also what lets the fallback below be reached at all — without it,
+    // GET / and GET /favicon.ico were 1101s too, because the request went to
+    // grammY and threw there.
+    if (webhook && request.method === "POST") {
       return webhook(request);
     }
     return new Response("Solana Meme Coin Scanner worker", { status: 200 });
