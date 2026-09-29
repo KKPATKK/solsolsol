@@ -42,6 +42,17 @@ import {
   type SkipCaptureState,
   type SkipDelta,
 } from "./skipcapture";
+// Turso round-trip probe (see /debug/db-latency and src/dblatency.ts): the
+// pure helpers live in that module so this route stays a thin reader of one
+// measurement.
+import {
+  changesVerdict,
+  claimShapeSavingMs,
+  clampLatencySamples,
+  dbRegionFromUrl,
+  summarizeLatencyOps,
+  DB_LATENCY_EXPECTED_COUNTER_PER_SAMPLE,
+} from "./dblatency";
 import {
   DexScreenerClient,
   DEX_LIST_CACHE_HITS_KEY,
@@ -235,6 +246,14 @@ const flowDebugLastRunAt = new Map<string, number>();
 /** Cooldown for the /debug/tick endpoint (manual scan trigger). */
 const TICK_DEBUG_COOLDOWN_MS = 25_000;
 let tickDebugLastRunAt = 0;
+/**
+ * Cooldown for /debug/db-latency (see the route). Each call spends six round
+ * trips per sample against the SAME database the tick is pushing through, so
+ * a poll loop must not be able to add load to the push path — while a human
+ * iterating on the numbers should never notice the wait.
+ */
+const DB_LATENCY_COOLDOWN_MS = 15_000;
+let dbLatencyLastRunAt = 0;
 /**
  * Cooldown for the /debug/backfill endpoint (one-shot Birdeye backfill).
  * It costs real CU (30–80 per request) and does a full 42h window walk, so
@@ -6930,6 +6949,90 @@ export default {
     // 2026-09-21 the shared egress IP started 429ing the profiles endpoint on
     // nearly every tick, and the only way to tell a deploy-clustered burst
     // from a steady drip was this READ, which had no reader.
+    if (url.pathname === "/debug/db-latency") {
+      // Turso round-trip probe (2026-09-29). The push path gives its claim a
+      // 400ms slice (scanner.CARD_CLAIM_BUDGET_MS) against a database this
+      // Worker does not run next to, and until the batching shipped with this
+      // route the claim was TWO sequential requests. This endpoint is the
+      // measurement behind that argument, taken from the isolate answering
+      // it, because nowhere else shares this isolate's path to the database:
+      //
+      //   select1             pure round trip — the distance/handshake number.
+      //   readRow             the tick's front-read shape (one row by key).
+      //   writeUpsert         the fleet-wide writer's cost, isolated.
+      //   claimShapeTwoTrip   the claim's OLD shape: INSERT OR IGNORE then an
+      //                       awaited counter upsert — two requests.
+      //   claimShapeOneTrip   the claim's shape NOW: the same two statements
+      //                       in ONE batch (see Db.claimTokenPush).
+      //
+      // `claimShapeSavingMs` is the difference between them, and `rawMs`
+      // keeps every sample so a slow FIRST sample (connection setup on a cold
+      // isolate) stays visible instead of being averaged into the median.
+      // `colo` (where Cloudflare ran this request) next to `dbRegion` (parsed
+      // from the connection URL) is the distance question itself.
+      //
+      // Read-mostly: the only writes land on two fixed worker_state probe
+      // rows, never seen_tokens — see src/dblatency.ts.
+      const since = Date.now() - dbLatencyLastRunAt;
+      if (since < DB_LATENCY_COOLDOWN_MS) {
+        return Response.json(
+          {
+            ok: false,
+            error: "cooldown — the probe spends real round trips",
+            retryAfterSec: Math.ceil((DB_LATENCY_COOLDOWN_MS - since) / 1000),
+          },
+          { status: 429 },
+        );
+      }
+      if (!db) {
+        return Response.json(
+          { ok: false, error: "db 未就緒", initError, dbReady },
+          { status: 503 },
+        );
+      }
+      try {
+        dbLatencyLastRunAt = Date.now();
+        const requested = clampLatencySamples(url.searchParams.get("samples"));
+        const measured = await db.measureLatency(requested);
+        const ops = summarizeLatencyOps(measured.raw);
+        return Response.json({
+          ok: true,
+          at: new Date().toISOString(),
+          colo:
+            (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? null,
+          dbRegion: dbRegionFromUrl(env.TURSO_DATABASE_URL),
+          samples: measured.samples,
+          ops,
+          claimShapeSavingMs: claimShapeSavingMs(ops),
+          // The arithmetic check. Each sample must move the probe counter by
+          // DB_LATENCY_EXPECTED_COUNTER_PER_SAMPLE, which only happens if the
+          // statement after an INSERT inside a batch sees THAT insert's
+          // changes() — the basis of the batched claim (Db.claimTokenPush).
+          // \"verified\" is the live proof that batching the counter is safe;
+          // \"mismatch\" is the reading that says it is not.
+          changes: {
+            before: measured.counterBefore,
+            after: measured.counterAfter,
+            expectedDelta:
+              measured.samples * DB_LATENCY_EXPECTED_COUNTER_PER_SAMPLE,
+            verdict: changesVerdict(
+              measured.counterBefore,
+              measured.counterAfter,
+              measured.samples,
+            ),
+          },
+          rawMs: measured.raw,
+        });
+      } catch (err) {
+        return Response.json(
+          {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          { status: 500 },
+        );
+      }
+    }
     if (url.pathname === "/debug/dex429") {
       try {
         const [rawTotal, rawAt, rawRing] = await Promise.all([

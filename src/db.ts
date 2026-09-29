@@ -5,6 +5,46 @@
 // import works in Node and on Workers. https:// URLs additionally force the
 // pure-HTTP transport everywhere.
 import { createClient, type Client } from "@libsql/client/web";
+import {
+  DB_LATENCY_PROBE_COUNT_KEY,
+  DB_LATENCY_PROBE_KEY,
+  DB_LATENCY_SAMPLES,
+  clampLatencySamples,
+  type DbLatencyMeasurement,
+  type DbLatencyOp,
+  type DbLatencyRaw,
+} from "./dblatency";
+
+/**
+ * The `worker_state` key holding the pushed-token counter — the cached
+ * `seen_tokens` row count /health reads instead of a COUNT(*) per ping.
+ *
+ * Named here because the claim and release paths below now move it INSIDE
+ * their own batch, where the increment has to come from SQL itself
+ * (`changes()`, see claimTokenPush) rather than from a second awaited call:
+ * one key, one place that knows how it moves.
+ */
+export const SEEN_TOKENS_COUNT_KEY = "telemetry_seen_tokens_count";
+
+/**
+ * The two statements that move the counter above, as SQL text.
+ *
+ * Constants because TWO callers must run them verbatim: the claim and release
+ * paths (one batch each) and the /debug/db-latency probe, whose whole job is
+ * to prove that a statement following an INSERT inside a batch sees THAT
+ * insert's row count (`changes()`). Inlining either copy would let the probe
+ * keep passing while the claim it describes drifted away from it.
+ *
+ * `changes()` is the delta because a batch cannot branch in TypeScript before
+ * it is sent: 1 when the row before it landed, 0 when INSERT OR IGNORE skipped
+ * it — see claimTokenPush.
+ */
+const CLAIM_COUNTER_UPSERT_SQL = `INSERT INTO worker_state (key, value) VALUES (?, changes())
+      ON CONFLICT(key) DO UPDATE SET
+        value = CAST(value AS INTEGER) + changes()`;
+const CLAIM_COUNTER_RELEASE_SQL = `INSERT INTO worker_state (key, value) VALUES (?, -changes())
+      ON CONFLICT(key) DO UPDATE SET
+        value = CAST(value AS INTEGER) - changes()`;
 
 /**
  * Hard timeout for every Turso HTTP request. The database has been
@@ -3180,26 +3220,181 @@ export class Db {
    * but only one caller wins this insert — duplicate push cards become
    * impossible at the storage layer. On failed delivery call
    * unclaimTokenPush so the chat-aware re-eval pool can retry later.
+   *
+   * ONE ROUND TRIP, NOT TWO (2026-09-29). The claim used to be the insert
+   * followed by an AWAITED bumpTelemetryCounter — two sequential Turso
+   * requests — while the push path gives the claim a 400ms slice
+   * (scanner.CARD_CLAIM_BUDGET_MS). The Worker does not run next to the
+   * database (live: ATL/DFW/MIA/DUB/SYD isolates against an
+   * `aws-ap-northeast-1` database, with a single `poolMs` batch request
+   * measuring 0-812ms), so a second round trip was enough to push a healthy
+   * claim past its bound and DEFER the card — the `deferred:1` per tick and
+   * `/debug/deferral.pending` shape this batching exists to remove. A libsql
+   * batch is ONE HTTP request (the statements run in order on one
+   * connection), so the slice now covers what it was calibrated for.
+   *
+   * The counter must still move only when the insert WON, and a batch cannot
+   * branch in TypeScript before it is sent — so the second statement asks
+   * SQLite itself: `changes()` is the row count of the statement just
+   * completed (1 when the insert landed, 0 when OR IGNORE skipped it). A lost
+   * claim therefore adds exactly what the guarded bump added, and the winning
+   * result is still read from the first statement's rowsAffected.
    */
   async claimTokenPush(chatId: string, token: string): Promise<boolean> {
-    const res = await this.get().execute({
-      sql: "INSERT OR IGNORE INTO seen_tokens (chat_id, token, first_seen_at) VALUES (?, ?, ?)",
-      args: [chatId, token, Date.now()],
-    });
-    const won = Number(res.rowsAffected ?? 0) > 0;
-    if (won) {
-      await this.bumpTelemetryCounter("telemetry_seen_tokens_count", 1);
-    }
-    return won;
+    const res = await this.get().batch(
+      [
+        {
+          sql: "INSERT OR IGNORE INTO seen_tokens (chat_id, token, first_seen_at) VALUES (?, ?, ?)",
+          args: [chatId, token, Date.now()],
+        },
+        { sql: CLAIM_COUNTER_UPSERT_SQL, args: [SEEN_TOKENS_COUNT_KEY] },
+      ],
+      "write",
+    );
+    return Number(res[0]?.rowsAffected ?? 0) > 0;
   }
 
-  /** Release a push claim after a failed delivery (retry stays possible). */
+  /**
+   * Release a push claim after a failed delivery (retry stays possible).
+   *
+   * Same one-round-trip shape as claimTokenPush — the delete and the counter
+   * ride one batch, with `changes()` supplying the delta instead of a second
+   * awaited call. It lands a small correctness fix on the way: the old version
+   * always subtracted 1, even for a release whose row never existed
+   * ("deleting a row that never landed is a no-op", see boundClaim), which
+   * walked the cached count down over time. Subtracting the DELETE's own row
+   * count keeps the counter equal to the table.
+   */
   async unclaimTokenPush(chatId: string, token: string): Promise<void> {
-    await this.get().execute({
-      sql: "DELETE FROM seen_tokens WHERE chat_id = ? AND token = ?",
-      args: [chatId, token],
-    });
-    await this.bumpTelemetryCounter("telemetry_seen_tokens_count", -1);
+    await this.get().batch(
+      [
+        {
+          sql: "DELETE FROM seen_tokens WHERE chat_id = ? AND token = ?",
+          args: [chatId, token],
+        },
+        { sql: CLAIM_COUNTER_RELEASE_SQL, args: [SEEN_TOKENS_COUNT_KEY] },
+      ],
+      "write",
+    );
+  }
+
+  /**
+   * Times the round-trip shapes the tick's hot path depends on, FROM THIS
+   * ISOLATE — the only place a Worker->Turso measurement means anything (a
+   * laptop or CI box reaches the database over a different path).
+   *
+   * Read-mostly by construction: the only writes touch worker_state probe rows
+   * (see src/dblatency.ts), never a table the push path reads, and the claim's
+   * own table is deliberately absent.
+   *
+   * It also CHECKS the batched claim's arithmetic instead of trusting it. Each
+   * sample inserts under a fresh key, so the two-trip shape's insert wins
+   * (changes() = 1 → the counter moves once) and the one-trip shape's insert on
+   * that same key loses (changes() = 0 → the counter must NOT move). The
+   * counter is read before and after and handed back with the samples, where
+   * dblatency.changesVerdict turns "2 per sample" into verified / mismatch.
+   *
+   * A failed sample is recorded as its wall time instead of thrown: a call
+   * that timed out IS the reading this probe is looking for, and one bad op
+   * must not cost the whole report.
+   */
+  async measureLatency(
+    samples: number = DB_LATENCY_SAMPLES,
+  ): Promise<DbLatencyMeasurement> {
+    const n = clampLatencySamples(samples);
+    const raw: DbLatencyRaw = {};
+    const counterBefore = await this.readProbeCounter();
+    const nonce = Date.now().toString(36);
+    const keys: string[] = [];
+    const time = async (
+      op: DbLatencyOp,
+      fn: () => Promise<unknown>,
+    ): Promise<void> => {
+      const t0 = Date.now();
+      try {
+        await fn();
+      } catch {
+        // The wait is the measurement; the error is not this probe's business.
+      }
+      const list = raw[op] ?? (raw[op] = []);
+      list.push(Date.now() - t0);
+    };
+    for (let i = 0; i < n; i++) {
+      // FRESH key per sample: that is what makes the two shapes differ in a
+      // way the counter can see (see the method doc). The rows are deleted at
+      // the end of the call, so nothing accumulates but the counter.
+      const key = `${DB_LATENCY_PROBE_KEY}:${nonce}:${i}`;
+      keys.push(key);
+      const insertProbe = {
+        sql: "INSERT OR IGNORE INTO worker_state (key, value) VALUES (?, ?)",
+        args: [key, "0"],
+      };
+      // The claim's OWN statement, on a probe row: the probe exists to prove
+      // this SQL, so it must not carry a second copy of it.
+      const countProbe = {
+        sql: CLAIM_COUNTER_UPSERT_SQL,
+        args: [DB_LATENCY_PROBE_COUNT_KEY],
+      };
+      const bumpProbe = {
+        sql: `INSERT INTO worker_state (key, value) VALUES (?, 1)
+              ON CONFLICT(key) DO UPDATE SET
+                value = CAST(value AS INTEGER) + 1`,
+        args: [DB_LATENCY_PROBE_COUNT_KEY],
+      };
+      // Re-read per sample so a mid-probe rebuild of the client (dead-tick
+      // reset) cannot leave the rest of the report measuring a dead proxy.
+      const c = this.get();
+      await time("select1", () => c.execute("SELECT 1"));
+      await time("readRow", () =>
+        c.execute({
+          sql: "SELECT value FROM worker_state WHERE key = ?",
+          args: ["scan_heartbeat"],
+        }),
+      );
+      await time("writeUpsert", () => c.execute(bumpProbe));
+      // The claim's two shapes, statement for statement. Two requests vs one
+      // is the ONLY difference, which is what CARD_CLAIM_BUDGET_MS cares
+      // about.
+      await time("claimShapeTwoTrip", async () => {
+        await c.execute(insertProbe);
+        await c.execute(countProbe);
+      });
+      await time("claimShapeOneTrip", () =>
+        c.batch([insertProbe, countProbe], "write"),
+      );
+    }
+    const counterAfter = await this.readProbeCounter();
+    // One request retires this call's rows. A leftover probe row would be
+    // inert, so a failure here never fails the report.
+    try {
+      await this.get().batch(
+        keys.map((key) => ({
+          sql: "DELETE FROM worker_state WHERE key = ?",
+          args: [key],
+        })),
+        "write",
+      );
+    } catch {
+      /* inert leftover */
+    }
+    return { samples: n, raw, counterBefore, counterAfter };
+  }
+
+  /**
+   * The probe's counter row as a number (see measureLatency). An absent row is
+   * 0 — the probe's first call has none yet, and that is a real reading. An
+   * unreadable row is null, which makes changesVerdict answer "unavailable"
+   * instead of inventing a verdict from a guess.
+   */
+  private async readProbeCounter(): Promise<number | null> {
+    try {
+      const raw = await this.getWorkerState(DB_LATENCY_PROBE_COUNT_KEY);
+      if (raw === null || raw === undefined || raw === "") return 0;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
