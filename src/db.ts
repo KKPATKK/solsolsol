@@ -830,6 +830,79 @@ export function schemaFingerprint(statements: readonly string[]): string {
 }
 
 /**
+ * The one-time migration flags that `init` asks for, in the ORDER its
+ * reads index them (2026-09-29).
+ *
+ * WHY DATA AND NOT NINE INLINE STATEMENTS. The boot batch below (`init`'s
+ * ONE read) and the destructuring that consumes its slice have to agree about
+ * the order, and the previous shape put the statements in one place and the
+ * positions in another — which is how `schema_alter_v4` /
+ * `settings_v5` were crossed once already (the comment that used to sit on
+ * those two lines said so). One list, one order, both sides derived from it.
+ */
+export const MIGRATION_FLAG_KEYS = [
+  "settings_v2_applied",
+  "schema_alter_v1_done",
+  "schema_alter_v2_done",
+  "settings_v3_applied",
+  "settings_v4_applied",
+  "schema_alter_v3_done",
+  "settings_v5_applied",
+  "schema_alter_v4_done",
+  "settings_v6_applied",
+] as const;
+
+/**
+ * The telemetry-seed marker (see the seed block at the end of `init`).
+ * Keyed here because the boot read asks for it as a ROW while the seed block
+ * writes it inside SQL text; both spell the same name.
+ */
+export const TELEMETRY_SEED_MARKER_KEY = "telemetry_counts_seeded_v1";
+
+/** The `batch` reply shape (see Db.init's boot read). */
+type BatchRows = Awaited<ReturnType<Client["batch"]>>;
+
+/**
+ * A `worker_state.push_audit` ring as read from its row: an array of
+ * entries, or `[]` for an absent / unreadable / non-array value.
+ * Tolerant on purpose — every reader of this ring treats "nothing readable" as
+ * "nothing proven", and a parse that threw would turn a diagnostics row into a
+ * failed heal.
+ *
+ * Exported and pure because the ring now has THREE readers that must agree:
+ * Db.getPushAudit, Db.getInitialPushAuditTokens and the tracker pass's carried
+ * proof parser (pushwatch.deliveredProofFromRows), which receives the RAW row
+ * inside the heal's ONE read instead of paying a request of its own.
+ */
+export function parsePushAuditRing(
+  raw: string | null | undefined,
+): Array<{ kind?: string; token?: string; sig?: string; at?: number }> {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as never) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Every token with an "initial" audit entry, out of an ALREADY-PARSED ring
+ * (see parsePushAuditRing). The rule lives here so Db.getInitialPushAuditTokens
+ * and the tracker heal's carried read cannot drift — they answer the same
+ * question off the same row, and only one of them pays a request for it.
+ */
+export function initialPushAuditTokens(
+  ring: ReadonlyArray<{ kind?: string; token?: string }>,
+): Set<string> {
+  const out = new Set<string>();
+  for (const entry of ring) {
+    if (entry?.kind === "initial" && entry.token) out.add(String(entry.token));
+  }
+  return out;
+}
+
+/**
  * The graduated-rotation slot for a clock reading — the ONE computation behind
  * both pool queries AND the edge-cache key that fronts them (2026-09-28).
  *
@@ -1262,14 +1335,44 @@ export class Db {
    * ledger read also used to be paid only after the untracked list came back
    * non-empty, which on a starved pass pushed the enrollments themselves into
    * the budget cut. Same rows, same order, one request.
+   *
+   * WIDENED 2026-09-29 (the same fix, one stage over). The heal asks its next
+   * question immediately after this read — "was a card for this token ever
+   * DELIVERED?" — and answered it with three MORE requests: the initial-only
+   * audit set, the unconfirmed-card record, and the whole ring again
+   * (pushwatch.readDeliveredTokens). Live `dbTickSteps` on one tick:
+   * `findUntrackedPushesAndLedger 589`, `getWorkerState:push_audit 289`,
+   * `getPushAudit 289` — 1.17s of opening bookkeeping for one stage.
+   *
+   * So when the caller names the unconfirmed record's key, the SAME batch also
+   * carries `worker_state.push_audit` and that row: four statements, ONE
+   * request, and `proofsCarried` says they are this read's own. The audit ring
+   * is read even on a pass whose untracked list comes back empty — it rides a
+   * request that was already going out, and the alternative (a conditional
+   * second request) is the cost this exists to remove.
+   *
+   * `proofsCarried` is explicit rather than "auditRaw is defined" so a
+   * caller whose Db is a narrow double (the heal tests') is told plainly that
+   * the rows are NOT here and must ask readDeliveredTokens itself.
    */
   async findUntrackedPushesAndLedger(
     sinceMs: number,
     ledgerKey: string,
     limit = 10,
+    /** The unconfirmed-card record's key (deferrallog.UNCONFIRMED_CARD_STATE_KEY).
+     * Spelled as a parameter rather than imported because src/deferrallog.ts
+     * imports THIS module. Only the heal passes it. */
+    unconfirmedKey?: string,
   ): Promise<{
     missing: Array<{ token: string; chatId: string; pushedAt: number }>;
     ledgerRaw: string | null;
+    /** The `push_audit` ring as THIS request read it (parse it with
+     * parsePushAuditRing). Present iff `proofsCarried`. */
+    auditRaw?: string | null;
+    /** The unconfirmed-card record as THIS request read it. */
+    unconfirmedRaw?: string | null;
+    /** Whether the two rows above are this read's own (see the doc). */
+    proofsCarried?: boolean;
   }> {
     const res = await this.get().batch(
       [
@@ -1284,6 +1387,22 @@ export class Db {
           args: [sinceMs, limit],
         },
         { sql: "SELECT value FROM worker_state WHERE key = ?", args: [ledgerKey] },
+        // The proof rows (see the widened doc above): the delivery audit ring
+        // and the unconfirmed-card record. Appended only when the caller named
+        // the second key, so a caller that wants nothing else still pays the
+        // narrow two-statement shape.
+        ...(unconfirmedKey
+          ? [
+              {
+                sql: "SELECT value FROM worker_state WHERE key = 'push_audit'",
+                args: [] as Array<string | null>,
+              },
+              {
+                sql: "SELECT value FROM worker_state WHERE key = ?",
+                args: [unconfirmedKey] as Array<string | null>,
+              },
+            ]
+          : []),
       ],
       "read",
     );
@@ -1296,7 +1415,20 @@ export class Db {
       };
     });
     const ledgerRow = (res[1]?.rows ?? [])[0] as Record<string, unknown> | undefined;
-    return { missing, ledgerRaw: ledgerRow ? String(ledgerRow.value) : null };
+    if (!unconfirmedKey) {
+      return { missing, ledgerRaw: ledgerRow ? String(ledgerRow.value) : null };
+    }
+    const proofRow = (i: number) =>
+      (res[i]?.rows ?? [])[0] as Record<string, unknown> | undefined;
+    const auditEntry = proofRow(2);
+    const unconfirmedEntry = proofRow(3);
+    return {
+      missing,
+      ledgerRaw: ledgerRow ? String(ledgerRow.value) : null,
+      auditRaw: auditEntry ? String(auditEntry.value) : null,
+      unconfirmedRaw: unconfirmedEntry ? String(unconfirmedEntry.value) : null,
+      proofsCarried: true,
+    };
   }
 
   /**
@@ -1750,23 +1882,58 @@ export class Db {
         `CREATE INDEX IF NOT EXISTS idx_pushed_holders_at ON pushed_holders(pushed_at);`,
     ];
 
-    // See the fingerprint gate comment above `ddl`. ONE small read decides
-    // whether the batch runs at all: the row is a single short string (~46
-    // bytes on the wire), against ~8KB of statements and their results.
+    // THE BOOT READ (2026-09-29): ONE request answers every question this boot
+    // block asks.
+    //
+    // See the fingerprint gate comment above `ddl`: the marker is one small
+    // row (~46 bytes on the wire) against ~8KB of statements, so the gate is
+    // worth a read of its own. What the gate is NOT worth is the rest of the
+    // block paying a request EACH — and that is what a recycled isolate was
+    // billed for. The four questions (the marker, the nine migration flags, the
+    // column probe and the telemetry-seed marker) were four sequential Turso
+    // round trips because each was written where it was needed instead of where
+    // it could be paid for. Measured live 2026-09-29: a cron tick's front split
+    // reads `preStart 1006 init 1008` — `init` IS the front — while the
+    // Worker's egress measures ~250-290ms per Turso request (`dbTickSteps`).
+    // Four of them IS the second. The gate is doing its job inside it
+    // (scripts/test-schema-gate.js pins that a SECOND init runs no DDL at all);
+    // what was left is the round trips its own legs each paid separately.
+    //
+    // A libsql batch is ONE HTTP request — the statements run in order on one
+    // connection — so the same rows in the same order now cost what the marker
+    // read alone used to. Every consumer below takes its slice of that ONE
+    // reply. The only path that still pays separately is this batch having
+    // FAILED, which is the database whose `worker_state` does not exist yet
+    // (the never-initialized one, i.e. the one the DDL below has just created);
+    // that path re-reads the flags after the DDL, exactly as it did before.
     const ddlFingerprint = schemaFingerprint(ddl);
-    let storedFingerprint: string | null = null;
+    /** One `worker_state` row by key, in the boot batch's own shape. */
+    const flagRead = (
+      key: string,
+    ): { sql: string; args: Array<string | null> } => ({
+      sql: "SELECT value FROM worker_state WHERE key = ?",
+      args: [key],
+    });
+    // Slice offsets into the boot batch, named so the readers below cannot
+    // drift from the order the statements are sent in (the destructuring used
+    // to be positional across two separate arrays — see MIGRATION_FLAG_KEYS).
+    const FLAG_INDEX = 1;
+    const PROBE_INDEX = FLAG_INDEX + MIGRATION_FLAG_KEYS.length;
+    const TELEMETRY_INDEX = PROBE_INDEX + COLUMN_PROBE_TABLES.length;
+    let boot: BatchRows | null = null;
     try {
-      const known = await c.batch(
+      boot = await c.batch(
         [
-          {
-            sql: "SELECT value FROM worker_state WHERE key = ?",
-            args: [SCHEMA_DDL_FINGERPRINT_KEY],
-          },
+          flagRead(SCHEMA_DDL_FINGERPRINT_KEY),
+          ...MIGRATION_FLAG_KEYS.map(flagRead),
+          ...COLUMN_PROBE_TABLES.map((table) => ({
+            sql: "SELECT name FROM pragma_table_info(?)",
+            args: [table] as Array<string | null>,
+          })),
+          flagRead(TELEMETRY_SEED_MARKER_KEY),
         ],
         "read",
       );
-      storedFingerprint =
-        known[0]?.rows.length > 0 ? String(known[0].rows[0].value) : null;
     } catch {
       // Every `worker_state` failure mode — table absent (a database that
       // has never been initialized), refused read, timeout — means an
@@ -1774,8 +1941,17 @@ export class Db {
       // it here is required, not optional: a gate that could throw would
       // turn a cheap optimisation into a way for init to fail on the one
       // database it has never seen.
-      storedFingerprint = null;
+      //
+      // It ALSO means the whole boot read failed, so `flags` below re-reads
+      // its slice on its own after the DDL: the pre-2026-09-29 shape, paid only
+      // by the one database that has no `worker_state` yet.
+      boot = null;
     }
+    const bootRes = boot;
+    const storedFingerprint =
+      bootRes && bootRes[0]?.rows.length > 0
+        ? String(bootRes[0].rows[0].value)
+        : null;
     if (storedFingerprint !== ddlFingerprint) {
       await c.batch(ddl, "write");
       // Stamped AFTER the batch, so the marker can never claim a schema the
@@ -1796,48 +1972,28 @@ export class Db {
       }
     }
 
-    // Flag reads in ONE batched read round trip.
-    const flags = await c.batch(
-      [
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'settings_v2_applied'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v1_done'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v2_done'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'settings_v3_applied'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'settings_v4_applied'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v3_done'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'settings_v5_applied'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'schema_alter_v4_done'",
-          args: [],
-        },
-        {
-          sql: "SELECT value FROM worker_state WHERE key = 'settings_v6_applied'",
-          args: [],
-        },
-      ],
-      "read",
-    );
+    // The column probe: the slice the boot read above already carried, but ONLY
+    // when the schema those rows describe is the one already in place. On a
+    // mismatch they were read BEFORE the DDL landed, so priming the cache with
+    // them would answer "column missing" for a column the DDL just added — the
+    // silent migration skip scripts/test-schema-gate.js exists to prevent. The
+    // carry is dropped in that case and the lazy probe runs after the DDL.
+    if (bootRes && storedFingerprint === ddlFingerprint) {
+      this.columnProbeRows = COLUMN_PROBE_TABLES.map(
+        (_, i) =>
+          (bootRes[PROBE_INDEX + i]?.rows ?? []) as Array<
+            Record<string, unknown>
+          >,
+      );
+    }
+
+    // The migration flags: the boot read's own slice, or a batch of their own
+    // when that read failed (a database with no `worker_state` yet — the one
+    // the DDL above has just created). Same rows, same ORDER as before, and the
+    // destructuring below is unchanged.
+    const flags: BatchRows = bootRes
+      ? bootRes.slice(FLAG_INDEX, PROBE_INDEX)
+      : await c.batch(MIGRATION_FLAG_KEYS.map(flagRead), "read");
     const settingsV2 =
       flags[0].rows.length > 0 ? String(flags[0].rows[0].value) : null;
     const schemaAlterDone =
@@ -2068,9 +2224,15 @@ export class Db {
     // 2026-08-16). Seed the counters once per database here, then keep them
     // fresh with cheap incremental bumps (see bumpTelemetryCounter) so
     // /health reads two tiny worker_state rows instead of two full scans.
-    const telemetrySeeded = await this.getWorkerState(
-      "telemetry_counts_seeded_v1",
-    );
+    // The seed marker rode the boot read too (see above): on a recycled
+    // isolate this was the FOURTH and last request the pre-2026-09-29 init paid
+    // separately. A failed boot read falls back to the single-key read, which
+    // is the shape every path had before.
+    const telemetrySeeded = bootRes
+      ? (bootRes[TELEMETRY_INDEX]?.rows.length ?? 0) > 0
+        ? String(bootRes[TELEMETRY_INDEX].rows[0].value)
+        : null
+      : await this.getWorkerState(TELEMETRY_SEED_MARKER_KEY);
     if (!telemetrySeeded) {
       const counts = await c.batch(
         [
@@ -2271,6 +2433,13 @@ export class Db {
   private columnCache: Set<string> | null = null;
 
   /**
+   * Column rows the boot read ALREADY carried (see Db.init's ONE read). Set
+   * only when that read's schema matched the running DDL, consumed by the first
+   * readColumnNames() below, and cleared there whatever happens next.
+   */
+  private columnProbeRows: Array<Array<Record<string, unknown>>> | null = null;
+
+  /**
    * Whether `table.column` exists — WITHOUT a round trip of its own once
    * the cache is primed.
    *
@@ -2305,16 +2474,25 @@ export class Db {
    */
   private async readColumnNames(): Promise<Set<string>> {
     const found = new Set<string>();
+    // The carry is taken AND CLEARED unconditionally: rows a previous boot left
+    // behind must never answer a later probe, and a carry left set after a
+    // failure would be reused by the next call as if it were fresh.
+    const carried = this.columnProbeRows;
+    this.columnProbeRows = null;
     try {
-      const res = await this.get().batch(
-        COLUMN_PROBE_TABLES.map((table) => ({
-          sql: "SELECT name FROM pragma_table_info(?)",
-          args: [table],
-        })),
-        "read",
-      );
+      const rows: Array<ReadonlyArray<Record<string, unknown>>> =
+        carried ??
+        (
+          await this.get().batch(
+            COLUMN_PROBE_TABLES.map((table) => ({
+              sql: "SELECT name FROM pragma_table_info(?)",
+              args: [table],
+            })),
+            "read",
+          )
+        ).map((res) => res?.rows ?? []);
       COLUMN_PROBE_TABLES.forEach((table, i) => {
-        for (const row of res?.[i]?.rows ?? []) {
+        for (const row of rows[i] ?? []) {
           found.add(columnKey(table, String(row.name ?? "")));
         }
       });
@@ -3460,18 +3638,13 @@ export class Db {
    * budget) — the same merge as the rest of this change (2026-09-17).
    */
   async getInitialPushAuditTokens(): Promise<Set<string>> {
-    const raw = await this.getWorkerState("push_audit");
-    if (!raw) return new Set();
-    try {
-      const list = JSON.parse(raw) as Array<{ kind?: string; token?: string }>;
-      return new Set(
-        list
-          .filter((e) => e.kind === "initial" && e.token)
-          .map((e) => String(e.token)),
-      );
-    } catch {
-      return new Set();
-    }
+    // The rule is initialPushAuditTokens, shared with the tracker heal's
+    // CARRIED read (see findUntrackedPushesAndLedger): the two answer the same
+    // question off the same row, and one of them does not pay a request for it,
+    // so a rule kept in two places would eventually disagree.
+    return initialPushAuditTokens(
+      parsePushAuditRing(await this.getWorkerState("push_audit")),
+    );
   }
 
   /** Newest-last view of the delivery audit ring for /debug/push-audit. */
