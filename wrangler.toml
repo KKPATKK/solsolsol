@@ -574,22 +574,22 @@ TRADE_AMOUNT_SOL = "0.01"
 # your ID with @userinfobot. NOTE: /setmode stores a durable override in the
 # DB that wins over TRADE_MODE until it is changed again.
 BOT_ADMIN_IDS = "530602939"
-# Axiom Trade trending feed. Two auth paths: (a) email+password — set
-# AXIOM_EMAIL + AXIOM_PASSWORD as SECRETS (Cloudflare dashboard, never
-# here) and do a one-time OTP login via /debug/axiom-login; (b) Google/SSO
-# accounts (no password) — log in on axiom.trade in your browser, copy the
-# auth-access-token + auth-refresh-token cookies, and store them via
-# /debug/axiom-tokens?access=...&refresh=... Either way the tokens live in
-# worker_state and are auto-refreshed by the scanner. 0 = disabled; default
-# 20 per scan.
+# Axiom Trade trending feed (RETIRED — see AXIOM_ENABLED below). Its two
+# auth paths while it was live: (a) email+password — set AXIOM_EMAIL +
+# AXIOM_PASSWORD as SECRETS (Cloudflare dashboard, never here) and do a
+# one-time OTP login; (b) Google/SSO accounts (no password) — log in on
+# axiom.trade in your browser, copy the auth-access-token +
+# auth-refresh-token cookies, and store them in worker_state, where the
+# scanner auto-refreshed them. The five /debug/axiom-* probes that drove
+# that login were removed 2026-09-29. 0 = disabled; default 20 per scan.
 # KEPT AT 0: the trending endpoint IS reachable from the worker (verified
 # 2026-08-16: HTTP 200 with real data), but the refresh-access-token
 # endpoint sits behind Cloudflare Bot Management — it 418s every
 # non-browser TLS fingerprint (worker fetch / curl; cf-ray confirms the
 # edge, not the app, answers), while access tokens only live ~16 min
 # (JWT exp). So the feed cannot self-renew from the worker and dies with
-# each token. /debug/axiom-tokens stores tokens, /debug/axiom-refresh
-# probes the blocked endpoint, /debug/axiom-trending probes the feed.
+# each token. (The /debug/axiom-* probes that stored the tokens and probed
+# the blocked refresh + the feed were removed 2026-09-29.)
 # DISABLED 2026-09-19: 0 = no trending calls. The session needs a manual
 # browser re-login and can never self-renew from the Worker's egress (Bot
 # Management answers 418 to /refresh-access-token), so the integration was

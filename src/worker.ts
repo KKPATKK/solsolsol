@@ -235,8 +235,6 @@ let arkham: ArkhamClient | null = null;
 let crimeWallets: CrimeWalletClient | null = null;
 let walletAnalyzer: WalletAnalyzer | null = null;
 let flurryAnalyzer: FlurryAnalyzer | null = null;
-/** OTP JWT from the pending Axiom login step 1 (module-local, short-lived). */
-let pendingAxiomOtpJwt: string | null = null;
 let trade: TradeService | null = null;
 let cfg: AppConfig | null = null;
 /** Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
@@ -3509,8 +3507,8 @@ async function ensureInitialized(env: Env): Promise<void> {
     crimeWalletsConfigured = Boolean(config.crimeWallets.enabled);
     walletAnalyzerConfigured = Boolean(config.walletAnalysis.enabled);
     // Axiom is configured when there are login credentials OR already
-    // persisted tokens (Google/SSO accounts have no password — they get
-    // tokens via /debug/axiom-tokens, which is re-checked after DB init).
+    // persisted tokens (Google/SSO accounts have no password — their tokens
+    // land in worker_state, which is re-checked after DB init).
     axiomConfigured = Boolean(
       config.axiomEnabled && config.axiomEmail && config.axiomPassword,
     );
@@ -3558,9 +3556,9 @@ async function ensureInitialized(env: Env): Promise<void> {
               // telemetry only — never fail init over a counter read
             }
           }
-          // A Google/SSO Axiom account has no password — its tokens are
-          // persisted by /debug/axiom-tokens, so the feed is "configured"
-          // whenever a stored access token exists too.
+          // A Google/SSO Axiom account has no password — its tokens reach
+          // worker_state out of band, so the feed is "configured" whenever a
+          // stored access token exists too.
           const storedAxiomToken = bootStates?.get("axiom_access_token") ?? null;
           if (storedAxiomToken && config.axiomEnabled) axiomConfigured = true;
           if (bootStates) {
@@ -3666,10 +3664,8 @@ async function ensureInitialized(env: Env): Promise<void> {
       axiom = null;
       // The client is created whenever the feed is enabled, the bot-users
       // push gate is armed, OR a stored session exists — credentials are
-      // optional (Google/SSO accounts provide tokens via /debug/axiom-tokens
-      // instead of a password; the client's login methods guard on that).
-      // Decoupling from the trending switch keeps /debug/axiom-token-info
-      // usable while the feed is off.
+      // optional (Google/SSO accounts store tokens instead of a password;
+      // the client's login methods guard on that).
       //
       // AXIOM_ENABLED=0 short-circuits ALL of it: no client means no trending
       // call, no per-candidate /token-info and no refresh attempt, so a dead
@@ -6107,295 +6103,9 @@ export default {
       }
     }
 
-    // Axiom Trade login + trending probe. Login is interactive: step 1
-    // (no params) submits the stored email/password and emails an OTP code;
-    // step 2 (?otp=XXXXXX) completes login and persists the access/refresh
-    // tokens in worker_state (survives isolate recycling). The trending
-    // probe (?noauth=1 skips token use) exercises the same client the
-    // scanner uses.
-    if (url.pathname === "/debug/axiom-login") {
-      const client = axiom;
-      if (!client) {
-        return Response.json({
-          ok: false,
-          error: "Axiom feed disabled (AXIOM_TRENDING_LIMIT=0) — the OTP login also needs AXIOM_EMAIL + AXIOM_PASSWORD (not available for Google/SSO accounts — use /debug/axiom-tokens)",
-        });
-      }
-      const otp = (url.searchParams.get("otp") ?? "").trim();
-      try {
-        if (!otp) {
-          const step1 = await client.loginStep1();
-          if (!step1.otpJwtToken) {
-            return Response.json({
-              ok: false,
-              error: "login step1 returned no otpJwtToken",
-              raw: step1.raw,
-            });
-          }
-          // Cache the OTP JWT briefly so step 2 doesn't need it re-sent.
-          pendingAxiomOtpJwt = step1.otpJwtToken;
-          return Response.json({
-            ok: true,
-            step: 1,
-            message: "OTP code emailed — call again with ?otp=<code>",
-          });
-        }
-        const jwt = pendingAxiomOtpJwt;
-        if (!jwt) {
-          return Response.json({
-            ok: false,
-            error: "no pending login — call /debug/axiom-login first (step 1)",
-          });
-        }
-        const step2 = await client.loginStep2(jwt, otp);
-        if (!step2.accessToken || !step2.refreshToken) {
-          return Response.json({
-            ok: false,
-            error: "login step2 returned no tokens",
-            raw: step2.raw,
-          });
-        }
-        await db?.setWorkerState("axiom_access_token", step2.accessToken);
-        await db?.setWorkerState("axiom_refresh_token", step2.refreshToken);
-        pendingAxiomOtpJwt = null;
-        return Response.json({ ok: true, step: 2, loggedIn: true });
-      } catch (err) {
-        return Response.json({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    // Axiom token injection — for accounts without a password (Google/SSO):
-    // log in on axiom.trade in your own browser, copy the auth-access-token
-    // and auth-refresh-token cookie values, then call
-    //   /debug/axiom-tokens?access=<token>&refresh=<token>
-    // `access` alone is accepted (verifies worker egress immediately);
-    // `refresh` is optional but strongly recommended — without it the feed
-    // dies when the access token expires (JWT lifetime ≈ 16 min).
-    if (url.pathname === "/debug/axiom-tokens") {
-      const access = (url.searchParams.get("access") ?? "").trim();
-      const refresh = (url.searchParams.get("refresh") ?? "").trim();
-      if (!access) {
-        return Response.json({
-          ok: false,
-          error: "missing ?access=<token> (refresh=<token> optional)",
-        });
-      }
-      await db?.setWorkerState("axiom_access_token", access);
-      if (refresh) {
-        await db?.setWorkerState("axiom_refresh_token", refresh);
-      }
-      const storedRefresh = Boolean(refresh);
-      axiomConfigured = true;
-      const res: Record<string, unknown> = {
-        ok: true,
-        stored: true,
-        refreshStored: storedRefresh,
-        hint: storedRefresh
-          ? "call /debug/axiom-trending to verify the feed"
-          : "no refresh token stored — the feed will stop when the access token expires",
-      };
-      // Report the JWT expiry so the user can see how long the access token
-      // is valid (middle segment is base64url JSON with iat/exp).
-      try {
-        const parts = access.split(".");
-        if (parts.length === 3) {
-          const payload = JSON.parse(
-            Buffer.from(parts[1], "base64url").toString("utf8"),
-          );
-          if (typeof payload.exp === "number") {
-            res.accessExpiresAt = new Date(payload.exp * 1000).toISOString();
-            res.accessLifetimeMin = Math.round((payload.exp - payload.iat) / 60);
-          }
-        }
-      } catch {
-        // non-JWT access token — skip expiry info
-      }
-      // Immediately verify with the just-stored token when a client exists.
-      if (axiom) {
-        try {
-          const items = await axiom.fetchTrending(access, "1h", 5);
-          res.count = items.length;
-          res.sample = items.slice(0, 2).map((i) => ({
-            symbol: i.symbol,
-            mcap: i.marketCapUsd,
-            sniper: i.sniperCount,
-          }));
-        } catch (err) {
-          res.probeError = err instanceof Error ? err.message : String(err);
-        }
-      }
-      return Response.json(res);
-    }
-
-    // Axiom refresh probe — exercises refreshAccessToken from the worker's
-    // own egress with the stored refresh token (diagnoses whether the
-    // refresh endpoint is reachable: 200 + new token = healthy; 418 = the
-    // endpoint's bot-protection blocks worker fetch, like GMGN's edge did).
-    if (url.pathname === "/debug/axiom-refresh") {
-      const client = axiom;
-      if (!client) {
-        return Response.json({
-          ok: false,
-          error: "Axiom feed disabled (AXIOM_TRENDING_LIMIT=0)",
-        });
-      }
-      const refreshToken = await db?.getWorkerState("axiom_refresh_token");
-      if (!refreshToken) {
-        return Response.json({ ok: false, error: "no refresh token stored" });
-      }
-      try {
-        const out = await client.refreshAccessToken(refreshToken);
-        if (out.accessToken) {
-          await db?.setWorkerState("axiom_access_token", out.accessToken);
-          if (out.refreshToken) {
-            await db?.setWorkerState("axiom_refresh_token", out.refreshToken);
-          }
-        }
-        return Response.json({
-          ok: Boolean(out.accessToken),
-          accessToken: out.accessToken ? "refreshed-and-stored" : null,
-          refreshRotated: Boolean(out.refreshToken),
-        });
-      } catch (err) {
-        return Response.json({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    // Axiom trending probe — verifies the feed works end-to-end from the
-    // worker's own egress with the stored token (diagnoses auth-expiry vs
-    // blocked-egress vs parser mismatch).
-    if (url.pathname === "/debug/axiom-trending") {
-      const client = axiom;
-      if (!client) {
-        return Response.json({
-          ok: false,
-          error: "Axiom feed disabled (AXIOM_TRENDING_LIMIT=0)",
-        });
-      }
-      const accessToken = await db?.getWorkerState("axiom_access_token");
-      if (!accessToken) {
-        return Response.json({
-          ok: false,
-          error: "not logged in — run /debug/axiom-login first",
-        });
-      }
-      try {
-        const t0 = Date.now();
-        const items = await client.fetchTrending(accessToken, "1h", 10);
-        return Response.json({
-          ok: true,
-          count: items.length,
-          ms: Date.now() - t0,
-          sample: items.slice(0, 3).map((i) => ({
-            symbol: i.symbol,
-            mcap: i.marketCapUsd,
-            sniper: i.sniperCount,
-            insiderPct: i.insiderPct,
-            bundlePct: i.bundlePct,
-            holders: i.holderCount,
-          })),
-        });
-      } catch (err) {
-        return Response.json({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    // Axiom token-info probe — per-token detail metrics (holders,
-    // numBotUsers, concentration) from /token-info-v2 using the stored session.
-    // Refreshes once and retries on auth failure. Reveals the live schema
-    // so card enrichment can be designed against real field names.
-    if (url.pathname === "/debug/axiom-token-info") {
-      const mint = (url.searchParams.get("mint") ?? "").trim();
-      // Endpoint discovery: ?path=/xxx&param=yyy probes candidate API
-      // surfaces with the live session. Defaults mirror the PRODUCTION
-      // combo (/token-info-v2 + pairAddress) — the v2 endpoint returns full
-      // data including numBotUsers, concentration, etc.
-      const rawPath = url.searchParams.get("path") ?? "/token-info-v2";
-      const path = rawPath.startsWith("/") ? rawPath : "/token-info-v2";
-      const param = (url.searchParams.get("param") ?? "pairAddress").replace(/[^a-zA-Z0-9_]/g, "");
-      // Raw passthrough for endpoints that require additional params
-      // (e.g. top-traders-v4 needs onlyTrackedWallets + a v= timestamp).
-      const extraQuery = (url.searchParams.get("extra") ?? "").replace(/[^a-zA-Z0-9_=&.]/g, "");
-      // Optional host override for endpoint discovery — some routes only
-      // exist on specific gateways (e.g. axiom.trade/api, api.axiomtrade.com).
-      const hostsParam = (url.searchParams.get("host") ?? "")
-        .split(",")
-        .map((h) => h.trim().replace(/[^a-z0-9.\-]/g, ""))
-        .filter(Boolean);
-      if (!mint) {
-        return Response.json({ ok: false, error: "missing ?mint=<address>" });
-      }
-      const client = axiom;
-      if (!client) {
-        return Response.json({
-          ok: false,
-          error: "Axiom client disabled",
-        });
-      }
-      let accessToken = await db?.getWorkerState("axiom_access_token");
-      if (!accessToken) {
-        return Response.json({
-          ok: false,
-          error: "not logged in — run /debug/axiom-login first",
-        });
-      }
-      // Refresh ONLY when the stored JWT is actually expired (or nearly):
-      // every refresh rotates the refresh token, so unconditional refreshes
-      // burn the session (the failure mode that killed it once already).
-      const jwtExpired = (tok: string): boolean => {
-        try {
-          const payload = JSON.parse(
-            Buffer.from(tok.split(".")[1] ?? "", "base64url").toString("utf8"),
-          ) as { exp?: number };
-          return !payload.exp || payload.exp * 1000 < Date.now() + 60_000;
-        } catch {
-          return true;
-        }
-      };
-      const refreshToken0 = await db?.getWorkerState("axiom_refresh_token");
-      if (!accessToken || jwtExpired(accessToken)) {
-        if (refreshToken0) {
-          try {
-            const fresh = await client.refreshAccessToken(refreshToken0);
-            if (fresh.accessToken) {
-              accessToken = fresh.accessToken;
-              await db?.setWorkerState("axiom_access_token", fresh.accessToken);
-              if (fresh.refreshToken) {
-                await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
-              }
-            }
-          } catch {
-            // keep the stored token — maybe still valid
-          }
-        }
-      }
-      try {
-        const out = await client.fetchTokenInfo(
-          accessToken,
-          mint,
-          path,
-          param,
-          extraQuery,
-          hostsParam.length ? hostsParam : undefined,
-          refreshToken0 ?? undefined,
-        );
-        return Response.json({ ok: out.status === 200, status: out.status, data: out.data });
-      } catch (err) {
-        return Response.json({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
+    // The five /debug/axiom-* probes were removed 2026-09-29: Axiom is off
+    // (AXIOM_ENABLED=0), and /debug/axiom-tokens was an unauthenticated write
+    // of a session token straight into worker_state.
 
     // GeckoTerminal trending probe — ground truth for the momentum feed:
     // reports the raw HTTP status + parse count so a persistent geoTrend: 0
