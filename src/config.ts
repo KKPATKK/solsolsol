@@ -293,6 +293,13 @@ export interface AppConfig {
    * are ordered by distance to the window entry, so the most relevant coins
    * are always evaluated first; anything not processed within the tick's
    * deadline stays in the pool and is retried next tick (nothing is lost).
+   *
+   * The budget this number splits (see Db.getReevalPool) is hot + near + far,
+   * and the HOT share is a hard requirement rather than a preference: the hot
+   * band must fit UNDER its own LIMIT or its oldest eligible tier is clipped
+   * on every scan (measured 2026-09-29: 82 of 268 eligible rows lost to a
+   * 607-row band capped at 300, which is why the 1000 ceiling below is 1200 =
+   * 460 hot + 490 near + 210 far plus the hot headroom).
    */
   reevalPoolSize: number;
   /**
@@ -717,9 +724,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dexscreenerBoostsLimit: Number.isFinite(Number(env.DEXSCREENER_BOOSTS_LIMIT ?? 0))
       ? Math.max(0, Math.min(Math.floor(Number(env.DEXSCREENER_BOOSTS_LIMIT ?? 0)), 30))
       : 0,
+    // Ceiling 1200 (was 1000) since 2026-09-29: the hot band had outgrown its
+    // 300-row LIMIT and was clipping its own eligible tier (see
+    // POOL_HOT_ABOVE_MS in src/db.ts), so the hot budget went to 460 and the
+    // pool to 460 + 490 + 210. The ceiling exists so a typo in
+    // RE_EVAL_POOL_SIZE cannot turn the per-tick pool read into a full-table
+    // read; raise it only with the band measurement in hand.
     reevalPoolSize:
       Number.isFinite(rawReevalPool) && rawReevalPool > 0
-        ? Math.min(Math.floor(rawReevalPool), 1000)
+        ? Math.min(Math.floor(rawReevalPool), 1200)
         : 40,
     // Slots = sweep minutes ÷ the pool cache TTL (they must stay aligned so
     // every cache expiry advances to the next slot). Defaults at the 3-min

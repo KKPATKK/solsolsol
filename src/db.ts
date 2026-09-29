@@ -189,15 +189,33 @@ export const DEFAULT_SETTINGS: Omit<ChatSettings, "chatId"> = {
  * qualify or freshly qualified — are evaluated EVERY scan. This is the
  * push-latency-critical cohort: a coin that crosses the gates right after
  * entering the window should be pushed within a minute, not whenever its
- * rotation slot next comes up. The above-entry side is 1h (was 2h): a coin
- * that fails a gate at entry almost never flips within hours, so the extra
- * hour of band only burned rows-read (the hot band is read+sorted every
- * scan, and it is the pool query's dominant Turso rows-read consumer).
+ * rotation slot next comes up. The above-entry side is 30 min (was 1h, 2h
+ * before that): a coin that fails a gate at entry almost never flips within
+ * hours, so a wide warm side mostly burns rows-read (the hot band is
+ * read+sorted every scan, and it is the pool query's dominant Turso rows-read
+ * consumer). It is not free to remove, though — the warm side is what writes a
+ * coin's max_mcap_observed BEFORE it can qualify, the high-water mark the
+ * whole rotation ranks and prunes on.
+ *
+ * 2026-09-29 (measured, then fixed): the band and its LIMIT had drifted apart.
+ * The rotation audit read the live band at 607 rows against a 300-row
+ * POOL_HOT_MAX, so the nearest-entry-first LIMIT reached only ages 61–99min
+ * and CLIPPED 82 of the 268 ELIGIBLE rows (ages 99–110min) on every scan —
+ * the "hot zone is evaluated every scan" guarantee was false for 31% of the
+ * cohort it exists for. The band is now sized to fit UNDER its LIMIT: 30 min
+ * of warm side (437 rows measured) under a 460-row budget, so nothing is
+ * clipped. 460 + the unchanged near/far rotation budget (740) is why
+ * RE_EVAL_POOL_SIZE is 1200 (was 1000, see src/config.ts). Sizing the warm
+ * side down rather than the budget up is deliberate — the same measurement
+ * prices the warm side at rows-read per row that cannot qualify at that age,
+ * which is why it went 2h → 1h before. RE-MEASURE before moving either number:
+ * a band that outgrows its LIMIT again silently stops reading its OLDEST
+ * eligible tier, which is the one closest to the near sweep.
  */
 const POOL_HOT_BELOW_MS = 0.5 * 3600_000;
-const POOL_HOT_ABOVE_MS = 1 * 3600_000;
+const POOL_HOT_ABOVE_MS = 0.5 * 3600_000;
 /** Max hot-zone coins per scan; the rest of the pool limit goes to rotation. */
-const POOL_HOT_MAX = 300;
+const POOL_HOT_MAX = 460;
 /**
  * Graduated rotation (2026-08-16 redesign, replaces the uniform-slot sweep):
  * the rotation zone — everything older than the hot zone — is split into TWO
@@ -230,6 +248,54 @@ const POOL_NEAR_SLOTS = 2;
 const POOL_FAR_SLOTS = 6;
 /** Share of the rotation budget given to the near zone (rest → far zone). */
 const POOL_NEAR_LIMIT_SHARE = 0.7;
+/**
+ * Buckets a near/far band's overflow rotates through (see poolBandOrder).
+ *
+ * WHY: a rotation band is read in signal order (max_mcap_observed, then
+ * first_m5_vol) and capped at its per-slot LIMIT, so a sub-window holding more
+ * rows than its LIMIT is truncated to the same signal-ordered head on every
+ * visit — the rest is never read, "however often its slot comes around" (the
+ * 2026-09-15 sizing note in wrangler.toml). Resizing the slots fixed that once;
+ * by 2026-09-29 growth had undone it, and the overflow had collapsed into a
+ * single TIE GROUP: the live worst far sub-window held 400 rows against a
+ * 210-row LIMIT, of which 256 shared the identical key (no peak, zero
+ * first_m5_vol) and only 66 of that group fitted — 190 rows readable only if
+ * something rotated the choice. Those rows carry no signal to lose, so a tie
+ * break appended AFTER both signal keys cannot demote a row that has signal:
+ * it only decides WHICH of the indistinguishable rows the LIMIT takes, and
+ * advances that choice once per recurrence of the band. Measured on that
+ * sub-window: K=8 serves 76.8% of the band over 8 recurrences (2.4h) where the
+ * fixed ordering serves the same 52.5% forever; K=16 reaches 100% over 16.
+ * The key is the token's last character (base58 ⇒ evenly spread), which keeps
+ * the rotation deterministic and cacheable — unlike RANDOM().
+ */
+const POOL_BAND_ROTATE_BUCKETS = 8;
+
+/**
+ * The ORDER BY a re-eval band is read with, shared by Db.getReevalPool and
+ * Db.getReevalPoolBatched so the two band splits cannot drift (the batched copy
+ * builds its own SQL, and a unit test pins the two to the same tokens in the
+ * same order).
+ *
+ * `rotate: true` means the caller must bind the band's rotation phase as the
+ * next argument after the seen-clause args and BEFORE `center`/`LIMIT` — the
+ * fragment carries exactly one `?`.
+ */
+function poolBandOrder(orderBy: "entry" | "signal"): {
+  sql: string;
+  rotate: boolean;
+} {
+  if (orderBy === "entry") {
+    return { sql: "ORDER BY ABS(launch_ms - ?)", rotate: false };
+  }
+  return {
+    sql:
+      "ORDER BY COALESCE(max_mcap_observed, 0) DESC, " +
+      "COALESCE(first_m5_vol, 0) DESC, " +
+      `((UNICODE(SUBSTR(token, -1)) + ?) % ${POOL_BAND_ROTATE_BUCKETS})`,
+    rotate: true,
+  };
+}
 /**
  * Rotation cadence default — must match the caller's pool cache TTL so
  * every cache expiry moves to the next slot instead of re-serving the same
@@ -1546,6 +1612,8 @@ export class Db {
       center: number;
       limit: number;
       orderBy: "entry" | "signal";
+      /** See queryReevalBand / POOL_BAND_ROTATE_BUCKETS ("signal" only). */
+      rotatePhase?: number;
     }> = [];
     if (hotHi > hotLo) {
       bands.push({ lo: hotLo, hi: hotHi, center, limit: hotLimit, orderBy: "entry" });
@@ -1563,19 +1631,37 @@ export class Db {
       );
       const farLimit = Math.max(0, rotLimit - nearLimit);
       const slot = poolRotationSlot(now, opts.rotationPeriodMs);
+      // Must match getReevalPool's phases exactly (the unit test pins the two
+      // paths to the same tokens in the same order).
+      const nearPhase = Math.floor(slot / nearSlots);
+      const farPhase = Math.floor(slot / farSlots);
       if (rotHi > nearLo && nearLimit > 0) {
         const slotW = (rotHi - nearLo) / nearSlots;
         const s = slot % nearSlots;
         const lo = rotHi - (s + 1) * slotW;
         const hi = rotHi - s * slotW;
-        bands.push({ lo, hi, center: (lo + hi) / 2, limit: nearLimit, orderBy: "signal" });
+        bands.push({
+          lo,
+          hi,
+          center: (lo + hi) / 2,
+          limit: nearLimit,
+          orderBy: "signal",
+          rotatePhase: nearPhase,
+        });
       }
       if (nearLo > rotLo && farLimit > 0) {
         const slotW = (nearLo - rotLo) / farSlots;
         const s = slot % farSlots;
         const lo = nearLo - (s + 1) * slotW;
         const hi = nearLo - s * slotW;
-        bands.push({ lo, hi, center: (lo + hi) / 2, limit: farLimit, orderBy: "signal" });
+        bands.push({
+          lo,
+          hi,
+          center: (lo + hi) / 2,
+          limit: farLimit,
+          orderBy: "signal",
+          rotatePhase: farPhase,
+        });
       }
     }
     if (bands.length === 0) return [];
@@ -1598,6 +1684,11 @@ export class Db {
         args.push(opts.minQualifyLiquidity);
       }
       args.push(...seen.args);
+      // The ORDER BY comes from the SAME helper the per-band path uses (see
+      // poolBandOrder), so a change to the signal ordering or its rotation tie
+      // break cannot land on one path only.
+      const order = poolBandOrder(b.orderBy);
+      if (order.rotate) args.push(b.rotatePhase ?? 0);
       if (b.orderBy === "signal") {
         args.push(b.limit);
         return {
@@ -1605,7 +1696,7 @@ export class Db {
                 WHERE launch_ms BETWEEN ? AND ?
                   AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
                   ${seen.clause}
-                ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC
+                ${order.sql}
                 LIMIT ?`,
           args,
         };
@@ -1616,7 +1707,7 @@ export class Db {
               WHERE launch_ms BETWEEN ? AND ?
                 AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
                 ${seen.clause}
-              ORDER BY ABS(launch_ms - ?)
+              ${order.sql}
               LIMIT ?`,
         args,
       };
@@ -3961,6 +4052,13 @@ export class Db {
     );
     const farLimit = Math.max(0, rotLimit - nearLimit);
     const slot = poolRotationSlot(now, opts.rotationPeriodMs);
+    // One rotation step per RECURRENCE of a given sub-window (see
+    // POOL_BAND_ROTATE_BUCKETS): the near zone's window comes back every
+    // nearSlots slot-periods, the far zone's every farSlots, and the phase must
+    // advance exactly once per recurrence so that the overflow's bucket choice
+    // moves on rather than repeating.
+    const nearPhase = Math.floor(slot / nearSlots);
+    const farPhase = Math.floor(slot / farSlots);
     // Near zone: entry → entry + POOL_NEAR_WINDOW_MS of age — fresh
     // in-window coins, most likely to cross the gates → frequent sweep.
     if (rotHi > nearLo && nearLimit > 0) {
@@ -3977,6 +4075,7 @@ export class Db {
           minQualifyLiquidity: opts.minQualifyLiquidity,
           seenChatIds: opts.seenChatIds,
           orderBy: "signal",
+          rotatePhase: nearPhase,
         })),
       );
     }
@@ -3996,6 +4095,7 @@ export class Db {
           minQualifyLiquidity: opts.minQualifyLiquidity,
           seenChatIds: opts.seenChatIds,
           orderBy: "signal",
+          rotatePhase: farPhase,
         })),
       );
     }
@@ -4007,7 +4107,10 @@ export class Db {
    * ranks by distance to the band center (hot zone — nearest to the window
    * entry first); "signal" ranks by qualification signal
    * (max_mcap_observed, then first_m5_vol) so the per-band LIMIT picks the
-   * most promising coins instead of arbitrary band-edge ones.
+   * most promising coins instead of arbitrary band-edge ones — and then
+   * resolves the remaining TIES by `rotatePhase` bucket, so a sub-window
+   * holding more rows than its LIMIT does not hand the same overflow to
+   * nobody forever (see poolBandOrder / POOL_BAND_ROTATE_BUCKETS).
    */
   private async queryReevalBand(
     lo: number,
@@ -4021,9 +4124,22 @@ export class Db {
       minQualifyLiquidity?: number;
       seenChatIds?: string[];
       orderBy: "entry" | "signal";
+      /**
+       * Rotation phase for the "signal" ordering's tie break. Callers pass the
+       * band's own recurrence index (see getReevalPool); "entry" ignores it.
+       */
+      rotatePhase?: number;
     },
   ): Promise<TokenStats[]> {
-    const clauses: string[] = [];
+    // The dead-pool pre-filter rides BOTH builders (see DEAD_POOL_CLAUSE).
+    // Until 2026-09-29 it reached only the batched one: that is the production
+    // path, but this per-band read is its FALLBACK (poolfallback.ts calls
+    // super.getReevalPool when the batch throws), so a clause on one side only
+    // re-admitted the corpses the other drops exactly when the transport was
+    // already degraded — and it made every offline instrument that reads this
+    // path measure a pool larger than the tick's (found while measuring the
+    // band sizes behind POOL_BAND_ROTATE_BUCKETS).
+    const clauses: string[] = [DEAD_POOL_CLAUSE];
     if (opts.minQualifyMcap !== undefined)
       clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed >= ?)`);
     if (opts.maxQualifyMcap !== undefined)
@@ -4040,10 +4156,8 @@ export class Db {
     if (opts.minQualifyLiquidity !== undefined)
       args.push(opts.minQualifyLiquidity);
     args.push(...seen.args);
-    const order =
-      opts.orderBy === "signal"
-        ? "ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC"
-        : "ORDER BY ABS(launch_ms - ?)";
+    const order = poolBandOrder(opts.orderBy);
+    if (order.rotate) args.push(opts.rotatePhase ?? 0);
     if (opts.orderBy === "entry") args.push(center);
     args.push(opts.limit);
     const res = await this.get().execute({
@@ -4052,7 +4166,7 @@ export class Db {
               AND first_seen_at > ?
               ${qualifyClause}
               ${seen.clause}
-            ${order}
+            ${order.sql}
             LIMIT ?`,
       args,
     });

@@ -3293,3 +3293,72 @@ reader 零次調用）。`test-schema-gate.js` 6 → **7**（新一條釘住 boo
 - heal 嗰個 ring 讀**每次 pass 都買**（以前係「有 missing 才買」），但佢騎喺一個本來就要出嘅 request
   上面，所以係 0 成本；代價係嗰個 request 嘅 payload 大 ~20KB。
 - **未量**：呢次改動嘅 `wallMax` 前後對比要 deploy 之後由 CFMIN 抽，本文只記錄咗 baseline。
+
+## 4.48 輪替嘅兩個結構性損耗：hot band 撐爆自己嘅 LIMIT、rotation band 嘅超額永遠讀唔到（2026-09-29）
+
+由 240-tick 健康報告延伸出嚟嘅修法。全部數字都係**唯讀打生產 Turso**：一次臨時探針
+（`scripts/tmp-band-probe.js`，跑完已刪）＋ 直接讀 `Db.queryReevalBand` 同一條 band，
+唔係喺 JS 重寫一次排序。
+
+### 一、量到嘅兩個損耗
+
+| 睇 | 實測（2026-09-29 10:25–10:33Z）| 後果 |
+|---|---|---|
+| HOT band vs 自己嘅 LIMIT | **607 行 / 300**，nearest-entry 排序只覆蓋 age 61–99min | **82 行 eligible（age 99–110min）每次 scan 都被切走** —— 268 個 eligible 之中 31%，即「hot zone 每次 scan 都評估」對最貼近 near sweep 嗰批係假嘅 |
+| worst FAR sub-window | 413 行 / LIMIT 210 → 190 超額，**全部喺同一個 tie group**（256 行 key 一模一樣：無 mcap peak、`first_m5_vol` 0），切點落在組中間 | 同一個 sub-window 每次輪到都揀返同一批 → 呢 190 行**永遠讀唔到**。wrangler.toml 2026-09-15 註解講過嘅 starvation，隨 pool 增長返嚟 |
+| worst NEAR sub-window | 602 行 / LIMIT 490 → 112 超額（同一機制）| 同上 |
+
+### 二、順手揭到嘅第三個問題：`DEAD_POOL_CLAUSE` 只喺一條路徑
+
+`DEAD_POOL_CLAUSE`（drained pool 嘅 `last_liquidity_usd` 前篩）自 2026-09-19 起只加喺
+`getReevalPoolBatched`（生產路徑），而 `queryReevalBand`（batched 拋錯時嘅 fallback，亦係所有
+離線儀器讀嘅路徑）冇 —— 但佢自己嘅註解寫明「both MUST carry it」。同一個 band 實測：
+**299 行（有 clause）vs 413 行（冇）**。
+
+所以今日較早報告（同 §4.38 嗰條線嘅 2026-09-15 sizing audit）用嗰條路徑讀到嘅 far starvation
+**偏高**：實測 far 每 sweep 嘅超額由「666 行」修正為約 **91 行**（worst slot 73–78，其餘 0–12），
+near 由 116 修正為 **19**。已修：兩條路徑而家都帶 clause。
+
+### 三、修法
+
+1. **hot band 縮到裝得落自己嘅 LIMIT**：`POOL_HOT_ABOVE_MS` 1h → **30min**（warm side），
+   `POOL_HOT_MAX` 300 → **460**。量到 band 382 行（eligible 221 + warm 161）→ **clipped 0**。
+   縮 warm side 而唔係把 LIMIT 撐大係刻意嘅：warm side 嘅每一行都係「喺該 age 永遠冇資格」嘅
+   rows-read（所以佢由 2h 變 1h），但完全唔要亦唔得 —— 佢係 coin 嘅 `max_mcap_observed`
+   高水位唯一會喺 entry 之前被寫入嘅地方，而成個輪替（排序＋prune）都建喺嗰個值上面。
+2. **預算 1000 → 1200**（`RE_EVAL_POOL_SIZE`；`src/config.ts` 嘅 clamp 同步 1000 → 1200，
+   `wrangler.toml [vars]` 同步）→ hot 460 + near 518 + far 222，兩邊 band 都唔再靠縮細嚟避
+   starvation。
+3. **near/far 嘅 signal ordering 加一個每 recurrence 前進一格嘅 tie-break**
+   （`POOL_BAND_ROTATE_BUCKETS = 8`，key = token 最後一個字元，base58 平均分佈；phase =
+   `floor(slot / slots)`，即 sub-window 每次輪到就移一格）。tie-break 擺喺**兩個 signal key 之後**，
+   所以有 signal 嘅 row 永遠唔會被輪替擠走 —— 佢只決定「一模一樣」嗰批之中邊啲入 LIMIT。
+4. ORDER BY 抽成 `poolBandOrder()`，由兩條路徑共用（batched 之前自己抄一份，正係上面 clause 嗰種 drift 嘅溫床）。
+5. 測試：新增一條釘住「飽和 band 嘅超額要輪替、signal head 每個 recurrence 都要讀」；
+   `test-unit.js` 433 → **434 passed**。
+
+### 四、驗收（同一條 SQL 打生產，實測）
+
+| 睇 | 改前 | 改後（實測）|
+|---|---|---|
+| hot band / LIMIT | 607 / 300 → clip 82 eligible | 382 / 460 → **clip 0** |
+| worst far band / LIMIT | 413 / 210 → 190 超額，全部同一 tie group | 299 / 222 → 73 超額；**8 個 recurrence 內覆蓋 295/295 = 100%**（固定 ordering 只 222 = 75.3%）|
+| 帶 signal 嘅 row（該 band 30 行）| 100%（從來冇被切）| 100%（**每個 phase 都讀**，30/30）|
+| worst near band / LIMIT | 602 / 490 → 112 | 537 / 518 → 19 |
+| `npm run build`（tsc）| 綠 | 綠 |
+| `test-unit.js` | 433 passed | **434 passed** |
+
+### 五、界線（老實講）
+
+- **未 deploy**：`wrangler.toml [vars]`（`RE_EVAL_POOL_SIZE`）＋ src 改動要 deploy 之後才生效，
+  喺此之前生產仍然行 1000 / hot 300 / warm 1h。
+- **D 層（曝光 vs 評估覆蓋率）冇得再量**：`scripts/pool-rotation-audit.js` 已按指示刪除，所以本文
+  只量到「band 有幾多行讀唔到」同「超額輪唔輪到」，**冇**再量「far cohort 240 tick 內幾多 % 入 slice」。
+- pool read 由約 1,000 行/tick 升到約 1,200 行/tick（＋20% 回傳行數）；**Turso rows-read 實際增幅未量**
+  （本機量唔到），deploy 後要睇 /debug/pool 同 Turso 側讀數。
+- 輪替係「有界」唔係「即時」：worst band 嘅超額要 8 個 recurrence（far = 8 × 18min ≈ 2.4h）先全部
+  輪到一次；K=8 係桶數選擇，加大 K 只會令單次輪替更碎，唔會改變覆蓋上限。
+- 「100%」係指 band 內嘅 row 讀得到，**仍然受 slice（`RE_EVAL_PER_TICK_MAX` 90）限制** ——
+  擴大 slice 唔係今次範圍（2026-09-28 已試 90 → 180 並回退，見 `src/scanner.ts` 註解）。
+- 順手修嘅 `DEAD_POOL_CLAUSE` 對**生產 tick 行為零影響**（生產走 batched，本來就有 clause），
+  影響嘅係 fallback 路徑同所有離線儀器嘅讀數。

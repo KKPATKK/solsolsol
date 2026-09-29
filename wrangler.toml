@@ -143,9 +143,16 @@ SCAN_PROFILE_LIMIT = "200"
 DEXSCREENER_BOOSTS_LIMIT = "30"
 # Re-evaluation pool: never-pushed coins nearing/inside the qualifying age
 # window that the bot keeps tracking until they qualify (code default 40,
-# max 1000). Ordered by relevance, so the closest-to-qualifying coins are
+# max 1200). Ordered by relevance, so the closest-to-qualifying coins are
 # always checked first; leftovers simply defer to the next tick.
-RE_EVAL_POOL_SIZE = "1000"
+# 1000 → 1200 (2026-09-29): the HOT band had outgrown its own LIMIT — measured
+# 607 rows read against a 300-row cap, which clipped 82 of the 268 ELIGIBLE
+# rows (ages 99-110min) on every scan, so the hot zone was not in fact
+# "evaluated every scan". The band's warm side was halved to 30 min and its
+# budget raised to 460 so nothing is clipped; 460 + 490 near + 210 far = 1200.
+# This is a budget SPLIT, not extra work per tick: the same rotation slice is
+# still what gets evaluated.
+RE_EVAL_POOL_SIZE = "1200"
 # Graduated re-eval pool rotation (see src/db.ts): everything older than the
 # hot zone (window entry ± margin, evaluated EVERY scan) is swept in two
 # tiers. NEAR tier = the first 6h inside the age window — the coins most
@@ -169,11 +176,20 @@ RE_EVAL_POOL_SIZE = "1000"
 # and the NEAR zone does not. 12 far slots narrow each sub-window to ~1.6h
 # (~105 prune-passing coins, comfortably under 210) so the far sweep covers
 # its zone instead of re-reading a head; a full far sweep is 18 min. NEAR
-# stays at 2 slots (~3 min) because its zone already fits. Sizing down from
-# here reintroduces far-zone starvation; sizing far UP only shrinks the
-# per-tick pool (each tick reads one near + one far sub-window), which costs
-# evaluations per minute for no extra coverage. Both must stay multiples of
-# the pool cache TTL.
+# stays at 2 slots (~3 min) because its zone already fits. Both must stay
+# multiples of the pool cache TTL.
+#
+# 2026-09-29 — SIZING ALONE STOPPED BEING ENOUGH: the pool grew until the
+# sub-windows were over their LIMIT again (worst far sub-window 400 rows vs
+# 210; worst near 602 vs 490), so the starvation the 09-15 audit fixed was
+# back. Re-sizing every time growth catches up is a treadmill, and the same
+# measurement showed why it never needs to be: the 190 overflow rows of that
+# far sub-window sat in ONE tie group — 256 rows carrying the identical signal
+# key (no mcap peak, zero first_m5_vol), of which the LIMIT could take 66. The
+# bands now resolve those ties with a rotating bucket (src/db.ts
+# POOL_BAND_ROTATE_BUCKETS / poolBandOrder), so the overflow is served over
+# successive sweeps instead of never, and the slot counts below are a cadence
+# choice again rather than a starvation lever.
 REEVAL_NEAR_SWEEP_MIN = "3"
 REEVAL_FAR_SWEEP_MIN = "18"
 # Re-eval pool query cache TTL + rotation period, in seconds. The pool query

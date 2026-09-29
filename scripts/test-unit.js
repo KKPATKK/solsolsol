@@ -6915,6 +6915,78 @@ async function main() {
     }
   });
 
+  // 2026-09-29: a sub-window holding MORE rows than its per-slot LIMIT used to
+  // be truncated to the same signal-ordered head on EVERY visit, so the
+  // overflow was never read — measured live at 190 rows of one far sub-window
+  // (all identical signal key). The tie break now rotates once per recurrence,
+  // and this test pins both halves of that promise: the overflow moves, and a
+  // row that HAS signal is never displaced by it.
+  await test("getReevalPool: a saturated band's overflow rotates, signal order does not", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const M = 60e3;
+      const now = 50 * 300e3;
+      const seed = async (token, ageMin, mcap, vol) => {
+        const launch = now - ageMin * M;
+        await t.client.execute({
+          sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: [token, launch, vol, ageMin, launch, mcap, 40_000],
+        });
+      };
+      // 30 far rows sharing the IDENTICAL signal key (peak + first_m5_vol) —
+      // the tie group the live far band was measured to hold — plus one row
+      // that outranks them all and must never lose its slot to the rotation.
+      for (let i = 0; i < 30; i += 1) await seed(`R${i}`, 1000, 200_000, 0);
+      await seed("HIGH", 1000, 400_000, 0);
+      const opts = (nn) => ({
+        sinceMs: now - 30 * 3600e3,
+        minLaunchMs: now - 2580 * M,
+        maxLaunchMs: now - 180 * M,
+        windowEntryLaunchMs: now - 360 * M,
+        // hot takes its 460-row budget first, leaving 40 for rotation →
+        // near 28 + far 12, so these 31 far rows are well over the limit.
+        limit: 500,
+        nearSlots: 1,
+        // ONE far sub-window (= the whole far zone) so every call reads the
+        // same band and the phase advances with the slot, one per recurrence.
+        farSlots: 1,
+        rotationPeriodMs: 300e3,
+        minQualifyMcap: 30_000,
+        maxQualifyMcap: 500_000,
+        minQualifyLiquidity: 5_000,
+        now: nn,
+      });
+      const first = (await db.getReevalPool(opts(now))).map((r) => r.token);
+      assert.ok(first.includes("HIGH"), "the signal head is read");
+      const firstR = first.filter((x) => x.startsWith("R"));
+      assert.ok(
+        firstR.length > 0 && firstR.length < 30,
+        `the band must be over its LIMIT (read ${firstR.length} of 30)`,
+      );
+      const union = new Set(firstR);
+      for (let k = 1; k <= 7; k += 1) {
+        const rows = (await db.getReevalPool(opts(now + k * 300e3))).map((r) => r.token);
+        assert.ok(rows.includes("HIGH"), `the signal head is read on recurrence ${k}`);
+        const r = rows.filter((x) => x.startsWith("R"));
+        assert.equal(
+          r.length,
+          firstR.length,
+          `the LIMIT stays full on recurrence ${k}`,
+        );
+        for (const x of r) union.add(x);
+      }
+      assert.ok(
+        union.size > firstR.length,
+        `the overflow must rotate: ${union.size} distinct rows over 8 recurrences vs ${firstR.length} for a fixed head`,
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("getReevalPool: pre-filter drops hopeless coins, rotation orders by mcap signal", async () => {
     const t = tmpDb();
     try {
