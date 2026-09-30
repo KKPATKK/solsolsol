@@ -3882,3 +3882,46 @@ curl -s .../health | jq '.birdeyeCu.byEndpoint.today'        # tokenOverview 應
 - **已經 arm 嘅 `div` mark 只有價格那條腿可以清**：`divActive = chgSincePush ≥ 25% && holderRatio ≤ 0.9`。probe 關掉之後 `holdersLast` 凍結（唔再寫），所以 `holderRatio ≤ 0.9` 會一直為真，mark 只可以靠 `chgSincePush` 跌返 25% 以下才清。今日實測：靜音前後 ring 內 `hold`／`div` 都係 0 筆，所以呢個係「將來要留意」而唔係現時已存在嘅隱患。
 - **呢個開關唔慳 Turso**：省的只是 Birdeye CU（及相應 subrequest），其他 round trips 不變。
 - 反轉要 redeploy（wrangler var），冇 Telegram 指令。
+
+## 4.57 靜音再加 🩸 賣壓主導同 ⚠️ 動能轉弱（2026-09-30）
+
+### 一、需求
+
+Operator 話「暫時不需要推送的跟進卡：🩸 賣壓主導、⚠️ 動能轉弱」—— 即 §4.53 開關再加三隻 sig：`sell`（🩸）同 `w35`／`w45`（⚠️ 係**兩段 sig**）。
+同前兩次一樣係「暫時唔想收到」，唔係唔想再追蹤 —— 引擎行為要完全不變，un-mute 之後亦唔可以補發一堆舊卡。
+
+### 二、做法：只改 wrangler var，零引擎改動
+
+| 位置 | 改動 | 為何 |
+|---|---|---|
+| `wrangler.toml` | `PUSH_WATCH_MUTE = "liqwarn,drain,recap,hold,div,sell,w35,w45"`（＋註解補三行 sig 對照） | 開關係 deploy 層，同 §4.53/§4.55 一模一樣；三隻都係 audit ring 嘅真 sig，唔會靜錯卡 |
+| `src/config.ts` | `parseMutedCardSigs` 嘅 doc comment 補 `sell`／`w35`／`w45` | 文件同實況一致；parser 本身零改動 |
+
+要點：
+
+1. **⚠️ 係清單入面唯一一對 sig**：`evaluateWatch` 出 ⚠️ 卡時傳嘅 sig 係 `weakMark` —— 距峰 ≤ −45% 出 `w45`，−35%…−45% 出 `w35`。所以**只收一隻會唔齊**（另一隻照樣喺 chat 出現），今次兩隻一齊入名單。呢個係 `weakMark` 呢個寫法本身嘅直接後果，唔係今次新加嘅複雜度。
+2. **muted 🩸 仍然行 streak 同 pace**：`sellDomStreak` 照加（2 → 3）、`lastAlertAt` 照寫 —— un-mute 之後係等「下一次連續 3 次賣壓、而且距上次卡 ≥ 1 小時」先再有 🩸，唔會即刻補一張。
+3. **muted ⚠️ 仍然落 mark**：`w35`／`w45` 照入 `up_stages`（同時 `lastState = "weak"`），同 §4.55 嘅 📈/⚡ 一樣 —— 「留低嘅 transition 才係真正價值」。
+
+### 三、測試（main suite 448 → **449 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+- `loadConfig: PUSH_WATCH_MUTE parses the tracker's muted card sigs` —— 期望值加 `sell`／`w35`／`w45`。
+- `PushWatcher: PUSH_WATCH_MUTE withholds 🩸 sell and ⚠️ w35/w45 and still lands their state` —— (a) muted 🩸：冇卡、`muted 1`、streak 2 → 3、`lastAlertAt > 0`、`followupsSent` 照計 1；unmuted control 照出 🩸。(b) muted w35（距峰 −40%）同 w45（−50%）：兩隻都冇卡、`muted 1`、`up_stages` 照樣有 `w35`／`w45`、`lastState = "weak"`；unmuted control 照出 ⚠️。
+
+### 四、驗收（deploy 後）
+
+```bash
+curl -s .../debug/push-watch | jq '.mutedSigs'
+# 期望 ["liqwarn","drain","recap","hold","div","sell","w35","w45"]
+```
+
+- 🩸／⚠️ 由 chat 消失；`/debug/push-audit` ring 唔再新增 `sell`／`w35`／`w45` 條目；
+- ⚠️ 嘅 mark 照樣落（唔可以靠 ring 推論「⚠️ 冇再觸發過」——同 §4.53 嘅界線一樣）。
+
+### 五、界線（老實講）
+
+- **改嘅只係 send 口**：`sell`／`w35`／`w45` 照計 announced（`followupsSent`）、照寫 mark 同 `lastAlertAt`；名片本身唔會去 Telegram。
+- **收 ⚠️ 之後，-35%…-55% 呢段係完全靜音**：chat 只剩回落嘅 `💀 走死`（≤ −55%）同未收嘅 `💧 流動性驟降`。即係「峰位開始鬆」呢個中間警告冇咗，要等到走死或者 LP 驟降先知 —— 呢個係今次的確實代價，唔係零成本。
+- **🩸 係分佈預警**：收咗之後，緩慢出貨（價未跌、賣壓連續佔優）唔會再有卡，要到 🚀 續漲／💀／⚠️（已收）之類嘅轉折才見。
+- **反轉要 redeploy**（wrangler var），冇 Telegram 指令；要 un-mute 建議一次一隻 sig，睇返一日 ring 先再加。
+- **同 §4.56 嘅關係**：worker 程式碼唔變、round trips 唔變，今次純係交付層嘅開關。

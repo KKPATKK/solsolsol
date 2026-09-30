@@ -507,13 +507,18 @@ PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
 #   recap   = 🏁 結案報告 (window close — the row is still pruned)
 #   hold    = 📈 持倉增長 (baseline still rolls forward — see isMuted)
 #   div     = ⚡ 籌碼集中 (the div mark still lands)
-# SET 2026-09-30 at the operator's request (「暫時不想收到」). A muted card is
+#   sell    = 🩸 賣壓主導 (the streak + its 1h pace clock still land)
+#   w35/w45 = ⚠️ 動能轉弱 — BOTH depth stages, because the card fires with
+#             `weakMark` (`w45` at ≤ -45% off the peak, `w35` above it):
+#             muting only one leaves the other visible. The mark still lands.
+# SET 2026-09-30 at the operator's request (「暫時不想收到」; extended the same
+# day with 「暫時不需要推送：賣壓主導、動能轉弱」). A muted card is
 # still DERIVED and its transition still LANDS (a muted drain still goes rug,
 # a muted recap still closes the row); only the Telegram send is withheld, and
 # the pass note counts them as `muted N`. Lifting a mute = delete its sig here
 # (or the whole line) and redeploy: the NEXT transition is delivered, nothing
 # is replayed. See PushWatcher.isMuted.
-PUSH_WATCH_MUTE = "liqwarn,drain,recap,hold,div"
+PUSH_WATCH_MUTE = "liqwarn,drain,recap,hold,div,sell,w35,w45"
 # Birdeye CU allowance per calendar month (code default 30_000 = the free
 # tier). REPORTING ONLY: the client charges every request attempt (per-endpoint
 # prices live in src/birdeye.ts BIRDEYE_CU_PRICES) and a durable day ledger sums

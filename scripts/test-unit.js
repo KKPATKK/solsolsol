@@ -1430,6 +1430,93 @@ async function main() {
     assert.match(String(texts[0]), /⚡ 籌碼集中/);
   });
 
+  // PUSH_WATCH_MUTE extended again (2026-09-30, 「暫時不需要推送：賣壓主導、動能轉弱」):
+  // 🩸 sell and ⚠️ weak join the switch. The ⚠️ card is the one sig PAIR in
+  // the set: evaluateWatch fires it with `weakMark` — `w45` at ≤ -45% off the
+  // peak, `w35` above it — so muting only one of the two stages would leave
+  // the other visible. Same contract as every other muted card: the message is
+  // withheld, the transition still LANDS (the 🩸 streak + its 1h pace clock,
+  // the ⚠️ depth mark in up_stages), so un-muting later starts from the NEXT
+  // transition instead of replaying the backlog.
+  await test("PushWatcher: PUSH_WATCH_MUTE withholds 🩸 sell and ⚠️ w35/w45 and still lands their state", async () => {
+    const texts = [];
+    const bot = { api: { sendMessage: async (_c, text) => { texts.push(text); return { message_id: 4 }; } } };
+    const make = (db, cfg, pairFor) =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        cfg,
+        async (addrs) => new Map(addrs.map((a) => [a, pairFor(a)])),
+        null,
+      );
+    const muted = loadConfig({ PUSH_WATCH_MUTE: "sell,w35,w45" });
+
+    // (a) 🩸 賣壓主導 muted: the streak's THIRD sell-dominant check fires the
+    // card (2 → 3 ≥ SELL_DOM_STREAK_NEEDED) on a +50% runup and an expired 1h
+    // pace. Withheld — but the streak still advances and lastAlertAt still
+    // lands, so the NEXT card needs another full hour even after un-muting.
+    const sellRow = () => termRow({ upStages: "liq1", sellDomStreak: 2, peakMcap: 150_000 });
+    // 2:1 sells over buys on h1 (0.5 < SELL_DOM_RATIO).
+    const sellPair = (a) => ({
+      ...termPair(a, 50_000),
+      txns: { ...termPair(a, 50_000).txns, h1Buys: 50, h1Sells: 100 },
+    });
+    const dbSell = termDb([sellRow()]);
+    const outSell = await make(dbSell, muted, sellPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the 🩸 card is withheld");
+    assert.equal(outSell.muted, 1, "the pass reports the withheld card");
+    assert.match(String(outSell.note), / muted 1/);
+    assert.equal(outSell.undelivered, 0, "a withheld card is not a failure");
+    assert.equal(dbSell.updated.length, 1);
+    const [, wSell] = dbSell.updated[0];
+    assert.equal(wSell.sellDomStreak, 3, "the streak still advances");
+    assert.ok(wSell.lastAlertAt > 0, "and the pace clock lands");
+    assert.equal(wSell.followupsSent, 1, "the announcement still counts as one");
+
+    // CONTROL: the same row without the mute delivers the 🩸 card.
+    const dbSellCtl = termDb([sellRow()]);
+    await make(dbSellCtl, loadConfig({}), sellPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "without the mute the 🩸 card goes out");
+    assert.match(String(texts[0]), /🩸 賣壓主導/);
+
+    // (b) ⚠️ 動能轉弱 muted — BOTH depths. -40% off the peak is `w35`; -50%
+    // is the `w45` escalation (it stays above the -55% that 💀 owns). Each is
+    // withheld, and each still lands its mark in up_stages — the once-per-
+    // depth memory that keeps the same card from re-announcing after the mute
+    // is lifted.
+    texts.length = 0;
+    const weakPair = (a, mcap) => ({ ...termPair(a, 50_000), marketCap: mcap });
+    const db35 = termDb([termRow({ upStages: "liq1", peakMcap: 200_000 })]);
+    const out35 = await make(db35, muted, (a) => weakPair(a, 120_000)).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the w35 card is withheld");
+    assert.equal(out35.muted, 1);
+    assert.equal(db35.updated.length, 1);
+    const [, w35] = db35.updated[0];
+    assert.ok(
+      String(w35.upStages).split(",").includes("w35"),
+      `the w35 mark lands anyway: ${w35.upStages}`,
+    );
+    assert.equal(w35.lastState, "weak", "the weak transition still lands");
+
+    const db45 = termDb([termRow({ upStages: "liq1,w35", peakMcap: 200_000 })]);
+    const out45 = await make(db45, muted, (a) => weakPair(a, 100_000)).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the w45 escalation is withheld too — muting one stage would have left it visible");
+    assert.equal(out45.muted, 1);
+    const [, w45] = db45.updated[0];
+    assert.ok(
+      String(w45.upStages).split(",").includes("w45"),
+      `the w45 mark lands anyway: ${w45.upStages}`,
+    );
+
+    // CONTROL: unmuted, the same -40% row sends the ⚠️ card.
+    texts.length = 0;
+    const db35Ctl = termDb([termRow({ upStages: "liq1", peakMcap: 200_000 })]);
+    await make(db35Ctl, loadConfig({}), (a) => weakPair(a, 120_000)).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "without the mute the ⚠️ card goes out");
+    assert.match(String(texts[0]), /⚠️ 動能轉弱/);
+  });
+
   // The invocation's subrequest ceiling, threaded into the pass (2026-09-24).
   // Live: the front spent 47 of the 50 Workers Free allows on a cold isolate,
   // and the pass behind it — which needs `trips 5`-`8` plus its pair batch —
@@ -3962,13 +4049,14 @@ async function main() {
 
   await test("loadConfig: PUSH_WATCH_MUTE parses the tracker's muted card sigs", () => {
     // Default: nothing is muted — shipping the mute must not silence any card
-    // until an operator sets the variable (the three sigs are the audit ring's
-    // own: liqwarn ⚠️ 流動性跌穿地板, drain 💧 流動性枯竭, recap 🏁 結案報告,
-    // hold 📈 持倉增長, div ⚡ 籌碼集中).
+    // until an operator sets the variable (the sigs are the audit ring's own:
+    // liqwarn ⚠️ 流動性跌穿地板, drain 💧 流動性枯竭, recap 🏁 結案報告,
+    // hold 📈 持倉增長, div ⚡ 籌碼集中, sell 🩸 賣壓主導, and w35/w45 — the
+    // two depth stages of the ⚠️ 動能轉弱 card).
     assert.deepEqual(loadConfig({}).pushWatch.mutedSigs, []);
     assert.deepEqual(
-      loadConfig({ PUSH_WATCH_MUTE: "liqwarn,drain,recap,hold,div" }).pushWatch.mutedSigs,
-      ["liqwarn", "drain", "recap", "hold", "div"],
+      loadConfig({ PUSH_WATCH_MUTE: "liqwarn,drain,recap,hold,div,sell,w35,w45" }).pushWatch.mutedSigs,
+      ["liqwarn", "drain", "recap", "hold", "div", "sell", "w35", "w45"],
     );
     // Normalized (case/space) and deduped. An UNKNOWN sig stays in the list
     // but matches no card — a typo can only leave a card visible, never
