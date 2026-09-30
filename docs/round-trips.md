@@ -3990,3 +3990,47 @@ curl -s .../debug/feed-stats | jq '.byFeed[] | select(.feed=="boosts")'
 - **未 cover ③：上游本身**。`refused 366 / hitPct 99.9%` 講嘅係共享 Worker egress IP 被 DexScreener 拒（同 §gecko-429 同一類問題），呢個 fix 只係令「自適應 gap」唔再變成「條 leg 靜靜死」；唔會減少 429。
 - **收益細，要講清楚**：boosts 累計只發現 41 枚幣、push 1 次（5 日），係一條細 lane；今次係把它嘅行為修正成「可以問就問」，唔係話佢值好多卡。
 - **profiles leg 冇同樣改**：佢有 reuse lane（`PROFILE_FEED_REUSE_MS` 30 分鐘）＋ 永遠第一 slot，所以唔在今次範圍；要記住呢個唔對稱。
+
+## 4.59 靜音 🪝 回調轉強（2026-09-30）
+
+### 一、需求
+
+Operator 話「暫時不需要推送跟進卡：🪝 回調轉強」—— §4.53 個開關再加第四批 sig：`pullback`。
+口氣同前三次一樣係「暫時唔想收到」而唔係「唔想再追蹤」：引擎行為不變，un-mute 之後亦唔可以補發舊卡。
+
+### 二、做法：又係只改 wrangler var，零引擎改動
+
+| 位置 | 改動 | 為何 |
+|---|---|---|
+| `wrangler.toml` | `PUSH_WATCH_MUTE = "liqwarn,drain,recap,hold,div,sell,w35,w45,pullback"`（＋註解補一行 `pullback` 對照） | 開關係 deploy 層，同 §4.53/§4.55/§4.57 一模一樣；`pullback` 係 audit ring 嘅真 sig，唔會靜錯卡 |
+| `src/config.ts` | `parseMutedCardSigs` 嘅 doc comment 補 `pullback` | 文件同實況一致；parser 本身零改動 |
+
+要點：
+
+1. **🪝 係唯一一張有「兩個記憶」嘅 muted 卡**：`fire()` 一次過寫 `pb` mark（呢個 episode 已消費）同 `lastAlertAt`（10 分鐘 pace，`PULLBACK_PACE_MS`）。兩樣都照寫 —— 同 §4.57 嘅 🩸 clock 同一道理，un-mute 之後要等下一個「跑完 ≥50%、回撤 −15…−45%、5m tape 轉身」嘅新 episode，唔會補一張舊卡。
+2. **re-arm 邏輯不受影響**：回到距峰 −8% 以內就 `marks.delete("pb")`（`PULLBACK_REARM_DD_PCT`），呢步同靜音無關。
+3. **冇改任何門檻**：`PULLBACK_MIN_RUNUP_PCT` / `_MIN_DD_PCT` / `_MAX_DD_PCT` / `_TURN_CHG5M_PCT` / `_TURN_VOL_USD` / `_TURN_BS_RATIO` / `_REARM_DD_PCT` / `_PACE_MS` 全部原封不動。
+
+### 三、測試（main suite 449 → **450 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+- `loadConfig: PUSH_WATCH_MUTE parses the tracker's muted card sigs` —— 期望值加 `pullback`（9 隻 sig）。
+- `PushWatcher: PUSH_WATCH_MUTE withholds 🪝 pullback and still stamps its mark` —— (a) muted：冇卡、`muted 1`、note 有 ` muted 1`、`undelivered 0`、`up_stages` 照樣有 `pb`、`lastAlertAt > 0`、`followupsSent` 照計 1；unmuted control 照出 🪝。
+- fixture 造形：`peakMcap 200_000`（推送價 100_000 ⇒ runup +100%）、`live mcap 150_000`（距峰 −25%）、`m5 +12%`、`m5 量 $12K`、h1 買賣 100:80 = 1.25:1；`upStages` 預先帶 `up50`（免 🚀 補一卡），m5 $12K 低於 `IGNITION_VOL_USD` 15K（免 🔥 補一卡）—— 即係測試只可能見到 🪝 一張卡。
+
+### 四、驗收（deploy 後）
+
+```bash
+curl -s .../debug/push-watch | jq '.mutedSigs'
+# 期望 ["liqwarn","drain","recap","hold","div","sell","w35","w45","pullback"]
+```
+
+- 🪝 由 chat 消失；`/debug/push-audit` ring 唔再新增 `pullback` 條目；
+- `pb` mark 照樣落（所以唔可以靠「ring 冇咗 pullback」推論「引擎冇再觸發過」—— 同 §4.53 嘅界線一樣）。
+
+### 五、界線（老實講）
+
+- **改嘅只係 send 口**：`pullback` 照計 announced（`followupsSent`）、照寫 `pb` 同 `lastAlertAt`；卡本身唔會去 Telegram。
+- **收益細，要講清楚**：🪝 本來就唔係噪音來源 —— 5.2 小時嘅 audit ring（in-window 157 筆）只有 **3 筆** `pullback`，相比同時段 `dead` 20、`ignite` 18、`revive` 18、🩸/⚠️（已收）加起來幾十筆。今次係照 operator 指示收卡，唔係修 bug，實際 chat 噪音降幅會好細。
+- **收嘅係「入場提示」而唔係「出場警告」**：呢張卡係唯一講「回調完、tape 轉身」嘅多頭訊號（♻️ `reclaim` 要破前高、🔥 要 $15K 爆量），收咗之後 −15…−45% 回撤後嘅轉強只可以靠 🚀 續漲／未收嘅 ♻️ 睇。
+- **反轉要 redeploy**（wrangler var），冇 Telegram 指令；要 un-mute 建議一次一隻 sig，睇返一日 ring 先再加。
+- **同 §4.56 嘅關係**：worker 程式碼唔變、round trips 唔變、門檻唔變，今次純係交付層嘅鏍絲。

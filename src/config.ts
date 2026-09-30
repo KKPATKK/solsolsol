@@ -85,8 +85,10 @@ export function parseAdminIds(raw: string | undefined): number[] {
  * the two DEPTH STAGES of the ⚠️ 動能轉弱 card (the rule fires it with
  * `weakMark`, so the audit sig is `w45` at ≤ -45% off the peak and `w35`
  * above it — muting one stage leaves the other visible, so both must be
- * listed). An unknown sig is INERT — it matches no card — so a typo can
- * only leave a card visible, never silence the wrong one.
+ * listed), and `pullback` = the 🪝 回調轉強 entry re-card (its once-per-
+ * episode `pb` mark and 10-minute pace clock still land — see
+ * PULLBACK_PACE_MS). An unknown sig is INERT — it matches no card — so a typo
+ * can only leave a card visible, never silence the wrong one.
  */
 export function parseMutedCardSigs(raw: string | undefined): string[] {
   if (!raw) return [];

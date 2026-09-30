@@ -1517,6 +1517,66 @@ async function main() {
     assert.match(String(texts[0]), /⚠️ 動能轉弱/);
   });
 
+  // PUSH_WATCH_MUTE extended once more (2026-09-30,
+  // 「暫時不需要推送跟進卡：🪝 回調轉強」): the 🪝 pullback ENTRY card joins the
+  // switch. Unlike the exit cards above it, the pullback's memory is the
+  // once-per-episode `pb` mark AND the shared `lastAlertAt` pace clock
+  // (fire() stamps both, PULLBACK_PACE_MS = 10 min) — the same discipline the
+  // 🩸 card's clock follows, and the reason muting it must still write both.
+  await test("PushWatcher: PUSH_WATCH_MUTE withholds 🪝 pullback and still stamps its mark", async () => {
+    const texts = [];
+    const bot = { api: { sendMessage: async (_c, text) => { texts.push(text); return { message_id: 4 }; } } };
+    const make = (db, cfg, pairFor) =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        cfg,
+        async (addrs) => new Map(addrs.map((a) => [a, pairFor(a)])),
+        null,
+      );
+    const muted = loadConfig({ PUSH_WATCH_MUTE: "pullback" });
+
+    // The pullback shape: already ran (peak 2× the push), now -25% off that
+    // peak, and the newest tape turns back up — a +12% 5m bar on $12K of 5m
+    // volume with a 1.25:1 buy:sell lean. `up50` rides in the row's upStages
+    // (the +50% milestone this reading re-crosses) so the 🚀 ladder has
+    // nothing to announce and 🪝 is the ONLY card in play — and m5 = $12K
+    // stays under IGNITION_VOL_USD (15K) so 🔥 cannot fire either.
+    const pbRow = () => termRow({ upStages: "liq1,up50", peakMcap: 200_000 });
+    const pbPair = (a) => ({
+      ...termPair(a, 50_000),
+      marketCap: 150_000,
+      volume: { h24: 1_000_000, h1: 20_000, m5: 12_000 },
+      priceChange: { m5: 12, h1: 5 },
+    });
+
+    // (a) muted: the card is withheld, but fire()'s stamps still land — the
+    // `pb` mark (this pullback episode is spent) and lastAlertAt (the 10-min
+    // pace), so un-muting later starts from the NEXT episode instead of
+    // replaying this one.
+    const dbPb = termDb([pbRow()]);
+    const outPb = await make(dbPb, muted, pbPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the 🪝 card is withheld");
+    assert.equal(outPb.muted, 1, "the pass reports the withheld card");
+    assert.match(String(outPb.note), / muted 1/);
+    assert.equal(outPb.undelivered, 0, "a withheld card is not a failure");
+    assert.equal(dbPb.updated.length, 1);
+    const [, wPb] = dbPb.updated[0];
+    assert.ok(
+      String(wPb.upStages).split(",").includes("pb"),
+      `the pb mark lands anyway: ${wPb.upStages}`,
+    );
+    assert.ok(wPb.lastAlertAt > 0, "and the pace clock lands, so un-muting waits for the next episode");
+    assert.equal(wPb.followupsSent, 1, "the announcement still counts as one");
+
+    // CONTROL: the same row without the mute delivers the 🪝 card.
+    const dbPbCtl = termDb([pbRow()]);
+    await make(dbPbCtl, loadConfig({}), pbPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "without the mute the 🪝 card goes out");
+    assert.match(String(texts[0]), /🪝 回調轉強/);
+  });
+
   // The invocation's subrequest ceiling, threaded into the pass (2026-09-24).
   // Live: the front spent 47 of the 50 Workers Free allows on a cold isolate,
   // and the pass behind it — which needs `trips 5`-`8` plus its pair batch —
@@ -4051,12 +4111,14 @@ async function main() {
     // Default: nothing is muted — shipping the mute must not silence any card
     // until an operator sets the variable (the sigs are the audit ring's own:
     // liqwarn ⚠️ 流動性跌穿地板, drain 💧 流動性枯竭, recap 🏁 結案報告,
-    // hold 📈 持倉增長, div ⚡ 籌碼集中, sell 🩸 賣壓主導, and w35/w45 — the
-    // two depth stages of the ⚠️ 動能轉弱 card).
+    // hold 📈 持倉增長, div ⚡ 籌碼集中, sell 🩸 賣壓主導, w35/w45 — the two
+    // depth stages of the ⚠️ 動能轉弱 card — and pullback 🪝 回調轉強).
     assert.deepEqual(loadConfig({}).pushWatch.mutedSigs, []);
     assert.deepEqual(
-      loadConfig({ PUSH_WATCH_MUTE: "liqwarn,drain,recap,hold,div,sell,w35,w45" }).pushWatch.mutedSigs,
-      ["liqwarn", "drain", "recap", "hold", "div", "sell", "w35", "w45"],
+      loadConfig({
+        PUSH_WATCH_MUTE: "liqwarn,drain,recap,hold,div,sell,w35,w45,pullback",
+      }).pushWatch.mutedSigs,
+      ["liqwarn", "drain", "recap", "hold", "div", "sell", "w35", "w45", "pullback"],
     );
     // Normalized (case/space) and deduped. An UNKNOWN sig stays in the list
     // but matches no card — a typo can only leave a card visible, never
