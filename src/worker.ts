@@ -1657,8 +1657,9 @@ const TRACKER_PASS_BUDGET_MS = 5_000;
  * Wall-clock budget for the maintenance invocation's whole job (see
  * MAINTENANCE_CRON and runMaintenanceInvocation).
  *
- * Its two legs are interval-gated (the Birdeye backfill hourly, the crime list
- * by its own TTL) and both are no-ops on almost every delivery, so the number
+ * Its legs are interval-gated (the Birdeye backfill hourly, the crime list by
+ * its own TTL, and since 2026-09-30 the telemetry-count reconcile hourly) and
+ * all three are no-ops on almost every delivery, so the number
  * only has to cover the passes that DO work: the backfill walks up to ~4
  * six-hour Birdeye chunks and then writes one batch of token rows; the crime
  * refresh downloads and persists ~4.8K addresses. Neither is close to this,
@@ -4028,8 +4029,9 @@ async function runTrackerInvocation(env: Env): Promise<void> {
  * wrangler.toml).
  *
  * WHAT IT DOES: init, then Scanner.runMaintenanceJobs with
- * MAINTENANCE_BUDGET_MS — the Birdeye periodic backfill and the crime-wallet
- * list refresh, both interval-gated, both side effects. Nothing the scan tick
+ * MAINTENANCE_BUDGET_MS — the Birdeye periodic backfill, the crime-wallet
+ * list refresh and the telemetry-count reconcile, all interval-gated, all side
+ * effects. Nothing the scan tick
  * owns is touched here: no scan lock, no cadence gate, no cron-arrival counter,
  * no heartbeat, no tick telemetry. That is deliberate and load-bearing — the
  * arrival counters and the cadence gate both compare SCAN arrivals, so a

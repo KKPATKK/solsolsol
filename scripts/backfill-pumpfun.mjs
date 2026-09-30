@@ -9,6 +9,14 @@
  * network (the Cloudflare Worker is unaffected, it egresses from
  * Cloudflare's network).
  *
+ * NOTE (2026-09-30): every INSERT OR IGNORE below is paired with a bump of
+ * worker_state.telemetry_token_stats_count, exactly as Db.recordTokenStats
+ * does in src/db.ts. Without it the rows are never counted but the prune
+ * that later deletes them still DECREMENTS the counter, which is how this
+ * script froze a −6,884 gap into /health for weeks (the counter read 6,884
+ * below /debug/pool's live COUNT(*) and could never recover: only a negative
+ * counter self-heals). Keep the bump if this script is ever rewritten.
+ *
  * Usage:
  *   node --env-file-if-exists=.env.local scripts/backfill-pumpfun.mjs [--since-hours 42] [--max-pages 1500] [--dry-run]
  */
@@ -154,6 +162,30 @@ async function main() {
     console.log(
       `Done. Inserted ${inserted} new token_stats rows (${coins.length - inserted} already known).`,
     );
+    // Pay the /health pool counter for what this run inserted. The SQL is
+    // Db.bumpTelemetryCounter's, verbatim (an atomic SQL-side add, so a
+    // concurrent tick's bump can never be lost), and the row name is spelled
+    // out rather than imported because this script shares nothing with the
+    // Worker bundle. Best-effort: telemetry may never fail the backfill —
+    // the rows are already stored. The next hourly reconcile
+    // (Db.reconcileTelemetryCounts) re-derives the counter from a live
+    // COUNT(*) anyway, so a failed bump is bounded by one hour of drift.
+    if (inserted > 0) {
+      try {
+        await client.execute({
+          sql: `INSERT INTO worker_state (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = CAST(value AS INTEGER) + excluded.value`,
+          args: ["telemetry_token_stats_count", String(inserted)],
+        });
+        console.log(`  bumped telemetry_token_stats_count by ${inserted}`);
+      } catch (err) {
+        console.warn(
+          `  ⚠️ telemetry_token_stats_count bump failed (rows are still stored):`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
   } finally {
     client.close();
   }

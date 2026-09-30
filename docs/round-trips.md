@@ -3449,3 +3449,77 @@ near 由 116 修正為 **19**。已修：兩條路徑而家都帶 clause。
   呢條腿係**故意唔 edge-cache**）。即係自己每 tick 對同一共享 IP 放 ~8 個請求。呢個係「自己加重自己」嘅可能來源，
   但今次只量到、冇改（要改就要諗 pair cache 嘅新鮮度約束）。
 - **警報延遲 = 30 分鐘**（§4.36 已接受）：`profiles` 跌到 make-up 大細係 operator 睇開嘅訊號，窗口拉長會令佢遲咗出現。
+
+---
+
+## 4.50 池計數凍結喺 −6,884：一條冇 bump 嘅寫入路徑，加一小時一次嘅重算（2026-09-30）
+
+### 一、量到嘅嘢（8 對樣本，01:12–01:23Z，同一分鐘內先後讀）
+
+| 時刻 | `/health.tokenStatsCount`（bump 計數器）| `/debug/pool.total`（live `COUNT(*)`）| 差 |
+|---|---|---|---|
+| 01:12 | 45,517 | 52,401 | −6,884 |
+| 01:13 | 45,541 | 52,425 | −6,884 |
+| 01:14 | 45,564 | 52,448 | −6,884 |
+| 01:16 | 45,673 | 52,557 | −6,884 |
+| 01:17 | 45,738 | 52,622 | −6,884 |
+| 01:18 | 45,774 | 52,658 | −6,884 |
+| 01:21 | 45,492 | 52,376 | −6,884 |
+| 01:23 | 45,520 | 52,404 | −6,884 |
+
+兩個側面**每次都同步移動 1:1**，中間 01:20→01:22 一次 prune 兩邊**同時**掉 −282。
+即係差距**唔係擴大，係凍結** —— 呢個推翻咗之前「6,884 並且擴大」嘅講法。
+
+### 二、成因：三條 INSERT 之中唯一一條冇 bump
+
+`token_stats` 嘅寫入者只有三個地方（`db.ts` 兩個 ＋ `/debug/backfill` 一個），全部都用 `rowsAffected` bump。
+第四條路係 **`scripts/backfill-pumpfun.mjs`**（手動喺住宅 IP 跑嘅一次性 backfill）：佢 `INSERT OR IGNORE` 完**完全冇碰** `worker_state.telemetry_token_stats_count`。
+於是那些行**從來冇被計**；而當佢們老化過 prune 界（`poolNow − RE_EVAL_WINDOW_MS`）被刪時，`pruneOldTokenStats` 照樣 `−deleted` ⇒ 淨額 −6,884，一次過、永久。
+
+**唯一會自我修復嘅係負數**：`readTelemetryCounter` 只在 `cached === null || cached < 0` 時才做 live `COUNT(*)` 並重新落種。
+即係「計數器高於實情」永遠冇修復路徑 —— 啱好就係今次嘅形狀。
+
+**同一類嘅鄰居**：`Db.removeChat` 刪 `seen_tokens` 時**唔減**計數器 ⇒ `pushedTotal` 727 對 `/debug/pushes` 721（計數器**高** 6），一樣凍結。
+
+### 三、修咗三件（`(a)`＋`(b)`＋`(c)`）
+
+| | 改動 | 為什麼 |
+|---|---|---|
+| **(a)** | `scripts/backfill-pumpfun.mjs` 喺批次插入之後補一個 `INSERT … ON CONFLICT DO UPDATE SET value = CAST(value AS INTEGER) + excluded.value`（同 `Db.bumpTelemetryCounter` 逐字一樣），`inserted = 0` 就唔發；失敗只 warn | 填返源頭，令之後嘅 prune 減得有對象 |
+| **(b)** | 新增 `Db.reconcileTelemetryCounts(now)` ＋ `TELEMETRY_RECONCILE_INTERVAL_MS = 60 分鐘`／`TELEMETRY_RECONCILE_AT_KEY`，由 `Scanner.runMaintenanceJobs` 做**第一條腿** | 計數器係增量維護、又只有負數會自愈 ⇒ 一定要有一條「由 live `COUNT(*)` 重新落種」嘅路；佢順手封埋 `seen_tokens` 嗰邊 |
+| **(c)** | `test-unit.js` 新增 source-shape 不變式：任何 `src/*.ts`（`db.ts` 除外）或 `scripts/*.mjs` 只要 INSERT／DELETE `token_stats`／`seen_tokens`，就**必須**喺同一個寫入 40 行內**喺程式碼度**（註解會被剝走）點名佢嗰個計數器 | 呢個 bug 係「一個寫入者忘記自己屬於邊個計數器」，唔係「某一句 SQL 寫錯」 |
+
+`(b)` 嘅內部：**當其時**（一小時一次）＝ 1 次單行讀（閘）＋ 1 個 read batch（兩個 `COUNT(*)`）＋ 1 個 write batch（兩個計數器 ＋ 閘嘅印記）；**唔當其時**＝ 1 次單行讀。
+刻意**唔**用 `countTokenStats()`／`countSeenTokens()` —— 嗰兩個喺 `>= 0` 時會回緩存值，啱好就係要重算嘅嘢。
+
+### 四、成本
+
+| | 每 5 分鐘嘅維護 pass | 每日 |
+|---|---|---|
+| 唔當其時（11/12） | 1 次單行讀 | 264 |
+| 當其時（1/12） | ＋1 read batch ＋1 write batch（兩個 ~50K 行表嘅 `COUNT(*)`） | ＋24 ＋24 |
+
+即每日多 ~312 個請求，對比 tick 本身每分鐘 ~21 個（≈30K/日）係 ~1%；
+而個 `COUNT(*)` 落喺一個**冇人等**、預算 6s 嘅 invocation 度，唔會咬 tick 嘅 50-subrequest 額。
+
+### 五、驗收（deploy 後）
+
+```bash
+curl -s .../health | jq .tokenStatsCount      # 應該跳到 ~52,4xx
+curl -s .../debug/pool | jq .total            # 唔變，兩者應該幾乎相等
+```
+
+Deploy 之後**頭 5 分鐘內**就會有第一個 maintenance pass（冇印記 ⇒ 即刻 due），所以呢個驗收係 5 分鐘級、唔係一小時級。
+之後每一小時跟一次，離差**只會**係「上次重算之後、一條新嘅忘記 bump 嘅路徑所寫嘅行」——正常情況下係 0。
+
+單元測試：`test-unit.js` 436 → **439 passed, 0 failed**（新增三條：reconcile 行為（due／唔 due／重算是覆寫而非累加）＋ counter pairing 不變式 ＋ scanner wiring）；其餘 suite 全部不變、全綠。
+
+### 六、界線（老實講）
+
+- **未 deploy**：三個改動都只係喺 repo 度，prod 讀數要 deploy 之後才會動。
+- **重算唔係原子**：`COUNT(*)` 同寫入之間落嘅 bump 會被覆蓋（最多一個 tick 嘅行數）。呢個係刻意嘅取捨 —— 重算是**重新導出**而唔係累加，所以誤差唔會複合；下一小時又校正一次。
+- **重算救唔到 repo 以外嘅寫入者**：人手喺 Turso CLI 打嘅 SQL、或者另一個 repo 嘅腳本，`(c)` 嗰條測試睇唔到。一小時後會被重算抹平，但「成因」係冇紀錄嘅。
+- **`(a)` 嘅 bump 有機會失敗**（住宅 IP 跑、Turso 502 等）：只 warn，唔會影響已入庫嘅行；離差上限就係一個鐘。
+- **`(b)` 只喺 maintenance pass 度跑**：如果個 maintenance cron 完全唔投遞，tick 會用 fallback 重跑 backfill／crime 兩條腿，但**唔會**重算計數器（今次冇把佢加入 fallback，避免喺 tick 嘅預算入面加兩個全表掃描）。
+- **`pushedTotal` 高 6 嗰單**係同一次重算封埋嘅（兩個計數器一齊重算），但 `removeChat` 嘅**根源**仍然存在：佢刪行時唔減計數器 —— 只係而家有一個鐘一次嘅地板兜住。要真正修好就要喺 `removeChat` 度用同一招 `changes()`（今次冇做）。
+- **同 `LIST_FEED_CACHE_TTL_S = 60`、pair 批次 edge cache 等項目無關**，今次冇碰任何 feed 腿。

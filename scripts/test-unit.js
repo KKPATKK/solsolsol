@@ -9,7 +9,7 @@ const { createClient } = require("@libsql/client");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS, poolRotationSlot, SEEN_TOKENS_COUNT_KEY } = require("../dist/db.js");
+const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS, poolRotationSlot, SEEN_TOKENS_COUNT_KEY, TOKEN_STATS_COUNT_KEY, TELEMETRY_RECONCILE_INTERVAL_MS, TELEMETRY_RECONCILE_AT_KEY } = require("../dist/db.js");
 const { DB_LATENCY_PROBE_KEY, DB_LATENCY_PROBE_COUNT_KEY, DB_LATENCY_SAMPLES, DB_LATENCY_SAMPLES_MAX, DB_LATENCY_OPS, clampLatencySamples, summarizeLatency, summarizeLatencyOps, claimShapeSavingMs, dbRegionFromUrl, changesVerdict, DB_LATENCY_EXPECTED_COUNTER_PER_SAMPLE } = require("../dist/dblatency.js");
 const { parseFilterArgs, tradeKeyboard } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("../dist/config.js");
@@ -17694,6 +17694,189 @@ async function main() {
       `an unproven card is re-sent: ${JSON.stringify(sent)}`,
     );
     assert.equal(ringReads, 0, "…and the ring is still not read again");
+  });
+
+  // ---------- the telemetry counters (src/db.ts) ----------
+  //
+  // Both /health table counts are INCREMENTAL: every INSERT/DELETE bumps its
+  // counter by rowsAffected, which is exact only while every writer remembers.
+  // Measured 2026-09-30: /health `tokenStatsCount` read 45,517 while
+  // /debug/pool's live COUNT(*) read 52,401 — a frozen −6,884 across 8 paired
+  // samples over 11 minutes (both sides moving 1:1, with one −282 prune hitting
+  // both). One insert path (scripts/backfill-pumpfun.mjs) never bumped, so its
+  // rows were never counted while the prune that later deleted them still
+  // DECREMENTED the counter — and readTelemetryCounter only self-heals a
+  // NEGATIVE value, so a positive gap had no repair path at all.
+  //
+  // Two pins: the reconcile that re-derives both counts from a live COUNT(*)
+  // once an hour, and the invariant that a writer of either table names the
+  // counter its rows belong to.
+  await test("db: reconcileTelemetryCounts re-derives both cached counters from live COUNT(*)s, hourly", async () => {
+    const t = tmpDb();
+    const now = Date.now();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // Rows written the way the buggy script wrote them: straight SQL, no bump.
+      for (const token of ["REC-A", "REC-B"]) {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms) VALUES (?, ?, 0, 0, ?)",
+          args: [token, now, now],
+        });
+      }
+      await t.client.execute({
+        sql: "INSERT INTO seen_tokens (chat_id, token, first_seen_at) VALUES ('c', 'REC-A', ?)",
+        args: [now],
+      });
+      // The drifted state, in BOTH directions: token_stats BELOW its table (the
+      // production gap) and seen_tokens ABOVE it (removeChat's un-decremented
+      // delete). Both are usable (>= 0), so countTokenStats/countSeenTokens
+      // serve them as-is — exactly the reading that must not come back.
+      await db.setWorkerState(TOKEN_STATS_COUNT_KEY, "0");
+      await db.setWorkerState(SEEN_TOKENS_COUNT_KEY, "9");
+      assert.equal(await db.countTokenStats(), 0, "the drifted counter is what /health served");
+      const calls = { exec: 0, reads: 0, writes: 0 };
+      const counting = {
+        execute: (a) => { calls.exec += 1; return t.client.execute(a); },
+        batch: (a, m) => {
+          if (m === "read") calls.reads += 1;
+          else calls.writes += 1;
+          return t.client.batch(a, m);
+        },
+        close: () => t.client.close(),
+      };
+      const fdb = new Db(t.p, undefined, counting);
+      await fdb.init();
+      calls.exec = 0;
+      calls.reads = 0;
+      calls.writes = 0;
+      // (a) Due (no stamp row yet): one gate read, one read batch, one write.
+      assert.deepEqual(
+        await fdb.reconcileTelemetryCounts(now),
+        { tokens: 2, seen: 1 },
+        "the live COUNT(*)s are the truth",
+      );
+      assert.deepEqual(
+        calls,
+        { exec: 1, reads: 1, writes: 1 },
+        "a due reconcile is exactly three requests",
+      );
+      assert.equal(await fdb.getWorkerState(TOKEN_STATS_COUNT_KEY), "2");
+      assert.equal(await fdb.getWorkerState(SEEN_TOKENS_COUNT_KEY), "1");
+      assert.equal(
+        await fdb.getWorkerState(TELEMETRY_RECONCILE_AT_KEY),
+        String(now),
+        "the stamp is written with the counts, in the same batch",
+      );
+      // (b) Not due: the gate row alone, no table scan at all. The counters
+      // above were asserted through their own reads, so the count restarts
+      // here — what is measured is the reconcile's OWN requests.
+      calls.exec = 0;
+      calls.reads = 0;
+      calls.writes = 0;
+      assert.equal(await fdb.reconcileTelemetryCounts(now + 1000), null, "the hour gate holds");
+      assert.deepEqual(
+        calls,
+        { exec: 1, reads: 0, writes: 0 },
+        "a pass that is not due pays one row read and nothing else",
+      );
+      // (c) Due again, and it OVERWRITES rather than adds: an incremental bump
+      // that landed since is replaced by the live count (bounded by one tick of
+      // rows, and re-derived — never compounded — by the next reconcile).
+      await fdb.bumpTelemetryCounter(TOKEN_STATS_COUNT_KEY, 5);
+      assert.equal(Number(await fdb.getWorkerState(TOKEN_STATS_COUNT_KEY)), 7, "the bump landed");
+      const later = now + TELEMETRY_RECONCILE_INTERVAL_MS + 1;
+      assert.deepEqual(
+        await fdb.reconcileTelemetryCounts(later),
+        { tokens: 2, seen: 1 },
+        "the second reconcile re-derives, it does not accumulate the bump",
+      );
+      assert.equal(await fdb.getWorkerState(TOKEN_STATS_COUNT_KEY), "2");
+      assert.equal(await fdb.getWorkerState(TELEMETRY_RECONCILE_AT_KEY), String(later));
+      // ...and what /health serves after it is the live reading, both sides.
+      assert.equal(await fdb.countTokenStats(), 2);
+      assert.equal(await fdb.countSeenTokens(), 1);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("counter pairing: every writer of token_stats/seen_tokens outside src/db.ts names its counter", () => {
+    const ROOT = path.join(__dirname, "..");
+    // The counter each table's rows belong to (src/db.ts).
+    const TABLES = {
+      token_stats: TOKEN_STATS_COUNT_KEY,
+      seen_tokens: SEEN_TOKENS_COUNT_KEY,
+    };
+    // What may write these tables: the Worker sources (src/db.ts is the
+    // canonical home and IS the pairing — its four writers each bump, so
+    // re-asserting their bodies here would only restate them) and the
+    // operational scripts (the `.mjs` ones; the `test-*.js` files build
+    // fixtures in a throwaway local SQLite and are not production writers).
+    const files = [
+      ...fs
+        .readdirSync(path.join(ROOT, "src"))
+        .filter((f) => f.endsWith(".ts") && f !== "db.ts")
+        .map((f) => `src/${f}`),
+      ...fs
+        .readdirSync(path.join(ROOT, "scripts"))
+        .filter((f) => f.endsWith(".mjs"))
+        .map((f) => `scripts/${f}`),
+    ];
+    assert.ok(files.length > 20, `the scan must cover the sources (got ${files.length})`);
+    // Comments are stripped so the pairing has to be CODE: the fix for the
+    // 2026-09-30 gap names the counter in a comment a few lines above its bump,
+    // and a comment must never be able to satisfy this check.
+    const stripComments = (text) =>
+      text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    const writes = [];
+    const missing = [];
+    for (const rel of files) {
+      const lines = stripComments(
+        fs.readFileSync(path.join(ROOT, rel), "utf8"),
+      ).split("\n");
+      for (const [table, counter] of Object.entries(TABLES)) {
+        // Every statement shape that adds or removes rows.
+        const re = new RegExp(
+          `\\b(?:INSERT(?:\\s+OR\\s+\\w+)?|REPLACE)\\s+INTO\\s+${table}\\b|\\bDELETE\\s+FROM\\s+${table}\\b`,
+          "i",
+        );
+        lines.forEach((line, i) => {
+          if (!re.test(line)) return;
+          writes.push(`${rel}:${i + 1} ${table}`);
+          // The bump may sit a few statements after the write (a batch loop
+          // inserts, then ONE bump pays for the whole batch's rowsAffected),
+          // never far: 40 lines is the insert block plus its log line.
+          const window = lines.slice(i, i + 40).join("\n");
+          if (!window.includes(counter)) {
+            missing.push(`${rel}:${i + 1} writes ${table} without naming ${counter} nearby`);
+          }
+        });
+      }
+    }
+    assert.deepEqual(missing, [], missing.join("; "));
+    // The scan is worthless if it found nothing: it must find the operational
+    // pump.fun backfill — the writer that caused the gap.
+    assert.ok(
+      writes.some((w) => w.startsWith("scripts/backfill-pumpfun.mjs:")),
+      `the scan must find the backfill's token_stats writer, got ${JSON.stringify(writes)}`,
+    );
+  });
+
+  await test("scanner: the maintenance pass owns the reconcile, and nothing else calls it", () => {
+    const scannerSrc = fs.readFileSync(
+      path.join(__dirname, "..", "src", "scanner.ts"),
+      "utf8",
+    );
+    const calls = scannerSrc.split("reconcileTelemetryCounts(").length - 1;
+    assert.equal(calls, 1, "exactly one call site — the reconcile is not a tick leg");
+    const passAt = scannerSrc.indexOf("async runMaintenanceJobs(");
+    const callAt = scannerSrc.indexOf("reconcileTelemetryCounts(");
+    assert.ok(passAt > 0 && callAt > passAt, "and it is inside runMaintenanceJobs");
+    // It runs BEFORE the Birdeye walk (see the ordering note there): the
+    // cheapest leg must never be the one a pass runs out of budget on.
+    const backfillAt = scannerSrc.indexOf("runPeriodicBackfill()", callAt);
+    assert.ok(backfillAt > callAt, "the reconcile is the pass's first leg");
   });
 
   // ---------- fetch routing (src/worker.ts) ----------

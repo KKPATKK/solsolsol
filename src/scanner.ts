@@ -2973,9 +2973,18 @@ export class Scanner {
    * equivalent — except that running them HERE stops the tick paying their wall
    * clock inside a front phase that the gates and the push need.
    *
-   * Both legs keep their own interval gates, which is what makes moving them
-   * safe: this method is called every 5 minutes and almost always does nothing
-   * at all (the backfill is hourly, the crime TTL is longer). It still stamps —
+   * THE THIRD LEG IS NOT A MOVE (2026-09-30): the telemetry-count reconcile
+   * (Db.reconcileTelemetryCounts) was never a tick leg at all — it is new here
+   * because this invocation is the only one in the fleet whose clock is coarser
+   * than the tick and which nobody waits on, and because it is the only place a
+   * full-table COUNT(*) can be paid without spending the tick's subrequests.
+   * Its hour-long gate rides the same row discipline as the two above, and its
+   * failure mode (a logged warning, no throw) matches theirs.
+   *
+   * All three legs keep their own interval gates, which is what makes moving
+   * them safe: this method is called every 5 minutes and almost always does
+   * nothing at all (the backfill is hourly, the crime TTL is longer, the
+   * reconcile is hourly). It still stamps —
    * a no-op pass is exactly the reading `maintFresh` needs, and a stamp only
    * on the passes that did work would make a healthy fleet look dead.
    *
@@ -2990,7 +2999,28 @@ export class Scanner {
     const left = (): number => deadlineMs - Date.now();
     let backfill = 0;
     let crime = false;
-    // 1. Birdeye periodic backfill. Same shape the tick used: the interval gate
+    // 1. The telemetry-count reconcile. A pure side effect with no network
+    // cost (two COUNT(*)s and three worker_state rows) and its own hour-long
+    // gate, so on 11 passes out of 12 it is a single row read. It exists
+    // because the two /health table counters are maintained incrementally
+    // and only a NEGATIVE value self-heals, so a positive drift was permanent
+    // (measured: tokenStatsCount 6,884 under the live COUNT(*)); being an hour
+    // behind a drift of a few dozen rows is nothing next to never repairing a
+    // hole. FIRST because it is the cheapest leg here and a leg that yields
+    // its budget must never be the minute-long Birdeye walk: see
+    // Db.reconcileTelemetryCounts.
+    let telemetry: { tokens: number; seen: number } | null = null;
+    if (left() > 250) {
+      try {
+        telemetry = await this.db.reconcileTelemetryCounts(Date.now());
+      } catch (err) {
+        console.error(
+          "[scanner] maintenance telemetry reconcile failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    // 2. Birdeye periodic backfill. Same shape the tick used: the interval gate
     // rides the leg (runPeriodicBackfill), so this is a cheap no-op on almost
     // every pass. `fetchFeedCapped` converts a hung upstream into a 0 instead
     // of a wedged invocation, which matters more here than in the tick: nobody
@@ -3009,7 +3039,7 @@ export class Scanner {
         );
       }
     }
-    // 2. Crime-wallet blocklist. This is the leg that gains the most from
+    // 3. Crime-wallet blocklist. This is the leg that gains the most from
     // moving: the network fetch persists the parsed list, and every SCAN
     // isolate then hydrates that copy with one read instead of downloading
     // ~4.8K addresses (see CrimeWalletClient.hydrateFromPersisted). One pass
@@ -3040,7 +3070,11 @@ export class Scanner {
       return null;
     }
     console.log(
-      `[scanner] maintenance pass: backfill ${backfill} crime ${
+      `[scanner] maintenance pass: telemetry ${
+        telemetry === null
+          ? "not-due"
+          : `${telemetry.tokens} tokens / ${telemetry.seen} seen`
+      } backfill ${backfill} crime ${
         crime ? "ok" : "skipped"
       } ${Date.now() - startedAt}ms`,
     );

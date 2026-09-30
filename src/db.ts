@@ -27,6 +27,24 @@ import {
 export const SEEN_TOKENS_COUNT_KEY = "telemetry_seen_tokens_count";
 
 /**
+ * The other half of the pair above: the cached `token_stats` row count that
+ * /health publishes as `tokenStatsCount` (the re-eval pool's coverage). It is
+ * moved by `rowsAffected` on every insert (recordTokenStats,
+ * recordTokenStatsMany) and by the deleted count on every prune
+ * (pruneOldTokenStats).
+ *
+ * Named HERE (2026-09-30) because Db.reconcileTelemetryCounts writes both rows
+ * of the pair by name, and the pair's whole failure mode is one writer
+ * forgetting which row its rows belong to: scripts/backfill-pumpfun.mjs
+ * inserted token_stats rows without touching this counter, so those rows were
+ * never counted while the prune that later removed them still decremented it —
+ * a one-time hole (measured: /health 45,517 against the live 52,401) that no
+ * later incremental bump can close, because a counter can only add the rows it
+ * is told about.
+ */
+export const TOKEN_STATS_COUNT_KEY = "telemetry_token_stats_count";
+
+/**
  * The two statements that move the counter above, as SQL text.
  *
  * Constants because TWO callers must run them verbatim: the claim and release
@@ -117,6 +135,35 @@ export const SCAN_DB_TIMEOUT_MS = 1_200;
  * HTTP fallback) share one cadence.
  */
 const TOKEN_STATS_PRUNE_INTERVAL_MS = 10 * 60_000;
+
+/**
+ * Min gap between live re-derivations of the two cached table counters (see
+ * Db.reconcileTelemetryCounts), and the `worker_state` row holding the stamp.
+ *
+ * WHY A NET EXISTS AT ALL (measured 2026-09-30): both counters are maintained
+ * incrementally, and readTelemetryCounter only self-heals a NEGATIVE value, so
+ * any POSITIVE drift is permanent by construction. Production had exactly that:
+ * /health `tokenStatsCount` read 45,517 while /debug/pool's live COUNT(*) read
+ * 52,401 — a frozen −6,884 across 8 paired samples over 11 minutes, both sides
+ * moving 1:1 and a −282 prune hitting both. The cause was one insert path that
+ * never bumped (scripts/backfill-pumpfun.mjs, fixed in the same change); the
+ * gap itself needs a re-derivation, since no incremental bump can add rows it
+ * was never told about.
+ *
+ * WHY AN HOUR: the reconcile is two full COUNT(*) scans — precisely the cost
+ * the counters exist to avoid — so it must be rare, where the incremental bumps
+ * are per tick. An hour is also the coarsest unit that still repairs a drift
+ * minutes into the shift in which an operator reads the page, and the
+ * tick-level counters are unaffected: this is a floor under them, not their
+ * source.
+ *
+ * WHY THE MAINTENANCE PASS: it is the only invocation in the fleet with a
+ * clock coarser than the tick (every 5 minutes) and no user waiting on it — the
+ * same reason its other legs live there. See Scanner.runMaintenanceJobs.
+ */
+export const TELEMETRY_RECONCILE_INTERVAL_MS = 60 * 60_000;
+/** `worker_state` row: epoch (ms) of the last reconcile above. */
+export const TELEMETRY_RECONCILE_AT_KEY = "telemetry_reconcile_at";
 /**
  * How far behind the alert clock the RECONSTRUCTED completion stamp of a
  * terminal row sits (see Db.restampTerminalCompletion). One send slice — the
@@ -3126,9 +3173,90 @@ export class Db {
   /** Total rows in token_stats (telemetry for /health — pool coverage). */
   async countTokenStats(): Promise<number> {
     return this.readTelemetryCounter(
-      "telemetry_token_stats_count",
+      TOKEN_STATS_COUNT_KEY,
       "SELECT COUNT(*) AS n FROM token_stats",
     );
+  }
+
+  /**
+   * Re-derive BOTH cached table counters from live COUNT(*)s and re-seed their
+   * rows, at most once per TELEMETRY_RECONCILE_INTERVAL_MS. Returns the counts
+   * it wrote, or null when it was not due (or the live read failed).
+   *
+   * WHY A RE-DERIVATION AND NOT AN ADDITIVE REPAIR: the counters are maintained
+   * by incremental bumps, and readTelemetryCounter only self-heals a NEGATIVE
+   * value, so a positive gap (measured: tokenStatsCount 6,884 below the live
+   * COUNT(*) across 8 paired samples over 11 minutes — see
+   * TELEMETRY_RECONCILE_INTERVAL_MS) has no repair path at all. Every table write in this file bumps, so an ADD would
+   * have to know WHICH writer skipped its bump, and how much; a whole-table
+   * COUNT(*) does not have to know anything. That is why this exists once an
+   * hour rather than on the tick.
+   *
+   * NOT ATOMIC, on purpose and bounded: a bump landing between the COUNT(*) and
+   * the re-seed is lost (the row is overwritten, not added to), so the error is
+   * whatever one tick inserted in those few milliseconds — and it is
+   * re-derived, never compounded, by the next reconcile. The incremental path stays the fresh one; this is
+   * the drift floor under it.
+   *
+   * Also the ONLY path that repairs the seen_tokens side of the same bug: the
+   * counter is bumped by markTokenSeen/claimTokenPush, but Db.removeChat deletes
+   * a chat's rows without decrementing, so `pushedTotal` reads high after every
+   * /remove (measured: 727 against /debug/pushes' 721).
+   *
+   * Cost when due: one single-row read (the gate), then TWO requests — one read
+   * batch for both counts, one write batch for both re-seeds plus the stamp —
+   * which is what makes an hourly scan of two ~50K-row tables affordable. When
+   * not due (the 11/12 of passes either side of the hour): one single-row read.
+   */
+  async reconcileTelemetryCounts(
+    now: number,
+  ): Promise<{ tokens: number; seen: number } | null> {
+    let lastRaw: string | null = null;
+    try {
+      lastRaw = await this.getWorkerState(TELEMETRY_RECONCILE_AT_KEY);
+    } catch {
+      // A failed gate read is a pass that cannot prove it is due. Take the
+      // audit-due direction (run it): the cost is one scan per pass instead of
+      // one per hour, and a database that cannot answer even this is already
+      // being reported as unhealthy everywhere else.
+      lastRaw = null;
+    }
+    if (
+      lastRaw !== null &&
+      Number.isFinite(Number(lastRaw)) &&
+      now - Number(lastRaw) < TELEMETRY_RECONCILE_INTERVAL_MS
+    ) {
+      return null; // not due yet
+    }
+    let counts: { tokens: number; seen: number };
+    try {
+      const res = await this.get().batch(
+        [
+          { sql: "SELECT COUNT(*) AS n FROM token_stats", args: [] },
+          { sql: "SELECT COUNT(*) AS n FROM seen_tokens", args: [] },
+        ],
+        "read",
+      );
+      const count = (batchRes: typeof res, i: number): number =>
+        Number(
+          (batchRes[i]?.rows[0] as { n?: number | bigint } | undefined)?.n ?? 0,
+        );
+      counts = { tokens: count(res, 0), seen: count(res, 1) };
+    } catch (err) {
+      console.warn("[db] telemetry reconcile count failed:", err);
+      return null;
+    }
+    try {
+      await this.setWorkerStatesMany([
+        { key: TOKEN_STATS_COUNT_KEY, value: String(counts.tokens) },
+        { key: SEEN_TOKENS_COUNT_KEY, value: String(counts.seen) },
+        { key: TELEMETRY_RECONCILE_AT_KEY, value: String(now) },
+      ]);
+    } catch (err) {
+      console.warn("[db] telemetry reconcile write failed:", err);
+      return null;
+    }
+    return counts;
   }
 
   /**
