@@ -4657,6 +4657,17 @@ export class Scanner {
       // included): the front window is closed.
       this.stampPhase("pair");
       diag.pairs = pairsByToken.size;
+      // The `dex` block is refreshed a SECOND time here (see the front refresh
+      // above): the pair phase that just finished is the tick's last
+      // DexScreener wire, and the pair lane's edge-cache counters
+      // (pairCacheHits/Misses/Refused, see PAIR_BATCH_CACHE_TTL_S) are written
+      // during it — the front snapshot predates every one of them, so without
+      // this read the summary could only report the pair lane one tick late,
+      // and on an isolate recycled between ticks (the exact case the edge
+      // cache exists for) it would read 0 forever however well the cache was
+      // working. getStats() is a read of local state, so the refresh costs
+      // nothing.
+      diag.dex = this.dex.getStats();
       // Kept for the post-push tracker pass (see lastPairs).
       this.lastPairs = pairsByToken;
 

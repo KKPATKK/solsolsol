@@ -3626,6 +3626,9 @@ curl -s .../debug/pushes | jq .total          # 仍然相等
   —— 唔會借 edge cache 繞過 429 退避，因為 MISS 始終會去 origin。
 - **唔會撈亂 list 帳**：`getJson` 用 `dexFeedLeg(path)` 分 lane（同 drop 計數用同一個 mapping），pair 嘅 outcome 只入 instance counters，
   list ledger 一個數都唔會動；反方向亦然。
+- **`dex` 區塊喺 pair phase 之後再刷新一次**（`scanner.ts`，跟喺 `diag.pairs = pairsByToken.size` 之後）：tick summary 嘅 `dex`
+  本來喺 front read 之後就截數，當時 pair phase 未跑 —— 唔加呢一次讀，pair 三個計數器只可以下一個 tick 才見到，
+  而 isolate 中途被回收（正是 edge cache 存在嘅理由）就永遠讀 0，同 list feed 當年「讀 0 但其實有做嘢」係同一個陷阱。
 
 ### 三、測試（main suite 440 → **441 passed, 0 failed**；其餘 7 個 suite 全綠）
 
@@ -3645,8 +3648,10 @@ curl -s .../health | jq '.heartbeat.summary.dex | {pairCacheHits, pairCacheMisse
 
 讀法：**`pairCacheHits` 上升**而 `pairCacheMisses` 只佔少數 ⇒ origin 真係被慳返；
 `pairCacheRefused > 0` 代表嗰批 request 去到 origin 被 429（同 cache 無關，睇 `http429`／`blockedForMs`）。
-因為 counters 係 instance state，讀數要喺**跑咗 scan 嗰個 tick 嘅 summary**（`/health.heartbeat.summary` 就係嗰個）度睇，
-唔係去撞一個新鮮 isolate 嘅 `/health` 頂層。
+Counters 係 instance state，但 summary 喺 pair phase 之後已經刷新過一次，所以**跑咗 scan 嗰個 tick 嘅 summary**
+（`/health.heartbeat.summary`）就係當個 tick 嘅讀數，唔使等下一個 tick、亦唔使去撞新鮮 isolate 嘅 `/health` 頂層。
+另外：`blockedForMs > 0` 嘅 tick（任何 feed 腿 429 引發嘅 90 秒退避）pair phase 根本唔會 dispatch，
+三個數停留 0 係預期、唔係 cache 冇效 —— 呢個時候 `pairs` 交畀 Jupiter fallback 頂住。
 
 ### 五、界線（老實講）
 

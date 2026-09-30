@@ -4023,6 +4023,20 @@ async function main() {
     } finally {
       globalThis.fetch = origFetch;
     }
+
+    // (e) The tick summary refreshes the `dex` block AFTER the pair phase. The
+    // front snapshot predates the pair fetch, so without this second read an
+    // isolate that is recycled between ticks — the exact case the edge cache
+    // exists for — would report the pair lane as 0 forever.
+    const flatScanner = fs
+      .readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8")
+      .replace(/\s+/g, "");
+    const pairPhaseAt = flatScanner.indexOf("diag.pairs=pairsByToken.size;");
+    assert.ok(pairPhaseAt > 0, "the pair-phase anchor must exist");
+    assert.ok(
+      flatScanner.indexOf("diag.dex=this.dex.getStats();", pairPhaseAt) > pairPhaseAt,
+      "the summary's dex block is refreshed right after the pair phase",
+    );
   });
 
   await test("AdaptiveSpacing: a refusal widens the dispatch spacing, a healthy streak walks it back", () => {
@@ -4328,10 +4342,22 @@ async function main() {
     // `spacingFleetSteps 3` beside `intervalMs 250 / spacingSteps 0`).
     const refresh = scannerSrc.indexOf("diag.dex = this.dex.getStats();");
     assert.ok(refresh > adopt, "the dex block must be refreshed after the adoption");
+    // TWO refresh sites since 2026-09-30, and the second one is load-bearing for
+    // a DIFFERENT reader: the pair lane's edge-cache counters
+    // (pairCacheHits/Misses/Refused) are written during the pair phase, which runs
+    // after this front snapshot, so the summary needs a read after it — without
+    // one a tick's own pair outcome is only visible one tick later, and never on
+    // an isolate recycled between ticks. The pair lane's own test pins that
+    // second site's POSITION (right after the pair phase).
     assert.equal(
       (scannerSrc.match(/diag\.dex = this\.dex\.getStats\(\)/g) || []).length,
-      1,
-      "exactly one refresh site",
+      2,
+      "exactly two refresh sites: the front one and the pair-phase one",
+    );
+    assert.ok(
+      scannerSrc.lastIndexOf("diag.dex = this.dex.getStats();") >
+        scannerSrc.indexOf("diag.pairs = pairsByToken.size;"),
+      "and the second refresh follows the pair phase",
     );
     // One writer only: a second write site would be a second round trip on a
     // tick that already has one, and the two could disagree.
