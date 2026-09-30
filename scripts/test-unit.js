@@ -17696,6 +17696,97 @@ async function main() {
     assert.equal(ringReads, 0, "…and the ring is still not read again");
   });
 
+  // ---------- fetch routing (src/worker.ts) ----------
+  //
+  // The request handler ends in a Telegram-webhook fallback that is handed
+  // every request the router did not claim, and grammY's cloudflare-mod
+  // adapter throws on anything that is not a POST. Before the POST gate,
+  // therefore, every unrouted GET — `/` itself included — came back as a
+  // Cloudflare 1101 ("Worker threw a JavaScript exception"), which reads
+  // exactly like the Worker crashing, and the 200 banner on the line below the
+  // webhook call had never answered a GET in production.
+  //
+  // The bot token is what makes the webhook branch EXIST (it stays null
+  // without one), and with it configured a GET that resolves is proof the
+  // request never reached the adapter. Deliberately no POST probe here: grammY
+  // initialises on the first POST (getMe) and a fake token 401s, so observing
+  // the adapter needs a live bot — the wiring test below covers that half.
+  //
+  // These are the only two tests that touch `fetch`, and they are last on
+  // purpose: the module boots once, on the first call, and keeps the env it
+  // booted with (module-level `cfg`/`webhook`).
+  await test("fetch routing: an unrouted path answers instead of throwing in the webhook adapter", async () => {
+    const worker = require("../dist/worker.js").default;
+    const env = { TELEGRAM_BOT_TOKEN: "123456:AAHfakeTokenForTests" };
+    const ctx = { waitUntil: (p) => { if (p && p.catch) p.catch(() => {}); } };
+    const get = async (p) => {
+      const res = await worker.fetch(
+        new Request(`https://worker.example${p}`),
+        env,
+        ctx,
+      );
+      return { status: res.status, body: await res.text() };
+    };
+    const UNKNOWN = "unknown debug endpoint";
+
+    // (a) The unrouted /debug namespace, bare /debug included, says so — and a
+    // probe this repo deleted reads as gone rather than as a fault. Every one
+    // of these was a 1101 before the gate, and the `await` is itself the
+    // assertion: a rejected promise fails here exactly the way production
+    // failed.
+    for (const p of ["/debug", "/debug/", "/debug/nope-not-here", "/debug/axiom-tokens"]) {
+      const r = await get(p);
+      assert.equal(r.status, 404, `${p} must be a 404, not a thrown webhook`);
+      assert.ok(r.body.includes(UNKNOWN), `${p} must name the cause: ${r.body}`);
+    }
+
+    // (b) The banner is reachable now. /webhook is included because a GET there
+    // is not Telegram, and must not be handed to the adapter.
+    for (const p of ["/", "/favicon.ico", "/webhook"]) {
+      const r = await get(p);
+      assert.equal(r.status, 200, `${p} must answer the banner instead of throwing`);
+      assert.equal(r.body, "Solana Meme Coin Scanner worker");
+    }
+
+    // (c) The 404 rule sits after every real route, so it cannot shadow one.
+    for (const p of ["/health", "/debug/pool"]) {
+      const r = await get(p);
+      assert.equal(r.status, 200, `${p} is a real route and must still answer`);
+      assert.ok(!r.body.includes(UNKNOWN), `${p} must not be answered by the 404 rule`);
+    }
+  });
+
+  await test("fetch routing: the webhook call is POST-only, and sits after the /debug routes", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "src", "worker.ts"),
+      "utf8",
+    );
+
+    // Exactly one call site, and it is method-gated. Telegram only ever POSTs,
+    // so the bot is untouched by this gate, while every other method stops
+    // reaching grammY and throwing there. A second, ungated call would put
+    // every unrouted GET back on the 1101 path.
+    const sites = src.match(/if \(webhook[^\n]*\)/g) ?? [];
+    assert.deepEqual(
+      sites,
+      ['if (webhook && request.method === "POST")'],
+      "the webhook call must be POST-gated at its only call site",
+    );
+
+    // And the 404 rule must stay BELOW every route: moving it up silently
+    // shadows the debug endpoints an operator reads.
+    const ruleAt = src.indexOf(
+      'if (url.pathname === "/debug" || url.pathname.startsWith("/debug/"))',
+    );
+    assert.ok(ruleAt > 0, "the unrouted-/debug rule must exist");
+    const lastRouteAt = src.lastIndexOf('url.pathname === "/debug/');
+    assert.ok(lastRouteAt > 0, "the /debug routes must still be there");
+    assert.ok(
+      ruleAt > lastRouteAt,
+      "the 404 rule must sit AFTER every /debug route, or it shadows them",
+    );
+  });
+
   console.log("\n===== UNIT TESTS =====");
   for (const line of results) console.log(line);
   console.log(`\n  ${passed} passed, ${failed} failed`);
