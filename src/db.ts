@@ -47,15 +47,18 @@ export const TOKEN_STATS_COUNT_KEY = "telemetry_token_stats_count";
 /**
  * The two statements that move the counter above, as SQL text.
  *
- * Constants because TWO callers must run them verbatim: the claim and release
- * paths (one batch each) and the /debug/db-latency probe, whose whole job is
- * to prove that a statement following an INSERT inside a batch sees THAT
- * insert's row count (`changes()`). Inlining either copy would let the probe
- * keep passing while the claim it describes drifted away from it.
+ * Constants because every caller must run them verbatim: the claim and release
+ * paths (claimTokenPush / unclaimTokenPush), removeChat's /debug/chats batch,
+ * and the /debug/db-latency probe, whose whole job is to prove that a statement
+ * following an INSERT inside a batch sees THAT insert's row count
+ * (`changes()`). Inlining any copy would let the probe keep passing while the
+ * claim it describes drifted away from it.
  *
  * `changes()` is the delta because a batch cannot branch in TypeScript before
- * it is sent: 1 when the row before it landed, 0 when INSERT OR IGNORE skipped
- * it — see claimTokenPush.
+ * it is sent: the row count of the statement just before it — 1 when the
+ * INSERT landed, 0 when INSERT OR IGNORE skipped it (see claimTokenPush), and
+ * the deleted count when that statement is a DELETE (unclaimTokenPush,
+ * removeChat).
  */
 const CLAIM_COUNTER_UPSERT_SQL = `INSERT INTO worker_state (key, value) VALUES (?, changes())
       ON CONFLICT(key) DO UPDATE SET
@@ -2815,17 +2818,36 @@ export class Db {
     return res.rows.map((row) => this.mapRow(row));
   }
 
-  /** Remove a chat entirely (settings + seen history). Returns whether it existed. */
+  /**
+   * Remove a chat entirely (settings + seen history). Returns whether it
+   * existed.
+   *
+   * ONE BATCH, THREE STATEMENTS (2026-09-30): the seen_tokens delete used to
+   * land on its own, without moving the counter /health publishes as
+   * `pushedTotal` — so every chat removal left that counter high by the chat's
+   * row count (measured: 727 against /debug/pushes' 721; the only caller is
+   * the /debug/chats?chatId=... DELETE). The release statement is
+   * unclaimTokenPush's own constant: `changes()` is the DELETE's row count, so
+   * the counter subtracts exactly the rows this batch removed. Riding one
+   * batch also means a failed request can never ship half a removal (rows
+   * deleted, counter unmoved) — the two travel together or not at all.
+   */
   async removeChat(chatId: string): Promise<boolean> {
-    const res = await this.get().execute({
-      sql: "DELETE FROM chat_settings WHERE chat_id = ?",
-      args: [chatId],
-    });
-    await this.get().execute({
-      sql: "DELETE FROM seen_tokens WHERE chat_id = ?",
-      args: [chatId],
-    });
-    return Number(res.rowsAffected ?? 0) > 0;
+    const res = await this.get().batch(
+      [
+        {
+          sql: "DELETE FROM chat_settings WHERE chat_id = ?",
+          args: [chatId],
+        },
+        {
+          sql: "DELETE FROM seen_tokens WHERE chat_id = ?",
+          args: [chatId],
+        },
+        { sql: CLAIM_COUNTER_RELEASE_SQL, args: [SEEN_TOKENS_COUNT_KEY] },
+      ],
+      "write",
+    );
+    return Number(res[0]?.rowsAffected ?? 0) > 0;
   }
 
   async isTokenSeen(chatId: string, token: string): Promise<boolean> {
@@ -3198,10 +3220,14 @@ export class Db {
    * re-derived, never compounded, by the next reconcile. The incremental path stays the fresh one; this is
    * the drift floor under it.
    *
-   * Also the ONLY path that repairs the seen_tokens side of the same bug: the
-   * counter is bumped by markTokenSeen/claimTokenPush, but Db.removeChat deletes
-   * a chat's rows without decrementing, so `pushedTotal` reads high after every
-   * /remove (measured: 727 against /debug/pushes' 721).
+   * Also what repaired the seen_tokens side of the same bug in production: the
+   * counter is bumped by markTokenSeen/claimTokenPush, and Db.removeChat used to
+   * delete a chat's rows without decrementing, so `pushedTotal` read high after
+   * every chat removal (measured before this shipped: 727 against
+   * /debug/pushes' 721). That writer is fixed as of 2026-09-30 — its DELETE
+   * rides one batch
+   * with the release statement (see removeChat) — and this reconcile remains
+   * the floor under both counters.
    *
    * Cost when due: one single-row read (the gate), then TWO requests — one read
    * batch for both counts, one write batch for both re-seeds plus the stamp —

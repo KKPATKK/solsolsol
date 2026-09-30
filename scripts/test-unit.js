@@ -17729,9 +17729,11 @@ async function main() {
         args: [now],
       });
       // The drifted state, in BOTH directions: token_stats BELOW its table (the
-      // production gap) and seen_tokens ABOVE it (removeChat's un-decremented
-      // delete). Both are usable (>= 0), so countTokenStats/countSeenTokens
-      // serve them as-is — exactly the reading that must not come back.
+      // production gap) and seen_tokens ABOVE it (the chat-removal leak, since fixed
+      // at the writer by removeChat's own batch — seeded here because an
+      // OVER-count has no repair path other than this reconcile). Both are
+      // usable (>= 0), so countTokenStats/countSeenTokens serve them as-is —
+      // exactly the reading that must not come back.
       await db.setWorkerState(TOKEN_STATS_COUNT_KEY, "0");
       await db.setWorkerState(SEEN_TOKENS_COUNT_KEY, "9");
       assert.equal(await db.countTokenStats(), 0, "the drifted counter is what /health served");
@@ -17801,22 +17803,97 @@ async function main() {
     }
   });
 
-  await test("counter pairing: every writer of token_stats/seen_tokens outside src/db.ts names its counter", () => {
+  // The /debug/chats?chatId=... DELETE — removeChat's only caller, and the
+  // only way a chat's seen history is ever dropped — used to remove those rows
+  // with a bare DELETE: the counter /health publishes as `pushedTotal` never
+  // moved, so every removal left it high by that chat's row count — measured
+  // before the hourly reconcile shipped: 727 against /debug/pushes' 721. The
+  // rows and the counter now ride ONE batch, the
+  // release statement subtracting the DELETE's own row count (`changes()`, the
+  // statement unclaimTokenPush already runs), so no window exists where a
+  // removal has landed but its counter has not.
+  await test("db: removeChat subtracts its chat's rows from the seen counter, in the same batch", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // The "existed" signal removeChat returns is the SETTINGS row, so both
+      // chats are registered first (a chat that only ever pushed looks
+      // absent). Three rows for the doomed chat, one for a survivor — through
+      // the production claim path, so the counter is the pair's live count
+      // first.
+      for (const chat of ["c1", "c2"]) {
+        await db.saveChatSettings({ ...DEFAULT_SETTINGS, chatId: chat });
+      }
+      for (const [chat, token] of [["c1", "T1"], ["c1", "T2"], ["c1", "T3"], ["c2", "T4"]]) {
+        assert.equal(await db.claimTokenPush(chat, token), true, `${chat}/${token} claims`);
+      }
+      assert.equal(await db.getWorkerState(SEEN_TOKENS_COUNT_KEY), "4", "four rows, four counted");
+      const calls = { exec: 0, readBatches: 0, writeBatches: 0 };
+      const counting = {
+        execute: (a) => { calls.exec += 1; return t.client.execute(a); },
+        batch: (a, m) => {
+          if (m === "read") calls.readBatches += 1;
+          else calls.writeBatches += 1;
+          return t.client.batch(a, m);
+        },
+        close: () => t.client.close(),
+      };
+      const fdb = new Db(t.p, undefined, counting);
+      await fdb.init();
+      calls.exec = 0;
+      calls.readBatches = 0;
+      calls.writeBatches = 0;
+      // (a) Both deletes and the counter, one request; the counter subtracts
+      // exactly the DELETE's 3 rows.
+      assert.equal(await fdb.removeChat("c1"), true, "a chat that existed reports removed");
+      assert.deepEqual(
+        calls,
+        { exec: 0, readBatches: 0, writeBatches: 1 },
+        "one write batch covers the settings, the rows and the counter",
+      );
+      assert.equal(
+        await fdb.getWorkerState(SEEN_TOKENS_COUNT_KEY),
+        "1",
+        "the counter subtracted exactly the 3 deleted rows",
+      );
+      const live = await t.client.execute("SELECT COUNT(*) AS n FROM seen_tokens");
+      assert.equal(Number(live.rows[0].n), 1, "and the table holds exactly the survivor");
+      assert.equal(await fdb.countSeenTokens(), 1, "which is what /health serves");
+      // (b) Removing the same chat again matches no row: changes() = 0, so the
+      // counter must not walk down for a removal that never happened.
+      assert.equal(await fdb.removeChat("c1"), false, "a chat that did not exist reports so");
+      assert.equal(await fdb.getWorkerState(SEEN_TOKENS_COUNT_KEY), "1", "and nothing moved");
+      // (c) A settings-only chat (imported, never pushed): the settings delete
+      // still wins, and its zero seen rows subtract zero.
+      await fdb.saveChatSettings({ ...DEFAULT_SETTINGS, chatId: "c3" });
+      assert.equal(await fdb.removeChat("c3"), true, "settings-only removal still reports removed");
+      assert.equal(await fdb.getWorkerState(SEEN_TOKENS_COUNT_KEY), "1", "an empty removal is a no-op for the counter");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("counter pairing: every writer of token_stats/seen_tokens, src/db.ts included, names its counter", () => {
     const ROOT = path.join(__dirname, "..");
-    // The counter each table's rows belong to (src/db.ts).
+    // The counter each table's rows belong to, in BOTH spellings a writer may
+    // use: the literal key it passes in SQL args / bump calls, and the exported
+    // constant db.ts moves it through. Either one is a writer saying which
+    // counter its rows belong to; neither is silence.
     const TABLES = {
-      token_stats: TOKEN_STATS_COUNT_KEY,
-      seen_tokens: SEEN_TOKENS_COUNT_KEY,
+      token_stats: [TOKEN_STATS_COUNT_KEY, "TOKEN_STATS_COUNT_KEY"],
+      seen_tokens: [SEEN_TOKENS_COUNT_KEY, "SEEN_TOKENS_COUNT_KEY"],
     };
-    // What may write these tables: the Worker sources (src/db.ts is the
-    // canonical home and IS the pairing — its four writers each bump, so
-    // re-asserting their bodies here would only restate them) and the
-    // operational scripts (the `.mjs` ones; the `test-*.js` files build
-    // fixtures in a throwaway local SQLite and are not production writers).
+    // What may write these tables: the Worker sources — src/db.ts INCLUDED (the
+    // old exemption is exactly what let removeChat delete seen_tokens rows with
+    // no counter in sight: the file is the counter's home, not a licence to
+    // skip it) — and the operational scripts (the `.mjs` ones; the `test-*.js`
+    // files build fixtures in a throwaway local SQLite and are not production
+    // writers).
     const files = [
       ...fs
         .readdirSync(path.join(ROOT, "src"))
-        .filter((f) => f.endsWith(".ts") && f !== "db.ts")
+        .filter((f) => f.endsWith(".ts"))
         .map((f) => `src/${f}`),
       ...fs
         .readdirSync(path.join(ROOT, "scripts"))
@@ -17835,7 +17912,7 @@ async function main() {
       const lines = stripComments(
         fs.readFileSync(path.join(ROOT, rel), "utf8"),
       ).split("\n");
-      for (const [table, counter] of Object.entries(TABLES)) {
+      for (const [table, names] of Object.entries(TABLES)) {
         // Every statement shape that adds or removes rows.
         const re = new RegExp(
           `\\b(?:INSERT(?:\\s+OR\\s+\\w+)?|REPLACE)\\s+INTO\\s+${table}\\b|\\bDELETE\\s+FROM\\s+${table}\\b`,
@@ -17848,18 +17925,23 @@ async function main() {
           // inserts, then ONE bump pays for the whole batch's rowsAffected),
           // never far: 40 lines is the insert block plus its log line.
           const window = lines.slice(i, i + 40).join("\n");
-          if (!window.includes(counter)) {
-            missing.push(`${rel}:${i + 1} writes ${table} without naming ${counter} nearby`);
+          if (!names.some((n) => window.includes(n))) {
+            missing.push(`${rel}:${i + 1} writes ${table} without naming ${names.join(" / ")} nearby`);
           }
         });
       }
     }
     assert.deepEqual(missing, [], missing.join("; "));
     // The scan is worthless if it found nothing: it must find the operational
-    // pump.fun backfill — the writer that caused the gap.
+    // pump.fun backfill — the writer that caused the gap — and it must now
+    // reach src/db.ts, whose writers the old exemption left unwatched.
     assert.ok(
       writes.some((w) => w.startsWith("scripts/backfill-pumpfun.mjs:")),
       `the scan must find the backfill's token_stats writer, got ${JSON.stringify(writes)}`,
+    );
+    assert.ok(
+      writes.some((w) => w.startsWith("src/db.ts:")),
+      `the scan must cover the counter's own home, got ${JSON.stringify(writes)}`,
     );
   });
 

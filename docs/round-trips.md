@@ -3522,4 +3522,68 @@ Deploy 之後**頭 5 分鐘內**就會有第一個 maintenance pass（冇印記 
 - **`(a)` 嘅 bump 有機會失敗**（住宅 IP 跑、Turso 502 等）：只 warn，唔會影響已入庫嘅行；離差上限就係一個鐘。
 - **`(b)` 只喺 maintenance pass 度跑**：如果個 maintenance cron 完全唔投遞，tick 會用 fallback 重跑 backfill／crime 兩條腿，但**唔會**重算計數器（今次冇把佢加入 fallback，避免喺 tick 嘅預算入面加兩個全表掃描）。
 - **`pushedTotal` 高 6 嗰單**係同一次重算封埋嘅（兩個計數器一齊重算），但 `removeChat` 嘅**根源**仍然存在：佢刪行時唔減計數器 —— 只係而家有一個鐘一次嘅地板兜住。要真正修好就要喺 `removeChat` 度用同一招 `changes()`（今次冇做）。
+
+→ **同日稍後已修**：`removeChat` 而家用同一招 `changes()`，同一個 batch 交數 —— 見 §4.51。
+
+## 4.51 Chat 刪除（`removeChat`）刪 `seen_tokens` 唔減計數器：修喺寫入者度，三句一個 batch（2026-09-30）
+
+### 一、問題（同 §4.50 量到嘅一致）
+
+`removeChat`（唯一 caller 係 `/debug/chats?chatId=...` 嘅 DELETE／POST）本來係兩次獨立 `execute`：
+
+```
+DELETE FROM chat_settings WHERE chat_id = ?
+DELETE FROM seen_tokens    WHERE chat_id = ?
+```
+
+第二句刪幾多行，`telemetry_seen_tokens_count` 都唔會動 ⇒ `/health.pushedTotal` 每做一次 chat 刪除就**高**該 chat 嘅行數。
+`readTelemetryCounter` 只自愈**負數**，所以呢個「高」係永久離差（§4.50 量到：727 對 `/debug/pushes` 721）。
+
+§4.50 部署後嘅實測（04:19–04:25Z）：deploy 後 24 秒計數器仲係漂移值（743），第一次 maintenance pass（~04:21Z）把兩個計數器重設成 live `COUNT(*)` ⇒ 743 → **737**，同 `/debug/pushes.total` 737 相等。
+即係嗰個 +6 係由重算抹平；今次嘅改動係**唔再產生新嘅 +N**。
+
+### 二、修法：同一個 batch ＋ `changes()`
+
+```sql
+DELETE FROM chat_settings WHERE chat_id = ?                   -- 1
+DELETE FROM seen_tokens    WHERE chat_id = ?                   -- 2
+INSERT INTO worker_state (key, value) VALUES (?, -changes())   -- 3
+  ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) - changes()
+```
+
+第 3 句就係 `CLAIM_COUNTER_RELEASE_SQL` —— `unclaimTokenPush` 本身用緊嗰條常量，唔係新寫一份「睇落一樣」嘅 SQL
+（常量嘅存在理由就係唔想有第二份睇落一樣嘅 SQL；今次順手把常量嘅註解由「TWO callers」改成「every caller」，因為佢而家有第三個使用者）。
+`changes()` 取**上一句**（即第 2 句 DELETE）嘅改動行數 ⇒ 減嘅永遠係真正刪咗幾多行，包括刪 0 行（重複刪、settings-only chat）就減 0。
+
+| | 舊 | 新 |
+|---|---|---|
+| round trips | 2（settings、seen 各一）| **1**（三句，一個 HTTP request）|
+| 離差窗口 | 兩句之間失敗 ⇒ 永久 +N | 冇：libsql batch 係一個 transaction（本機 client 送 `BEGIN…COMMIT`、失敗 `ROLLBACK`；Turso hrana 側用條件串連），三句要嘛都落、要嘛都唔落 |
+| 返回值 | `chat_settings` 嗰句嘅 `rowsAffected` | 一樣（`res[0].rowsAffected`），語義不變 |
+
+### 三、測試（440 passed, 0 failed；main suite 439 → 440）
+
+1. **新測試**「`db: removeChat subtracts its chat's rows from the seen counter, in the same batch`」：counting client 釘住 `{exec:0, reads:0, writes:1}`；counter 4 → 1（Δ = DELETE 嘅 3 行）；live `COUNT(*)` = 1；再刪同一 chat 返 `false` 而 counter 唔動（`changes()=0`）；settings-only chat 刪得成功、counter 一樣唔動。
+2. **pairing 掃描嘅豁免拆咗**：source-shape 不變式原本係「`src/*.ts`（**`db.ts` 除外**）＋ `scripts/*.mjs`」，理由寫住「db.ts 係計數器嘅家、佢四個寫入者都 bump」—— 而 `removeChat` 啱啱就係第五個、冇 bump。豁免拆咗，`src/db.ts` 同其他檔一視同仁；同時接受**常量名**或**字面 key** 兩種寫法（db.ts 兩種都有用）。另加一個 assert 要求掃描真係搵到 `src/db.ts:` 嘅寫入者，唔係靜靜哋掃空氣。
+3. reconcile 測試嗰句「seen_tokens ABOVE it (removeChat's un-decremented delete)」改成「已修喺寫入者；呢度係故意種高個離差嚟證明重算救得返 OVER-count」。
+
+### 四、驗收（deploy 後）
+
+```bash
+curl -s .../health | jq .pushedTotal
+curl -s .../debug/pushes | jq .total          # 兩者應該相等
+curl -s -X DELETE '.../debug/chats?chatId=<chat>' | jq .
+curl -s .../health | jq .pushedTotal          # 同 /debug/pushes 一齊跌返該 chat 嘅行數
+curl -s .../debug/pushes | jq .total          # 仍然相等
+```
+
+冇 deploy 之前，呢種刪除會留低一個 +N 正離差，要等 ≤1 小時嘅重算才抹平；修咗之後**即時**一齊跌。
+
+### 五、界線（老實講）
+
+- **未 deploy**：呢個修復同 §4.50 一樣，只係喺 repo 度。prod 而家（04:21Z 起）兩個計數器係相等嘅，但底層仍然係「一小時一次重算」嘅地板。
+- **呢個 batch 會 throw 就 throw**：`changes()` 唔支援嘅話個 request 直接失敗（嗰個 DELETE 睇到錯誤），唔會靜靜哋寫半邊 —— 刻意嘅 fail-loud 方向。`changes()` 本身已經由 claim／release 喺 prod 用緊，`/debug/db-latency` probe 亦一直喺度驗證佢。
+- **只動 `seen_tokens` 嗰邊**：`token_stats` 嘅源頭（backfill 冇 bump）係 §4.50 (a) 修嘅，今次冇重覆。
+- **repo 以外嘅寫入者**照舊睇唔到（同 §4.50 一樣）：Turso CLI 直接打 SQL 刪 `seen_tokens` 仍然要等重算兜底。
+- **兩邊嘅定義**：`/debug/pushes.total` 係 `listSeenTokens().length`（live 表），`pushedTotal` 係計數器 —— 今次令佢哋喺刪除之後都保持相等。
 - **同 `LIST_FEED_CACHE_TTL_S = 60`、pair 批次 edge cache 等項目無關**，今次冇碰任何 feed 腿。
