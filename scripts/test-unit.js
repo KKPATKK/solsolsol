@@ -10161,8 +10161,9 @@ async function main() {
     );
     assert.equal(r3.alerts.length, 0, "an announced stage does not repeat inside the window");
 
-    // Everything else in the gate is still paced: a dormant tape printing its
-    // first big 5m volume bar inside the window fires nothing …
+    // 🔥 left this gate on 2026-09-30 (entry cards): a dormant→burst tape is
+    // an ENTRY, so it is paced by its own 10-minute clock — not by the
+    // 30-minute cooldown — and no longer waits half an hour for its turn.
     const vol = { mcap: 52_000, liquidity: 30_000, chg5m: 5, vol5m: 40_000, buysH1: 200, sellsH1: 100 };
     const ignitionHeld = evaluateWatch(
       row({ lastAlertAt: now - 60_000, lastVol5m: 5_000 }),
@@ -10170,10 +10171,11 @@ async function main() {
       vol,
       cfg,
     );
-    assert.equal(ignitionHeld.alerts.length, 0, "ignition is still paced by the cooldown");
-    // … and fires once the window has passed.
+    assert.equal(ignitionHeld.alerts.length, 0, "a burst one minute after another card is held by the 10-min pace");
+    // … and fires 11 minutes after the last card — well inside the cooldown
+    // the old rule would still have been serving.
     const ignitionDue = evaluateWatch(
-      row({ lastAlertAt: now - 31 * 60_000, lastVol5m: 5_000 }),
+      row({ lastAlertAt: now - 11 * 60_000, lastVol5m: 5_000 }),
       now,
       vol,
       cfg,
@@ -10598,7 +10600,7 @@ async function main() {
     }
   });
 
-  await test("evaluateWatch: volume ignition fires once from a dormant tape, never after rising stages", () => {
+  await test("evaluateWatch: volume ignition is once per dormant→burst and no longer capped at +50%", () => {
     const row = (over = {}) => ({
       token: "T", chatId: "c", symbol: "CONK", pushedAt: 0,
       mcapAtPush: 50_000, peakMcap: 55_000, lastLiquidity: 30_000,
@@ -10609,21 +10611,124 @@ async function main() {
     });
     const cfg = { cooldownMs: 0 };
 
-    // Dormant (4K) → 60K 5m volume with a mild move → ignition.
+    // Dormant (4K) → 60K 5m volume with a mild move → ignition. The memory is
+    // the PERSISTENT `ignite` mark now, not lastState (which ⚠️/🚀 overwrite).
     const i1 = evaluateWatch(row(), 1000, { mcap: 55_000, liquidity: 30_000, chg5m: 6, vol5m: 60_000, buysH1: 300, sellsH1: 100 }, cfg);
     assert.equal(i1.alerts.length, 1);
     assert.equal(i1.alerts[0].kind, "ignition");
     assert.match(i1.alerts[0].text, /量能點火 CONK/);
-    assert.equal(i1.lastState, "ignite");
+    assert.ok(String(i1.announcedUpStages).split(",").includes("ignite"), `the mark lands: ${i1.announcedUpStages}`);
+    assert.equal(i1.lastState, null, "lastState is not the memory any more");
 
-    // Tape still hot but the PREVIOUS check was already hot → no repeat.
-    const i2 = evaluateWatch(row({ lastState: "ignite" }), 1000, { mcap: 56_000, liquidity: 30_000, chg5m: 3, vol5m: 70_000, buysH1: 300, sellsH1: 120 }, cfg);
+    // The previous check was already hot → not a dormant→burst, and the mark
+    // it carried is released (a hot tape has no dormant half to remember).
+    const i2 = evaluateWatch(row({ lastVol5m: 60_000, upStages: "ignite" }), 1100, { mcap: 56_000, liquidity: 30_000, chg5m: 3, vol5m: 70_000, buysH1: 300, sellsH1: 120 }, cfg);
     assert.equal(i2.alerts.length, 0);
+    assert.ok(!String(i2.announcedUpStages ?? "").split(",").includes("ignite"), `the hot check re-arms the mark: ${i2.announcedUpStages}`);
 
-    // Once +50% is crossed, 🚀 owns the narrative — no ignition noise.
+    // A fresh dormant→burst after that re-arm fires again.
+    const i2b = evaluateWatch(row(), 1200, { mcap: 56_000, liquidity: 30_000, chg5m: 3, vol5m: 50_000, buysH1: 300, sellsH1: 120 }, cfg);
+    assert.equal(i2b.alerts.filter((a) => a.kind === "ignition").length, 1, "the second leg gets its own card");
+
+    // The old +50% ceiling is GONE (2026-09-30): a coin that already ran and
+    // went quiet gets a second-leg ignition too — here +80%, with the 🚀 card
+    // for the freshly crossed +50% riding the same pass.
     const i3 = evaluateWatch(row(), 1000, { mcap: 90_000, liquidity: 30_000, chg5m: 10, vol5m: 80_000, buysH1: 400, sellsH1: 100 }, cfg);
-    assert.ok(i3.alerts.every((a) => a.kind !== "ignition"));
-    assert.ok(i3.alerts.some((a) => a.kind === "rising"));
+    assert.ok(i3.alerts.some((a) => a.kind === "ignition"), "no cap: the second-leg burst fires");
+    assert.ok(i3.alerts.some((a) => a.sig === "up50"), "and the milestone card is not lost");
+  });
+
+  await test("evaluateWatch: 🪝 pullback re-entry fires once per episode and re-arms on recovery", () => {
+    // The entry card the exit machinery could not make: peak ≥ +50%, still
+    // -15%…-45% off that peak, and the NEWEST tape turns up. ⚠️ w35 only says
+    // the peak is slipping; this says the dip is being bought.
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "REG", pushedAt: 0,
+      mcapAtPush: 100_000, peakMcap: 200_000, lastLiquidity: 30_000,
+      lastVol5m: 2_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0, lastState: null,
+      upStages: "up50,up100",
+      ...over,
+    });
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const live = (over = {}) => ({
+      mcap: 150_000, liquidity: 30_000, chg5m: 10, vol5m: 12_000,
+      buysH1: 100, sellsH1: 50, ...over,
+    });
+    const now = 3_600_000;
+
+    // Peak +100%, now -25% off it, 5m +10% on 12K with buys 2:1 → the card.
+    const p1 = evaluateWatch(row(), now, live(), cfg);
+    assert.equal(p1.alerts.length, 1, "nothing else in play: the entry card is the whole alert set");
+    assert.equal(p1.alerts[0].sig, "pullback");
+    assert.match(p1.alerts[0].text, /🪝 回調轉強 REG/);
+    assert.match(p1.alerts[0].text, /回撤 -25%/);
+    assert.match(p1.alerts[0].text, /失效 跌破/, "the card names its own invalidation level");
+    assert.ok(String(p1.announcedUpStages).split(",").includes("pb"), `the episode mark lands: ${p1.announcedUpStages}`);
+
+    // While the mark stands the same dip cannot repeat…
+    const p2 = evaluateWatch(row({ upStages: "up50,up100,pb" }), now + 60_000, live(), cfg);
+    assert.equal(p2.alerts.length, 0, "the mark, not the clock, keeps it once-only");
+    // …while the reclaim rule's own arming half still runs off the same dip.
+    assert.ok(String(p2.announcedUpStages).split(",").includes("dip20"), `the dip half arms too: ${p2.announcedUpStages}`);
+
+    // …a recovery to within -8% of the peak releases it…
+    const p3 = evaluateWatch(row({ upStages: "up50,up100,pb" }), now + 120_000, live({ mcap: 195_000 }), cfg);
+    assert.equal(p3.alerts.length, 0, "a recovered row has no pullback to report");
+    assert.ok(!String(p3.announcedUpStages ?? "").split(",").includes("pb"), `the mark is released on recovery: ${p3.announcedUpStages}`);
+
+    // …and the NEXT dip gets its own card (the pace is long since satisfied).
+    const p4 = evaluateWatch(row({ upStages: "up50,up100" }), now + 180_000, live(), cfg);
+    assert.equal(p4.alerts.filter((a) => a.sig === "pullback").length, 1, "the next episode fires again");
+
+    // Negative filters, one at a time: no 5m turn, no volume, a sell-heavy
+    // tape, a plunge past -45% (⚠️/💀 territory), and a runup too small.
+    for (const [name, r, l] of [
+      ["no 5m turn", row(), live({ chg5m: 2 })],
+      ["no volume", row(), live({ vol5m: 3_000 })],
+      ["sell-heavy", row(), live({ buysH1: 50, sellsH1: 100 })],
+      ["too deep", row(), live({ mcap: 100_000 })],
+      ["no runup", row({ peakMcap: 130_000 }), live({ mcap: 110_000 })],
+    ]) {
+      const r0 = evaluateWatch(r, now, l, cfg);
+      assert.equal(r0.alerts.filter((a) => a.sig === "pullback").length, 0, name);
+    }
+  });
+
+  await test("evaluateWatch: ♻️ peak reclaim consumes the dip mark, and a straight high is the ladder's business", () => {
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "HH", pushedAt: 0,
+      mcapAtPush: 100_000, peakMcap: 160_000, lastLiquidity: 30_000,
+      lastVol5m: 5_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 0, lastState: null,
+      upStages: "up50,up100",
+      ...over,
+    });
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const now = 3_600_000;
+
+    // A -21% pullback first ARMS the dip mark (no card on its own).
+    // 126K, not 128K: 128/160 is -20.000% to the last bit and the boundary
+    // comparison lives one ulp away from it — the test must not sit on it.
+    const a1 = evaluateWatch(row(), now, { mcap: 126_000, liquidity: 30_000, chg5m: -2, vol5m: 5_000, buysH1: 80, sellsH1: 90 }, cfg);
+    assert.equal(a1.alerts.length, 0, "a pullback alone is not a card");
+    assert.ok(String(a1.announcedUpStages).split(",").includes("dip20"), `the dip is remembered: ${a1.announcedUpStages}`);
+
+    // …then taking the old high out fires the reclaim and consumes it.
+    const a2 = evaluateWatch(row({ upStages: "up50,up100,dip20" }), now + 60_000, { mcap: 170_000, liquidity: 30_000, chg5m: 6, vol5m: 20_000, buysH1: 90, sellsH1: 40 }, cfg);
+    const rec = a2.alerts.filter((a) => a.sig === "reclaim");
+    assert.equal(rec.length, 1);
+    assert.match(rec[0].text, /♻️ 破前高 HH/);
+    assert.match(rec[0].text, /前高 \$160\.00K/, "the card names the high it took out");
+    assert.match(rec[0].text, /失效 跌返/, "and the level it has to hold");
+    assert.ok(!String(a2.announcedUpStages ?? "").split(",").includes("dip20"), `the mark is consumed: ${a2.announcedUpStages}`);
+
+    // A straight new high with no dip behind it is the 🚀 ladder's business.
+    const a3 = evaluateWatch(row(), now, { mcap: 170_000, liquidity: 30_000, chg5m: 6, vol5m: 20_000, buysH1: 90, sellsH1: 40 }, cfg);
+    assert.equal(a3.alerts.filter((a) => a.sig === "reclaim").length, 0);
+    assert.ok(!String(a3.announcedUpStages ?? "").includes("dip20"), "and nothing arms a dip that never happened");
   });
 
   await test("evaluateWatch: dead is silent afterwards, then resurrects at trough x1.5", () => {

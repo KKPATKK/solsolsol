@@ -3747,3 +3747,51 @@ curl -s .../debug/push-watch | jq '.mutedSigs'   # 期望 ["liqwarn","drain","re
 - **absent ≠ lost**：audit ring 只記送咗嘅卡，muted transition 唔會出現喺 ring —— 呢個係預期。
 - **muted 💧 唔會寫 unconfirmed 記錄**：因為根本冇 request 飛出去，settle 條 path 唔會 re-arm。
 - **`recap` 係 pseudo-sig**：🏁 本身冇 sig（唔經 alert 圈），靜音名用 `recap` 純係要同操作語言一致。
+
+## 4.54 入市方向嘅三張卡：🪝 回調轉強、♻️ 破前高、🔥 點火鬆綁（2026-09-30）
+
+### 一、需求
+
+Operator 問「有咩跟進推送幫我即時捕捉入市位」。盤點現有 11 款卡：真正「叫你入」嘅只有一張
+🔥（而且有兩個死角），其餘全部係續航（🚀）或者叫你走（⚠️/💀/🩸/⚡/💧家族/🏁）。
+今次補三張入場卡，全部純規則（pair 快照已帶齊 mcap、5m 幅、5m 量、h1 買賣比、liquidity，**零新增請求**）。
+
+### 二、三張卡嘅規則
+
+| 卡 | sig | 觸發 | 記憶 |
+|---|---|---|---|
+| 🪝 **回調轉強** | `pullback` | peak ≥ +50%；距前高 -15%…-45%；當下 5m ≥ +8%、5m 量 ≥ $8K、買賣比 ≥ 1.2:1；距上次任何卡 ≥ 10 分鐘 | mark `pb`；回到 -8% 內才 re-arm |
+| ♻️ **破前高** | `reclaim` | 標記過「回調 ≥ 20%」（mark `dip20`）之後**嚴格升穿舊前高**；舊前高本身要 ≥ +20% over 推送 | `dip20` 一經消耗（即發卡）就冇；下一次 ≥20% 回調再 arm |
+| 🔥 **量能點火** | `ignite` | 沉睡（前值 < $10K）→ burst（≥ $15K）；**拆走 +50% 上限**；距上次卡 ≥ 10 分鐘 | mark `ignite`；tape 一熱就 re-arm |
+
+關鍵設計（三張卡共通）：
+
+1. **全部喺 30 分鐘 cooldown 閘之外**（跟 🚀/🩸 先例）：呢啲係首發結構訊號，唔係重複；用 clock 只會令訊號遲到。記憶全部用 `up_stages` 嘅 persistent marks。
+2. **卡片內容跟 operator 要求**：現價 vs 推送（×N）、距前高、 5m 幅/量、h1 買賣比，同**失效參考**（🪝 跌破 peak×0.55；♻️ 跌返前高之下）。
+3. **同 PUSH_WATCH_MUTE 兼容**：三個 sig（`pullback`/`reclaim`/`ignite`）直接可以用 §4.53 嘅靜音開關收掉，零額外工作。
+
+### 三、實作
+
+- `src/pushwatch.ts`：常數（`PULLBACK_*`、`RECLAIM_*`、`IGNITION_PACE_MS`）、`commitMarks()` helper（統一 CSV 寫回）、兩張新卡嘅 rule block、以及 ignition 由 `if (cooledDown)` 搬出嚟。
+- ignition 嘅記憶由 `lastState` 改成 mark：lastState 會被 ⚠️/🚀 覆蓋，而 mark 唔會（同 🚀 ladder 同一個道理）。
+- 冇新 note 計數器：入場卡照計 `alerted`，喺 audit ring 以自己嘅 sig 出現。
+
+### 四、測試（main suite 444 → **446 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+- `evaluateWatch: 🪝 pullback re-entry fires once per episode and re-arms on recovery` —— 正例 + mark 落地 + 唔可以重發 + 收復 re-arm + 下一個 episode 再發 + 五個逐一負面條件（冇 5m 轉強、冇量、賣壓、過深 -45% 外、runup 不足）。
+- `evaluateWatch: ♻️ peak reclaim consumes the dip mark…` —— 先 arm 唔出卡、再破頂出卡 + 消耗 mark、直線破頂唔出卡。
+- 舊 ignition 測試改寫成新合約（一次 dormant→burst、冇 +50% 上限、`lastState` 唔再係記憶）；cooldown pacing 測試嘅 ignition 半邊改成「10 分鐘 pace」兼驗 11 分鐘內就發得出。
+
+### 五、驗收（deploy 後）
+
+- `/debug/push-audit` ring 會陸續出現 `pullback` / `reclaim` / `ignite` 三種 sig；
+- `/debug/push-watch` 嘅 row `upStages` 會見到 `pb` / `dip20` / `ignite` 三種新 mark；
+- 對比部署前後嘅 `ok:X/Y`（Y 係 alerting rows）：Y 應該醒少少升（多咗入場卡），同埋唔應該出現同一隻幣短時間內重複 `pullback`。
+
+### 六、界線（老實講）
+
+- **60 秒係硬上限**：卡片只可以喺 tick 上發，pair 快照本身係上游 5m/1h 聚合 —— 「即時」嘅定義就係一個 tick。
+- **🪝 唔覆蓋深潛反彈**：-45% 以下（w45/💀 區）唔發，交返畀 w45/💀/🟢；同理 ♻️ 只講「回調過 ≥20% 之後」嘅破頂，直接破頂交畀 🚀。
+- **🔥 嘅 10 分鐘 pace 係略過，唔係延遲**：10 分鐘內嘅第二次 burst 唔會補發。
+- **卡片量會升**，要觀察實際噪音；三隻新 sig 可以隨時用 `PUSH_WATCH_MUTE` 獨立收掉。
+- **門檻（-15/-45、+8%、$8K、1.2:1、+20%）係初版拍訝**：冇歷史 replay 引擎，所以 deploy 後要睇 audit ring 嘅實際命中同噪音再調（歷史上 §4.11 嘅 📈、§4.12 嘅 w35 都調過）。

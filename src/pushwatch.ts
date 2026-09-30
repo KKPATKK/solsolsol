@@ -1090,11 +1090,44 @@ export function liquidityIsComparable(pair: {
  * Volume ignition: a tracked coin whose 5m volume jumps from dormant
  * (< DORMANT) to >= VOL is often the first breath of a new leg (the CONK
  * pattern: 75 min of quiet consolidation, then a volume spike minutes
- * before the god candle). Early-warning only — it never fires once the
- * +50% rising stage has been crossed, where 🚀 alerts take over.
+ * before the god candle).
+ *
+ * 2026-09-30 (entry cards): the old "early-warning only, pre-+50%" framing
+ * is gone — a coin that already ran and went quiet gets its second-leg
+ * ignition the same way, and the rule now lives OUTSIDE the 30-minute
+ * cooldown (the burst IS the entry; a clock can only make it late). Its
+ * once-per-burst memory is the `ignite` mark in up_stages, not lastState
+ * (which ⚠️/🚀 overwrite).
  */
 export const IGNITION_VOL_USD = 15_000;
 export const IGNITION_DORMANT_USD = 10_000;
+/** Minimum gap between 🔥 cards — bursts repeat on a choppy tape. */
+const IGNITION_PACE_MS = 10 * 60_000;
+/**
+ * 🪝 Pullback re-entry (2026-09-30): the coin has to be at least this far
+ * up from the push before a dip counts as a pullback worth an entry card.
+ */
+const PULLBACK_MIN_RUNUP_PCT = 50;
+/** The dip must be at least this deep (from the tracked peak)… */
+const PULLBACK_MIN_DD_PCT = 15;
+/** …but a plunge past this is the ⚠️/💀 machinery's business, not an entry. */
+const PULLBACK_MAX_DD_PCT = 45;
+/** The turn itself: a ≥ 8% 5m bar on ≥ $8K of 5m volume, buys ≥ 1.2× sells. */
+const PULLBACK_TURN_CHG5M_PCT = 8;
+const PULLBACK_TURN_VOL_USD = 8_000;
+const PULLBACK_TURN_BS_RATIO = 1.2;
+/** Recovery to within this much of the peak ENDS the episode (re-arms 🪝). */
+const PULLBACK_REARM_DD_PCT = 8;
+/** Minimum gap between 🪝 cards, paced on the row's own alert clock. */
+const PULLBACK_PACE_MS = 10 * 60_000;
+/**
+ * ♻️ Peak reclaim (2026-09-30): a high → a pullback of at least this depth
+ * (the `dip20` mark) → the high taken out. The reclaim CONSUMES the mark,
+ * so the card fires once per dip-and-reclaim cycle.
+ */
+const RECLAIM_MIN_DIP_PCT = 20;
+/** The peak being reclaimed must itself sit this far above the push. */
+const RECLAIM_MIN_RUNUP_PCT = 20;
 /**
  * Holder-growth threshold vs the ROLLING baseline (holders_at_push). Each
  * 📈 alert rolls the baseline forward to the current count, so every card
@@ -1633,6 +1666,24 @@ export function evaluateWatch(
       ? undefined
       : csv;
   };
+  /**
+   * Write-through for the persistent marks — the same comparison every rule
+   * below inlines (announcedUpStages is only set when the CSV actually moved,
+   * so an untouched column is left alone; see the 🚀 stages for the contract).
+   */
+  const commitMarks = (): void => {
+    const csv = [...marks].sort().join(",");
+    if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
+      announcedUpStages = csv;
+    }
+  };
+  /** 現價 vs 推送價, the "how late am I" reading every entry card carries. */
+  const pushX = (live.mcap / Math.max(row.mcapAtPush, 1)).toFixed(2);
+  /** The tape side of an entry card: h1 buy:sell ratio. */
+  const entryBs =
+    live.buysH1 + live.sellsH1 > 0
+      ? `${(live.buysH1 / Math.max(live.sellsH1, 1)).toFixed(1)}:1`
+      : "—";
   if (live.liquidity !== null && live.liquidity < liqFloor) {
     if (!marks.has(DRAIN_CONFIRM_MARK)) {
       // First sighting: warn and remember, but keep watching. The card says
@@ -1894,23 +1945,96 @@ export function evaluateWatch(
     }
   }
 
-  if (cooledDown) {
-    // Volume ignition (early-warning, pre-🚀 only): dormant tape suddenly
-    // prints a big 5m volume bar.
-    if (
-      chgSincePush < RISING_STAGES[0] &&
-      live.vol5m >= IGNITION_VOL_USD &&
-      (row.lastVol5m ?? 0) < IGNITION_DORMANT_USD &&
-      lastState !== "ignite"
-    ) {
-      fire(
-        "ignition",
-        `🔥 量能點火 ${symbol} | 5m量 ${fmtUsd(live.vol5m)}（前值 ${fmtUsd(row.lastVol5m ?? 0)}）| 5m ${pct(live.chg5m)} — 疑似新一段行情啟動`,
-        "ignite",
-      );
-      lastState = "ignite";
-    }
+  // ── Entry cards (2026-09-30, operator request) ──────────────────────────
+  // The tracker used to speak loudest about EXITS (⚠️/💀/🩸/💧) and about
+  // milestones already crossed (🚀), while the only card that pointed at an
+  // ENTRY was the pre-+50% 🔥. These three close that gap, and all of them
+  // run OUTSIDE the cooldown gate with PERSISTENT MARKS as their memory (the
+  // same discipline as the 🚀 ladder and the 🩸 pace): a first-time structural
+  // signal is not a repeat, and a 30-minute clock could only make it late.
 
+  // ♻️ 破前高 (peak reclaim): the coin set a high, pulled back ≥20%, and has
+  // now taken that high out. A higher high on a repaired structure is a
+  // continuation entry — and the one bullish transition the 🚀 ladder CANNOT
+  // report, because a milestone already crossed is marked and never
+  // re-announced (reclaiming a +60% high from +60% crosses nothing). `dip20`
+  // is the armed half and is CONSUMED by the reclaim: one card per cycle, and
+  // a fresh ≥20% dip has to happen before the next one.
+  if (drawdownFromPeak <= -RECLAIM_MIN_DIP_PCT) {
+    if (!marks.has("dip20")) {
+      marks.add("dip20");
+      commitMarks();
+    }
+  }
+  if (
+    row.peakMcap > 0 &&
+    live.mcap > row.peakMcap &&
+    marks.has("dip20") &&
+    (row.peakMcap / Math.max(row.mcapAtPush, 1) - 1) * 100 >= RECLAIM_MIN_RUNUP_PCT
+  ) {
+    fire(
+      "rising",
+      `♻️ 破前高 ${symbol} | 前高 ${fmtUsd(row.peakMcap)} → 現 ${fmtUsd(live.mcap)}（推送 ×${pushX}，${pct(chgSincePush)}）| 回調後收復前高 | 5m ${pct(live.chg5m)} 量 ${fmtUsd(live.vol5m)} 買賣比 ${entryBs} | 失效 跌返 ${fmtUsd(row.peakMcap)} 之下`,
+      "reclaim",
+    );
+    marks.delete("dip20");
+    commitMarks();
+  }
+
+  // 🪝 回調轉強 (pullback re-entry): a coin that already ran (peak ≥ +50%) is
+  // -15%…-45% off that peak — a real pullback, but short of the -55% that 💀
+  // calls dead — and the NEWEST tape turns back up: a ≥8% 5m bar on ≥$8K of
+  // 5m volume with buys outnumbering sells. That shape is the second entry
+  // the exit cards cannot describe: ⚠️ w35 only says the peak is slipping.
+  // `pb` is the once-per-episode mark; the episode ends when the coin is back
+  // within -8% of its peak, which is what re-arms the next one.
+  if (drawdownFromPeak > -PULLBACK_REARM_DD_PCT) {
+    if (marks.delete("pb")) commitMarks();
+  } else if (
+    runupFromPushPct >= PULLBACK_MIN_RUNUP_PCT &&
+    drawdownFromPeak <= -PULLBACK_MIN_DD_PCT &&
+    drawdownFromPeak > -PULLBACK_MAX_DD_PCT &&
+    live.chg5m >= PULLBACK_TURN_CHG5M_PCT &&
+    live.vol5m >= PULLBACK_TURN_VOL_USD &&
+    live.buysH1 / Math.max(live.sellsH1, 1) >= PULLBACK_TURN_BS_RATIO &&
+    !marks.has("pb") &&
+    now - (row.lastAlertAt ?? 0) >= PULLBACK_PACE_MS
+  ) {
+    fire(
+      "rising",
+      `🪝 回調轉強 ${symbol} | 前高 ${fmtUsd(peakMcap)} 回撤 ${pct(drawdownFromPeak)} | 現 ${fmtUsd(live.mcap)}（推送 ×${pushX}）| 5m ${pct(live.chg5m)} 量 ${fmtUsd(live.vol5m)} 買賣比 ${entryBs} | 失效 跌破 ${fmtUsd(peakMcap * (1 - PULLBACK_MAX_DD_PCT / 100))}`,
+      "pullback",
+    );
+    marks.add("pb");
+    commitMarks();
+  }
+
+  // 🔥 量能點火 — loosened (2026-09-30): the burst IS the entry, so the rule
+  // moved out of the cooldown block and lost its `chgSincePush < +50%`
+  // ceiling. That ceiling described a pre-🚀 warning; a coin that already ran
+  // and went quiet gets a SECOND leg the same way (dormant 5m volume, then a
+  // ≥$15K bar), which the old gate could not see at all. The `ignite` mark is
+  // the once-per-burst memory (re-armed when the tape goes dormant again),
+  // paced by IGNITION_PACE_MS because bursts can repeat on a choppy tape.
+  const igniteBurst =
+    live.vol5m >= IGNITION_VOL_USD &&
+    (row.lastVol5m ?? 0) < IGNITION_DORMANT_USD;
+  if (!igniteBurst) {
+    if (marks.delete("ignite")) commitMarks();
+  } else if (
+    !marks.has("ignite") &&
+    now - (row.lastAlertAt ?? 0) >= IGNITION_PACE_MS
+  ) {
+    fire(
+      "ignition",
+      `🔥 量能點火 ${symbol} | 5m量 ${fmtUsd(live.vol5m)}（前值 ${fmtUsd(row.lastVol5m ?? 0)}）| 5m ${pct(live.chg5m)} 距前高 ${pct(drawdownFromPeak)} | 現 ${fmtUsd(live.mcap)}（推送 ×${pushX}）— 疑似新一段行情啟動`,
+      "ignite",
+    );
+    marks.add("ignite");
+    commitMarks();
+  }
+
+  if (cooledDown) {
     // Weak: meaningful runup then ≥35% off the peak. Depth-staged with
     // PERSISTENT memory (w35/w45 marks in up_stages next to the 🚀 stages):
     // a 📈/🚀 overwriting lastState used to re-fire the same ⚠️ one cooldown
