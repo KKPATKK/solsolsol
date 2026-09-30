@@ -298,9 +298,28 @@ GECKOTERMINAL_TRENDING_LIMIT = "0"
 # 0 = the leg is off. Restore a positive value only after /debug/gmgn proves
 # the block is gone. This switch does NOT cover the candidate-enrichment path
 # (smart-money count / wash-trading flag, and with it the
-# GMGN_BLOCK_WASH_TRADING gate): GMGN_ENABLED = "0" removes the whole client
-# in one move, which is the AXIOM_ENABLED-style choice if the block persists.
+# GMGN_BLOCK_WASH_TRADING gate) — see GMGN_ENABLED below, which removes the
+# whole client.
 GMGN_TRENDING_LIMIT = "0"
+# Global GMGN kill switch (default on; mirrors ARKHAM_ENABLED). 0 = the Worker
+# never constructs the GMGN client (src/worker.ts builds it only when
+# GMGN_API_KEY is set AND this is not "0"/"false"), so every GMGN call goes
+# away in one move: the discovery feed above, the per-candidate /token/info
+# that fed the card's smart-money line, and with it the
+# GMGN_BLOCK_WASH_TRADING gate (inert either way — the lookup it reads has
+# never succeeded from this egress, so it could not fire).
+# TAKEN (2026-09-30): the 2026-09-24 block never cleared. It is the shared
+# egress IP that GMGN 429s, not the key, so no retry/backoff tuning can clear
+# it — the client only ever spent requests that could not land (~1 per 5-min
+# backoff window, plus the per-candidate probes sharing that backoff).
+# Live /health now reads `gmgnConfigured true` with `gmgn 0`; after this it
+# reads `gmgnConfigured false`.
+# TRADE-OFF: an absent client means /debug/gmgn can only report
+# `GMGN not configured` — it can no longer make the probe request. The
+# acceptance path is kept but now costs one flip: set this back to "1" (plus
+# GMGN_TRENDING_LIMIT) to re-arm the probe, and keep it only once the feed
+# delivers items again.
+GMGN_ENABLED = "0"
 # Crime-wallet blocklist (community list — see src/crimewallets.ts).
 # DISABLED (2026-09-24): the gate it feeds is display-only
 # (CRIME_WALLETS_BLOCK=false) and, live, never judges — /debug/crime-wallets

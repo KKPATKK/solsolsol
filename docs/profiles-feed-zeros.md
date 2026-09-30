@@ -110,6 +110,11 @@ profiles 修好之後，逐個 feed 量度，發現**同一類問題還有四個
 
 ## 另一個每 tick 都焼成本嘅：GMGN 429 重試階梯
 
+> 狀態更新（2026-09-30）：下面呢段係當時（GMGN 仍開住）嘅記錄。之後兩個開關都關掉了
+> ——09-24 關 leg（`GMGN_TRENDING_LIMIT = "0"`）、09-30 關整個 client（`GMGN_ENABLED = "0"`），
+> `/health.gmgnConfigured` 現在係 `false`。見 `docs/cost-trim-2026-09-24.md` §2。
+> 保留本文因為 429 重試階梯同 backoff 嘅分析仍然有效。
+
 GMGN 在生產係**開住**嘅（`GMGN_ENABLED` 預設 true + `GMGN_API_KEY` 有值 ⇒ `/health.gmgnConfigured true`），
 但 GMGN 嘅 edge 對 Worker egress 一直 429（`/debug/gmgn` → `GMGN HTTP 429`；而 gecko trending 出現時嘅註釋
 本身就寫住佢係 GMGN trending 嘅替代品）。而 `GmgnClient.getJson` 對 429 用 **2s/4s 重試階梯**：
