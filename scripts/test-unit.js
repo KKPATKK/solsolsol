@@ -12,7 +12,7 @@ const path = require("path");
 const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS, poolRotationSlot, SEEN_TOKENS_COUNT_KEY, TOKEN_STATS_COUNT_KEY, TELEMETRY_RECONCILE_INTERVAL_MS, TELEMETRY_RECONCILE_AT_KEY } = require("../dist/db.js");
 const { DB_LATENCY_PROBE_KEY, DB_LATENCY_PROBE_COUNT_KEY, DB_LATENCY_SAMPLES, DB_LATENCY_SAMPLES_MAX, DB_LATENCY_OPS, clampLatencySamples, summarizeLatency, summarizeLatencyOps, claimShapeSavingMs, dbRegionFromUrl, changesVerdict, DB_LATENCY_EXPECTED_COUNTER_PER_SAMPLE } = require("../dist/dblatency.js");
 const { parseFilterArgs, tradeKeyboard } = require("../dist/bot.js");
-const { parseAdminIds, isAdmin, parseSmartMoneyTypes, loadConfig } = require("../dist/config.js");
+const { parseAdminIds, isAdmin, parseSmartMoneyTypes, parseMutedCardSigs, loadConfig } = require("../dist/config.js");
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
@@ -1260,6 +1260,101 @@ async function main() {
     assert.equal(ring[0].token, "LOBBY");
     assert.equal(ring[0].chatId, "c");
     assert.match(String(out.note), /abandoned 1/);
+  });
+
+  // PUSH_WATCH_MUTE (2026-09-30, operator request 「暫時不想收到」): the three
+  // card types — ⚠️ liqwarn, 💧 drain, 🏁 recap — can be silenced WITHOUT
+  // touching the tracker's behaviour. The mute sits at the SEND site (never in
+  // evaluateWatch), so a muted card is still derived and its transition still
+  // lands: a muted ⚠️ still arms the two-reading count, a muted 💧 still
+  // terminalizes its row, a muted 🏁 is still superseded by the prune. That is
+  // what makes the switch reversible with no backlog and no stale re-announce.
+  await test("PushWatcher: PUSH_WATCH_MUTE withholds liqwarn/drain but lands their transitions", async () => {
+    const muted = (db, bot) =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        loadConfig({ PUSH_WATCH_MUTE: "liqwarn,drain,recap" }),
+        async (addrs) => new Map(addrs.map((a) => [a, termPair(a, 2_000)])),
+        null,
+      );
+    const texts = [];
+    const bot = { api: { sendMessage: async (_c, text) => { texts.push(text); return { message_id: 1 }; } } };
+
+    // (a) FIRST sub-floor reading: the ⚠️ card is withheld, and its transition
+    // still lands — the drain-confirm mark is armed exactly as if the card had
+    // gone out, so the NEXT reading decides instead of warning again.
+    const db1 = termDb([termRow({ upStages: null })]);
+    const out1 = await muted(db1, bot).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "no card reached the chat");
+    assert.equal(out1.muted, 1, "the pass reports the withheld card");
+    assert.match(String(out1.note), / muted 1/);
+    assert.equal(out1.undelivered, 0, "a withheld card is not a failure — nothing rolls back");
+    assert.equal(db1.updated.length, 1);
+    const [, w1] = db1.updated[0];
+    assert.ok(
+      String(w1.upStages).split(",").includes("liq1"),
+      `the two-reading count is armed: ${w1.upStages}`,
+    );
+    assert.equal(w1.lastState, null, "the row keeps watching");
+    assert.equal(w1.followupsSent, 1, "the announcement still counts as one");
+
+    // (b) SECOND reading: the 💧 drain is muted too and its TERMINAL
+    // transition still lands — lastState rug, no durable unconfirmed record
+    // (nothing was in flight), no abandoned accounting.
+    const db2 = termDb([termRow({ upStages: "liq1" })]);
+    const out2 = await muted(db2, bot).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the drain card is withheld too");
+    assert.equal(out2.muted, 1);
+    assert.equal(out2.terminalAbandoned, 0, "a withheld card is never an abandoned send");
+    assert.equal(
+      db2.state.get(UNCONFIRMED_TERMINAL_STATE_KEY),
+      undefined,
+      "nothing in flight → nothing recorded for the settle",
+    );
+    const [, w2] = db2.updated[0];
+    assert.equal(w2.lastState, "rug", "the row still terminalizes");
+    assert.ok(w2.lastAlertAt > 0, "and its clock still lands");
+
+    // (c) UNMUTED control: the same row shape still sends — the suppression
+    // above is the mute, not the harness.
+    const db3 = termDb([termRow({ upStages: "liq1" })]);
+    const out3 = await termWatcher(db3, bot, 2_000).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "without the mute the drain card goes out");
+    assert.match(String(texts[0]), /💧 流動性枯竭/);
+    assert.equal(out3.muted, 0);
+  });
+
+  await test("PushWatcher: PUSH_WATCH_MUTE=recap withholds the 🏁 card without keeping the row", async () => {
+    const expiringRow = () =>
+      termRow({ pushedAt: Date.now() - 48 * 3_600_000, upStages: null, lastMcap: 100_000 });
+    const recapDb = () => {
+      const db = termDb([expiringRow()]);
+      // The claim is the row's tombstone and it runs BEFORE the mute check: a
+      // won claim is what closes the row, so the mute can only ever withhold
+      // the message, never leave a claimed row alive.
+      db.claimRecapsAndPrune = async (tokens) => ({ won: tokens.map(() => true), pruned: tokens.length });
+      return db;
+    };
+    const texts = [];
+    const bot = { api: { sendMessage: async (_c, text) => { texts.push(text); return { message_id: 2 }; } } };
+    const make = (db, cfg) =>
+      new PushWatcher(db, bot, null, cfg, async (addrs) => new Map(addrs.map((a) => [a, termPair(a, 50_000)])), null);
+
+    // CONTROL: the same harness delivers the 🏁 card when nothing is muted.
+    const out1 = await make(recapDb(), loadConfig({})).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "the unmuted recap lands");
+    assert.match(String(texts[0]), /🏁 結案報告/);
+    assert.equal(out1.muted, 0);
+
+    // MUTED: the claim still ran and the prune it rode still deletes the row —
+    // only the send is withheld, and the pass counts it.
+    texts.length = 0;
+    const out2 = await make(recapDb(), loadConfig({ PUSH_WATCH_MUTE: "recap" })).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "no 🏁 card reaches the chat");
+    assert.equal(out2.muted, 1, "counted as withheld");
+    assert.match(String(out2.note), / muted 1/);
   });
 
   // The invocation's subrequest ceiling, threaded into the pass (2026-09-24).
@@ -3790,6 +3885,23 @@ async function main() {
     assert.equal(off.axiomMinBotUsers, 90);
     assert.equal(off.axiomTrendingLimit, 20);
     assert.equal(off.axiomExternalRefresh, false);
+  });
+
+  await test("loadConfig: PUSH_WATCH_MUTE parses the tracker's muted card sigs", () => {
+    // Default: nothing is muted — shipping the mute must not silence any card
+    // until an operator sets the variable (the three sigs are the audit ring's
+    // own: liqwarn ⚠️ 流動性跌穿地板, drain 💧 流動性枯竭, recap 🏁 結案報告).
+    assert.deepEqual(loadConfig({}).pushWatch.mutedSigs, []);
+    assert.deepEqual(
+      loadConfig({ PUSH_WATCH_MUTE: "liqwarn,drain,recap" }).pushWatch.mutedSigs,
+      ["liqwarn", "drain", "recap"],
+    );
+    // Normalized (case/space) and deduped. An UNKNOWN sig stays in the list
+    // but matches no card — a typo can only leave a card visible, never
+    // silence the wrong one.
+    assert.deepEqual(parseMutedCardSigs(" Liqwarn , DRAIN ,, drain "), ["liqwarn", "drain"]);
+    assert.deepEqual(parseMutedCardSigs(undefined), []);
+    assert.deepEqual(parseMutedCardSigs("   "), []);
   });
 
   // If these numbers drift, the far zone silently starves again (its oldest

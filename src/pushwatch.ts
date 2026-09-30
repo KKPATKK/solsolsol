@@ -2348,6 +2348,20 @@ export class PushWatcher {
   }
 
   /**
+   * Is this card type MUTED for now (PUSH_WATCH_MUTE — see
+   * AppConfig.pushWatch.mutedSigs)? Asked at the SEND sites, never inside
+   * evaluateWatch: a muted card is still derived and its transition still
+   * LANDS — a muted 💧 drain still terminalizes its row, a muted ⚠️ liqwarn
+   * still arms the two-reading count, a muted 🏁 recap is still superseded by
+   * the prune — so the mute withholds the message and nothing else. Counted
+   * per pass as `muted N` in the note, and reversible by redeploying without
+   * the sig: the NEXT transition is delivered, no backlog is replayed.
+   */
+  private isMuted(sig: string): boolean {
+    return this.config.pushWatch.mutedSigs.includes(sig);
+  }
+
+  /**
    * Bounds ONE network stage to `capMs`. The work is NOT cancelled — the
    * caller stops waiting and a late settle is dropped, the same contract as
    * the scanner's bestEffort(). Callers decide what a miss MEANS (the alert
@@ -2504,6 +2518,13 @@ export class PushWatcher {
      * at all, which is the same reason `terminalAbandoned` is optional here.
      */
     deduped?: number;
+    /**
+     * Cards WITHHELD because their type is muted (see
+     * AppConfig.pushWatch.mutedSigs). Part of `alerted` — the transition
+     * landed, the send did not. Optional: only a pass that reaches the recap
+     * stage or the row loop can withhold one.
+     */
+    muted?: number;
     /** Cumulative undelivered cards this isolate (survives the pass note). */
     undeliveredTotal: number;
     /** Of those, the ones a later pass actually re-announced. */
@@ -2564,6 +2585,15 @@ export class PushWatcher {
     // Turso call below is a full request on a pass that only holds
     // TRACKER_TICK_BUDGET_MS, so this count is the tracker's real cost driver.
     let trips = 0;
+    /**
+     * Cards WITHHELD because their type is muted (PUSH_WATCH_MUTE — see
+     * isMuted). Declared here, next to `trips`, because the recap stage below
+     * runs BEFORE the row-loop counters: a `let` down there would put the
+     * recap loop in its temporal dead zone. A muted card counts as ANNOUNCED
+     * (its transition lands) but never as undelivered — nothing is in flight,
+     * so no mark, no proof and no re-announce are owed.
+     */
+    let mutedCards = 0;
     // Per-stage clock for the pass, reported in the coverage note as
     // `ms/trips`. The pass has no cadence of its own — it is handed whatever
     // the scan tick has left — so `allow` plus this split is the only way to
@@ -2663,6 +2693,12 @@ export class PushWatcher {
     const deferred = {
       checked: 0,
       alerted: 0,
+      // Read at return time, so a deferral reports the recaps a muted 🏁
+      // withheld before the pass stopped (see mutedCards — the getter is why
+      // the declaration has to sit above this object).
+      get muted() {
+        return mutedCards;
+      },
       // Read at return time, so a deferral names the stage it stopped in.
       get note() {
         return `deferred:${deferReason} ${stageNote()} trips ${trips}`;
@@ -2791,6 +2827,17 @@ export class PushWatcher {
       }
       for (let i = 0; i < expiring.length; i++) {
         if (!won[i]) continue;
+        // MUTED (PUSH_WATCH_MUTE=recap): the operator asked not to receive
+        // the 🏁 card for now. The claim above still ran, so the row is
+        // closed and the prune deletes it exactly as usual — only the send is
+        // withheld. The mute is re-read every pass, which is what makes it
+        // reversible without re-arming anything: lifting it starts delivering
+        // the NEXT window's recaps, and a row already closed here can never
+        // come back.
+        if (this.isMuted("recap")) {
+          mutedCards += 1;
+          continue;
+        }
         try {
           // BOUNDED like every other send in the pass (see bounded): this was
           // the last unbounded await in runTick, and the one that measured
@@ -3256,8 +3303,12 @@ export class PushWatcher {
       return {
         checked: 0,
         alerted: 0,
-        note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"} ${stageNote()} trips ${trips}`,
+        // A recap withheld in the stage above is reported here too: this exit
+        // is the common shape when the window closes (every row expired), so
+        // omitting it was the one place a muted 🏁 could go unmentioned.
+        note: `rows 0/${activeRows.length} ${rows.length === 0 ? "no-rows" : "all-terminal"}${mutedCards > 0 ? ` muted ${mutedCards}` : ""} ${stageNote()} trips ${trips}`,
         trips,
+        muted: mutedCards,
         undelivered: 0,
         undeliveredTotal: this.undeliveredTotal,
         recoveredUndelivered: this.recoveredUndeliveredTotal,
@@ -3927,6 +3978,20 @@ export class PushWatcher {
           if (carryAt !== undefined) attempts.push({ sig: a.sig, at: carryAt });
           continue;
         }
+        // MUTED CARD (PUSH_WATCH_MUTE): the operator asked not to receive
+        // this card type for now. The transition still lands exactly as if
+        // the card had gone out — a muted 💧 drain still terminalizes its row
+        // (lastState rug) and a muted ⚠️ liqwarn still arms the two-reading
+        // count — so un-muting later starts with the NEXT transition and can
+        // never resurrect this one. Counted like a deduped card (announced,
+        // not delivered) and NOT attempted: nothing is in flight, so there is
+        // no audit entry and no attempt mark to carry.
+        if (this.isMuted(a.sig)) {
+          mutedCards += 1;
+          alerted += 1;
+          sentCount += 1;
+          continue;
+        }
         const sendLeft = sendBudgetEnd - Date.now();
         if (sendLeft <= 0) {
           console.error(
@@ -4249,6 +4314,7 @@ export class PushWatcher {
       ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
       `${dupSkipped > 0 ? ` dup-skip ${dupSkipped}` : ""}` +
+      `${mutedCards > 0 ? ` muted ${mutedCards}` : ""}` +
       `${undelivered > 0 ? ` undelivered ${undelivered}` : ""}` +
       `${terminalAbandoned > 0 ? ` abandoned ${terminalAbandoned}` : ""}` +
       `${rearmedCards > 0 ? ` rearmed ${rearmedCards}` : ""}` +
@@ -4271,6 +4337,7 @@ export class PushWatcher {
       checked,
       alerted,
       deduped: dupSkipped,
+      muted: mutedCards,
       note,
       trips,
       undelivered,

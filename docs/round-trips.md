@@ -3691,3 +3691,52 @@ deploy 之後連續抽樣一個鐘（約每 18 秒讀一次 `/health.heartbeat.s
    feed／tracker 一變就重新 key），所以 TTL 唔係瓶頸。要再提高命中率，下一步係改 **key**（固定分桶／按地址集），
    唔係調 TTL。
 4. 冇調 => 冇新改動可 deploy；呢節只係量度紀錄。抽樣數據喺 sandbox 嘅 `/tmp/w/pairsamples*.tsv`，冇入 repo。
+
+## 4.53 靜音三張卡：`PUSH_WATCH_MUTE` 將 ⚠️ liqwarn、💧 drain、🏁 recap 截喺 SEND 口（2026-09-30）
+
+### 一、需求：operator 話「暫時不想收到」三張卡
+
+具體係：
+
+- `⚠️ 流動性跌穿地板`（audit ring 嘅 sig = `liqwarn`；第一次低於地板嘅警告，仲會 arm 兩讀數倒數）；
+- `💧 流動性枯竭`（sig = `drain`；第二次讀數，引擎喺呢一步將 row 轉做 terminal `rug`）；
+- `🏁 結案報告`（window 關閉嗰張；冇 sig，喺 recap/prune stage 直接發）。
+
+要求係「暫時唔想收到」，唔係「唔想再追蹤」：所以引擎行為要完全不變，只係 Telegram 唔出嗰三款卡 ——
+而且要可逆：un-mute 之後由下一個 transition 開始收，唔可以補發一堆舊卡。
+
+### 二、做法：靜音放喺 SEND 口，唔入 evaluateWatch
+
+| 位置 | 改動 | 為何 |
+|---|---|---|
+| `src/config.ts` | `parseMutedCardSigs(PUSH_WATCH_MUTE)`（trim／lowercase／去重；未知 sig 無效）＋ `AppConfig.pushWatch.mutedSigs` | 開關係 deploy 層（wrangler var），同 `GMGN_ENABLED` 等同一種鏍絲；未知 sig 只會漏靜音、唔會靜錯卡 |
+| `src/pushwatch.ts` | `PushWatcher.isMuted(sig)`；alert 圈跳到 就計 `alerted`／`sentCount` 但唔 send；recap 圈喺 claim 之後跳過 send | 卡照樣 DERIVE、transition 照樣 LAND：muted ⚠️ 仍然 arm `liq1`；muted 💧 仍然 `last_state=rug`；muted 🏁 照樣 prune |
+| 讀數 | note 加 ` muted N`；`runTick` 回傳 `muted`（`no-rows` 早退同 `deferred` getter 都帶埋） | 靜音期間「冇卡」同「冇 transition」要分得開 |
+
+要點：
+
+1. **冇 backlog**：muted 卡唔入 mark、唔入 audit、唔入 `attempts`；un-mute 由下一個 transition 開始，唔會補發。
+2. **冇 rollback**：muted 卡唔算 `undelivered`（冇 request 喺飛），所以 row 嘅 transition 一定 land；💧 亦唔會寫 `UNCONFIRMED_TERMINAL_STATE_KEY`。
+3. **dedupe 優先**：一張 audit 已證明送咗嘅卡仍然計 `dup-skip`，唔會同 muted 重覆計。
+4. **具體設定**：`wrangler.toml` 寫上 `PUSH_WATCH_MUTE = "liqwarn,drain,recap"`；要收返任何一張，刪走嗰個 sig（或者成行）再 redeploy 就得。
+
+### 三、測試（main suite 441 → **444 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+- `loadConfig: PUSH_WATCH_MUTE parses the tracker's muted card sigs` —— 預設 `[]`；大小寫／空格／重覆全部正規化；未知 sig 照列（inert）。
+- `PushWatcher: PUSH_WATCH_MUTE withholds liqwarn/drain but lands their transitions` —— (a) 第一次低於地板：冇卡，`liq1` 照 arm；(b) 第二次：冇卡，`last_state=rug` 照 land，冇 terminal 記錄；(c) unmuted control 照出卡。
+- `PushWatcher: PUSH_WATCH_MUTE=recap withholds the 🏁 card without keeping the row` —— claim 照贏、prune 照刪、卡唔出（unmuted control 照出）。
+
+### 四、驗收（deploy 後）
+
+- 呢三款卡由 chat 消失；`/debug/push-audit` ring 唔再新增 `liqwarn`／`drain` 條目；
+- 被 💧 terminal 嘅 row 照樣喺 `/debug/push-watch` 變 `rug`（唔會留喺 rotation 度空轉）；
+- 過窗嘅 row 照樣被 prune（🏁 冇出，唔等於 row 冇清）；
+- 靜音卡觸發嗰陣，pass note 會多一段 ` muted N`（`/health.tracker.note` 睇得到）。
+
+### 五、界線（老實講）
+
+- **deploy 層開關，唔係 chat 設定**：反轉要改 wrangler var ＋ redeploy（~1.5 分鐘），冇 Telegram 指令。
+  目前只有一個 chat（530602939），所以全局＝單 chat，唔構成問題。
+- **absent ≠ lost**：audit ring 只記送咗嘅卡，muted transition 唔會出現喺 ring —— 呢個係預期。
+- **muted 💧 唔會寫 unconfirmed 記錄**：因為根本冇 request 飛出去，settle 條 path 唔會 re-arm。
+- **`recap` 係 pseudo-sig**：🏁 本身冇 sig（唔經 alert 圈），靜音名用 `recap` 純係要同操作語言一致。

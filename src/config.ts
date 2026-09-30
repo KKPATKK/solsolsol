@@ -76,6 +76,24 @@ export function parseAdminIds(raw: string | undefined): number[] {
 }
 
 /**
+ * Parse PUSH_WATCH_MUTE (comma-separated tracker card sigs to silence) into a
+ * lower-cased, deduped list (pure — unit-tested). Empty/missing → [] (nothing
+ * muted). The sigs are the delivery audit's own: `liqwarn` = the ⚠️ 流動性跌穿
+ * 地板 warning, `drain` = the 💧 流動性枯竭 terminal card, `recap` = the 🏁
+ * 結案報告 window summary. An unknown sig is INERT — it matches no card — so a
+ * typo can only leave a card visible, never silence the wrong one.
+ */
+export function parseMutedCardSigs(raw: string | undefined): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const part of raw.split(",")) {
+    const s = part.trim().toLowerCase();
+    if (s && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+/**
  * Whether a Telegram user may run money-affecting commands (pure —
  * unit-tested). When no admins are configured every call is denied
  * (fail-closed: /setmode and the buy button stay locked).
@@ -462,6 +480,18 @@ export interface AppConfig {
      * stage alone is ~86K CU/month.
      */
     holderMinGapMin: number;
+    /**
+     * Tracker card types to SILENCE for now without stopping the tracker
+     * (PUSH_WATCH_MUTE, a comma-separated list of card sigs; empty = nothing
+     * muted): `liqwarn` ⚠️ 流動性跌穿地板, `drain` 💧 流動性枯竭, `recap` 🏁
+     * 結案報告. A muted card is still DERIVED and its transition still LANDS —
+     * a muted drain still terminalizes its row, a muted recap still closes the
+     * window — so un-muting starts with the NEXT transition instead of
+     * replaying a backlog, and muting can never stall the rotation (see
+     * PushWatcher.isMuted). Reversible: delete a sig (or the whole variable)
+     * and redeploy.
+     */
+    mutedSigs: string[];
   };
   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
   dexRequestIntervalMs: number;
@@ -829,6 +859,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       holderMinGapMin: Number.isFinite(Number(env.PUSH_WATCH_HOLDER_MIN_GAP_MIN ?? 60))
         ? Math.max(0, Math.min(Math.floor(Number(env.PUSH_WATCH_HOLDER_MIN_GAP_MIN ?? 60)), 1440))
         : 60,
+      mutedSigs: parseMutedCardSigs(env.PUSH_WATCH_MUTE),
     },
     dexRequestIntervalMs:
       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
