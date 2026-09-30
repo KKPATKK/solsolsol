@@ -210,11 +210,12 @@ export const BOOST_FEED_SELF_BUDGET_MS = 480;
  * rotating set of "latest" profiles, the tick runs every 60s, and this client
  * ALREADY accepts a 10-minute-old list on a failed fetch (see
  * PROFILE_FEED_REUSE_MS) — so a 60s-old HIT is strictly fresher than what the
- * tick would otherwise evaluate. It is deliberately NOT applied to
- * `/latest/dex/tokens` (the pair batch): those are the metrics the gate and
- * the tracker judge (5m volume/change, liquidity), they are keyed by the
- * address set this tick happens to hold, and the client already has its own
- * short-lived pair cache for them.
+ * tick would otherwise evaluate. The pair batch carries its own, LONGER
+ * window on the same discipline since 2026-09-30 — see
+ * PAIR_BATCH_CACHE_TTL_S, which is where the reasoning lives: those rows are
+ * the metrics the gate and the tracker judge, so the window is sized so the
+ * edge can never serve anything staler than the client's own in-memory pair
+ * cache already does.
  *
  * OPEN QUESTION (2026-09-26, deliberately NOT changed here — but no longer
  * unanswerable). A TTL that equals the tick period is a boundary: an entry
@@ -265,7 +266,7 @@ export const LIST_FEED_CACHE_TTL_S = 60;
  * (DEX_LIST_CACHE_REFUSED_KEY) — see noteListCacheRefused for why the ratio
  * alone could not answer the TTL question.
  */
-const LIST_CACHE_HIT_RE = /^(HIT|REVALIDATED)$/i;
+const EDGE_CACHE_HIT_RE = /^(HIT|REVALIDATED)$/i;
 
 const listCacheLedger = {
   hits: 0,
@@ -292,7 +293,7 @@ const listCacheLedger = {
  */
 function noteListCacheOutcome(status: string | null): void {
   listCacheLedger.status = status;
-  if (status !== null && LIST_CACHE_HIT_RE.test(status)) {
+  if (status !== null && EDGE_CACHE_HIT_RE.test(status)) {
     listCacheLedger.hits += 1;
     return;
   }
@@ -1036,9 +1037,44 @@ const PAIRS_FETCH_BUDGET_MS = 2_000;
  * also hammer — the observed hard 429 block. A short TTL keeps gate math
  * fresh enough (cooldowns are ≥30 min) while cutting request volume ~70%.
  */
-const PAIR_CACHE_TTL_MS = 180_000;
+export const PAIR_CACHE_TTL_MS = 180_000;
 /** Cache size cap (oldest entries evicted) — bounds isolate memory. */
 const PAIR_CACHE_MAX = 4_000;
+/**
+ * Edge-cache TTL for the pair batches (`/latest/dex/tokens/<addresses>`), in
+ * seconds — the same `cacheEverything` discipline the list feeds ride, on a
+ * LONGER window because the freshness it may spend is larger.
+ *
+ * WHY THIS LANE CAN RIDE THE CACHE AT ALL (2026-09-30): the earlier note above
+ * kept it out on purpose — these rows carry the metrics the gates and the
+ * tracker judge — but the client ALREADY serves pair data up to
+ * PAIR_CACHE_TTL_MS (180s) old from its own in-memory map, and does it for
+ * every caller: the scan, the tracker pass and the /debug pair probes all read
+ * that map before the wire. An edge entry is therefore never staler than what
+ * a WARM isolate would already have served from memory; what changes is WHICH
+ * isolates get to reuse it. That is the whole point: isolates are recycled
+ * constantly (see POOL_EDGE_CACHE_URL in scanner.ts), so most ticks were cold
+ * and paid the origin in full even though the previous tick's isolate had just
+ * fetched the SAME batches. The batches repeat because their key is the
+ * address set, and the set is stable while the pool snapshot's rotation slot
+ * holds — the pool query itself is edge-cached (POOL_EDGE_CACHE_URL, TTL =
+ * REEVAL_POOL_CACHE_SECONDS 90s), so consecutive ticks, and the cold isolates
+ * among them, ask for the same URLs.
+ *
+ * WHY 120, NOT 60 OR 180: two ticks at the 60s cadence fit inside one entry
+ * plus jitter, so the tick after a mint is a HIT instead of a boundary MISS —
+ * and a MISS pays the shared egress's 300-800ms against a 2,000ms phase budget
+ * (see PAIRS_FETCH_BUDGET_MS), which is the shape that drops tail batches. 180
+ * is the in-memory number and stays the ceiling: this value must never exceed
+ * PAIR_CACHE_TTL_MS (pinned by test).
+ *
+ * SAFETY: non-2xx stays OUT of the cache (`cacheTtlByStatus`), so a 429 can
+ * never be served to the next tick as fresh pair data; the in-memory pair
+ * cache is still consulted FIRST, so a hit there costs no request at all; and
+ * while the 90s cache-only backoff is armed (`batchBlockedUntil`) no batch is
+ * dispatched at all, so the edge cache is not a second way around a refusal.
+ */
+export const PAIR_BATCH_CACHE_TTL_S = 120;
 /** After a batched-endpoint 429, skip all batch calls for this long. */
 const PAIR_BATCH_BACKOFF_MS = 90_000;
 /**
@@ -1109,6 +1145,17 @@ export class DexScreenerClient {
   private http429Total = 0;
   /** Epoch of the most recent 429 response, or null if never. */
   private last429At: number | null = null;
+  /**
+   * Pair-batch edge-cache ledger (see PAIR_BATCH_CACHE_TTL_S). INSTANCE state,
+   * unlike the list ledger above: it is read through getStats() on the tick
+   * summary the SCANNING isolate writes, so per-isolate is the right
+   * granularity — and keeping it out of the module ledger is what stops a pair
+   * HIT from changing the ratio that decides LIST_FEED_CACHE_TTL_S.
+   */
+  private pairCacheHits = 0;
+  private pairCacheMisses = 0;
+  private pairCacheRefused = 0;
+  private lastPairCacheStatus: string | null = null;
   // The list-feed edge-cache ledger is MODULE state (see the ledger beside
   // LIST_FEED_CACHE_TTL_S): it is the accumulator the durable
   // dex_list_cache_* rows mirror, so it cannot be per-instance without the two
@@ -1272,6 +1319,23 @@ export class DexScreenerClient {
      * DYNAMIC…) when the response was a 2xx, `HTTP-<code>` when the origin
      * refused it, or null when the leg has not run in this isolate. */
     lastListCacheStatus: string | null;
+    /** Pair batches served from the colo edge cache (see
+     * PAIR_BATCH_CACHE_TTL_S) — climbing = the origin was not asked for that
+     * batch. Instance state: counted on the isolate that ran the fetch, read
+     * back on that tick's own summary. */
+    pairCacheHits: number;
+    /** Pair batches the cache did NOT serve (`cf-cache-status` MISS / BYPASS /
+     * EXPIRED / DYNAMIC, or no header at all): the share of these against the
+     * hits is what says whether the edge window is landing between ticks. */
+    pairCacheMisses: number;
+    /** Pair batches the ORIGIN refused (non-2xx), counted apart for the same
+     * reason as listCacheRefused (see noteListCacheRefused): otherwise "the
+     * entry expired" and "the origin said no" read identically. */
+    pairCacheRefused: number;
+    /** The LAST pair-batch outcome: a `cf-cache-status` when the response was
+     * a 2xx, `HTTP-<code>` when the origin refused, null while no pair fetch
+     * has run in this isolate. */
+    lastPairCacheStatus: string | null;
     /** Attempts never SENT because the caller's window was already spent (the
      * throttle queue ate it) — the reading that separates "refused" from
      * "never asked". */
@@ -1299,6 +1363,10 @@ export class DexScreenerClient {
       listCacheMisses: listCacheLedger.misses,
       listCacheRefused: listCacheLedger.refused,
       lastListCacheStatus: listCacheLedger.status,
+      pairCacheHits: this.pairCacheHits,
+      pairCacheMisses: this.pairCacheMisses,
+      pairCacheRefused: this.pairCacheRefused,
+      lastPairCacheStatus: this.lastPairCacheStatus,
       budgetDrops: this.budgetDrops,
       lastDroppedAt: this.lastDroppedAt,
       dropsByLeg: { ...this.dropsByLeg },
@@ -1344,6 +1412,34 @@ export class DexScreenerClient {
     this.dropsByLeg[leg] += 1;
     this.lastDropLeg = leg;
     this.lastDroppedAt = Date.now();
+  }
+
+  /**
+   * Count one pair-batch edge-cache outcome (2xx only — see
+   * PAIR_BATCH_CACHE_TTL_S). Same rule as the list lane and the same regex:
+   * `HIT`/`REVALIDATED` is a batch the origin was not asked for, anything else
+   * is a miss, and a response with no `cf-cache-status` at all counts as a miss
+   * because a hit is the one outcome that needs evidence. Only WHERE the count
+   * lives differs (instance here, the durable journal for lists).
+   */
+  private notePairCacheOutcome(status: string | null): void {
+    this.lastPairCacheStatus = status;
+    if (status !== null && EDGE_CACHE_HIT_RE.test(status)) {
+      this.pairCacheHits += 1;
+      return;
+    }
+    this.pairCacheMisses += 1;
+  }
+
+  /**
+   * Count one pair-batch request the origin REFUSED (non-2xx), mirroring
+   * noteListCacheRefused: without it, `pairCacheMisses` climbing reads the same
+   * whether the edge entry expired or the origin said no — and those two have
+   * opposite fixes (re-size the TTL vs. wait out the refusal).
+   */
+  private notePairCacheRefused(status: number): void {
+    this.pairCacheRefused += 1;
+    this.lastPairCacheStatus = `HTTP-${status}`;
   }
 
   /**
@@ -1393,18 +1489,19 @@ export class DexScreenerClient {
    * allows, and once it is exhausted the call returns null instead of
    * throwing.
    *
-   * `listCacheTtlS` (optional, seconds) asks for the Cloudflare EDGE CACHE on
-   * this request — passed by the two LIST feeds only (see
-   * LIST_FEED_CACHE_TTL_S), never by the pair batches: those are keyed by this
-   * tick's address set and carry the metrics the gates judge, so they must
-   * reach the origin. With the TTL set, a 429 stops costing the tick its list:
-   * a HIT never leaves the colo, and a refused 400/500 is kept out of the cache
-   * by `cacheTtlByStatus`, so nothing bad can be served as if it were fresh.
+   * `edgeCacheTtlS` (optional, seconds) asks for the Cloudflare EDGE CACHE on
+   * this request — passed by the two LIST feeds (LIST_FEED_CACHE_TTL_S) and,
+   * since 2026-09-30, by the pair batches too (PAIR_BATCH_CACHE_TTL_S, a
+   * longer window on the same discipline). With the TTL set, a 429 stops
+   * costing the tick its data: a HIT never leaves the colo, and a refused
+   * 400/500 is kept out of the cache by `cacheTtlByStatus`, so nothing bad can
+   * be served as if it were fresh. The outcome is counted on the LANE's own
+   * ledger (see the `pairLane` split below).
    */
   private async getJson(
     path: string,
     deadline?: number,
-    listCacheTtlS?: number,
+    edgeCacheTtlS?: number,
   ): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1461,14 +1558,15 @@ export class DexScreenerClient {
             headers: { Accept: "application/json" },
             signal: AbortSignal.timeout(left),
           };
-          if (listCacheTtlS !== undefined && listCacheTtlS > 0) {
-            // See LIST_FEED_CACHE_TTL_S. Non-2xx stays OUT of the cache: a 429
-            // must never be served to the next tick as a fresh feed.
+          if (edgeCacheTtlS !== undefined && edgeCacheTtlS > 0) {
+            // See LIST_FEED_CACHE_TTL_S / PAIR_BATCH_CACHE_TTL_S. Non-2xx stays
+            // OUT of the cache: a 429 must never be served to the next tick as
+            // fresh data.
             init.cf = {
               cacheEverything: true,
-              cacheTtl: listCacheTtlS,
+              cacheTtl: edgeCacheTtlS,
               cacheTtlByStatus: {
-                "200-299": listCacheTtlS,
+                "200-299": edgeCacheTtlS,
                 "300-399": 0,
                 "400-599": 0,
               },
@@ -1480,24 +1578,32 @@ export class DexScreenerClient {
         // budget answer, not a failure: the caller already owns its own
         // fallback, and retrying would only spend the caller's window.
         if (res === null) return null;
-        if (listCacheTtlS !== undefined) {
+        if (edgeCacheTtlS !== undefined) {
+          // ONE place decides which LANE an outcome belongs to (the path — the
+          // same dexFeedLeg mapping the drop counters use), so a pair HIT can
+          // never move the list ratio that decides LIST_FEED_CACHE_TTL_S.
+          const pairLane = dexFeedLeg(path) === "pairs";
           if (res.ok) {
             // ONE place counts a list outcome and one place decides what a hit
             // is (see the ledger): a second inline regex here is how the durable
-            // ratio would come to disagree with the page's own reading.
+            // ratio would come to disagree with the page's own reading. The
+            // pair lane reuses the same rule (see notePairCacheOutcome).
             //
             // 2xx ONLY for the hit/miss split, and it is the ratio's meaning
             // that requires it: `cacheTtlByStatus` gives an entry a TTL for
             // 200-299 alone, so a 429/5xx was never a candidate for the edge
             // cache and cannot read as an entry that had EXPIRED.
-            noteListCacheOutcome(res.headers.get("cf-cache-status"));
+            const cacheStatus = res.headers.get("cf-cache-status");
+            if (pairLane) this.notePairCacheOutcome(cacheStatus);
+            else noteListCacheOutcome(cacheStatus);
           } else {
-            // …and the refusal, counted on its OWN row (2026-09-30, see
+            // …and the refusal, counted on its OWN counter (2026-09-30, see
             // noteListCacheRefused): keeping it out of hit/miss was right and
             // keeping it out of the durable record entirely left the one
             // reading the TTL decision needs — "the origin refused us" —
             // invisible. Live: 19 refusals in 21 ticks read `99.8% HIT`.
-            noteListCacheRefused(res.status);
+            if (pairLane) this.notePairCacheRefused(res.status);
+            else noteListCacheRefused(res.status);
           }
         }
         if (res.status === 429) this.note429();
@@ -1802,6 +1908,11 @@ export class DexScreenerClient {
           data = (await this.getJson(
             `/latest/dex/tokens/${batch.join(",")}`,
             deadline,
+            // See PAIR_BATCH_CACHE_TTL_S: the batches are keyed by the address
+            // set, which the edge-cached pool snapshot keeps stable across
+            // ticks, so a cold isolate rides the previous tick's fetch instead
+            // of paying the shared egress (and its 429s) again.
+            PAIR_BATCH_CACHE_TTL_S,
           )) as { pairs?: Array<Record<string, unknown>> } | null;
         } catch (err) {
           // A rate-limited batch means the remaining ones will 429 too — stop

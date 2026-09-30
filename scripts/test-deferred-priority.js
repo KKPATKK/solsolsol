@@ -698,13 +698,17 @@ async function subreqFloorTest() {
 // durable ring measured 17 429s/hour — one per tick-failure). What this client
 // CAN decide is whether the request reaches the origin at all, which is what
 // the GeckoTerminal leg has done since 2026-09-21. These cases pin both halves:
-// the two LIST feeds are asked through the cache, the pair batch never is, and
-// an attempt the throttle queue holds past the caller's window is COUNTED as a
-// drop rather than read as an upstream refusal.
+// the two LIST feeds and the pair batches are asked through the cache, each on
+// its own TTL and ledger (the pair lane's window may never exceed the staleness
+// the in-memory pair cache already serves), and an attempt the throttle queue
+// holds past the caller's window is COUNTED as a drop rather than read as an
+// upstream refusal.
 async function dexListCacheTest() {
   const {
     DexScreenerClient,
     LIST_FEED_CACHE_TTL_S,
+    PAIR_BATCH_CACHE_TTL_S,
+    PAIR_CACHE_TTL_MS,
     PROFILE_FEED_SELF_BUDGET_MS,
   } = require("../dist/dexscreener.js");
   const json = (body, headers = {}) =>
@@ -760,17 +764,49 @@ async function dexListCacheTest() {
   await dex.fetchBoostedTokens(20);
   assert.equal(init.cf && init.cf.cacheEverything, true, "the boosts list rides the same cache");
 
-  // (c) The PAIR batch must NOT be cached: those are the metrics the gates and
-  // the tracker judge (5m volume/change, liquidity), keyed by this tick's
-  // address set, and the client already has its own pair cache for them.
+  // (c) The PAIR batch rides the same cache on its OWN, longer TTL (see
+  // PAIR_BATCH_CACHE_TTL_S): those rows are the metrics the gates and the
+  // tracker judge, so the window is sized against what the client ALREADY
+  // serves from its in-memory pair cache — an edge entry must never be staler
+  // than the warm path — and the outcome is counted on a SEPARATE ledger, so a
+  // pair HIT can never move the ratio that decides LIST_FEED_CACHE_TTL_S.
+  assert.ok(
+    PAIR_BATCH_CACHE_TTL_S * 1000 <= PAIR_CACHE_TTL_MS,
+    "the edge window may never exceed the staleness the in-memory pair cache already serves",
+  );
+  assert.ok(
+    PAIR_BATCH_CACHE_TTL_S >= 60,
+    "and it must cover at least one tick, or every other tick is a boundary MISS",
+  );
   let pairInit = null;
   globalThis.fetch = async (_url, opts = {}) => {
     pairInit = opts;
-    return json({ pairs: [] });
+    return json({ pairs: [] }, { "cf-cache-status": "HIT" });
   };
   dex = new DexScreenerClient(loadConfig({}));
+  const listHitsBeforePairs = dex.getStats().listCacheHits;
+  const listMissesBeforePairs = dex.getStats().listCacheMisses;
   await dex.fetchPairsForTokens(["EDGE_A"]);
-  assert.equal(pairInit.cf, undefined, "the pair batch is never edge-cached");
+  assert.equal(
+    pairInit.cf && pairInit.cf.cacheEverything,
+    true,
+    "the pair batch joins the colo cache",
+  );
+  assert.equal(pairInit.cf.cacheTtl, PAIR_BATCH_CACHE_TTL_S);
+  assert.deepEqual(
+    pairInit.cf.cacheTtlByStatus,
+    { "200-299": PAIR_BATCH_CACHE_TTL_S, "300-399": 0, "400-599": 0 },
+    "a 429/5xx is kept OUT of the pair cache too — a refused batch is never served as fresh metrics",
+  );
+  const pairLaneStats = dex.getStats();
+  assert.equal(pairLaneStats.pairCacheHits, 1, "the pair HIT is counted on the pair lane");
+  assert.equal(pairLaneStats.lastPairCacheStatus, "HIT");
+  assert.equal(
+    pairLaneStats.listCacheHits - listHitsBeforePairs,
+    0,
+    "and it never moves the list lane — that ratio is what decides LIST_FEED_CACHE_TTL_S",
+  );
+  assert.equal(pairLaneStats.listCacheMisses, listMissesBeforePairs);
 
   // (d) A dropped attempt is its own reading. The throttle gap is set wider
   // than the profiles self-budget, which is exactly the live shape the counters

@@ -19,7 +19,7 @@ const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dis
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
-const { passesChgGate, DexScreenerClient } = require("../dist/dexscreener.js");
+const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
 const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
@@ -3908,6 +3908,118 @@ async function main() {
       await dex.fetchPairsForTokens(addrs);
       assert.equal(calls, before, "blocked calls serve cache only (no requests)");
       assert.equal(episodes.length, 1, "no duplicate episode notify while blocked");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("DexScreenerClient: pair batches ride the colo edge cache on their own TTL and ledger", async () => {
+    // The pair batches (/latest/dex/tokens/<addresses>) were the one lane left
+    // off the edge cache (see the 2026-09-26 note beside LIST_FEED_CACHE_TTL_S)
+    // because those rows are the metrics the gates and the tracker judge. They
+    // ride it now (2026-09-30) at PAIR_BATCH_CACHE_TTL_S, and the boundary that
+    // makes that safe is arithmetic, not opinion: the client ALREADY serves pair
+    // data up to PAIR_CACHE_TTL_MS (180s) old from its in-memory map, for every
+    // caller, so an edge entry on a shorter window is never staler than the warm
+    // path — and its outcomes are counted on a SEPARATE ledger, so the ratio
+    // that decides LIST_FEED_CACHE_TTL_S can never be moved by a pair batch.
+    assert.ok(
+      PAIR_BATCH_CACHE_TTL_S * 1000 <= PAIR_CACHE_TTL_MS,
+      "the edge window may never exceed the staleness the in-memory pair cache already serves",
+    );
+    assert.ok(PAIR_BATCH_CACHE_TTL_S >= 60, "one tick of coverage is the floor");
+    const origFetch = globalThis.fetch;
+    const addrs = Array.from({ length: 30 }, (_, i) => `MINT${i}`.padEnd(44, "x"));
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" });
+
+    // (a) A HIT asks for the cache, is counted on the pair lane, and leaves the
+    // list lane's ledger exactly where it was.
+    let init = null;
+    globalThis.fetch = async (_url, opts = {}) => {
+      init = opts;
+      return new Response(JSON.stringify({ pairs: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "cf-cache-status": "HIT" },
+      });
+    };
+    try {
+      const dex = new DexScreenerClient(cfg);
+      const listHitsBefore = dex.getStats().listCacheHits;
+      const listMissesBefore = dex.getStats().listCacheMisses;
+      const listRefusedBefore = dex.getStats().listCacheRefused;
+      await dex.fetchPairsForTokens(addrs);
+      assert.equal(init.cf && init.cf.cacheEverything, true, "a pair batch joins the colo cache");
+      assert.equal(init.cf.cacheTtl, PAIR_BATCH_CACHE_TTL_S, "on the pair lane's own window");
+      assert.deepEqual(
+        init.cf.cacheTtlByStatus,
+        { "200-299": PAIR_BATCH_CACHE_TTL_S, "300-399": 0, "400-599": 0 },
+        "a 429/5xx is kept OUT: a refused batch must never be served as fresh metrics",
+      );
+      const stats = dex.getStats();
+      assert.equal(stats.pairCacheHits, 1, "the HIT is counted on the pair lane");
+      assert.equal(stats.pairCacheMisses, 0);
+      assert.equal(stats.pairCacheRefused, 0);
+      assert.equal(stats.lastPairCacheStatus, "HIT", "and the label is the one the edge sent");
+      assert.equal(stats.listCacheHits, listHitsBefore, "a pair HIT must not move the list ledger");
+      assert.equal(stats.listCacheMisses, listMissesBefore);
+      assert.equal(stats.listCacheRefused, listRefusedBefore);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    // (b) A 2xx with no cf-cache-status at all is a MISS — a hit is the one
+    // outcome that needs evidence.
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ pairs: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const dex = new DexScreenerClient(cfg);
+      await dex.fetchPairsForTokens(addrs);
+      const stats = dex.getStats();
+      assert.equal(stats.pairCacheHits, 0);
+      assert.equal(stats.pairCacheMisses, 1, "no header means the origin answered");
+      assert.equal(stats.lastPairCacheStatus, null, "and nothing claims a provenance it was not given");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    // (c) A refusal is counted apart, with its code as the label: `misses`
+    // climbing must not read the same whether the entry expired or the origin
+    // said no (the lesson listCacheRefused already encodes).
+    globalThis.fetch = async () =>
+      new Response("rate limited", {
+        status: 429,
+        headers: { "cf-cache-status": "BYPASS" },
+      });
+    try {
+      const dex = new DexScreenerClient(cfg);
+      await dex.fetchPairsForTokens(addrs);
+      const stats = dex.getStats();
+      assert.equal(stats.pairCacheRefused, 1, "the refusal has its own counter");
+      assert.equal(stats.pairCacheMisses, 0, "and it is not a miss — it was never a cache candidate");
+      assert.equal(stats.lastPairCacheStatus, "HTTP-429");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    // (d) Lane separation the other way: a list fetch never moves the pair
+    // counters.
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([{ chainId: "solana", tokenAddress: "EDGE_L" }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "cf-cache-status": "MISS" },
+      });
+    try {
+      const dex = new DexScreenerClient(cfg);
+      await dex.fetchLatestSolanaProfiles();
+      const stats = dex.getStats();
+      assert.equal(stats.pairCacheMisses, 0, "the pair lane counts pair batches only");
+      assert.equal(stats.pairCacheHits, 0);
+      assert.equal(stats.pairCacheRefused, 0);
+      assert.equal(stats.lastPairCacheStatus, null);
+      assert.equal(stats.lastListCacheStatus, "MISS");
     } finally {
       globalThis.fetch = origFetch;
     }

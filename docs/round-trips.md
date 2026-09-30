@@ -3587,3 +3587,76 @@ curl -s .../debug/pushes | jq .total          # 仍然相等
 - **repo 以外嘅寫入者**照舊睇唔到（同 §4.50 一樣）：Turso CLI 直接打 SQL 刪 `seen_tokens` 仍然要等重算兜底。
 - **兩邊嘅定義**：`/debug/pushes.total` 係 `listSeenTokens().length`（live 表），`pushedTotal` 係計數器 —— 今次令佢哋喺刪除之後都保持相等。
 - **同 `LIST_FEED_CACHE_TTL_S = 60`、pair 批次 edge cache 等項目無關**，今次冇碰任何 feed 腿。
+
+→ **同日已做**：pair 批次而家都上咗 edge cache（自己一條 120 秒窗口、自己一本帳）—— 見 §4.52。
+
+## 4.52 Pair 批次（`/latest/dex/tokens`）上 colo edge cache：120 秒、同 list 分帳（2026-09-30）
+
+### 一、問題：呢條腿一直係唯一冇上 edge cache 嘅高頻 lane
+
+§4.50／§4.51 嘅界線都寫住「pair 批次 edge cache」係另一個未碰嘅項目，今次就係嗰個。
+
+2026-09-26 嘅註解（`LIST_FEED_CACHE_TTL_S` 旁邊）寫得好白：list feed 騎 edge cache，但
+`/latest/dex/tokens` **故意唔騎** —— (a) 佢載住 gate／tracker 判嘅 metrics（5m 量／幅、liquidity），
+(b) 佢個 key 係「呢個 tick 手上嗰組 address」，(c) client 自己已經有 in-memory pair cache。
+
+今日睇返，(c) 恰恰就係 (a) 嘅答案：`fetchPairsForTokens` **喺 wire 之前一定先查 `pairCache`**，
+而嗰個 cache 嘅 TTL 係 `PAIR_CACHE_TTL_MS = 180_000`（180 秒）—— 即係話**所有** caller
+（scan、tracker pass、`/debug` 探針）而家已經接受咗「最多 180 秒舊」嘅 pair 數據。
+邊界就係 isolate：每分鐘一個 tick、isolate 不斷被回收（同 `POOL_EDGE_CACHE_URL` 嗰段講嘅同一件事），
+所以大部分 tick 都係 **cold** —— 明明上一個 tick 先啱啱拉過同一組 batch，都要由 origin 再拉一次。
+
+### 二、改動：同一套 `cf`，窗口 120 秒，同 list 分帳
+
+| | list feeds（不變） | pair 批次（新） |
+|---|---|---|
+| 常數 | `LIST_FEED_CACHE_TTL_S = 60` | **`PAIR_BATCH_CACHE_TTL_S = 120`** |
+| `cf` | `cacheEverything` + `cacheTtl` + `cacheTtlByStatus` | 一樣（200-299 = TTL、300-399 = 0、**400-599 = 0**）|
+| 命中記喺 | module ledger → durable `dex_list_cache_*`（`/health.dexListCache`）| **instance counters → `getStats()` → tick summary 個 `dex` 區塊** |
+| 拒絕記喺 | `listCacheRefused` | `pairCacheRefused`（label = `HTTP-<code>`）|
+
+- **120 秒嘅理由**：兩個 60 秒 tick 加 jitter 都食得落同一張 entry（60 秒會令隔一個 tick 一定係 boundary MISS），
+  而 120 ≤ 180 —— edge 永遠唔會比 warm path 本身更舊。呢條不等式由測試釘死
+  （`PAIR_BATCH_CACHE_TTL_S * 1000 <= PAIR_CACHE_TTL_MS`；為此把 `PAIR_CACHE_TTL_MS` export 咗）。
+- **key 就係 address set**：batch URL 本身就係 key 嘅全部。個 set 之所以會重複，係因為 pool snapshot 都上咗 edge cache
+  （`POOL_EDGE_CACHE_URL`，TTL = `REEVAL_POOL_CACHE_SECONDS` 90s）—— 同一個 rotation slot 內，cold isolate 拿到嘅
+  地址組一模一樣，所以 batch URL 一模一樣。呢兩層係配套嘅。
+- **非 2xx 照舊唔入 cache**（`cacheTtlByStatus` 400-599 = 0）：429／5xx 永遠唔會變成下一 tick 嘅「新鮮 metrics」。
+- **次序照舊**：先 in-memory `pairCache`（嗰度命中係零請求），再 wire；`batchBlockedUntil` 武裝期間**一律唔 dispatch**
+  —— 唔會借 edge cache 繞過 429 退避，因為 MISS 始終會去 origin。
+- **唔會撈亂 list 帳**：`getJson` 用 `dexFeedLeg(path)` 分 lane（同 drop 計數用同一個 mapping），pair 嘅 outcome 只入 instance counters，
+  list ledger 一個數都唔會動；反方向亦然。
+
+### 三、測試（main suite 440 → **441 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+1. `scripts/test-unit.js` 新測試「`DexScreenerClient: pair batches ride the colo edge cache on their own TTL and ledger`」：
+   (a) HIT ⇒ `cf` 齊、`cacheTtl = PAIR_BATCH_CACHE_TTL_S`、`400-599: 0`、`pairCacheHits 1`、`lastPairCacheStatus "HIT"`，
+   而且 `listCacheHits/Misses/Refused` 一個都唔動；(b) 冇 `cf-cache-status` 嘅 200 ⇒ 算 miss（hit 係唯一需要證據嘅結果）；
+   (c) 429 ⇒ `pairCacheRefused 1`、`lastPairCacheStatus "HTTP-429"`、**唔算** miss；(d) list fetch 唔會動 pair counters。
+   另外釘死 TTL 不等式同下限 60。
+2. `scripts/test-deferred-priority.js` 嗰條舊 assert（`pairInit.cf === undefined`「never edge-cached」）連頭部註解一齊改寫：
+   而家釘嘅係 pair 批次**騎** cache、`cacheTtl = PAIR_BATCH_CACHE_TTL_S`、非 2xx 規則、hit 入 pair 帳而 list 帳不動。
+
+### 四、驗收（deploy 後）
+
+```bash
+curl -s .../health | jq '.heartbeat.summary.dex | {pairCacheHits, pairCacheMisses, pairCacheRefused, lastPairCacheStatus}'
+```
+
+讀法：**`pairCacheHits` 上升**而 `pairCacheMisses` 只佔少數 ⇒ origin 真係被慳返；
+`pairCacheRefused > 0` 代表嗰批 request 去到 origin 被 429（同 cache 無關，睇 `http429`／`blockedForMs`）。
+因為 counters 係 instance state，讀數要喺**跑咗 scan 嗰個 tick 嘅 summary**（`/health.heartbeat.summary` 就係嗰個）度睇，
+唔係去撞一個新鮮 isolate 嘅 `/health` 頂層。
+
+### 五、界線（老實講）
+
+- **未 deploy**：全部只係 repo 內；上面驗收係 deploy 之後嘅事。
+- **HIT 都係一個 subrequest**：慳嘅係 **origin call**（連帶 429 風險同 300-800ms latency），唔係 subrequest 預算。
+  Tail batch 少咗機會被 origin latency 鋸走係副作用，唔係保證。
+- **命中率取決於 address set 穩定性**：rotation slice 一換（slot 前進），batch URL 就換；isolate 喺 slot 尾才跑嘅話，
+  第一個 tick 仍然係 MISS。真實命中率要 deploy 後睇 `pairCacheHits`／`pairCacheMisses` 先知 120 秒啱唔啱。
+- **退避期間唔會讀 edge**：`batchBlockedUntil` 武裝時唔 dispatch ⇒ 嗰 90 秒內 pair 數據只可以來自 in-memory／早前嘅結果。
+  冇改成「blocked 都讀 edge」，因為 MISS 會直接撞 origin，同退避嘅目的相反。
+- **跨 colo 唔共享**：edge cache 係 per-colo（list feed 一直如此）。
+- **120 秒係常數**：冇 env knob，要收返就要 redeploy（同 `LIST_FEED_CACHE_TTL_S` 一樣）。
+- **metrics 最多舊 120 秒**，仍然 ≤ in-memory cache 一直接受嘅 180 秒；gate 冷卻 ≥30 分鐘、age 窗 28 小時，所以判斷類別不變。
