@@ -1357,6 +1357,79 @@ async function main() {
     assert.match(String(out2.note), / muted 1/);
   });
 
+  // PUSH_WATCH_MUTE extended (2026-09-30, 「暫時不需要推送：持倉增長、籌碼集中」):
+  // 📈 hold and ⚡ div join the switch. These two are the cards whose VALUE is
+  // the transition they leave behind, not the message, so the assertions are on
+  // the WRITES as much as on the silence: a muted 📈 must still roll the holder
+  // baseline forward (rolling 1,000 → 1,200 is what makes lifting the mute later
+  // wait for the NEXT +10% instead of dumping the whole backlog at once), and a
+  // muted ⚡ must still land its `div` mark (the once-per-activation memory that
+  // a 📈/🚀 wiping lastState would otherwise let re-fire).
+  await test("PushWatcher: PUSH_WATCH_MUTE withholds 📈 hold and ⚡ div and still writes their marks", async () => {
+    const texts = [];
+    const bot = { api: { sendMessage: async (_c, text) => { texts.push(text); return { message_id: 3 }; } } };
+    const make = (db, cfg, pairFor) =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        cfg,
+        async (addrs) => new Map(addrs.map((a) => [a, pairFor(a)])),
+        null,
+      );
+    // Flat mcap and flat volume: the ONLY alert in play is the muted one.
+    const flatPair = (a) => termPair(a, 50_000);
+    const muted = loadConfig({ PUSH_WATCH_MUTE: "hold,div" });
+
+    // (a) 📈 持倉增長 muted: no card, and the baseline rolls 1,000 → 1,200.
+    const holdRow = () => termRow({ upStages: null, holdersAtPush: 1_000, holdersLast: 1_200 });
+    const dbHold = termDb([holdRow()]);
+    const outHold = await make(dbHold, muted, flatPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the 📈 card is withheld");
+    assert.equal(outHold.muted, 1, "the pass reports the withheld card");
+    assert.match(String(outHold.note), / muted 1/);
+    assert.equal(outHold.undelivered, 0, "a withheld card is not a failure");
+    assert.equal(dbHold.updated.length, 1);
+    const [, wHold] = dbHold.updated[0];
+    assert.equal(wHold.holdersAtPush, 1_200, "the holder baseline still rolls forward");
+    assert.equal(wHold.followupsSent, 1, "the announcement still counts as one");
+
+    // CONTROL: the same row without the mute delivers the card.
+    const dbHoldCtl = termDb([holdRow()]);
+    await make(dbHoldCtl, loadConfig({}), flatPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "without the mute the 📈 card goes out");
+    assert.match(String(texts[0]), /📈 持倉增長/);
+
+    // (b) ⚡ 籌碼集中 muted: no card, and the `div` mark still lands.
+    const divRow = () =>
+      termRow({
+        upStages: null,
+        mcapAtPush: 50_000,
+        peakMcap: 70_000,
+        holdersAtPush: 1_000,
+        holdersLast: 850,
+      });
+    // +30% price on a −15% holder base (the JEFFERY shape).
+    const divPair = (a) => ({ ...termPair(a, 50_000), marketCap: 65_000 });
+    texts.length = 0;
+    const dbDiv = termDb([divRow()]);
+    const outDiv = await make(dbDiv, muted, divPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the ⚡ card is withheld");
+    assert.equal(outDiv.muted, 1);
+    assert.equal(dbDiv.updated.length, 1);
+    const [, wDiv] = dbDiv.updated[0];
+    assert.ok(
+      String(wDiv.upStages).split(",").includes("div"),
+      `the div mark lands anyway: ${wDiv.upStages}`,
+    );
+
+    // CONTROL: unmuted, the same row sends the ⚡ card.
+    const dbDivCtl = termDb([divRow()]);
+    await make(dbDivCtl, loadConfig({}), divPair).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "without the mute the ⚡ card goes out");
+    assert.match(String(texts[0]), /⚡ 籌碼集中/);
+  });
+
   // The invocation's subrequest ceiling, threaded into the pass (2026-09-24).
   // Live: the front spent 47 of the 50 Workers Free allows on a cold isolate,
   // and the pass behind it — which needs `trips 5`-`8` plus its pair batch —
@@ -3890,11 +3963,12 @@ async function main() {
   await test("loadConfig: PUSH_WATCH_MUTE parses the tracker's muted card sigs", () => {
     // Default: nothing is muted — shipping the mute must not silence any card
     // until an operator sets the variable (the three sigs are the audit ring's
-    // own: liqwarn ⚠️ 流動性跌穿地板, drain 💧 流動性枯竭, recap 🏁 結案報告).
+    // own: liqwarn ⚠️ 流動性跌穿地板, drain 💧 流動性枯竭, recap 🏁 結案報告,
+    // hold 📈 持倉增長, div ⚡ 籌碼集中).
     assert.deepEqual(loadConfig({}).pushWatch.mutedSigs, []);
     assert.deepEqual(
-      loadConfig({ PUSH_WATCH_MUTE: "liqwarn,drain,recap" }).pushWatch.mutedSigs,
-      ["liqwarn", "drain", "recap"],
+      loadConfig({ PUSH_WATCH_MUTE: "liqwarn,drain,recap,hold,div" }).pushWatch.mutedSigs,
+      ["liqwarn", "drain", "recap", "hold", "div"],
     );
     // Normalized (case/space) and deduped. An UNKNOWN sig stays in the list
     // but matches no card — a typo can only leave a card visible, never

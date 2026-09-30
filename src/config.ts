@@ -80,8 +80,9 @@ export function parseAdminIds(raw: string | undefined): number[] {
  * lower-cased, deduped list (pure — unit-tested). Empty/missing → [] (nothing
  * muted). The sigs are the delivery audit's own: `liqwarn` = the ⚠️ 流動性跌穿
  * 地板 warning, `drain` = the 💧 流動性枯竭 terminal card, `recap` = the 🏁
- * 結案報告 window summary. An unknown sig is INERT — it matches no card — so a
- * typo can only leave a card visible, never silence the wrong one.
+ * 結案報告 window summary, `hold` = the 📈 持倉增長 card, `div` = the ⚡
+ * 籌碼集中 card. An unknown sig is INERT — it matches no card — so a typo can
+ * only leave a card visible, never silence the wrong one.
  */
 export function parseMutedCardSigs(raw: string | undefined): string[] {
   if (!raw) return [];

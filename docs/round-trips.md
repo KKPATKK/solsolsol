@@ -3795,3 +3795,44 @@ Operator 問「有咩跟進推送幫我即時捕捉入市位」。盤點現有 1
 - **🔥 嘅 10 分鐘 pace 係略過，唔係延遲**：10 分鐘內嘅第二次 burst 唔會補發。
 - **卡片量會升**，要觀察實際噪音；三隻新 sig 可以隨時用 `PUSH_WATCH_MUTE` 獨立收掉。
 - **門檻（-15/-45、+8%、$8K、1.2:1、+20%）係初版拍訝**：冇歷史 replay 引擎，所以 deploy 後要睇 audit ring 嘅實際命中同噪音再調（歷史上 §4.11 嘅 📈、§4.12 嘅 w35 都調過）。
+
+## 4.55 靜音擴到 📈 持倉增長同 ⚡ 籌碼集中（2026-09-30）
+
+### 一、需求
+
+Operator 話「暫時不需要推送：持倉增長、籌碼集中」，即 §4.53 開關加兩隻 sig：`hold`（📈 持倉增長）同 `div`（⚡ 籌碼集中）。
+同上次一樣係「暫時唔想收到」，唔係唔想再追蹤 —— 引擎行為要完全不變，un-mute 之後亦唔可以補發一堆舊卡。
+
+### 二、做法：只改 wrangler var，零引擎改動
+
+| 位置 | 改動 | 為何 |
+|---|---|---|
+| `wrangler.toml` | `PUSH_WATCH_MUTE = "liqwarn,drain,recap,hold,div"`（＋註解補兩行 sig 對照） | 開關係 deploy 層，同 §4.53 一模一樣；`hold`／`div` 都係 audit ring 嘅真 sig，唔會靜錯卡 |
+| `src/config.ts` | `parseMutedCardSigs` 嘅 doc comment 補 `hold`／`div` | 文件同實況一致；parser 本身零改動 |
+
+要點：
+
+1. **兩張卡嘅價值喺「留低嘅 transition」，唔喺條訊息**：muted 📈 仍然 roll holder baseline 向前（1,000 → 1,200），所以第日 un-mute 之後係等「下一個 +10%」而唔係一次過倒成個 backlog 出嚟；muted ⚡ 仍然落 `div` mark（一旦被 📈/🚀 蓋掉 `lastState`，冇咗個 mark 就會重複發同一個 activation）。呢兩點係 §4.53「muted 卡照計 announced、transition 照 land」嘅直接推論，但今次有測試釘實。
+2. **唔慳成本**：靜音只係截喺 send 口，Birdeye 持倉探測同 CU 消耗照舊 —— 想真正停咗個持倉追蹤係另一件事（改 `PUSH_WATCH_HOLDER_*` 或者關 Birdeye），今次冇做。
+
+### 三、測試（main suite 446 → **447 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+- `loadConfig: PUSH_WATCH_MUTE parses the tracker's muted card sigs` —— 加咗 `hold`／`div` 落期望值。
+- `PushWatcher: PUSH_WATCH_MUTE withholds 📈 hold and ⚡ div and still writes their marks` —— (a) muted 📈：冇卡、`muted 1`、`holdersAtPush` 由 1,000 滾到 1,200、`followupsSent` 照計 1；unmuted control 照出 📈。(b) muted ⚡：冇卡，`upStages` 照樣有 `div`；unmuted control 照出 ⚡。
+
+### 四、驗收（deploy 後）
+
+```bash
+curl -s .../debug/push-watch | jq '.mutedSigs'
+# 期望 ["liqwarn","drain","recap","hold","div"]
+```
+
+- 📈／⚡ 由 chat 消失；`/debug/push-audit` ring 唔再新增 `hold`／`div` 條目；
+- 持倉 baseline 照樣向前滾（`/debug/push-watch` row 嘅 `upStages` 之外，📈 之前發過嘅 row 應該唔會因為 un-mute 而回帶）；
+- 呢個唔影響 §4.54 三張入場卡（`pullback`／`reclaim`／`ignite` 全部照出）。
+
+### 五、界線（老實講）
+
+- **同 §4.53 同一條界線**：反轉要改 wrangler var ＋ redeploy，冇 Telegram 指令；目前只有一個 chat（530602939），全局＝單 chat。
+- **靜音 ≠ 停止追蹤**：muted ⚡ 唔會出現喺 ring，但佢個 mark 有寫；唔可以靠 ring 推論「⚡ 冇再觸發過」。
+- **呢兩張卡係最有「行為記憶」嘅兩張**：以後如果想 un-mute 其中一張，建議只 un-mute 一張，睇一日 ring 再決定第二張。
