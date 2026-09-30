@@ -3862,7 +3862,7 @@ Operator 話「暫停 Birdeye 持倉探測同 CU 消耗」—— 即係唔止唔
 
 ### 三、測試（main suite 447 → **448 passed, 0 failed**；其餘 7 個 suite 全綠）
 
-- `PushWatcher: PUSH_WATCH_MAX_HOLDER_CHECKS=0 stops the Birdeye probe instead of discarding it` —— `probes === 0`、冇 holder write、`holder_probe_at` **零讀取**、note `probe0 miss0`；control（預設 config）照樣发 1 次 probe。
+- `PushWatcher: PUSH_WATCH_MAX_HOLDER_CHECKS=0 stops the Birdeye probe instead of discarding it` —— `probes === 0`、冇 holder write、`holder_probe_at` **零讀取**、note `probe0 miss0`；control（預設 config）照樣發 1 次 probe。
 
 ### 四、驗收（deploy 後）
 
@@ -3878,8 +3878,11 @@ curl -s .../health | jq '.birdeyeCu.byEndpoint.today'        # tokenOverview 應
 
 ### 五、界線（老實講）
 
-- **停掉 probe 之後，已經寫入嘅 `holders_at_push`/`holders_last` 會變凍結舊值**：第日如果直接 un-mute 卡（而 `PUSH_WATCH_MAX_HOLDER_CHECKS` 仍係 0），⚡ `div` 係有機會根據陳年 baseline 錯誤發炮。要恢復持倉卡，**必須同時**把 probe 開返。
-- **已經 arm 嘅 `div` mark 只有價格那條腿可以清**：`divActive = chgSincePush ≥ 25% && holderRatio ≤ 0.9`。probe 關掉之後 `holdersLast` 凍結（唔再寫），所以 `holderRatio ≤ 0.9` 會一直為真，mark 只可以靠 `chgSincePush` 跌返 25% 以下才清。今日實測：靜音前後 ring 內 `hold`／`div` 都係 0 筆，所以呢個係「將來要留意」而唔係現時已存在嘅隱患。
+- **停掉 probe 之後，已寫入嘅 `holders_at_push` / `holders_last` 會凍結，但「凍結」倒向邊邊要睇凍結嗰刻嘅 ratio**（原本呢句寫成「⚡ 有機會根據陳年 baseline 發炮」；2026-09-30 量完之後收緊如下）：
+  - `holderRatio > 0.9` —— **實測就係呢個情況**：`divActive` 嘅 holder 腿恆假，所以 ⚡ 唔係誤發，係**完全發唔出**（un-mute 都一樣，note 只會繼續 `holders 0/0`）；同時任何帶住 `div` mark 嘅 row，下一個 pass 會被 `!divActive` 嗰條 un-arm 分支刪走（即「只有價腿可以清 mark」在呢個情況下係反過來：holder 腿無條件清）。
+  - `holderRatio ≤ 0.9` —— 先至係原本寫嘅風險（mark 淨靠價腿維持 active）。但要形成佢，**同一條 row 要連續兩次 probe 都真係見到 ≥10% 跌幅**，而 `PUSH_WATCH_HOLDER_MIN_GAP_MIN=60` 令全隊一個鐘只買到 ~1 個 count，機會比想像中低。
+- **點解實測係 `ratio = 1.000`**：`db.setPushWatchHolders*` 寫嘅係 `holders_at_push = COALESCE(holders_at_push, ?), holders_last = ?` —— 兩條 column 收**同一粒數**，而 baseline 係由**第一次成功 probe** seed（見 §4.16），所以 seed 嗰刻必然 Last = AtPush（ratio 由 1.000 開始），要跌到 < 1 就必須有**第二次** probe。實測（2026-09-30 17:38Z）：6 條有讀數嘅 row **全部 `ratio 1.000`**（606/606、169/169、2071/2071、1756/1756、1467/1467、302/302），`up_stages` 冇任何 `div`／`hold`。
+- **2026-09-30 確認 probe 真係停咗（四個獨立讀數）**：`maxHolderChecksPerTick 0`；pass note `holders 0/0 held0 cut0 probe0 miss0`；`birdeyeCu.byEndpoint.today.tokenOverview` 停在 10 calls / 200 CU；6 條 row 嘅 `holdersCheckedAt` 停留喺 03:16–09:18Z（即 `002e0c9` deploy 09:32:49Z 之前），之後 8.3–14.4 個鐘零寫入。所以「停 probe ⇒ ⚡ 亂發炮」唔成立，真正後果係 ⚡ 靜音；要開返 = 改 `PUSH_WATCH_MAX_HOLDER_CHECKS` 回正數（預設 4／硬上限 10）**同** 由 `PUSH_WATCH_MUTE` 移除 `div` 兩件事一齊做（`hold` 可留）。
 - **呢個開關唔慳 Turso**：省的只是 Birdeye CU（及相應 subrequest），其他 round trips 不變。
 - 反轉要 redeploy（wrangler var），冇 Telegram 指令。
 
