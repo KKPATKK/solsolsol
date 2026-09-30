@@ -4201,6 +4201,13 @@ export class Scanner {
       // metrics and no timestamps: the age comes from the pair.
       // Sized by DEXSCREENER_BOOSTS_LIMIT (0 = disabled); best-effort — a
       // failure is [] and the tick continues.
+      //
+      // `feedDeadline` is passed INTO the fetch as well as used as this job's
+      // race: the boosts leg is the tick's SECOND DexScreener request and pays a
+      // throttle gap, so its budget is that gap plus an attempt — and this tick's
+      // window is the cap on what it may pay (see BOOST_FEED_SELF_BUDGET_MS).
+      // The leg does the drop itself, so a gap the window cannot hold reads as
+      // `dropsByLeg.boosts` instead of as an empty list.
       let boostProfiles: TokenProfile[] = [];
       if (
         this.dex &&
@@ -4209,7 +4216,11 @@ export class Scanner {
       ) {
         feedJobs.push(
           this.fetchFeedCapped(
-            async () => this.dex!.fetchBoostedTokens(this.config.dexscreenerBoostsLimit),
+            async () =>
+              this.dex!.fetchBoostedTokens(
+                this.config.dexscreenerBoostsLimit,
+                feedDeadline,
+              ),
             [],
             feedDeadline,
           )

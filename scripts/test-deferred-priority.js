@@ -882,6 +882,66 @@ async function dexListCacheTest() {
     "exactly two requests reached the network: the dropped attempt was never sent",
   );
 
+  // ---------- the boosts leg pays ONE gap — and asks for it ----------------
+  // The boosts list is the tick's SECOND DexScreener request, so unlike the
+  // profiles list it always pays a throttle gap. Its budget was the same
+  // constant 480ms the profiles leg spends on its whole call, i.e. SMALLER than
+  // one widened gap: at a 640ms queue (two raises on the adaptive ladder) the
+  // slot check dropped the attempt WITHOUT SENDING IT, so the tick read
+  // `boosts 0` with http429 flat. Live 2026-09-30 audit: delivered on 4 of 10
+  // sampled ticks, dropsByLeg.boosts carrying the other 6. The budget is now
+  // the leg's own slot plus one attempt (BOOST_FEED_ATTEMPT_MS), so the ladder's
+  // 640/1024 steps ask and answer again instead of silently dropping.
+  const gapUrls = [];
+  globalThis.fetch = async (url) => {
+    gapUrls.push(String(url));
+    return json([{ chainId: "solana", tokenAddress: "EDGE_F" }]);
+  };
+  dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "640" }));
+  await dex.fetchLatestSolanaProfiles(); // takes the tick's first slot (t0)
+  const gapBoost = await dex.fetchBoostedTokens(20); // slot t0+640, inside slot + attempt
+  const gapStats = dex.getStats();
+  assert.deepEqual(
+    gapBoost.map((p) => p.tokenAddress),
+    ["EDGE_F"],
+    "a widened gap no longer drops the leg: it is ASKED, and answered",
+  );
+  assert.equal(gapStats.budgetDrops, 0, "...so nothing is counted as a drop");
+  assert.deepEqual(
+    gapStats.dropsByLeg,
+    { profiles: 0, boosts: 0, pairs: 0, other: 0 },
+    "no leg is blamed for a request that was sent",
+  );
+  assert.deepEqual(
+    gapUrls.map((u) => (u.includes("token-boosts") ? "boosts" : "profiles")),
+    ["profiles", "boosts"],
+    "both requests reached the network — the leg pays the gap instead of vanishing behind it",
+  );
+
+  // ...and the CAP still ends the leg when the gap cannot fit the caller's OWN
+  // window: at the 1200ms ceiling the slot + attempt outlives the feed phase, so
+  // the answer would be raced away and the pair phase would pay the gap anyway.
+  // That case must stay a NAMED drop (dropsByLeg.boosts), never an empty list —
+  // "never asked" and "the upstream returned nothing" cannot look alike.
+  let capOnlyProfiles = 0;
+  globalThis.fetch = async (url) => {
+    if (!String(url).includes("token-boosts")) capOnlyProfiles++; // the boosts leg must not be sent
+    return json([{ chainId: "solana", tokenAddress: "EDGE_G" }]);
+  };
+  dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "1200" }));
+  await dex.fetchLatestSolanaProfiles(); // first slot (t0), no wait
+  const capped = await dex.fetchBoostedTokens(20, Date.now() + 200); // window far shorter than the gap
+  const capStats = dex.getStats();
+  assert.deepEqual(capped, [], "a gap the tick's window cannot hold is not attempted");
+  assert.equal(capOnlyProfiles, 1, "only the profiles list reached the network");
+  assert.equal(capStats.budgetDrops, 1, "the leg names it as a drop instead of reporting an empty list");
+  assert.deepEqual(
+    capStats.dropsByLeg,
+    { profiles: 0, boosts: 1, pairs: 0, other: 0 },
+    "and the leg it blames is the one that wanted the slot",
+  );
+  assert.equal(capStats.lastDropLeg, "boosts");
+
   // ---------- the PAIR phase stops at the window, not at a drop -------------
   // Its tail batches used to be enqueued only for the queue to hold them past
   // PAIRS_FETCH_BUDGET_MS: each consumed a 250ms slot (delaying the legs behind

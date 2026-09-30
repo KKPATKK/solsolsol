@@ -178,8 +178,45 @@ export const PROFILE_FEED_REUSE_MS = 30 * 60_000;
  * shape as the profiles feed's budget: one request, no retry chain worth
  * waiting for. It is an OPTIONAL leg in the scanner (dropOptionalLeg), so a
  * 429 here costs one list, not the tick.
+ *
+ * WHY IT IS A FLOOR AND NOT THE WHOLE BUDGET (2026-09-30). 480 is the same
+ * number the profiles leg spends on its whole call, and for the boosts leg that
+ * arithmetic only holds while the throttle queue is FREE. The profiles list is
+ * dispatched at tick start and takes the tick's first slot; this leg is the
+ * tick's SECOND DexScreener request and therefore always pays a gap — the
+ * queue spaces request STARTS `intervalMs` apart, globally across callers (see
+ * Throttle). One gap at the configured 250ms still fits inside 480, which is
+ * why the leg answers on a healthy day. The gap stops fitting the moment the
+ * 429 controller widens the queue, and getJson's slot check then drops the
+ * attempt WITHOUT SENDING IT: the tick reads `boosts 0` with `http429` flat,
+ * and the only trace is `dropsByLeg.boosts`.
+ *
+ * MEASURED (2026-09-30 audit, live): the boosts list was delivered on 4 of 10
+ * sampled ticks and dropped on 6, with `dropsByLeg.boosts` carrying the drops,
+ * while the spacing sat on the adaptive ladder (250 → 400 → 640 → 1024 →
+ * 1200). That is NOT the trade the drop was written for: nothing else in the
+ * tick's feed window is queued behind this leg (the pair phase is enqueued
+ * after the feed phase joins), so the drop bought no headroom for another leg
+ * and cost the tick its entire boosts list.
+ *
+ * SO THE BUDGET IS THE SLOT, NOT A CONSTANT: the deadline in fetchBoostedTokens
+ * is this leg's own slot (Throttle.nextSlotAt) plus one attempt
+ * (BOOST_FEED_ATTEMPT_MS) — what the leg must actually wait for — and the
+ * caller's feed window is passed in as a CAP, so a gap the tick cannot afford
+ * still ends the leg rather than spending a slot whose answer the scanner's own
+ * race would throw away.
  */
 export const BOOST_FEED_SELF_BUDGET_MS = 480;
+
+/**
+ * The attempt the boosts leg keeps AFTER its queue gap: one shared-egress
+ * answer, i.e. the same 480ms the profiles leg spends on its whole call (its
+ * queue is empty, this leg's is not). Added to the leg's SLOT rather than to a
+ * constant, so the same arithmetic holds at the 250ms base and on the widened
+ * ladder: the leg asks for its slot + an attempt, and is dropped only when that
+ * does not fit the window it was handed.
+ */
+const BOOST_FEED_ATTEMPT_MS = 480;
 
 /**
  * Edge-cache TTL for the two LIST feeds (`/token-profiles/latest/v1`,
@@ -1668,12 +1705,39 @@ export class DexScreenerClient {
    * — NO metrics and NO timestamps, exactly like a profile row — so the age
    * comes from the pair the next batch fetches (and a boost mint with no pair
    * is skipped, not mis-aged, see the stats loop in scanner.ts).
+   *
+   * `feedWindowDeadline` (optional, ms epoch) is the caller's own window — the
+   * scanner's `feedDeadline`. See BOOST_FEED_SELF_BUDGET_MS for why the budget
+   * is the queue SLOT plus an attempt, and why a gap that does not fit that
+   * window ends the leg instead of spending a slot the tick cannot use.
    */
-  async fetchBoostedTokens(limit: number): Promise<TokenProfile[]> {
+  async fetchBoostedTokens(
+    limit: number,
+    feedWindowDeadline?: number,
+  ): Promise<TokenProfile[]> {
     // Off by default (DEXSCREENER_BOOSTS_LIMIT = 0) — the leg must cost
     // nothing when disabled, not even a request.
     if (!(limit > 0)) return [];
-    const deadline = Date.now() + BOOST_FEED_SELF_BUDGET_MS;
+    // THE SLOT IS DECIDED BEFORE IT IS SPENT here too, and the budget is what
+    // the slot costs: this leg is the tick's second DexScreener request, so it
+    // must wait one gap before its own attempt starts (see
+    // BOOST_FEED_SELF_BUDGET_MS). A free queue still answers inside the same
+    // 480ms the profiles leg gets, so nothing changes on a healthy tick.
+    const deadline = Math.max(
+      Date.now() + BOOST_FEED_SELF_BUDGET_MS,
+      this.throttle.nextSlotAt() + BOOST_FEED_ATTEMPT_MS,
+    );
+    // ...and the caller's window is the CAP. A queue this leg cannot afford to
+    // sit in is not a request the tick can use: the answer would land after the
+    // feed phase joins and be thrown away by the caller's own race, while the
+    // gap it spent is one the pair phase pays for. Counted as a drop — an
+    // attempt that was never sent — because the other reading, an empty boosts
+    // list, is exactly what a healthy upstream returning nothing looks like
+    // (see noteDrop).
+    if (feedWindowDeadline !== undefined && deadline > feedWindowDeadline) {
+      this.noteDrop("/token-boosts/latest/v1");
+      return [];
+    }
     let data: unknown = null;
     try {
       // Same edge-cache discipline as the profiles list (see

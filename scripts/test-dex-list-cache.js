@@ -419,7 +419,7 @@ async function main() {
     const order = (needle) => src.indexOf(needle);
     for (const [what, at] of [
       ["the profiles result", order("() => profilesCall")],
-      ["the boosts fetch", order("fetchBoostedTokens(this.config.dexscreenerBoostsLimit)")],
+      ["the boosts fetch", order("this.dex!.fetchBoostedTokens(")],
       ["the pool phase", order("getReevalPoolCached(poolNow")],
     ]) {
       assert.ok(

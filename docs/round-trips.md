@@ -3925,3 +3925,68 @@ curl -s .../debug/push-watch | jq '.mutedSigs'
 - **🩸 係分佈預警**：收咗之後，緩慢出貨（價未跌、賣壓連續佔優）唔會再有卡，要到 🚀 續漲／💀／⚠️（已收）之類嘅轉折才見。
 - **反轉要 redeploy**（wrangler var），冇 Telegram 指令；要 un-mute 建議一次一隻 sig，睇返一日 ring 先再加。
 - **同 §4.56 嘅關係**：worker 程式碼唔變、round trips 唔變，今次純係交付層嘅開關。
+
+## 4.58 Boosts feed 唔再被 DexScreener 隊列 gap 食掉（2026-09-30）
+
+### 一、需求
+
+Operator 跟進 Cloudflare 審計嘅一條：「boosts feed 被封鎖，約 60% 嘅 tick 被 DexScreener budget 砍掉」。
+即係 `DEXSCREENER_BOOSTS_LIMIT = 30` 開住，但大半數 tick 嘅 `summary.boosts` 係 0 —— 要揾出「誰砍、點解砍、可唔可以唔砍」。
+
+### 二、量到嘅原因（讀碼 + live）
+
+| 讀數 | 值 | 意思 |
+|---|---|---|
+| `fetchBoostedTokens` 嘅自預算 | `deadline = Date.now() + BOOST_FEED_SELF_BUDGET_MS`（480） | 同 profiles leg 一樣 **一個常數** |
+| `getJson` 嘅 slot 檢查 | `throttle.nextSlotAt() >= deadline → noteDrop(path); return null` | 「冇送出」唔會整 429，只會計 `dropsByLeg` |
+| 兩條 leg 嘅隊列位置 | profiles 係 tick **第一支** DexScreener 請求（tick 開始就 dispatch）；boosts 係**第二支** | profiles 隊列通常空 → slot ≈ now；boosts 一定要等**一個 gap** |
+| gap 嘅實際值 | `DEX_REQUEST_INTERVAL_MS` 250 → 429 自適應 400 / 640 / 1024 / **1200**（`DEX_ADAPTIVE_GROWTH` 1.6、上限 `DEX_ADAPTIVE_MAX_MS`） | gap > 480 − profiles 延遲 ⇒ **必 drop** |
+| 審計 live sample | 10 ticks 之中 4 次交付 20 行、**6 次 0** | `summary.boosts = 0`，唯一痕跡係 `dropsByLeg.boosts` |
+| 同期 429 | `/debug/dex429` 11:39Z–15:09Z 20 條；`last6h 40 / last24h 50` | spacing 就係喺呢啲時段升上去 |
+| 429 靜嘅時候 | 16:38Z tick：`intervalMs 250 / spacingSteps 0 / budgetDrops 0 / boosts 21` | 對照組：上游健康時條 leg 完全正常 |
+| 共享 egress 被拒比例 | `dexListCache {hits 6318, misses 8, refused 366, hitPct 99.9}` | 邊緣快取命中率 99.9%，但 origin 一被問就 **5% 拒** |
+
+**根因**：boosts 係 tick 嘅第二支請求，天生要付一個 gap；佢嘅預算卻係一個常數 480（= profiles leg 由「slot 免費」換嚟嘅數字）。429 一出現，自適應把 gap 拉到 640–1200，`getJson` 嘅 slot 檢查就在**未送出**之前把佢 drop —— 所以係「被 budget 砍」而唔係「被上游拒」。
+
+### 三、做法：預算 = 自己嘅 slot + 一次嘗試，caller 個 window 做上限
+
+| 位置 | 改動 |
+|---|---|
+| `src/dexscreener.ts` | `fetchBoostedTokens(limit, feedWindowDeadline?)`：`deadline = max(now + 480, throttle.nextSlotAt() + BOOST_FEED_ATTEMPT_MS[480])`；`deadline > feedWindowDeadline` 就 `noteDrop("/token-boosts/latest/v1")` 再回 `[]` |
+| `src/scanner.ts` | boosts 嘅 fan-out 把本 tick 嘅 `feedDeadline` 一齊傳入 |
+| `scripts/test-dex-list-cache.js` | 源码錨點由 `fetchBoostedTokens(this.config.dexscreenerBoostsLimit)` 改成 `this.dex!.fetchBoostedTokens(`（簽名多咗個參數） |
+
+要點：
+
+1. **免費隊列行為完全不變**：隊列空（今日/健康日）時 `nextSlotAt() ≈ now`，`max` 取返 480，同改之前一模一樣。
+2. **唔係「無限加預算」**：只有「自己嘅 slot + 一次嘗試」落得入 tick 自己嘅 feed window（1600ms）先會送。1200ms 天花板加 480 一定超窗，所以**依然會 drop** —— 呢個係刻意：嗰個 gap 之下，答案會被 scanner 自己嘅 race 掉，而個 slot 係 pair phase 要付嘅。
+3. **drop 保留做一個「有名嘅讀數」**：cap 路徑照計 `dropsByLeg.boosts`，所以「冇問過」同「上游答空」永遠唔會一樣樣（同 §4.53 以嚟嘅分流原則一致）。
+4. **pair phase 唔會被拖**：boosts 嘅 slot 係 tick 第一支請求之後一個 gap；只有天花板（1200）先會令 pair batch 遲一個 gap，而嗰個情況已經被 cap 擋走。
+
+### 四、測試
+
+- 新 case（`scripts/test-deferred-priority.js`，`dexListCacheTest` 內）：
+  - **640ms gap**：`fetchLatestSolanaProfiles()` 佔第一個 slot 之後，`fetchBoostedTokens(20)` 必須**照問、照答**（回 `[EDGE_F]`），`budgetDrops 0`、`dropsByLeg` 全 0，而且真係有兩支請求出去；
+  - **1200ms ceiling + 短 window**（cap = `now + 200`）：唔准送 boosts、`budgetDrops 1`、`dropsByLeg.boosts 1`、`lastDropLeg "boosts"`。
+- **確定性驗證過「舊 code 一定 fail」**：臨時把 `deadline` 還原成 `Date.now() + BOOST_FEED_SELF_BUDGET_MS` 重新 build，個 case 立即以 `a widened gap no longer drops the leg: it is ASKED, and answered` fail；還原修正後 pass（測試唔係事後合理化）。
+- 全套：main suite **449 passed, 0 failed**；其餘 7 個 suite 全綠（`deferred-priority`、`tick-path`、`schema-gate`、`health-front`、`dex-list-cache`、`usd-formatter`、`dex-last-profiles`）。
+
+### 五、驗收（deploy 後）
+
+```bash
+curl -s .../health | jq '.heartbeat.summary | {boosts, dex: .dex | {intervalMs, spacingSteps, budgetDrops, dropsByLeg}}'
+curl -s .../debug/dex429 | jq '{lastHour, last6h, total}'
+curl -s .../debug/feed-stats | jq '.byFeed[] | select(.feed=="boosts")'
+```
+
+- 429 靜（`spacingFleetSteps 0`）時應該同 16:38Z 一樣：`boosts 20-21 / dropsByLeg.boosts 0`。
+- 429 進入 400/640/1024 段時，**新行為**係 `boosts > 0` 而 `dropsByLeg.boosts 0`；**舊行為**係 `boosts 0` 而 `dropsByLeg.boosts ≥ 1`。所以要**故意抽 429 時段嘅 tick** 先分得出（429 靜嘅日 sample 唔具區分力）。
+- `/debug/feed-stats` 嘅 `boosts.coins` 係累計值（2026-09-25 起到 2026-09-30 只 41 枚），升幅只能當長期趨勢，唔可以當逐 tick 讀數。
+
+### 六、界線（老實講）
+
+- **未 cover ①：1200ms 天花板 tick 照樣 drop**（cap 擋）。嗰啲 tick 係一個 isolate/一段時間內 3 次以上 429 先出現；喺嗰個 gap 之下，tick 嘅 1600ms feed window 真係塞唔落「第二支 list 請求」。
+- **未 cover ②：`fetchFeedCapped` 嘅 250ms floor** —— 如果 fan-out 到達時 feed window 剩 ≤ 250ms，boosts（同其他非 in-flight leg）根本唔會被叫，而且**唔會**計 drop。呢條路徑今日未見過（profiles 自預算 ≤ 480 ⇒ 到達時通常剩 > 1000ms），但佢係一個冇名嘅第二條 drop 路。
+- **未 cover ③：上游本身**。`refused 366 / hitPct 99.9%` 講嘅係共享 Worker egress IP 被 DexScreener 拒（同 §gecko-429 同一類問題），呢個 fix 只係令「自適應 gap」唔再變成「條 leg 靜靜死」；唔會減少 429。
+- **收益細，要講清楚**：boosts 累計只發現 41 枚幣、push 1 次（5 日），係一條細 lane；今次係把它嘅行為修正成「可以問就問」，唔係話佢值好多卡。
+- **profiles leg 冇同樣改**：佢有 reuse lane（`PROFILE_FEED_REUSE_MS` 30 分鐘）＋ 永遠第一 slot，所以唔在今次範圍；要記住呢個唔對稱。
