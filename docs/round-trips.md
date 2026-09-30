@@ -3728,6 +3728,13 @@ deploy 之後連續抽樣一個鐘（約每 18 秒讀一次 `/health.heartbeat.s
 
 ### 四、驗收（deploy 後）
 
+```bash
+curl -s .../debug/push-watch | jq '.mutedSigs'   # 期望 ["liqwarn","drain","recap"]
+```
+
+`mutedSigs` 係 isolate 開機時讀到嘅 PUSH_WATCH_MUTE（新加嘅 echo）：pass note 要等一張 muted 卡真正觸發才會有 ` muted N`，
+所以呢個欄位就係「redeploy 有冇真係上到」嗰個即刻讀得到嘅讀數。
+
 - 呢三款卡由 chat 消失；`/debug/push-audit` ring 唔再新增 `liqwarn`／`drain` 條目；
 - 被 💧 terminal 嘅 row 照樣喺 `/debug/push-watch` 變 `rug`（唔會留喺 rotation 度空轉）；
 - 過窗嘅 row 照樣被 prune（🏁 冇出，唔等於 row 冇清）；

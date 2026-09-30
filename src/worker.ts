@@ -6497,6 +6497,11 @@ export default {
         count: rows.length,
         limit,
         issueCount: issues.length,
+        // The muted card sigs (PUSH_WATCH_MUTE) THIS isolate booted with.
+        // The pass note only shows ` muted N` once a muted transition fires,
+        // so without this echo the switch's liveness would be unobservable
+        // until then — and this is the reading that proves a redeploy landed.
+        mutedSigs: cfg?.pushWatch.mutedSigs ?? [],
         issues,
         rows: rows.map((r) => ({
           ...r,
