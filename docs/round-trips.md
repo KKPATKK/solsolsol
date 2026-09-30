@@ -3665,3 +3665,29 @@ Counters 係 instance state，但 summary 喺 pair phase 之後已經刷新過�
 - **跨 colo 唔共享**：edge cache 係 per-colo（list feed 一直如此）。
 - **120 秒係常數**：冇 env knob，要收返就要 redeploy（同 `LIST_FEED_CACHE_TTL_S` 一樣）。
 - **metrics 最多舊 120 秒**，仍然 ≤ in-memory cache 一直接受嘅 180 秒；gate 冷卻 ≥30 分鐘、age 窗 28 小時，所以判斷類別不變。
+
+### 六、一小時實測（2026-09-30 06:11–07:11Z，154 個樣本）：**TTL 維持 120 秒**
+
+deploy 之後連續抽樣一個鐘（約每 18 秒讀一次 `/health.heartbeat.summary.dex`）：
+
+| 讀數 | 值 |
+|---|---|
+| 主導 isolate 累積（峰值）| `hits 17 / misses 368` ⇒ 命中份額 **4.4%** |
+| 其他（cold／被換走嘅）isolate 樣本 | 36 個，**hits 全部 = 0**（最大一次 0/14）|
+| `cf-cache-status` 分佈（每 tick 嘅最後一個 pair 回應）| MISS 141、**REVALIDATED 3**、**EXPIRED 3**、無 7 |
+| pair 批次被 origin 拒絕（`pairCacheRefused`）| 0 |
+| 因任何 feed 腿 429 而整段退避（pair phase 冇 dispatch）| 7 個樣本（~5%）|
+| 冇 `dex` 區塊嘅樣本（tick 自己 skip）| 11 |
+
+讀法同決定：
+
+1. **命中係真嘅，但細**：一個鐘有 17 個 batch 由 colo edge 應答（其中 3 次係 `REVALIDATED`），
+   即約 4.4% 嘅 pair origin call 被慳返。呢個就係 120 秒窗口嘅真實價值。
+2. **`EXPIRED` 淨係出現 3 次（~2%）**：即係「edge 本來有 entry、但攞嘅時候已經過期」嘅個案好少。
+   如果 MISS 係由過期主導，加 TTL 就有用 —— 但實測係由 **新 key** 主導：
+   主導 isolate 每 tick 約 +6 個 batch（368 ÷ 一個鐘嘅 tick 數），全部都係佢 180 秒 in-memory 窗內未見過嘅地址，
+   加長 TTL 唔會令呢批 miss 變成 hit，只會令 gate／tracker 睇到嘅 metrics 更舊。
+3. **cold isolate 一律 0 命中**：跨 isolate 重用嘅窗口本身窄（batch URL = 有次序嘅地址切片，
+   feed／tracker 一變就重新 key），所以 TTL 唔係瓶頸。要再提高命中率，下一步係改 **key**（固定分桶／按地址集），
+   唔係調 TTL。
+4. 冇調 => 冇新改動可 deploy；呢節只係量度紀錄。抽樣數據喺 sandbox 嘅 `/tmp/w/pairsamples*.tsv`，冇入 repo。
