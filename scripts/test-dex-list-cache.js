@@ -11,6 +11,10 @@
  *
  *   1. What a hit is (and that a header-less response is NOT one — before this
  *      change such a response was counted as neither hit nor miss).
+ *   1b. That a REFUSAL is its own row (2026-09-30). It stays out of the 2xx
+ *      ratio by design, but keeping it out of the durable record entirely left
+ *      the TTL decision blind: a lane refused 19 times in 21 ticks read
+ *      `99.8% HIT` and said nothing about the nineteen.
  *   2. peek does not advance, and consume commits ONLY the rows that landed —
  *      the difference between "a failed write is re-offered" and "a landed
  *      write is written twice".
@@ -36,6 +40,7 @@ const {
   consumeListCacheDelta,
   DEX_LIST_CACHE_HITS_KEY,
   DEX_LIST_CACHE_MISSES_KEY,
+  DEX_LIST_CACHE_REFUSED_KEY,
   DEX_LIST_CACHE_LAST_KEY,
 } = require("../dist/dexscreener.js");
 const { Db } = require("../dist/db.js");
@@ -69,6 +74,23 @@ async function oneListFetch(header) {
   const dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" }));
   const out = await dex.fetchLatestSolanaProfiles();
   assert.deepEqual(out.map((p) => p.tokenAddress), ["CACHE_A"], "the stub answered a list");
+  return dex;
+}
+
+/**
+ * Fetch a list leg once and get REFUSED, so the ledger counts one refusal.
+ * The `cf-cache-status` header is present on purpose: the point is that a
+ * refusal's verdict is irrelevant, not that it is absent.
+ */
+async function oneRefusedListFetch(status = 429) {
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: "nope" }), {
+      status,
+      headers: { "cf-cache-status": "BYPASS" },
+    });
+  const dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" }));
+  const out = await dex.fetchLatestSolanaProfiles();
+  assert.deepEqual(out, [], "a refused list answers nothing");
   return dex;
 }
 
@@ -109,13 +131,17 @@ async function main() {
     drain();
     const dex = await oneListFetch("HIT");
     let delta = peekListCacheDelta();
-    assert.deepEqual(delta, { hits: 1, misses: 0, status: "HIT" }, "a HIT is a hit, and the label is news");
+    assert.deepEqual(
+      delta,
+      { hits: 1, misses: 0, refused: 0, status: "HIT" },
+      "a HIT is a hit, and the label is news",
+    );
 
     await oneListFetch("MISS");
     delta = peekListCacheDelta();
     assert.deepEqual(
       delta,
-      { hits: 1, misses: 1, status: "MISS" },
+      { hits: 1, misses: 1, refused: 0, status: "MISS" },
       "a MISS is a miss — the delta is a difference, so the hit from before is still in it",
     );
 
@@ -126,7 +152,7 @@ async function main() {
     delta = peekListCacheDelta();
     assert.deepEqual(
       delta,
-      { hits: 1, misses: 2, status: null },
+      { hits: 1, misses: 2, refused: 0, status: null },
       "no header = the origin answered as far as we can tell; the label is unchanged, so it is not news",
     );
 
@@ -134,30 +160,64 @@ async function main() {
     await oneListFetch("REVALIDATED");
     assert.deepEqual(
       peekListCacheDelta(),
-      { hits: 2, misses: 2, status: "REVALIDATED" },
+      { hits: 2, misses: 2, refused: 0, status: "REVALIDATED" },
       "REVALIDATED is a hit",
     );
   });
 
-  await test("a refusal is NOT a miss: 2xx only, because a 429 was never cached", async () => {
+  await test("a refusal is NOT a miss — it is its own row, and the 2xx ratio is untouched", async () => {
     drain();
     const before = peekListCacheDelta();
-    // A 429 (and a 5xx) carries a cf-cache-status here on purpose: the point is
-    // that the status is irrelevant, not that it is absent.
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify({ error: "nope" }), {
-        status: 429,
-        headers: { "cf-cache-status": "BYPASS" },
-      });
-    const dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" }));
-    const out = await dex.fetchLatestSolanaProfiles();
-    assert.deepEqual(out, [], "a refused list answers nothing (the make-up lane has nothing to add yet)");
-    assert.ok(dex.getStats().http429 > 0, "the refusal WAS seen — otherwise this case asserts nothing");
-    assert.deepEqual(
-      peekListCacheDelta(),
-      before,
-      "cacheTtlByStatus gives a TTL to 200-299 alone: a refusal cannot read as an entry that had expired, and it has its own counter (http429)",
+    const dex = await oneRefusedListFetch(429);
+    assert.ok(
+      dex.getStats().http429 > 0,
+      "the refusal WAS seen — otherwise this case asserts nothing",
     );
+    const after = peekListCacheDelta();
+    assert.equal(after.hits, before.hits, "a refusal is not a hit");
+    assert.equal(
+      after.misses, before.misses,
+      "and not a miss: cacheTtlByStatus gives a TTL to 200-299 alone, so a refusal cannot read as an entry that had expired",
+    );
+    assert.equal(
+      after.refused, before.refused + 1,
+      "it lands on its own counter — the reading the TTL decision needs and could not get (2026-09-30: 19 refusals in 21 ticks read `hits 5256 / misses 8 / 99.8% HIT`)",
+    );
+    assert.equal(
+      after.status, "HTTP-429",
+      "and the label says what happened on the last list request, so a refusal cannot read as a cache verdict",
+    );
+  });
+
+  await test("the refusal row is an ADD of its own window, and is not re-offered once consumed", async () => {
+    // The label is only written when it CHANGED, so this case has to declare a
+    // starting point and commit it before the refusal can be news.
+    await oneListFetch("HIT");
+    drain();
+    await oneRefusedListFetch(429);
+    const bumps = [];
+    const replaces = [];
+    const scanner = scannerWith({
+      bumpTelemetryCounter: async (key, value) => bumps.push([key, value]),
+      setWorkerState: async (key, value) => replaces.push([key, value]),
+    });
+    await scanner.stampListCacheDelta();
+    assert.deepEqual(
+      bumps,
+      [[DEX_LIST_CACHE_REFUSED_KEY, 1]],
+      "the refusal accumulates on a row of its own: a replacement would report one window as if it were the total, and the share against the 2xx rows is the whole reading",
+    );
+    assert.deepEqual(
+      replaces,
+      [[DEX_LIST_CACHE_LAST_KEY, "HTTP-429"]],
+      "and the label carries the code that was refused",
+    );
+
+    bumps.length = 0;
+    replaces.length = 0;
+    await scanner.stampListCacheDelta();
+    assert.deepEqual(bumps, [], "a consumed window is not written twice");
+    assert.deepEqual(replaces, [], "nor is a label that did not change");
   });
 
   await test("getStats reads the same ledger, and peeking never consumes it", async () => {
@@ -181,27 +241,27 @@ async function main() {
     drain();
     await oneListFetch("BYPASS");
     const delta = peekListCacheDelta();
-    assert.deepEqual(delta, { hits: 0, misses: 1, status: "BYPASS" });
+    assert.deepEqual(delta, { hits: 0, misses: 1, refused: 0, status: "BYPASS" });
 
     consumeListCacheDelta(delta, { hits: true });
     const afterHitsOnly = peekListCacheDelta();
     assert.deepEqual(
       afterHitsOnly,
-      { hits: 0, misses: 1, status: "BYPASS" },
+      { hits: 0, misses: 1, refused: 0, status: "BYPASS" },
       "the misses row and the label were NOT written, so they are re-offered",
     );
 
     consumeListCacheDelta(afterHitsOnly, { misses: true });
     assert.deepEqual(
       peekListCacheDelta(),
-      { hits: 0, misses: 0, status: "BYPASS" },
+      { hits: 0, misses: 0, refused: 0, status: "BYPASS" },
       "the label is still pending: its own write is the one that failed",
     );
 
     consumeListCacheDelta(peekListCacheDelta(), { status: true });
     assert.deepEqual(
       peekListCacheDelta(),
-      { hits: 0, misses: 0, status: null },
+      { hits: 0, misses: 0, refused: 0, status: null },
       "an already-reported label is not news, so nothing is re-offered forever",
     );
   });
@@ -255,7 +315,7 @@ async function main() {
     assert.deepEqual(bumps, [[DEX_LIST_CACHE_MISSES_KEY, 1]], "the counted row landed");
     assert.deepEqual(
       peekListCacheDelta(),
-      { hits: 0, misses: 0, status: "MISS" },
+      { hits: 0, misses: 0, refused: 0, status: "MISS" },
       "the counted row is committed, and the label — whose write threw — is still pending",
     );
     await scanner.stampListCacheDelta();
@@ -313,6 +373,29 @@ async function main() {
         "HIT",
         "the label is a replacement and it did not change, so it was not written again",
       );
+
+      // A third window, on its own: a refusal is an ADD like the others
+      // (2026-09-30), and it is the counter that makes the TTL question
+      // answerable, so its durable path is asserted rather than assumed.
+      scanner.scanFront.writes = [];
+      await oneRefusedListFetch(429);
+      await scanner.stampListCacheDelta();
+      await db.writeScanFront(scanner.scanFront.writes);
+      assert.equal(
+        await db.getWorkerState(DEX_LIST_CACHE_REFUSED_KEY),
+        "1",
+        "the refusal accumulates on a row of its own",
+      );
+      assert.equal(
+        await db.getWorkerState(DEX_LIST_CACHE_LAST_KEY),
+        "HTTP-429",
+        "and the label is replaced with the refusal, because it is news against the HIT above",
+      );
+      assert.equal(
+        await db.getWorkerState(DEX_LIST_CACHE_HITS_KEY),
+        "3",
+        "and the 2xx counters are untouched by a refusal: a refusal is not a hit",
+      );
     } finally {
       await t.client.close();
       try {
@@ -368,11 +451,16 @@ async function main() {
     for (const [name, key] of [
       ["DEX_LIST_CACHE_HITS_KEY", DEX_LIST_CACHE_HITS_KEY],
       ["DEX_LIST_CACHE_MISSES_KEY", DEX_LIST_CACHE_MISSES_KEY],
+      ["DEX_LIST_CACHE_REFUSED_KEY", DEX_LIST_CACHE_REFUSED_KEY],
       ["DEX_LIST_CACHE_LAST_KEY", DEX_LIST_CACHE_LAST_KEY],
     ]) {
       assert.ok(call.includes(name), `${name} must ride the front's key list`);
       assert.ok(key.startsWith("dex_list_cache_"), `${name} names a durable row`);
     }
+    assert.ok(
+      src.includes("telemetryCounterUsable(listCacheRefused)"),
+      "and the refused row must be part of what makes the block publish: a lane that was ONLY ever refused is the state this counter exists to show, and gating on the two 2xx rows alone would report null",
+    );
     assert.equal(
       src.includes("        dexListCache,\n"),
       true,

@@ -3366,3 +3366,86 @@ near 由 116 修正為 **19**。已修：兩條路徑而家都帶 clause。
   `limit` 都係 `src/worker.ts` 裡面寫死嘅 `1000`。deploy log 明明寫住 `env.RE_EVAL_POOL_SIZE
   ("1200")`，端點仍然報 1000 —— 呢個端點正正係用嚟睇 LIMIT 有冇 starve 嘅工具，寫死即係
   由改動一刻起就量細過 tick 實際讀嘅 pool。兩處已改成讀 `cfg.reevalPoolSize`。
+
+## 4.49 profiles 腿 90% 被拒：reuse 窗按 §4.36 嘅 tripwire 由 10 → 30 分鐘，並補一個「被拒」讀數（2026-09-30）
+
+### 一、§4.36 寫落嘅 tripwire 響咗
+
+| §4.36 嘅 tripwire 條件 | 實測（2026-09-30 00:0xZ） |
+|---|---|
+| 連續 ≥6 個 tick 讀 make-up 大細（`profiles` 2-4） | **中** —— 00:01:26Z → 00:11:09Z 連續 **11 個 tick** 讀 `profiles 2`；同日另有 22:55–23:03（9 個）、23:23–23:26（3 個）|
+| `dex_429` 仍然熱 | **中** —— isolate 內 `http429 19`、adapter `intervalMs` 已釘喺上限 1200 |
+| `dex_list_cache_misses` 有升 | **量唔到** —— 見 §四，帳本只計 2xx，被拒根本入唔到分母 |
+
+第三條量唔到就係今次一併修儀器嘅理由：tripwire 本身用一個睇唔到「被拒」嘅讀數去判斷「係唔係跟住 regime 行」。
+§4.36 亦已經寫明補救方向：**按 regime 長度（≥30 分鐘）size，並接受 `profiles` 警報延遲** —— 下面就係執行嗰句。
+
+### 二、量到嘅嘢
+
+**上游冇壞，係針對 Worker egress IP：**由另一部機（唔同 IP）連續 3 次打 `/token-profiles/latest/v1`，
+**3/3 HTTP 200、49–72ms、30 筆（19 筆 solana）**。所以 429 唔係 API 故障、唔係 schema 變。
+
+**isolate 實測（`/health.heartbeat.summary`）：**
+
+| 讀數 | 值 |
+|---|---|
+| `feedMakeup.feedRequests` | 21 |
+| `feedMakeup.failedTotal` / `dex.http429` | **19 / 19**（兩個數完全相等 → 失敗就是被拒）|
+| 2xx 命中（`listCacheHits`） | **2**（21 個請求之中只有 2 個係 2xx）|
+| `lastRawProfiles` | 0 |
+| `profiles` / `profilesSettled` | **20 / true** → 該 tick 係靠 reuse lane 救返 |
+| `dex.intervalMs` / `configuredIntervalMs` | **1200 / 250**（自適應間距已頂到 `DEX_ADAPTIVE_MAX_MS`）|
+| `dex.dropsByLeg` | `{profiles: 0, boosts: 20}` → profiles 腿**從來冇**因為窗口用完而唔發，佢係真係發咗、換返 429 |
+
+**塌陷形狀：**窗口內 240 tick 有 **20 條讀 `profiles ≤5`（8.3%）**，分 4 段（22:23、22:55–23:03、23:23–23:26、00:01–00:11）。
+塌陷期間 tick 耗時 2334–2986ms、`pool` 919–1103、**0 次掃描失敗、0 條漏推** —— 呢個係 discovery 降級，唔係掃描故障。
+
+正常 tick 讀 `profiles 20-22` = reuse 出嚟嘅 19 筆 + 補發；塌陷 tick 讀 `2/4` = 補發清單**單獨**（數字亦同 `deferral.pending` 對得上）。
+
+### 三、點解 10 分鐘窗 一定輸
+
+```
+原始 fetch 被拒 ──► failed=true ──► 要靠 last-good list
+                                        ▲
+   journal 只有「成功」嗰個 tick 才寫（Scanner.stampProfileFeedSnapshot）
+   reuse 窗 = PROFILE_FEED_REUSE_MS
+                                        ▲
+   連續 >窗 冇一次成功 ──► reuse=false ──► 只回補發清單（profiles = pending）
+```
+
+兩條鐘：被拒率高 → 成功稀疏 → 窗口到期 → 塌陷；下一個成功就即刻重新 arm（00:12:02 起讀返 20）。
+§4.36 當時量到最長 streak **4–5 分鐘**（vs 窗 10 分鐘 = 2–2.5×）= 今日最長 **11 分鐘** ⇒ 10 分鐘窗一定輸。
+
+### 四、修法
+
+1. **`PROFILE_FEED_REUSE_MS` 10 → 30 分鐘**（`src/dexscreener.ts`）。按 §4.36 嘅處方（regime 長度 ≥30 分鐘）size，
+   對實測最長 run（11 分鐘）有 ~2.7× 邊際。同時保住「上界」：訊號本身唔騎呢個窗 ——
+   `feedMakeup.lastRawProfiles / failedTotal / emptyFeedTotal` 照樣報「fetch 有冇被拒」，所以死 feed 只係遲 30 分鐘才塌，唔會被永久遮蓋。
+   新增 guard 測試：窗必須 **大於** 實測最長無成功 run（11 分鐘），同時 **≤1 小時**。
+2. **補「被拒」讀數**：`listCacheLedger.refused` ＋ 新 durable row **`dex_list_cache_refused`**，
+   並令 `lastStatus` 由「只可能是 `cf-cache-status`」變成「lane 嘅最後結局」——2xx 就係 `cf-cache-status`，被拒就係 **`HTTP-<code>`**。
+   為何唔可以用 `http429` 代替：佢係 **per-isolate、per-client、每條腿相加**，正正係呢個 durable 帳本一開始要擺脫嘅兩樣嘢。
+   `/health.dexListCache` 加 `refused`（同 `hits/misses` 一齊讀），而 publish gate 亦改為「有 `refused` 都要報」——
+   一個從來只有被拒嘅 lane 正是呢個 row 要顯示嘅狀態，全靠 2xx 兩個 row 判斷會報 null。
+
+### 五、驗收
+
+| 睇 | 結果 |
+|---|---|
+| `npm run build`（tsc） | 綠 |
+| `test-unit.js` | **436 passed, 0 failed**（不變）|
+| `test-dex-list-cache.js` | 9 → **10 passed**（新增「被拒係自己一行、2xx 比率不動」＋ durable ADD 路徑）|
+| `test-dex-last-profiles.js` | 13 → **14 passed**（新增窗長 guard）|
+| 其餘 suite（deferred-priority／tick-path／schema-gate／health-front／usd-formatter） | 全部綠 |
+
+### 六、界線（老實講）
+
+- **未 deploy**：兩個改動都要 deploy 之後才生效。deploy 前後預期嘅分別：塌陷需要「>30 分鐘冇一次成功」才會出現，
+  而唔再係 10 分鐘；`dexListCache.refused` 由 deploy 一刻開始累加。
+- **`LIST_FEED_CACHE_TTL_S` 仍然係 60**，冇改。今次只係把決策所需嘅讀數（被拒）補上 ——
+  等 `refused` 同 `misses` 一齊睇得夠久，才決定 60 → 180（§4.36／`src/dexscreener.ts` 嘅 OPEN QUESTION 條件不變）。
+- **被拒係 IP 層**：實測由另一 IP 打同一端點 3/3 200。我哋控制唔到共用 egress 嘅桶，只控制「有冇去問」。
+- **順手量到、但未修**：同一個 dex client 每 tick 仲會對同一 origin 打 **~7 個 pair 批次請求**（`/latest/dex/tokens`，本 tick `pairs 191` 個代幣；
+  呢條腿係**故意唔 edge-cache**）。即係自己每 tick 對同一共享 IP 放 ~8 個請求。呢個係「自己加重自己」嘅可能來源，
+  但今次只量到、冇改（要改就要諗 pair cache 嘅新鮮度約束）。
+- **警報延遲 = 30 分鐘**（§4.36 已接受）：`profiles` 跌到 make-up 大細係 operator 睇開嘅訊號，窗口拉長會令佢遲咗出現。

@@ -140,6 +140,35 @@ async function main() {
     assert.deepEqual(out, [], "past the window the tick is back to the make-up lane alone");
   });
 
+  // ---------- the window is sized against a MEASUREMENT ----------
+  await test("the reuse window outlasts the longest measured run with no successful fetch", () => {
+    // What this window has to absorb is not the gap between two outages but the
+    // longest run in which NOTHING succeeded: only a successful fetch stamps
+    // the journal, so only a success re-arms the window.
+    //
+    // Measured on the scan ring 2026-09-30: 11 consecutive ticks reading
+    // `profiles: 2` (00:01:26Z → 00:11:09Z) while the isolate counted
+    // `http429 19` of `feedRequests 21`, ending the moment one fetch got
+    // through. The earlier collapses that day (22:55–23:03, 23:23–23:26) have
+    // the same shape. At 10 minutes that run cost the whole lane, every time —
+    // which is why this is a guard and not a comment: lowering it back under
+    // the measurement re-creates the bug.
+    const MEASURED_NO_SUCCESS_RUN_MS = 11 * 60_000;
+    assert.ok(
+      PROFILE_FEED_REUSE_MS > MEASURED_NO_SUCCESS_RUN_MS,
+      `the window must outlast the run it exists to absorb (${PROFILE_FEED_REUSE_MS}ms vs a measured ${MEASURED_NO_SUCCESS_RUN_MS}ms)`,
+    );
+    // …and it stays a BOUND. The signal that the upstream is DEAD does not ride
+    // this window — `feedMakeup.lastRawProfiles / failedTotal / emptyFeedTotal`
+    // report the fetch itself — so the cost of a wide window is only how long a
+    // stale-but-real list keeps being evaluated. Past an hour a permanent
+    // refusal hides behind a list nobody re-checked.
+    assert.ok(
+      PROFILE_FEED_REUSE_MS <= 60 * 60_000,
+      "a permanently refused feed still has to collapse to the make-up lane within the hour",
+    );
+  });
+
   await test("the freshest list wins, in both directions", async () => {
     globalThis.fetch = async () => okList(["FRESH_A"]);
     const dex = client();

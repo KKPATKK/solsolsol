@@ -151,11 +151,27 @@ const RETRY_MIN_ATTEMPT_MS = 250;
  * and its coins are what the pool re-evaluates anyway).
  *
  * The bound exists so a DEAD feed cannot be papered over forever: past it, the
- * tick goes back to the make-up list alone. 10 minutes is deliberately longer
- * than the 5-minute outage cycle it absorbs, and short enough that a permanent
- * rate-limit shows up as `profiles` collapsing to the make-up size.
+ * tick goes back to the make-up list alone.
+ *
+ * WHY IT ROSE FROM 10 MINUTES (2026-09-30, measured on the scan ring). The
+ * 5-minute outage cycle this absorbed is no longer the shape: the shared egress
+ * IP is now refused on MOST ticks, so what matters is not the gap between two
+ * outages but the longest run with NO SUCCESSFUL FETCH — only a success stamps
+ * the journal, so only a success re-arms this window. Live 00:01:26Z → 00:11:09Z
+ * was 11 consecutive ticks at `profiles: 2` (the make-up size) with `http429
+ * 19` of `feedRequests 21` in the isolate, ending the moment one fetch got
+ * through; the earlier collapses (22:55–23:03, 23:23–23:26) have the same
+ * shape. A 10-minute window therefore loses that whole lane on any run longer
+ * than ten minutes — which is now the normal case rather than the exception.
+ *
+ * 30 minutes is sized against the MEASURED worst run (11 minutes) with margin,
+ * and it is still a bound: the signal that the upstream is dead does NOT ride
+ * this window — `feedMakeup.lastRawProfiles` / `failedTotal` / `emptyFeedTotal`
+ * report the fetch itself and are unaffected by what the tick evaluates — so a
+ * permanently refused feed reads as refused for those 30 minutes and then
+ * collapses to the make-up lane, exactly as before, only later.
  */
-export const PROFILE_FEED_REUSE_MS = 10 * 60_000;
+export const PROFILE_FEED_REUSE_MS = 30 * 60_000;
 
 /**
  * Self-budget for the boosted-token feed (/token-boosts/latest/v1), the same
@@ -244,14 +260,21 @@ export const LIST_FEED_CACHE_TTL_S = 60;
  * A 2xx response with NO `cf-cache-status` header counts as a MISS: a hit is
  * the one outcome that needs a header to prove itself, and a response whose
  * provenance is unknown was answered by the origin as far as we can tell.
- * A non-2xx response is not counted at all (see getJson): it was never a
- * candidate for the cache, and the refusals have their own counters.
+ * A non-2xx response is deliberately NOT part of this ratio (see getJson): it
+ * was never a candidate for the cache. It is counted on its own row instead
+ * (DEX_LIST_CACHE_REFUSED_KEY) — see noteListCacheRefused for why the ratio
+ * alone could not answer the TTL question.
  */
 const LIST_CACHE_HIT_RE = /^(HIT|REVALIDATED)$/i;
 
 const listCacheLedger = {
   hits: 0,
   misses: 0,
+  /**
+   * List requests the ORIGIN refused (non-2xx: a 429, a 5xx, a 4xx). Counted
+   * apart from the two above — see noteListCacheRefused.
+   */
+  refused: 0,
   /** The last status seen in this isolate (null = no list fetch yet). */
   status: null as string | null,
   /**
@@ -276,13 +299,47 @@ function noteListCacheOutcome(status: string | null): void {
   listCacheLedger.misses += 1;
 }
 
-/** The hit/miss counts as of the last consume (see peekListCacheDelta). */
-let listCacheBaseline = { hits: 0, misses: 0 };
+/**
+ * Count one list request the origin REFUSED, and record the refusal as the
+ * lane's last outcome (2026-09-30).
+ *
+ * WHY THIS COUNTER HAD TO EXIST: hits and misses are 2xx-only BY
+ * CONSTRUCTION — `cacheTtlByStatus` gives an entry a TTL for 200-299 alone, so
+ * a 429 was never a candidate for the edge cache and was deliberately kept out
+ * of the ratio. That is right for the ratio and useless for the decision,
+ * because the whole point of the ledger is to answer "is `LIST_FEED_CACHE_TTL_S`
+ * leaving the entry expired, or is the origin refusing us?" — and a refusal is
+ * invisible in both of the counters it has. Measured 2026-09-30T00:0xZ: the
+ * profiles leg answered 2xx TWICE in 21 ticks while /health went on reporting
+ * `hits 5256 / misses 8 / hitPct 99.8`. The ratio was true of the responses
+ * that arrived and silent about the nineteen that never did.
+ *
+ * `http429` (getStats) is not a substitute: it is per-ISOLATE, per-CLIENT, and
+ * counts every leg — exactly the churn and the mixing this durable ledger was
+ * built to survive.
+ *
+ * The label carries the refusal, so `lastStatus` answers "what happened on the
+ * last list request?" in one reading: a `cf-cache-status` value when the origin
+ * (or the edge) answered, `HTTP-<code>` when it refused to.
+ */
+function noteListCacheRefused(status: number): void {
+  listCacheLedger.refused += 1;
+  listCacheLedger.status = `HTTP-${status}`;
+}
+
+/** The counted window as of the last consume (see peekListCacheDelta). */
+let listCacheBaseline = { hits: 0, misses: 0, refused: 0 };
 
 /** What a reporter has to persist, and nothing it does not. */
 export interface ListCacheDelta {
   hits: number;
   misses: number;
+  /**
+   * List requests the origin refused in this window. Unlike hits/misses this
+   * one is not a cache verdict — it is the reading that says the lane never got
+   * the chance to have one.
+   */
+  refused: number;
   /**
    * The status to persist, or null when the durable row already says it —
    * absent and "no list fetch yet" are the same row value, so a null status
@@ -302,6 +359,7 @@ export function peekListCacheDelta(): ListCacheDelta {
   return {
     hits: listCacheLedger.hits - listCacheBaseline.hits,
     misses: listCacheLedger.misses - listCacheBaseline.misses,
+    refused: listCacheLedger.refused - listCacheBaseline.refused,
     status:
       listCacheLedger.status !== listCacheLedger.reported
         ? listCacheLedger.status
@@ -316,6 +374,7 @@ export function peekListCacheDelta(): ListCacheDelta {
 export interface ListCacheDeltaLanded {
   hits?: boolean;
   misses?: boolean;
+  refused?: boolean;
   status?: boolean;
 }
 
@@ -332,10 +391,16 @@ export interface ListCacheDeltaLanded {
  */
 export function consumeListCacheDelta(
   delta: ListCacheDelta,
-  landed: ListCacheDeltaLanded = { hits: true, misses: true, status: true },
+  landed: ListCacheDeltaLanded = {
+    hits: true,
+    misses: true,
+    refused: true,
+    status: true,
+  },
 ): void {
   if (landed.hits) listCacheBaseline.hits += delta.hits;
   if (landed.misses) listCacheBaseline.misses += delta.misses;
+  if (landed.refused) listCacheBaseline.refused += delta.refused;
   if (landed.status && delta.status !== null) {
     listCacheLedger.reported = delta.status;
   }
@@ -350,6 +415,13 @@ export function consumeListCacheDelta(
  */
 export const DEX_LIST_CACHE_HITS_KEY = "dex_list_cache_hits";
 export const DEX_LIST_CACHE_MISSES_KEY = "dex_list_cache_misses";
+/**
+ * List requests the origin refused (see noteListCacheRefused). Its own row for
+ * the reason the misses row has one: a replacement would report a WINDOW as if
+ * it were the total, and the reading this exists for is the share of refusals
+ * against the 2xx outcomes the other two rows count.
+ */
+export const DEX_LIST_CACHE_REFUSED_KEY = "dex_list_cache_refused";
 export const DEX_LIST_CACHE_LAST_KEY = "dex_list_cache_last";
 
 /**
@@ -1191,8 +1263,14 @@ export class DexScreenerClient {
      * these against the hits is what decides LIST_FEED_CACHE_TTL_S, and hits
      * alone could not tell a working cache from a lane that never ran. */
     listCacheMisses: number;
-    /** The LAST list-feed `cf-cache-status` (HIT / MISS / BYPASS / DYNAMIC…), or
-     * null when the leg has not run in this isolate. */
+    /** List requests the ORIGIN refused (non-2xx). The other half of the
+     * TTL reading: `misses` climbing = the entry expired and the origin
+     * answered, THIS climbing = there was nothing to serve because the origin
+     * said no (see noteListCacheRefused). */
+    listCacheRefused: number;
+    /** The LAST list-feed outcome: a `cf-cache-status` (HIT / MISS / BYPASS /
+     * DYNAMIC…) when the response was a 2xx, `HTTP-<code>` when the origin
+     * refused it, or null when the leg has not run in this isolate. */
     lastListCacheStatus: string | null;
     /** Attempts never SENT because the caller's window was already spent (the
      * throttle queue ate it) — the reading that separates "refused" from
@@ -1219,6 +1297,7 @@ export class DexScreenerClient {
       cacheSize: this.pairCache.size,
       listCacheHits: listCacheLedger.hits,
       listCacheMisses: listCacheLedger.misses,
+      listCacheRefused: listCacheLedger.refused,
       lastListCacheStatus: listCacheLedger.status,
       budgetDrops: this.budgetDrops,
       lastDroppedAt: this.lastDroppedAt,
@@ -1401,17 +1480,25 @@ export class DexScreenerClient {
         // budget answer, not a failure: the caller already owns its own
         // fallback, and retrying would only spend the caller's window.
         if (res === null) return null;
-        if (listCacheTtlS !== undefined && res.ok) {
-          // ONE place counts a list outcome and one place decides what a hit
-          // is (see the ledger): a second inline regex here is how the durable
-          // ratio would come to disagree with the page's own reading.
-          //
-          // 2xx ONLY, and it is the ratio's meaning that requires it:
-          // `cacheTtlByStatus` gives an entry a TTL for 200-299 alone, so a
-          // 429/5xx was never a candidate for the edge cache and cannot read
-          // as an entry that had EXPIRED — a refusal is its own reading (see
-          // note429), and live 2026-09-26 they arrive every few minutes.
-          noteListCacheOutcome(res.headers.get("cf-cache-status"));
+        if (listCacheTtlS !== undefined) {
+          if (res.ok) {
+            // ONE place counts a list outcome and one place decides what a hit
+            // is (see the ledger): a second inline regex here is how the durable
+            // ratio would come to disagree with the page's own reading.
+            //
+            // 2xx ONLY for the hit/miss split, and it is the ratio's meaning
+            // that requires it: `cacheTtlByStatus` gives an entry a TTL for
+            // 200-299 alone, so a 429/5xx was never a candidate for the edge
+            // cache and cannot read as an entry that had EXPIRED.
+            noteListCacheOutcome(res.headers.get("cf-cache-status"));
+          } else {
+            // …and the refusal, counted on its OWN row (2026-09-30, see
+            // noteListCacheRefused): keeping it out of hit/miss was right and
+            // keeping it out of the durable record entirely left the one
+            // reading the TTL decision needs — "the origin refused us" —
+            // invisible. Live: 19 refusals in 21 ticks read `99.8% HIT`.
+            noteListCacheRefused(res.status);
+          }
         }
         if (res.status === 429) this.note429();
         if (res.status === 429 || res.status >= 500) {

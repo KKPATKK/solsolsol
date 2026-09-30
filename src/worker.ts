@@ -58,6 +58,7 @@ import {
   DEX_LIST_CACHE_HITS_KEY,
   DEX_LIST_CACHE_LAST_KEY,
   DEX_LIST_CACHE_MISSES_KEY,
+  DEX_LIST_CACHE_REFUSED_KEY,
 } from "./dexscreener";
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
@@ -5571,10 +5572,18 @@ export default {
       let dexListCache: {
         hits: number;
         misses: number;
-        /** hits / (hits + misses) as a percentage, or null while nothing
-         * was answered. THIS is the LIST_FEED_CACHE_TTL_S reading. */
+        /** List requests the origin REFUSED (non-2xx). Published because the
+         * TTL question needs both halves: `misses` = the edge entry expired
+         * and the origin answered, `refused` = the origin said no, so the lane
+         * never had a cache verdict to report. */
+        refused: number;
+        /** hits / (hits + misses) as a percentage, or null while none of the
+         * two was answered. Read it WITH `refused`: this ratio is over the
+         * responses that arrived, and a lane refused most ticks can hold it
+         * near 100 (live 2026-09-30: 99.8% while 19 of 21 requests were 429). */
         hitPct: number | null;
-        /** The last list-feed `cf-cache-status` the durable row carries. */
+        /** The last list-lane outcome the durable row carries: a
+         * `cf-cache-status` on a 2xx, or `HTTP-<code>` on a refusal. */
         lastStatus: string | null;
       } | null = null;
       try {
@@ -5611,6 +5620,7 @@ export default {
           // literal in the scanner is how the two ends drift apart.
           DEX_LIST_CACHE_HITS_KEY,
           DEX_LIST_CACHE_MISSES_KEY,
+          DEX_LIST_CACHE_REFUSED_KEY,
           DEX_LIST_CACHE_LAST_KEY,
         ]);
         const tickState = front?.states;
@@ -5708,18 +5718,29 @@ export default {
         const listCacheMisses = parseTelemetryCounter(
           tickState?.get(DEX_LIST_CACHE_MISSES_KEY),
         );
+        const listCacheRefused = parseTelemetryCounter(
+          tickState?.get(DEX_LIST_CACHE_REFUSED_KEY),
+        );
         if (
           telemetryCounterUsable(listCacheHits) ||
-          telemetryCounterUsable(listCacheMisses)
+          telemetryCounterUsable(listCacheMisses) ||
+          // A lane that has ONLY ever been refused is the reading this row was
+          // added for (2026-09-30): gating on the two 2xx counters alone would
+          // publish null for exactly the state the operator needs to see.
+          telemetryCounterUsable(listCacheRefused)
         ) {
           const hits = telemetryCounterUsable(listCacheHits) ? listCacheHits : 0;
           const misses = telemetryCounterUsable(listCacheMisses)
             ? listCacheMisses
             : 0;
+          const refused = telemetryCounterUsable(listCacheRefused)
+            ? listCacheRefused
+            : 0;
           const answered = hits + misses;
           dexListCache = {
             hits,
             misses,
+            refused,
             hitPct:
               answered > 0 ? +((hits / answered) * 100).toFixed(1) : null,
             lastStatus: tickState?.get(DEX_LIST_CACHE_LAST_KEY) ?? null,

@@ -19,6 +19,7 @@ import {
   DEX_LIST_CACHE_HITS_KEY,
   DEX_LIST_CACHE_LAST_KEY,
   DEX_LIST_CACHE_MISSES_KEY,
+  DEX_LIST_CACHE_REFUSED_KEY,
   DEX_SPACING_STATE_KEY,
   type PairInfo,
   type TokenProfile,
@@ -2457,8 +2458,15 @@ export class Scanner {
    */
   async stampListCacheDelta(): Promise<void> {
     const delta = peekListCacheDelta();
-    if (delta.hits === 0 && delta.misses === 0 && delta.status === null) return;
-    const landed = { hits: false, misses: false, status: false };
+    if (
+      delta.hits === 0 &&
+      delta.misses === 0 &&
+      delta.refused === 0 &&
+      delta.status === null
+    ) {
+      return;
+    }
+    const landed = { hits: false, misses: false, refused: false, status: false };
     const stamp = async (
       key: string,
       value: string,
@@ -2477,6 +2485,9 @@ export class Scanner {
     }
     if (delta.misses > 0) {
       await stamp(DEX_LIST_CACHE_MISSES_KEY, String(delta.misses), true, "misses");
+    }
+    if (delta.refused > 0) {
+      await stamp(DEX_LIST_CACHE_REFUSED_KEY, String(delta.refused), true, "refused");
     }
     if (delta.status !== null) {
       await stamp(DEX_LIST_CACHE_LAST_KEY, delta.status, false, "status");
