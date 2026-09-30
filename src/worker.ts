@@ -6502,6 +6502,11 @@ export default {
         // so without this echo the switch's liveness would be unobservable
         // until then — and this is the reading that proves a redeploy landed.
         mutedSigs: cfg?.pushWatch.mutedSigs ?? [],
+        // Birdeye holder probes allowed per pass (PUSH_WATCH_MAX_HOLDER_CHECKS),
+        // 0 = the holder stage is switched off. Same reason as `mutedSigs`: with
+        // the stage off there is no `probe`/`miss` movement in the note to read,
+        // so this echo is what proves the redeploy that stopped the CU landed.
+        maxHolderChecksPerTick: cfg?.pushWatch.maxHolderChecksPerTick ?? null,
         issues,
         rows: rows.map((r) => ({
           ...r,

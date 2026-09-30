@@ -488,6 +488,18 @@ PUSH_WATCH_HOLDER_CAP_MS = "2400"
 # free tier); at 10 it is ~86K. Raise this only against a PAID plan.
 # The stamp is durable (worker_state.holder_probe_at), so the cap holds across
 # isolates; rows the gap skips stay DUE (`cut` in the pass note, plus `cu-gate`).
+# Birdeye HOLDER PROBES per pass, 0 = the holder stage is switched OFF.
+# SET TO 0 on 2026-09-30 (「暫停 Birdeye 持倉探測同 CU 消耗」): the holder cards
+# (📈 持倉增長 / ⚡ 籌碼集中) are muted anyway, so the probes only burned CU —
+# `/defi/token_overview` is 20 CU a call and the month's ledger showed 193 such
+# calls (3,860 of 8,060 CU). 0 removes the WHOLE stage (`if (birdeye &&
+# cfg.maxHolderChecksPerTick > 0)`): no fetch, no `holder_probe_at` read, no
+# holder count written, and no `probe`/`miss` in the pass note. The Birdeye
+# account itself stays wired — the scanner's new-listing backfill
+# (BIRDEYE_BACKFILL_ENABLED) still uses it, and `/health.birdeyeCu` keeps
+# reporting. Set back to a positive number (default 4, hard ceiling 10) and
+# redeploy to resume probing; the counts simply resume from the next due row.
+PUSH_WATCH_MAX_HOLDER_CHECKS = "0"
 PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
 # Tracker card types to SILENCE for now, comma-separated card sigs (empty = none):
 #   liqwarn = ⚠️ 流動性跌穿地板 (first sub-floor reading)

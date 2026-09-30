@@ -9304,6 +9304,62 @@ async function main() {
     );
   });
 
+  // PUSH_WATCH_MAX_HOLDER_CHECKS=0 (2026-09-30, 「暫停 Birdeye 持倉探測同 CU
+  // 消耗」): §4.55 muted the two holder CARDS, this stops the SPEND they were
+  // paying for. The stage's own gate is `if (birdeye &&
+  // cfg.maxHolderChecksPerTick > 0)`, so 0 removes the whole block rather than
+  // letting it run and discard: no fetch, no `holder_probe_at` stamp read, no
+  // count written, and `probe0 miss0` in the note. That distinction is the
+  // whole point — `/defi/token_overview` is BILLED whether or not its count
+  // lands (20 CU a call; the month's ledger: 193 calls, 3_860 CU of 8_060).
+  await test("PushWatcher: PUSH_WATCH_MAX_HOLDER_CHECKS=0 stops the Birdeye probe instead of discarding it", async () => {
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const updated = [];
+    const holderWrites = [];
+    let probes = 0;
+    let stampReads = 0;
+    const db = {
+      ...watchDb(rows, updated),
+      setPushWatchHoldersMany: async (updates) => {
+        for (const u of updates) holderWrites.push([u.token, u.holders]);
+      },
+      // Counts ONLY the CU gate's own key, so this stays a statement about the
+      // holder stage even if the pass reads other worker_state rows.
+      getWorkerState: async (key) => {
+        if (key === "holder_probe_at") stampReads += 1;
+        return null;
+      },
+      setWorkerState: async () => {},
+    };
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      { getTokenOverview: async () => { probes += 1; return { holderCount: 321 }; } },
+      loadConfig({ PUSH_WATCH_MAX_HOLDER_CHECKS: "0" }),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    const out = await pw.runTick(Date.now() + 4_500);
+    assert.equal(probes, 0, "not one Birdeye call is made");
+    assert.equal(holderWrites.length, 0, "and no holder count is written");
+    assert.equal(stampReads, 0, "the CU gate's stamp is not even read");
+    assert.match(String(out.note), /probe0 miss0/, `the stage reports itself idle: ${out.note}`);
+
+    // CONTROL: the same harness with the default cap DOES probe — the silence
+    // above is the switch, not the fixture.
+    let probes2 = 0;
+    const pw2 = new PushWatcher(
+      { ...watchDb(rows, []) },
+      watchBot,
+      { getTokenOverview: async () => { probes2 += 1; return { holderCount: 321 }; } },
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, watchPair(a)])),
+      null,
+    );
+    await pw2.runTick(Date.now() + 4_500);
+    assert.equal(probes2, 1, "the default cap still spends its one probe");
+  });
+
   await test("PushWatcher: holder probe slots follow the Birdeye throttle, so the pass stops paying for probes it cannot collect", async () => {
     // One rate gate serves every Birdeye call in the isolate
     // (BIRDEYE_REQUEST_INTERVAL_MS, 1100ms live — the stage shares it with the

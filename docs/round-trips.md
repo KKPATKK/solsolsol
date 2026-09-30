@@ -3836,3 +3836,49 @@ curl -s .../debug/push-watch | jq '.mutedSigs'
 - **同 §4.53 同一條界線**：反轉要改 wrangler var ＋ redeploy，冇 Telegram 指令；目前只有一個 chat（530602939），全局＝單 chat。
 - **靜音 ≠ 停止追蹤**：muted ⚡ 唔會出現喺 ring，但佢個 mark 有寫；唔可以靠 ring 推論「⚡ 冇再觸發過」。
 - **呢兩張卡係最有「行為記憶」嘅兩張**：以後如果想 un-mute 其中一張，建議只 un-mute 一張，睇一日 ring 再決定第二張。
+
+## 4.56 真停 Birdeye 持倉探測：`PUSH_WATCH_MAX_HOLDER_CHECKS = 0`（2026-09-30）
+
+### 一、需求
+
+Operator 話「暫停 Birdeye 持倉探測同 CU 消耗」—— 即係唔止唔要卡（§4.55 已做），連**成本**都要停。
+動機有數：`/health.birdeyeCu` 顯示當月 8,060 CU 其中 `tokenOverview`（持倉探測）193 次叫、**3,860 CU**（≈48%）；
+單日 280 CU 中更有 200 CU（≈71%）係佢。而 `tokenOverview` 係**叫咗就收費**，就算個 count 落唔到地、就算張卡已經靜音。
+
+### 二、做法：用 0 把整個 stage 關掉，不是在 send 口丟棄
+
+| 位置 | 改動 | 為何 |
+|---|---|---|
+| `wrangler.toml` | `PUSH_WATCH_MAX_HOLDER_CHECKS = "0"`（＋註解） | 個 stage 本身有門 `if (birdeye && cfg.maxHolderChecksPerTick > 0)`，0 = 整嚦 block 唔執行 |
+| `src/config.ts` | `maxHolderChecksPerTick` 補 doc（0 = 關；已存在 clamp `Math.max(0, …)`，零邏輯改動） | 呢個 0 係有意義嘅設定值，唔係「離譜數值」 |
+| `src/worker.ts` | `/debug/push-watch` echo `maxHolderChecksPerTick` | 跟 §4.53 嘅 `mutedSigs` 同一個理由：stage 關咗就冇 `probe`/`miss` 動靜，呢個 echo 係「redeploy 有冇真係停到 CU」嘅即時讀數 |
+
+要點：
+
+1. **「停」同「發完再丟」係兩件事**：關掉之後**一次 fetch 都唔發**、**連 `holder_probe_at` 嗰個 worker_state 讀都唔做**、holder count 唔寫、note 永遠 `probe0 miss0`。這正是舊 1,200ms cap 嘅教訓 —— 舊寫法照叫照費，只係收到嘅 count 丟掉（`probe4 miss3`：三次叫、三次 park、得一個 count）。
+2. **Birdeye 帳號照駁**：掃描器嘅 new-listing backfill（`BIRDEYE_BACKFILL_ENABLED`，預設 true）照用；`/health.birdeyeCu` 照報。即係今次只停持倉探測，冇停整個 Birdeye。
+3. **恢復方法**：改回正數（預設 4／硬上限 10）再 deploy；counts 由「下一個 due row」自然接上，唔需要補資料。
+4. **同 §4.55 嘅關係**：兩層可以獨立反轉。只想要卡唔想花錢 → 維持 0；想再收卡但唔想花錢 → 唔可能（冇 count 就冇卡文）。
+
+### 三、測試（main suite 447 → **448 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+- `PushWatcher: PUSH_WATCH_MAX_HOLDER_CHECKS=0 stops the Birdeye probe instead of discarding it` —— `probes === 0`、冇 holder write、`holder_probe_at` **零讀取**、note `probe0 miss0`；control（預設 config）照樣发 1 次 probe。
+
+### 四、驗收（deploy 後）
+
+```bash
+curl -s .../debug/push-watch | jq '.maxHolderChecksPerTick'   # 期望 0
+curl -s .../health | jq '.birdeyeCu.byEndpoint.today'        # tokenOverview 應該停住
+```
+
+- `/health.birdeyeCu.byEndpoint.today.tokenOverview.calls` 唔再升（`newListing` 仍會升，係 backfill）；
+- 過一日後 `/health.birdeyeCu.today` 應該由 ~280 CU 跌到剩 backfill 那部分（實測今日 backfill 係 80 CU）；
+- pass note（`/health.tracker.note`）永遠 `probe0 miss0`；
+- 持倉 card 就此完全不會再出現（比 §4.55 嘅靜音更徹底：連 mark 都唔會再新増）。
+
+### 五、界線（老實講）
+
+- **停掉 probe 之後，已經寫入嘅 `holders_at_push`/`holders_last` 會變凍結舊值**：第日如果直接 un-mute 卡（而 `PUSH_WATCH_MAX_HOLDER_CHECKS` 仍係 0），⚡ `div` 係有機會根據陳年 baseline 錯誤發炮。要恢復持倉卡，**必須同時**把 probe 開返。
+- **已經 arm 嘅 `div` mark 只有價格那條腿可以清**：`divActive = chgSincePush ≥ 25% && holderRatio ≤ 0.9`。probe 關掉之後 `holdersLast` 凍結（唔再寫），所以 `holderRatio ≤ 0.9` 會一直為真，mark 只可以靠 `chgSincePush` 跌返 25% 以下才清。今日實測：靜音前後 ring 內 `hold`／`div` 都係 0 筆，所以呢個係「將來要留意」而唔係現時已存在嘅隱患。
+- **呢個開關唔慳 Turso**：省的只是 Birdeye CU（及相應 subrequest），其他 round trips 不變。
+- 反轉要 redeploy（wrangler var），冇 Telegram 指令。

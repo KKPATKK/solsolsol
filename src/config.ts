@@ -450,7 +450,7 @@ export interface AppConfig {
    * is watched for `windowHours` and refreshed from ONE DexScreener batch
    * call per tick; follow-up alerts report continuation (🚀 stages) or
    * breakdown (⚠️ weak / 💀 dead / 💧 liquidity). Birdeye holder growth
-   * probes are CU-bounded by maxHolderChecksPerTick.
+   * probes are CU-bounded by maxHolderChecksPerTick (0 = stage off).
    */
   pushWatch: {
     enabled: boolean;
@@ -458,6 +458,18 @@ export interface AppConfig {
     windowHours: number;
     cooldownMin: number;
     holdersRefreshMin: number;
+    /**
+     * Birdeye holder probes allowed per pass
+     * (PUSH_WATCH_MAX_HOLDER_CHECKS, default 4, ceiling 10).
+     *
+     * `0` = the holder stage is OFF, and it is the only switch that stops the
+     * SPEND rather than the card: the stage is gated by
+     * `if (birdeye && cfg.maxHolderChecksPerTick > 0)`, so 0 removes the whole
+     * block — no fetch, no `holder_probe_at` stamp read, no count written. Set
+     * 2026-09-30 alongside muting 📈/⚡, whose probes were 193 of the month's
+     * calls and 3_860 of its 8_060 CU. The Birdeye client stays wired for the
+     * scanner's new-listing backfill.
+     */
     maxHolderChecksPerTick: number;
     /**
      * How long ONE Birdeye holder probe may take, ms
