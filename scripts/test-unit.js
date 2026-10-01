@@ -4967,6 +4967,115 @@ async function main() {
     }
   });
 
+  await test("Scanner.stageSnapshot: the in-flight stage is readable at the cut, and cleared when the scan settles", async () => {
+    // WHY (live 2026-09-30: a 110-tick cut streak, 21:42-23:31Z, every row
+    // `ms 15500, profiles 0`): a cut tick flushes before the scanner publishes
+    // anything, so nothing durable said WHICH awaited dependency held the
+    // scan — CF analytics could only prove the invocations stayed alive. The
+    // scanner now names its in-flight stage and the worker snapshots it at the
+    // instant the race trips (see the err clause the completion flush writes
+    // into scan_history).
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({ chatId: "chat-on", ...DEFAULT_SETTINGS, enabled: true });
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchPairsForTokens = async () => new Map();
+      const scanner = new Scanner(db, { api: { sendMessage: async () => ({}) } }, dex, cfg, null, null, null);
+      assert.equal(scanner.stageSnapshot(), null, "no scan yet → no reading");
+      // Case A: a feed that never answers. The whole fan-out is the `feeds`
+      // stage, so a cut here reads `feeds` — the shape the 110-tick stall row
+      // could not name (profiles 0).
+      dex.fetchLatestSolanaProfiles = () => new Promise(() => {});
+      const scanA = scanner.runOnce();
+      const feedView = scanner.stageSnapshot();
+      assert.ok(feedView, "an in-flight scan must read as a stage");
+      assert.equal(feedView.stage, "feeds", "a hung feed reads as the feeds stage");
+      assert.ok(
+        Number.isFinite(feedView.ms) && feedView.ms >= 0,
+        `ms must be a duration (got ${feedView.ms})`,
+      );
+      scanner.abort();
+      await scanA;
+      assert.equal(scanner.stageSnapshot(), null, "a settled scan must leave no reading");
+      // Case B: a slow token-stats read — the stretch between the pair and
+      // gate stamps — reads `stats`, and its ms is the LIVE age the worker's
+      // clause quotes as "Nms in", not a constant.
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: "FEEDCOIN1" }];
+      db.getTokenStatsMany = () =>
+        new Promise((resolve) => setTimeout(() => resolve(new Map()), 400));
+      const scanB = scanner.runOnce();
+      let statsView = null;
+      for (let i = 0; i < 200 && !statsView; i++) {
+        const view = scanner.stageSnapshot();
+        if (view && view.stage === "stats") statsView = view;
+        else await new Promise((r) => setTimeout(r, 5));
+      }
+      assert.ok(statsView, "the slow token-stats read must read as the stats stage");
+      await new Promise((r) => setTimeout(r, 30));
+      const later = scanner.stageSnapshot();
+      assert.ok(
+        later && later.stage === "stats" && later.ms > statsView.ms,
+        "ms must be the live age, not a constant",
+      );
+      scanner.abort();
+      await scanB;
+      assert.equal(scanner.stageSnapshot(), null, "cleared again once the second scan settles");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("cut telemetry: the worker snapshots the stage at the cut and pins it to the scan_history err", () => {
+    // The reading lives in Scanner (stageSnapshot); this case pins the two
+    // halves that hold it together — the snapshot is taken INSIDE the timeout
+    // callback and BEFORE the cooperative abort() (a later read would name the
+    // stage the scan moved into, not the one the cut found), and the clause
+    // rides ONLY the exceeded branch of the err the completion flush persists
+    // into scan_history (a shed tick entered no stage, so its message stays as
+    // it was).
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const workerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8"),
+    );
+    const scannerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+    );
+    const cut = workerSrc.indexOf("constcut=scanner?.stageSnapshot()??null;");
+    const note = workerSrc.indexOf("cutStageNote=cut?");
+    const abort = workerSrc.indexOf("scanner?.abort();", cut);
+    assert.ok(cut >= 0, "the worker must snapshot the scanner's stage at the cut");
+    assert.ok(note > cut, "and compose the clause from that same snapshot");
+    assert.ok(abort > note, "the snapshot must be taken BEFORE the cooperative abort()");
+    assert.ok(
+      workerSrc.includes("cutinthe${cut.stage}stage"),
+      "the clause must name the stage",
+    );
+    assert.equal(
+      (workerSrc.match(/\$\{cutStageNote\}/g) || []).length,
+      1,
+      "the clause rides exactly one branch — the exceeded one, not the shed",
+    );
+    // Scanner: one entry per boundary, in the tick's order, the seq guard that
+    // keeps a straggler from writing a reading for a newer scan, and the clear
+    // when the scan settles.
+    assert.ok(scannerSrc.includes("stageSnapshot():{stage:string;ms:number}|null{"));
+    assert.ok(scannerSrc.includes("if(seq!==this.scanSeq)return;"));
+    const at = (stage) => scannerSrc.indexOf(`this.enterStage("${stage}",seq);`);
+    assert.ok(
+      at("feeds") >= 0 && at("pool") > at("feeds") && at("stats") > at("pool") && at("gate") > at("stats"),
+      "the four stages must be entered in the scan's order",
+    );
+    assert.ok(scannerSrc.includes('this.scanStage="";'), "a settled scan must clear the reading");
+  });
+
   await test("Scanner: the tracker's pair lookup reuses the tick's pairs and falls back to Jupiter", async () => {
     // The tracked coins are PUSHED coins, which the re-eval pool query
     // excludes, so the tracker's batch is a second request — and when

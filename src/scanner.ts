@@ -2302,6 +2302,29 @@ export class Scanner {
    */
   private inflightSummary: ScanSummary | null = null;
   /**
+   * The scan's IN-FLIGHT stage (see stageSnapshot) and when it began. One
+   * reading, moved at each phase boundary of runOnce: `feeds` (the front read
+   * and the feed fan-out, until the ladder's `front` stamp), `pool` (the pool
+   * join and the pair fetch, until `pair`), `stats` (the token-stats read,
+   * until `gate`), `gate` (the candidate chain: registration, eval, the
+   * per-chat gates, the push). Written ONLY by the current scan (see
+   * enterStage) and cleared when it settles, so a reading can never describe
+   * a finished or superseded scan.
+   *
+   * WHY THIS EXISTS (live 2026-09-30: a 110-tick cut streak, 21:42-23:31Z).
+   * Every row of that stall read the same shape — the race window at
+   * `ms 15500`, `profiles 0` — and CF analytics could only prove the
+   * invocations stayed alive, never which awaited dependency held them: an
+   * isolate-local stage was the one reading nobody persisted. The worker
+   * snapshots this pair in its race timeout and appends it to the err string
+   * the completion flush writes into scan_history (see cutStage there), so
+   * the next recurrence names its stage on the row an operator already
+   * opens.
+   */
+  private scanStage = "";
+  /** When `scanStage` began (epoch ms); 0 when no stage has been entered. */
+  private scanStageAt = 0;
+  /**
    * Pair data THIS tick's pair phase already paid for (the DexScreener
    * batch plus its Jupiter fallback). Kept for the post-push tracker pass:
    * the tracked coins are PUSHED coins, which the re-eval pool query
@@ -3463,6 +3486,33 @@ export class Scanner {
     return out;
   }
 
+  /**
+   * Move the in-flight stage reading (see scanStage). Called at each phase
+   * boundary of runOnce, with the scan's own seq: the guard is the same rule
+   * the finally's summary publish uses — a straggler that settles late must
+   * never write a reading for a scan that superseded it.
+   */
+  private enterStage(stage: string, seq: number): void {
+    if (seq !== this.scanSeq) return;
+    this.scanStage = stage;
+    this.scanStageAt = Date.now();
+  }
+
+  /**
+   * The stage in flight RIGHT NOW (see scanStage): its name plus how long the
+   * scan has been inside it, or null when no scan is running — nothing
+   * entered yet, or the last one settled. The worker reads this in its race
+   * timeout and writes it to the completion row, so a cut tick says WHAT held
+   * the scan and for how long, instead of only that it was held.
+   */
+  stageSnapshot(): { stage: string; ms: number } | null {
+    if (this.scanStage === "") return null;
+    return {
+      stage: this.scanStage,
+      ms: Math.max(0, Date.now() - this.scanStageAt),
+    };
+  }
+
   /** Worker hook: flag the running scan to stop at its next phase boundary. */
   abort(): void {
     this.abortRequested = true;
@@ -3641,6 +3691,10 @@ export class Scanner {
     // call was worth more than the whole tick (they cannot be started from
     // outside the scan: get() gates on this flag).
     this.db.enterScanMode();
+    // The scan's first stage runs from here to the front stamp: the front
+    // read, the pool/prune dispatch, the feed fan-out and the backfill (see
+    // stageSnapshot).
+    this.enterStage("feeds", seq);
     // Watchdog: if the scan outlives its budget, release the lock so the next
     // tick can retry instead of the isolate wedging in a permanent skip loop.
     const watchdog = setTimeout(() => {
@@ -4410,6 +4464,9 @@ export class Scanner {
       }
       // The discovery-feed phase is behind us (see the worker's phase ladder).
       this.stampPhase("front");
+      // In flight now: the pool join below and the pair fetch (see
+      // stageSnapshot).
+      this.enterStage("pool", seq);
       diag.feedsMs = Date.now() - feedsStart;
       // Dedupe the feeds (mints overlap across all three); the DexScreener
       // entry wins — it carries richer profile data.
@@ -4667,6 +4724,9 @@ export class Scanner {
       // The pool read AND the pair fetch are behind us (Jupiter fallback
       // included): the front window is closed.
       this.stampPhase("pair");
+      // In flight now: the token-stats read that precedes the candidate
+      // chain (see stageSnapshot).
+      this.enterStage("stats", seq);
       diag.pairs = pairsByToken.size;
       // The `dex` block is refreshed a SECOND time here (see the front refresh
       // above): the pair phase that just finished is the tick's last
@@ -4714,6 +4774,8 @@ export class Scanner {
       // Past the registration read: what follows is the candidate chain — eval,
       // the per-chat gates, the push (see the worker's phase ladder).
       this.stampPhase("gate");
+      // In flight now: the whole candidate chain (see stageSnapshot).
+      this.enterStage("gate", seq);
       const newStats: TokenStats[] = [];
       for (const profile of feedProfiles) {
         // Read failed → register nothing: `existingStats` missing means we
@@ -5674,6 +5736,10 @@ export class Scanner {
         diag.dbMs = scanDbMs;
         this.lastSummary = diag;
         this.lastSkip = null;
+        // The reading is over when the scan is: a settled scan must never be
+        // credited to a later cut (see stageSnapshot).
+        this.scanStage = "";
+        this.scanStageAt = 0;
         this.running = false;
       }
     }

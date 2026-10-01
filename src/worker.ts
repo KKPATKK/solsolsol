@@ -4391,6 +4391,13 @@ async function runScan(
   if (backfillEntry) deadTickStreak++;
   let rebuilt = false;
   let timedOut = false;
+  // The err clause naming the scan's in-flight stage at the instant the race
+  // tripped (see Scanner.stageSnapshot), or "" when there was nothing to
+  // name. Composed INSIDE the timeout callback, never read when the err below
+  // is: the cooperative abort lets the scan cross one more phase boundary
+  // before this tick resumes, and the clause must name the stage the CUT
+  // found, not the one the scan moved into after it.
+  let cutStageNote = "";
   // Whether OUR completion batch settled (success or fast error). Set
   // in the inner finally, read in the outer finally for streak
   // bookkeeping: a settled flush is the isolate-liveness proof the old
@@ -4528,6 +4535,14 @@ async function runScan(
         new Promise<void>((resolve) => {
           setTimeout(() => {
             timedOut = true;
+            // Snapshot BEFORE the abort: see cutStageNote — the reading is the
+            // stage in flight at the cut, and abort() only marks the scan to
+            // stop at its next boundary, so this is the last moment the pair
+            // still describes the hold the race tripped on.
+            const cut = scanner?.stageSnapshot() ?? null;
+            cutStageNote = cut
+              ? `, cut in the ${cut.stage} stage (${cut.ms}ms in)`
+              : "";
             // Cooperative stop: tell runOnce its budget is up so the
             // background scan returns at its next phase boundary instead of
             // grinding on until Cloudflare kills the isolate — the zombie
@@ -4553,10 +4568,19 @@ async function runScan(
       // subtraction (budget - reserve - window). Naming both halves also
       // separates a CPU-heavy payload from a slow claim round trip, which
       // have different fixes.
+      // The stage the race cut rides the err (see cutStageNote /
+      // Scanner.stageSnapshot) — the one reading no other telemetry carries,
+      // because a cut tick flushes before the scanner publishes anything, and
+      // CF analytics only ever proved the invocation stayed alive. It is the
+      // SAME err string the completion flush persists into scan_history, so
+      // the row an operator opens names what held the scan (and for how long),
+      // not just that it was held. Deliberately absent on the shed path: a
+      // shed tick refused the window up front and never entered a stage — its
+      // own message already names the front as the reason.
       lastScanError = timedOut
         ? raceShedReason
           ? `scan shed: the front left a ${grantedRaceMs}ms window, under the ${SCAN_RACE_MIN_USEFUL_MS}ms floor it takes to reach the pair phase (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, ${frontSplitNote(preTick)})`
-          : `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, ${frontSplitNote(preTick)})`
+          : `scan exceeded its ${scanRaceMs}ms race window (tick budget ${SCAN_TICK_BUDGET_MS}ms, flush reserve ${SCAN_FLUSH_RESERVE_MS}ms, ${frontSplitNote(preTick)})${cutStageNote}`
         : null;
       if (timedOut) {
         console.error(

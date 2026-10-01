@@ -4037,3 +4037,39 @@ curl -s .../debug/push-watch | jq '.mutedSigs'
 - **收嘅係「入場提示」而唔係「出場警告」**：呢張卡係唯一講「回調完、tape 轉身」嘅多頭訊號（♻️ `reclaim` 要破前高、🔥 要 $15K 爆量），收咗之後 −15…−45% 回撤後嘅轉強只可以靠 🚀 續漲／未收嘅 ♻️ 睇。
 - **反轉要 redeploy**（wrangler var），冇 Telegram 指令；要 un-mute 建議一次一隻 sig，睇返一日 ring 先再加。
 - **同 §4.56 嘅關係**：worker 程式碼唔變、round trips 唔變、門檻唔變，今次純係交付層嘅鏍絲。
+
+## 4.60 Scan cut 嘅時候，記錄成績卡喺邊個 stage（寫入 scan_history）（2026-10-01）
+
+### 一、動機（2026-09-30 夜晚嘅 110-tick stall，實測）
+
+- 21:42:29Z → 23:31:29Z **連續 110 個 tick 被 race window 切**（更大範圍 240 row：130 ok / 110 fail，fail 形狀完全一樣：`ms=15500`、`profiles 0`、`candidates 0`、`pushed 0`）；23:32:18Z **自己恢復**，恢復後 26/26 ok。
+- **CF analytics 反而係乾淨嘅**（12h，719 行）：110 分鐘內每個 invocation 都係 `success`、冇 `exceededResources`、memory 峰值 8.2MB（cap 128MB）、subreq/inv 5.04（cap 50）——但 `wallMax` 中位數由 5.06s 升到 **17.15s**（109/110 分鐘 >15s）。結論：invocation 一直活著，係**內部有 awaited 依賴阻塞**，最後被 scan 自己嘅 race window 切低。
+- **卡喺邊個依賴？** CF 冇 stage dimension，而 `scan_history` 得 `ms` + err，err 只有 window／front split —— 110 個 tick 都答唔到「卡喺邊」。呢個缺口就係今次補嘅嘢：下次一復發，**row 自己講出邊個 stage**。
+
+### 二、改動
+
+| 檔案 | 改動 |
+|---|---|
+| `src/scanner.ts` | `Scanner` 加 `scanStage`／`scanStageAt` ＋ `enterStage(stage, seq)` ＋ `stageSnapshot()`；`runOnce` 喺四個邊界入 stage：`feeds`（front read＋feed fan-out，直至 `front` stamp）→ `pool`（pool join＋pair fetch，直至 `pair`）→ `stats`（token-stats read，直至 `gate`）→ `gate`（candidate chain）；scan settle 時清空。`enterStage` 帶 seq guard（同 finally 嘅 summary publish 同一條規則），straggler 永遠冇得寫一個新 scan 嘅讀數。 |
+| `src/worker.ts` | race timeout callback 一 set `timedOut` 就 `scanner?.stageSnapshot()` 快照 —— **先快照、後 `abort()`**：abort 係合作式，之後 scan 仲會再過一個 boundary，讀遲咗會報「之後嗰個 stage」。非 shed 嘅 err 尾加 `, cut in the <stage> stage (<ms>ms in)`；呢條 err 就係 `persistScanCompletion` 寫入 `scan_history.err` 嗰條（亦係心跳嘅 `err`）。shed 路徑刻意唔加：shed 根本冇入過 stage，佢自己句嘢已經點名 front。 |
+
+### 三、測試（main suite 450 → **452 passed, 0 failed**；其餘 7 個 suite 全綠）
+
+- `Scanner.stageSnapshot`： (a) hung feed 讀 `feeds`、settle 後 null；(b) 400ms 慢 token-stats read 讀 `stats`，而且 30ms 之後 `ms` 真係大咗（證明係 live age，唔係常數）——即係 worker 引號嗰個「Nms in」係跑住嘅讀數。
+- `cut telemetry`（source pin）：快照喺 timeout callback 內、而且喺 `abort()` 之前；`cutStageNote` 全檔只出現一次 interpolation（只掛 exceeded 分支，shed 不變）；scanner 四個 `enterStage` 次序同 settle 清空。
+
+### 四、驗收（deploy 後）
+
+```bash
+curl -s .../debug/scan-history?rows=40 | jq -r '.rows[] | select(.ok==false) | "\(.at) \(.ms) \(.err)"'
+# 期望：切嘅 row 尾段有 ", cut in the <feeds|pool|stats|gate> stage (<N>ms in)"
+```
+
+- 復發時第一眼：`feeds` ⇒ 睇 feed fan-out（最似 2026-09-30 嗰次，因為 `profiles 0`）；`pool` ⇒ pool join／pair fetch；`stats` ⇒ token-stats read；`gate` ⇒ candidate chain。
+
+### 五、界線（老實講）
+
+- **呢個係讀數，唔係修復**：唔會令 stall 唔再發生，只係令下次一復發就即刻指到 stage（之前 110 個 tick 全部答唔到）。
+- **粒度係 4 格**（同 phase ladder 一樣），唔係逐個 await 一個名；更深嘅要配合同一條 err 內嘅 front split／`subreqs` 睇。
+- **`ms` 係「入咗呢個 stage 之後幾耐」**（即卡住嗰個 stage 已經燒咗幾多），唔係嗰個 await 嘅時間；**pre-race 卡住唔會出現在呢個 clause**（嗰個問題由 err 內嘅 front split 答）。
+- **Turso 係唯一落地點**：row 落唔到（flush 死）時，ladder record 都會帶呢條 err，但佢有 320 字上限 —— 睇唔到 clause 就係嗰個上限剪咗尾，正常路徑（row 落得到）冇呢個問題。
