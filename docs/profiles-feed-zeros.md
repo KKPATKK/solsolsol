@@ -284,3 +284,80 @@ metrics 要新鮮）。順手加咗 `listCacheHits` / `lastListCacheStatus` / `b
 **驗收（deploy 之後）。** 只要 `push_deferral.pending ≥ 1`，`/health.heartbeat.rejects` 就應該出現一條
 `owed: true` 嘅 entry，reason 就係嗰筆債等緊嘅閘；`pending` 清零之後應該再見唔到 `owed` entry
 （冇債就冇豁免、份額亦唔會被佔）。
+
+---
+
+# 後續（2026-10-01）：`profiles 0` 再現，今次係 **pool 階段嘅 caps 加起上嚟大過窗口**
+
+## 症狀（量度）
+
+窗口 `2026-10-01T05:45:59Z → 12:23:56Z`，`/debug/scan-history` 400 行：
+
+| 項目 | 數值 |
+|---|---|
+| 起點 | **11:09:56.903Z** 第一次被 cut（上一個好 tick：11:08:43.744Z） |
+| 影響 | **73 / 73 連續 tick 全 `ok:false`**，`ms` 固定 **15500** |
+| 錯誤 | `scan exceeded its ~15.2s race window …, cut in the pool stage (13625ms in)` |
+| 同 tick 嘅其他讀數 | `profiles 0`、`candidates 0`、`pushed 0`、`pool 507–1095` |
+| 推送影響 | 最後一張卡 **08:59:45Z**，全段零推送 |
+| 恢復 | `wrangler deploy`（新版）之後第一 tick：`ok:true ms 4593 profiles 21`，之後 `2431ms`、`2332ms` |
+| 起點前後嘅 Dex | 429 ring 最後一條 **11:07:41.621Z**，之後 **79 分鐘一條都冇**（直到 12:26:41） |
+
+`profiles 0` 係**真讀數**，唔係 cut 行嘅預設值：掃描期間 `diag` 就係 `inflightSummary`，`diag.profiles` 喺 feed 階段就寫入（scanner 4049），而 cut 行嘅 `pool 507/1095/707` 亦係真值 —— 即係掃描**確實過咗 pool join**，先死在 pool 階段後半。
+
+## 根因（代碼 + 算術，唔係推測）
+
+`SCAN_GATE_RESERVE_MS` 上面嘅註釋本身就寫明契約：
+
+> The front phases (feeds + pool read + pair fetch) must ALL be done by here …
+> **Every front-phase budget is clamped to this, so no combination of them can consume the tick.**
+
+實際上唔成立：`frontDeadline` 只餵咗 `feedDeadline`（`grep frontDeadline src/scanner.ts` = 兩行），
+**pool 階段四條腿各自帶 cap，冇任何一條夾喺佢**：
+
+| pool 階段嘅腿 | cap | 有冇夾 window |
+|---|---|---|
+| launch_ms backfill（`resumeLaunchBackfill`） | 4 000ms | ❌（而且只喺 chunk 之間檢查 deadline） |
+| pool read + prune | 2 400ms（`POOL_FETCH_BUDGET_MS`） | ❌ |
+| front 嘅 ONE write（`flushScanFront`） | ~1 200ms（DB scan mode） | n/a（唯一必落地嗰筆） |
+| pair fetch | 2 000ms（`PAIRS_FETCH_BUDGET_MS`） | ❌ —— `callerDeadlineMs` **從來冇 caller 傳過** |
+| Jupiter fallback | 900ms | ❌ |
+| **合計** | **10 500ms** | 對住 `FRONT_PHASE_WINDOW_MS` = **6 400ms** |
+
+即係：**每條腿都被包住，但佢哋嘅和冇被包住**。加上 tick 開頭已花掉嘅 ~1.9s，pool 階段只要同時踩
+多條腿嘅上限就會衝破 15.2s race window —— 呢個正是註釋所講「唔應該可達」嘅形狀（同一類 2026-09-16 零推送根因：
+`1800 + 2200 + 1500 = 5500ms` 撞 `4.2s` deadline）。
+
+`profiles 0` 就係**觸發器**：Dex list 條腿返空之後，pair batch（已被 90s `batchBlockedUntil` 封住）必然
+少過一半 ⇒ **Jupiter fallback 開火**（健康 tick 唔會行嘅第 5 條腿），同時整條池線行喺最壞分支上。
+
+**未能歸因嘅部分（老實講）**：`scan_history` 只存 `at/ok/ms/err/profiles/pool/candidates/pushed` 七欄，
+pool 階段又係**一舊冇名嘅 block**，所以「4s backfill / 2.4s pool / 1.2s write / 2s pairs / 0.9s jup
+邊一條食咗 13.6s」喺事故之後**無法還原**（heartbeat 每個 tick 覆寫）。今次修法同時補呢個缺口。
+
+## 修法
+
+| 位置 | 變更 |
+|---|---|
+| `scanner.ts` | 四條腿全部夾去 window：`poolDeadline = min(poolNow + POOL_FETCH_BUDGET_MS, frontDeadline)`；backfill 改成 `fetchFeedCapped(() => resumeLaunchBackfill(...), false, min(now+4000, frontDeadline))`（**raced**，唔止俾個 budget —— 佢個 loop 只喺 chunk 之間檢查）；front write 係唯一必落地嗰筆，保持唔 race |
+| `scanner.ts` | 兩個網絡腿收口：`fetchPairsForTokens(addresses, frontDeadline)`（終於傳嗰個為此而設嘅參數）；Jupiter fallback 加 `Date.now() < frontDeadline` gate |
+| `dexscreener.ts` | caller deadline **已經過咗 = 唔出請求**：舊句 `callerDeadlineMs > now ? callerDeadlineMs : Infinity` 會喺 caller 遲到時**丟掉** deadline 再送一個全新 2 000ms；cache hits 照樣免費派 |
+| `scanner.ts` | pool 階段拆出子階段名（`pool-read` / `front-write` / `pairs` / `pairs-jup`），cut 句今後會講明**邊條腿**：事故當日只有 `cut in the pool stage (13625ms in)` 一個字 |
+
+## 測試（4 條新，全部做過 mutation 檢查）
+
+改 `dist/` 還原修正再跑：`pool legs clamped` → **fail（`runOnce took 8036ms`）**、
+`pair fetch is handed the front window` → **fail（`must pass its front deadline`）**、
+`a caller deadline already in the past sends nothing` → **fail（`must not open a request`）**。
+第 4 條（子階段名／順序）讀 `src/scanner.ts`，屬 source 不變式。
+
+`npm run test:unit`：**462 passed / 0 failed**（原本 458），其餘 suite 7 / 5 / 10 / 4 / 14 全 0 failed。
+
+## 未驗收（誠實列明）
+
+- **未 deploy**，所以以上全部係本機量度；`pool-read` 等子階段名要落線之後才有真實 cut 行可以讀。
+- 事故真正起點嘅**上游原因未定**：429 ring 由 09:11 起每 ~2 分鐘一條，到 11:07:41 突然停足 79 分鐘
+  （= 嗰段時間根本冇打 Dex 出去），同日 deploy 後 12:26:41 又再出現。呢點同「tick 先死、所以冇請求」
+  相符，但**兩者因果未證**。今次改動只保證「就算四條腿同時踩上限，tick 都唔會再被 cut」，唔保證上游唔再 429。
+- 呢份 doc 上面（2026-09-21）曾經試過「feed 喺 tick 開頭 dispatch」並**同日 revert**（令 tick 撞 9.6s 殺點）。
+  今次**冇**動 envelope、冇加任何新請求，只係把已存在嘅 caps 收窄到契約本身要求嘅窗口。

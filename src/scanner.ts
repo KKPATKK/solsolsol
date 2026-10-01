@@ -3881,7 +3881,12 @@ export class Scanner {
       // are picked up shortly before they qualify and pushed the moment they
       // do.
       const poolNow = Date.now();
-      const poolDeadline = poolNow + POOL_FETCH_BUDGET_MS;
+      // Clamped to the FRONT's shared window (see frontDeadline), like every
+      // other front-phase cap: the pool read and the prune are front phases,
+      // and their 2400ms is one of the terms that window has to hold. Healthy
+      // ticks are unchanged (2400 < 6400); the clamp only bites on a tick that
+      // is already late, which is exactly the tick that used to lose the race.
+      const poolDeadline = Math.min(poolNow + POOL_FETCH_BUDGET_MS, frontDeadline);
       const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));
       const poolMaxAgeMin = Math.max(...chats.map((c) => c.maxAgeMinutes));
       const poolMinMcapUsd = Math.min(...chats.map((c) => c.minMarketCapUsd));
@@ -4604,15 +4609,46 @@ export class Scanner {
         ),
       ];
       const now = Date.now();
+      // Sub-stage label (see stageSnapshot). The pool stage is FOUR
+      // independently-capped legs, and a cut tick must be able to NAME the one
+      // that held it: the 2026-10-01 outage was 73 consecutive cuts whose only
+      // reading was `cut in the pool stage (13625ms in)`, with no way to say
+      // which leg spent the time (see docs/profiles-feed-zeros.md).
+      this.enterStage("pool-read", seq);
       // Resume the one-time launch_ms backfill migration until it finishes
       // (bounded per tick — see Db.resumeLaunchBackfill). While legacy rows
       // still have NULL launch_ms they are invisible to the banded pool query
       // below, so finishing quickly keeps re-eval coverage continuous after a
       // deploy. Best-effort: a failure just retries next tick.
+      //
+      // ITS BUDGET IS THE WINDOW'S, NOT ITS OWN (2026-10-01). 4000ms was the
+      // largest single cap in the front, and a per-leg cap is not a bound on
+      // the tick: this leg, the pool read, the front's write, the pair fetch
+      // and the Jupiter fallback together carried 10_500ms of caps against a
+      // FRONT_PHASE_WINDOW_MS of 6400ms, so a degraded tick could overrun the
+      // race window on the sum of its own limits — the exact shape the
+      // SCAN_GATE_RESERVE_MS note says is not supposed to be reachable. A
+      // migration that runs out of window simply resumes next tick — that is
+      // how it is designed to run.
       if (!this.launchBackfillDone) {
         if (this.shouldStopEarly()) return;
+        // Raced against its own deadline, not merely handed one: the
+        // migration's loop only checks between chunks, so a single hung
+        // libsql call would outlive any budget it was given. `false` is the
+        // "not done" answer this leg already returns, so a window with
+        // nothing left keeps the migration unfinished for the next tick
+        // instead of opening a call it cannot wait for.
+        const backfillDeadline = Math.min(now + 4_000, frontDeadline);
         try {
-          this.launchBackfillDone = await this.db.resumeLaunchBackfill(4_000, this.scanFront);
+          this.launchBackfillDone = await this.fetchFeedCapped(
+            () =>
+              this.db.resumeLaunchBackfill(
+                backfillDeadline - Date.now(),
+                this.scanFront,
+              ),
+            false,
+            backfillDeadline,
+          );
         } catch (err) {
           console.error(
             "[scanner] launch_ms backfill resume failed:",
@@ -4653,6 +4689,7 @@ export class Scanner {
       // was a rare warm isolate's `misses 2`). That build runs BEFORE the
       // fetches answer, so every COLD isolate — which is most ticks —
       // journaled an empty delta and lost its window with the isolate.
+      this.enterStage("front-write", seq);
       await this.stampListCacheDelta();
       // The list the NEXT 429 tick falls back on, journaled beside it (see
       // DEX_PROFILES_LAST_KEY): a REPLACE, and only when this tick's fetch
@@ -4738,12 +4775,34 @@ export class Scanner {
         ]),
       ];
       if (this.shouldStopEarly()) return;
-      const pairsByToken = await this.dex.fetchPairsForTokens(addresses);
+      this.enterStage("pairs", seq);
+      // The caller deadline this fetch was BUILT to take (see
+      // fetchPairsForTokens' own note: "the scanner's front-phase window"). It
+      // used to be omitted, on the claim that "the scanner's front-phase caps
+      // already sum inside the window" — the assumption the 2026-10-01
+      // outage falsified. Passing frontDeadline bounds the SUM, not just this
+      // leg, so the pair phase yields to the gate/push reserve instead of
+      // spending it.
+      const pairsByToken = await this.dex.fetchPairsForTokens(
+        addresses,
+        frontDeadline,
+      );
       // Fallback: when DexScreener's batched endpoint is blocked (shared
       // egress 429s — observed 2026-08-22, pairs: 0/550), source the gate
       // data from Jupiter's token API instead. It carries every input the
       // gates need (mcap, liquidity, 5m/1h volume+change, txns, createdAt).
-      if (pairsByToken.size < addresses.length * 0.5 && this.jupiter) {
+      //
+      // Gated on the front window as well: this leg only ever fires on the
+      // ticks that have the LEAST room (a Dex refusal is what drops pairs
+      // under half), and its 900ms came out of the same 6400ms window as
+      // everything above it. Coins it cannot reach keep their pool slot and
+      // are re-read on the next rotation, like every other budget here.
+      if (
+        pairsByToken.size < addresses.length * 0.5 &&
+        this.jupiter &&
+        Date.now() < frontDeadline
+      ) {
+        this.enterStage("pairs-jup", seq);
         try {
           const missing = addresses.filter((a) => !pairsByToken.has(a));
           for (const [k, v] of await this.jupiter.fetchTokenDataBatch(missing))

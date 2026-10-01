@@ -6632,6 +6632,150 @@ async function main() {
     }
   });
 
+  await test("Scanner: the pool stage's legs are clamped to the FRONT window, so their SUM cannot hold the tick", async () => {
+    // 2026-10-01, live: 73 consecutive ticks were cut with the SAME reading —
+    // `scan exceeded its 15.2s race window … cut in the pool stage (13625ms
+    // in)`, `profiles 0`, candidates 0 — for 74 minutes. The shape that made
+    // it reachable: every leg of the pool stage carried its own cap (launch
+    // backfill 4000 + pool read/prune 2400 + the front's one write 1200 + pair
+    // fetch 2000 + Jupiter fallback 900 = 10_500ms) against a
+    // FRONT_PHASE_WINDOW_MS of 6400ms, and no SUM was clamped to it — the
+    // opposite of what the SCAN_GATE_RESERVE_MS note promises.
+    //
+    // Both wedged legs BELOW resolve after 8s (not never) so a regression
+    // fails this assertion instead of hanging the suite: before the clamp the
+    // migration leg was awaited unraced, so the scan sat on it for the whole 8s
+    // and the tick ended up past where the worker's race would cut it.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({ chatId: "chat-on", ...DEFAULT_SETTINGS, enabled: true });
+      const wedged = () => new Promise((resolve) => setTimeout(() => resolve(false), 8_000));
+      db.resumeLaunchBackfill = wedged;
+      db.getReevalPool = wedged;
+      db.pruneOldTokenStats = wedged;
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      const scanner = new Scanner(db, { api: { sendMessage: async () => ({}) } }, dex, cfg, null, null, null);
+      const t0 = Date.now();
+      const seen = new Set();
+      let settled = false;
+      const scan = scanner.runOnce().then(() => {
+        settled = true;
+      });
+      while (!settled && Date.now() - t0 < 14_000) {
+        const view = scanner.stageSnapshot();
+        if (view) seen.add(view.stage);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      await scan;
+      const elapsed = Date.now() - t0;
+      assert.ok(settled, "the tick must settle instead of being held by a wedged leg");
+      // The FRONT window (6400ms) plus slack for the front's own write. Pre-fix
+      // this tick sat past 8s on the backfill leg alone, and live it sat past
+      // 13s — which is what made the worker's 15.2s race cut it every minute.
+      assert.ok(elapsed < 7_000, `runOnce took ${elapsed}ms — the front's caps are not clamped to the window`);
+      assert.ok(scanner.lastSummary, "the tick still publishes a summary instead of being cut");
+      // The stage that spent the time names ITSELF to the worker's cut clause:
+      // the outage's only reading was `cut in the pool stage (13625ms in)`,
+      // with four different legs behind that one word.
+      assert.ok(seen.has("pool-read"), `expected the pool-read sub-stage, saw ${[...seen].join(", ")}`);
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: the pair fetch is handed the front window, not left to its own budget", async () => {
+    // The patch that added `callerDeadlineMs` documented it as "the scanner's
+    // front-phase window" and then no caller ever passed it: the front pair
+    // phase relied on the caps of its NEIGHBOURS summing inside the window,
+    // which is exactly what stopped being true (see the test above).
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({ chatId: "chat-on", ...DEFAULT_SETTINGS, enabled: true });
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      // A feed coin, so the scan reaches the pair phase at all (an empty feed
+      // AND an empty pool returns before it).
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: "FEEDCOIN1" }];
+      let seenDeadline = "not called";
+      dex.fetchPairsForTokens = async (_addrs, deadline) => {
+        seenDeadline = deadline;
+        return new Map();
+      };
+      const scanner = new Scanner(db, { api: { sendMessage: async () => ({}) } }, dex, cfg, null, null, null);
+      const t0 = Date.now();
+      await scanner.runOnce();
+      assert.equal(typeof seenDeadline, "number", "the scanner must pass its front deadline");
+      assert.ok(seenDeadline > t0, "and it must be in the future when the phase starts");
+      // The front window is 6400ms into the scan; allow the scan's own start
+      // offset plus slack, but nothing near the 15.2s race window.
+      assert.ok(seenDeadline - t0 < 9_000, `front deadline ${seenDeadline - t0}ms out — not the front window`);
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: the pool stage's sub-stages are named, in the scan's order", () => {
+    // The 2026-10-01 outage's only reading was "cut in the pool stage (13625ms
+    // in)" — the stage that spent 13.6s was one unlabelled block of four
+    // different legs. Each leg now stamps its own name before it runs, so the
+    // next cut says WHICH one held the tick.
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    const at = (stage) => src.indexOf(`this.enterStage("${stage}", seq);`);
+    assert.ok(at("pool") > 0, "the pool stage itself stays");
+    for (const stage of ["pool-read", "front-write", "pairs"]) {
+      assert.ok(
+        at(stage) > at("pool") && at(stage) < at("stats"),
+        `"${stage}" must be a sub-stage of pool, not a stage of its own`,
+      );
+    }
+    assert.ok(at("pool-read") < at("front-write"), "the DB legs run before the front's write");
+    assert.ok(at("front-write") < at("pairs"), "and the pair fetch is last, as before");
+    assert.ok(at("pairs-jup") > at("pairs"), "the Jupiter fallback is named apart from the batch");
+  });
+
+  await test("DexScreenerClient.fetchPairsForTokens: a caller deadline already in the past sends nothing", async () => {
+    // The clamp only means something if a SPENT window actually stops the
+    // wire: the old arithmetic (`callerDeadlineMs > now ? callerDeadlineMs :
+    // Infinity`) threw the deadline away exactly when the caller was late,
+    // handing it a fresh PAIRS_FETCH_BUDGET_MS — which is what let a late tick
+    // keep spending.
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const cfg = loadConfig({});
+    const dex = new DexScreenerClient(cfg);
+    const origFetch = globalThis.fetch;
+    let wire = 0;
+    globalThis.fetch = async () => {
+      wire += 1;
+      return new Response(JSON.stringify({ pairs: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    try {
+      const spent = await dex.fetchPairsForTokens(["AAA", "BBB"], Date.now() - 1);
+      assert.equal(wire, 0, "a window that is already gone must not open a request");
+      assert.equal(spent.size, 0);
+      // A FUTURE deadline still fetches, and lands the batch it was given time for.
+      const live = await dex.fetchPairsForTokens(["AAA"], Date.now() + 5_000);
+      assert.equal(wire, 1, "a usable window still goes to the wire");
+      assert.equal(typeof live, "object");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   await test("Scanner.bestEffort: a hung chain step resolves with its fallback at the chain deadline", async () => {
     // The 2026-09-16 zero-push shape: the candidate chain awaits ~11 live
     // calls SERIALLY (RugCheck, crime checkToken, Axiom, Birdeye ×2, GMGN,

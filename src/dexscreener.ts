@@ -1913,8 +1913,10 @@ export class DexScreenerClient {
      * front-phase window, see FRONT_PHASE_WINDOW_MS). The pair fetch is the
      * last front phase, so when a deadline is supplied it yields to whichever
      * comes first: its own PAIRS_FETCH_BUDGET_MS or that deadline. Omitted
-     * (tests, ad-hoc calls, and the scanner today, whose front-phase caps
-     * already sum inside the window) → the local budget only.
+     * (tests and ad-hoc calls) → the local budget only. The SCANNER PASSES IT
+     * since 2026-10-01 — it used to rely on its front-phase caps summing
+     * inside the window, which the 73-cut outage falsified (see the module
+     * note in scanner.ts around SCAN_GATE_RESERVE_MS).
      */
     callerDeadlineMs?: number,
   ): Promise<Map<string, PairInfo>> {
@@ -1936,9 +1938,18 @@ export class DexScreenerClient {
     // burn the tick's budget on doomed retries) — cache-only for now.
     if (Date.now() < this.batchBlockedUntil) return result;
 
+    // A caller deadline ALREADY IN THE PAST is honoured as "send nothing"
+    // (2026-10-01), not folded into the local budget: this used to read
+    // `callerDeadlineMs > now ? callerDeadlineMs : Infinity`, so the one caller
+    // whose phase had already run out — the tick that is late — silently got
+    // another full PAIRS_FETCH_BUDGET_MS of wire time. A deadline in the past
+    // now makes the loop's own `Date.now() > deadline` check stop it before the
+    // first batch, which is the same rule the loop already applies to a batch
+    // it cannot start ("pure latency here"), and cache hits are still served
+    // above this line — they are free and the gates need them.
     const deadline = Math.min(
       now + PAIRS_FETCH_BUDGET_MS,
-      typeof callerDeadlineMs === "number" && callerDeadlineMs > now
+      typeof callerDeadlineMs === "number"
         ? callerDeadlineMs
         : Number.POSITIVE_INFINITY,
     );
