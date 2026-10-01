@@ -605,8 +605,12 @@ JUP_SUS_BLOCK = "true"
 # (docs/suspicious-token-gates.md) measured score 0 at 5/5 drained in-window but
 # deliberately did NOT ship a floor, because a low score can also just mean a
 # young token. Watch fails.organic in /health.heartbeat.summary before trusting
-# 60, and raise ORGANIC_MIN_SCORE (or set 0) from that reading.
-ORGANIC_MIN_SCORE = "60"
+# the number, and raise ORGANIC_MIN_SCORE (or set 0) from that reading.
+#
+# 2026-10-01: 60 → 55 (operator). The live reading that prompted it was a single
+# block, PUZZLE at score 0.0 — a 5-point move does not change that shape; it
+# only admits the 55–59 band that 60 held out.
+ORGANIC_MIN_SCORE = "55"
 # Arkham Intelligence (requires ARKHAM_API_KEY, a SECRET — set in the
 # Cloudflare dashboard, never here): smart-money attribution on push cards.
 # Each qualifying coin's top-100 holders are checked for entity types in

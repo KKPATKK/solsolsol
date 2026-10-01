@@ -655,7 +655,7 @@ export interface AppConfig {
    */
   jupSusBlock: boolean;
   /**
-   * Minimum Jupiter organic score (ORGANIC_MIN_SCORE, default 60, 0 = off).
+   * Minimum Jupiter organic score (ORGANIC_MIN_SCORE, default 55, 0 = off).
    *
    * Jupiter's `organicScore` (0–100) separates real retail participation from
    * wash/coordinated volume, and it is FREE here: the reading is the very
@@ -669,9 +669,9 @@ export interface AppConfig {
    *
    * OPERATOR CHOICE, not calibration: docs/suspicious-token-gates.md §5
    * measured score 0 at 5/5 drained in-window but deliberately declined to ship
-   * a floor, because a low score can also mean a young token. 60 is the
-   * operator's number; watch fails.organic in /health.heartbeat.summary before
-   * trusting it.
+   * a floor, because a low score can also mean a young token. 55 is the
+   * operator's number (60 until 2026-10-01); watch fails.organic in
+   * /health.heartbeat.summary before trusting it.
    */
   organicMinScore: number;
   /** Crime-wallet blocklist (community list — see CrimeWalletClient). */
@@ -1013,7 +1013,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // disables rather than becoming NaN (NaN would pass every comparison and
       // silently disarm the gate). Clamped to the score's own 0–100 scale so a
       // typo cannot turn the gate into a total block.
-      const v = Number(env.ORGANIC_MIN_SCORE ?? 60);
+      const v = Number(env.ORGANIC_MIN_SCORE ?? 55);
       return Number.isFinite(v) && v > 0 ? Math.min(v, 100) : 0;
     })(),
     crimeWallets: {

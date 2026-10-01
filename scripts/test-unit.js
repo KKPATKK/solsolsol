@@ -8816,16 +8816,67 @@ async function main() {
     assert.equal(organicMinBlockReason(NaN, null, 60) === null, true);
   });
 
-  await test("ORGANIC_MIN_SCORE: default 60, 0 and junk disable, the scale is clamped", () => {
-    // The operator asked for the floor (60); unset keeps it, and the escape
-    // hatches follow the other floors: 0 = off, unparseable = off (never NaN,
-    // which would pass every comparison and silently disarm the gate).
-    assert.equal(loadConfig({}).organicMinScore, 60, "unset ships the operator's 60");
+  await test("ORGANIC_MIN_SCORE: default 55, 0 and junk disable, the scale is clamped", () => {
+    // The operator asked for the floor (55 since 2026-10-01, 60 before that);
+    // unset keeps it, and the escape hatches follow the other floors: 0 = off,
+    // unparseable = off (never NaN, which would pass every comparison and
+    // silently disarm the gate).
+    assert.equal(loadConfig({}).organicMinScore, 55, "unset ships the operator's 55");
+    assert.equal(
+      loadConfig({ ORGANIC_MIN_SCORE: "60" }).organicMinScore,
+      60,
+      "the previous value still parses — the dial is the operator's",
+    );
     assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "0" }).organicMinScore, 0, "0 is OFF");
     assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "nope" }).organicMinScore, 0, "junk fails closed");
     assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "-5" }).organicMinScore, 0, "below zero is OFF too");
     assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "75" }).organicMinScore, 75);
     assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "9000" }).organicMinScore, 100, "clamped to the score's own scale");
+  });
+
+  await test("organic gate: a coin it blocks can never be enrolled in the tracking pool", () => {
+    // Operator rule (2026-10-01). It is already guaranteed, and by CONSTRUCTION
+    // rather than by a flag: the push_watch table has exactly one writer,
+    // reached from exactly one call site, and that site sits after Telegram
+    // returned a message_id for the initial card. Every gate — this one
+    // included — `continue`s long before it, so a blocked coin is never even a
+    // candidate for enrollment. Pinned here because the guarantee is a CALL
+    // GRAPH fact, not a setting: an edit that enrolled at admission ("watch it
+    // so we can follow it up later") would fill the tracker with exactly the
+    // coins the operator held back, and it has to fail this test instead.
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const dbSrc = read("src/db.ts");
+    const scannerSrc = read("src/scanner.ts");
+    assert.equal(
+      dbSrc.split("INSERT INTO push_watch").length - 1,
+      1,
+      "one writer for the tracking pool",
+    );
+    assert.equal(
+      scannerSrc.split(".onPush(").length - 1,
+      1,
+      "one enrollment call site in the scan",
+    );
+    const gate = scannerSrc.indexOf("organicMinBlockReason(");
+    const delivered = scannerSrc.indexOf("pushed++;");
+    const enroll = scannerSrc.indexOf(".onPush(");
+    assert.ok(gate > 0 && delivered > gate, "the organic gate fires before any push is counted");
+    assert.ok(
+      enroll > delivered,
+      "and enrollment rides a push that already went out (it is behind pushed++)",
+    );
+    // The same branch records the delivery audit, which is the evidence a card
+    // left the bot — the tracker is seeded off deliveries, never off candidates.
+    assert.ok(
+      scannerSrc.includes("await this.db.recordPushDelivery("),
+      "the enrollment shares the delivery branch, not the candidate chain",
+    );
+    // And the tracker's self-heal (the one path that seeds rows the hook
+    // missed) can only ever look at PUSHED tokens: it anti-joins seen_tokens.
+    assert.ok(
+      dbSrc.includes("AND NOT EXISTS (SELECT 1 FROM push_watch pw WHERE pw.token = s.token)"),
+      "the self-heal lists pushes, so a blocked coin has no row to be healed from",
+    );
   });
 
   await test("organic gate is sited with the Jupiter suspicion gate and reuses its one awaited reading", () => {
