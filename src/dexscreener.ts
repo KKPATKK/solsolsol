@@ -1115,6 +1115,20 @@ export const PAIR_BATCH_CACHE_TTL_S = 120;
 /** After a batched-endpoint 429, skip all batch calls for this long. */
 const PAIR_BATCH_BACKOFF_MS = 90_000;
 /**
+ * Minimum gap between two durable 429 records (see note429).
+ *
+ * WHY IT EXISTS (2026-10-01). The notify used to be debounced by the batch
+ * block's own re-arm (`episodeStart = now >= batchBlockedUntil`), which only
+ * worked while every refusal armed that block. Refusals are now charged to the
+ * lane that made the request (see note429), and the LIST lanes are refused
+ * about once a tick — measured live 14:59Z: `listCacheRefused 25` of
+ * `feedRequests 30`, `lastRawProfiles 0` — so without a window of its own the
+ * fleet ring would take one Turso write per tick, forever, for a drip that has
+ * not changed. Sized as the number that debounce used to be, so the ring keeps
+ * the cadence it had while the two were coupled.
+ */
+export const DEX_429_RECORD_MIN_GAP_MS = PAIR_BATCH_BACKOFF_MS;
+/**
  * Batch requests kept in flight concurrently. The pair loop used to dispatch
  * strictly sequentially — each batch waited for the previous response before
  * even arming its throttle spacing — so fetch cost scaled as
@@ -1141,8 +1155,12 @@ const PAIR_BATCH_CONCURRENCY = 3;
  */
 export interface DexScreenerHooks {
   /**
-   * Fired once per rate-limit episode (the first 429, not every retry
-   * attempt of it), after the cache-only backoff is armed.
+   * Fired for a refusal on ANY of the client's lanes — the ring it feeds is
+   * the host-wide "is DexScreener refusing this egress IP" reading — at most
+   * once per DEX_429_RECORD_MIN_GAP_MS (see note429), so a refusal per tick
+   * cannot become a Turso write per tick. The batch lane's own reactions (the
+   * cache-only block, the spacing) do NOT ride this hook: they run on every
+   * batch refusal, whether or not that refusal is recorded.
    */
   onBatch429?: (at: number) => void;
 }
@@ -1178,6 +1196,12 @@ export class DexScreenerClient {
   >();
   /** Until this epoch the endpoint 429'd — serve pair cache only. */
   private batchBlockedUntil = 0;
+  /**
+   * When a refusal was last written to the fleet ring (see note429 and
+   * DEX_429_RECORD_MIN_GAP_MS). Deliberately NOT the batch block: the block is
+   * the batch lane's reaction, the ring is every lane's record.
+   */
+  private last429RecordedAt = 0;
   /** 429 responses seen by this isolate (incl. retry attempts). */
   private http429Total = 0;
   /** Epoch of the most recent 429 response, or null if never. */
@@ -1316,8 +1340,10 @@ export class DexScreenerClient {
    * Live rate-limit telemetry for /health: the configured dispatch spacing
    * (DEX_REQUEST_INTERVAL_MS), how often the shared egress IP has been 429'd
    * since this isolate booted, and how long the cache-only backoff still has
-   * to run. `blockedForMs > 0` means the batched endpoint is refusing us and
-   * every tick is serving cache-only until it clears.
+   * to run. `blockedForMs > 0` means the BATCHED endpoint itself refused us
+   * (see note429; `pairCacheRefused` carries the receipts) and every tick is
+   * serving cache-only until it clears — a LIST-lane refusal no longer arms
+   * it, so this field and `spacingSteps` are the pair lane's own reading.
    */
   getStats(): {
     /** The spacing dispatch is running at RIGHT NOW (see AdaptiveSpacing): the
@@ -1480,34 +1506,50 @@ export class DexScreenerClient {
   }
 
   /**
-   * Record a 429 and arm the cache-only backoff. Called from getJson — the
-   * only place the status is visible — because the pair path's retry loop
-   * turns a budgeted 429 into a `null` response (attempt 2 sees the deadline
-   * already gone and returns null instead of throwing), so the batch loop's
-   * own /429/ check never ran on the real path: the backoff never armed and a
-   * rate-limited tick looked identical to an empty one. Counting here makes
-   * the limit observable (getStats → scan summary → /health) and lets the
-   * next tick go straight to cache-only.
+   * Record a 429: always the count, the timestamp and the fleet ring; the
+   * batch lane's TWO reactions (arm the cache-only backoff, widen the dispatch
+   * spacing) only when the refusal came from the batch lane itself.
    *
-   * One hook per episode: a storm is 3 retry attempts × N batches, and the
-   * hook writes to Turso, so re-notifying while the backoff is already armed
-   * would turn a rate limit into a write flood. The counter still increments
-   * per response (that is the drip signal); only the notify is debounced.
+   * WHY THE LANE IS PASSED IN (2026-10-01, measured live). This method is
+   * called from getJson, which the two LIST lanes (`/token-profiles/`,
+   * `/token-boosts/`) share with the pair batches — and while it was called
+   * with no lane at all, a LIST refusal did both batch jobs. The profiles list
+   * is refused by the shared egress IP's bucket on most ticks by design (see
+   * LIST_FEED_CACHE_TTL_S: ~5 requests/minute per SOURCE IP and strangers spend
+   * the bucket), so the coupling did not read as an incident — it read as the
+   * normal state: measured 14:59Z, the list was refused 2s into the tick
+   * (`last429At` = tick start, `listCacheRefused` == `http429`), `blockedForMs`
+   * read 87,942 BEFORE the pair phase ran, and the pair lane dispatched nothing
+   * at all that hour (`poolLegMs.pairs 0`, `pairCacheMisses 0`,
+   * `pairCacheRefused 0`) while `pairsJup == pairs` every tick — the tick's
+   * pair data was 100% the Jupiter fallback's, for a refusal the batch
+   * endpoint never made. That is the one reading the old coupling hid: the
+   * batch lane was never asked, so nothing could say whether it too was
+   * refused. The batch reactions are now driven by the batch lane's own
+   * refusals — exactly what PAIR_BATCH_BACKOFF_MS and AdaptiveSpacing were
+   * written to describe — and a real batch 429 still arms both of them at once.
+   *
+   * The spacing follows EVERY batch refusal, not once per episode: an episode
+   * is 3 retry attempts × N batches, and it is the LAST of them that must
+   * leave the queue slower than the first — resting the spacing on the episode
+   * start would return the queue to 250ms while the storm was still arriving.
+   *
+   * The ring stays host-wide — "is DexScreener refusing this egress IP?" is a
+   * property of the host, not of one lane — and it needs its own gap now
+   * (DEX_429_RECORD_MIN_GAP_MS); the counter still increments per response, so
+   * the drip stays visible even while the notify is debounced.
    */
-  private note429(): void {
+  private note429(batchLane: boolean): void {
     const now = Date.now();
-    const episodeStart = now >= this.batchBlockedUntil;
     this.http429Total++;
     this.last429At = now;
-    this.batchBlockedUntil = now + PAIR_BATCH_BACKOFF_MS;
-    // The spacing follows the refusal (see AdaptiveSpacing). Counted on EVERY
-    // 429 response, not once per episode: an episode is 3 retry attempts × N
-    // batches, and it is the LAST of them that must leave the queue slower than
-    // the first — resting the spacing on the episode start would return the
-    // queue to 250ms while the storm was still arriving.
-    this.spacing.noteRefused();
-    this.throttle.setIntervalMs(this.spacing.currentMs);
-    if (!episodeStart) return;
+    if (batchLane) {
+      this.batchBlockedUntil = now + PAIR_BATCH_BACKOFF_MS;
+      this.spacing.noteRefused();
+      this.throttle.setIntervalMs(this.spacing.currentMs);
+    }
+    if (now - this.last429RecordedAt < DEX_429_RECORD_MIN_GAP_MS) return;
+    this.last429RecordedAt = now;
     try {
       this.hooks.onBatch429?.(now);
     } catch {
@@ -1615,11 +1657,14 @@ export class DexScreenerClient {
         // budget answer, not a failure: the caller already owns its own
         // fallback, and retrying would only spend the caller's window.
         if (res === null) return null;
+        // ONE place decides which LANE an outcome belongs to (the path — the
+        // same dexFeedLeg mapping the drop counters use), so a pair HIT can
+        // never move the list ratio that decides LIST_FEED_CACHE_TTL_S — and
+        // the 429 handler below charges the refusal to that same lane (see
+        // note429), which is why the answer is computed before the
+        // edge-cache branch rather than inside it.
+        const pairLane = dexFeedLeg(path) === "pairs";
         if (edgeCacheTtlS !== undefined) {
-          // ONE place decides which LANE an outcome belongs to (the path — the
-          // same dexFeedLeg mapping the drop counters use), so a pair HIT can
-          // never move the list ratio that decides LIST_FEED_CACHE_TTL_S.
-          const pairLane = dexFeedLeg(path) === "pairs";
           if (res.ok) {
             // ONE place counts a list outcome and one place decides what a hit
             // is (see the ledger): a second inline regex here is how the durable
@@ -1643,7 +1688,7 @@ export class DexScreenerClient {
             else noteListCacheRefused(res.status);
           }
         }
-        if (res.status === 429) this.note429();
+        if (res.status === 429) this.note429(pairLane);
         if (res.status === 429 || res.status >= 500) {
           throw new Error(`DexScreener HTTP ${res.status}`);
         }

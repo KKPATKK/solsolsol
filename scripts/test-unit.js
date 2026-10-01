@@ -4482,6 +4482,92 @@ async function main() {
     }
   });
 
+  await test("DexScreenerClient: a LIST 429 must not block or slow the BATCH lane", async () => {
+    // Measured live 2026-10-01T14:59Z (see docs/profiles-feed-zeros.md, third
+    // round): the profiles list (/token-profiles/latest/v1) is refused by the
+    // shared egress IP's bucket about once a tick, and note429 — called from
+    // getJson, which every lane shares — was arming the pair batches' 90s
+    // cache-only backoff from those refusals. The pair lane then dispatched
+    // NOTHING (`poolLegMs.pairs 0`, `pairCacheMisses 0`, `pairCacheRefused 0`,
+    // `pairsJup == pairs` every tick): the hour's pair data came 100% from the
+    // Jupiter fallback, for a refusal the batch endpoint never made. A LIST
+    // refusal is evidence about the LIST endpoint — the batch block and the
+    // batch spacing must be driven by the batch lane's own refusals.
+    const origFetch = globalThis.fetch;
+    const urls = [];
+    let pairMode = "ok";
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("/token-profiles/"))
+        return new Response("rate limited", { status: 429 });
+      if (pairMode === "429") return new Response("rate limited", { status: 429 });
+      return new Response(
+        JSON.stringify({
+          pairs: [
+            {
+              chainId: "solana",
+              baseToken: { address: "PAIRMINT", name: "Pair", symbol: "PAIR" },
+              priceUsd: "1.23",
+              marketCap: 123_000,
+              liquidity: { usd: 45_000 },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    const episodes = [];
+    try {
+      const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "250" });
+      const dex = new DexScreenerClient(cfg, {
+        onBatch429: (at) => episodes.push(at),
+      });
+      const addrs = Array.from({ length: 30 }, (_, i) => `MINT${i}`.padEnd(44, "x"));
+
+      // (a) The LIST refusal: counted, recorded for the fleet ring — and it
+      // must NOT reach the batch lane's two reactions.
+      await dex.fetchLatestSolanaProfiles();
+      const afterList = dex.getStats();
+      assert.ok(afterList.http429 >= 1, "the LIST refusal is still counted");
+      assert.equal(episodes.length, 1, "and still reaches the fleet ring");
+      assert.equal(afterList.blockedForMs, 0, "the pair block must stay unarmed");
+      assert.equal(afterList.intervalMs, 250, "the dispatch spacing must stay at the base");
+      assert.equal(afterList.spacingSteps, 0, "with no phantom raise");
+
+      // (b) …so the pair lane can still reach the wire on the same isolate —
+      // the reading the old coupling hid.
+      const pairs = await dex.fetchPairsForTokens(addrs);
+      assert.ok(
+        urls.some((u) => u.includes("/latest/dex/tokens/")),
+        "a LIST 429 leaves the pair lane able to ask",
+      );
+      assert.equal(pairs.size, 1, "and a served batch is handed back");
+      assert.equal(dex.getStats().blockedForMs, 0, "the phase ends with the lane open");
+
+      // (c) A BATCH refusal — inside the ring's own debounce window — must
+      // still arm both reactions: the ledger's gap may never gate the lane's
+      // reaction.
+      pairMode = "429";
+      const late = Array.from({ length: 30 }, (_, i) => `LATE${i}`.padEnd(44, "x"));
+      const refused = await dex.fetchPairsForTokens(late);
+      assert.equal(refused.size, 0, "a refused batch contributes nothing");
+      const afterBatch = dex.getStats();
+      assert.ok(afterBatch.blockedForMs > 0, "a BATCH 429 arms the pair block");
+      assert.ok(afterBatch.intervalMs > 250, "and widens the dispatch spacing");
+      assert.ok(afterBatch.spacingSteps >= 1, "counting the raise");
+      assert.equal(afterBatch.pairCacheRefused, 1, "with the pair lane's own receipt");
+      assert.equal(afterBatch.lastPairCacheStatus, "HTTP-429");
+      assert.equal(
+        episodes.length,
+        1,
+        "the ring's gap debounces the RECORD, never the reaction",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   await test("DexScreenerClient: pair batches ride the colo edge cache on their own TTL and ledger", async () => {
     // The pair batches (/latest/dex/tokens/<addresses>) were the one lane left
     // off the edge cache (see the 2026-09-26 note beside LIST_FEED_CACHE_TTL_S)

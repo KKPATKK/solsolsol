@@ -435,3 +435,75 @@ Mutation（改 `dist/` 再還原）：拆走 `Math.min(now+900, caller)` → 2 �
   2. 縮細前段 address 集合（slice 90 + tracker head 42 + feed ~25）——`RE_EVAL_PER_TICK_MAX` 之前已量過一次
      （見 `docs/front-window-coverage-2026-09-28.md`：加去 180 換唔到 candidate，已 revert），tracker head 就係下一個候選。
 - **未驗收**：`pairsJup` / `pairsMissing` 要落線先讀得到；呢兩個數亦係判斷「Dex 恢復之後 fallback 係唔係真係縮返」嘅唯一讀數。
+
+---
+
+# 跟進（2026-10-01 第三輪）：唔係 spacing、唔係 address set —— 係 **LIST lane 嘅 429 封住咗 BATCH lane**
+
+## 觸發
+
+第二輪文末列咗兩條槓桿（spacing 降返 250；縮前段 address 集合，下一候選 tracker head）。落手之前先量 —— 量出嚟嘅形狀同兩條槓桿嘅**前提**都唔同。
+
+## 量度（線上，`b6e77ab` 之後；`/health` 抽樣 14:59:49Z tick ＋ `/debug/dex429`）
+
+| 讀數 | 值 | 意思 |
+|---|---|---|
+| `pairs` / `pairsJup` | 195 / 195 | fallback 又係 100% 扛住（同第二輪一樣） |
+| `poolLegMs.pairs` | **0ms** | Dex 條 pair 腿**一個 batch 都冇派出** |
+| `dex.pairCacheMisses` / `pairCacheHits` / `pairCacheRefused` | 0 / 0 / 0 | pair lane 由頭到尾冇問過 origin（唔係被拒，係冇問） |
+| `dex.blockedForMs` | **87,942**（剩餘） | summary 寫入嗰刻，cache-only block 仍有 87.9s |
+| `dex.last429At` | 14:59:46.992 | ＝ **tick 開始後 0.4s**，即 feed 階段嗰個 list fetch |
+| `dex.listCacheRefused` / `dex.http429` | 25 / 25 | **每一個** 429 都係 list lane 嘅；pair lane 冇 refusal |
+| `feedMakeup.lastRawProfiles` / `failedTotal` / `feedRequests` | 0 / 25 / 30 | profiles list 近 30 次請求 25 次被拒（shared egress 桶，見 `LIST_FEED_CACHE_TTL_S`） |
+| `dex.intervalMs` / `configuredIntervalMs` / `spacingSteps` | 1200 / 250 / 4 | spacing 亦係 list refusal 推上去 |
+| `pairsMissing` | **0**（該 tick） | 唔係每 tick 都漏：14:35:48 嗰個 tick 係 `pairs 100 / pairsJup 100 / pairsMissing 72` |
+
+地址集合（同一 tick）：`pairs 195`（fallback 全覆蓋）− tracker head 30（tracker pass note `rows 30/30`）− slice 90（`poolSliced`）＝ **feed ~75**。第二輪 doc 寫「address ~150」係用 feed ~25 估嘅；實際 feed 係各腿聯集（同一 tick 原始行數 pump 20 + meteora 19 + jup 30 + jupTrend 9 + profiles 18 = 96，去重後約 75）。
+
+## 根因（代碼，唔係推測）
+
+`note429()` 只有一個呼叫點：`getJson`（`src/dexscreener.ts`）—— 而 `getJson` 係**三條 lane 共用**（兩個 list ＋ pair batch）。舊版每一條 429 都做齊 pair lane 嘅兩件事：
+
+```
+this.batchBlockedUntil = now + PAIR_BATCH_BACKOFF_MS;   // 90s cache-only，pair 專用
+this.spacing.noteRefused();                             // pair 嘅 dispatch spacing
+```
+
+⇒ list 條腿嘅 refusal 喺 tick 開始 ~2 秒內就替 pair lane 上鎖，pair 階段（4.3s 後）永遠 cache-only。**第二輪 doc 寫「`intervalMs 1200` ⇒ ~2 batch/tick」係推斷**；實測係 **0 batch/tick** —— spacing 唔係閘，block 先係閘。而 `PAIR_BATCH_BACKOFF_MS` 嘅註釋本身就寫「After a **batched-endpoint** 429」：呢個耦合係實作同常量文件唔一致，唔係設計。
+
+## 兩條舊槓桿點解唔係正解（都係量度）
+
+| 槓桿 | 點解唔係 |
+|---|---|
+| spacing 降返 250 | pair lane 被封住時，spacing 係幾多都冇 batch 派出（0 × 任何數 = 0）。而且 `intervalMs 1200` 本身係 list refusal 推上去 —— 人手降返，下一 tick 又推返上 1200。要 spacing 自己行返落 250，先要**停止將 list 嘅 refusal 計入 pair lane** |
+| 縮 tracker head（30） | 最壞 tick（`pairsMissing 72`）miss 嘅係**掃描自己嘅幣**：Jupiter 一個 chunk 只夠 100，head 排在最後（「a batch the phase's deadline skips is the tracker's pre-fetch」），係最先被犧牲嘅尾巴 —— 縮佢唔會令 72 變細。反效果：tracker pass 冇咗 prefetch，佢自己嗰條三源 fallback（lastPairs → Dex → Jupiter → Gecko）要多打一次；而今個 tick 佢係免費嘅（`pairs 195` 全覆蓋） |
+
+## 修法（`src/dexscreener.ts`：一個 lane 判定 ＋ 一個 debounce）
+
+| 位置 | 變更 |
+|---|---|
+| `getJson` | `const pairLane = dexFeedLeg(path) === "pairs"` 由 edge-cache 分支**提上嚟**（同一個純函數、唔加參數、唔加第二個判定），再傳落 `note429(pairLane)` |
+| `note429(batchLane)` | 永遠：`http429Total++`、`last429At`、fleet ring；**只有 `batchLane`**：`batchBlockedUntil = now+90s` ＋ `spacing.noteRefused()` ＋ throttle 更新。list lane 嘅 refusal 只係計數（list 自己有防守：edge cache、`PROFILE_FEED_REUSE_MS` 30 分鐘 reuse、`lastRawProfiles`/`failedTotal` 讀數） |
+| ring debounce | 舊 debounce 寄生喺 block（`episodeStart = now >= batchBlockedUntil`）；解耦之後 list refusal 每 tick 一次 ⇒ 會變成每 tick 寫一次 Turso。新常數 `DEX_429_RECORD_MIN_GAP_MS = PAIR_BATCH_BACKOFF_MS`（90s）＋ `last429RecordedAt`，ring 保持原本寫入節奏；**debounce 只管記錄，唔管反應**（batch refusal 喺窗口內一樣即刻 arm） |
+
+## 測試（1 條新，3 個 mutation）
+
+`DexScreenerClient: a LIST 429 must not block or slow the BATCH lane`（假 transport 三段）：(a) list 429 ⇒ `http429` 有數、ring 有記錄，但 `blockedForMs 0`、`intervalMs 250`、`spacingSteps 0`；(b) 同一 isolate pair lane 照樣上到 wire 並拿到 pair（舊耦合下呢步唔可能發生）；(c) 跟住一個 batch 429（**喺 ring 嘅 debounce 窗口之內**）⇒ `blockedForMs > 0`、`intervalMs > 250`、`pairCacheRefused 1`、`lastPairCacheStatus "HTTP-429"`，而 ring 唔會多寫一條。
+
+| Mutation（改 `dist/` 再還原） | 邊條變紅 |
+|---|---|
+| `note429(pairLane)` → `note429(true)`（舊耦合） | `the pair block must stay unarmed` |
+| 把 `if (batchLane) {…}` 移入 debounce 之後 | `a BATCH 429 arms the pair block` |
+| `DEX_429_RECORD_MIN_GAP_MS = 0` | `the ring's gap debounces the RECORD, never the reaction` |
+
+`npm run typecheck` 0 error；main suite **467 passed / 0 failed**（原 466）；其餘 7 / 5 / 10 / 4 / 14 ＋ `test-deferred-priority`、`test-tick-path` 全 pass。
+
+## 落線之後點讀（未驗收，誠實列明）
+
+| 形狀 | 意思 |
+|---|---|
+| `pairCacheMisses` 5–7/tick、`poolLegMs.pairs` 幾百–2000ms、`pairsJup` 細、`blockedForMs 0`、`intervalMs` 自己沿階梯由 1200 行返落 250（每 6 個 2xx 一級；fleet row 每 60s 一級） | **World A**：batch endpoint 其實冇拒我哋 —— 之前係被 list 嘅 429 拖住。fallback 可以退回後備位 |
+| `pairCacheRefused` 升、`lastPairCacheStatus "HTTP-429"`、`blockedForMs` 再上 ~88s、`pairsJup == pairs` 照舊 | **World B**：batch endpoint 真係同一個桶。呢個先係「量度到」——下一步唔應該再動 spacing，而係前段工作量本身（fallback 時間／chunk 覆蓋） |
+| `listCacheRefused` 繼續升 | 唔變：list 條腿嘅甩漏由 `lastRawProfiles`/`failedTotal` 讀，reuse 窗口兜住 30 分鐘 |
+
+**未做**（留返量度驅動）：tracker head 冇動（佢唔係 miss 嘅來源）；`DEX_REQUEST_INTERVAL_MS` 冇動（World A 之下 adaptive 自己行返落 250，人手降 spacing 只會同時掩蓋 World B 嘅指紋）。
