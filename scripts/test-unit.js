@@ -6748,6 +6748,80 @@ async function main() {
     assert.ok(at("pairs-jup") > at("pairs"), "the Jupiter fallback is named apart from the batch");
   });
 
+  await test("pool legs: each FRONT leg reports its own wall time in every summary", async () => {
+    // The deterministic reading the 2026-10-01 outage lacked. On a healthy tick
+    // nothing is cut, so the cut clause never fires — and before this the only
+    // per-leg numbers (poolMs / poolWaitMs / feedsMs) covered the pool JOIN,
+    // not the four legs after it, so "which leg costs what" could only be
+    // answered by waiting for a failure. The durations come from the stage
+    // transitions themselves (Scanner.enterStage banks the closing leg), so
+    // they cost no request, no timer and no new column: they ride the heartbeat
+    // the tick already writes.
+    const { Scanner } = require("../dist/scanner.js");
+    const FEED_LEG_NAMES = ["front-write", "pairs", "pairs-jup", "pool-read"];
+    const scan = async (pairHit) => {
+      const t = tmpDb();
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+      try {
+        const db = new Db(t.p, undefined, t.client);
+        await db.init();
+        await db.saveChatSettings({ chatId: "chat-on", ...DEFAULT_SETTINGS, enabled: true });
+        const cfg = loadConfig({});
+        const dex = new DexScreenerClient(cfg);
+        dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: "FEEDCOIN1" }];
+        // A hit makes the pair phase succeed; an empty map drops it under half,
+        // which is the only path that runs the Jupiter fallback.
+        dex.fetchPairsForTokens = async () =>
+          pairHit ? new Map([["FEEDCOIN1", {}]]) : new Map();
+        const jupiter = { fetchTokenDataBatch: async () => new Map() };
+        const scanner = new Scanner(
+          db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+          null, null, null, null, null, null, jupiter,
+        );
+        await scanner.runOnce();
+        return scanner.lastSummary && scanner.lastSummary.poolLegMs;
+      } finally {
+        globalThis.fetch = origFetch;
+        await t.cleanup();
+      }
+    };
+    // The degraded branch (Dex comes back short) runs all four legs.
+    const all = await scan(false);
+    assert.ok(all, "the summary must carry the per-leg reading");
+    for (const leg of ["pool-read", "front-write", "pairs", "pairs-jup"]) {
+      assert.equal(typeof all[leg], "number", `${leg} must report a duration`);
+      assert.ok(Number.isFinite(all[leg]) && all[leg] >= 0, `${leg} must be a finite ms`);
+    }
+    assert.deepEqual(
+      Object.keys(all).sort(),
+      FEED_LEG_NAMES,
+      "exactly the four front legs — the other stages already have their own reading",
+    );
+    // The healthy branch never runs the fallback, and an absent leg is ABSENT
+    // rather than 0: "did not run" and "ran instantly" are different readings.
+    const healthy = await scan(true);
+    assert.ok(healthy, "a healthy tick reports the legs too");
+    assert.equal(healthy["pairs-jup"], undefined, "a leg that did not run is not reported as 0");
+    assert.deepEqual(
+      Object.keys(healthy).sort(),
+      ["front-write", "pairs", "pool-read"],
+      "and the legs that DID run are still all there",
+    );
+    // The names are the ones the worker's cut clause prints, so the two
+    // readings describe the same four legs (see the sub-stage test above).
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    assert.ok(
+      src.includes('export type FrontLeg = "pool-read" | "front-write" | "pairs" | "pairs-jup";'),
+      "the leg names are declared once, exported for the test",
+    );
+    // Measured at the transitions, and closed again at settle so a leg a cut
+    // interrupts still counts (that is the 2026-10-01 shape).
+    assert.ok(src.includes("this.closeFrontLeg();\n    this.scanStage = stage;"), "enterStage banks the closing leg");
+    assert.ok(src.includes("this.closeFrontLeg();\n        this.lastSummary = diag;"), "and settle closes the open one");
+  });
+
   await test("DexScreenerClient.fetchPairsForTokens: a caller deadline already in the past sends nothing", async () => {
     // The clamp only means something if a SPENT window actually stops the
     // wire: the old arithmetic (`callerDeadlineMs > now ? callerDeadlineMs :

@@ -343,6 +343,7 @@ pool 階段又係**一舊冇名嘅 block**，所以「4s backfill / 2.4s pool / 
 | `scanner.ts` | 兩個網絡腿收口：`fetchPairsForTokens(addresses, frontDeadline)`（終於傳嗰個為此而設嘅參數）；Jupiter fallback 加 `Date.now() < frontDeadline` gate |
 | `dexscreener.ts` | caller deadline **已經過咗 = 唔出請求**：舊句 `callerDeadlineMs > now ? callerDeadlineMs : Infinity` 會喺 caller 遲到時**丟掉** deadline 再送一個全新 2 000ms；cache hits 照樣免費派 |
 | `scanner.ts` | pool 階段拆出子階段名（`pool-read` / `front-write` / `pairs` / `pairs-jup`），cut 句今後會講明**邊條腿**：事故當日只有 `cut in the pool stage (13625ms in)` 一個字 |
+| `scanner.ts` | 新增 `summary.poolLegMs`：四條腿各自嘅 wall time（ms）。由**階段轉換本身**量度（`enterStage` 收尾上一條腿），所以零請求、零 timer、零新欄位 —— 跟 heartbeat 現有嘅寫入一齊出去，**每個健康 tick** 都讀得到；settle 時會收尾仍未關嘅腿（即 cut 中斷嗰條）。未跑過嘅腿係**缺席**而非 0（「冇跑」同「跑得極快」係兩種讀數）。`/health.heartbeat.summary.poolLegMs` |
 
 ## 測試（4 條新，全部做過 mutation 檢查）
 
@@ -355,7 +356,7 @@ pool 階段又係**一舊冇名嘅 block**，所以「4s backfill / 2.4s pool / 
 
 ## 未驗收（誠實列明）
 
-- **未 deploy**，所以以上全部係本機量度；`pool-read` 等子階段名要落線之後才有真實 cut 行可以讀。
+- **cut 句嘅子階段名要出 cut 先睇得到**，所以單靠佢仍然係「等下次故障」。`summary.poolLegMs` 就是為此而加：健康 tick 一樣讀得到四條腿嘅耗時，唔需要等 cut。兩者用同一組名。
 - 事故真正起點嘅**上游原因未定**：429 ring 由 09:11 起每 ~2 分鐘一條，到 11:07:41 突然停足 79 分鐘
   （= 嗰段時間根本冇打 Dex 出去），同日 deploy 後 12:26:41 又再出現。呢點同「tick 先死、所以冇請求」
   相符，但**兩者因果未證**。今次改動只保證「就算四條腿同時踩上限，tick 都唔會再被 cut」，唔保證上游唔再 429。

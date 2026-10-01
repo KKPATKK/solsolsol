@@ -1597,6 +1597,26 @@ export interface RejectionEntry {
 }
 
 /** Rejection reasons from the last completed scan (surfaced via /health). */
+/**
+ * The four legs the pool stage is made of, in the order they run (see
+ * ScanSummary.poolLegMs and Scanner.enterStage, which names each one before it
+ * starts and banks the closing one).
+ *
+ * They are named individually because they are the block the 2026-10-01
+ * outage could not attribute: 73 cut ticks said only `cut in the pool stage`,
+ * and the four caps behind that word summed to 10_500ms against a 6_400ms
+ * window. The cut clause names the leg that was open; this reading names how
+ * long each leg took on a tick that finished normally.
+ */
+export type FrontLeg = "pool-read" | "front-write" | "pairs" | "pairs-jup";
+
+const FRONT_LEG_STAGES: ReadonlySet<string> = new Set<string>([
+  "pool-read",
+  "front-write",
+  "pairs",
+  "pairs-jup",
+]);
+
 export interface ScanSummary {
   profiles: number;
   /**
@@ -1701,6 +1721,26 @@ export interface ScanSummary {
    * tick's long pole.
    */
   poolWaitMs?: number;
+  /**
+   * Wall time (ms) spent in each of the pool stage's FRONT legs — the four
+   * independently-capped steps between the feed fan-out and the eval
+   * (`pool-read`, `front-write`, `pairs`, `pairs-jup`; see FrontLeg).
+   *
+   * WHY IT EXISTS (2026-10-01). That stage's four legs summed to 10_500ms of
+   * caps against a 6_400ms front window, and 73 consecutive ticks were cut
+   * with `cut in the pool stage (13625ms in)` as the ONLY reading — the leg
+   * that spent the time was not recoverable afterwards, because scan_history
+   * stores four numbers and the stage reported as one block. The durations are
+   * measured from the stage transitions themselves (Scanner.enterStage), so a
+   * leg that a cut interrupts still counts, and they ride the heartbeat the
+   * tick already writes — no new request, no new round trip, no new column.
+   *
+   * A leg that never ran (a healthy tick's `pairs-jup` — the Jupiter fallback
+   * only fires when DexScreener returns under half the requested pairs) is
+   * simply absent rather than 0: "did not run" and "ran instantly" are
+   * different readings, which is the same distinction the gates make.
+   */
+  poolLegMs?: Partial<Record<FrontLeg, number>>;
   /**
    * Edge-cache ledger for the re-eval pool snapshot (see POOL_EDGE_CACHE_URL):
    * hits is work Turso did not do, misses is the read that then seeded the
@@ -2357,6 +2397,24 @@ export class Scanner {
   private scanStage = "";
   /** When `scanStage` began (epoch ms); 0 when no stage has been entered. */
   private scanStageAt = 0;
+  /**
+   * Accumulate the leg that is CLOSING into the summary's poolLegMs (see the
+   * field's note). Only the four FRONT legs are kept: the other stages
+   * (`feeds`, `pool` itself, `stats`, `gate`) already have their own reading
+   * in the summary (feedsMs / poolMs / poolWaitMs / evalMs), so re-reporting
+   * them here would be a second number for one quantity.
+   */
+  private closeFrontLeg(): void {
+    const stage = this.scanStage;
+    const at = this.scanStageAt;
+    if (stage === "" || at === 0) return;
+    if (!FRONT_LEG_STAGES.has(stage)) return;
+    const diag = this.inflightSummary;
+    if (!diag) return;
+    const legs = (diag.poolLegMs ??= {});
+    const leg = stage as FrontLeg;
+    legs[leg] = (legs[leg] ?? 0) + Math.max(0, Date.now() - at);
+  }
   /**
    * Pair data THIS tick's pair phase already paid for (the DexScreener
    * batch plus its Jupiter fallback). Kept for the post-push tracker pass:
@@ -3527,6 +3585,11 @@ export class Scanner {
    */
   private enterStage(stage: string, seq: number): void {
     if (seq !== this.scanSeq) return;
+    // The leg that is closing banks its wall time here — the transition IS the
+    // measurement, so a leg needs no timer of its own and cannot forget to
+    // stop one. `scanStageAt` is left alone on purpose: stageSnapshot() reads
+    // it for the worker's cut clause while the stage is open.
+    this.closeFrontLeg();
     this.scanStage = stage;
     this.scanStageAt = Date.now();
   }
@@ -5850,6 +5913,12 @@ export class Scanner {
         diag.flurryRpcCalls = fs?.rpcCalls ?? 0;
         diag.flurryCacheHits = fs?.cacheHits ?? 0;
         diag.dbMs = scanDbMs;
+        // Close the leg still open at settle, if any: a cut or an abort can
+        // end the scan INSIDE a front leg (that is the 2026-10-01 shape), and
+        // the completion row should still carry how long that leg ran. Called
+        // before the publish and before scanStageAt is zeroed, so it banks the
+        // real duration exactly once (a second call finds the stage cleared).
+        this.closeFrontLeg();
         this.lastSummary = diag;
         this.lastSkip = null;
         // The reading is over when the scan is: a settled scan must never be
