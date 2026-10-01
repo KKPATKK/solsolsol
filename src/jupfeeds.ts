@@ -232,6 +232,18 @@ const JUP_BATCH_SIZE = 100;
  * budget here.
  */
 const JUP_FALLBACK_BUDGET_MS = 900;
+/**
+ * Minimum ROOM a caller's deadline must leave before this fallback may even
+ * START — the same floor the chunk loop applies below (`remaining` under this
+ * and the chunk is not attempted). Exported because the SCANNER checks it
+ * before it stamps the leg: a `pairs-jup` stage entered with no room would
+ * publish a near-zero `poolLegMs` reading, indistinguishable from "the leg ran
+ * and was instant" — and this repo reads "did not run" and "ran instantly" as
+ * two different facts (see FrontLeg). The DexScreener pair lane states the same
+ * rule for its own batches (max-latency): a request that cannot START inside
+ * the phase is not a drop, it is not attempted at all.
+ */
+export const JUP_FALLBACK_MIN_ROOM_MS = 250;
 
 function n(v: unknown): number {
   const x = Number(v);
@@ -490,10 +502,34 @@ export class JupTokensClient {
    * deadline-bounded, so a tripped race still settles and flushes a
    * diagnosable timeout row instead of dying as a dead tick.
    */
-  async fetchTokenDataBatch(mints: string[], max = 500): Promise<Map<string, PairInfo>> {
+  async fetchTokenDataBatch(
+    mints: string[],
+    /**
+     * Absolute epoch ms the CALLER's phase must be done by (the scanner's
+     * front-phase window, see FRONT_PHASE_WINDOW_MS). Same contract as
+     * DexScreenerClient.fetchPairsForTokens' second parameter — and it exists
+     * for the same reason.
+     *
+     * WHY (2026-10-01, follow-up to the 73-cut outage). The scanner used to
+     * check only that SOME front window was left and then hand this method
+     * nothing, so the leg spent its own full 900ms from its own start: started
+     * 1ms before `frontDeadline` it still ran ~900ms PAST it, i.e. it could eat
+     * most of the 1_600ms gate/push reserve (SCAN_GATE_RESERVE_MS) that the
+     * front caps exist to protect. It was the last front leg whose budget was
+     * not clamped to the shared window. A deadline ALREADY IN THE PAST sends
+     * nothing (the loop's own first check does it), exactly like the pair lane.
+     */
+    callerDeadlineMs?: number,
+    max = 500,
+  ): Promise<Map<string, PairInfo>> {
     const out = new Map<string, PairInfo>();
     const list = mints.filter((m) => MINT_RE.test(m)).slice(0, Math.max(0, max));
-    const deadline = Date.now() + JUP_FALLBACK_BUDGET_MS;
+    const deadline = Math.min(
+      Date.now() + JUP_FALLBACK_BUDGET_MS,
+      typeof callerDeadlineMs === "number"
+        ? callerDeadlineMs
+        : Number.POSITIVE_INFINITY,
+    );
     for (let i = 0; i < list.length; i += JUP_BATCH_SIZE) {
       if (this.rateLimited() || Date.now() > deadline) break;
       const chunk = list.slice(i, i + JUP_BATCH_SIZE);
@@ -504,7 +540,7 @@ export class JupTokensClient {
       // gate/push phase behind it — past the scan's deadline. A chunk that
       // expires contributes nothing and the loop exits on the next check.
       const remaining = deadline - Date.now();
-      if (remaining <= 250) break;
+      if (remaining <= JUP_FALLBACK_MIN_ROOM_MS) break;
       const data = await Promise.race([
         this.get(`/search?query=${chunk.join(",")}`),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), remaining)),

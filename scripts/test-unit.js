@@ -18,7 +18,7 @@ const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmoun
 const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
-const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient } = require("../dist/jupfeeds.js");
+const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
@@ -6723,6 +6723,29 @@ async function main() {
       // The front window is 6400ms into the scan; allow the scan's own start
       // offset plus slack, but nothing near the 15.2s race window.
       assert.ok(seenDeadline - t0 < 9_000, `front deadline ${seenDeadline - t0}ms out — not the front window`);
+      // The JUPITER fallback is the other network leg of this phase, and it was
+      // the last one still outside the window (2026-10-01 follow-up): it was
+      // entered whenever SOME window was left and then spent its own 900ms from
+      // its own start. Both halves of the fix are pinned here — the deadline it
+      // is handed, and the room the scanner requires before it stamps the leg
+      // (a leg entered with no room would publish a near-zero duration, which
+      // reads exactly like "it ran and was instant").
+      const strip = (text) =>
+        text
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/\/\/[^\n]*/g, "")
+          .replace(/\s+/g, "");
+      const scannerSrc = strip(
+        fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+      );
+      assert.ok(
+        scannerSrc.includes("fetchTokenDataBatch(missing,frontDeadline,)"),
+        "the Jupiter fallback must be handed the front deadline too (no caller passed one before)",
+      );
+      assert.ok(
+        scannerSrc.includes("frontDeadline-Date.now()>JUP_FALLBACK_MIN_ROOM_MS"),
+        "and it must not be entered without room for one chunk",
+      );
     } finally {
       globalThis.fetch = origFetch;
       await t.cleanup();
@@ -6775,20 +6798,39 @@ async function main() {
         // which is the only path that runs the Jupiter fallback.
         dex.fetchPairsForTokens = async () =>
           pairHit ? new Map([["FEEDCOIN1", {}]]) : new Map();
-        const jupiter = { fetchTokenDataBatch: async () => new Map() };
+        // The fallback stub records the deadline it was HANDED (2026-10-01
+        // follow-up: this leg used to be called with no deadline at all) and
+        // what it yields, so both halves of the contract are assertable.
+        const jupSeen = { calls: 0, deadline: "not called" };
+        const jupiter = {
+          fetchTokenDataBatch: async (_mints, deadline) => {
+            jupSeen.calls += 1;
+            jupSeen.deadline = deadline;
+            return new Map([["FEEDCOIN1", {}]]);
+          },
+        };
         const scanner = new Scanner(
           db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
           null, null, null, null, null, null, jupiter,
         );
+        const t0 = Date.now();
         await scanner.runOnce();
-        return scanner.lastSummary && scanner.lastSummary.poolLegMs;
+        const s = scanner.lastSummary;
+        return {
+          legs: s && s.poolLegMs,
+          jup: s && s.pairsJup,
+          missing: s && s.pairsMissing,
+          calls: jupSeen.calls,
+          deadline: jupSeen.deadline === "not called" ? null : jupSeen.deadline - t0,
+        };
       } finally {
         globalThis.fetch = origFetch;
         await t.cleanup();
       }
     };
     // The degraded branch (Dex comes back short) runs all four legs.
-    const all = await scan(false);
+    const degraded = await scan(false);
+    const all = degraded.legs;
     assert.ok(all, "the summary must carry the per-leg reading");
     for (const leg of ["pool-read", "front-write", "pairs", "pairs-jup"]) {
       assert.equal(typeof all[leg], "number", `${leg} must report a duration`);
@@ -6799,10 +6841,25 @@ async function main() {
       FEED_LEG_NAMES,
       "exactly the four front legs — the other stages already have their own reading",
     );
+    // The fallback is handed the FRONT WINDOW (ms to run), not left to its own
+    // 900ms from its own start — and the summary reports what it yielded and
+    // what the phase could NOT cover.
+    assert.equal(degraded.calls, 1, "the degraded tick runs the fallback once");
+    assert.equal(typeof degraded.deadline, "number", "the leg must be handed the front deadline");
+    assert.ok(
+      degraded.deadline > 0 && degraded.deadline < 9_000,
+      `fallback deadline ${degraded.deadline}ms out — not the front window`,
+    );
+    assert.equal(degraded.jup, 1, "pairsJup counts the pairs the fallback contributed");
+    assert.equal(degraded.missing, 0, "pairsMissing counts the scan's own coins left without a pair");
     // The healthy branch never runs the fallback, and an absent leg is ABSENT
     // rather than 0: "did not run" and "ran instantly" are different readings.
-    const healthy = await scan(true);
+    const healthyScan = await scan(true);
+    const healthy = healthyScan.legs;
     assert.ok(healthy, "a healthy tick reports the legs too");
+    assert.equal(healthyScan.calls, 0, "a tick Dex covers needs no fallback");
+    assert.equal(healthyScan.jup, undefined, "pairsJup is absent when the leg did not run");
+    assert.equal(healthyScan.missing, 0, "and the coverage reading still lands");
     assert.equal(healthy["pairs-jup"], undefined, "a leg that did not run is not reported as 0");
     assert.deepEqual(
       Object.keys(healthy).sort(),
@@ -8725,6 +8782,73 @@ async function main() {
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+
+  await test("fetchTokenDataBatch: the caller's window bounds the leg, and no room = no request", async () => {
+    // 2026-10-01 follow-up to the 73-cut outage: this leg was the LAST front
+    // budget not clamped to the shared window. The scanner checked only that
+    // SOME window was left (`Date.now() < frontDeadline`) and handed the method
+    // nothing, so a fallback started 1ms before `frontDeadline` still spent its
+    // own 900ms PAST it — up to 900ms of the 1600ms gate/push reserve. Three
+    // readings, cheapest first: a deadline already gone, a window with no room
+    // for one chunk, and a legitimate window.
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const calls = [];
+    const client = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async (url) => {
+        calls.push(url);
+        return new Response(JSON.stringify([{ id: mint, mcap: 123 }]), {
+          status: 200,
+        });
+      },
+    );
+    // (1) A caller deadline already in the past opens NO request at all — the
+    // pair lane's rule, applied to this lane too.
+    assert.equal((await client.fetchTokenDataBatch([mint], Date.now() - 1)).size, 0);
+    assert.equal(calls.length, 0, "a caller deadline already gone must not open a request");
+    // (2) A window with less than one chunk's room (JUP_FALLBACK_MIN_ROOM_MS)
+    // sends nothing either: the scanner must not stamp a leg it cannot spend.
+    assert.equal((await client.fetchTokenDataBatch([mint], Date.now() + 50)).size, 0);
+    assert.equal(calls.length, 0, "the leg must not be spent on a window too small for a chunk");
+    // (3) Control: a legitimate window fetches normally, and the caller's
+    // deadline does NOT raise the leg's own 900ms cap.
+    const got = await client.fetchTokenDataBatch([mint], Date.now() + 5_000);
+    assert.equal(calls.length, 1, "one chunk, one request");
+    assert.equal(got.get(mint).marketCap, 123);
+    assert.equal(JUP_FALLBACK_MIN_ROOM_MS, 250, "the floor is the chunk loop's own number");
+  });
+
+  await test("fetchTokenDataBatch: a caller deadline stops the chunk loop early (the 900ms cap is not the only bound)", async () => {
+    // The shape the fast test above cannot show: the caller's deadline must
+    // actually END the loop, not merely be read. The fake transport sleeps
+    // 150ms per chunk, so a `now + 300` deadline can only ever fit ONE chunk
+    // (`remaining <= JUP_FALLBACK_MIN_ROOM_MS` after it), while the leg's own
+    // 900ms budget fits five.
+    const mints = Array.from({ length: 250 }, (_, i) =>
+      ("M" + i.toString(36).replace(/[0OlI]/g, "z")).padEnd(44, "1"),
+    );
+    const make = () => {
+      let n = 0;
+      const client = new JupTokensClient(
+        { jupiterRequestIntervalMs: 0 },
+        async () => {
+          n += 1;
+          await new Promise((r) => setTimeout(r, 150));
+          return new Response(JSON.stringify([]), { status: 200 });
+        },
+      );
+      return { client, calls: () => n };
+    };
+    const unbounded = make();
+    await unbounded.client.fetchTokenDataBatch(mints);
+    const capped = make();
+    await capped.client.fetchTokenDataBatch(mints, Date.now() + 300);
+    assert.ok(capped.calls() >= 1, "the window had room for one chunk, so one must be sent");
+    assert.ok(
+      capped.calls() < unbounded.calls(),
+      `the caller's deadline must cut the loop: ${capped.calls()} vs ${unbounded.calls()} chunks`,
+    );
   });
 
   await test("fetchOrganicScore: parses score/label/traders; genuine 0 ≠ absent", async () => {

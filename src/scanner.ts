@@ -40,7 +40,11 @@ import { parseAxiomTokenInfo } from "./axiom";
 import { subreqRemaining } from "./subreqs";
 import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
 import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
-import { trendBandFromChats, type JupTokensClient } from "./jupfeeds";
+import {
+  JUP_FALLBACK_MIN_ROOM_MS,
+  trendBandFromChats,
+  type JupTokensClient,
+} from "./jupfeeds";
 import { renderMessage } from "./render";
 import { WalletAnalyzer } from "./walletanalysis";
 import {
@@ -1902,6 +1906,33 @@ export interface ScanSummary {
   pushWatchRecovered?: number;
   /** Pool+feed coins with live DexScreener pair data this scan (vs pool count). */
   pairs?: number;
+  /**
+   * Pairs the tick's JUPITER FALLBACK contributed to the pair phase — its yield,
+   * not a wall time (`poolLegMs["pairs-jup"]` is the time). Set only on a tick
+   * that entered the leg, so a healthy tick that never needed it stays ABSENT
+   * rather than 0 (same rule as poolLegMs). Read together with `pairs` and
+   * `pairsMissing`, it is the reading that says how much of the scan's pair
+   * data the keyless Jupiter lane is carrying — live 2026-10-01, with
+   * DexScreener's pair lane throttled to ~2 batches/tick by the shared egress's
+   * 429s, it carried the MAJORITY of the phase every tick, pinned at its 900ms
+   * cap. That is the headroom question this field exists to answer.
+   */
+  pairsJup?: number;
+  /**
+   * The scan's OWN coins (feed + rotation slice, i.e. `scannedProfiles`) that
+   * reached the gates with NO pair data at all — the coins every gate must skip
+   * (a coin without a pair cannot be judged on mcap/liquidity/volume). The
+   * tracker head fetched alongside them is deliberately excluded: those rows
+   * gate nothing on this tick and their own pass fetches them.
+   *
+   * WHY IT EXISTS: the Jupiter fallback and the Dex pair lane are both budgeted,
+   * so "the phase came back short" was previously invisible — `pairs` alone
+   * cannot be read without knowing how many were asked for (a healthy tick and
+   * a capped tick both report a number). `pairs 96, pairsJup 40, pairsMissing
+   * 21` names the capped-tick shape; `pairsMissing 0` says the phase covered
+   * everything it needed to, whatever it cost.
+   */
+  pairsMissing?: number;
   fails: {
     mcap: number;
     chg: number;
@@ -4860,15 +4891,30 @@ export class Scanner {
       // under half), and its 900ms came out of the same 6400ms window as
       // everything above it. Coins it cannot reach keep their pool slot and
       // are re-read on the next rotation, like every other budget here.
+      //
+      // TWO CORRECTIONS (2026-10-01, follow-up to the 73-cut outage). The gate
+      // above used to be `Date.now() < frontDeadline` — "SOME window is left"
+      // — and the call carried no deadline, so this leg started 1ms before the
+      // window closed still spent its own full 900ms PAST it: the ONE front leg
+      // whose budget was not clamped to frontDeadline, i.e. up to 900ms of the
+      // 1600ms gate/push reserve (SCAN_GATE_RESERVE_MS) was reachable from a
+      // fallback. It now takes the same caller deadline the pair fetch does,
+      // and it is not entered at all when the window has less than one chunk's
+      // worth of room (JUP_FALLBACK_MIN_ROOM_MS) — the Dex pair lane's own
+      // rule for a batch that cannot START inside the phase.
       if (
         pairsByToken.size < addresses.length * 0.5 &&
         this.jupiter &&
-        Date.now() < frontDeadline
+        frontDeadline - Date.now() > JUP_FALLBACK_MIN_ROOM_MS
       ) {
         this.enterStage("pairs-jup", seq);
+        const beforeJup = pairsByToken.size;
         try {
           const missing = addresses.filter((a) => !pairsByToken.has(a));
-          for (const [k, v] of await this.jupiter.fetchTokenDataBatch(missing))
+          for (const [k, v] of await this.jupiter.fetchTokenDataBatch(
+            missing,
+            frontDeadline,
+          ))
             pairsByToken.set(k, v);
         } catch (err) {
           console.error(
@@ -4876,6 +4922,7 @@ export class Scanner {
             err instanceof Error ? err.message : err,
           );
         }
+        diag.pairsJup = pairsByToken.size - beforeJup;
       }
       // The pool read AND the pair fetch are behind us (Jupiter fallback
       // included): the front window is closed.
@@ -4884,6 +4931,19 @@ export class Scanner {
       // chain (see stageSnapshot).
       this.enterStage("stats", seq);
       diag.pairs = pairsByToken.size;
+      // The pair phase's COVERAGE reading (2026-10-01): pairs is how many
+      // coins came back, this is how many of the SCAN'S OWN coins did NOT —
+      // the ones the gates cannot judge and skip. Read together they answer
+      // the question this phase's designer had to guess at: is the 900ms
+      // Jupiter fallback still covering everything (`pairs 155 pairsJup 120
+      // pairsMissing 0`), or is it at its cap while coins go unjudged
+      // (`pairs 96 pairsJup 40 pairsMissing 21`)? The TRACKER head rides in
+      // `addresses` too but is deliberately not counted here: those rows gate
+      // nothing on this tick, and their own pass fetches them (see
+      // pairsForTracker).
+      diag.pairsMissing = scannedProfiles.filter(
+        (p) => !pairsByToken.has(p.tokenAddress),
+      ).length;
       // The `dex` block is refreshed a SECOND time here (see the front refresh
       // above): the pair phase that just finished is the tick's last
       // DexScreener wire, and the pair lane's edge-cache counters

@@ -321,7 +321,7 @@ metrics 要新鮮）。順手加咗 `listCacheHits` / `lastListCacheStatus` / `b
 | pool read + prune | 2 400ms（`POOL_FETCH_BUDGET_MS`） | ❌ |
 | front 嘅 ONE write（`flushScanFront`） | ~1 200ms（DB scan mode） | n/a（唯一必落地嗰筆） |
 | pair fetch | 2 000ms（`PAIRS_FETCH_BUDGET_MS`） | ❌ —— `callerDeadlineMs` **從來冇 caller 傳過** |
-| Jupiter fallback | 900ms | ❌ |
+| Jupiter fallback | 900ms | ❌ → ✅（同日第二輪：`fetchTokenDataBatch(missing, frontDeadline)`，見文末「跟進」） |
 | **合計** | **10 500ms** | 對住 `FRONT_PHASE_WINDOW_MS` = **6 400ms** |
 
 即係：**每條腿都被包住，但佢哋嘅和冇被包住**。加上 tick 開頭已花掉嘅 ~1.9s，pool 階段只要同時踩
@@ -362,3 +362,76 @@ pool 階段又係**一舊冇名嘅 block**，所以「4s backfill / 2.4s pool / 
   相符，但**兩者因果未證**。今次改動只保證「就算四條腿同時踩上限，tick 都唔會再被 cut」，唔保證上游唔再 429。
 - 呢份 doc 上面（2026-09-21）曾經試過「feed 喺 tick 開頭 dispatch」並**同日 revert**（令 tick 撞 9.6s 殺點）。
   今次**冇**動 envelope、冇加任何新請求，只係把已存在嘅 caps 收窄到契約本身要求嘅窗口。
+
+---
+
+# 跟進（2026-10-01 第二輪）：`pairs-jup` 係唯一未夾窗口嘅腿，而且冇「覆蓋率」讀數
+
+## 觸發
+
+上一輪落線之後，`poolLegMs` 每個 tick 都讀到 `pairs-jup` **549–900ms**（5/5 抽樣，多次貼死 900ms
+上限）——即係嗰條腿**長期食滿自己嘅 cap**。當時嘅判斷：目前安全，但已無餘裕。
+
+## 量度（線上，deploy `5859f55` 之後）
+
+| 讀數 | 值 | 意思 |
+|---|---|---|
+| `poolLegMs["pairs-jup"]` | 549 / 557 / 563 / 900 / 549 / 623 / 549 ms | 幾乎每個 tick 都跑，且多次貼住上限 |
+| `dex.pairCacheMisses` | **2**（每個 tick） | Dex pair lane 每 tick 只派到 ~2 個 batch（= 最多 60 個 address） |
+| `dex.intervalMs` vs `configuredIntervalMs` | **1200** vs 250 | 共享 egress 429 ⇒ spacing 自動升 4.8 倍 ⇒ 2 000ms 預算只剩 ~2 個 slot |
+| 前段 address 集合（feed + slice + tracker head） | **~150** | Dex 最多覆蓋 60 ⇒ 永遠低過 50% 觸發線 ⇒ **fallback 每 tick 開火** |
+| fallback 覆蓋後 `pairs` | 155–198 | ⇒ **Jupiter（keyless lite-api）正扛住 pair 階段嘅大部分數據**，唔止係「後備」 |
+
+## 兩個缺口（代碼，唔係推測）
+
+1. **唯一未夾 `frontDeadline` 嘅前段腿**：scanner 只檢查 `Date.now() < frontDeadline`（「仲有窗口剩」），
+   而 `fetchTokenDataBatch` 由**自己嘅開始**計 900ms ⇒ 喺窗口關閉前 1ms 入去，仍然可以行足 900ms
+   **越過**窗口，即係食 `SCAN_GATE_RESERVE_MS`（1600ms）最多 900ms。上一輪嘅修法收口了另外四條腿，
+   呢條係漏低嘅一條（就係「表入面唯一仍然寫 ❌」嗰行）。
+2. **「fallback 有冇跑完」冇讀數**：`pairs`（幾多個幣拿到 pair）係一個孤零零嘅數 ——
+   健康 tick 同「貼住上限但唔夠」嘅 tick 讀落一樣，而 `pairs-jup` 嘅 ms 亦分唔開「跑到盡」同「跑到盡仲有剩」。
+
+## 修法
+
+| 位置 | 變更 |
+|---|---|
+| `jupfeeds.ts` | `fetchTokenDataBatch(mints, callerDeadlineMs?, max = 500)`：`deadline = min(now + 900, callerDeadlineMs)`（同 `fetchPairsForTokens` 同一個契約）；新 export `JUP_FALLBACK_MIN_ROOM_MS = 250`（就係 chunk loop 自己嘅 floor）；**caller deadline 已過 = 唔出請求** |
+| `scanner.ts` | 閘由「仲有窗口」改成 **`frontDeadline - Date.now() > JUP_FALLBACK_MIN_ROOM_MS`**：少於一個 chunk 嘅空間 ⇒ **唔入 leg、亦唔 stamp stage**（同 Dex pair lane「開唔到嘅 batch 唔算 drop，係唔嘗試」同一條規則；入去但零請求會發佈一個近 0ms 嘅 `pairs-jup`，讀落同「跑得快」一樣，正正係呢個 repo 要分開嘅兩種讀數）；呼叫改為 `fetchTokenDataBatch(missing, frontDeadline)` |
+| `scanner.ts` | 新讀數 **`summary.pairsJup`**（今個 tick fallback 貢獻咗幾多個 pair；冇跑 = **缺席**，同 `poolLegMs` 一致）同 **`summary.pairsMissing`**（掃描自己嘅幣（feed + rotation slice）之中，行到閘口仍然**冇 pair 數據** = 注定被跳過嘅數目；tracker head 唔計，佢哋唔閘任何嘢、由自己嘅 pass 負責） |
+
+**成本**：0 個新請求（只係收窄既有 cap）、0 個新 timer、0 個新 DB 欄位；`pairsMissing` 係一次 O(n) 掃（n ≈ 90–200）。
+
+## 點讀（落線之後）
+
+| 形狀 | 意思 |
+|---|---|
+| `pairsJup` 大、`pairsMissing 0` | fallback 扛住大部分 pair 數據，但**覆蓋完整** —— 即係「貴，但冇漏」 |
+| `pairsJup` 少、`pairsMissing 大` | 條腿被 cap 或窗口切斷，**有幣今個 tick 冇被評審**（等下一次 rotation） |
+| `pairsJup` 缺席 | 條腿冇跑（Dex 自己夠數）—— 唯一「唔需要擔心」嘅形狀 |
+
+## 測試（2 條新 + 2 條既有擴充，全部做過 mutation 檢查）
+
+| 測試 | 釘住咩 |
+|---|---|
+| `fetchTokenDataBatch: the caller's window bounds the leg, and no room = no request` | deadline 已過 = 0 請求；窗口 < 一 chunk = 0 請求；正常窗口照做 |
+| `fetchTokenDataBatch: a caller deadline stops the chunk loop early` | caller deadline **真正結束 loop**（150ms/chunk 嘅假 transport：`now+300` 只夠 1 個 chunk，預設 900ms 夠多個） |
+| `pool legs: …`（擴充） | scanner 真係傳一個 **front window 級**嘅 deadline 落去、`pairsJup` / `pairsMissing` 真係有數 |
+| `pair fetch is handed the front window`（擴充） | source 不變式：`fetchTokenDataBatch(missing,frontDeadline,)` 同 `frontDeadline-Date.now()>JUP_FALLBACK_MIN_ROOM_MS` |
+
+Mutation（改 `dist/` 再還原）：拆走 `Math.min(now+900, caller)` → 2 條新 jupfeeds 測試即刻紅
+（`must not open a request`、`the caller's deadline must cut the loop: 3 vs 3 chunks`）；
+拆走 scanner 嘅 deadline 參數 + 用返舊閘 → `pool legs` 紅（`fallback deadline NaNms out — not the front window`）。
+
+`npm run typecheck` 0 error；`npm run test:unit` **466 passed / 0 failed**（原 464），其餘 7 / 5 / 10 / 4 / 14 全 0。
+
+## 未做／風險（誠實列明）
+
+- 呢個改動**唔會**令 `pairs-jup` 唔再食 900ms：喺 Dex 被 429 夾住期間，佢扛住嘅係**每一 tick 真正要做嘅工作量**
+  （Dex 只覆蓋到 ~1/3）。修法保證嘅係 (a) 佢唔會越過窗口、(b) 冇空間就唔開、(c) 覆蓋率由
+  `pairsJup` / `pairsMissing` 讀得出。
+- **上游根因未動**：DexScreener 共享 egress 429（`intervalMs 1200` vs 配置 250）令 pair lane 只派到 ~2 batch/tick。
+  要真正收返啲 wall time，兩條槓桿（兩者都要另行量度，唔應該順手改）：
+  1. 令 Dex 條腿恢復（spacing 降返 250 ⇒ 6 batch/tick ≈ 180 address ⇒ fallback 唔再開火）；
+  2. 縮細前段 address 集合（slice 90 + tracker head 42 + feed ~25）——`RE_EVAL_PER_TICK_MAX` 之前已量過一次
+     （見 `docs/front-window-coverage-2026-09-28.md`：加去 180 換唔到 candidate，已 revert），tracker head 就係下一個候選。
+- **未驗收**：`pairsJup` / `pairsMissing` 要落線先讀得到；呢兩個數亦係判斷「Dex 恢復之後 fallback 係唔係真係縮返」嘅唯一讀數。
