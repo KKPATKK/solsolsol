@@ -592,6 +592,21 @@ MCAP_LIQ_RATIO_MIN = "2"
 # precision. It is Jupiter's flag and its latency is unknown, so a fast rug can
 # still be pushed before the flag appears. Watch fails.sus.
 JUP_SUS_BLOCK = "true"
+# Minimum Jupiter organic score (0–100) a coin must reach before its card is
+# pushed; blocks below it, 0 = off. FREE: the reading is the same response the
+# card's 🌱 有機度 line already fetches (no extra request, key or provider) and
+# it is awaited once and read by both this gate and JUP_SUS_BLOCK above.
+#
+# FAIL-OPEN, by design: a token Jupiter carries no score for (field absent —
+# NOT a genuine 0, which the client tells apart on purpose) still pushes, and
+# so does a reading that missed its deadline. "No data" never judges.
+#
+# This floor is the OPERATOR'S number, not a calibrated one. The 2026-09-28 ring
+# (docs/suspicious-token-gates.md) measured score 0 at 5/5 drained in-window but
+# deliberately did NOT ship a floor, because a low score can also just mean a
+# young token. Watch fails.organic in /health.heartbeat.summary before trusting
+# 60, and raise ORGANIC_MIN_SCORE (or set 0) from that reading.
+ORGANIC_MIN_SCORE = "60"
 # Arkham Intelligence (requires ARKHAM_API_KEY, a SECRET — set in the
 # Cloudflare dashboard, never here): smart-money attribution on push cards.
 # Each qualifying coin's top-100 holders are checked for entity types in

@@ -1880,6 +1880,8 @@ export interface ScanSummary {
     liqRatio: number;
     /** Jupiter's own suspicion flag (audit.isSus) blocked the push. */
     sus: number;
+    /** Jupiter's organic score (ORGANIC_MIN_SCORE) fell below the floor. */
+    organic: number;
     other: number;
   };
   /** Flurry forensics verdicts produced this scan (0 when disabled). */
@@ -2108,6 +2110,37 @@ export function jupSusBlockReason(
       ? `，dev 持倉 ${devBalancePct.toFixed(1)}%`
       : "";
   return `Jupiter 標記可疑（audit.isSus${dev}）`;
+}
+
+/**
+ * Jupiter organic-score push gate (ORGANIC_MIN_SCORE).
+ *
+ * `organicScore` (0–100) is Jupiter's separation of real retail participation
+ * from wash/coordinated volume, and this call is FREE: the reading is the same
+ * payload the card's 🌱 有機度 line already fetches, so the gate costs no
+ * request, no key and no provider — it only changes what a reading means.
+ *
+ * FAIL-OPEN is the whole contract ("如果沒有有機度就照推送"), in both of the
+ * shapes a missing reading takes:
+ *   - `score === null` — Jupiter omitted the field. Never judged. A genuine 0
+ *     is a NUMBER and DOES judge (fetchOrganicScore distinguishes the two on
+ *     purpose), because 0 was 5/5 drained in the calibration ring.
+ *   - `minScore <= 0` — the gate is off.
+ * A slot that missed its deadline degrades to null and the coin pushes.
+ *
+ * `label` is decoration for the reject reason only. The floor is the operator's
+ * own number, not a calibrated one — see docs/suspicious-token-gates.md §5.
+ */
+export function organicMinBlockReason(
+  score: number | null,
+  label: string | null,
+  minScore: number,
+): string | null {
+  if (!(minScore > 0)) return null;
+  if (score === null || !Number.isFinite(score)) return null;
+  if (score >= minScore) return null;
+  const tag = label ? `，Jupiter 標籤 ${label}` : "";
+  return `有機度 ${score.toFixed(1)} < ${minScore}${tag}（真散戶參與不足，多為對倒／協同成交量）`;
 }
 
 /**
@@ -3640,6 +3673,7 @@ export class Scanner {
         flurry: 0,
         liqRatio: 0,
         sus: 0,
+        organic: 0,
         other: 0,
       },
       flurryAnalyzed: 0,
@@ -5293,11 +5327,10 @@ export class Scanner {
         if (arkham) diag.arkham++;
         // organic has no counter line here: its late-bound slot (see above)
         // owns the increment, so a reading that has not landed yet can never
-        // be counted as "this tick had one". The Jupiter SUSPICION gate
-        // below is the one reader that does await that slot (see its note);
-        // the slot, not this line, still owns the counter. The Jupiter SUSPICION gate
-        // below is the one reader that does await that slot (see its note);
-        // the slot, not this line, still owns the counter.
+        // be counted as "this tick had one". The two JUPITER push gates below
+        // (audit.isSus and the organic-score floor) are the readers that DO
+        // await that slot — one shared await, see the note there; the slot,
+        // not this line, still owns the counter.
         if (
           this.gmgn &&
           this.config.gmgnBlockWashTrading &&
@@ -5327,18 +5360,42 @@ export class Scanner {
         //
         // Sited before the wallet analysis and the Flurry gate on purpose: a
         // flagged coin then saves the chain's two most expensive legs.
-        const susReading = this.config.jupSusBlock
-          ? await this.bestEffort(() => organicSlot, chainDeadline, null)
-          : null;
+        //
+        // The ORGANIC-SCORE gate (ORGANIC_MIN_SCORE) reads the SAME awaited
+        // reading — one await, two judgements — so it also costs nothing extra
+        // and also blocks in front of the expensive legs. Awaited only when one
+        // of the two gates is on, so a configuration with both off still never
+        // waits here (the slot stays purely display-bound, as it was).
+        const jupReading =
+          this.config.jupSusBlock || this.config.organicMinScore > 0
+            ? await this.bestEffort(() => organicSlot, chainDeadline, null)
+            : null;
         const susReason = jupSusBlockReason(
-          susReading?.sus ?? false,
-          susReading?.devBalancePct ?? null,
+          jupReading?.sus ?? false,
+          jupReading?.devBalancePct ?? null,
         );
         if (susReason) {
           diag.fails.sus++;
           this.addReject(diag, coin, susReason);
           console.log(
             `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (Jupiter audit.isSus)`,
+          );
+          continue;
+        }
+        // Organic-score floor. Fail-open BOTH ways: no reading (score null —
+        // Jupiter omitted the field, or the slot missed its deadline) and the
+        // gate off (0) both push the coin. A genuine 0 is a number and DOES
+        // judge. See organicMinBlockReason's contract.
+        const organicReason = organicMinBlockReason(
+          jupReading?.score ?? null,
+          jupReading?.label ?? null,
+          this.config.organicMinScore,
+        );
+        if (organicReason) {
+          diag.fails.organic++;
+          this.addReject(diag, coin, organicReason);
+          console.log(
+            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (organic score below floor)`,
           );
           continue;
         }

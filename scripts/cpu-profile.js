@@ -525,10 +525,11 @@ async function main() {
     const runEval = (list) => {
       // Kept in lockstep with ScanSummary["fails"] in src/scanner.ts: matchCoins
       // increments these by key, so a missing key here would silently record
-      // NaN for every gate that fired (2026-09-28: liqRatio + sus added).
+      // NaN for every gate that fired (2026-09-28: liqRatio + sus added;
+      // 2026-10-01: organic added).
       const fails = {
         mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, flurry: 0,
-        liqRatio: 0, sus: 0, other: 0,
+        liqRatio: 0, sus: 0, organic: 0, other: 0,
       };
       const rejects = [];
       const agedEval = { count: 0 };

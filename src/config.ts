@@ -654,6 +654,26 @@ export interface AppConfig {
    * helper's calibration notes (JUP_SUS_BLOCK in wrangler.toml).
    */
   jupSusBlock: boolean;
+  /**
+   * Minimum Jupiter organic score (ORGANIC_MIN_SCORE, default 60, 0 = off).
+   *
+   * Jupiter's `organicScore` (0–100) separates real retail participation from
+   * wash/coordinated volume, and it is FREE here: the reading is the very
+   * response the card's 🌱 有機度 line already fetches (same request, no key,
+   * no provider), so this gate adds no spend — see scanner.organicMinBlockReason.
+   *
+   * FAIL-OPEN on a missing reading, like every other gate: a token Jupiter
+   * carries no score for (score absent — not a genuine 0) still pushes. The
+   * slot is late-bound (dispatched with the display batch, read before the
+   * send), so a reading that missed its deadline is "no data", not "low".
+   *
+   * OPERATOR CHOICE, not calibration: docs/suspicious-token-gates.md §5
+   * measured score 0 at 5/5 drained in-window but deliberately declined to ship
+   * a floor, because a low score can also mean a young token. 60 is the
+   * operator's number; watch fails.organic in /health.heartbeat.summary before
+   * trusting it.
+   */
+  organicMinScore: number;
   /** Crime-wallet blocklist (community list — see CrimeWalletClient). */
   crimeWallets: CrimeWalletsConfig;
   /** Pushed-coin wallet analysis (creator profile + holder ages + clustering). */
@@ -988,6 +1008,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       return Number.isFinite(v) && v > 0 ? v : 0;
     })(),
     jupSusBlock: (env.JUP_SUS_BLOCK ?? "true") !== "false",
+    organicMinScore: (() => {
+      // Same stance as the other floors: 0 disables, and anything unparseable
+      // disables rather than becoming NaN (NaN would pass every comparison and
+      // silently disarm the gate). Clamped to the score's own 0–100 scale so a
+      // typo cannot turn the gate into a total block.
+      const v = Number(env.ORGANIC_MIN_SCORE ?? 60);
+      return Number.isFinite(v) && v > 0 ? Math.min(v, 100) : 0;
+    })(),
     crimeWallets: {
       enabled: (env.CRIME_WALLETS_ENABLED ?? "true") !== "false",
       url: env.CRIME_WALLETS_URL || DEFAULT_CRIME_WALLETS_URL,

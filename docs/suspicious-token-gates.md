@@ -90,10 +90,11 @@ below 2.0x had their liquidity pulled.
 |---|---|---|
 | Reject `audit.isSus === true` | `scanner.jupSusBlockReason`, awaited after the display batch and **before** the wallet/Flurry legs so a flagged coin saves those two legs | `JUP_SUS_BLOCK` (default true) |
 | Reject `mcap/LP < MCAP_LIQ_RATIO_MIN` — the band's low side, `top10MinBlockReason`'s shape | `scanner.mcapRatioBlockReason(…, ratioMin)`, called through `gateLiquidityUsd` like its ceiling | `MCAP_LIQ_RATIO_MIN = "2"` (= liq/mcap ≥ 0.50 blocks), 0 = off |
+| Reject `organicScore < ORGANIC_MIN_SCORE` | `scanner.organicMinBlockReason`, read from the **same awaited reading** `jupSusBlockReason` uses (one await, two judgements) and sited with it, before the wallet/Flurry legs | `ORGANIC_MIN_SCORE = "60"`, 0 = off |
 | Missing bundler reading prints `—（未检测）`, a real 0% keeps `0.0%（未检测到捆绑网络）` | `rugcheck.ts` (real-0 vs no-answer) + `render.ts` (three states) | — |
 
-Observability: `fails.sus` and `fails.liqRatio` in
-`/health.heartbeat.summary`, split so the floor can be tuned from live numbers
+Observability: `fails.sus`, `fails.organic` and `fails.liqRatio` in
+`/health.heartbeat.summary`, split so each floor can be tuned from live numbers
 (the low side alone — the high side keeps counting into `fails.other`), plus
 the reject ring in `/debug/tick` carrying the reason text and numbers.
 
@@ -115,10 +116,18 @@ the reject ring in `/debug/tick` carrying the reason text and numbers.
 - **`liq/mcap` is a DexScreener-leg number** and inherits the provenance guard
   (`gateLiquidityUsd`): a Jupiter/Gecko-sourced pair (~half the same pool) is
   left unjudged rather than compared against a different metric.
-- Not measured, and deliberately not shipped: an organic-score gate
-  (score 0 was 5/5 drained in-window, but 0 can also mean "too new" and the
-  drift caveat above applies), and `devBalancePercentage` as a gate of its own
-  (it matched `isSus` exactly in this sample, so it adds nothing yet).
+- **`ORGANIC_MIN_SCORE` is the operator's number, not this file's.** The
+  measurement below pointed at a floor, but the threshold itself was never
+  calibrated here, so `fails.organic` (not this document) is what the 60 should
+  be judged by. Fail-open is the shipped contract: a token Jupiter carries no
+  score for — field absent, never a genuine 0 — still pushes, as does a reading
+  that missed its deadline. Note the section-5 drift caveat above applies to it
+  too: the score is read at push time, not snapshotted.
+  What §3 did measure: of the 13 in-window liquidity pulls, all 5 that carried
+  score 0 were drained, but 0 can also just mean "too new", which is why this
+  file declined to ship a floor on its own.
+- Not measured, and deliberately not shipped: `devBalancePercentage` as a gate
+  of its own (it matched `isSus` exactly in this sample, so it adds nothing yet).
 
 ## 6. The falsifiable next step
 

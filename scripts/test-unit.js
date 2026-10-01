@@ -29,7 +29,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -8645,6 +8645,65 @@ async function main() {
     assert.match(bare, /audit\.isSus/);
     assert.equal(bare.includes("%"), false, "no number is invented when there is none");
     assert.equal(jupSusBlockReason(true, NaN).includes("NaN"), false);
+  });
+
+  await test("organicMinBlockReason: below the floor blocks, exactly at it passes, a missing reading never judges", () => {
+    // The operator's gate (ORGANIC_MIN_SCORE): push only coins whose Jupiter
+    // organic score reaches the floor, and push anyway when there is no score.
+    assert.equal(organicMinBlockReason(60, "medium", 60), null, "exactly at the floor passes");
+    assert.equal(organicMinBlockReason(79, "high", 60), null);
+    // A genuine 0 is a NUMBER and DOES judge — fetchOrganicScore keeps "field
+    // absent" (null) and "Jupiter says nobody" (0) apart on purpose, and the
+    // calibration ring measured 0 at 5/5 drained in-window.
+    const zero = organicMinBlockReason(0, "low", 60);
+    assert.match(zero, /有機度 0\.0 < 60/);
+    assert.match(zero, /標籤 low/);
+    const justBelow = organicMinBlockReason(59.9, null, 60);
+    assert.match(justBelow, /有機度 59\.9 < 60/);
+    assert.equal(justBelow.includes("標籤"), false, "no label is invented when there is none");
+    // FAIL-OPEN: the two shapes of "no organic score" both push.
+    assert.equal(organicMinBlockReason(null, null, 60), null, "field absent never judges");
+    assert.equal(organicMinBlockReason(null, "low", 60), null, "nor an absent score with a stray label");
+    assert.equal(organicMinBlockReason(NaN, null, 60), null, "NaN is not a reading");
+    // 0 disables: the gate is off, whatever the score.
+    assert.equal(organicMinBlockReason(0, "low", 0), null);
+    assert.equal(organicMinBlockReason(1, null, 0), null);
+    // The reason prints no NaN and no bare decimal noise.
+    assert.equal(organicMinBlockReason(NaN, null, 60) === null, true);
+  });
+
+  await test("ORGANIC_MIN_SCORE: default 60, 0 and junk disable, the scale is clamped", () => {
+    // The operator asked for the floor (60); unset keeps it, and the escape
+    // hatches follow the other floors: 0 = off, unparseable = off (never NaN,
+    // which would pass every comparison and silently disarm the gate).
+    assert.equal(loadConfig({}).organicMinScore, 60, "unset ships the operator's 60");
+    assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "0" }).organicMinScore, 0, "0 is OFF");
+    assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "nope" }).organicMinScore, 0, "junk fails closed");
+    assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "-5" }).organicMinScore, 0, "below zero is OFF too");
+    assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "75" }).organicMinScore, 75);
+    assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "9000" }).organicMinScore, 100, "clamped to the score's own scale");
+  });
+
+  await test("organic gate is sited with the Jupiter suspicion gate and reuses its one awaited reading", () => {
+    // The reading is FREE (the card's 🌱 有機度 payload), so the gate must not
+    // add a request: it shares the one await with jupSusBlockReason. Pin that,
+    // plus the single counter writer — a second write site would double-count.
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    assert.equal(src.split("fails.organic++").length - 1, 1, "one writer for the counter");
+    assert.equal(
+      src.split("await this.bestEffort(() => organicSlot, chainDeadline, null)").length - 1,
+      1,
+      "exactly one await of the organic slot — the two gates share it",
+    );
+    assert.ok(
+      src.includes("this.config.jupSusBlock || this.config.organicMinScore > 0"),
+      "the shared await is only paid when one of the two gates is on",
+    );
+    const sus = src.indexOf("diag.fails.sus++");
+    const gate = src.indexOf("organicMinBlockReason(\n          jupReading?.score ?? null,");
+    const wallets = src.indexOf("this.markPhase(diag, \"wallets\", startedAt)");
+    assert.ok(sus > 0 && gate > sus, "the organic gate runs behind the suspicion gate");
+    assert.ok(wallets > gate, "and in front of the wallet/Flurry legs, so a low-score coin saves them");
   });
 
   await test("mcapRatioBlockReason: the LOW side is the LP-heavy shape (2026-09-28 ring)", () => {
