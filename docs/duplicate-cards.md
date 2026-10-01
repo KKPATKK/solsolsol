@@ -952,3 +952,83 @@ Turso 連線走 **HTTP transport**（`src/db.ts` `createRawClient`：`libsql://`
   SQL／round-trip 一條（一個 batch、兩句、args 綁 stamp）、pass 層兩條（兩種 loss 分流）。
 
 詳情同 live 讀數見 `docs/round-trips.md` §4.37。
+
+
+---
+
+## 二十一、第四修：attempt mark 嘅壽命 —— 一次「唔關事嘅寫入」清走咗個 mark（2026-10-01）
+
+**讀數（Quest，token `AV9TkfXb…Qpump`，香港時間 11:57–12:11）**：同一個 `up50` transition 出咗**三張**
+🚀 續漲卡，全部都係同一個 baseline：
+
+| 時間（Z） | 卡 | audit ring |
+| --- | --- | --- |
+| 03:57:43 | msg7956 `🚀 up50` | `03:57:43Z up50` |
+| 03:57:43 | msg7957 `♻️ reclaim` | `03:57:43Z reclaim` |
+| 04:05:43 | msg7962 `🚀 up50` | `04:05:43Z up50` |
+| 04:05:44 | msg7963 `♻️ reclaim` | `04:05:44Z reclaim` |
+| 04:11:43 | msg7965 `🚀 up50` | `04:11:43Z up50` |
+
+操作員收到嘅就係 04:05（$271.4K／+67%）同 04:11（$246.1K／+52%）兩張 —— 第二張**數字更差**（5m −16%、
+峰值回撤 −9%）係關鍵線索：佢唔係重算一個新 milestone，而係**同一個 transition 嘅後一次檢查**，用嗰一刻嘅
+live 讀數重新送出。當時 row：`mcapAtPush 162300.32`、`peakMcap 271404.79`、`followupsSent 2`、
+`lastState "up50"`、`upStages "dip20,up50"`（**冇 `p:` mark**）。同一形狀 30 分鐘窗掃描仲有
+ELON/reclaim、GND/up100、HALL/dead、HALL/revive、LAB/dead、Meridian/ignite、NUTFLEX/up50、
+NUTFLEX/reclaim、P(DOOM)/reclaim、QUANT/dead、SI/dead ×3、swarmsdots/reclaim —— 唔止 Quest。
+
+**根因**：`p:<sig>:<minute>` 呢個 attempt mark 本來設計成「只活一次評估」——註釋寫住 *cut marks are
+consumed, not carried*，前提係「下一個 check 嘅寫入會用自己嘅 marks 重算成條欄」。呢個前提**只喺個 check
+寫同一條 transition 時成立**，而實測大部分時間唔成立：
+
+* **rollback 路徑**：`hold=true` 時寫 `addCutMarks(row.upStages, attempts)`，而 `addCutMarks` 會剔除所有舊
+  `p:` mark、只加返**今次** attempt 嘅。一個 sibling 被拒（Telegram 4xx）⇒ 另一張卡（已送達嗰張）留低嘅
+  mark 係靠 `carriedAttempts` 帶過去嘅，冇佢就會消失。
+* **靜默重算路徑**：一個唔宣佈任何卡嘅 pass（低於 +50%、價格低過舊峰值）只要**因為自己嘅原因**移動到條欄
+  —— `ignite` mark 因 tape 休眠被 `marks.delete`、drain disarm 清走 `liq1`、`pb` 因回到 −8% 內被 re-arm ——
+  寫出嘅就係「由 `marks` 重算」嘅 CSV，所有 `p:` mark 一齊消失。
+* **deferral 路徑**：`announcedUpStages: addCutMarks(row.upStages, young)` 只保住**young** mark；而一張
+  「已經有 proof」嘅 mark 按定義就**唔係** young（`young = attemptIsCurrent && proofFor < at`）⇒ 啱啱好
+  掉走最有價值嗰個。
+
+冇咗個 mark 之後，`fire()` 只剩 §十九 嗰條「冇 mark 都查 proof」規則，而佢只認**落喺 `last_checked`
+自己嘅桶／下一個桶**嘅 proof —— 6 分鐘之後個 proof 已經喺窗外，於是判斷「未送過」⇒ 再送。6 分鐘間距
+＝ tracker rotation（同一 row 兩次 check 相隔）。
+
+**修法（`src/pushwatch.ts`）**：
+
+* `CARRIED_ATTEMPT_SIGS`：可以跨欄位重算保存嘅 sig 集合（`up50/up100/up200/up400`、`ignite`、`reclaim`、
+  `pb`、`w35`、`w45`、`div`、`sell`、`dead`、`revive`、`liqwarn`、`drain`、`hold`）。入選條件係「呢條
+  transition 有自己嘅 re-arm 規則」。
+* `evaluateWatch` 記住 `announcedSigs`（`fire()` 最前加入 —— sent／muted／deduped 三者都算：佢哋嘅
+  transition 一樣喺今次寫入落地）同 `rearmedSigs`（每個 re-arm 點加入：dip20 上膛、回到 −8% 內、tape
+  休眠、回到 −25% 上、div 完結、drain disarm、💀 之後、sell streak 斷）。
+* `columnCsv(set)` / `columnMoved(set)`：成條欄永遠由「stage marks ＋ 未被公告、未被 re-arm 嘅 carried
+  attempts」組成（`marksChanged`／`commitMarks` 同所有原本 inline 嘅比較都改行呢兩個）。
+* `WatchEval.carriedAttempts`：俾 row loop 嘅 `rollbackMarks()` 用 —— rollback 寫「今次 attempt ＋ 佢冇掂過嘅
+  carried attempts」，所以一張 sibling 卡嘅 rollback 唔會再順手刪走另一張卡嘅證據。
+* deferral 早早 return 改為 `addCutMarks(row.upStages, attemptMarks)`（全部），供應商「唔公告就唔消耗」。
+* `addCutMarks` 本身語意**冇改**（文件註明：邊啲 mark 要跨重算保存係 caller 嘅責任）。
+
+**界線（老實講）**：
+
+* `liqcrash` 刻意**唔**carry：佢唯一嘅記憶係共用嘅 `lastState`，冇嘢證明個 mark 過期。
+* carry 之後，一個舊 proof 可以壓抑同一 sig 嘅**新**卡（`provenAgainstMark` 係「proof ≥ mark」而唔設窗）——
+  所以每個 carried sig 都必須有 re-arm 規則，而 re-arm 咗就掉個 mark。已知一條：`sell`（re-arm 只加咗
+  `rearmedSigs`，如果嗰個 pass 冇其他嘢移動條欄，個 `p:sell` mark 會留在 row 上，直到下一次寫入為止）。
+* 一個 re-arm 咗嘅 mark 亦要有 write 才真正離開條欄；冇 write 嘅 pass 只會令佢留低（唔會令佢加長：mark
+  唔會重新蓋章），之後嘅 young／proof 規則照樣判。
+
+**測試（`scripts/test-unit.js`，455 passed／0 failed；negative control：攞走修法 ⇒ 452 passed／**3 failed**，
+三個 fail message 都係「`dip20`，個 mark 唔見咗」）**：
+
+* `evaluateWatch`：唔關事嘅寫入（🔥 re-arm）⇒ `announcedUpStages` 保住兩個 `p:` mark、`liqcrash` 唔 carry、
+  `carriedAttempts` 帶返原章；同一個 fixture 加價到 +60% ⇒ 公告咗嘅 `up50` 掉、sibling ♻️ 留；回到 −8% 內
+  ⇒ `pb` 嘅 mark 跟住個 episode 一齊掉。
+* `evaluateWatch`：deferral 保住**所有** mark（young ＋ 已 proven 嗰個）。
+* `PushWatcher`（端到端，三個 pass）：🚀 送達 ＋ ♻️ 被拒 ⇒ rollback 寫 `p:up50`；下一個 pass 低於 +50%、
+  唯一嘅移動係 drain disarm ⇒ 個 mark **照樣喺條欄**（修法前寫出 `dip20`）；第三個 pass 再見 +54% ⇒
+  同一個 transition **dup-skip**、🚀 唔再送、只有從未落地嘅 ♻️ 送一次。
+
+**線上驗收**：`curl …/debug/push-audit?rows=200`（掃「同 token 同 sig、30 分鐘內重複」）應該大幅收縮；
+`curl …/debug/push-watch` 嘅 `upStages` 應該見得到 `p:` mark 存活；`/health` 嘅 pass note 應該見到正常
+`dup-skip`（而唔係跟住多送一張卡）。同類修法嘅 context 見 §十五（fail-open 重送）同 §十九（冇 mark 都查 proof）。

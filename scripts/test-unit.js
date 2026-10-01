@@ -22,7 +22,7 @@ const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
-const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS } = require("../dist/pushwatch.js");
+const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS, CARRIED_ATTEMPT_SIGS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
 const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX } = require("../dist/worker.js");
@@ -2110,6 +2110,130 @@ async function main() {
     assert.equal(addCutMarks("p:dead:1,up50", []), "up50", "a pass that attempted nothing drops stale attempts");
   });
 
+  // ---------- the attempt marks that must SURVIVE an unrelated write ----------
+  //
+  // Live 2026-10-01 (Quest, 11:57Z / 12:11Z): the operator got TWO 🚀 續漲 cards
+  // for ONE +50% crossing, six minutes apart, both quoting the same baseline
+  // ($162.3K) — the first at the peak's live numbers ($271.4K, +67%), the second
+  // LOWER ($246.1K, +52%) because it was simply a later check of the same
+  // transition. The row never lost the crossing: it lost the attempt. A
+  // `p:<sig>:<minute>` mark used to live exactly ONE evaluation ("the next check
+  // write recomputes the column without it"), which assumes that next check
+  // writes the column for the SAME transition. Measured live, it usually does
+  // not — a write that moves the column for any other reason (a stale `ignite`
+  // re-arming, the drain disarm, a sibling card's rollback) rebuilt the column
+  // from its stage marks alone and deleted the attempt, and the pass after that
+  // had no mark left to compare the audit's proof against, so it sent the card
+  // again. The three passes of the Quest shape are pinned end-to-end below.
+  await test("evaluateWatch: a column write that did not consume the attempt carries its marks along", () => {
+    const at = 1_800_000_000_000; // a mark bucket boundary
+    const row = (over = {}) => ({
+      token: "QUEST", chatId: "c", symbol: "Quest", pushedAt: 0,
+      mcapAtPush: 162_300, peakMcap: 271_404, lastLiquidity: 36_229,
+      deadTroughMcap: null, holdersAtPush: null, holdersLast: null,
+      holdersCheckedAt: null, sellDomStreak: 0,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      upStages: null,
+      ...over,
+    });
+    // The dormant tape (vol5m below IGNITION_DORMANT_USD) re-arms the 🔥 mark,
+    // which is the unrelated edit that moves the column in (a).
+    const live = (mcap) => ({
+      mcap, liquidity: 36_229, chg5m: 5, vol5m: 1_000, buysH1: 130, sellsH1: 100,
+    });
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const up50 = cutMarkFor("up50", at);
+    const reclaim = cutMarkFor("reclaim", at);
+    const crash = cutMarkFor("liqcrash", at);
+    const csv = `dip20,ignite,${crash},${reclaim},${up50}`;
+
+    // (a) No card at all: below +50% and only -12% off the peak. The 🔥 mark
+    // re-arms and goes with the write, and the attempts ride out.
+    const silent = evaluateWatch(row({ upStages: csv }), at + 60_000, live(240_000), cfg);
+    assert.deepEqual(silent.alerts, [], "nothing is announced, so nothing is consumed");
+    const silentCsv = String(silent.announcedUpStages ?? "").split(",");
+    assert.ok(silentCsv.includes("dip20"), `the stage mark stays: ${silent.announcedUpStages}`);
+    assert.ok(!silentCsv.includes("ignite"), `the re-armed 🔥 goes: ${silent.announcedUpStages}`);
+    assert.ok(silentCsv.includes(up50), `the 🚀 attempt survives it: ${silent.announcedUpStages}`);
+    assert.ok(silentCsv.includes(reclaim), `so does the ♻️ one: ${silent.announcedUpStages}`);
+    assert.ok(
+      !silentCsv.includes(crash),
+      `but a sig with no re-arm rule keeps the old one-write life: ${silent.announcedUpStages}`,
+    );
+    assert.ok(!CARRIED_ATTEMPT_SIGS.has("liqcrash"), "whose only memory is the shared lastState");
+    assert.deepEqual(
+      (silent.carriedAttempts ?? []).map((a) => a.sig).sort(),
+      ["reclaim", "up50"],
+      "and the caller is told which attempts a ROLLBACK has to keep",
+    );
+    assert.deepEqual(
+      (silent.carriedAttempts ?? []).map((a) => a.at),
+      [at, at],
+      "with their own stamps, so the wait cannot extend itself",
+    );
+
+    // (b) The crossing IS announced here (+60%): its own mark is consumed by
+    // the write that lands the transition, and the sibling's — which nothing in
+    // this evaluation decided — still rides out.
+    const risen = evaluateWatch(row({ upStages: csv }), at + 60_000, live(260_000), cfg);
+    assert.equal(risen.alerts.length, 1);
+    assert.equal(risen.alerts[0].sig, "up50");
+    assert.equal(risen.alerts[0].deduped, undefined, "no proof in the fixture: the card is owed");
+    const risenCsv = String(risen.announcedUpStages).split(",");
+    assert.ok(risenCsv.includes("up50"), `the stage mark lands: ${risen.announcedUpStages}`);
+    assert.ok(!risenCsv.includes(up50), `while the attempt is consumed: ${risen.announcedUpStages}`);
+    assert.ok(risenCsv.includes(reclaim), `and the untried sibling still carries: ${risen.announcedUpStages}`);
+    assert.deepEqual((risen.carriedAttempts ?? []).map((a) => a.sig), ["reclaim"]);
+
+    // (c) A RE-ARMED transition drops its mark by the same rule that re-arms
+    // it: back within -8% of the peak ends the pullback episode, and the 🪝
+    // mark of the episode that just ended must not suppress the next one.
+    const pb = cutMarkFor("pb", at);
+    const recovered = evaluateWatch(
+      row({ peakMcap: 205_000, upStages: `dip20,pb,${pb}` }),
+      at + 60_000,
+      live(200_000),
+      cfg,
+    );
+    assert.deepEqual(recovered.alerts, [], "a pullback re-entry needs a real pullback");
+    assert.equal(recovered.announcedUpStages, "dip20", "the re-armed 🪝's attempt is gone with its episode");
+    assert.deepEqual(recovered.carriedAttempts ?? [], [], "and nothing is left in flight");
+  });
+
+  await test("evaluateWatch: a deferral carries EVERY attempt mark, not only the young ones", () => {
+    // The deferral writes the marks back so its wait cannot extend itself, and
+    // it used to re-add only the ones it was WAITING on — but a mark it is not
+    // waiting on is one whose proof it has already read, i.e. exactly the
+    // evidence a later pass needs (see carriedAttempts). Dropping it was the
+    // other half of the live Quest duplicate: a PROVEN mark is by definition
+    // not young.
+    const at = 1_800_000_000_000;
+    const row = (over = {}) => ({
+      token: "QUEST", chatId: "c", symbol: "Quest", pushedAt: 0,
+      mcapAtPush: 162_300, peakMcap: 271_404, lastLiquidity: 36_229,
+      deadTroughMcap: null, holdersAtPush: null, holdersLast: null,
+      holdersCheckedAt: null, sellDomStreak: 0,
+      // The check clock of the pass that cut the young attempt: same bucket.
+      lastChecked: at + 2_000, lastAlertAt: 0, followupsSent: 0,
+      lastState: null, upStages: null,
+      ...over,
+    });
+    const live = { mcap: 250_000, liquidity: 36_229, chg5m: 5, vol5m: 12_000, buysH1: 130, sellsH1: 100 };
+    const cfg = { cooldownMs: 30 * 60_000 };
+    const young = cutMarkFor("up50", at);
+    const older = cutMarkFor("reclaim", at - CUT_MARK_BUCKET_MS);
+
+    const waited = evaluateWatch(row({ upStages: `${older},${young}` }), at + 30_000, live, cfg);
+    assert.deepEqual(waited.alerts, [], "a young attempt defers the whole evaluation");
+    assert.equal(waited.lastState, null, "nothing is announced");
+    assert.equal(waited.followupsSent, 0, "not the counter");
+    assert.deepEqual(
+      String(waited.announcedUpStages).split(",").sort(),
+      [older, young].sort(),
+      "both stamps ride back out, unchanged",
+    );
+  });
+
   await test("deliveredFollowupProofs: the newest delivery per (token, sig), the token key for an unstamped entry", () => {
     const map = deliveredFollowupProofs([
       { token: "A", kind: "followup", sig: "dead", at: 100 },
@@ -2511,6 +2635,115 @@ async function main() {
       ["weak"],
       "only the card that never landed is re-sent",
     );
+  });
+
+  await test("PushWatcher: the 🚀 attempt survives an unrelated write, so ONE crossing is not announced twice (Quest)", async () => {
+    // Live 2026-10-01, the operator's report: two 🚀 續漲 Quest cards six
+    // minutes apart, both naming the same baseline ($162.3K → $271.4K +67% at
+    // 11:57Z, → $246.1K +52% at 12:11Z). The second card's WORSE numbers are
+    // the tell: it is not a second milestone but a LATER check of the same
+    // transition, re-derived and re-sent because the row had forgotten the
+    // attempt. The audit ring agreed — three `followup`/`up50` entries for one
+    // crossing, `followups_sent` 2 — and the fix is the mark's lifetime: a
+    // pass that moves the column for its OWN reason no longer deletes an
+    // attempt it did not consume (see evaluateWatch.carriedAttempts).
+    const questRow = (over = {}) =>
+      termRow({
+        token: "QUEST", symbol: "Quest",
+        mcapAtPush: 162_300, peakMcap: 205_000,
+        lastLiquidity: 36_229, lastVol5m: 9_000,
+        // `dip20` arms the ♻️ reclaim, `liq1` is the drain count the disarm
+        // below clears — the unrelated column move this test needs.
+        upStages: "dip20,liq1",
+        ...over,
+      });
+    const makeWatcher = (db, bot, mcap) =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        loadConfig({}),
+        async (addrs) =>
+          new Map(addrs.map((a) => [a, { ...termPair(a, 36_229), marketCap: mcap }])),
+        null,
+      );
+
+    // Pass 1 — the crossing is announced AND DELIVERED, its ♻️ sibling is
+    // refused: the rollback keeps the delivered card's attempt as its only
+    // evidence, and the audit entry is the proof that goes with it.
+    const db = termDb([questRow()]);
+    const delivered = [];
+    db.recordPushDelivery = async (e) => { delivered.push(e); };
+    const texts1 = [];
+    const out1 = await makeWatcher(
+      db,
+      {
+        api: {
+          sendMessage: async (_chat, text) => {
+            texts1.push(text);
+            if (text.includes("🚀")) return { message_id: 7956 };
+            throw new Error("400 Bad Request: chat not found");
+          },
+        },
+      },
+      250_000,
+    ).runTick(Date.now() + 1_500);
+    assert.ok(texts1[0].includes("🚀"), `the crossing goes out first: ${texts1[0]}`);
+    assert.ok(texts1[1].includes("♻️"), `with its sibling behind it: ${texts1[1]}`);
+    assert.equal(out1.undelivered, 1, "the refused sibling holds the row back");
+    const [, w1] = db.updated[0];
+    assert.equal(w1.lastState, null, "so the announcement is rolled back");
+    assert.match(String(w1.upStages), /(^|,)p:up50:/, `the DELIVERED card leaves its attempt: ${w1.upStages}`);
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].sig, "up50", "and its audit entry names the card it proves");
+
+    // Pass 2 — no card at all: the price is back under +50%, and the ONE thing
+    // moving the column is the drain disarm (a real reading above the floor).
+    // Before the fix this write was `dip20` alone: the attempt went with it.
+    const db2 = termDb([questRow({ upStages: w1.upStages })], {
+      audit: [{ ...delivered[0], at: Date.now() }],
+    });
+    let sends2 = 0;
+    const out2 = await makeWatcher(
+      db2,
+      { api: { sendMessage: async () => { sends2 += 1; return { message_id: 1 }; } } },
+      195_000,
+    ).runTick(Date.now() + 1_500);
+    assert.equal(sends2, 0, "below +50% there is nothing to send");
+    assert.equal(out2.deduped, 0, "and nothing to refuse");
+    const [, w2] = db2.updated[0];
+    assert.match(String(w2.upStages), /(^|,)p:up50:/, `the attempt rides a write that did not consume it: ${w2.upStages}`);
+    assert.ok(
+      !String(w2.upStages).split(",").includes("liq1"),
+      `while the disarm's own edit lands: ${w2.upStages}`,
+    );
+
+    // Pass 3 — the same crossing is re-derived, and the proof pass 1 wrote is
+    // still the answer to the mark the row still carries: announced, not sent.
+    // This is the pass that produced the operator's second 🚀 card; the ♻️
+    // sibling, which never landed, is still owed and goes out exactly once.
+    const db3 = termDb([questRow({ upStages: w2.upStages })], {
+      audit: [{ ...delivered[0], at: Date.now() }],
+    });
+    const texts3 = [];
+    const out3 = await makeWatcher(
+      db3,
+      { api: { sendMessage: async (_chat, text) => { texts3.push(text); return { message_id: 9 }; } } },
+      250_000,
+    ).runTick(Date.now() + 1_500);
+    assert.equal(out3.deduped, 1, "the crossing is refused on the attempt's own proof");
+    assert.match(String(out3.note), /dup-skip 1/);
+    assert.ok(
+      !texts3.some((t) => t.includes("🚀")),
+      `the duplicate 🚀 card is NOT sent: ${JSON.stringify(texts3)}`,
+    );
+    assert.equal(texts3.filter((t) => t.includes("♻️")).length, 1, "while the unproven sibling is");
+    const [, w3] = db3.updated[0];
+    assert.ok(
+      !String(w3.upStages ?? "").includes("p:"),
+      `the mark is consumed now that its transition landed: ${w3.upStages}`,
+    );
+    assert.equal(w3.lastState, "up50", "and the transition still lands");
   });
 
   await test("evaluateWatch: with NO cut mark, a proof from the row's OWN check still refuses the duplicate", () => {

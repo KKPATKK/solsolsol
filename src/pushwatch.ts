@@ -1324,6 +1324,17 @@ export interface WatchEval {
   sellDomStreak: number;
   /** CSV to persist into up_stages (undefined = keep; '' = clear, resurrection). */
   announcedUpStages?: string;
+  /**
+   * The row's in-flight attempt marks this evaluation did NOT announce and did
+   * not re-arm (see carriedAttempts): the marks a ROLLBACK has to carry along.
+   * The caller's rollback rebuilds the column from the row's stage marks, so
+   * without this a sibling card's rollback silently deletes the record that a
+   * delivered card already went out (live Quest 2026-10-01: three 🚀 up50
+   * cards in fourteen minutes, each one with its own audit entry). Absent on
+   * every early return — a deferral, a drain, a revival — none of which can
+   * leave the column holding a live attempt the caller must preserve.
+   */
+  carriedAttempts?: Array<{ sig: string; at: number }>;
 }
 
 function pct(n: number): string {
@@ -1409,9 +1420,13 @@ export function parseCutMarks(
  * The CSV a row is written with while one of its attempts is still open (see
  * CUT_MARK_PREFIX): the marks it already had, plus one mark per attempt the
  * caller hands it — each an unknown-outcome send, delivered or cut mid-flight.
+ *
  * Older attempt marks are replaced, because they describe a check that is over;
  * the ones passed in are the current evidence, and the result keeps the
- * column's sorted shape.
+ * column's sorted shape. The marks that must SURVIVE a recomputation are the
+ * caller's business: the row loop hands this function the carried set it got
+ * from the evaluation (see evaluateWatch.carriedAttempts) instead of relying
+ * on the column to be rewritten with them by accident.
  *
  * Each attempt keeps its OWN stamp: for a cut card that is the instant the pass
  * stopped waiting (its proof can only be NEWER than that), and for a delivered
@@ -1430,6 +1445,36 @@ export function addCutMarks(
   for (const a of attempts) kept.push(cutMarkFor(a.sig, a.at));
   return kept.sort().join(",");
 }
+
+/**
+ * The sigs whose attempt marks are CARRIED across a column recomputation (see
+ * evaluateWatch.carriedAttempts). Membership means "this transition has a
+ * state rule that re-arms it", so the mark may live until either that rule
+ * runs or the card is announced. Everything else keeps the old one-write life:
+ * a mark that outlives its transition would suppress the NEXT, genuinely new
+ * card — the one outcome this engine must never take (see the FLOOR note on
+ * evaluateWatch). `liqcrash` is the standing example of a sig left out: its
+ * only memory is the shared lastState, so nothing can prove the mark stale.
+ */
+export const CARRIED_ATTEMPT_SIGS: ReadonlySet<string> = new Set([
+  // The 🚀 ladder: re-armed only by the 🟢 revival, which rewrites the column.
+  "up50",
+  "up100",
+  "up200",
+  "up400",
+  "ignite", // re-armed when the tape goes dormant again
+  "reclaim", // re-armed by a fresh ≥20% dip (the dip20 arm)
+  "pb", // re-armed back within -8% of the peak
+  "w35",
+  "w45", // re-armed above -25%
+  "div", // re-armed when the divergence ends
+  "sell", // re-armed when the sell streak breaks
+  "dead", // 💀 : the revival clears the column
+  "revive", // re-armed by the next 💀 card
+  "liqwarn",
+  "drain", // re-armed by the drain disarm
+  "hold", // re-armed by its own announcement (the holder baseline rolls)
+]);
 
 /** One attempt's mark in an otherwise unchanged CSV (see addCutMarks). */
 export function addCutMark(
@@ -1498,6 +1543,20 @@ export function evaluateWatch(
   for (const m of attemptMarks) {
     attemptAt.set(m.sig, Math.max(attemptAt.get(m.sig) ?? 0, m.at));
   }
+  /**
+   * Sigs whose card THIS evaluation announces — everything pushed into
+   * `alerts`, whether it will be sent, muted, or skipped as already delivered
+   * (see `fire`). An attempt mark for one of these has done its job: the
+   * transition lands with this pass's write, so the mark goes with it.
+   */
+  const announcedSigs = new Set<string>();
+  /**
+   * Sigs whose own re-arm rule ran in THIS evaluation: the transition is armed
+   * again, so a stale attempt mark for it must not be allowed to suppress the
+   * next card (the mark is dropped by the same rule that re-arms it — the
+   * discipline every persistent stage mark already keeps).
+   */
+  const rearmedSigs = new Set<string>();
   /**
    * When the audit ring proves a card for this transition was ACCEPTED, as the
    * newest `at` it carries; 0 = nothing proven.
@@ -1605,10 +1664,20 @@ export function evaluateWatch(
       // The stored trough is the 💀 row's resurrection anchor: a deferral
       // announces nothing, so it must not be dropped by the write either.
       deadTroughMcap: row.deadTroughMcap ?? null,
-      announcedUpStages: addCutMarks(row.upStages, young),
+      // EVERY attempt the row already carries rides back out untouched, with
+      // its own stamp (see addCutMarks): a deferral announces nothing, so it
+      // must not consume anything either — dropping the marks that were NOT
+      // young was the other half of the live duplicate, since a PROVEN mark is
+      // by definition not young.
+      announcedUpStages: addCutMarks(row.upStages, attemptMarks),
     };
   }
   const fire = (kind: WatchAlert["kind"], text: string, sig: string) => {
+    // Announced HERE, before the dedupe decides: a deduped card's transition
+    // lands with this pass's write exactly like a sent one, and a muted card's
+    // lands by design (see PUSH_WATCH_MUTE) — so all three drop the attempt
+    // mark (see carriedAttempts).
+    announcedSigs.add(sig);
     // Proof is asked per CARD, so an entry for another transition of the same
     // row can never stand in for this attempt (the token-only fallback aside).
     const at = attemptAt.get(sig);
@@ -1652,30 +1721,66 @@ export function evaluateWatch(
   const liqFloor = cfg.liqFloorUsd ?? LIQ_FLOOR_USD;
   const marks = new Set<string>();
   for (const m of (row.upStages ?? "").split(",")) {
-    // Cut marks are consumed, not carried: they describe an attempt, and the
-    // next check write recomputes this column from `marks`, so a mark that is
-    // not re-added here disappears — one attempt, one mark, no staleness that
-    // could suppress a LATER, genuinely new transition.
+    // The stage marks are the set every rule below mutates. The `p:` attempt
+    // marks stay in `attemptAt` (read at the top) and ride the column back out
+    // through columnCsv — they are no longer consumed by the next write that
+    // recomputes this column, see carriedAttempts.
     if (m && !m.startsWith(CUT_MARK_PREFIX)) marks.add(m);
   }
+  /**
+   * The attempt marks still worth carrying, and the column they are carried
+   * in. See CUT_MARK_PREFIX for what a mark means and `deduped` for how it is
+   * read; what changed 2026-10-01 is how long it LIVES.
+   *
+   * The mark used to live exactly one evaluation — "the next check write
+   * recomputes the column without it". That assumed the next check WRITES THE
+   * COLUMN IT RECOMPUTES, which holds only when it recomputes the same
+   * transition. Measured live, it often does not: a pass that derives a card
+   * and misses its send slice rolls the column back (one attempt mark per card
+   * it tried), and the next pass that moves the column for ANY reason — a
+   * stale `ignite` mark re-arming, a rolled-back card of its own — writes a
+   * column rebuilt from its own marks alone, so the attempt mark goes with it.
+   * The proof the mark exists to consult is still in the audit ring; what
+   * disappeared was the only thing that would have asked for it. Live Quest
+   * 2026-10-01 11:57-12:11 HKT: the same 🚀 up50 card three times, each with a
+   * `followup`/`up50` entry in the ring, `followups_sent` 2.
+   *
+   * A mark now lives until its transition is ANNOUNCED (see announcedSigs) or
+   * RE-ARMED by its own rule (see rearmedSigs). Nothing else drops it: a stale
+   * mark is what the young/proof rules are for, and a mark with no proof still
+   * re-sends exactly as before.
+   */
+  const carriedAttempts = (): Array<{ sig: string; at: number }> => {
+    const out: Array<{ sig: string; at: number }> = [];
+    for (const [sig, at] of attemptAt) {
+      if (!CARRIED_ATTEMPT_SIGS.has(sig)) continue;
+      if (announcedSigs.has(sig) || rearmedSigs.has(sig)) continue;
+      out.push({ sig, at });
+    }
+    return out;
+  };
+  /** The column as it will be written: stage marks + carried attempt marks. */
+  const columnCsv = (set: ReadonlySet<string>): string =>
+    [
+      ...set,
+      ...carriedAttempts().map((a) => cutMarkFor(a.sig, a.at)),
+    ]
+      .sort()
+      .join(",");
+  /** Whether that column differs from what the row stores (no write when equal). */
+  const columnMoved = (set: ReadonlySet<string>): boolean =>
+    columnCsv(set) !== (row.upStages ?? "").split(",").sort().join(",");
   // undefined = the mark set is unchanged, so the caller leaves the column as
   // it is (the same contract the 🚀 stages use).
-  const marksChanged = (): string | undefined => {
-    const csv = [...marks].sort().join(",");
-    return csv === (row.upStages ?? "").split(",").sort().join(",")
-      ? undefined
-      : csv;
-  };
+  const marksChanged = (): string | undefined =>
+    columnMoved(marks) ? columnCsv(marks) : undefined;
   /**
    * Write-through for the persistent marks — the same comparison every rule
    * below inlines (announcedUpStages is only set when the CSV actually moved,
    * so an untouched column is left alone; see the 🚀 stages for the contract).
    */
   const commitMarks = (): void => {
-    const csv = [...marks].sort().join(",");
-    if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
-      announcedUpStages = csv;
-    }
+    if (columnMoved(marks)) announcedUpStages = columnCsv(marks);
   };
   /** 現價 vs 推送價, the "how late am I" reading every entry card carries. */
   const pushX = (live.mcap / Math.max(row.mcapAtPush, 1)).toFixed(2);
@@ -1732,6 +1837,11 @@ export function evaluateWatch(
   // evidence either way and must not erase what the last real reading said.
   let drainDisarm: string | undefined;
   if (live.liquidity !== null && marks.has(DRAIN_CONFIRM_MARK)) {
+    // A real reading back above the floor ends the drain episode, so the next
+    // sub-floor reading starts a NEW warning: the attempt marks for the pair
+    // go with the arm they belong to (see rearmedSigs).
+    rearmedSigs.add("liqwarn");
+    rearmedSigs.add("drain");
     marks.delete(DRAIN_CONFIRM_MARK);
     drainDisarm = marksChanged();
   }
@@ -1815,6 +1925,9 @@ export function evaluateWatch(
       `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(live.mcap * RESURRECTION_MULT)}＝低點 ×1.5 會再通知）`,
       "dead",
     );
+    // The 💀 card ARMS a new revival (recovery to trough ×1.5), so a stale
+    // attempt mark for the last one must not suppress it (see rearmedSigs).
+    rearmedSigs.add("revive");
     return {
       alerts,
       peakMcap,
@@ -1840,6 +1953,9 @@ export function evaluateWatch(
   if (live.sellsH1 > 0 && live.buysH1 / live.sellsH1 < SELL_DOM_RATIO) {
     sellDomStreak += 1;
   } else {
+    // The streak breaking re-arms the 🩸 card (its pace is the clock on top),
+    // so a stale attempt mark for it must not suppress the next one.
+    if (sellDomStreak > 0) rearmedSigs.add("sell");
     sellDomStreak = 0;
   }
   if (
@@ -1938,12 +2054,7 @@ export function evaluateWatch(
       break; // one card per crossing, however many stages it spans
     }
   }
-  {
-    const csv = [...firedStages].sort().join(",");
-    if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
-      announcedUpStages = csv;
-    }
-  }
+  if (columnMoved(firedStages)) announcedUpStages = columnCsv(firedStages);
 
   // ── Entry cards (2026-09-30, operator request) ──────────────────────────
   // The tracker used to speak loudest about EXITS (⚠️/💀/🩸/💧) and about
@@ -1961,6 +2072,9 @@ export function evaluateWatch(
   // is the armed half and is CONSUMED by the reclaim: one card per cycle, and
   // a fresh ≥20% dip has to happen before the next one.
   if (drawdownFromPeak <= -RECLAIM_MIN_DIP_PCT) {
+    // A fresh ≥20% dip ARMS the next reclaim: the attempt mark for the last
+    // one must not survive it (see rearmedSigs).
+    rearmedSigs.add("reclaim");
     if (!marks.has("dip20")) {
       marks.add("dip20");
       commitMarks();
@@ -1989,6 +2103,7 @@ export function evaluateWatch(
   // `pb` is the once-per-episode mark; the episode ends when the coin is back
   // within -8% of its peak, which is what re-arms the next one.
   if (drawdownFromPeak > -PULLBACK_REARM_DD_PCT) {
+    rearmedSigs.add("pb");
     if (marks.delete("pb")) commitMarks();
   } else if (
     runupFromPushPct >= PULLBACK_MIN_RUNUP_PCT &&
@@ -2020,6 +2135,7 @@ export function evaluateWatch(
     live.vol5m >= IGNITION_VOL_USD &&
     (row.lastVol5m ?? 0) < IGNITION_DORMANT_USD;
   if (!igniteBurst) {
+    rearmedSigs.add("ignite");
     if (marks.delete("ignite")) commitMarks();
   } else if (
     !marks.has("ignite") &&
@@ -2042,6 +2158,8 @@ export function evaluateWatch(
     // only on real recovery above -25%; dead takes over at -55%.
     const runupPct = (row.peakMcap / Math.max(row.mcapAtPush, 1) - 1) * 100;
     if (drawdownFromPeak > -25) {
+      rearmedSigs.add("w35");
+      rearmedSigs.add("w45");
       firedStages.delete("w35");
       firedStages.delete("w45");
     }
@@ -2058,10 +2176,7 @@ export function evaluateWatch(
       );
       firedStages.add(weakMark);
       lastState = "weak";
-      const csv = [...firedStages].sort().join(",");
-      if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
-        announcedUpStages = csv;
-      }
+      if (columnMoved(firedStages)) announcedUpStages = columnCsv(firedStages);
     }
 
     // Liquidity crash.
@@ -2115,10 +2230,8 @@ export function evaluateWatch(
         holderRatio <= 1 - DIVERGENCE_MIN_DROP_PCT;
       if (!divActive && firedStages.has("div")) {
         firedStages.delete("div");
-        const csv = [...firedStages].sort().join(",");
-        if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
-          announcedUpStages = csv;
-        }
+        rearmedSigs.add("div");
+        if (columnMoved(firedStages)) announcedUpStages = columnCsv(firedStages);
       }
       if (
         cooledDown &&
@@ -2132,10 +2245,7 @@ export function evaluateWatch(
         );
         firedStages.add("div");
         lastState = "divergence";
-        const csv = [...firedStages].sort().join(",");
-        if (csv !== (row.upStages ?? "").split(",").sort().join(",")) {
-          announcedUpStages = csv;
-        }
+        if (columnMoved(firedStages)) announcedUpStages = columnCsv(firedStages);
       }
     }
   }
@@ -2152,6 +2262,8 @@ export function evaluateWatch(
     // A stage change owns the column when one happened; otherwise the drain
     // rule's disarm is the only edit that has to land.
     announcedUpStages: announcedUpStages ?? drainDisarm,
+    // What a rollback must carry (see carriedAttempts).
+    carriedAttempts: carriedAttempts(),
   };
 }
 
@@ -3913,6 +4025,23 @@ export class PushWatcher {
       // them into its claim (one round trip), the alerting path writes them
       // after its sends — with `hold` rolling the announcement columns back
       // when a card did not go out (see the final write).
+      /**
+       * The attempt marks a rollback writes: the cards THIS pass tried (with
+       * its own stamps) plus the in-flight attempts it did NOT touch (§
+       * WatchEval.carriedAttempts) — a sibling card's rollback is no reason to
+       * forget that a delivered card already went out. Live Quest 2026-10-01
+       * 11:57-12:11 HKT: the same 🚀 up50 card three times, all three proven in
+       * the audit ring, because the second pass's rollback rebuilt the column
+       * without the first one's mark.
+       */
+      const rollbackMarks = (
+        attempts: ReadonlyArray<{ sig: string; at: number }>,
+      ): Array<{ sig: string; at: number }> => [
+        ...attempts,
+        ...(evalResult.carriedAttempts ?? []).filter(
+          (a) => !attempts.some((t) => t.sig === a.sig),
+        ),
+      ];
       const checkFields = (
         hold: boolean,
         attempts: ReadonlyArray<{ sig: string; at: number }> = [],
@@ -3943,10 +4072,12 @@ export class PushWatcher {
         // ask the audit before re-sending that same transition. ALL of them,
         // not just the cut one: a rollback re-derives every card of the row,
         // and a card the audit can prove was delivered must not be announced
-        // again merely because a LATER sibling ate the slice (POPEYE).
+        // again merely because a LATER sibling ate the slice (POPEYE). The
+        // marks this pass did NOT attempt ride along too (see rollbackMarks) —
+        // the same promise, one pass older.
         upStages: hold
-          ? attempts.length > 0
-            ? addCutMarks(row.upStages, attempts)
+          ? rollbackMarks(attempts).length > 0
+            ? addCutMarks(row.upStages, rollbackMarks(attempts))
             : row.upStages
           : evalResult.announcedUpStages,
         deadTroughMcap: hold
