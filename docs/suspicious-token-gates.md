@@ -185,3 +185,37 @@ its own: the verdict's organic branch disabled; `if (config.jupSusBlock)` →
 that reaches any card, including the ones that used to slip through on slow
 ticks. A push with a below-floor score printed on its card is a regression of
 this section.
+
+### §7.1 After deploy (`eb71702`, 2026-10-01 17:24:45Z)
+
+Live, 17:25–17:42Z (12 ticks, `/health` + `/debug/scan-history` +
+`/debug/push-audit`): no below-floor push and `fails.organic` still 0 — the
+gate has not been exercised yet, because no coin has reached the render with a
+low reading. The last INITIAL card is still GG (`17:23:07.781Z`, mcap 71,985,
+pushed by the pre-deploy code); the cards sent after the deploy are followups
+(Uptober `revive` 17:31:23, SARKA `reclaim` 17:32:02, Meridian 17:40:03), which
+ride the tracker/push-watch path and never touch `renderMessage`. JANE itself
+is no longer reaching the card either way: `/debug/token` reports
+`maxMcapObserved 279091` while its re-evaluations are rejected at the mcap gate
+(`市值 — < $60K` in `summary.rejects`), i.e. the coin now dies one gate EARLIER
+than the organic floor.
+
+**The verification did find a residual hole in the first cut**, and it is the
+same class of bug this section is about: the render judgement was taken before
+`await this.trade.effectiveMode()`, while `organicBox` is written from a `.then`
+microtask — so a reading that lands during that await would still be printed by
+the card unjudged. Hardened: the snapshot
+`const organicReading = organicBox.value;` is taken AFTER the last await in
+front of the card, and the SAME snapshot is what `renderMessage` receives
+(`organicReading`), so judgement and card are literally one read — the window is
+now closed rather than merely narrowed. The wiring pin was tightened to say so
+(one snapshot; the render call after the trade-mode read; the card built from
+`organicReading,`), and its mutations are red on their own: snapshot moved in
+front of the await (ordering assert), card back on the raw box (snapshot assert).
+The historical patch `docs/patches/organic-late-bound-and-probe-2026-09-26.apply.js`
+now accepts either the direct box or the judged snapshot, so re-applying it
+cannot silently undo the hardening.
+
+Still worth watching (unchanged): the first tick where `fails.organic` moves
+tells us the render judgement is doing live work; a card that PRINTS a
+below-floor `有機度` is the regression to look for.

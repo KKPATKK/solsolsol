@@ -581,3 +581,32 @@ Head 嘅 Jupiter 開支喺邊（量度）：**唔喺 front window** —— track
 | claim bug：`list.slice(nextChunk * …)` → `list.slice(0, …)`（兩條 lane 攞同一個 chunk） | 並行測試紅（交付 100 ≠ 200；`468 passed, 1 failed`），refusal 測試照綠 |
 
 `npm run typecheck` 0 error；主 suite **469/0**；其餘 7 條（deferred-priority、tick-path、schema-gate 7、health-front 5、dex-list-cache 10、usd-formatter 4、dex-last-profiles 14）全 pass。
+
+## 驗收（deploy `eb71702`，2026-10-01 17:25–17:42Z）
+
+CI run `36898980028` success、`headSha` 核對 `eb71702`（17:24:45Z 完成）。之後抽 9 個 tick：
+
+| 時刻 (Z) | pairs | pairsJup | pairsMissing | Dex `blockedForMs` | `pairCacheRefused` | `pairs-jup` ms |
+|---|---|---|---|---|---|---|
+| 17:31:25 | 192 | 163 | 0 | 89,305（429 backoff） | 6 | 695 |
+| 17:32:03 | 191 | 161 | 0 | 51,330 | 6 | 384 |
+| 17:33:06 | 192 | 171 | 0 | 0 | 6 | 696 |
+| 17:37:06 | 190 | 149 | 0 | 89,306 | 9 | 694 |
+| 17:38:03 | 193 | 153 | 0 | 31,942 | 9 | 352 |
+| 17:39:06 | 191 | 144 | 0 | 0 | 9 | 696 |
+| 17:40:05 | 193 | 140 | 0 | 0 | 9 | 697 |
+| 17:41:17 | 209 | 144 | 0 | 0 | 9 | 690 |
+| 17:42:05 | 189 | 146 | 0 | 89,308 | 12 | 692 |
+
+（`poolSliced` 讀過嘅 tick 全部 90；tick `ms` 1420–4162，全部 `ok:true`、零 cut。）
+
+**量度**：
+
+- 每一個抽樣樣本嘅 `pairsJup` 都 **> 100**。一個 chunk 上限 100 mints，所以 `pairsJup 140–171` = **至少 2 個 chunk 真係出咗街** —— 包括 Dex pair lane 被 429 鎖住 89s 嘅 tick。舊 serial 喺同一 regime 只交 1 個 chunk（上一輪 14:35:48：`pairs 100 / pairsJup 100 / pairsMissing 72`）。
+- `pairsMissing` **9/9 = 0**：fallback 覆蓋完整，連 Dex batch endpoint 入唔到嘅 tick 都冇幣因為「冇 pair 數據」而被跳過。
+- `pairs-jup` 352–697ms（2 個 chunk）；對照落線前健康 tick `182 pairs / 565ms`（serial 2–3 chunk）。
+- 429 冇因為並行而惡化：`/debug/dex429` lastHour 15（同落線前同一節奏），ring 內 17:25–17:37 四次；`dex.http429` 7 → 16 係同一條 list lane 嘅既有節奏。
+
+**未量到（誠實講）**：冇抽到「ask ≥ 190、Dex 完全零交付」嘅 tick，所以 `pairsJup → ~200` 嘅上限未直接見到（最高 171）；亦未見到 `pairs-jup` 貼近「單 chunk latency」嘅極端讀數。要嘅係下一個 Dex 全黑 tick 嘅 `pairsJup`。
+
+**期間嘅 push**：全部係 followup（Uptober `revive` 17:31:23、SARKA `reclaim` 17:32:02、Meridian 17:40:03）—— tracker／push-watch 條路徑唔經 `fetchTokenDataBatch` 嘅 front fallback，所以呢個數唔係本節嘅驗收讀數；initial 卡 0（`cand 1 push 0` 9/9 tick，`fails.organic` / `fails.sus` 全 0）。

@@ -5711,14 +5711,6 @@ export class Scanner {
           );
           continue;
         }
-        // LAST-CALL Jupiter judgement (see jupiterGatesBlocked): the reading
-        // is late-bound, so between the early gate and this card a
-        // slow-but-successful fetch can land — and the card would then PRINT
-        // a reading no gate ever judged (live 2026-10-01: JANE pushed with
-        // `有機度 0.0（low）` on a 7_458ms tick). This reads the same box the
-        // card is built from, waits for nothing, and a null box still fails
-        // open.
-        if (this.jupiterGatesBlocked(diag, coin, organicBox.value)) continue;
         // Live trade-mode read (once per token): /setmode flips apply to the
         // very next card. Buy button renders in manual mode; sell buttons in
         // any non-off mode (in auto the coin was already bought — exits are
@@ -5727,6 +5719,18 @@ export class Scanner {
         const tradeMode = this.trade
           ? await this.trade.effectiveMode()
           : "off";
+        // LAST-CALL Jupiter judgement (see jupiterGatesBlocked): the reading
+        // is late-bound, so between the early gate and this card a
+        // slow-but-successful fetch can land — and the card would then PRINT
+        // a reading no gate ever judged (live 2026-10-01: JANE pushed with
+        // `有機度 0.0（low）` on a 7_458ms tick). The snapshot is taken AFTER
+        // the last await in front of the card (the trade-mode read above):
+        // the box is written from a `.then` microtask, so an await anywhere
+        // between a judgement and `renderMessage` can hand the card a reading
+        // that judgement never saw. One snapshot, one verdict, one card — and
+        // a box still holding null keeps the documented fail-open.
+        const organicReading = organicBox.value;
+        if (this.jupiterGatesBlocked(diag, coin, organicReading)) continue;
         const tokenAddress = coin.pair.baseToken.address;
         const message = renderMessage(
           coin,
@@ -5740,9 +5744,9 @@ export class Scanner {
           arkham,
           crime,
           wallet,
-          // The late-bound reading (see organicSlot): whatever landed by the
-          // time this card is built, or null → the line is hidden.
-          organicBox.value,
+          // The late-bound reading (see organicSlot): the very snapshot the
+          // gate above judged — or null → the line is hidden.
+          organicReading,
           axiomInfo,
           // null = forensics disabled → line hidden; { report: null } =
           // configured but nothing to report (non-pump mint / skip).

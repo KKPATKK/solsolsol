@@ -9329,19 +9329,34 @@ async function main() {
       "one early call",
     );
     assert.equal(
-      src.split("this.jupiterGatesBlocked(diag, coin, organicBox.value)").length - 1,
+      src.split("this.jupiterGatesBlocked(diag, coin, organicReading)").length - 1,
       1,
-      "one render call, on the box the card reads",
+      "one render call, on the snapshot the card is built from",
+    );
+    assert.equal(
+      src.split("const organicReading = organicBox.value;").length - 1,
+      1,
+      "one snapshot: the verdict and the card read the same value",
+    );
+    assert.equal(
+      src.split("organicReading," + String.fromCharCode(10)).length - 1,
+      1,
+      "the card is built from the very snapshot the gate judged",
     );
     const early = src.indexOf("this.jupiterGatesBlocked(diag, coin, jupReading)");
     const wallets = src.indexOf("this.markPhase(diag, \"wallets\", startedAt)");
-    const late = src.indexOf("this.jupiterGatesBlocked(diag, coin, organicBox.value)");
+    const mode = src.indexOf("const tradeMode = this.trade");
+    const snapshot = src.indexOf("const organicReading = organicBox.value;");
+    const late = src.indexOf("this.jupiterGatesBlocked(diag, coin, organicReading)");
     const render = src.indexOf("const message = renderMessage(");
     assert.ok(
       early > 0 && wallets > early,
       "the early call is in front of the wallet/Flurry legs, so a blocked coin saves them",
     );
-    assert.ok(late > wallets && render > late, "the render call is the last judgement in front of the card");
+    assert.ok(
+      mode > wallets && snapshot > mode && late > snapshot && render > late,
+      "the render call is the last judgement in front of the card — after the trade-mode await, so the snapshot it reads cannot go stale",
+    );
   });
 
   await test("mcapRatioBlockReason: the LOW side is the LP-heavy shape (2026-09-28 ring)", () => {
@@ -17218,7 +17233,8 @@ async function main() {
           "constorganicBox:{value:Awaited<typeoforganicSlot>}={value:null};",
         ) &&
         scannerSrc.includes("const[gmgn,arkham]=awaitdisplayBatch;") &&
-        scannerSrc.includes("organicBox.value,"),
+        scannerSrc.includes("constorganicReading=organicBox.value;") &&
+        scannerSrc.includes("organicReading,"),
       "worker (the probe asks from the worker's own egress, with its latency)":
         workerSrc.includes(
           'constorganicMint=(url.searchParams.get("organic")??"").trim();',

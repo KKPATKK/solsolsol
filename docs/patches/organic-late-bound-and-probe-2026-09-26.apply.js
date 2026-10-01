@@ -81,7 +81,8 @@ const NEW_TEST = lines(
   `          "constorganicBox:{value:Awaited<typeoforganicSlot>}={value:null};",`,
   `        ) &&`,
   `        scannerSrc.includes("const[gmgn,arkham]=awaitdisplayBatch;") &&`,
-  `        scannerSrc.includes("organicBox.value,"),`,
+  `        scannerSrc.includes("organicReading,") ||
+        scannerSrc.includes("organicBox.value,"),`,
   `      "worker (the probe asks from the worker's own egress, with its latency)":`,
   `        workerSrc.includes(`,
   `          'constorganicMint=(url.searchParams.get("organic")??"").trim();',`,
@@ -181,7 +182,8 @@ const EDITS = [
       `          organicBox.value,`,
       `          axiomInfo,`,
     ),
-    (src) => src.includes("organicBox.value,"),
+    (src) =>
+      src.includes("organicBox.value,") || src.includes("organicReading,"),
   ],
   [
     "src/worker.ts",
