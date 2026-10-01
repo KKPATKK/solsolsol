@@ -507,3 +507,77 @@ this.spacing.noteRefused();                             // pair 嘅 dispatch spa
 | `listCacheRefused` 繼續升 | 唔變：list 條腿嘅甩漏由 `lastRawProfiles`/`failedTotal` 讀，reuse 窗口兜住 30 分鐘 |
 
 **未做**（留返量度驅動）：tracker head 冇動（佢唔係 miss 嘅來源）；`DEX_REQUEST_INTERVAL_MS` 冇動（World A 之下 adaptive 自己行返落 250，人手降 spacing 只會同時掩蓋 World B 嘅指紋）。
+
+## 驗收（deploy `e741bdb` 之後，實測 15:27–15:38Z）
+
+CI run `36884203824` success（`headSha` 核對 `e741bdb`）；落線後 ~11 個 tick 全部 `ok:true`（`ms` 2366–4030）、零 cut，`pairsMissing` 每個抽樣都 **0**，tracker pass `rows 30/30 pairs 30/30 miss 0 lost 0`。
+
+| 觀察 | 讀數 | 意思 |
+|---|---|---|
+| pair lane 終於有人問 | `poolLegMs.pairs` 1277–1656ms（4 個 tick）、`pairCacheRefused` 0→8、`lastPairCacheStatus` 出 `MISS` / `HTTP-429` | 解耦生效：batch lane 唔再被 list 拖死 |
+| **list refusal 唔再 re-arm / re-raise** | 15:31:49：`blockedForMs` 89,438 → 30,317（**同一個 block 老化**）而 `listCacheRefused` +1；15:35:49 同樣（30,386 而 `L` +1） | 呢個係修法獨有嘅指紋；舊碼下 `listCacheRefused` 一升，`blockedForMs` 就會跳返 ~88s |
+| batch endpoint **自己都會拒** | `pairCacheRefused` 爬到 8；dispatch 嘅 tick 兩個 batch 一齊 429（15:28、15:30:50、15:34:49），之後 block 自己行 ~88s → ~30s → 0 | **World B 部分成立**：shared egress 桶連 batch lane 都拒。舊耦合嘅「結果」唔算錯，但機制錯 —— 佢連 batch endpoint 肯服務嘅 tick 都封埋 |
+| Dex 條腿到手（cache 或 wire） | 15:30:29 `pairs 193 / pairsJup 177`（Dex 16）；15:30:50: 190/173（17）；15:31:49: 192/168（**24**，全部係上一個 tick 嘅 180s in-memory cache） | 2 batch = 60 address；其餘照樣 Jupiter |
+| ring 冇寫爆 | `/debug/dex429` `total` 5440 → 5451（~38 分鐘）、`lastHour 15`、`lastAt` 跟 tick start | 新 90s gap 保持舊寫入節奏（原本 ~14/hour） |
+| spacing 仍然 1200（steps 4、fleet 3–4） | `intervalMs 1200` 全程；durable row 每 60s 才 decay 一級 | 每次 dispatch 嘅 2 個 batch 都 429 ⇒ `noteRefused` 又推返上去 |
+
+**結論（老實講）**：修法目標（pair lane 唔再被 list 封死、反應跟返自己嘅證據）達到；但量度出嚟係「batch endpoint 都係同一個 shared 桶嘅受害者」—— 即係舊耦合嘅**結果**唔算錯，只係機制錯（佢連 batch endpoint 肯服務嘅 tick 都封埋，仲令 spacing 永遠由 list 主導）。要再收窄 fallback 嘅工作量，下一條槓桿唔似係 spacing（2 batch/tick 都一樣被拒，唔似係我哋嘅速率問題），而係前段工作量本身（tracker head／feed、或 fallback 嘅 chunk 覆蓋）。
+
+## 第四輪量度（2026-10-01 16:10–16:21Z）：front Jupiter fallback 嘅工作量 —— tracker head vs feed
+
+入口：`/health`（`pairs` / `pairsJup` / `pairsMissing` / `poolSliced` / `poolLegMs` / feed 行數 / `dex.*`）＋ `/debug/scan-history.pushWatchPass.note`（tracker pass 嘅 `spend[pairs X/Y]`；`const spent` 係 pass 內部狀態，所以係**單 pass** 開支，唔係累計）。6 個抽樣：
+
+| 時刻 (Z) | pairs | pairsJup | pairsMissing | Dex 到手 | `pairs-jup` | tracker pass pairs | 讀法 |
+|---|---|---|---|---|---|---|---|
+| 16:10:29 | 100 | 100 | **74** | 0（cache-only） | 900（用滿） | — | 降級 tick：一個 chunk |
+| 16:13:16 | 182 | 182 | 0 | 0（cache-only） | 565 | 206ms | Jupiter 健康：2–3 chunk 清得完 |
+| 16:14:23 | 182 | 159 | 0 | 23 | 562 | 1129ms | 同上；pass 自己打 |
+| 16:15:30 | 213 | 169 | 0 | 44 | 697 | 71ms（`pairs 23/30 miss 7`） | 同上 |
+| 16:19:28 | 195 | 148 | 0 | 47（in-memory cache） | 839 | 517ms | block 老化中 |
+| 16:20:43 | 210 | 170 | 0 | 40（in-memory cache） | 881 | **0ms** | pass 全 prefetch hit |
+
+Address 組成（代碼順序 + 代數，**唔係猜測**）：`addresses = [feed(去重後 ~84–100), pool slice(74–90), tracker head(30)]`，ask ~195–220；呢個順序就係 Jupiter chunk（100/個）嘅先後。
+
+| 組件 | 佔 ask | 降級 tick（只有 chunk 1）交付 | 健康 tick（2–3 chunk）交付 |
+|---|---|---|---|
+| feed | ~45% | 幾乎全部 —— chunk 1 = 頭 100 = feed 全體 ＋ slice 頭幾個 | 全部 |
+| pool slice (90) | ~40% | 尾部餓死（`pairsMissing 74` 主體） | 全部 |
+| tracker head (30) | **~14%** | **≈0**（永遠排最後，chunk 1 到唔到；16:10 反推 S ≤ 174 ⇒ head 交付 = 174−S ≤ 9） | 落入 chunk 2；16:15 反推交付 21–30（前提 feed' ≤ raw 102） |
+
+Head 嘅 Jupiter 開支喺邊（量度）：**唔喺 front window** —— tracker pass 自己嘅 cron invocation 付（per-pass `spend[pairs]` 0–1129ms）。0ms = 同 isolate front 啱好 prefetch 到；>0ms = 佢自己 `pairsForTracker` 再走 Dex → Jupiter → Gecko。
+
+所以：
+
+- **縮 head 唔係槓桿**（量度否決，同第三輪一致）。降級 tick 佢交付 ≈0（排最後，chunk 1 都到唔到）；健康 tick 佢至多令 front ask 由 2 chunk 變 3 chunk（215 vs 185，**推斷**）—— 而 front window 而家鬆（tick 1.8–4.0s、零 cut），tracker pass 又會自己攞返呢 30 個地址。
+- **稀缺嘅係 front Jupiter 嘅 chunk 吞吐**：降級 tick 一個 chunk 100（budget 900ms 用滿）；健康 2–3 chunk 用 560–880ms。`fetchTokenDataBatch` 個 chunk loop 係 **serial**：第二個 chunk 嘅覆蓋「寄宿」喺第一個 chunk 嘅 latency 上（第一個慢 ⇒ 剩餘 < `JUP_FALLBACK_MIN_ROOM_MS` 250 ⇒ 第二個唔派）。而 ask（feed+slice ~185）本身就過 100。
+
+## 槓桿一：chunk 並行（已實作，本地已驗，未 commit／未 push）
+
+- 做法：`jupfeeds.fetchTokenDataBatch` 嘅 serial `for` chunk loop 改成小 worker pool（DexScreener pair lane 嘅 `worker()`／`PAIR_BATCH_CONCURRENCY` 係現成先例）；每個 worker 認領下一個 chunk，`rateLimited()` 同 deadline 檢查照舊；`JUP_BATCH_SIZE 100` 唔動（endpoint documented cap）。
+- 驗收讀數：降級 tick `pairsJup` 100 → ~200、`pairsMissing` 74 → ~0；健康 tick `pairsMissing` 繼續 0，而 `poolLegMs.pairs-jup` 由 560–880ms 跌向單 chunk latency。
+- 風險（誠實講）：如果上游係「全局排隊」而唔係 per-request latency，並行冇 gain（`rateLimited()`／空 chunk 照樣出現）—— 嗰時就係 key 嘅問題（Jupiter API key，同 `COINGECKO_API_KEY` 同一套路），留返再下一步。
+- 唔做：head（量度否決）；ask 排序（slice vs feed 邊個先食稀缺窗口）—— 降級 tick 而家係 feed 全覆蓋、slice 餓死，係價值判斷，留待有 push 數據先傾。
+
+### 實作細節
+
+| 位置 | 變更 |
+|---|---|
+| `src/jupfeeds.ts` | 新常量 `JUP_FALLBACK_CONCURRENCY = 2`（註釋寫明量度來源同「為何唔多過 2」）；chunk queue ＋ lane：`slice` ＋ `nextChunk += 1` 一齊同步做，所以兩條 lane 唔會攞同一個 chunk |
+| 每條 lane 保持舊規則 | `rateLimited()` ／ `Date.now() > deadline` ⇒ 即刻收工；`remaining <= JUP_FALLBACK_MIN_ROOM_MS` ⇒ 唔派（chunk 連 START 都唔得就唔試）；每個 request 自己 race 自己嘅 `remaining` |
+| 不變 | `JUP_BATCH_SIZE 100`（documented cap）、`JUP_FALLBACK_BUDGET_MS 900`、`max 500`、`jupToPairInfos` 解析路徑 |
+
+### 測試（`scripts/test-unit.js`，+2；baseline 467 → **469**）
+
+| 測試 | 驗咩 |
+|---|---|
+| `a slow first chunk must not starve the second (parallel lanes)` | 200 mints（2 chunk）＋每 chunk 650ms：serial 只會交 1 個 chunk（`remaining 250` 唔夠 room），2 lane 要交齊 200 且總時間 < 900ms；再加 caller window `+500ms`／300ms per chunk 版本（serial 只交 100）。假 mint 用**固定闊度** base58 編碼（`padEnd` 會撞：「2」＋43×「1」＝「21」＋42×「1」） |
+| `a refusal stops NEW chunks across the lanes (one shared gate)` | 300 mints（3 chunk）＋第一個 request 429：第 3 個 chunk 唔准出街（`requests 2`）、答到嗰條 lane 照交 100；跟住第二個 call 完全唔開 request（pause 生效） |
+
+### Mutation（改 `dist/jupfeeds.js` 再 `npm run build` 還原）
+
+| Mutation | 結果 |
+|---|---|
+| `JUP_FALLBACK_CONCURRENCY = 2` → `1`（即舊 serial 行為） | 兩條新測試都紅（`467 passed, 2 failed`） |
+| claim bug：`list.slice(nextChunk * …)` → `list.slice(0, …)`（兩條 lane 攞同一個 chunk） | 並行測試紅（交付 100 ≠ 200；`468 passed, 1 failed`），refusal 測試照綠 |
+
+`npm run typecheck` 0 error；主 suite **469/0**；其餘 7 條（deferred-priority、tick-path、schema-gate 7、health-front 5、dex-list-cache 10、usd-formatter 4、dex-last-profiles 14）全 pass。

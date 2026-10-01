@@ -29,7 +29,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, jupiterGateVerdict, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -8937,6 +8937,107 @@ async function main() {
     );
   });
 
+  await test("fetchTokenDataBatch: a slow first chunk must not starve the second (parallel lanes)", async () => {
+    // The shape that motivated the lanes (see docs/profiles-feed-zeros.md,
+    // 第四輪量度 2026-10-01): the front's ask is 2-3 chunks (~185-215
+    // addresses), and on a degraded tick the SERIAL loop resolved exactly one
+    // (`pairs 100 pairsJup 100`) with the whole 900ms budget spent — the
+    // second chunk's coverage was hostage to the first chunk's latency, while
+    // a healthy tick resolved 182 over 2-3 chunks in 565-880ms. 200 mints =
+    // exactly two chunks of JUP_BATCH_SIZE.
+    // Valid base58 mints, guaranteed UNIQUE: the delivered-size assertions
+    // count distinct mints from the echoed chunks, so a collision (the
+    // `0`/`l` -> `z` trick the older tests use only counts REQUESTS) would
+    // fake a shortfall.
+    const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    const mintAt = (i) => {
+      // FIXED-WIDTH header + constant tail: uniqueness is the point — padEnd
+      // alone collides ("2" + "1"x43 === "21" + "1"x42), and these tests
+      // count DISTINCT mints delivered.
+      let s = "";
+      for (let n = i; n > 0; n = Math.floor(n / 58)) s = B58[n % 58] + s;
+      return "1".repeat(3 - s.length) + s + "9".repeat(41);
+    };
+    const mints = Array.from({ length: 200 }, (_, i) => mintAt(i));
+    const requests = [];
+    const make = (latencyMs, deadline) =>
+      new JupTokensClient(
+        { jupiterRequestIntervalMs: 0 },
+        async (url) => {
+          requests.push(url);
+          await new Promise((r) => setTimeout(r, latencyMs));
+          const query = url.split("query=")[1];
+          return new Response(
+            JSON.stringify(query.split(",").map((id) => ({ id, mcap: 42 }))),
+            { status: 200 },
+          );
+        },
+      ).fetchTokenDataBatch(mints, deadline);
+    // (a) The leg's own 900ms cap with 650ms per chunk: a serial loop resolves
+    // ONE chunk and breaks on the next check (`remaining` 250 is not room),
+    // while two lanes each hold the full window for their own round trip.
+    const started = Date.now();
+    const both = await make(650, undefined);
+    const ms = Date.now() - started;
+    assert.equal(both.size, 200, "one slow chunk must not cancel the other lane's chunk");
+    assert.equal(requests.length, 2, "two chunks, two requests — issued together");
+    assert.ok(ms < 900, `the 900ms cap still bounds the call (took ${ms}ms)`);
+    // (b) A CALLER window that fits one serial round trip but not two: the
+    // deadline must not turn the second lane's chunk into a casualty either.
+    const before = requests.length;
+    const both2 = await make(300, Date.now() + 500);
+    assert.equal(
+      both2.size,
+      200,
+      "the caller's window covers both chunks when they race together",
+    );
+    assert.equal(requests.length - before, 2, "both lanes opened inside the window");
+  });
+
+  await test("fetchTokenDataBatch: a refusal stops NEW chunks across the lanes (one shared gate)", async () => {
+    // The serial loop's 429 rule was positional: it checked `rateLimited()`
+    // BETWEEN chunks, so no chunk AFTER a refused one was ever asked. With
+    // lanes that rule must survive the concurrency: a lane already on the
+    // wire cannot be recalled (which is why the lane count stays small), but
+    // no NEW chunk may go out once the client is paused — a refused fallback
+    // must not keep spending the shared egress bucket from the other lane.
+    const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    const mintAt = (i) => {
+      // FIXED-WIDTH header + constant tail: uniqueness is the point — padEnd
+      // alone collides ("2" + "1"x43 === "21" + "1"x42), and these tests
+      // count DISTINCT mints delivered.
+      let s = "";
+      for (let n = i; n > 0; n = Math.floor(n / 58)) s = B58[n % 58] + s;
+      return "1".repeat(3 - s.length) + s + "9".repeat(41);
+    };
+    const mints = Array.from({ length: 300 }, (_, i) => mintAt(i));
+    const requests = [];
+    const client = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async (url) => {
+        const index = requests.push(url) - 1;
+        await new Promise((r) => setTimeout(r, 20));
+        if (index === 0) {
+          return new Response(JSON.stringify({ msg: "RATE_LIMIT_EXCEEDED" }), {
+            status: 429,
+          });
+        }
+        const query = url.split("query=")[1];
+        return new Response(
+          JSON.stringify(query.split(",").map((id) => ({ id, mcap: 7 }))),
+          { status: 200 },
+        );
+      },
+    );
+    const got = await client.fetchTokenDataBatch(mints);
+    assert.equal(got.size, 100, "the answering lane still contributes its chunk");
+    assert.equal(requests.length, 2, "the third chunk must NOT be asked after the refusal");
+    // The pause outlives the call: a second call opens no request at all.
+    const again = await client.fetchTokenDataBatch(mints);
+    assert.equal(again.size, 0);
+    assert.equal(requests.length, 2, "a paused client makes zero requests, not a probe per lane");
+  });
+
   await test("fetchOrganicScore: parses score/label/traders; genuine 0 ≠ absent", async () => {
     const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
     const body = JSON.stringify([
@@ -9100,6 +9201,41 @@ async function main() {
     assert.equal(organicMinBlockReason(NaN, null, 60) === null, true);
   });
 
+  await test("jupiterGateVerdict: the JANE reading answers the same whenever it is read, and JUP_SUS_BLOCK really disarms sus", () => {
+    // 2026-10-01: JANE pushed with `🌱 有機度: 0.0（low）` on the card while
+    // `fails.organic` stayed 0 — the reading is late-bound, the early gate's
+    // wait is chain-clamped, and the reading landed in time to be PRINTED but
+    // not in time to be judged. The scan now judges the card's own box a
+    // second time at the render, and both moments come here.
+    const on = { jupSusBlock: true, organicMinScore: 55 };
+    const jane = { score: 0, label: "low", sus: false, devBalancePct: null };
+    assert.deepEqual(jupiterGateVerdict(jane, on), {
+      gate: "organic",
+      reason: organicMinBlockReason(0, "low", 55),
+    });
+    // FAIL-OPEN unchanged: no reading at all, and a score Jupiter omitted,
+    // never judge — a genuine 0 does.
+    assert.equal(jupiterGateVerdict(null, on), null);
+    assert.equal(
+      jupiterGateVerdict({ score: null, label: null, sus: false, devBalancePct: null }, on),
+      null,
+    );
+    // The floor's own edge: exactly at it passes; the knob off disarms it.
+    assert.equal(jupiterGateVerdict({ ...jane, score: 55 }, on), null);
+    assert.equal(jupiterGateVerdict(jane, { jupSusBlock: true, organicMinScore: 0 }), null);
+    // Sus is judged FIRST when both fire (the flag is the more specific
+    // reason), and JUP_SUS_BLOCK=false really disarms it — the organic floor
+    // then judges the same reading on its own.
+    const flagged = { ...jane, sus: true, devBalancePct: 12.5 };
+    assert.equal(jupiterGateVerdict(flagged, on).gate, "sus");
+    assert.match(jupiterGateVerdict(flagged, on).reason, /audit\.isSus/);
+    assert.equal(
+      jupiterGateVerdict(flagged, { jupSusBlock: false, organicMinScore: 55 }).gate,
+      "organic",
+    );
+    assert.equal(jupiterGateVerdict(flagged, { jupSusBlock: false, organicMinScore: 0 }), null);
+  });
+
   await test("ORGANIC_MIN_SCORE: default 55, 0 and junk disable, the scale is clamped", () => {
     // The operator asked for the floor (55 since 2026-10-01, 60 before that);
     // unset keeps it, and the escape hatches follow the other floors: 0 = off,
@@ -9163,12 +9299,16 @@ async function main() {
     );
   });
 
-  await test("organic gate is sited with the Jupiter suspicion gate and reuses its one awaited reading", () => {
-    // The reading is FREE (the card's 🌱 有機度 payload), so the gate must not
-    // add a request: it shares the one await with jupSusBlockReason. Pin that,
-    // plus the single counter writer — a second write site would double-count.
+  await test("the Jupiter gates are judged twice — early for the legs, again at the render — and both calls share one verdict function", () => {
+    // The reading is FREE (the card's 🌱 有機度 payload), so neither call adds
+    // a request: one slot await, one verdict function. The EARLY call keeps
+    // the leg-saving siting; the RENDER call is the 2026-10-01 fix — the
+    // reading is late-bound, so a reading that lands after the early wait can
+    // still reach the card, and the card must never print a reading no gate
+    // judged (live: JANE, `有機度 0.0（low）`, pushed).
     const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
     assert.equal(src.split("fails.organic++").length - 1, 1, "one writer for the counter");
+    assert.equal(src.split("fails.sus++").length - 1, 1, "one writer for the suspicion counter");
     assert.equal(
       src.split("await this.bestEffort(() => organicSlot, chainDeadline, null)").length - 1,
       1,
@@ -9178,11 +9318,30 @@ async function main() {
       src.includes("this.config.jupSusBlock || this.config.organicMinScore > 0"),
       "the shared await is only paid when one of the two gates is on",
     );
-    const sus = src.indexOf("diag.fails.sus++");
-    const gate = src.indexOf("organicMinBlockReason(\n          jupReading?.score ?? null,");
+    assert.ok(
+      src.includes("export function jupiterGateVerdict(") &&
+        src.includes("const verdict = jupiterGateVerdict("),
+      "both call sites ride the one verdict function",
+    );
+    assert.equal(
+      src.split("this.jupiterGatesBlocked(diag, coin, jupReading)").length - 1,
+      1,
+      "one early call",
+    );
+    assert.equal(
+      src.split("this.jupiterGatesBlocked(diag, coin, organicBox.value)").length - 1,
+      1,
+      "one render call, on the box the card reads",
+    );
+    const early = src.indexOf("this.jupiterGatesBlocked(diag, coin, jupReading)");
     const wallets = src.indexOf("this.markPhase(diag, \"wallets\", startedAt)");
-    assert.ok(sus > 0 && gate > sus, "the organic gate runs behind the suspicion gate");
-    assert.ok(wallets > gate, "and in front of the wallet/Flurry legs, so a low-score coin saves them");
+    const late = src.indexOf("this.jupiterGatesBlocked(diag, coin, organicBox.value)");
+    const render = src.indexOf("const message = renderMessage(");
+    assert.ok(
+      early > 0 && wallets > early,
+      "the early call is in front of the wallet/Flurry legs, so a blocked coin saves them",
+    );
+    assert.ok(late > wallets && render > late, "the render call is the last judgement in front of the card");
   });
 
   await test("mcapRatioBlockReason: the LOW side is the LP-heavy shape (2026-09-28 ring)", () => {

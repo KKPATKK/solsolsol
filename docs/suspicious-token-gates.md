@@ -93,6 +93,12 @@ below 2.0x had their liquidity pulled.
 | Reject `organicScore < ORGANIC_MIN_SCORE` | `scanner.organicMinBlockReason`, read from the **same awaited reading** `jupSusBlockReason` uses (one await, two judgements) and sited with it, before the wallet/Flurry legs | `ORGANIC_MIN_SCORE = "55"` (60 until 2026-10-01), 0 = off |
 | Missing bundler reading prints `—（未检测）`, a real 0% keeps `0.0%（未检测到捆绑网络）` | `rugcheck.ts` (real-0 vs no-answer) + `render.ts` (three states) | — |
 
+The two Jupiter judgements share ONE callable since 2026-10-01
+(`scanner.jupiterGateVerdict`) and are applied TWICE — at the early site above,
+and again immediately before the card is built, from the same late-bound box the
+card reads. The second call is §7; the first is what saves the wallet/Flurry
+legs.
+
 Observability: `fails.sus`, `fails.organic` and `fails.liqRatio` in
 `/health.heartbeat.summary`, split so each floor can be tuned from live numbers
 (the low side alone — the high side keeps counting into `fails.other`), plus
@@ -136,3 +142,46 @@ the two claims this file makes: `isSus` still has no false positive, and the
 pushes between 2.0x and 2.9x behave like the clean cohort. If any push below
 2.0x turns out healthy, the floor is too strict and `MCAP_LIQ_RATIO_MIN` is the
 single number to raise.
+
+## 7. 2026-10-01: the late-bound reading could be PRINTED without being judged (JANE)
+
+**Live:** `I am Jane Doe (JANE)` was pushed with `🌱 有機度: 0.0（low）` on the
+card while `fails.organic` stayed 0 — score 0, floor 55, pushed. The reading was
+real and current: `/debug/jupiter?organic=<mint>` (the Worker's own egress)
+answered `score 0, label low` in 71–144ms, and the same reading is on the card.
+The losing tick measured **7_458ms** (the slowest in its neighbourhood; the
+`pushed=1` row is in `/debug/scan-history` at 16:35:10Z).
+
+**Root cause — a timing hole, not a config one.** The organic slot is
+late-bound: dispatched with the display batch, walled at `tickDeadline` (+8.0s),
+and the card is rendered from its box (`organicBox.value`) after the
+wallet/Flurry legs. The two gates read a ONE-TIME snapshot of it at the early
+site, whose wait is clamped to `chainDeadline` (+6.5s). On that slow tick the
+early wait answered `null` — fail-open, which is correct for "no data" — and
+the reading landed afterwards, in time for the CARD but too late for the gate.
+The number was never wrong; only the moment it was judged was.
+
+**Fix.** `scanner.jupiterGateVerdict` (exported for tests) composes
+`jupSusBlockReason` + `organicMinBlockReason`, and `Scanner.jupiterGatesBlocked`
+applies it twice: at the early site (unchanged — it is what saves the
+wallet/Flurry legs) and again immediately before the card is built, reading the
+SAME box the card reads. The render call waits for nothing (a null box still
+fails open, so the push reserve is untouched) and a block at the early site
+`continue`s the chain, so the counters cannot double-count. Inside the verdict
+`JUP_SUS_BLOCK` is now honoured — before this, `false` left the flag judged
+anyway whenever the organic floor kept the await alive; the deployed value is
+`true`, so nothing changes live, but the knob now matches this file's table.
+
+**Tests.** `jupiterGateVerdict` (pure): the JANE reading blocks whenever it is
+read, a score exactly at the floor passes, a null reading / absent score never
+judges, sus wins the report when both fire, and `JUP_SUS_BLOCK=false` disarms
+sus while the floor keeps judging. Wiring pin: one `fails.organic++` /
+`fails.sus++` writer, one slot await, one early call (in front of the wallet
+legs) and one render call (in front of `renderMessage`). Mutations, each red on
+its own: the verdict's organic branch disabled; `if (config.jupSusBlock)` →
+`if (true)`; the render call deleted from the chain.
+
+**Worth watching:** `fails.organic` should now fire on the FIRST low reading
+that reaches any card, including the ones that used to slip through on slow
+ticks. A push with a below-floor score printed on its card is a regression of
+this section.

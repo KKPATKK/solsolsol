@@ -244,6 +244,27 @@ const JUP_FALLBACK_BUDGET_MS = 900;
  * the phase is not a drop, it is not attempted at all.
  */
 export const JUP_FALLBACK_MIN_ROOM_MS = 250;
+/**
+ * Chunks of ONE fallback call that may be on the wire together.
+ *
+ * WHY PARALLEL AT ALL (measured 2026-10-01, fourth-round reading recorded in
+ * docs/profiles-feed-zeros.md). The front's ask is 2-3 chunks (~185-215
+ * addresses: feed + pool slice + tracker head), and the loop used to be
+ * SERIAL — so the second chunk's coverage was hostage to the first chunk's
+ * latency. The live shape: a degraded tick resolved exactly one chunk
+ * (`pairs 100 pairsJup 100`) with the whole 900ms budget spent, while a
+ * healthy tick resolved 182 over 2-3 chunks in 565-880ms. With two lanes each
+ * chunk holds the full window for its OWN round trip, so a slow first chunk
+ * no longer cancels the rest of the ask — the same pipelined-batch shape the
+ * DexScreener pair lane already uses (PAIR_BATCH_CONCURRENCY).
+ *
+ * WHY 2, not more: a lane already on the wire cannot be recalled when another
+ * comes back refused, so the count is a ceiling on needless load against a
+ * shared-egress upstream, not a throughput target — and the measured ask
+ * shape is two lanes' worth. JUP_BATCH_SIZE stays the endpoint's documented
+ * per-request cap.
+ */
+const JUP_FALLBACK_CONCURRENCY = 2;
 
 function n(v: unknown): number {
   const x = Number(v);
@@ -530,23 +551,51 @@ export class JupTokensClient {
         ? callerDeadlineMs
         : Number.POSITIVE_INFINITY,
     );
-    for (let i = 0; i < list.length; i += JUP_BATCH_SIZE) {
-      if (this.rateLimited() || Date.now() > deadline) break;
-      const chunk = list.slice(i, i + JUP_BATCH_SIZE);
-      // Race the request itself against the remaining budget: checking the
-      // deadline BETWEEN chunks bounds the loop but not a single hung
-      // request (each get() carries its own multi-second transport
-      // timeout), so one stalled call could carry this phase — and the
-      // gate/push phase behind it — past the scan's deadline. A chunk that
-      // expires contributes nothing and the loop exits on the next check.
-      const remaining = deadline - Date.now();
-      if (remaining <= JUP_FALLBACK_MIN_ROOM_MS) break;
-      const data = await Promise.race([
-        this.get(`/search?query=${chunk.join(",")}`),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), remaining)),
-      ]);
-      for (const [k, v] of jupToPairInfos(data)) out.set(k, v);
-    }
+    // The shared chunk queue: each lane claims the next chunk SYNCHRONOUSLY
+    // (slice + increment are one uninterrupted step, so two lanes can never
+    // claim the same chunk), then does its own round trip inside the ONE
+    // shared deadline. See JUP_FALLBACK_CONCURRENCY for why the lanes exist.
+    const chunkCount = Math.ceil(list.length / JUP_BATCH_SIZE);
+    let nextChunk = 0;
+    const lane = async (): Promise<void> => {
+      while (nextChunk < chunkCount) {
+        // The serial loop's own rules, kept per lane: once the client is
+        // paused by a 429 no NEW chunk may be dispatched (a lane already on
+        // the wire cannot be recalled — which is exactly why the lane count
+        // stays small), and a deadline already gone stops the lane.
+        if (this.rateLimited() || Date.now() > deadline) return;
+        // A chunk the lane cannot START inside the window is not attempted at
+        // all — the same rule the serial loop applied (and the DexScreener
+        // pair lane's batches): a request that cannot finish is pure latency,
+        // and its tokens keep their pool slot for the next rotation.
+        const remaining = deadline - Date.now();
+        if (remaining <= JUP_FALLBACK_MIN_ROOM_MS) return;
+        const chunk = list.slice(
+          nextChunk * JUP_BATCH_SIZE,
+          (nextChunk + 1) * JUP_BATCH_SIZE,
+        );
+        nextChunk += 1;
+        // Race the request itself against the remaining budget: checking the
+        // deadline BETWEEN chunks bounds the loop but not a single hung
+        // request (each get() carries its own multi-second transport
+        // timeout), so one stalled call could carry this phase — and the
+        // gate/push phase behind it — past the scan's deadline. A chunk that
+        // expires contributes nothing; the other lane's chunk is unaffected.
+        const data = await Promise.race([
+          this.get(`/search?query=${chunk.join(",")}`),
+          new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), remaining),
+          ),
+        ]);
+        for (const [k, v] of jupToPairInfos(data)) out.set(k, v);
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(JUP_FALLBACK_CONCURRENCY, chunkCount) },
+        () => lane(),
+      ),
+    );
     return out;
   }
 }

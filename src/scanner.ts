@@ -2215,6 +2215,56 @@ export function organicMinBlockReason(
 }
 
 /**
+ * Verdict of the TWO Jupiter block gates — `audit.isSus` (JUP_SUS_BLOCK) and
+ * the organic-score floor (ORGANIC_MIN_SCORE) — from ONE reading, so a caller
+ * can apply both judgements wherever the reading is read.
+ *
+ * WHY IT IS A SEPARATE CALLABLE (2026-10-01). The reading is fetched by the
+ * 🌱 有機度 card slot, which is LATE-BOUND: the chain judges it once before the
+ * wallet/Flurry legs (to save them), but that wait is clamped to
+ * chainDeadline while the slot's own wall is the LATER tickDeadline, and the
+ * card is rendered seconds later from the same box. A reading that lands
+ * after the early wait therefore still reaches the CARD — with no gate
+ * looking at it. Live 2026-10-01 16:35Z: JANE pushed on a 7_458ms tick with
+ * `🌱 有機度: 0.0（low）` on the card and no organic reject anywhere — the
+ * number existed (the worker's own probe reads score 0 from its egress), the
+ * gate just never saw it. The scanner now judges this SAME reading again at
+ * the render (see Scanner.jupiterGatesBlocked), and both moments call HERE so
+ * the two gates can never drift apart.
+ *
+ * Sus is judged FIRST: a flagged token reports the flag, not its score. Its
+ * knob is honoured (JUP_SUS_BLOCK=false disarms the flag and leaves the
+ * organic floor to judge alone) — the docs' table names this helper for both.
+ *
+ * Fail-open is unchanged in both shapes a missing reading takes: `reading ===
+ * null` (the slot never landed) and `score === null` (Jupiter omitted the
+ * field) never judge. A genuine 0 is a NUMBER and DOES judge.
+ */
+export function jupiterGateVerdict(
+  reading: {
+    score: number | null;
+    label: string | null;
+    sus: boolean;
+    devBalancePct: number | null;
+  } | null,
+  config: { jupSusBlock: boolean; organicMinScore: number },
+): { gate: "sus" | "organic"; reason: string } | null {
+  if (config.jupSusBlock) {
+    const reason = jupSusBlockReason(
+      reading?.sus ?? false,
+      reading?.devBalancePct ?? null,
+    );
+    if (reason) return { gate: "sus", reason };
+  }
+  const reason = organicMinBlockReason(
+    reading?.score ?? null,
+    reading?.label ?? null,
+    config.organicMinScore,
+  );
+  return reason ? { gate: "organic", reason } : null;
+}
+
+/**
  * The liquidity reading a USD-level rule HERE may judge, or null when the pair
  * did not come from the leg those rules are calibrated on.
  *
@@ -5552,35 +5602,13 @@ export class Scanner {
           this.config.jupSusBlock || this.config.organicMinScore > 0
             ? await this.bestEffort(() => organicSlot, chainDeadline, null)
             : null;
-        const susReason = jupSusBlockReason(
-          jupReading?.sus ?? false,
-          jupReading?.devBalancePct ?? null,
-        );
-        if (susReason) {
-          diag.fails.sus++;
-          this.addReject(diag, coin, susReason);
-          console.log(
-            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (Jupiter audit.isSus)`,
-          );
-          continue;
-        }
-        // Organic-score floor. Fail-open BOTH ways: no reading (score null —
-        // Jupiter omitted the field, or the slot missed its deadline) and the
-        // gate off (0) both push the coin. A genuine 0 is a number and DOES
-        // judge. See organicMinBlockReason's contract.
-        const organicReason = organicMinBlockReason(
-          jupReading?.score ?? null,
-          jupReading?.label ?? null,
-          this.config.organicMinScore,
-        );
-        if (organicReason) {
-          diag.fails.organic++;
-          this.addReject(diag, coin, organicReason);
-          console.log(
-            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (organic score below floor)`,
-          );
-          continue;
-        }
+        // The LEG-SAVING pass of the two Jupiter gates (see
+        // jupiterGatesBlocked — the same judgement runs again at the render,
+        // because this wait is chain-clamped while the reading is late-bound
+        // and the card reads it seconds later). A null reading here — the
+        // slot had not landed when the window ran out, or both gates are off
+        // — fails open, as documented.
+        if (this.jupiterGatesBlocked(diag, coin, jupReading)) continue;
         // Wallet analysis — creator profile (age + serial-launcher create
         // count), top-holder wallet ages and cross-coin holder clustering.
         // Runs only for coins that pass every block gate (its pushed_holders
@@ -5683,6 +5711,14 @@ export class Scanner {
           );
           continue;
         }
+        // LAST-CALL Jupiter judgement (see jupiterGatesBlocked): the reading
+        // is late-bound, so between the early gate and this card a
+        // slow-but-successful fetch can land — and the card would then PRINT
+        // a reading no gate ever judged (live 2026-10-01: JANE pushed with
+        // `有機度 0.0（low）` on a 7_458ms tick). This reads the same box the
+        // card is built from, waits for nothing, and a null box still fails
+        // open.
+        if (this.jupiterGatesBlocked(diag, coin, organicBox.value)) continue;
         // Live trade-mode read (once per token): /setmode flips apply to the
         // very next card. Buy button renders in manual mode; sell buttons in
         // any non-off mode (in auto the coin was already bought — exits are
@@ -6292,6 +6328,53 @@ export class Scanner {
       );
       return { status: "hold" };
     }
+  }
+
+  /**
+   * Apply `jupiterGateVerdict` with the side effects a chain gate owns — the
+   * per-gate counter, the reject-ring entry and the console line. Returns
+   * true when the coin must not push.
+   *
+   * CALLED TWICE, AND THE SECOND CALL IS THE FIX (2026-10-01). The early call
+   * (behind the shared slot await, in front of the wallet/Flurry legs) is what
+   * saves those legs, but its wait is clamped to chainDeadline while the slot
+   * is late-bound and the card is rendered seconds later from the same box
+   * (organicBox). A reading that lands after the early wait was therefore
+   * PRINTED ON THE CARD without any gate judging it: live 2026-10-01 16:35Z,
+   * JANE pushed on a 7_458ms tick with `有機度 0.0（low）` on the card. The
+   * render-time call reads the SAME box the card reads, so the card can no
+   * longer show a reading the gate did not judge; it waits for nothing (the
+   * box is whatever has landed) and a null box still fails open, so neither
+   * the push reserve nor the fail-open contract changes. The counters cannot
+   * double-count: a block at the early call `continue`s the chain before the
+   * render, so only one call can ever fire for a coin.
+   */
+  private jupiterGatesBlocked(
+    diag: ScanSummary,
+    coin: QualifyingCoin,
+    reading: {
+      score: number | null;
+      label: string | null;
+      sus: boolean;
+      devBalancePct: number | null;
+    } | null,
+  ): boolean {
+    const verdict = jupiterGateVerdict(reading, {
+      jupSusBlock: this.config.jupSusBlock,
+      organicMinScore: this.config.organicMinScore,
+    });
+    if (!verdict) return false;
+    const symbol = coin.profile.symbol ?? coin.pair.baseToken.symbol;
+    if (verdict.gate === "sus") {
+      diag.fails.sus++;
+      this.addReject(diag, coin, verdict.reason);
+      console.log(`[scanner] blocked ${symbol} (Jupiter audit.isSus)`);
+    } else {
+      diag.fails.organic++;
+      this.addReject(diag, coin, verdict.reason);
+      console.log(`[scanner] blocked ${symbol} (organic score below floor)`);
+    }
+    return true;
   }
 
   /**
