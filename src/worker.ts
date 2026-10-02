@@ -7035,7 +7035,12 @@ export default {
       // keeps every sample so a slow FIRST sample (connection setup on a cold
       // isolate) stays visible instead of being averaged into the median.
       // `colo` (where Cloudflare ran this request) next to `dbRegion` (parsed
-      // from the connection URL) is the distance question itself.
+      // from the connection URL) is the distance question itself, and
+      // `cfPlacement` is the PLACEMENT EXPERIMENT's proof (see the [placement]
+      // block in wrangler.toml): Cloudflare adds that header while placement is
+      // enabled — `remote-NRT` means the request was forwarded to the placed
+      // colo, `local-LAX` means it ran locally — so a moved number can be
+      // attributed instead of guessed at.
       //
       // Read-mostly: the only writes land on two fixed worker_state probe
       // rows, never seen_tokens — see src/dblatency.ts.
@@ -7066,6 +7071,7 @@ export default {
           at: new Date().toISOString(),
           colo:
             (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? null,
+          cfPlacement: request.headers.get("cf-placement"),
           dbRegion: dbRegionFromUrl(env.TURSO_DATABASE_URL),
           samples: measured.samples,
           ops,

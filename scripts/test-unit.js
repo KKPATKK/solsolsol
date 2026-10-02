@@ -19212,6 +19212,14 @@ async function main() {
     const worker = read("src/worker.ts");
     assert.ok(worker.includes('url.pathname === "/debug/db-latency"'), "the route is registered");
     assert.ok(worker.includes("dbRegionFromUrl(env.TURSO_DATABASE_URL)"), "the report carries the db region");
+    // The placement experiment's proof (see the [placement] block in
+    // wrangler.toml): the header says whether Cloudflare forwarded the request
+    // to the placed colo (`remote-…`) or ran it locally (`local-…`), which is
+    // what makes a moved `colo` attributable instead of a guess.
+    assert.ok(
+      worker.includes('request.headers.get("cf-placement")'),
+      "the report must carry the placement proof header",
+    );
     assert.ok(worker.includes("await db.measureLatency(requested)"), "…and the measurement comes from the Db");
     assert.ok(worker.includes("verdict: changesVerdict("), "the report carries the changes() verdict");
     assert.ok(
@@ -19234,6 +19242,39 @@ async function main() {
     assert.ok(
       compiled.includes("sql: CLAIM_COUNTER_RELEASE_SQL"),
       "…and the release path uses its own shared statement",
+    );
+  });
+
+  // The placement experiment's lever lives in wrangler.toml, so it is pinned
+  // like every other deployed knob: an explicit region near the database, and
+  // NOT Smart Placement (which needs a traffic pattern this Worker's fetch
+  // path cannot feed). The block's own comment carries the measured baseline
+  // and the exit criteria; this test only stops the lever from being deleted
+  // or silently swapped while the experiment is still the live shape.
+  await test("placement experiment: the fetch path is pinned near the db region", () => {
+    const lines = fs
+      .readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8")
+      .split("\n");
+    const placement = {};
+    let inPlacement = false;
+    for (const line of lines) {
+      if (/^\s*\[/.test(line)) {
+        inPlacement = /^\s*\[placement\]/.test(line);
+        continue;
+      }
+      if (!inPlacement) continue;
+      const m = /^\s*([a-z_]+)\s*=\s*"([^"]*)"\s*$/.exec(line);
+      if (m) placement[m[1]] = m[2];
+    }
+    assert.equal(
+      placement.region,
+      "aws:ap-northeast-1",
+      "the fetch path must run near the Turso region the probe measures against",
+    );
+    assert.equal(
+      placement.mode,
+      undefined,
+      "an explicit region hint, not smart: the two are mutually exclusive",
     );
   });
 
