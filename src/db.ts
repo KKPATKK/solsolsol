@@ -561,6 +561,15 @@ interface PushWatchCheckValues {
   sellDomStreak?: number;
   /** Latest observed mcap (🏁 recap final value). */
   lastMcap?: number;
+  /**
+   * Pin-on-first-sight / the mark of the pool being judged (see the
+   * pool-pinning note in src/pushwatch.ts). Written only into a NULL column:
+   * a legacy row is pinned to the pool its first successful check actually
+   * read, and a pinned row's value is never overwritten by a check write. A
+   * CONFIRMED switch is rewritten only by Db.repinPushWatchPools, which is a
+   * compare-and-swap on the old pin.
+   */
+  poolAddress?: string | null;
 }
 
 /**
@@ -901,7 +910,13 @@ export interface PushWatchListRow {
     followupsSent: number;
     lastState: string | null;
     upStages: string | null;
-  }
+    /**
+     * The pool this row is PINNED to (see the pool-pinning note in
+     * src/pushwatch.ts). Null = legacy row, pinned on its first successful
+     * check write with the pool it was actually judged on.
+     */
+    poolAddress: string | null;
+}
 
 /**
  * worker_state key holding the fingerprint of the DDL `init` ran last (see the
@@ -2009,7 +2024,8 @@ export class Db {
           dead_trough_mcap REAL,
           sell_dom_streak INTEGER NOT NULL DEFAULT 0,
           last_mcap REAL,
-          up_stages TEXT
+          up_stages TEXT,
+          pool_address TEXT
         );`,
         `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
         // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
@@ -2368,6 +2384,12 @@ export class Db {
       "INTEGER NOT NULL DEFAULT 0",
     );
     await this.addColumnIfMissing("push_watch", "last_mcap", "REAL");
+    // push_watch.pool_address — the pool a row is PINNED to (the pool its
+    // push was based on, see the pool-pinning note in src/pushwatch.ts).
+    // Written at enrollment, on a legacy row's first successful check write
+    // (COALESCE — the pool it was actually judged on), and on a confirmed
+    // pool switch (Db.repinPushWatchPools). NULL = never pinned. Idempotent.
+    await this.addColumnIfMissing("push_watch", "pool_address", "TEXT");
     // Telemetry counters: /health used to run COUNT(*) over token_stats
     // (~400K rows) and seen_tokens (~50K rows) on every ping — at the 1-min
     // uptime-monitor cadence that alone is ~600M rows/day (alerted
@@ -4431,6 +4453,8 @@ export class Db {
     pushedAt: number;
     mcapAtPush: number;
     liquidityUsd: number | null;
+    /** The pool the push is based on (see the pool-pinning note); absent = unpinned. */
+    poolAddress?: string | null;
   }): Promise<void> {
     await this.upsertPushWatchMany([row]);
   }
@@ -4448,11 +4472,13 @@ export class Db {
       pushedAt: number;
       mcapAtPush: number;
       liquidityUsd: number | null;
+      /** The pool the push is based on (see the pool-pinning note); absent = unpinned. */
+      poolAddress?: string | null;
     }>,
   ): Promise<void> {
     if (rows.length === 0) return;
     const now = Date.now();
-    const placeholders = rows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(",");
+    const placeholders = rows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",");
     const args: Array<string | number | null> = [];
     for (const row of rows) {
       args.push(
@@ -4464,12 +4490,13 @@ export class Db {
         row.mcapAtPush,
         row.liquidityUsd,
         now,
+        row.poolAddress ?? null,
       );
     }
     await this.get().execute({
       sql: `INSERT INTO push_watch
               (token, chat_id, symbol, pushed_at, mcap_at_push, peak_mcap,
-               last_liquidity, last_checked)
+               last_liquidity, last_checked, pool_address)
             VALUES ${placeholders}
             ON CONFLICT(token) DO NOTHING`,
       args,
@@ -4668,6 +4695,10 @@ export class Db {
         followupsSent: Number(r.followups_sent ?? 0),
         lastState: r.last_state === null || r.last_state === undefined ? null : String(r.last_state),
         upStages: r.up_stages === null || r.up_stages === undefined ? null : String(r.up_stages),
+        poolAddress:
+          r.pool_address === null || r.pool_address === undefined
+            ? null
+            : String(r.pool_address),
       };
     });
   }
@@ -4692,7 +4723,8 @@ export class Db {
               holders_at_push = COALESCE(?, holders_at_push),
               sell_dom_streak = ?,
               up_stages = COALESCE(?, up_stages),
-              last_mcap = ?`,
+              last_mcap = ?,
+              pool_address = COALESCE(pool_address, ?)`,
       args: [
         v.peakMcap,
         v.lastLiquidity,
@@ -4707,6 +4739,7 @@ export class Db {
         v.sellDomStreak ?? 0,
         v.upStages ?? null,
         v.lastMcap ?? null,
+        v.poolAddress ?? null,
       ],
     };
   }
@@ -4720,6 +4753,38 @@ export class Db {
       sql: `UPDATE push_watch SET ${set.sql} WHERE token = ?`,
       args: [...set.args, token],
     });
+  }
+
+  /**
+   * Re-pin rows whose PINNED pool has left DexScreener's response — the
+   * second half of the tracker's pool-switch policy (see the pool-pinning
+   * note in src/pushwatch.ts): the pass that detects a switch neither judges
+   * the row nor leaves it on a dead pin; it points the row at the pool the
+   * token batch now represents it with, and the NEXT pass judges from there.
+   *
+   * ONE batch for every switch the pass confirmed, in the same shape as every
+   * other multi-row write here: one row per statement (a multi-row UPDATE
+   * cannot say which token moved), one round trip total.
+   *
+   * The WHERE is a compare-and-swap on the pin the caller READ — `pool_address
+   * = ?` (the old value). Two isolates detecting the same switch both write
+   * the same new pin, but a stale writer must never clobber a re-pin that a
+   * fresher pass already landed (they could name different new pools after a
+   * second switch); losing the race is free — the row still carries a pin the
+   * next pass can resolve, and a row whose pin stays stale simply re-detects
+   * on the next tick.
+   */
+  async repinPushWatchPools(
+    updates: Array<{ token: string; from: string; to: string }>,
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    await this.get().batch(
+      updates.map((u) => ({
+        sql: "UPDATE push_watch SET pool_address = ? WHERE token = ? AND pool_address = ?",
+        args: [u.to, u.token, u.from],
+      })),
+      "write",
+    );
   }
 
   /**

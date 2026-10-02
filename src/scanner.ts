@@ -53,6 +53,7 @@ import {
   liquidityIsComparable,
   notePeerPassYield,
   passRowAgeMs,
+  pinnablePoolAddress,
 } from "./pushwatch";
 import { FlurryAnalyzer, type FlurryOutcome, type FlurryReport } from "./flurry";
 import {
@@ -3009,6 +3010,10 @@ export class Scanner {
           // Trade service for the heal-resend card's buy/sell/mode buttons
           // (null = trading unconfigured → link + unwatch only).
           this.trade,
+          // The pinned-pool lookup (see pushwatch's pool-pinning note): the
+          // rows' own pools, answered by address.
+          (addresses: string[], deadlineMs?: number) =>
+            this.poolPairsForTracker(addresses, deadlineMs),
         )
       : null;
   }
@@ -3854,6 +3859,61 @@ export class Scanner {
           pairCreatedAt: 0,
         });
       }
+    }
+    return out;
+  }
+
+  /**
+   * The tracker's PINNED-POOL lookup (see the pool-pinning note in
+   * src/pushwatch.ts): the DexScreener answer for rows' own pool addresses,
+   * keyed by pool address. `null` = the endpoint ANSWERED and did not return
+   * that pool (a confirmed switch); a missing key = the lookup did not answer
+   * (a refusal or a spent window), which is evidence of nothing.
+   *
+   * Three rules, in order:
+   *  1. What this tick already fetched is served first — the scan front's own
+   *     pair phase carries the tracker's coins (see lastPairs), and when a
+   *     row's pool IS the token's representative pool, the front has already
+   *     answered for it, for free. Only DexScreener-sourced entries count:
+   *     the Jupiter/Gecko legs put the TOKEN MINT in `pairAddress`, and "the
+   *     mint happens to equal the pool" is not a confirmation.
+   *  2. The rest goes to the client's by-address endpoint
+   *     (fetchPairsByAddresses) — one request for ≤30 pools.
+   *  3. NO Jupiter/Gecko fallback, unlike pairsForTracker: those legs cannot
+   *     answer "is this POOL still in DexScreener's response" — they answer
+   *     per token and may name a different pool entirely. Unanswered pins stay
+   *     unanswered: the row skips this pass (never a stranger pool's numbers)
+   *     and the next pass asks again.
+   */
+  private async poolPairsForTracker(
+    addresses: string[],
+    deadlineMs?: number,
+  ): Promise<Map<string, PairInfo | null>> {
+    const out = new Map<string, PairInfo | null>();
+    const missing: string[] = [];
+    const byPool = new Map<string, PairInfo>();
+    for (const p of this.lastPairs.values()) {
+      if (!p || typeof p.pairAddress !== "string" || p.pairAddress.length === 0) {
+        continue;
+      }
+      if (p.feedSource !== undefined && p.feedSource !== "dexscreener") continue;
+      byPool.set(p.pairAddress, p);
+    }
+    for (const a of addresses) {
+      const hit = byPool.get(a);
+      if (hit) out.set(a, hit);
+      else missing.push(a);
+    }
+    if (missing.length === 0) return out;
+    try {
+      const res = await this.dex.fetchPairsByAddresses(missing, deadlineMs);
+      for (const a of missing) {
+        const hit = res.pairs.get(a);
+        if (hit) out.set(a, hit);
+        else if (res.answered) out.set(a, null); // asked & absent — a switch
+      }
+    } catch {
+      /* refused — every remaining pin stays unresolved (see rule 3) */
     }
     return out;
   }
@@ -6101,6 +6161,10 @@ export class Scanner {
               c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
               c.pair.marketCap,
               c.pair.liquidity.usd,
+              // The PIN (see pushwatch's pool-pinning note): the pool this
+              // card is based on. pinnablePoolAddress refuses a Jupiter/Gecko
+              // pair (their pairAddress is the mint, not a pool).
+              pinnablePoolAddress(c.pair),
             );
           } catch {
             /* tracking is optional */

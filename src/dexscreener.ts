@@ -561,6 +561,12 @@ export function dexFeedLeg(path: string): DexFeedLeg {
   if (path.startsWith("/token-profiles/")) return "profiles";
   if (path.startsWith("/token-boosts/")) return "boosts";
   if (path.startsWith("/latest/dex/tokens/")) return "pairs";
+  // The by-address lookup (see fetchPairsByAddresses) is the same upstream
+  // lane as the token batches: same endpoint family, same rate limit, same
+  // 429 reaction (the batch block and the adaptive spacing both key on the
+  // leg). Filing it under "pairs" is what keeps a refusal there from being
+  // counted — and reacted to — as if it were some other leg's.
+  if (path.startsWith("/latest/dex/pairs/")) return "pairs";
   return "other";
 }
 
@@ -1175,6 +1181,84 @@ export interface DexScreenerHooks {
 function pairDepth(pair: { liquidity: { usd: number | null } }): number {
   const liq = pair.liquidity?.usd;
   return typeof liq === "number" && Number.isFinite(liq) ? liq : -1;
+}
+
+/**
+ * ONE raw pair from a DexScreener pairs body → the PairInfo every caller
+ * reads. Extracted (2026-10-02) from fetchPairsForTokens' loop so the
+ * by-address lookup behind the tracker's pool pin (see
+ * fetchPairsByAddresses) maps a pair through the SAME field set: a second
+ * inline copy is how the two lanes would come to disagree about what a
+ * reading is — the pool pin's whole job is comparing pools through ONE
+ * definition of their numbers.
+ *
+ * Returns null for anything the map cannot carry: a non-solana chain (the
+ * endpoint serves every chain) and a pair with no baseToken address (they
+ * exist in the feed and have no key). The field semantics are unchanged,
+ * verbatim from the loop this came from: `marketCap` stays 0 when DexScreener
+ * omits it (the gate rejects 0 rather than quietly substituting FDV), `fdv`
+ * is its own quantity, and a drained pool's liquidity 0 is PRESERVED (it is
+ * the 💧 rules' evidence — never "unknown").
+ */
+function parseDexPair(raw: Record<string, unknown>): PairInfo | null {
+  if (raw.chainId !== "solana") return null;
+  const baseToken = raw.baseToken as
+    | { address?: string; name?: string; symbol?: string }
+    | undefined;
+  if (!baseToken?.address) return null;
+  const volume = raw.volume as { h24?: number; h1?: number; m5?: number } | undefined;
+  const txnsRaw = raw.txns as
+    | {
+        m5?: { buys?: number; sells?: number };
+        h1?: { buys?: number; sells?: number };
+      }
+    | undefined;
+  const priceChange = raw.priceChange as { m5?: number; h1?: number } | undefined;
+  return {
+    chainId: "solana",
+    url: String(raw.url ?? ""),
+    pairAddress: String(raw.pairAddress ?? ""),
+    baseToken: {
+      address: baseToken.address,
+      name: baseToken.name ?? "",
+      symbol: baseToken.symbol ?? "",
+    },
+    priceUsd: String(raw.priceUsd ?? "0"),
+    priceNative: Number(raw.priceNative),
+    marketCap: Number(raw.marketCap ?? 0),
+    // Reported FDV, stored as its own quantity. DexScreener omits
+    // `marketCap` for some pairs; that stays 0 (the gate rejects it)
+    // rather than quietly becoming an FDV.
+    fdvUsd: raw.fdv == null ? null : Number(raw.fdv),
+    volume: {
+      h24: Number(volume?.h24 ?? 0),
+      h1: Number(volume?.h1 ?? 0),
+      m5: Number(volume?.m5 ?? 0),
+    },
+    priceChange: {
+      m5: Number(priceChange?.m5 ?? 0),
+      h1: Number(priceChange?.h1 ?? 0),
+    },
+    txns: {
+      m5Buys: Number(txnsRaw?.m5?.buys ?? 0),
+      m5Sells: Number(txnsRaw?.m5?.sells ?? 0),
+      h1Buys: Number(txnsRaw?.h1?.buys ?? 0),
+      h1Sells: Number(txnsRaw?.h1?.sells ?? 0),
+    },
+    liquidity: {
+      // Preserve 0 — a drained pool reports usd: 0 and the push-watch
+      // rug rule must see it, not mistake it for "unknown" (null).
+      usd:
+        (raw.liquidity as { usd?: number } | undefined)?.usd ===
+        undefined
+          ? null
+          : Number((raw.liquidity as { usd?: number }).usd),
+    },
+    // The metric every USD-level rule is calibrated on (see the
+    // feedSource note on PairInfo).
+    feedSource: "dexscreener",
+    pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
+  };
 }
 
 export class DexScreenerClient {
@@ -2070,64 +2154,8 @@ export class DexScreenerClient {
         if (!Array.isArray(pairs)) continue;
 
         for (const raw of pairs) {
-          if (raw.chainId !== "solana") continue;
-          const baseToken = raw.baseToken as
-            | { address?: string; name?: string; symbol?: string }
-            | undefined;
-          if (!baseToken?.address) continue;
-          const volume = raw.volume as { h24?: number; h1?: number; m5?: number } | undefined;
-          const txnsRaw = raw.txns as
-            | {
-                m5?: { buys?: number; sells?: number };
-                h1?: { buys?: number; sells?: number };
-              }
-            | undefined;
-          const priceChange = raw.priceChange as { m5?: number; h1?: number } | undefined;
-          const info: PairInfo = {
-            chainId: "solana",
-            url: String(raw.url ?? ""),
-            pairAddress: String(raw.pairAddress ?? ""),
-            baseToken: {
-              address: baseToken.address,
-              name: baseToken.name ?? "",
-              symbol: baseToken.symbol ?? "",
-            },
-            priceUsd: String(raw.priceUsd ?? "0"),
-            priceNative: Number(raw.priceNative),
-            marketCap: Number(raw.marketCap ?? 0),
-            // Reported FDV, stored as its own quantity. DexScreener omits
-            // `marketCap` for some pairs; that stays 0 (the gate rejects it)
-            // rather than quietly becoming an FDV.
-            fdvUsd: raw.fdv == null ? null : Number(raw.fdv),
-            volume: {
-              h24: Number(volume?.h24 ?? 0),
-              h1: Number(volume?.h1 ?? 0),
-              m5: Number(volume?.m5 ?? 0),
-            },
-            priceChange: {
-              m5: Number(priceChange?.m5 ?? 0),
-              h1: Number(priceChange?.h1 ?? 0),
-            },
-            txns: {
-              m5Buys: Number(txnsRaw?.m5?.buys ?? 0),
-              m5Sells: Number(txnsRaw?.m5?.sells ?? 0),
-              h1Buys: Number(txnsRaw?.h1?.buys ?? 0),
-              h1Sells: Number(txnsRaw?.h1?.sells ?? 0),
-            },
-            liquidity: {
-              // Preserve 0 — a drained pool reports usd: 0 and the push-watch
-              // rug rule must see it, not mistake it for "unknown" (null).
-              usd:
-                (raw.liquidity as { usd?: number } | undefined)?.usd ===
-                undefined
-                  ? null
-                  : Number((raw.liquidity as { usd?: number }).usd),
-            },
-            // The metric every USD-level rule is calibrated on (see the
-            // feedSource note on PairInfo).
-            feedSource: "dexscreener",
-            pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
-          };
+          const info = parseDexPair(raw);
+          if (!info) continue;
           // DEEPEST POOL WINS — the pair that REPRESENTS a token is the one
           // with the most liquidity behind it, not whichever array position
           // the feed happened to use. DexScreener usually lists the deepest
@@ -2169,5 +2197,112 @@ export class DexScreenerClient {
       }
     }
     return result;
+  }
+
+  /**
+   * The DEXSCREENER answer for specific POOLS, keyed by pair address — the
+   * lookup behind the tracker's pool pin (see the pin's own note in
+   * src/pushwatch.ts).
+   *
+   * WHY IT EXISTS: fetchPairsForTokens answers "which pair REPRESENTS this
+   * token" (one pair per token, deepest wins), so a tracker row can never
+   * learn from it whether its OWN pool — the one the push was based on — is
+   * still in DexScreener's response. Live 2026-10-02 (Agency): one mint's
+   * returned pairs spanned mcap $48K–$3.3M across 8 pools, and a row judged
+   * from whichever pool the token batch happened to hold is exactly how a
+   * 現價 came out at half the market's. This endpoint
+   * (/latest/dex/pairs/{chainId}/{pairIds}, up to 30 ids per request, a
+   * `pairs` array back) answers for the pool the caller NAMES, and nothing
+   * else.
+   *
+   * `answered` is the contract that keeps absence honest:
+   *   false → this call did NOT get a full 2xx body (blocked, refused, out of
+   *           window). A requested pool missing from `pairs` is UNKNOWN —
+   *           definitely not gone.
+   *   true  → the body arrived; a requested pool that is not in `pairs` is
+   *           genuinely not in DexScreener's response (a switch / delist),
+   *           which is the ONLY state the caller may re-pin from.
+   * A partially-answered multi-batch call reports false: the un-answered
+   * batch's pools must not read as gone. (The pin path requests ≤30 addresses,
+   * i.e. one batch; the loop exists for completeness.)
+   *
+   * Lane discipline is the token batches' own: the shared throttle spaces the
+   * request, a 429 arms the batch block + adaptive spacing through note429
+   * (dexFeedLeg files this path under "pairs"), and the edge cache carries
+   * PAIR_BATCH_CACHE_TTL_S — the pinned address set is stable across passes,
+   * so a warm edge absorbs repeat lookups instead of re-paying the shared
+   * egress.
+   */
+  async fetchPairsByAddresses(
+    addresses: string[],
+    /**
+     * Absolute epoch ms the CALLER's phase must be done by — same contract as
+     * fetchPairsForTokens' deadline. Omitted (tests, ad-hoc calls) → the local
+     * budget only.
+     */
+    callerDeadlineMs?: number,
+  ): Promise<{ pairs: Map<string, PairInfo>; answered: boolean }> {
+    const pairs = new Map<string, PairInfo>();
+    const uniq: string[] = [];
+    for (const a of addresses) {
+      if (typeof a === "string" && a.length > 0 && !uniq.includes(a)) uniq.push(a);
+    }
+    // An empty request is trivially answered (there is nothing to be wrong
+    // about), so the caller can tell it apart from a refusal below.
+    if (uniq.length === 0) return { pairs, answered: true };
+    // Blocked by a recent hard 429: never send, and never let the caller read
+    // the empty answer as "the pools are gone".
+    if (Date.now() < this.batchBlockedUntil) return { pairs, answered: false };
+    const deadline = Math.min(
+      Date.now() + PAIRS_FETCH_BUDGET_MS,
+      typeof callerDeadlineMs === "number"
+        ? callerDeadlineMs
+        : Number.POSITIVE_INFINITY,
+    );
+    const batches: string[][] = [];
+    for (let i = 0; i < uniq.length; i += 30) batches.push(uniq.slice(i, i + 30));
+    let answered = true;
+    for (const batch of batches) {
+      // A batch the throttle cannot START inside the caller's window is not
+      // attempted at all (the same rule the token lane documents): nothing was
+      // asked, so the answer is incomplete — UNKNOWN, not "gone".
+      if (Date.now() > deadline || this.throttle.nextSlotAt() >= deadline) {
+        answered = false;
+        break;
+      }
+      let data: unknown;
+      try {
+        data = await this.getJson(
+          `/latest/dex/pairs/solana/${batch.join(",")}`,
+          deadline,
+          // See PAIR_BATCH_CACHE_TTL_S / the note above.
+          PAIR_BATCH_CACHE_TTL_S,
+        );
+      } catch {
+        // A 429 has already armed the block and the spacing (see note429),
+        // and any other error is transient: either way the caller must read
+        // this call as unanswered.
+        answered = false;
+        break;
+      }
+      if (data === null || typeof data !== "object") {
+        answered = false;
+        break;
+      }
+      const list = (data as { pairs?: unknown }).pairs;
+      if (!Array.isArray(list)) {
+        // A 2xx body without the documented `pairs` array is not an answer
+        // about any pool.
+        answered = false;
+        break;
+      }
+      for (const raw of list) {
+        if (raw === null || typeof raw !== "object") continue;
+        const info = parseDexPair(raw as Record<string, unknown>);
+        if (!info || info.pairAddress.length === 0) continue;
+        pairs.set(info.pairAddress, info);
+      }
+    }
+    return { pairs, answered };
   }
 }

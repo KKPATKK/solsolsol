@@ -1096,6 +1096,39 @@ export function liquidityIsComparable(pair: {
 }): boolean {
   return pair.feedSource === undefined || pair.feedSource === "dexscreener";
 }
+
+/**
+ * The pool address a row may be PINNED to, from one pair reading — the single
+ * definition used at enrollment (onPush, the heal), by the pass's
+ * pin-on-first-sight, and by the re-pin after a confirmed switch (see the
+ * pool-pinning note above PushWatchRow).
+ *
+ * Only a DexScreener pair qualifies: its `pairAddress` really is a pool. The
+ * other two legs both carry the TOKEN MINT there (jupfeeds' `id`, the
+ * scanner's gecko snapshot), so pinning from them would pin a row to an
+ * address that can never be looked up — the row would skip every pass.
+ * `feedSource` absent (fixtures, synthetic pairs) counts as DexScreener, the
+ * same rule comparableLiquidity uses.
+ *
+ * An empty address is not a pin (a pair that reports `pairAddress: ""`).
+ */
+export function pinnablePoolAddress(
+  pair:
+    | {
+        pairAddress?: string;
+        feedSource?: "dexscreener" | "jupiter" | "gecko";
+      }
+    | null
+    | undefined,
+): string | null {
+  if (!pair) return null;
+  if (pair.feedSource !== undefined && pair.feedSource !== "dexscreener") {
+    return null;
+  }
+  const addr = typeof pair.pairAddress === "string" ? pair.pairAddress.trim() : "";
+  return addr.length > 0 ? addr : null;
+}
+
 /**
  * Volume ignition: a tracked coin whose 5m volume jumps from dormant
  * (< DORMANT) to >= VOL is often the first breath of a new leg (the CONK
@@ -1243,6 +1276,44 @@ export function notePeerPassYield(at: number, ageMs: number): void {
   });
 }
 
+/**
+ * THE POOL PIN — which pool a row belongs to, and what a switch does
+ * (2026-10-02, see docs/pool-pin-2026-10-02.md).
+ *
+ * WHY: fetchPairsForTokens answers ONE pair per token (the deepest pool), so
+ * a row could never know whether the pool its push was based on is still in
+ * DexScreener's response. A coin that moved pools — or whose pool was pulled
+ * and re-created — was silently judged from a STRANGER pool, and a row's
+ * whole series (mcapAtPush, peak, dead trough) belongs to ONE pool. Live
+ * 2026-10-02 (Agency): one mint's returned pairs spanned mcap $48K–$3.3M
+ * across 8 pools, and a 💀 card quoted 0.50× the market's price. See
+ * docs/mcap-basis-and-pool-pick-2026-10-02.md §5.3 for the measurement.
+ *
+ * THE RULES:
+ *  1. A row is pinned to the pool its push was based on (`pool_address`,
+ *     written at enrollment). Legacy rows carry NULL and are pinned on
+ *     their first successful check write with the pool they were ACTUALLY
+ *     judged on (write-once — see Db's check write / poolAddress).
+ *  2. Every pass asks DexScreener for the rows' own pools by address (the
+ *     `poolPairsFor` dependency, backed by fetchPairsByAddresses). A row is
+ *     judged ONLY on its pinned pool's data — never on "whatever pool the
+ *     token batch returned for the token".
+ *  3. A pinned pool that is NOT in an ANSWERED response is a confirmed
+ *     switch: that pass does NOT judge the row (no claim, no check write, no
+ *     card, no pair-miss delete) and the row is RE-PINNED to the pool the
+ *     token batch now represents it with. The NEXT pass judges from the new
+ *     pool — exactly one pass of grace. A lookup that did NOT answer (429,
+ *     out of window) is not evidence of anything: the row still skips, but
+ *     the pin stays where it was.
+ *  4. A pin is never moved by a check write, and never taken from a
+ *     non-DexScreener source (see pinnablePoolAddress).
+ *
+ * DELIBERATE CONSEQUENCES (not bugs): nothing about the stored series is
+ * reset on a re-pin, so the one skipped pass is the entire switch protection;
+ * and a row whose token has no pair ANYWHERE (neither the pin nor the token
+ * batch resolves) skips every pass — it is not deleted and ages out via the
+ * window prune.
+ */
 export interface PushWatchRow {
   token: string;
   chatId: string;
@@ -1252,6 +1323,8 @@ export interface PushWatchRow {
   peakMcap: number;
   lastLiquidity: number | null;
   lastVol5m: number | null;
+  /** The pool this row is pinned to (see the pool-pinning note above). */
+  poolAddress?: string | null;
   /** Lowest mcap observed while in the dead state (resurrection anchor). */
   deadTroughMcap: number | null;
   holdersAtPush: number | null;
@@ -2579,6 +2652,21 @@ export class PushWatcher {
       effectiveMode(): Promise<"off" | "manual" | "auto">;
       buySizeLabel: string;
     } | null,
+    /**
+     * Pinned-pool lookup (see the pool-pinning note above PushWatchRow): the
+     * DexScreener answer for the rows' own pool addresses, keyed by pool
+     * address. `null` for a pool the endpoint ANSWERED about and did not
+     * return (a confirmed switch); a missing key means the lookup did not
+     * answer (refused / out of window), which is NOT evidence of a switch.
+     * Optional, so existing callers and test doubles keep their shape: with
+     * it absent a pinned row still resolves whenever the token batch's own
+     * pair IS the pin, and otherwise skips.
+     */
+    private readonly poolPairsFor?: (
+      addresses: string[],
+      /** Optional epoch-ms cap for this call (see TRACKER_PAIRS_BUDGET_MS). */
+      deadlineMs?: number,
+    ) => Promise<Map<string, import("./dexscreener").PairInfo | null>>,
   ) {}
 
   private hasTrade(): boolean {
@@ -2641,13 +2729,21 @@ export class PushWatcher {
     }
   }
 
-  /** Called right after a successful push (ON CONFLICT DO NOTHING dedupes). */
+  /**
+   * Called right after a successful push (ON CONFLICT DO NOTHING dedupes).
+   *
+   * `poolAddress` is the PIN (see the pool-pinning note above PushWatchRow):
+   * the pool the push was based on, from the card's own pair — the caller
+   * passes pinnablePoolAddress(pair), so a Jupiter/Gecko-sourced card pins
+   * nothing rather than pinning its mint as if it were a pool.
+   */
   async onPush(
     chatId: string,
     token: string,
     symbol: string | null,
     mcapAtPush: number,
     liquidityUsd: number | null,
+    poolAddress: string | null = null,
   ): Promise<void> {
     await this.db.upsertPushWatch({
       token,
@@ -2656,6 +2752,7 @@ export class PushWatcher {
       pushedAt: Date.now(),
       mcapAtPush,
       liquidityUsd,
+      poolAddress,
     });
     // `mcapAtPush` here IS the gate value (the same frozen pair object the
     // band tested), and it is the value the durable push-baseline ledger
@@ -2852,7 +2949,7 @@ export class PushWatcher {
     const spent = {
       setup: { ms: 0, trips: 0 }, // listing + recap + prune + terminal settle
       heal: { ms: 0, trips: 0 }, // untracked-push self-heal (reads + 補發)
-      pairs: { ms: 0, trips: 0 }, // the head pair batch (one request)
+      pairs: { ms: 0, trips: 0 }, // the head pair batch + the pin lookup (one request each)
       rows: { ms: 0, trips: 0 }, // the row loop: claim, reserve, send, write
       holders: { ms: 0, trips: 0 }, // Birdeye holder probes (additive; see TRACKER_HOLDER_CAP_MS)
       // Baseline repair (see Db.repairPushWatchBaselines): ONE guarded UPDATE
@@ -3271,6 +3368,7 @@ export class PushWatcher {
           pushedAt: number;
           mcapAtPush: number;
           liquidityUsd: number | null;
+          poolAddress: string | null;
         }> = [];
         /**
          * First healed coin of this pass, for the ONE durable audit entry
@@ -3435,6 +3533,11 @@ export class PushWatcher {
             pushedAt: m.pushedAt,
             mcapAtPush: healedMcap,
             liquidityUsd: comparableLiquidity(pair),
+            // A healed row is pinned to the pool it was healed FROM (see the
+            // pool-pinning note above PushWatchRow) — the same discipline as
+            // the push path: pin what the row is actually based on, and only
+            // when that pair is a DexScreener one (see pinnablePoolAddress).
+            poolAddress: pinnablePoolAddress(pair),
           });
           if (resent) continue; // fresh card just went out — skip holder seed noise
         }
@@ -3619,11 +3722,37 @@ export class PushWatcher {
     const pairsStart = Date.now();
     const pairsTrips = trips;
     let pairs = new Map<string, import("./dexscreener").PairInfo>();
+    // The rows' own pools, deduped (see the pool-pinning note above
+    // PushWatchRow): one by-address lookup answers for all of them.
+    const pinAddrs = [
+      ...new Set(
+        head
+          .map((r) => r.poolAddress)
+          .filter((a): a is string => typeof a === "string" && a.length > 0),
+      ),
+    ];
+    let pinPairs = new Map<string, import("./dexscreener").PairInfo | null>();
     try {
       pairs = await this.pairsFor(
         tokens,
         Date.now() + TRACKER_PAIRS_BUDGET_MS,
       );
+      // The pin lookup rides the pair STAGE and takes its own window, the
+      // same rule the token batch gets (a deadline measured from its own
+      // call — see the comment above): a slow token batch must not silently
+      // turn every pinned row into a skip. Best-effort by design — a failed
+      // or refused lookup leaves the pins UNRESOLVED (missing keys), which
+      // the loop reads as "not evidence", never as "gone".
+      if (pinAddrs.length > 0 && typeof this.poolPairsFor === "function") {
+        try {
+          pinPairs = await this.poolPairsFor(
+            pinAddrs,
+            Date.now() + TRACKER_PAIRS_BUDGET_MS,
+          );
+        } catch {
+          /* unresolved pins stay unresolved — rows skip, nothing re-pins */
+        }
+      }
     } catch (err) {
       // feed down — retry next tick; surface the reason via the heartbeat.
       spent.pairs.ms = Date.now() - pairsStart;
@@ -3670,6 +3799,21 @@ export class PushWatcher {
     let alerted = 0;
     let backfilled = 0;
     let pairMiss = 0;
+    /**
+     * Rows a pass did NOT judge because of the pool pin (see the pool-pinning
+     * note above PushWatchRow): their pinned pool was not confirmed in this
+     * pass's answer. Named apart from `miss` because the two need different
+     * fixes: `pin-skip` is the switch policy working as designed, `miss` is
+     * the token's feed data missing.
+     */
+    let pinSkip = 0;
+    /**
+     * Confirmed switches whose re-pin write this pass lands (`repin N` in the
+     * note): rows whose pinned pool left an ANSWERED response AND whose token
+     * batch names a new pool. Written as ONE batched CAS after the loop (see
+     * Db.repinPushWatchPools) — a lookup that merely failed queues nothing.
+     */
+    const repins: Array<{ token: string; from: string; to: string }> = [];
     let claimLost = 0;
     let budgetCut = false;
     /**
@@ -3940,8 +4084,46 @@ export class PushWatcher {
       // quiet row is ever left behind, and a refused card still says so
       // (`budget-cut` plus `defer-send N`).
       const overBudget = Date.now() + rowReserveMs() > deadline;
-      const pair = pairs.get(row.token);
+      // Resolve this row's pair through the PIN (see the pool-pinning note
+      // above PushWatchRow): a pinned row reads ONLY its own pool; an
+      // unpinned (legacy) row keeps the pre-pin rule — the token batch.
+      const pin = row.poolAddress ?? null;
+      let pair: import("./dexscreener").PairInfo | undefined;
+      /** The pin was CONFIRMED absent from an ANSWERED lookup (a switch). */
+      let pinGone = false;
+      if (pin !== null) {
+        const fromPins = pinPairs.get(pin);
+        if (fromPins) {
+          pair = fromPins;
+        } else if (fromPins === null) {
+          pinGone = true;
+        } else {
+          // Unresolved by address — the token batch may still PROVE the pin
+          // when its own representative pair IS the pinned pool (the common
+          // case: the pool is the deepest one). Any other pool's numbers are
+          // not this row's evidence and never will be.
+          const cand = pairs.get(row.token);
+          if (cand && cand.pairAddress === pin) pair = cand;
+        }
+      } else {
+        pair = pairs.get(row.token);
+      }
       if (!pair) {
+        if (pin !== null) {
+          // THE SWITCH PASS: don't judge (see the pool-pinning note). A
+          // CONFIRMED switch additionally re-pins the row to the pool the
+          // token batch now represents it with — queued here and applied
+          // after the loop in ONE batched CAS (see `repins`); the next pass
+          // judges from the new pool. An unresolved pin changes nothing:
+          // skipping is the whole reaction.
+          pinSkip += 1;
+          const cand = pairs.get(row.token);
+          const next = pinnablePoolAddress(cand);
+          if (pinGone && next !== null && next !== pin) {
+            repins.push({ token: row.token, from: pin, to: next });
+          }
+          continue;
+        }
         // Delisted/unfindable: drop after a grace period so stale rows don't
         // linger. The clock runs from the LAST SUCCESSFUL CHECK, not the
         // push time — the batched feed occasionally omits pairs (flaky
@@ -4095,6 +4277,11 @@ export class PushWatcher {
           : (evalResult.deadTroughMcap ?? null),
         sellDomStreak: hold ? row.sellDomStreak : evalResult.sellDomStreak,
         lastMcap: pair.marketCap,
+        // Pin-on-first-sight: a legacy row (NULL pin) is pinned to the pool
+        // it was actually judged on; a pinned row's value is write-once here
+        // (the column COALESCEs — see Db.pushWatchCheckSet), never moved by
+        // a check write.
+        poolAddress: row.poolAddress ?? pinnablePoolAddress(pair),
       });
 
       // SILENT ROW — nothing to announce (or a backfill, whose cards are
@@ -4185,6 +4372,7 @@ export class PushWatcher {
           deadTroughMcap: evalResult.deadTroughMcap ?? null,
           sellDomStreak: evalResult.sellDomStreak,
           lastMcap: pair.marketCap,
+          poolAddress: row.poolAddress ?? pinnablePoolAddress(pair),
         });
         // The race was LOST: nothing was announced, so the span is over at
         // once — release it rather than let the timer hold the invocation.
@@ -4450,6 +4638,22 @@ export class PushWatcher {
       // reserved-but-unwritten (see holdRowSpan).
       releaseRowSpan();
     }
+    // The confirmed switches (see the pool-pinning note above PushWatchRow):
+    // ONE batched CAS — `WHERE pool_address = <the pin the loop read>` — so a
+    // stale pass can never clobber a re-pin a fresher pass already landed.
+    // Best-effort: a lost CAS or a refused write leaves the row on its old
+    // pin, which simply re-detects on the next tick.
+    if (repins.length > 0) {
+      const repinFn = (this.db as Partial<Db>).repinPushWatchPools;
+      if (typeof repinFn === "function") {
+        trips += 1;
+        try {
+          await repinFn.call(this.db, repins);
+        } catch {
+          /* best-effort — the row keeps its old pin and re-detects next pass */
+        }
+      }
+    }
     // The silent half of the loop, in ONE round trip (see silentChecks). Each
     // statement is the CAS the per-row path sent, and the queue is written even
     // when the loop cut short: those rows were already evaluated, and one trip is
@@ -4564,7 +4768,10 @@ export class PushWatcher {
     // stale row was absorbed, so a starved tracker can never again look like
     // a healthy `ok:0/0` in /health — the exact shape that hid the 2026-09-17
     // stop for hours. One line names every skip reason: tokens the batch did
-    // not return (miss), cross-isolate claim races (lost), the pass running
+    // not return (miss), rows the pool pin skipped (pin-skip — their pinned
+    // pool was not in an ANSWERED lookup; see the pool-pinning note) and the
+    // confirmed switches re-pinned (repin), cross-isolate claim races (lost),
+    // the pass running
     // out of budget before the rest of the rotation (budget-cut), rows
     // whose first observation landed after a tracking gap (backfill), and
     // cards the pass could not deliver (undelivered — rolled back and
@@ -4576,7 +4783,11 @@ export class PushWatcher {
     // on a fully-clean pass, which is how a starved tracker looked healthy.)
     const note =
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
-      ` miss ${pairMiss} lost ${claimLost}${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
+      `${pinAddrs.length > 0 ? ` pins ${pinPairs.size}/${pinAddrs.length}` : ""}` +
+      ` miss ${pairMiss} lost ${claimLost}` +
+      `${pinSkip > 0 ? ` pin-skip ${pinSkip}` : ""}` +
+      `${repins.length > 0 ? ` repin ${repins.length}` : ""}` +
+      `${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +
       `${dupSkipped > 0 ? ` dup-skip ${dupSkipped}` : ""}` +
       `${mutedCards > 0 ? ` muted ${mutedCards}` : ""}` +

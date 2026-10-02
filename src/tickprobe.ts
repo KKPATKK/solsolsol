@@ -1385,6 +1385,7 @@ const CENSUS_METHODS = [
   "claimAndReservePushWatch",
   "claimPushWatchChecksMany",
   "updatePushWatchCheck",
+  "repinPushWatchPools",
   "upsertPushWatchMany",
   "setPushWatchHoldersMany",
   "rearmPushWatchAlert",

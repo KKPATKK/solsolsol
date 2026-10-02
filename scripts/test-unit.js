@@ -7090,6 +7090,71 @@ async function main() {
     }
   });
 
+  await test("DexScreenerClient.fetchPairsByAddresses: the pool is answered by address, and absence only counts when answered", async () => {
+    // The tracker's pool pin (docs/pool-pin-2026-10-02.md) needs an answer the
+    // token batch cannot give: "is THIS pool still in DexScreener's response?"
+    // (fetchPairsForTokens answers one pair per TOKEN — the deepest pool, which
+    // may be a different pool entirely). The by-address endpoint answers for
+    // exactly the pools the caller names, and `answered` is what keeps a
+    // REFUSED lookup from reading as "the pool is gone".
+    const { DexScreenerClient, dexFeedLeg } = require("../dist/dexscreener.js");
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" });
+    const mkPair = (token, pairAddress, marketCap, liquidityUsd) => ({
+      chainId: "solana",
+      url: `https://dexscreener.com/solana/${pairAddress}`,
+      pairAddress,
+      baseToken: { address: token, name: token, symbol: token },
+      priceUsd: "0.003",
+      marketCap,
+      fdv: marketCap,
+      liquidity: liquidityUsd === undefined ? {} : { usd: liquidityUsd },
+      volume: { h24: 100, h1: 10, m5: 1 },
+      txns: { m5: { buys: 1, sells: 1 }, h1: { buys: 2, sells: 2 } },
+      priceChange: { m5: 0, h1: 0 },
+      pairCreatedAt: 1,
+    });
+    const urls = [];
+    const origFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async (url) => {
+        urls.push(String(url));
+        // The endpoint answers only what it knows: the requested GONE pool is
+        // simply absent from the body.
+        return new Response(
+          JSON.stringify({ pairs: [mkPair("TOKEN1", "PINNED", 3_000_000, 200_000)] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+      const dex = new DexScreenerClient(cfg);
+      const res = await dex.fetchPairsByAddresses(["PINNED", "GONE"]);
+      assert.equal(res.answered, true, "a 2xx body with the pairs array IS an answer");
+      assert.equal(res.pairs.get("PINNED").marketCap, 3_000_000);
+      assert.equal(res.pairs.has("GONE"), false, "an answered request omits the gone pool");
+      assert.match(
+        urls[0],
+        /\/latest\/dex\/pairs\/solana\/PINNED,GONE$/,
+        "the pools are named in the path, batched like the token lane",
+      );
+      assert.equal(
+        dexFeedLeg("/latest/dex/pairs/solana/X"),
+        "pairs",
+        "the by-address lane must be a pairs lane (429 block + counters key on the leg)",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    // A refusal must NOT answer: the caller may never re-pin from it.
+    const dex2 = new DexScreenerClient(cfg);
+    globalThis.fetch = async () => new Response("{}", { status: 429 });
+    try {
+      const refused = await dex2.fetchPairsByAddresses(["PINNED"]);
+      assert.equal(refused.answered, false, "a 429 is not an answer about the pool");
+      assert.equal(refused.pairs.size, 0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   await test("Scanner.bestEffort: a hung chain step resolves with its fallback at the chain deadline", async () => {
     // The 2026-09-16 zero-push shape: the candidate chain awaits ~11 live
     // calls SERIALLY (RugCheck, crime checkToken, Axiom, Birdeye ×2, GMGN,
@@ -9803,6 +9868,149 @@ async function main() {
     assert.match(String(out.note), /rows 30\/30/, `the note must say so: ${out.note}`);
     assert.equal(batchCalls, 1, "thirty rows, one round trip");
     assert.equal(updated.length, 30);
+  });
+
+  await test("PushWatcher: the pool pin judges a row on ITS pool, skips the switch pass, and re-pins for the next", async () => {
+    // The 2026-10-02 Agency shape (docs/mcap-basis-and-pool-pick §5.3): a row
+    // read from "whatever pool the token batch returned" quoted a 💀 at 0.50×
+    // the market's price. The pin makes a row read ONLY its own pool; a switch
+    // is a CONFIRMED absence (an ANSWERED lookup), which skips exactly ONE
+    // pass and re-pins the row to the pool the token batch now names.
+    const rows = [
+      watchRow("AAA", { poolAddress: "pool-A" }),
+      watchRow("BBB"), // legacy: no pin, judged from the token batch, pinned on first write
+    ];
+    const updated = [];
+    const repins = [];
+    const db = watchDb(rows, updated);
+    db.repinPushWatchPools = async (ups) => { repins.push(...ups); };
+    // The token batch's representative pair for AAA is NOT its pin.
+    const pairsFor = async (addrs) =>
+      new Map(
+        addrs.map((a) => [
+          a,
+          { ...watchPair(a), pairAddress: `p-${a}`, marketCap: 111_000 },
+        ]),
+      );
+    const pinA = {
+      ...watchPair("AAA"),
+      pairAddress: "pool-A",
+      marketCap: 333_000,
+      liquidity: { usd: 60_000 },
+    };
+    const pinLookups = [];
+    const poolPairsFor = async (addrs) => {
+      pinLookups.push([...addrs]);
+      if (pinLookups.length === 1) return new Map([["pool-A", pinA]]); // alive
+      if (pinLookups.length === 2) return new Map([["pool-A", null]]); // answered, absent = switch
+      return new Map(); // not answered — no evidence
+    };
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}), pairsFor, null, poolPairsFor,
+    );
+
+    // Pass 1 — the pin wins over the token batch's representative pool.
+    const first = await pw.runTick();
+    const aaa1 = updated.find(([t]) => t === "AAA")?.[1];
+    assert.ok(aaa1, `AAA must be judged: ${first.note}`);
+    assert.equal(
+      aaa1.lastMcap,
+      333_000,
+      `AAA is judged on its pinned pool, not on p-AAA: ${first.note}`,
+    );
+    assert.doesNotMatch(String(first.note), /pin-skip/);
+    assert.match(String(first.note), /pins 1\/1/);
+    assert.equal(repins.length, 0);
+
+    // Pass 2 — the switch pass: AAA is NOT judged and is re-pinned to the pool
+    // the token batch now names. The legacy row keeps the token-batch path and
+    // is pinned to the pool it was actually judged on.
+    updated.length = 0;
+    const second = await pw.runTick();
+    assert.equal(
+      updated.some(([t]) => t === "AAA"),
+      false,
+      `the switch pass must not judge the row: ${second.note}`,
+    );
+    assert.match(String(second.note), /pin-skip 1/);
+    assert.match(String(second.note), /repin 1/);
+    assert.deepEqual(repins, [{ token: "AAA", from: "pool-A", to: "p-AAA" }]);
+    const bbb2 = updated.find(([t]) => t === "BBB")?.[1];
+    assert.ok(bbb2, "the legacy row keeps the token-batch path");
+    assert.equal(bbb2.poolAddress, "p-BBB", "a legacy row is pinned on its first check write");
+
+    // Pass 3 — the next pass judges from the NEW pin (the token batch's own
+    // pair IS the pin now), even with the by-address lookup answering nothing.
+    rows[0].poolAddress = "p-AAA";
+    updated.length = 0;
+    const third = await pw.runTick();
+    const aaa3 = updated.find(([t]) => t === "AAA")?.[1];
+    assert.ok(aaa3, `the re-pinned row must be judged again: ${third.note}`);
+    assert.equal(aaa3.lastMcap, 111_000, "the new pin's numbers are the row's evidence");
+    assert.doesNotMatch(String(third.note), /pin-skip/);
+
+    // Pass 4 — an UNANSWERED lookup is not evidence of a switch: the row
+    // skips, but its pin is left exactly where it was.
+    rows[0].poolAddress = "pool-UNANSWERED";
+    updated.length = 0;
+    const fourth = await pw.runTick();
+    assert.equal(updated.some(([t]) => t === "AAA"), false);
+    assert.match(String(fourth.note), /pin-skip 1/);
+    assert.doesNotMatch(String(fourth.note), /repin/);
+    assert.equal(repins.length, 1, "an unresolved lookup must never re-pin");
+  });
+
+  await test("Db.push_watch pool pin: stored at enrollment, write-once by checks, re-pinned by CAS", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "TOK",
+        chatId: "c",
+        symbol: "T",
+        pushedAt: Date.now(),
+        mcapAtPush: 1_000,
+        liquidityUsd: 100,
+        poolAddress: "pool-A",
+      });
+      let row = (await db.listPushWatch(10)).find((r) => r.token === "TOK");
+      assert.equal(row.poolAddress, "pool-A");
+      // A check write NEVER moves a pin (COALESCE): a check carrying another
+      // address must leave pool-A in place.
+      await db.updatePushWatchCheck("TOK", {
+        peakMcap: 2_000,
+        lastLiquidity: 100,
+        poolAddress: "pool-OTHER",
+      });
+      row = (await db.listPushWatch(10)).find((r) => r.token === "TOK");
+      assert.equal(row.poolAddress, "pool-A", "write-once: checks cannot move a pin");
+      // A legacy row (no pin at enrollment) is pinned by its first check write.
+      await db.upsertPushWatch({
+        token: "LEG",
+        chatId: "c",
+        symbol: "L",
+        pushedAt: Date.now(),
+        mcapAtPush: 1_000,
+        liquidityUsd: 100,
+      });
+      await db.updatePushWatchCheck("LEG", {
+        peakMcap: 1_000,
+        lastLiquidity: 100,
+        poolAddress: "pool-L",
+      });
+      row = (await db.listPushWatch(10)).find((r) => r.token === "LEG");
+      assert.equal(row.poolAddress, "pool-L", "a legacy row is pinned on its first write");
+      // Re-pin is a CAS on the old pin: a stale writer is a no-op.
+      await db.repinPushWatchPools([{ token: "TOK", from: "pool-STALE", to: "pool-B" }]);
+      row = (await db.listPushWatch(10)).find((r) => r.token === "TOK");
+      assert.equal(row.poolAddress, "pool-A", "a stale CAS must not move the pin");
+      await db.repinPushWatchPools([{ token: "TOK", from: "pool-A", to: "pool-B" }]);
+      row = (await db.listPushWatch(10)).find((r) => r.token === "TOK");
+      assert.equal(row.poolAddress, "pool-B");
+    } finally {
+      await t.cleanup();
+    }
   });
 
   await test("PushWatcher: the pair batch's deadline is measured from the CALL, not the pass start", async () => {

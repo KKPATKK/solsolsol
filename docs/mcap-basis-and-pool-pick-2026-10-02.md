@@ -78,5 +78,6 @@ tracker 嘅峰值／回撤數學當佢係真跌 → 假 💀。實測同一批�
    `p:dead:29849051` cut 標記亦係無害（已證送達，唔會再發同一張卡）。
 3. **殘餘風險**：`fetchPairsForTokens` 只拿到「每個 token 一個 pair」，所以 tracker 冇得
    知道自己行開嗰個池係咪仲喺 response 入面 —— 即係「行唔會跟住換池」呢件事未做。
-   要再硬淨啲，就要喺 `push_watch` 加 `pool_address`（pin 池），換池嗰 pass 唔判斷；
-   呢個係下一步，唔喺本次改動入面。
+   要再硬淨啲，就要喺 `push_watch` 加 `pool_address`（pin 池），換池嗰 pass 唔判斷。
+   **已做（2026-10-02，同日）**：政策 = 偵測到換池嗰 pass 唔判 → re-pin 新池 →
+   下一 pass 用新池續判（跳一 pass）。實作見 `docs/pool-pin-2026-10-02.md`。
