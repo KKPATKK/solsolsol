@@ -1,7 +1,16 @@
 name = "solana-meme-bot"
 main = "src/worker.ts"
 compatibility_date = "2026-08-09"
-compatibility_flags = ["nodejs_compat"]
+# global_fetch_strictly_public (2026-10-02): the cron scan tick now reaches
+# the placed fetch path through a global fetch() to this Worker's OWN public
+# URL (see [vars].SCAN_RELAY_URL and src/worker.ts relayScanTick). Cloudflare's
+# docs on error 1042: a global fetch() to another Worker on the same zone
+# "fails" unless this flag is set, because same-zone subrequests are otherwise
+# routed internally. Nothing else in this Worker fetches a same-zone host
+# (every other subrequest targets DexScreener / Jupiter / Turso / Telegram /
+# etc.), so all the flag decides is how the relay request is routed: strictly
+# public — edge ingress -> placement -> this Worker's fetch handler.
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
 # Both expressions fire every minute (the free-tier minimum), and each one is
 # a SEPARATE invocation with its own 50-subrequest budget — which is the
@@ -131,6 +140,18 @@ crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 # lever: it needs consistent traffic from multiple locations, and this fetch
 # path is low traffic (the explicit region is deterministic). Revert = delete
 # this block; the cron path never depended on it.
+#
+# DONE 2026-10-02 — THE SCAN NOW RUNS ON THIS PATH. The cron scan delivery no
+# longer runs its tick in its own region: it relays the tick to this placed
+# fetch handler (SCAN_RELAY_URL below, and src/worker.ts SCAN_RELAY_PATH /
+# relayScanTick / handleScanRelay), so the tick's DB round trips get the same
+# single-digit-ms readings this block measured on /debug/db-latency. What to
+# read after a deploy: /health.heartbeat.relay ("inner" = the placed
+# invocation ran the tick; "failed"/"skipped" = the cron fell back to its own
+# region) together with /health.heartbeat.colo (NRT expected for a relayed
+# tick; ORD is the cron region the probe measured). The tracker (*/1) and
+# maintenance (*/5) deliveries do NOT relay — they run no scan, and moving
+# them is a separate change. `mode = "smart"` is still not the lever.
 [placement]
 region = "aws:ap-northeast-1"
 
@@ -157,6 +178,16 @@ region = "aws:ap-northeast-1"
 # stays at `geo 0` (summary.geoDue is still true; it is the fetch that comes
 # back refused) and the two keyless sources carry the slot.
 [vars]
+# The Worker's own public URL, used by the scan cron delivery to run its tick
+# through the placed fetch path (see src/worker.ts SCAN_RELAY_PATH /
+# relayScanTick / handleScanRelay). Set = relay on; DELETE THIS KEY to roll
+# back to the pre-2026-10-02 shape, where the tick runs in the cron region.
+# MUST be this Worker's own hostname: the route it calls is internal and
+# authenticates the caller with TELEGRAM_BOT_TOKEN, so a wrong host either
+# 404s the tick back into the local fallback or asks a stranger's Worker for
+# one. The relay is also what makes the fetch path's placement buy anything
+# for the SCAN (before it, placement only accelerated HTTP reads).
+SCAN_RELAY_URL = "https://solana-meme-bot.cool1999k.workers.dev"
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one COMPLETED less
 # than `scanGateMs(this)` ago — this value minus a jitter budget, cross-isolate

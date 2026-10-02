@@ -16226,9 +16226,11 @@ async function main() {
     // it is scoped to the SCHEDULED HANDLER, because the tracker's own delivery
     // enters through the same init prologue (runTrackerInvocation, see
     // worker.TRACKER_CRON) and a bare indexOf would find that one first.
-    const handlerStart = workerSrc.indexOf(
-      'asyncscheduled(event:ScheduledEventLike,env:Env,ctx:ExecutionContextLike,):Promise<void>{',
-    );
+    // The signature now takes the relay's optional 4th argument (see the
+    // scan-relay block), so the anchor stops at the name — the tracker's own
+    // delivery enters through the same init prologue (runTrackerInvocation),
+    // which is why this must be scoped to `async scheduled(` at all.
+    const handlerStart = workerSrc.indexOf("asyncscheduled(");
     const scheduledInit = workerSrc.indexOf(
       'constinitAt=Date.now();awaitrecoveryAwait(ensureInitialized(env),FRONT_INIT_BOUND_MS,"init");',
       handlerStart,
@@ -18022,7 +18024,10 @@ async function main() {
       .readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8")
       .replace(/\s+/g, "");
     const from = src.indexOf("asyncfunctionmaybeRunScanIfStale(");
-    const to = src.indexOf("exportdefault{", from);
+    // The default export is a named const now (`const worker = {`, with the
+    // scan-relay block sitting between the fallback and it), so the slice
+    // ends where the handler object begins.
+    const to = src.indexOf("constworker={", from);
     assert.ok(from >= 0 && to > from, "the fallback path must exist");
     const fallback = src.slice(from, to);
     const stamp = fallback.indexOf("markPreTickEntry(now);");
@@ -19292,6 +19297,105 @@ async function main() {
       "no colo line, no reading",
     );
     assert.equal(parseTraceColo(""), null);
+  });
+
+  // ---------- the cron scan tick's relay into the placed fetch path ----------
+  //
+  // 2026-10-02: placement measured the FETCH path at NRT with 12-15x shorter
+  // statements, and the colo probe measured the cron path at ORD with its
+  // init/pool reads still in the ~1.4s class. The relay runs the tick through
+  // the placed fetch handler (a POST to this Worker's own URL, replayed into
+  // the scheduled handler) and must FAIL SAFE: any relay problem falls
+  // through to the same local tick the Worker always ran, so the worst case
+  // is the pre-relay shape. These pin the pure parts and the wiring the
+  // fail-safe depends on.
+  await test("scan relay: routing, auth and the fail-safe fallback are pinned", () => {
+    const { SCAN_RELAY_PATH, SCAN_CRON, scanRelayUrl, isScanRelayRequest } =
+      require("../dist/worker.js");
+    assert.equal(SCAN_RELAY_PATH, "/internal/scan-tick");
+    assert.equal(SCAN_CRON, "* * * * *");
+    assert.equal(
+      scanRelayUrl("https://solana-meme-bot.cool1999k.workers.dev"),
+      "https://solana-meme-bot.cool1999k.workers.dev/internal/scan-tick",
+    );
+    assert.equal(
+      scanRelayUrl("https://x.workers.dev/"),
+      "https://x.workers.dev/internal/scan-tick",
+      "a trailing slash must not double up",
+    );
+    assert.equal(
+      isScanRelayRequest("POST", "tok", "tok"),
+      true,
+      "the cron presents the configured secret on a POST",
+    );
+    assert.equal(isScanRelayRequest("GET", "tok", "tok"), false, "only POST drives a tick");
+    assert.equal(
+      isScanRelayRequest("POST", "nope", "tok"),
+      false,
+      "a wrong secret must not drive one",
+    );
+    assert.equal(isScanRelayRequest("POST", null, "tok"), false);
+    assert.equal(
+      isScanRelayRequest("POST", "tok", undefined),
+      false,
+      "no configured secret = no route",
+    );
+  });
+
+  await test("scan relay: the handler relays before the local tick, and the route is wired", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "src", "worker.ts"),
+      "utf8",
+    );
+    // The relay is attempted ONLY by a delivery the platform itself made
+    // (`relay: false` is the placed invocation's own call back in), and a
+    // false answer must fall through to the local tick — the block sits
+    // before scheduledTicks++ and returns only on success.
+    assert.ok(
+      src.includes("if (opts?.relay !== false)"),
+      "only the platform's own delivery may relay",
+    );
+    assert.ok(
+      src.includes("if (await relayScanTick(env))"),
+      "the relay answer gates the return",
+    );
+    const relayAt = src.indexOf("if (opts?.relay !== false)");
+    const localAt = src.indexOf("scheduledTicks++;", relayAt);
+    assert.ok(localAt > relayAt, "the local tick must stay reachable below the relay");
+    // The placed half: an HTTP route, authenticated, and handled BEFORE the
+    // rescue scanner is armed (a rescue scan racing the tick it is about to
+    // run would break the tick's own single-owner assumption).
+    const routeAt = src.indexOf("if (url.pathname === SCAN_RELAY_PATH)");
+    assert.ok(routeAt > 0, "the relay route must exist");
+    assert.ok(
+      routeAt < src.indexOf("ctx.waitUntil(maybeRunScanIfStale(env, ctx))", routeAt),
+      "the relay route must be handled before the rescue scanner is armed",
+    );
+    assert.ok(
+      src.includes(
+        "await worker.scheduled({ cron: SCAN_CRON }, env, ctx, { relay: false })",
+      ),
+      "the placed half replays the platform's own scheduled entry",
+    );
+    // The durable marker the post-deploy check reads from /health.
+    assert.ok(
+      src.includes("relay: scanRelayOutcome"),
+      "the completion heartbeat must name the path that ran the tick",
+    );
+    // And the relay target must be configured, or the tick silently stays in
+    // the cron region ("skipped") — the rollback is deleting this key.
+    const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    const url = /^\s*SCAN_RELAY_URL\s*=\s*"([^"]+)"/m.exec(toml);
+    assert.ok(url, "wrangler.toml must carry SCAN_RELAY_URL");
+    assert.ok(url[1].startsWith("https://"), "the relay URL must be https");
+    assert.ok(
+      !url[1].endsWith("/"),
+      "no trailing slash — the path is appended verbatim (scanRelayUrl tolerates one anyway)",
+    );
+    assert.ok(
+      /global_fetch_strictly_public/.test(toml),
+      "a global fetch to this Worker's own URL needs the strictly-public flag (error 1042)",
+    );
   });
 
   // ---------- the heal's opening read is ONE request (src/db.ts + src/pushwatch.ts) ----------
