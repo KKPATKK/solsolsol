@@ -3260,6 +3260,25 @@ async function main() {
     assert.equal(read("src/jupfeeds.ts").includes('feedSource:"jupiter"'), true);
     const scannerSrc = read("src/scanner.ts");
     assert.equal(scannerSrc.includes('feedSource:"gecko"'), true);
+    // The GECKO leg's market cap must be on the FDV basis every other leg and
+    // the recorded series use. Its snapshot hands over `market_cap_usd ??
+    // fdv_usd` (geckoterminal.ts parseTokenSnapshot), i.e. it is the ONE leg
+    // whose "market cap" can be a CIRCULATING valuation while DexScreener's
+    // `marketCap` == its `fdv` and Jupiter's `mcap` == its `fdv` — a silent
+    // ~2x basis switch inside one row's series, which the tracker's
+    // peak/drawdown math reads as a real move. Live 2026-10-02 20:11 HKT
+    // (Agency): the 💀 card's 現價 was $1.53M, EXACTLY 0.50x the $3.06M its
+    // own pool traded at in that same minute (the operator read $3.04M).
+    assert.equal(
+      scannerSrc.includes("marketCap:snap.fdvOnlyUsd??snap.fdvUsd??0,"),
+      true,
+      "the gecko leg must hand over the FDV basis, not the circulating substitution",
+    );
+    assert.equal(
+      scannerSrc.includes("marketCap:snap.fdvUsd??0,"),
+      false,
+      "and the substituting read must be gone",
+    );
     // The PRUNE WRITE must judge the same way (docs/patches/
     // terminal-send-and-liq-prune.patch): `token_stats.max_liquidity_observed`
     // feeds the re-eval pool's minQualifyLiquidity prune and is raise-only, so
@@ -6988,6 +7007,80 @@ async function main() {
       const live = await dex.fetchPairsForTokens(["AAA"], Date.now() + 5_000);
       assert.equal(wire, 1, "a usable window still goes to the wire");
       assert.equal(typeof live, "object");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("DexScreenerClient.fetchPairsForTokens: the deepest pool represents a token, not its list position", async () => {
+    // Measured live 2026-10-02 (Agency): one token's returned pairs spanned
+    // mcap $48K-$3.3M across 8 pools — a drained pair at $0 LP, two at ~$3,
+    // and an $85K-LP pool printing a $3,058 market cap (1000x off) — while
+    // the tracker's peak/drawdown/dead rules and the scan gates read whatever
+    // this map holds as ONE series, so an array position was deciding the
+    // 現價 on the cards. The pick must follow the DEPTH; a pair with no
+    // `liquidity` reading at all (the pump.fun bonding curve's shape) must
+    // lose to every real reading, including a drained pool's 0 — that 0 is
+    // the 💧 rules' evidence and must keep reaching them. And the cache must
+    // hold the WINNER, not the last-seen loser.
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" });
+    const dex = new DexScreenerClient(cfg);
+    const mkPair = (token, pairAddress, marketCap, liquidityUsd) => ({
+      chainId: "solana",
+      url: `https://dexscreener.com/solana/${pairAddress}`,
+      pairAddress,
+      baseToken: { address: token, name: token, symbol: token },
+      priceUsd: "0.003",
+      marketCap,
+      fdv: marketCap,
+      liquidity: liquidityUsd === undefined ? {} : { usd: liquidityUsd },
+      volume: { h24: 100, h1: 10, m5: 1 },
+      txns: { m5: { buys: 1, sells: 1 }, h1: { buys: 2, sells: 2 } },
+      priceChange: { m5: 0, h1: 0 },
+      pairCreatedAt: 1,
+    });
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          pairs: [
+            // An off-market pool listed FIRST: half the market cap, two orders
+            // of magnitude less depth.
+            mkPair("TOKEN1", "OFFMARKET", 1_530_000, 3.42),
+            // The pool the market is actually on.
+            mkPair("TOKEN1", "MAIN", 3_061_000, 198_266.06),
+            // A bonding-curve pair: no liquidity reading at all.
+            mkPair("TOKEN1", "CURVE", 48_561.93, undefined),
+            // A token whose only pairs are a curve and a drained pool: the $0
+            // reading is the one the drain rules need, so it must win.
+            mkPair("TOKEN2", "CURVE2", 48_561.93, undefined),
+            mkPair("TOKEN2", "DRAINED", 2_245_994, 0),
+            // A token with nothing but curve pairs keeps its first (absence
+            // of a reading is not evidence of depth).
+            mkPair("TOKEN3", "CURVE3", 40_000, undefined),
+            mkPair("TOKEN3", "CURVE4", 44_000, undefined),
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    try {
+      const pairs = await dex.fetchPairsForTokens(["TOKEN1", "TOKEN2", "TOKEN3"]);
+      const one = pairs.get("TOKEN1");
+      assert.equal(one.pairAddress, "MAIN", "the deepest pool is the token's pair");
+      assert.equal(one.marketCap, 3_061_000);
+      assert.equal(one.liquidity.usd, 198_266.06);
+      assert.equal(
+        pairs.get("TOKEN2").pairAddress,
+        "DRAINED",
+        "a drained pool's $0 outranks a pair that reports no liquidity at all",
+      );
+      assert.equal(pairs.get("TOKEN3").pairAddress, "CURVE3", "ties keep the first");
+      // The cache holds the winner: the second call is served from it and must
+      // return the same pools (a later, thinner pair must not overwrite it).
+      const cached = await dex.fetchPairsForTokens(["TOKEN1", "TOKEN2", "TOKEN3"]);
+      assert.equal(cached.get("TOKEN1").pairAddress, "MAIN");
+      assert.equal(cached.get("TOKEN2").pairAddress, "DRAINED");
     } finally {
       globalThis.fetch = origFetch;
     }

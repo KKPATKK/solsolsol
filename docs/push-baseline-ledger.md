@@ -288,6 +288,12 @@ agedEval 4     ← 每 tick ~91 個被評估的幣之中，只有 4 個行到動
 `fetchPairsForTokens` 嘅「first pair wins」唔係問題 —— DexScreener 本身按深度排序，
 11 個幣每一個嘅 first pair 都係最深池、冇 null。
 
+> **2026-10-02 更新**：呢個「唔係問題」係當日 11 隻幣嘅量度，唔係保證。同日 Agency 一個
+> response 內 8 個池 mcap 由 $48K 到 $3.3M（68 倍），而且有一個 $85K-LP 池報 **$3,058**；
+> 「靠 DexScreener 排序」等於將 tracker 嘅峰值／回撤／💀 判定交畀一個未定義嘅陣列位置。
+> 選擇規則已改為**最深池 wins**（`src/dexscreener.ts` `pairDepth`），見
+> `docs/mcap-basis-and-pool-pick-2026-10-02.md`。
+
 **改咗乜**：
 
 | 位置 | 變更 |

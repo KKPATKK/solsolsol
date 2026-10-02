@@ -1165,6 +1165,18 @@ export interface DexScreenerHooks {
   onBatch429?: (at: number) => void;
 }
 
+/**
+ * How deep the pool behind one pair is, for the "which pair represents this
+ * token" pick (see fetchPairsForTokens). `-1` for a pair that reports no
+ * `liquidity.usd` — the pump.fun bonding curve's shape — so every real
+ * reading outranks it, including a drained pool's `0` (the 0 is evidence the
+ * 💧 rules must keep seeing).
+ */
+function pairDepth(pair: { liquidity: { usd: number | null } }): number {
+  const liq = pair.liquidity?.usd;
+  return typeof liq === "number" && Number.isFinite(liq) ? liq : -1;
+}
+
 export class DexScreenerClient {
   private readonly throttle: Throttle;
   /**
@@ -1946,7 +1958,9 @@ export class DexScreenerClient {
   /**
    * Fetch live pair data for up to 30 addresses per request.
    * The /latest/dex/tokens endpoint returns a flat `pairs` array, so we
-   * group pairs by baseToken.address and keep the first Solana pair per token.
+   * group pairs by baseToken.address and keep the DEEPEST Solana pool per
+   * token (see the pick's own note in the loop — an array position is not a
+   * property of the market).
    * Bounded by PAIRS_FETCH_BUDGET_MS so a slow/limited endpoint cannot eat
    * the whole scan tick: batches past the deadline are skipped and their
    * tokens are simply re-tried on the next scan.
@@ -1966,6 +1980,13 @@ export class DexScreenerClient {
     callerDeadlineMs?: number,
   ): Promise<Map<string, PairInfo>> {
     const result = new Map<string, PairInfo>();
+    /**
+     * The depth already accepted for each token IN THIS RESPONSE (see the
+     * pick's note in the batch loop). Deliberately separate from `result`:
+     * `result` is pre-seeded with cache hits, and a cache hit's depth must
+     * not decide how a freshly-fetched pair is judged.
+     */
+    const batchDepth = new Map<string, number>();
     const now = Date.now();
     // Serve whatever is still fresh from the cache first; only cache misses
     // hit the wire.
@@ -2054,7 +2075,6 @@ export class DexScreenerClient {
             | { address?: string; name?: string; symbol?: string }
             | undefined;
           if (!baseToken?.address) continue;
-          if (result.has(baseToken.address)) continue; // first pair wins
           const volume = raw.volume as { h24?: number; h1?: number; m5?: number } | undefined;
           const txnsRaw = raw.txns as
             | {
@@ -2063,7 +2083,7 @@ export class DexScreenerClient {
               }
             | undefined;
           const priceChange = raw.priceChange as { m5?: number; h1?: number } | undefined;
-          result.set(baseToken.address, {
+          const info: PairInfo = {
             chainId: "solana",
             url: String(raw.url ?? ""),
             pairAddress: String(raw.pairAddress ?? ""),
@@ -2107,11 +2127,28 @@ export class DexScreenerClient {
             // feedSource note on PairInfo).
             feedSource: "dexscreener",
             pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
-          });
-          this.pairCache.set(baseToken.address, {
-            pair: result.get(baseToken.address)!,
-            at: now,
-          });
+          };
+          // DEEPEST POOL WINS — the pair that REPRESENTS a token is the one
+          // with the most liquidity behind it, not whichever array position
+          // the feed happened to use. DexScreener usually lists the deepest
+          // pool first (measured 2026-09-19 over 11 coins, and again
+          // 2026-10-02), but "usually" is not a market fact: one token's
+          // returned pairs spanned mcap $48K–$3.3M across 8 pools on
+          // 2026-10-02 (Agency) — a drained pair at $0 LP, two more at ~$3,
+          // and one $85K-LP pool printing a $3,058 market cap (1000× off) —
+          // while the tracker's peak/drawdown/dead rules and the scan gates
+          // all read whatever this map holds, as ONE series. A single listing
+          // accident therefore quoted a 💀 card's 現價 at half the pool's own
+          // price. A real reading (a drained pool's 0 included: it is the
+          // 💧 rules' evidence) outranks a pair that reports no `liquidity`
+          // at all; ties keep the first, so the pick is stable when the feed
+          // repeats itself.
+          const depth = pairDepth(info);
+          const known = batchDepth.get(info.baseToken.address);
+          if (known !== undefined && depth <= known) continue;
+          batchDepth.set(info.baseToken.address, depth);
+          result.set(info.baseToken.address, info);
+          this.pairCache.set(info.baseToken.address, { pair: info, at: now });
         }
       }
     };

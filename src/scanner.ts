@@ -3763,7 +3763,33 @@ export class Scanner {
           pairAddress: mint,
           baseToken: { address: mint, name: "", symbol: "" },
           priceUsd: String(snap.priceUsd ?? ""),
-          marketCap: snap.fdvUsd ?? 0,
+          // THE FDV BASIS, deliberately — `fdvOnlyUsd` first, never the
+          // `fdvUsd` substitution.
+          //
+          // This leg is the ONLY one whose "market cap" can be a CIRCULATING
+          // figure: `fdvUsd` is `market_cap_usd ?? fdv_usd`, and Gecko's
+          // `market_cap_usd` is CoinGecko's circulating-supply valuation. The
+          // other two legs and the whole recorded series are on the FDV/
+          // total-supply basis (DexScreener's `marketCap` == its `fdv` for
+          // these tokens, and Jupiter's `mcap` == its `fdv`), so a single
+          // leg that silently prefers the circulating number puts TWO
+          // valuations of the same coin into ONE row's history — and the
+          // tracker's peak/drawdown math reads that as a real move.
+          //
+          // Live 2026-10-02 20:11 HKT (Agency): the 💀 card quoted 現價
+          // $1.53M — EXACTLY 0.50× the $3.06M its own pool traded at in that
+          // same minute, which is what the operator read ($3.04M). The card
+          // then armed a resurrection target off a trough the coin never made
+          // (its dead-watch min, $601,816.84). A ~2× basis switch is exactly
+          // what circulating-vs-FDV looks like, and this leg is where it can
+          // enter; the same-pass peak of $3.34M and the later $2.99M re-entry
+          // were both read off the pool, i.e. the series was flipping bases.
+          //
+          // The flag rides along for the ledger (see PairInfo.mcapFromFdv):
+          // the number IS an FDV standing in for a market cap, exactly the
+          // case that field exists to record.
+          marketCap: snap.fdvOnlyUsd ?? snap.fdvUsd ?? 0,
+          mcapFromFdv: snap.fdvOnlyUsd !== null,
           volume: { h24: 0, h1: 0, m5: 0 },
           priceChange: { m5: 0, h1: 0 },
           txns: { m5Buys: 0, m5Sells: 0, h1Buys: 0, h1Sells: 0 },
