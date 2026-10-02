@@ -1480,8 +1480,8 @@ async function main() {
     assert.equal(texts.length, 1, "without the mute the 🩸 card goes out");
     assert.match(String(texts[0]), /🩸 賣壓主導/);
 
-    // (b) ⚠️ 動能轉弱 muted — BOTH depths. -40% off the peak is `w35`; -50%
-    // is the `w45` escalation (it stays above the -55% that 💀 owns). Each is
+    // (b) ⚠️ 動能轉弱 muted — BOTH depths. -40% off the peak is `w35`; -46%
+    // is the `w45` escalation (it stays above the -48% that 💀 owns). Each is
     // withheld, and each still lands its mark in up_stages — the once-per-
     // depth memory that keeps the same card from re-announcing after the mute
     // is lifted.
@@ -1500,7 +1500,7 @@ async function main() {
     assert.equal(w35.lastState, "weak", "the weak transition still lands");
 
     const db45 = termDb([termRow({ upStages: "liq1,w35", peakMcap: 200_000 })]);
-    const out45 = await make(db45, muted, (a) => weakPair(a, 100_000)).runTick(Date.now() + 1_500);
+    const out45 = await make(db45, muted, (a) => weakPair(a, 108_000)).runTick(Date.now() + 1_500);
     assert.equal(texts.length, 0, "the w45 escalation is withheld too — muting one stage would have left it visible");
     assert.equal(out45.muted, 1);
     const [, w45] = db45.updated[0];
@@ -11665,6 +11665,29 @@ async function main() {
     const d2 = evaluateWatch(row({ peakMcap: 50_000 }), 1000, { mcap: 22_000, liquidity: 14_000, chg5m: -20, buysH1: 2, sellsH1: 80 }, cfg);
     assert.equal(d2.alerts[0].kind, "dead");
     assert.equal(d2.stopTracking, false);
+
+    // Boundary (2026-10-02: the dead line moved 55 → 48): -47% off peak is
+    // not dead yet (the -45% weak escalation is), -48% is.
+    const nearDead = evaluateWatch(
+      row(),
+      1000,
+      { mcap: 47_700, liquidity: 15_000, chg5m: -10, buysH1: 20, sellsH1: 70 },
+      cfg,
+    );
+    assert.ok(
+      nearDead.alerts.every((a) => a.kind !== "dead"),
+      "-47% off peak must not be dead",
+    );
+    const atDead = evaluateWatch(
+      row(),
+      1000,
+      { mcap: 46_800, liquidity: 15_000, chg5m: -10, buysH1: 20, sellsH1: 70 },
+      cfg,
+    );
+    assert.ok(
+      atDead.alerts.some((a) => a.kind === "dead"),
+      "-48% off peak is dead",
+    );
 
     // Liquidity collapse >55% → liquidity alert (still above the absolute
     // floor: 30K → 11K is a 63% drop but ≥ $10K, so the rug rule stays quiet).

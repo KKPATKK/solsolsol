@@ -49,7 +49,7 @@ import {
  *   🔥 ignition       — 5m volume jumps from dormant (< $10K) to ≥ $15K
  *                       before any rising stage (early new-leg warning)
  *   ⚠️ weak           — ≥35% off the post-push peak (only if it had run up)
- *   💀 dead           — ≥55% off peak → fires once, then SILENT watch;
+ *   💀 dead           — ≥48% off peak → fires once, then SILENT watch;
  *                       recovery to trough × 1.5 resurrects the row with
  *                       a fresh baseline (V-reversals)
  *   💧 liquidity      — collapsed >55% since the last check, OR absolute
@@ -923,9 +923,19 @@ export function resetPushWatchHealStats(): void {
  */
 const DIVERGENCE_MIN_GAIN_PCT = 25;
 const DIVERGENCE_MIN_DROP_PCT = 0.10;
-/** Drawdown-from-peak thresholds for the weak / dead states (%). */
+/**
+ * Drawdown-from-peak thresholds for the weak / dead states (%).
+ *
+ * DEAD 55 → 48 on 2026-10-02 (operator request): the weak ladder (-35%/-45%)
+ * and the pullback band (-15%…-45%) are unchanged, so the deep-flush card
+ * simply arrives 7 points earlier. Everything behind it is unchanged too —
+ * the card still fires ONCE per death episode into the silent watch, and a
+ * -48%…-55% flush that recovers to trough × 1.5 still resurrects the row with
+ * a fresh baseline, so the earlier card costs a WATCHER nothing but an
+ * earlier notice; it does not cut the coin's tracking short.
+ */
 const WEAK_DRAWDOWN_PCT = 35;
-const DEAD_DRAWDOWN_PCT = 55;
+const DEAD_DRAWDOWN_PCT = 48;
 /** A coin must have run up at least this much before "weak" can fire. */
 const WEAK_MIN_RUNUP_PCT = 15;
 /** Liquidity crash: current < 45% of the last check AND last ≥ $5K. */
@@ -1915,10 +1925,10 @@ export function evaluateWatch(
     };
   }
 
-  // Dead: ≥55% off the peak. Fires ONCE (the row then enters the silent
-  // watch above) — deep-flush V-reversals are common, so recovery to
-  // trough × 1.5 resurrects it. Peak is always ≥ push mcap, so this also
-  // catches never-ran-up straight dumps.
+  // Dead: ≥DEAD_DRAWDOWN_PCT (48 since 2026-10-02) off the peak. Fires ONCE
+  // (the row then enters the silent watch above) — deep-flush V-reversals are
+  // common, so recovery to trough × 1.5 resurrects it. Peak is always ≥ push
+  // mcap, so this also catches never-ran-up straight dumps.
   if (drawdownFromPeak <= -DEAD_DRAWDOWN_PCT) {
     fire(
       "dead",
@@ -2096,7 +2106,7 @@ export function evaluateWatch(
   }
 
   // 🪝 回調轉強 (pullback re-entry): a coin that already ran (peak ≥ +50%) is
-  // -15%…-45% off that peak — a real pullback, but short of the -55% that 💀
+  // -15%…-45% off that peak — a real pullback, but short of the -48% that 💀
   // calls dead — and the NEWEST tape turns back up: a ≥8% 5m bar on ≥$8K of
   // 5m volume with buys outnumbering sells. That shape is the second entry
   // the exit cards cannot describe: ⚠️ w35 only says the peak is slipping.
@@ -2155,7 +2165,7 @@ export function evaluateWatch(
     // PERSISTENT memory (w35/w45 marks in up_stages next to the 🚀 stages):
     // a 📈/🚀 overwriting lastState used to re-fire the same ⚠️ one cooldown
     // later (BABYCATE -37% then -39%). Escalates once more at -45%; re-arms
-    // only on real recovery above -25%; dead takes over at -55%.
+    // only on real recovery above -25%; dead takes over at -48%.
     const runupPct = (row.peakMcap / Math.max(row.mcapAtPush, 1) - 1) * 100;
     if (drawdownFromPeak > -25) {
       rearmedSigs.add("w35");
