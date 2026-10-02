@@ -122,3 +122,12 @@
   （實測 2026-09-27：舊的 60s 門檻令 90 分鐘內 76 個 completion 有 26 個其實係 ping 跑嘅）。
 - 掃描器有 running 鎖（25s 時效自動打破）+ SCAN_INTERVAL_SECONDS=60 的
   心跳間隔閘門（跨 isolate），cron 與監控同時驅動也不會重疊或重複推送。
+
+## 2026-10-02 之後：sub-minute clock 唔會污染 cron 讀數
+
+大槓桿（`CLOCK_TICK_SECONDS` + `TickClock`，見 `docs/do-clock-2026-10-02.md`）
+上線後，scan/tracker 可以快過 1 分鐘。Clock 嘅 arrival **故意唔入** cron 嘅讀數
+（`scheduled_tick_ring` / `scheduled_tick_total` / pre-init stamp / `scheduledTicks`），
+所以上面呢張表嘅意思完全不變：`scheduledTickTotal` 停咗仍然等於「cron 停投遞」，
+唔會被 clock 嘅 tick 掩蓋。Clock 自己嘅存活要睇 `/debug/clock`（`alarmAt`；注意
+alarm 正在跑嗰刻 `getAlarm()` 會回 `null`）同 `heartbeat.via:"clock"` 嘅節奏。
