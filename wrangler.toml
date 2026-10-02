@@ -110,12 +110,27 @@ crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 # So the scan keeps paying the distance; this block only makes the HTTP path
 # (uptime-monitor rescue scans included) fast.
 #
+# WHERE THE UNPLACED PATH RUNS (measured 2026-10-02 06:56-07:07Z with the
+# probe added in 69b11f0): every cron tick answered `colo: ORD` — 10 of 10
+# samples, front init read 722-1265ms — against the placed path's single-digit
+# ms statements. So the two paths sit in DIFFERENT regions today (fetch: NRT,
+# scan: ORD), and the Turso group's aws-ap-northeast-1 sits beside the FETCH
+# path, not beside the scan. Turso's location list (api.turso.tech/v1/
+# locations) offers six: aws-ap-northeast-1 (Tokyo), aws-ap-south-1 (Mumbai),
+# aws-eu-west-1 (Ireland), aws-us-east-1 (Virginia), aws-us-east-2 (Ohio) and
+# aws-us-west-2 (Oregon) — aws-us-east-2 is the one nearest ORD.
+#
 # NEXT STEP these numbers support: route the scan through a placed fetch path,
-# or move it into a Durable Object with an apac-ne location hint. `mode =
-# "smart"` is NOT the lever: it needs consistent traffic from multiple
-# locations, and this fetch path is low traffic (the explicit region is
-# deterministic). Revert = delete this block; the cron path never depended on
-# it.
+# or move it into a Durable Object with a location hint — both put the scan
+# where the distance is short WITHOUT a database migration. The alternative
+# (or the complement) is moving the Turso group to aws-us-east-2: it is the
+# only option that also fixes the unplaced tracker/maintenance deliveries, but
+# it needs a second group (Scaler/Pro/Enterprise) or a recreate-and-copy
+# cutover, and THIS block must then be re-pointed to aws:us-east-2 in the same
+# change or the fetch path loses what it bought. `mode = "smart"` is NOT the
+# lever: it needs consistent traffic from multiple locations, and this fetch
+# path is low traffic (the explicit region is deterministic). Revert = delete
+# this block; the cron path never depended on it.
 [placement]
 region = "aws:ap-northeast-1"
 
