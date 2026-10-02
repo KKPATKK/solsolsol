@@ -632,3 +632,21 @@ CI run `36898980028` success、`headSha` 核對 `eb71702`（17:24:45Z 完成）�
 **呢個唔係今次改動造成**（`blk` 由 89,305 → 0 係上游 429 backoff 過期），但係今次新增嘅 `pairsMissing` 讀數**第一次量到「恢復世界」嘅代價**：`pairsJup` 缺席 ≠ 「唔需要擔心」——要同 `pairsMissing` 一齊讀，本節早前嘅讀法表要在呢點上補一句。對照：同一支 fallback 喺 Dex pair lane 全黑嘅 tick（00:27–00:36Z）交 `pairsJup 193–195`／`pairsMissing 0` —— 「缺席」只出現喺 Dex 交到 >50% 嘅 tick，同入場規則一致。
 
 未做嘅選項（留返畀有數據先決定）：把入場規則由「<50% 才入場」改成「`missing > 0` 且窗口夠一個 chunk」——成本係每 tick 多一個 chunk（Jupiter 係共享桶，同 Dex 同一個稀缺 egress）＋窗口佔用完；好處係 slice 尾部今個 tick 就被評審。現狀（唔改）＝尾部靠下一次 rotation 再讀。
+
+---
+
+## 第四補（2026-10-02）：pool 讀被 cap 放棄 → feed-only tick —— last-good slice 修正
+
+**症狀**：`scan_history` 每隔一兩分鐘就出現 `pool 73–97` 嘅 tick（正常 ~1.2K）；2026-10-02 03:32–03:52Z 20 分鐘內 9 個，頭先 500 行窗口共 22 個。呢啲 tick 唔止冇 pool，仲要食晒 `poolMs 2400 / poolWaitMs 1870`。
+
+**量度**（live，同一窗口）：
+
+- `dbSteps.getReevalPool` 一次真讀 = **2 182–2 903ms**（03:56 2182ms → pool 1259，啱啱好喺 cap 內；03:58 2903ms → 撞 2400ms cap → pool 77）。
+- miss 節奏：`REEVAL_POOL_CACHE_SECONDS "90"`（wrangler.toml）＋ 60s tick ⇒ 每 ~1.5 個 tick 一次真讀；`poolCache {memory 2–3, hits 0, misses 3, puts 3}` —— 邊緣 cache 從來冇 hit（每個 slot 都係自己第一個讀）。
+- **cap 冇買到時間**：同一窗口，feed-only tick 5.2–6.2s vs 正常 tick 2.8–5.6s —— join 一樣要等個 cap，放棄嘅讀取只係令 tick 用一個冇 pool 嘅掃描繼續。
+
+**成因**：`fetchFeedCapped`（scanner）超時一律 resolve `[]`，而唯一嘅 last-good 保護（`PoolFallbackDb`）只覆蓋 **thrown** read —— 被 cap 放棄嘅讀取（timeout）就直接令 tick feed-only。
+
+**修正**：`poolSliceForTick(read, lastGood)`（scanner.ts，exported）—— read 非空用 read，否則用 isolate 嘅 `reevalPoolCache.stats`（同 `PoolFallbackDb` 對 thrown read 嘅取態一致：stale sweep 只輸一個 rotation turn，never a wrong push）。重用行數發佈為 `summary.poolStale`；cold isolate（未有任何 snapshot）維持 `[]` 舊狀。
+
+**驗收點**：落線後 `pool < 200` 嘅 tick 應該消失（變成 `pool ~1.2K` ＋ `summary.poolStale ~1.2K`）；`/health` `heartbeat.summary.poolStale` 出現嗰啲 tick 就係本來會 feed-only 嘅 tick。`/debug/tick-legs` 每行亦有 `poolStale`。

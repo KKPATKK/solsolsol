@@ -2231,6 +2231,12 @@ export interface TickLegRow {
   pairsMissing: number | null;
   evalMs: number | null;
   dbMs: number | null;
+  /**
+   * Rows reused from the last good pool snapshot because the read was
+   * abandoned at the cap (see scanner.poolSliceForTick) — null when the tick
+   * evaluated its own read's rows.
+   */
+  poolStale: number | null;
 }
 
 /**
@@ -2282,6 +2288,7 @@ export function buildTickLegRow(input: {
     pairsMissing: s?.pairsMissing ?? null,
     evalMs: s?.evalMs ?? null,
     dbMs: s?.dbMs ?? null,
+    poolStale: s?.poolStale ?? null,
   };
 }
 

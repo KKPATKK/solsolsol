@@ -18619,6 +18619,43 @@ async function main() {
   );
 
   await test(
+    "last-good pool slice (2026-10-02): an abandoned read never costs the tick its pool",
+    () => {
+      const { poolSliceForTick } = require("../dist/scanner.js");
+      const read = [{ token: "a" }];
+      const lastGood = { stats: [{ token: "b" }] };
+      // A read that answered wins — the snapshot is only a fallback.
+      assert.equal(poolSliceForTick(read, lastGood), read);
+      // The abandoned read (fetchFeedCapped resolves the same [] on timeout)
+      // must evaluate the last good slice rather than nothing at all.
+      assert.equal(poolSliceForTick([], lastGood), lastGood.stats);
+      // A cold isolate with no snapshot keeps today's shape: [].
+      assert.equal(poolSliceForTick([], null).length, 0);
+      // Wiring: the join really substitutes, and the reuse is published — a
+      // helper nobody calls would pass every case above.
+      const strip = (text) =>
+        text
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/\/\/[^\n]*/g, "")
+          .replace(/\s+/g, "");
+      const scannerSrc = strip(
+        fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+      );
+      assert.ok(
+        scannerSrc.includes(
+          "constrecentStats=poolSliceForTick(poolReadRows,this.reevalPoolCache);",
+        ),
+        "the join substitutes the last good slice",
+      );
+      assert.ok(
+        scannerSrc.includes("diag.poolStale=recentStats.length;"),
+        "the reuse is published on the summary",
+      );
+      assert.ok(scannerSrc.includes("poolStale?:number;"), "the summary carries the reading");
+    },
+  );
+
+  await test(
     "tier 1 (2026-09-28) — pool edges: one slot computation, a stable key, and a cache that degrades",
     async () => {
       const strip = (text) =>

@@ -1082,6 +1082,39 @@ export function poolCacheView(): typeof poolCacheCounters & {
 } {
   return { available: poolEdgeCache() !== null, ...poolCacheCounters };
 }
+
+/**
+ * The pool slice one tick evaluates, from the read's own result and the
+ * isolate's last good snapshot (see getReevalPoolCached).
+ *
+ * WHY (2026-10-02, measured): the re-eval pool read costs 2.2-2.9s against
+ * the 2.4s POOL_FETCH_BUDGET_MS cap, and the cache-miss tick repeats every
+ * ~90s (REEVAL_POOL_CACHE_SECONDS = "90" in production), so a sliver of the
+ * reads lose the race and the tick used to continue with `[]` — scan_history
+ * `pool 73-97` instead of ~1.2K, i.e. a feed-only sweep for the whole minute.
+ * The abandoned read is not wasted (it still warms the cache when it lands),
+ * but the tick evaluated a fraction of its pool — and the cap bought NO
+ * latency: in the live cluster the ticks that lost the read ran no faster
+ * than the ones that got it (5.2-6.2s vs 2.8-5.6s across the same 20
+ * minutes), because the join waits out the cap either way.
+ *
+ * Reusing the previous slice is the same trade PoolFallbackDb already makes
+ * for a THROWN read — a stale sweep costs one rotation turn, never a wrong
+ * push (every gate re-reads live pair data and seen_tokens blocks a
+ * duplicate) — and it is strictly better than evaluating nothing. The
+ * distinction the Db layer keeps ("a genuinely empty result is NOT masked")
+ * cannot be kept here: a timeout and an empty read arrive as the same value
+ * (see fetchFeedCapped), and "no reading" must not become "evaluate
+ * nothing" on the one tick that has a last good slice to offer. A cold
+ * isolate (no snapshot yet) still gets `[]`, which is exactly today's shape.
+ */
+export function poolSliceForTick(
+  read: TokenStats[],
+  lastGood: { stats: TokenStats[] } | null,
+): TokenStats[] {
+  if (read.length > 0) return read;
+  return lastGood?.stats ?? read;
+}
 /**
  * How long a first-seen token stays eligible for re-evaluation. Must cover
  * the qualifying age window (max 28h) plus a registration margin — the
@@ -1753,6 +1786,13 @@ export interface ScanSummary {
    * at all (the Node container entry), not that the cache is broken.
    */
   poolCache?: ReturnType<typeof poolCacheView>;
+  /**
+   * Rows reused from the last good pool snapshot because this tick's read was
+   * abandoned at POOL_FETCH_BUDGET_MS (see poolSliceForTick). Undefined when
+   * the tick evaluated its own read's rows — present so a stale slice can
+   * never read as a fresh one in /health or the tick-leg ring.
+   */
+  poolStale?: number;
   /** Wall-clock ms for matching + candidate gate evaluation. */
   evalMs?: number;
   /**
@@ -4808,10 +4848,18 @@ export class Scanner {
       // the feeds finished first and the read is still this tick's long pole.
       if (this.shouldStopEarly()) return;
       const poolJoinStart = Date.now();
-      const recentStats = await poolRead;
+      const poolReadRows = await poolRead;
       diag.poolMs = poolReadMs;
       diag.poolCache = poolCacheView();
       diag.poolWaitMs = Date.now() - poolJoinStart;
+      // A read the cap abandoned must not cost the tick its pool (see
+      // poolSliceForTick): SUBSTITUTE the isolate's last good slice rather
+      // than evaluating feed-only, and say so — `poolStale` is the row count
+      // the tick reused, so the shape is readable in /health and the ring.
+      const recentStats = poolSliceForTick(poolReadRows, this.reevalPoolCache);
+      if (recentStats !== poolReadRows && recentStats.length > 0) {
+        diag.poolStale = recentStats.length;
+      }
       try {
         await pruneRun;
       } catch (err) {

@@ -106,6 +106,7 @@ test("a full tick maps every leg and the front split", () => {
         pairsMissing: 0,
         evalMs: 1624,
         dbMs: 1200,
+        poolStale: 1259,
       },
     }),
   );
@@ -130,6 +131,7 @@ test("a full tick maps every leg and the front split", () => {
   assert.equal(row.pairsJup, 98);
   assert.equal(row.evalMs, 1624);
   assert.equal(row.dbMs, 1200);
+  assert.equal(row.poolStale, 1259);
 });
 
 test("the row copies its maps — later mutation must not rewrite a tick", () => {
@@ -164,6 +166,7 @@ test("a cut tick with no summary records null legs, not zeros", () => {
   assert.equal(row.poolMs, null);
   assert.equal(row.poolLegMs, null);
   assert.equal(row.evalMs, null);
+  assert.equal(row.poolStale, null);
   assert.equal(row.preStartMs, null);
   assert.equal(row.steps, null);
 });
