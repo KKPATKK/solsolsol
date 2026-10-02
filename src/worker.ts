@@ -4220,7 +4220,12 @@ async function ensureInitialized(env: Env): Promise<void> {
  * relay to the placed fetch path (see the relay block at the bottom), so in
  * the healthy shape this body executes at NRT beside the database; the
  * relay's local fallback calls the same body in the cron region. Which one ran
- * is written into the pass row as `relay` (the relayTag parameter).
+ * is written into the pass row as `relay` (the relayTag parameter) — and the
+ * relayed readings are already in: passes come back `relay:"inner"` with
+ * `db` between 216ms and 1546ms across shapes (reads single-digit ms, writes
+ * tens) and `trackerMs` as low as 216ms, against the ~738ms `db` the ORD pass
+ * reported. The distance is no longer the pass's whole cost — its own writes
+ * are the floor — which is what any further tuning should read.
  *
  * WHY THE PASS STILL HAS A FALLBACK: this trigger's expression is new, and
  * this platform has silently stopped delivering cron events to this Worker
@@ -5779,11 +5784,14 @@ async function maybeRunScanIfStale(
  * WHY THE TRACKER AND MAINTENANCE DELIVERIES RELAY TOO (2026-10-02, the
  * follow-up the first cut named as its own change). They run no scan, but
  * their DB cost is the same shape: the tracker pass's durable note read
- * `db 738ms` per pass at ORD — a chain of round trips the placed path answers
- * in single-digit ms — and the maintenance legs write their token_stats
- * batches and the crime list from the same distance. So each delivery relays
- * itself; the routing is unchanged, because the replayed delivery enters the
- * SAME branches the platform's own delivery does (see `scheduled`). Which
+ * `db 738ms` per pass at ORD — a chain of Turso round trips, reads
+ * single-digit ms on the placed path — and the maintenance legs write their
+ * token_stats batches and the crime list from the same distance. (Measured
+ * after the relay: the relayed pass's `db` spans 216-1546ms across shapes,
+ * its own writes the floor, and `trackerMs` reaches 216ms.) So each delivery
+ * relays itself; the routing is unchanged, because the replayed delivery
+ * enters the SAME branches the platform's own delivery does (see
+ * `scheduled`). Which
  * region a run really happened in is durable, one marker per delivery: the
  * pass row and the maintenance stamp carry `relay`, exactly like the scan
  * heartbeat's field (see THE MARKER below).
@@ -8103,10 +8111,12 @@ const worker = {
     tickWaitUntil = (promise) => ctx.waitUntil(promise);
     // THE TRACKER'S OWN DELIVERY (see TRACKER_CRON): the pass, and nothing
     // else. First its relay attempt (see the relay block at the bottom): the
-    // pass's own durable note read `db 738ms` per pass in the cron region, all
-    // of it round trips the placed path answers in single-digit ms, so the
-    // pass is replayed there. On ANY relay failure the branch falls through to
-    // the same local pass the Worker always ran. After the relay attempt the
+    // pass's own durable note read `db 738ms` per pass in the cron region — a
+    // chain of Turso round trips, reads single-digit ms on the placed path —
+    // so the pass is replayed there. On ANY relay failure the branch falls
+    // through to the same local pass the Worker always ran. (Measured after
+    // the relay: the relayed `db` spans 216-1546ms across pass shapes, its own
+    // writes the floor, and `trackerMs` reaches 216ms.) After the relay attempt the
     // local run returns BEFORE scheduledTicks, the cron-arrival stamp and the
     // cadence gate, because all three count SCAN arrivals — the injected
     // cadence gate and the outage check both compare them, so a delivery that
