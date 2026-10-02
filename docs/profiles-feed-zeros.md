@@ -607,7 +607,19 @@ CI run `36898980028` success、`headSha` 核對 `eb71702`（17:24:45Z 完成）�
 - `pairs-jup` 352–697ms（2 個 chunk）；對照落線前健康 tick `182 pairs / 565ms`（serial 2–3 chunk）。
 - 429 冇因為並行而惡化：`/debug/dex429` lastHour 15（同落線前同一節奏），ring 內 17:25–17:37 四次；`dex.http429` 7 → 16 係同一條 list lane 嘅既有節奏。
 
-**未量到（誠實講）**：冇抽到「ask ≥ 190、Dex 完全零交付」嘅 tick，所以 `pairsJup → ~200` 嘅上限未直接見到（最高 171）；亦未見到 `pairs-jup` 貼近「單 chunk latency」嘅極端讀數。要嘅係下一個 Dex 全黑 tick 嘅 `pairsJup`。
+**後續量到（2026-10-02 00:27–00:36Z，落線 `352ca73` 之後嘅 sanity check）**：之前未抽到嘅「ask ≥ 190、Dex 完全零交付」tick，抽到 3 個 —— `poolLegMs.pairs 0`、`lastPairCacheStatus "HTTP-429"`、`pairCacheRefused 1–5`、`blockedForMs 30–89s`：
+
+| tick (Z, persist) | pairs | pairsJup | pairsMissing | `poolLegMs.pairs` | `pairs-jup` ms | Dex `blockedForMs` | `pairCacheRefused` |
+|---|---|---|---|---|---|---|---|
+| 00:27:07 | 195 | **195** | 0 | 0 | 465 | 89,231 | 1 |
+| 00:34:05 | 194 | **194** | 0 | 0 | 365 | 31,665 | 3 |
+| 00:36:06 | 193 | **193** | 0 | 0 | 618 | 30,152 | 5 |
+
+- `pairsJup 193–195` = **至少 2 個 chunk** 真出街（chunk 上限 100），高過 17:25–17:42 嗰輪嘅最高 171；`pairsJup == pairs` ⇒ fallback 今個 tick 100% 扛住（World B 讀法）。
+- `pairsMissing` **3/3 = 0**：Dex 零交付嘅 tick 都冇幣因為「冇 pair 數據」被跳過。
+- 三個 tick `fails.organic` / `fails.sus` 都係 0（`fails.mcap` 159–169：市場本身幾乎全部 < $60K，唔關閘事）。
+
+**仍未量到**：`pairs-jup` 貼近單 chunk latency（~200ms 級）嘅極端讀數（今次最低 365ms）；429 壓力再上（`dex429` ring 逼返）時 `pairsJup` 會唔會跌返 100 級。
 
 **期間嘅 push**：全部係 followup（Uptober `revive` 17:31:23、SARKA `reclaim` 17:32:02、Meridian 17:40:03）—— tracker／push-watch 條路徑唔經 `fetchTokenDataBatch` 嘅 front fallback，所以呢個數唔係本節嘅驗收讀數；initial 卡 0（`cand 1 push 0` 9/9 tick，`fails.organic` / `fails.sus` 全 0）。
 
@@ -617,6 +629,6 @@ CI run `36898980028` success、`headSha` 核對 `eb71702`（17:24:45Z 完成）�
 
 機制（代碼，唔係猜）：fallback 嘅**入場規則**係 `pairsByToken.size < addresses.length * 0.5`（`src/scanner.ts` ~4957，來自 `ae860d4` 嘅原始 fallback patch —— 唔係今次改動）。Dex 條腿今次交到 >50%（list cache HIT ＋ pool snapshot），所以 fallback **一個 chunk 都唔派**，`slice` 尾部（46–68 個幣）今個 tick 冇 pair 數據、等下一次 rotation。
 
-**呢個唔係今次改動造成**（`blk` 由 89,305 → 0 係上游 429 backoff 過期），但係今次新增嘅 `pairsMissing` 讀數**第一次量到「恢復世界」嘅代價**：`pairsJup` 缺席 ≠ 「唔需要擔心」——要同 `pairsMissing` 一齊讀，本節早前嘅讀法表要在呢點上補一句。
+**呢個唔係今次改動造成**（`blk` 由 89,305 → 0 係上游 429 backoff 過期），但係今次新增嘅 `pairsMissing` 讀數**第一次量到「恢復世界」嘅代價**：`pairsJup` 缺席 ≠ 「唔需要擔心」——要同 `pairsMissing` 一齊讀，本節早前嘅讀法表要在呢點上補一句。對照：同一支 fallback 喺 Dex pair lane 全黑嘅 tick（00:27–00:36Z）交 `pairsJup 193–195`／`pairsMissing 0` —— 「缺席」只出現喺 Dex 交到 >50% 嘅 tick，同入場規則一致。
 
 未做嘅選項（留返畀有數據先決定）：把入場規則由「<50% 才入場」改成「`missing > 0` 且窗口夠一個 chunk」——成本係每 tick 多一個 chunk（Jupiter 係共享桶，同 Dex 同一個稀缺 egress）＋窗口佔用完；好處係 slice 尾部今個 tick 就被評審。現狀（唔改）＝尾部靠下一次 rotation 再讀。

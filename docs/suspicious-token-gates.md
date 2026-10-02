@@ -227,7 +227,7 @@ gate exists to ask: `/debug/jupiter?organic=9qKHgTSAEFffsH1JzhqqjWejZZBvBTWSAH1c
 gate agree. With the snapshot in place that agreement is now structural rather
 than lucky: a card printing a below-floor `有機度` would have been blocked on
 the same read, which is what makes `fails.organic 0` across 17:25–18:12Z
-(≈45 ticks, 1 initial card + 6 followups) the acceptance reading.
+(≈45 ticks, 1 initial card + 6 followups) the acceptance reading. Post-deploy sanity window (00:27–00:36Z, three sampled ticks after `352ca73`): `fails.organic` and `fails.sus` are still 0, and the first fire remains unobserved.
 
 Still worth watching (unchanged): the first tick where `fails.organic` moves
 tells us the render judgement is doing live work; a card that PRINTS a
