@@ -186,7 +186,7 @@ that reaches any card, including the ones that used to slip through on slow
 ticks. A push with a below-floor score printed on its card is a regression of
 this section.
 
-### §7.1 After deploy (`eb71702`, 2026-10-01 17:24:45Z)
+### §7.1 After deploy (`eb71702` 2026-10-01 17:24:45Z; hardened `89d9f12` 18:08:34Z)
 
 Live, 17:25–17:42Z (12 ticks, `/health` + `/debug/scan-history` +
 `/debug/push-audit`): no below-floor push and `fails.organic` still 0 — the
@@ -212,9 +212,22 @@ now closed rather than merely narrowed. The wiring pin was tightened to say so
 (one snapshot; the render call after the trade-mode read; the card built from
 `organicReading,`), and its mutations are red on their own: snapshot moved in
 front of the await (ordering assert), card back on the raw box (snapshot assert).
+This hardening shipped as `89d9f12` (CI run `36904406578` success, completed
+18:08:34Z, `headSha` matched), so the PAPU reading below and the `fails.organic 0`
+span cover both commits.
+
 The historical patch `docs/patches/organic-late-bound-and-probe-2026-09-26.apply.js`
 now accepts either the direct box or the judged snapshot, so re-applying it
 cannot silently undo the hardening.
+
+**First initial card after the deploy.** PAPU (`17:55:08Z`, mcap 67,601) is the
+first INITIAL card the new code sent, and its reading answers the question the
+gate exists to ask: `/debug/jupiter?organic=9qKHgTSAEFffsH1JzhqqjWejZZBvBTWSAH1chz3VQwro`
+→ `score 64.6` (`medium`), `sus false`, 141ms — above the 55 floor, so card and
+gate agree. With the snapshot in place that agreement is now structural rather
+than lucky: a card printing a below-floor `有機度` would have been blocked on
+the same read, which is what makes `fails.organic 0` across 17:25–18:12Z
+(≈45 ticks, 1 initial card + 6 followups) the acceptance reading.
 
 Still worth watching (unchanged): the first tick where `fails.organic` moves
 tells us the render judgement is doing live work; a card that PRINTS a

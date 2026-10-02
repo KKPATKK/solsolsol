@@ -610,3 +610,13 @@ CI run `36898980028` success、`headSha` 核對 `eb71702`（17:24:45Z 完成）�
 **未量到（誠實講）**：冇抽到「ask ≥ 190、Dex 完全零交付」嘅 tick，所以 `pairsJup → ~200` 嘅上限未直接見到（最高 171）；亦未見到 `pairs-jup` 貼近「單 chunk latency」嘅極端讀數。要嘅係下一個 Dex 全黑 tick 嘅 `pairsJup`。
 
 **期間嘅 push**：全部係 followup（Uptober `revive` 17:31:23、SARKA `reclaim` 17:32:02、Meridian 17:40:03）—— tracker／push-watch 條路徑唔經 `fetchTokenDataBatch` 嘅 front fallback，所以呢個數唔係本節嘅驗收讀數；initial 卡 0（`cand 1 push 0` 9/9 tick，`fails.organic` / `fails.sus` 全 0）。
+
+### 驗收補充（18:07Z 起）：Dex 恢復世界 —— `pairsJup` 缺席，`pairsMissing` 46–68
+
+18:08–18:12Z 四個抽樣：`blk 0`、`lastListCacheStatus HIT`、`pairRef 0–15`、`pairs 137–157`、**`pairsJup` 缺席（`legJup -`）**、**`pairsMissing 46–68`**、tick `ms 2177–2811` 全 `ok:true`。
+
+機制（代碼，唔係猜）：fallback 嘅**入場規則**係 `pairsByToken.size < addresses.length * 0.5`（`src/scanner.ts` ~4957，來自 `ae860d4` 嘅原始 fallback patch —— 唔係今次改動）。Dex 條腿今次交到 >50%（list cache HIT ＋ pool snapshot），所以 fallback **一個 chunk 都唔派**，`slice` 尾部（46–68 個幣）今個 tick 冇 pair 數據、等下一次 rotation。
+
+**呢個唔係今次改動造成**（`blk` 由 89,305 → 0 係上游 429 backoff 過期），但係今次新增嘅 `pairsMissing` 讀數**第一次量到「恢復世界」嘅代價**：`pairsJup` 缺席 ≠ 「唔需要擔心」——要同 `pairsMissing` 一齊讀，本節早前嘅讀法表要在呢點上補一句。
+
+未做嘅選項（留返畀有數據先決定）：把入場規則由「<50% 才入場」改成「`missing > 0` 且窗口夠一個 chunk」——成本係每 tick 多一個 chunk（Jupiter 係共享桶，同 Dex 同一個稀缺 egress）＋窗口佔用完；好處係 slice 尾部今個 tick 就被評審。現狀（唔改）＝尾部靠下一次 rotation 再讀。
