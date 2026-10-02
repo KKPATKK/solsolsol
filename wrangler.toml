@@ -713,6 +713,19 @@ JUP_SUS_BLOCK = "true"
 # block, PUZZLE at score 0.0 — a 5-point move does not change that shape; it
 # only admits the 55–59 band that 60 held out.
 ORGANIC_MIN_SCORE = "55"
+# 1h-trader CEILING (the 🌱 有機度 line's other half, `| 1h 交易者 243`) — the
+# operator's anti-crowding gate: push only coins with FEWER than this many
+# traders in the trailing hour (2026-10-02: "少於 1400 才推送"). Same reading,
+# same request as ORGANIC_MIN_SCORE above — no extra spend. 0 = off.
+#
+# FAIL-OPEN on missing data, by the operator's instruction "沒有這項數據才推送":
+# Jupiter omitting the field (tradersH1 null) and the 6h/24h fallback window
+# (used when the trailing hour has no trades — a structurally larger count, so
+# it is not this ceiling's metric and does not judge; the CARD still prints
+# whichever window it has) both push. The boundary blocks: 1400 or more does
+# not push. Watch fails.organic in /health.heartbeat.summary — it counts the
+# score floor and this ceiling together, and the reject log names which one.
+ORGANIC_MAX_TRADERS_H1 = "1400"
 # Arkham Intelligence (requires ARKHAM_API_KEY, a SECRET — set in the
 # Cloudflare dashboard, never here): smart-money attribution on push cards.
 # Each qualifying coin's top-100 holders are checked for entity types in

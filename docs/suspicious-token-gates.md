@@ -232,3 +232,32 @@ the same read, which is what makes `fails.organic 0` across 17:25–18:12Z
 Still worth watching (unchanged): the first tick where `fails.organic` moves
 tells us the render judgement is doing live work; a card that PRINTS a
 below-floor `有機度` is the regression to look for.
+
+## 8. 2026-10-02: 🌱 有機度 line 的另一半變成閘門 — 1h 交易者 CEILING
+
+**營運者規則**（原話）：「將『1h 交易者』的數量成爲推送合資格幣前的閘門，如果少於
+1400 才推送，或者沒有這項數據才推送」。呢個係**反擠擁 ceiling**，唔係質素 floor：
+營運者要嘅係「未有人迫爆」嘅幣，所以 **1400 或以上 = 唔推**（「少於」嘅邊界屬於拒絕嗰邊，
+同 `organicMinBlockReason` 嘅 `>= minScore` pass 側互為鏡像）。
+
+**成本**：零。嗰個數字同 `ORGANIC_MIN_SCORE` 嘅分數嚟自**同一個** `fetchOrganicScore`
+payload（`stats1h.numTraders`），即係卡上 `| 1h 交易者 243` 嗰半行本身 —— 唔多一個
+request、唔多一個 key／provider，只係改變「一個讀數代表乜」。
+
+**FAIL-OPEN（「沒有這項數據才推送」）**，每一個「讀數唔齊」嘅形狀都唔判斷：
+
+| 形狀 | 為何唔判斷 |
+|---|---|
+| `tradersH1 === null` | Jupiter 冇交個 field。真 0 係一個**數字**，會照過 ceiling（0 < 1400） |
+| window ≠ `1h`（6h／24h fallback） | `fetchOrganicScore` 喺 1h 冇成交時會退落 6h／24h，而 24h 嘅數量**結構上**大好多 —— 唔係呢個 ceiling 嘅尺，所以當「1h 數字唔見咗」。**卡片照樣印**佢手上嗰個 window，只有閘門唔睇 |
+| reading 係 null（slot 過咗 deadline） | 同其他閘門一致：遲到嘅讀數 = 冇數據 |
+| `ORGANIC_MAX_TRADERS_H1 = 0` | 閘門熄咗 |
+
+**為什麼數字係 1400**：營運者自己嘅數（同 `ORGANIC_MIN_SCORE` 一樣係 operator choice，
+唔係 calibration）。要睇：`/health.heartbeat.summary` 嘅 `fails.organic` —— 佢同時數
+score floor 同呢個 ceiling（同一個 payload、同一個閘門家族），而**reject log 會寫明係邊個**
+（`` `1h 交易者 5,000 ≥ 1400（已經太多人參與，唔追呢一浸）` ``），所以唔會分唔清。
+
+**判斷點**：同 score floor 一樣係「一個 reading、三個判斷」，兩次判斷（early leg-saving
+＋ render 最後一判）都經 `jupiterGateVerdict`，所以唔會漂移；`jupReading` 嘅 await 條件亦
+加上 `organicMaxTradersH1 > 0`（唔係就會出現「configured 但冇讀數」嘅死閘門，測試 pin 住）。

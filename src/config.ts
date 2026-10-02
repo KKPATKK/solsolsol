@@ -674,6 +674,28 @@ export interface AppConfig {
    * /health.heartbeat.summary before trusting it.
    */
   organicMinScore: number;
+  /**
+   * Maximum Jupiter 1h traders (ORGANIC_MAX_TRADERS_H1, default 1400, 0 = off).
+   *
+   * The 🌱 有機度 line's other half (`| 1h 交易者 243`) is the very same FREE
+   * reading the score floor uses, so this ceiling costs no request, key or
+   * provider either — see scanner.organicTradersBlockReason. It is an
+   * ANTI-CROWDING ceiling rather than a quality floor: the operator wants the
+   * coins nobody has piled into yet, so 1400 or more traders in the trailing
+   * hour is left to run without a card (the boundary blocks — "少於 1400 才
+   * 推送").
+   *
+   * FAIL-OPEN in every missing-reading shape ("沒有這項數據才推送"):
+   * `tradersH1 === null` (Jupiter omitted the field), a NON-1h window (the
+   * client falls back to the 6h then 24h count when the trailing hour has no
+   * trades, and that fallback is not this ceiling's metric — the card still
+   * PRINTS it, only the gate ignores it), and a reading that missed its
+   * deadline (null).
+   *
+   * OPERATOR CHOICE, not calibration: watch fails.organic in
+   * /health.heartbeat.summary before trusting the number.
+   */
+  organicMaxTradersH1: number;
   /** Crime-wallet blocklist (community list — see CrimeWalletClient). */
   crimeWallets: CrimeWalletsConfig;
   /** Pushed-coin wallet analysis (creator profile + holder ages + clustering). */
@@ -1015,6 +1037,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // typo cannot turn the gate into a total block.
       const v = Number(env.ORGANIC_MIN_SCORE ?? 55);
       return Number.isFinite(v) && v > 0 ? Math.min(v, 100) : 0;
+    })(),
+    organicMaxTradersH1: (() => {
+      // Same stance as every other ceiling: 0 disables, and anything
+      // unparseable disables rather than becoming NaN (NaN would pass every
+      // comparison and silently disarm the gate). No upper clamp is needed —
+      // a huge ceiling is simply one that never fires — and the value is the
+      // operator's own number (1400), not a calibrated one.
+      const v = Number(env.ORGANIC_MAX_TRADERS_H1 ?? 1400);
+      return Number.isFinite(v) && v > 0 ? v : 0;
     })(),
     crimeWallets: {
       enabled: (env.CRIME_WALLETS_ENABLED ?? "true") !== "false",

@@ -2012,7 +2012,11 @@ export interface ScanSummary {
     liqRatio: number;
     /** Jupiter's own suspicion flag (audit.isSus) blocked the push. */
     sus: number;
-    /** Jupiter's organic score (ORGANIC_MIN_SCORE) fell below the floor. */
+    /**
+     * Jupiter's organic gates rejected the coin — the score floor
+     * (ORGANIC_MIN_SCORE) or the 1h-trader ceiling (ORGANIC_MAX_TRADERS_H1).
+     * One counter for both: the reject log carries which one (and the number).
+     */
     organic: number;
     other: number;
   };
@@ -2283,9 +2287,44 @@ export function organicMinBlockReason(
 }
 
 /**
- * Verdict of the TWO Jupiter block gates — `audit.isSus` (JUP_SUS_BLOCK) and
- * the organic-score floor (ORGANIC_MIN_SCORE) — from ONE reading, so a caller
- * can apply both judgements wherever the reading is read.
+ * Jupiter 1h-trader CEILING (ORGANIC_MAX_TRADERS_H1).
+ *
+ * The 🌱 有機度 line's other half — `| 1h 交易者 243` — rides the SAME
+ * fetchOrganicScore payload the score floor reads, so this gate costs no
+ * request, key or provider either: it only changes what a reading means. It is
+ * an ANTI-CROWDING ceiling, not a quality floor — the operator wants the coins
+ * nobody has piled into yet — so a count AT or ABOVE the ceiling blocks
+ * ("少於 1400 才推送": the boundary belongs to the rejection side, exactly like
+ * the score floor's `>= minScore` pass side is its mirror image).
+ *
+ * FAIL-OPEN is the whole contract for missing data ("沒有這項數據才推送"), in
+ * every shape one takes:
+ *   - `tradersH1 === null` — Jupiter omitted the field. Never judged. (A
+ *     genuine 0 is a NUMBER and passes the ceiling anyway.)
+ *   - a NON-1h window — fetchOrganicScore falls back to the 6h then 24h count
+ *     when the trailing hour has no trades, and a 24h count is STRUCTURALLY
+ *     larger than the figure this ceiling is about, so the fallback is treated
+ *     as "the 1h figure is missing" rather than judged on the wrong window.
+ *     The card keeps PRINTING the window it has; only the gate ignores it.
+ *   - `maxTraders <= 0` — the gate is off.
+ */
+export function organicTradersBlockReason(
+  tradersH1: number | null,
+  tradersWindow: "1h" | "6h" | "24h" | null,
+  maxTraders: number,
+): string | null {
+  if (!(maxTraders > 0)) return null;
+  if (tradersWindow !== "1h") return null;
+  if (tradersH1 === null || !Number.isFinite(tradersH1)) return null;
+  if (tradersH1 < maxTraders) return null;
+  return `1h 交易者 ${tradersH1.toLocaleString("en-US")} ≥ ${maxTraders}（已經太多人參與，唔追呢一浸）`;
+}
+
+/**
+ * Verdict of the THREE Jupiter block gates — `audit.isSus` (JUP_SUS_BLOCK),
+ * the organic-score floor (ORGANIC_MIN_SCORE) and the 1h-trader ceiling
+ * (ORGANIC_MAX_TRADERS_H1) — from ONE reading, so a caller can apply every
+ * judgement wherever the reading is read.
  *
  * WHY IT IS A SEPARATE CALLABLE (2026-10-01). The reading is fetched by the
  * 🌱 有機度 card slot, which is LATE-BOUND: the chain judges it once before the
@@ -2314,8 +2353,16 @@ export function jupiterGateVerdict(
     label: string | null;
     sus: boolean;
     devBalancePct: number | null;
+    /** The 🌱 line's other half (see organicTradersBlockReason). */
+    tradersH1?: number | null;
+    tradersWindow?: "1h" | "6h" | "24h" | null;
   } | null,
-  config: { jupSusBlock: boolean; organicMinScore: number },
+  config: {
+    jupSusBlock: boolean;
+    organicMinScore: number;
+    /** Absent = off (fail-open): the default lives in loadConfig. */
+    organicMaxTradersH1?: number;
+  },
 ): { gate: "sus" | "organic"; reason: string } | null {
   if (config.jupSusBlock) {
     const reason = jupSusBlockReason(
@@ -2329,7 +2376,13 @@ export function jupiterGateVerdict(
     reading?.label ?? null,
     config.organicMinScore,
   );
-  return reason ? { gate: "organic", reason } : null;
+  if (reason) return { gate: "organic", reason };
+  const tradersReason = organicTradersBlockReason(
+    reading?.tradersH1 ?? null,
+    reading?.tradersWindow ?? null,
+    config.organicMaxTradersH1 ?? 0,
+  );
+  return tradersReason ? { gate: "organic", reason: tradersReason } : null;
 }
 
 /**
@@ -5753,13 +5806,16 @@ export class Scanner {
         // Sited before the wallet analysis and the Flurry gate on purpose: a
         // flagged coin then saves the chain's two most expensive legs.
         //
-        // The ORGANIC-SCORE gate (ORGANIC_MIN_SCORE) reads the SAME awaited
-        // reading — one await, two judgements — so it also costs nothing extra
-        // and also blocks in front of the expensive legs. Awaited only when one
-        // of the two gates is on, so a configuration with both off still never
+        // The ORGANIC-SCORE gate (ORGANIC_MIN_SCORE) and the 1h-trader
+        // ceiling (ORGANIC_MAX_TRADERS_H1) read the SAME awaited reading —
+        // one await, three judgements — so they also cost nothing extra and
+        // also block in front of the expensive legs. Awaited only when one of
+        // the gates is on, so a configuration with all of them off still never
         // waits here (the slot stays purely display-bound, as it was).
         const jupReading =
-          this.config.jupSusBlock || this.config.organicMinScore > 0
+          this.config.jupSusBlock ||
+          this.config.organicMinScore > 0 ||
+          this.config.organicMaxTradersH1 > 0
             ? await this.bestEffort(() => organicSlot, chainDeadline, null)
             : null;
         // The LEG-SAVING pass of the two Jupiter gates (see
@@ -6521,11 +6577,14 @@ export class Scanner {
       label: string | null;
       sus: boolean;
       devBalancePct: number | null;
+      tradersH1?: number | null;
+      tradersWindow?: "1h" | "6h" | "24h" | null;
     } | null,
   ): boolean {
     const verdict = jupiterGateVerdict(reading, {
       jupSusBlock: this.config.jupSusBlock,
       organicMinScore: this.config.organicMinScore,
+      organicMaxTradersH1: this.config.organicMaxTradersH1,
     });
     if (!verdict) return false;
     const symbol = coin.profile.symbol ?? coin.pair.baseToken.symbol;
@@ -6536,7 +6595,7 @@ export class Scanner {
     } else {
       diag.fails.organic++;
       this.addReject(diag, coin, verdict.reason);
-      console.log(`[scanner] blocked ${symbol} (organic score below floor)`);
+      console.log(`[scanner] blocked ${symbol} (organic gate: ${verdict.reason})`);
     }
     return true;
   }

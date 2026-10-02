@@ -29,7 +29,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, jupiterGateVerdict, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -9347,6 +9347,90 @@ async function main() {
     assert.equal(loadConfig({ ORGANIC_MIN_SCORE: "9000" }).organicMinScore, 100, "clamped to the score's own scale");
   });
 
+  await test("ORGANIC_MAX_TRADERS_H1: the 1h-trader ceiling blocks at 1400, and missing data pushes", () => {
+    // Operator rule (2026-10-02): the 🌱 有機度 line's other half becomes a push
+    // gate — "少於 1400 才推送，沒有這項數據才推送". It reads the SAME payload
+    // as the score floor (one request, three judgements), and it keeps that
+    // gate's fail-open discipline for every shape a missing reading takes.
+    assert.equal(organicTradersBlockReason(243, "1h", 1400), null, "an ordinary reading passes");
+    assert.equal(organicTradersBlockReason(1399, "1h", 1400), null, "one below the ceiling passes");
+    assert.match(
+      organicTradersBlockReason(1400, "1h", 1400),
+      /1,400 ≥ 1400/,
+      "the boundary blocks: the operator's rule is `less than`",
+    );
+    assert.match(organicTradersBlockReason(5000, "1h", 1400), /5,000 ≥ 1400/);
+    assert.equal(organicTradersBlockReason(0, "1h", 1400), null, "a genuine 0 is a reading and passes");
+    // Missing data never judges: the field Jupiter omitted, a NON-1h window
+    // (the 6h/24h fallback is structurally larger, so it is not this ceiling's
+    // metric — the card still prints it), and the gate switched off.
+    assert.equal(organicTradersBlockReason(null, "1h", 1400), null, "field absent never judges");
+    assert.equal(organicTradersBlockReason(99999, "6h", 1400), null, "the 6h fallback is not the 1h figure");
+    assert.equal(organicTradersBlockReason(99999, "24h", 1400), null, "nor is the 24h one");
+    assert.equal(organicTradersBlockReason(99999, null, 1400), null, "no window = no judgement");
+    assert.equal(organicTradersBlockReason(Number.NaN, "1h", 1400), null, "NaN is not a reading");
+    assert.equal(organicTradersBlockReason(99999, "1h", 0), null, "0 is OFF");
+    // …and it reaches the push through the ONE verdict both call sites use
+    // (the early leg-saving pass and the last-call render judgement).
+    const on = { jupSusBlock: true, organicMinScore: 55, organicMaxTradersH1: 1400 };
+    const crowded = {
+      score: 80,
+      label: "high",
+      sus: false,
+      devBalancePct: null,
+      tradersH1: 1400,
+      tradersWindow: "1h",
+    };
+    assert.equal(jupiterGateVerdict(crowded, on).gate, "organic");
+    assert.match(jupiterGateVerdict(crowded, on).reason, /交易者/);
+    assert.equal(jupiterGateVerdict({ ...crowded, tradersH1: 1399 }, on), null);
+    assert.equal(
+      jupiterGateVerdict({ ...crowded, tradersWindow: "24h" }, on),
+      null,
+      "the fallback window fails open",
+    );
+    assert.equal(jupiterGateVerdict({ ...crowded, tradersH1: null }, on), null, "a missing count fails open");
+    // The existing order is unchanged where the reasons overlap: sus first,
+    // then the score floor, then this ceiling.
+    assert.equal(jupiterGateVerdict({ ...crowded, score: 0 }, on).reason, organicMinBlockReason(0, "high", 55));
+    assert.equal(jupiterGateVerdict({ ...crowded, sus: true }, on).gate, "sus");
+    // An ABSENT ceiling is off (fail-open), never an implicit 1400 — the
+    // default lives in loadConfig, so a caller that forgets the field cannot
+    // silently start blocking.
+    assert.equal(jupiterGateVerdict(crowded, { jupSusBlock: false, organicMinScore: 0 }), null);
+  });
+
+  await test("ORGANIC_MAX_TRADERS_H1: default 1400, 0 and junk disable, and the gate is wired", () => {
+    assert.equal(loadConfig({}).organicMaxTradersH1, 1400, "unset ships the operator's 1400");
+    assert.equal(
+      loadConfig({ ORGANIC_MAX_TRADERS_H1: "800" }).organicMaxTradersH1,
+      800,
+      "the dial is the operator's",
+    );
+    assert.equal(loadConfig({ ORGANIC_MAX_TRADERS_H1: "0" }).organicMaxTradersH1, 0, "0 is OFF");
+    assert.equal(loadConfig({ ORGANIC_MAX_TRADERS_H1: "nope" }).organicMaxTradersH1, 0, "junk fails closed");
+    assert.equal(loadConfig({ ORGANIC_MAX_TRADERS_H1: "-5" }).organicMaxTradersH1, 0, "below zero is OFF too");
+    // Wiring pins, read off the stripped source: a gate that is configured but
+    // never consulted is the failure this file exists to catch. The two rows
+    // are the only places the field has to appear — the verdict (which both
+    // judgement moments share) and the condition that decides whether the
+    // late-bound slot is awaited at all.
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8").replace(/\s+/g, "");
+    const scannerSrc = read("src/scanner.ts");
+    assert.equal(
+      scannerSrc.includes("organicMaxTradersH1:this.config.organicMaxTradersH1,"),
+      true,
+      "jupiterGatesBlocked must hand the ceiling to the one verdict",
+    );
+    assert.equal(
+      scannerSrc.includes(
+        "this.config.jupSusBlock||this.config.organicMinScore>0||this.config.organicMaxTradersH1>0",
+      ),
+      true,
+      "the late-bound organic slot must be awaited when this gate is the only one on",
+    );
+  });
+
   await test("organic gate: a coin it blocks can never be enrolled in the tracking pool", () => {
     // Operator rule (2026-10-01). It is already guaranteed, and by CONSTRUCTION
     // rather than by a flag: the push_watch table has exactly one writer,
@@ -9392,7 +9476,7 @@ async function main() {
     );
   });
 
-  await test("the Jupiter gates are judged twice — early for the legs, again at the render — and both calls share one verdict function", () => {
+  await test("the Jupiter gates are judged twice — early for the legs, again at the render — and both calls share one verdict function (three judgements, one await)", () => {
     // The reading is FREE (the card's 🌱 有機度 payload), so neither call adds
     // a request: one slot await, one verdict function. The EARLY call keeps
     // the leg-saving siting; the RENDER call is the 2026-10-01 fix — the
@@ -9407,9 +9491,20 @@ async function main() {
       1,
       "exactly one await of the organic slot — the two gates share it",
     );
+    // The shared await is only paid when one of the gates is on — and there are
+    // THREE of them since 2026-10-02 (the 1h-trader ceiling rides the same
+    // reading). The pin reads the condition's own clauses instead of its line
+    // breaks, and requires all three: a gate that is configured but never
+    // given a reading is exactly the failure mode this file pins.
+    const jupAwaitGuard = src.slice(
+      src.indexOf("const jupReading ="),
+      src.indexOf("? await this.bestEffort(() => organicSlot, chainDeadline, null)"),
+    );
     assert.ok(
-      src.includes("this.config.jupSusBlock || this.config.organicMinScore > 0"),
-      "the shared await is only paid when one of the two gates is on",
+      jupAwaitGuard.includes("this.config.jupSusBlock") &&
+        jupAwaitGuard.includes("this.config.organicMinScore > 0") &&
+        jupAwaitGuard.includes("this.config.organicMaxTradersH1 > 0"),
+      "the shared await is only paid when one of the gates is on",
     );
     assert.ok(
       src.includes("export function jupiterGateVerdict(") &&
