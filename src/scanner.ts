@@ -1419,6 +1419,12 @@ export interface MaintenancePassStamp {
   backfill: number;
   /** Whether the crime-wallet list answered ok this pass. */
   crime: boolean;
+  /**
+   * Which region the invoking delivery ran in (see PassRelayTag and worker.ts's
+   * relay block). Omitted when the caller cannot say, so a caller with no
+   * answer keeps the stamp's old shape.
+   */
+  relay?: PassRelayTag;
 }
 
 /**
@@ -1441,6 +1447,7 @@ export function parseMaintenanceStamp(
       at?: unknown;
       backfill?: unknown;
       crime?: unknown;
+      relay?: unknown;
     };
     const at =
       typeof parsed.at === "number" && Number.isFinite(parsed.at) && parsed.at > 0
@@ -1451,7 +1458,21 @@ export function parseMaintenanceStamp(
       typeof parsed.backfill === "number" && Number.isFinite(parsed.backfill)
         ? parsed.backfill
         : 0;
-    return { at, backfill, crime: parsed.crime === true };
+    // The relay reading is validated and passed through ONLY when present —
+    // the same shape rule the writers use, so a row without one parses to the
+    // byte-identical object /health served before the relay existed.
+    const relay =
+      parsed.relay === "inner" ||
+      parsed.relay === "failed" ||
+      parsed.relay === "skipped"
+        ? parsed.relay
+        : undefined;
+    return {
+      at,
+      backfill,
+      crime: parsed.crime === true,
+      ...(relay ? { relay } : {}),
+    };
   } catch {
     return null;
   }
@@ -2045,6 +2066,13 @@ export interface ScanSummary {
   maintFresh?: boolean;
   /** Age of the maintenance pass row in ms, or null when absent/unreadable. */
   maintAgeMs?: number | null;
+  /**
+   * Which region the LAST maintenance invocation ran in (see PassRelayTag and
+   * worker.ts's relay block), read from its stamp: "inner" = the placed fetch
+   * invocation a cron relay drove, "failed"/"skipped" = its local fallback.
+   * Null = the row carries no reading (never relayed, or an older stamp).
+   */
+  maintRelay?: PassRelayTag | null;
   /** Per-coin rejection trace for the last scan, EVAL stage (bounded — see
    * REJECT_LOG_MAX). Filled first, so the push-stage reasons are in their own
    * ring below rather than competing with it. */
@@ -2431,6 +2459,16 @@ function describePushError(err: unknown): PushErrorInfo {
 }
 
 /**
+ * Where the invocation that ran a pass actually ran — the relay's durable
+ * reading (see worker.ts's relay block). "inner" = the placed fetch
+ * invocation a cron relay drove (next to the database); "failed" / "skipped"
+ * = the cron ran the pass in its own region because the relay could not (or
+ * was not configured to). Carried into the pass row and the maintenance
+ * stamp only when a caller provides it.
+ */
+export type PassRelayTag = "inner" | "failed" | "skipped";
+
+/**
  * How a tracker pass was started (see Scanner.runTrackerPass, and
  * worker.TRACKER_CRON for the two owners).
  */
@@ -2448,6 +2486,12 @@ export interface TrackerPassRunOptions {
    * does not say (every test), which keeps the row's shape unchanged.
    */
   via?: "cron-pass" | "tick";
+  /**
+   * Which region this pass's invocation ran in (see PassRelayTag and
+   * worker.ts's relay block), recorded in the row for the same reason `via`
+   * is. Omitted by a caller that cannot say.
+   */
+  relay?: PassRelayTag;
 }
 
 export class Scanner {
@@ -3229,6 +3273,12 @@ export class Scanner {
    */
   async runMaintenanceJobs(
     deadlineMs: number,
+    /**
+     * Where the invoking delivery ran (see PassRelayTag and worker.ts's relay
+     * block): "inner" = the placed fetch invocation a cron relay drove. The
+     * stamp carries it when provided; omitted for callers that cannot say.
+     */
+    relay?: PassRelayTag,
   ): Promise<MaintenancePassStamp | null> {
     const startedAt = Date.now();
     const left = (): number => deadlineMs - Date.now();
@@ -3291,7 +3341,12 @@ export class Scanner {
         );
       }
     }
-    const stamp: MaintenancePassStamp = { at: Date.now(), backfill, crime };
+    const stamp: MaintenancePassStamp = {
+      at: Date.now(),
+      backfill,
+      crime,
+      ...(relay ? { relay } : {}),
+    };
     try {
       // No scanFront in this invocation (runScan never ran), so stampFront
       // writes the row directly — awaited, so the window the tick checks opens
@@ -3388,7 +3443,13 @@ export class Scanner {
           this.lastSummary.pushWatch = cutNote;
           this.lastSummary.trackerMs = Date.now() - startedAt;
         }
-        await this.persistPassNote(cutNote, startedAt, "cut", options?.via);
+        await this.persistPassNote(
+          cutNote,
+          startedAt,
+          "cut",
+          options?.via,
+          options?.relay,
+        );
         return cutNote;
       }
       const passDbMs = this.exitTickDbLeash();
@@ -3413,7 +3474,13 @@ export class Scanner {
         );
         this.lastSummary.trackerMs = Date.now() - startedAt;
       }
-      await this.persistPassNote(note, startedAt, "done", options?.via);
+      await this.persistPassNote(
+        note,
+        startedAt,
+        "done",
+        options?.via,
+        options?.relay,
+      );
       return note;
     } catch (err) {
       this.exitTickDbLeash();
@@ -3454,7 +3521,13 @@ export class Scanner {
       // indistinguishable from a tick that never reached the pass at all
       // (2026-09-21 04:03-04:05Z: fast ticks, no note, no way to tell the two
       // apart without the Cloudflare log the operator cannot read).
-      await this.persistPassNote(errNote, startedAt, "done", options?.via);
+      await this.persistPassNote(
+        errNote,
+        startedAt,
+        "done",
+        options?.via,
+        options?.relay,
+      );
       return null;
     }
   }
@@ -3537,6 +3610,11 @@ export class Scanner {
      * that does not (every test, and any older caller) keeps its exact shape.
      */
     via?: "cron-pass" | "tick",
+    /**
+     * Which region this pass's invocation ran in (see PassRelayTag and
+     * worker.ts's relay block). Same caller-says-it rule as `via`.
+     */
+    relay?: PassRelayTag,
   ): Promise<void> {
     // AWAITED, not raced. The race this replaces resolved at its bound while the
     // write was still in flight, and an abandoned promise is CANCELLED the
@@ -3559,6 +3637,9 @@ export class Scanner {
           // ownership clock (see passRowAgeMs) never has to parse a field it
           // does not use and the row a test writes stays byte-for-byte the same.
           ...(via ? { via } : {}),
+          // Same rule for the relay reading: a caller that cannot say leaves
+          // no field, and a reader that does not care never sees one.
+          ...(relay ? { relay } : {}),
         }),
       );
     } catch {
@@ -4048,6 +4129,11 @@ export class Scanner {
       );
       diag.maintFresh = maintFresh;
       diag.maintAgeMs = maintenancePassAgeMs(maintRaw, Date.now());
+      // WHICH REGION THE LAST MAINTENANCE DELIVERY RAN IN (see worker.ts's
+      // relay block): the stamp carries the reading, and this one line
+      // republishes it on the tick's summary so the relay is verifiable from
+      // /health without a Cloudflare log.
+      diag.maintRelay = parseMaintenanceStamp(maintRaw)?.relay ?? null;
 
       // Re-eval pool read + token_stats prune, dispatched HERE — with the feed
       // fan-out rather than after it. The read depends on `chats` (read from

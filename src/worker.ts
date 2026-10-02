@@ -181,6 +181,7 @@ interface Env {
   HELIUS_API_KEY?: string;
   SCAN_INTERVAL_SECONDS?: string;
   SCAN_PROFILE_LIMIT?: string;
+  CRON_RELAY_URL?: string;
 }
 
 /** Minimal ScheduledEvent shape — avoids pulling in workers-types. */
@@ -4210,6 +4211,12 @@ async function ensureInitialized(env: Env): Promise<void> {
  * scan's leftovers to it: measured live, the tick's pass ran on 0-6 of them
  * (`ok:0/0 deferred:subreq-budget`, `defer-send N subreq-cut N`).
  *
+ * RUNS WHERE THE RELAY PUTS IT (2026-10-02): the delivery's first move is its
+ * relay to the placed fetch path (see the relay block at the bottom), so in
+ * the healthy shape this body executes at NRT beside the database; the
+ * relay's local fallback calls the same body in the cron region. Which one ran
+ * is written into the pass row as `relay` (cronRelayOutcome).
+ *
  * WHY THE PASS STILL HAS A FALLBACK: this trigger's expression is new, and
  * this platform has silently stopped delivering cron events to this Worker
  * before (docs/uptime-monitor.md). The pass's durable row IS the ownership
@@ -4236,7 +4243,10 @@ async function runTrackerInvocation(env: Env): Promise<void> {
       Date.now() + TRACKER_PASS_BUDGET_MS,
       hold ? (p: Promise<unknown>) => hold(p) : undefined,
       subreqRemaining,
-      { via: "cron-pass" },
+      // Where this invocation ran (see the relay block): the pass row carries
+      // it, so "the relay worked" is durable even though the pass writes no
+      // scan heartbeat. Null (a direct manual call) omits the field.
+      { via: "cron-pass", relay: cronRelayOutcome ?? undefined },
     );
   } catch (err) {
     // A pass can also be killed mid-flight (no catch ever runs), which is why
@@ -4262,6 +4272,11 @@ async function runTrackerInvocation(env: Env): Promise<void> {
  * delivery that never scans must not move them (the rule runTrackerInvocation
  * documents for the same reason).
  *
+ * RUNS WHERE THE RELAY PUTS IT (2026-10-02): like the pass above, the
+ * delivery relays itself to the placed fetch path first (see the relay
+ * block), and this body is both the placed replay's implementation and the
+ * local fallback; the stamp it writes carries `relay`.
+ *
  * WHY THIS IS SAFE TO SPLIT AT ALL: neither leg's result is consumed by the
  * invocation that produced it. The backfill seeds unseen coins into token_stats
  * and the crime refresh persists the blocklist for the fleet to hydrate, so the
@@ -4282,7 +4297,12 @@ async function runMaintenanceInvocation(env: Env): Promise<void> {
   // what tells the tick to fall back — which it will, on the next tick.
   if (!scanner) return;
   try {
-    await scanner.runMaintenanceJobs(Date.now() + MAINTENANCE_BUDGET_MS);
+    await scanner.runMaintenanceJobs(
+      Date.now() + MAINTENANCE_BUDGET_MS,
+      // Where this invocation ran (see the relay block): the maintenance stamp
+      // carries it, and the next tick republishes it as diag.maintRelay.
+      cronRelayOutcome ?? undefined,
+    );
   } catch (err) {
     console.error(
       "[worker] maintenance invocation failed:",
@@ -4967,7 +4987,7 @@ async function runScan(
             // pre-relay shape. Null = an HTTP/manual scan or a placement
             // propagation window. Read together with `colo` above: a relayed
             // tick is "inner" + NRT, a fallen-back one "failed" + ORD.
-            relay: scanRelayOutcome,
+            relay: cronRelayOutcome,
             ok: lastScanOk,
             phase: "done",
             count: scanCount,
@@ -5689,17 +5709,21 @@ async function maybeRunScanIfStale(
 
 /**
  * ============================================================================
- * THE CRON SCAN TICK'S RELAY INTO THE PLACED FETCH PATH (2026-10-02)
+ * THE CRON DELIVERIES' RELAY INTO THE PLACED FETCH PATH (2026-10-02)
  * ============================================================================
  *
- * WHAT IT IS. Every scan cron delivery ("* * * * *") now runs its tick through
- * ONE HTTP request to this Worker's own public URL, so the tick executes on
- * the placed FETCH path instead of in the cron region. Nothing about the tick
- * changes: the placed invocation replays the same delivery by calling
- * `worker.scheduled({ cron: SCAN_CRON }, env, ctx, { relay: false })`, so it
- * gets the same beginPreTick window, waitUntil, pre-init arrival stamp,
- * cadence gate, outage check and runScan the platform's own delivery would run
- * — only the data center differs.
+ * WHAT IT IS. Every cron delivery — the scan tick, the tracker pass and the
+ * maintenance legs (SCAN_CRON / TRACKER_CRON / MAINTENANCE_CRON) — runs its
+ * work through ONE HTTP request to this Worker's own public URL, so the work
+ * executes on the placed FETCH path instead of in the cron region. Nothing
+ * about a delivery changes: the placed invocation replays the same delivery
+ * by calling `worker.scheduled({ cron }, env, ctx, { relay: false })`, so it
+ * gets the same beginPreTick window, waitUntil, routing (tracker / maintenance
+ * / scan), pre-init arrival stamp, cadence gate and runScan the platform's own
+ * delivery would run — only the data center differs. WHICH delivery arrives
+ * travels in the x-cron-relay-delivery header; the placed route maps it back
+ * to THIS module's own cron constant (see DELIVERY_CRONS), so the wire never
+ * carries a cron string the handler has to trust.
  *
  * WHY (measured 2026-10-02). `[placement]` pins the FETCH path to NRT, next to
  * the Turso database (aws-ap-northeast-1), and its statements collapsed 12-15x
@@ -5714,23 +5738,36 @@ async function maybeRunScanIfStale(
  * WHY AN HTTP RELAY AND NOT A DURABLE OBJECT (yet): the DO option buys
  * sub-minute cadence and single-owner state, but it also moves the scanner's
  * module state (rings, caches, mirrors) into a DO and rewrites every
- * diagnostic that reads them. The relay is one route and one call site, and
- * leaves tick legs, heartbeat and rings working unchanged. It does NOT relay
- * the tracker or maintenance deliveries — they run no scan, and moving them
- * is a separate change with its own measurement.
+ * diagnostic that reads them. The relay is one route and one call site per
+ * delivery, and leaves tick legs, heartbeat and rings working unchanged.
  *
- * FAIL-SAFE, IN ORDER: no SCAN_RELAY_URL (or no bot token to authenticate
- * with) -> "skipped", the tick runs locally; refused/timed-out/erroring relay
- * -> "failed", the same local tick the Worker has always run. A timed-out
- * relay can overlap the placed tick it gave up on — that is the same
- * cron-vs-HTTP overlap the DB scan lock and cadence gate already arbitrate
- * (the loser skips a tick; it cannot double-push). The rollback is deleting
- * the var; the cron path never depended on the relay.
+ * WHY THE TRACKER AND MAINTENANCE DELIVERIES RELAY TOO (2026-10-02, the
+ * follow-up the first cut named as its own change). They run no scan, but
+ * their DB cost is the same shape: the tracker pass's durable note read
+ * `db 738ms` per pass at ORD — a chain of round trips the placed path answers
+ * in single-digit ms — and the maintenance legs write their token_stats
+ * batches and the crime list from the same distance. So each delivery relays
+ * itself; the routing is unchanged, because the replayed delivery enters the
+ * SAME branches the platform's own delivery does (see `scheduled`). Which
+ * region a run really happened in is durable, one marker per delivery: the
+ * pass row and the maintenance stamp carry `relay`, exactly like the scan
+ * heartbeat's field (see THE MARKER below).
+ *
+ * FAIL-SAFE, IN ORDER: no CRON_RELAY_URL (or no bot token to authenticate
+ * with) -> "skipped", the delivery runs locally; refused/timed-out/erroring
+ * relay -> "failed", the same local work the Worker has always run. A
+ * timed-out relay can overlap the placed invocation it gave up on — that is
+ * the same cron-vs-HTTP overlap the DB scan lock, the pass's
+ * claim+reservation batch and the cadence gate already arbitrate (the loser
+ * skips a tick; it cannot double-push). The rollback is deleting the var; no
+ * cron path depended on the relay.
  *
  * AUTH: the relay presents the bot token (TELEGRAM_BOT_TOKEN) in a header and
  * the route compares it. The route is public (workers.dev), so it must not
  * answer a caller that cannot present the configured secret — and it answers
- * 404 rather than 401 so it does not confirm its own existence.
+ * 404 rather than 401 so it does not confirm its own existence. An
+ * authenticated request naming a delivery that is not one of the three is
+ * answered 400, never replayed.
  *
  * CROSS-REGION ROUTING: Cloudflare's docs (error 1042) say a global fetch()
  * to another Worker on the same zone fails unless the
@@ -5738,12 +5775,18 @@ async function maybeRunScanIfStale(
  * wrangler.toml. Every other fetch this Worker makes targets a third-party
  * host, so the flag decides only how this relay is routed.
  *
- * THE MARKER: the completion heartbeat publishes `relay` — "inner" when the
- * placed invocation ran the tick, "failed"/"skipped" when the cron fell back
- * to its own region. That one field, read from /health, is what says whether
- * the relay is doing anything at all.
+ * THE MARKER: every delivery that runs leaves a durable `relay` reading of
+ * its own — the scan completion heartbeat, the tracker pass row
+ * (Scanner.persistPassNote) and the maintenance stamp
+ * (scanner.MAINTENANCE_PASS_STATE_KEY, surfaced on the next tick as
+ * summary.diag.maintRelay). "inner" = the placed fetch invocation a relay
+ * drove; "failed"/"skipped" = the cron ran the work in its OWN region because
+ * the relay could not (or was not configured to) — the pre-relay shape; null =
+ * a scan written by a path that was not a cron delivery. Read together with
+ * `colo` where the row carries one: a relayed run is "inner" + NRT, a
+ * fallen-back one "failed" + ORD.
  */
-export const SCAN_RELAY_PATH = "/internal/scan-tick";
+export const CRON_RELAY_PATH = "/internal/cron-relay";
 /**
  * The scan tick's own expression (wrangler.toml [triggers].crons, FIRST
  * entry). Replayed into the relayed invocation so it routes to the SCAN
@@ -5752,32 +5795,49 @@ export const SCAN_RELAY_PATH = "/internal/scan-tick";
  */
 export const SCAN_CRON = "* * * * *";
 /**
- * How long the cron waits for the placed tick before giving up and running
- * the tick locally: above the tick's own 20s envelope (SCAN_TICK_BUDGET_MS),
- * so only a wedged invocation falls back (a healthy tick settles at 2-4s),
- * and far inside the 15-minute Cron Trigger duration limit — the cron only
- * sits on a fetch here, its own CPU stays at the ~33ms the tick measures.
+ * The three deliveries the relay can carry, and the canonical expression each
+ * one replays. A delivery is NAMED on the wire (CRON_RELAY_DELIVERY_HEADER)
+ * and mapped here, so the placed route never replays a caller-supplied cron
+ * string: an authenticated caller can only ask for one of these three, and a
+ * scan tick keeps arriving as SCAN_CRON.
  */
-const SCAN_RELAY_BOUND_MS = 26_000;
-/** The header the placed route authenticates (see handleScanRelay). */
-const SCAN_RELAY_HEADER = "x-scan-relay";
+export type CronRelayDelivery = "scan" | "tracker" | "maintenance";
+export const DELIVERY_CRONS: Record<CronRelayDelivery, string> = {
+  scan: SCAN_CRON,
+  tracker: TRACKER_CRON,
+  maintenance: MAINTENANCE_CRON,
+};
 /**
- * Last relay outcome in THIS isolate, published on the completion heartbeat
- * (see the marker note above). "inner" is set by the route while it drives
- * the placed tick and CLEARED when the tick returns, so another invocation
- * cannot inherit it; "failed"/"skipped" are set by the cron immediately
- * before it falls through to the local tick, so the tick that actually ran
- * names why it ran there.
+ * How long a cron waits for the placed invocation before giving up and
+ * running the work locally: above every relayed envelope (the scan tick's 20s
+ * SCAN_TICK_BUDGET_MS, the tracker pass's 5s budget, the maintenance pass's
+ * 6s), so only a wedged invocation falls back (healthy runs settle in 1-4s),
+ * and far inside the 15-minute Cron Trigger duration limit — the cron only
+ * sits on a fetch here, its own CPU stays tiny.
  */
-let scanRelayOutcome: "inner" | "failed" | "skipped" | null = null;
+const CRON_RELAY_BOUND_MS = 26_000;
+/** The header the placed route authenticates (see handleCronRelay). */
+const CRON_RELAY_HEADER = "x-cron-relay";
+/** The header naming which delivery to replay (see DELIVERY_CRONS). */
+const CRON_RELAY_DELIVERY_HEADER = "x-cron-relay-delivery";
+/**
+ * Last relay outcome in THIS isolate, published on every durable row the
+ * delivery writes: the scan completion heartbeat, the tracker pass row and
+ * the maintenance stamp (both passed in by the invocations below). "inner" is
+ * set by the route while it drives the placed run and CLEARED when it
+ * returns, so another invocation cannot inherit it; "failed"/"skipped" are
+ * set by the cron immediately before it falls through to the local work, so
+ * the run that actually happened names why it ran there.
+ */
+let cronRelayOutcome: "inner" | "failed" | "skipped" | null = null;
 
 /** Pure: the relay URL for a configured base (trailing slashes tolerated). */
-export function scanRelayUrl(base: string): string {
-  return `${base.replace(/\/+$/, "")}${SCAN_RELAY_PATH}`;
+export function cronRelayUrl(base: string): string {
+  return `${base.replace(/\/+$/, "")}${CRON_RELAY_PATH}`;
 }
 
-/** Pure: does this request carry the relay secret? (see handleScanRelay) */
-export function isScanRelayRequest(
+/** Pure: does this request carry the relay secret? (see handleCronRelay) */
+export function isCronRelayRequest(
   method: string,
   presented: string | null,
   token: string | undefined,
@@ -5790,47 +5850,62 @@ export function isScanRelayRequest(
   );
 }
 
+/** Pure: the delivery a relay request names, or null for an unknown one. */
+export function parseCronRelayDelivery(
+  value: string | null | undefined,
+): CronRelayDelivery | null {
+  return value === "scan" || value === "tracker" || value === "maintenance"
+    ? value
+    : null;
+}
+
 /**
- * The cron half: run this delivery's tick through the placed fetch path.
- * Returns true when the placed invocation ran it (the caller must NOT run the
- * local tick), false when the caller must fall through to the local tick —
- * unconfigured, refused, timed out or errored, with `scanRelayOutcome` naming
+ * The cron half: run this delivery through the placed fetch path. Returns
+ * true when the placed invocation ran it (the caller must NOT run the local
+ * work), false when the caller must fall through to the local work —
+ * unconfigured, refused, timed out or errored, with `cronRelayOutcome` naming
  * which of those it was.
  */
-async function relayScanTick(env: Env): Promise<boolean> {
-  const base = env.SCAN_RELAY_URL;
+async function relayCronDelivery(
+  env: Env,
+  delivery: CronRelayDelivery,
+): Promise<boolean> {
+  const base = env.CRON_RELAY_URL;
   const secret = env.TELEGRAM_BOT_TOKEN;
   if (!base || !secret) {
-    scanRelayOutcome = "skipped";
+    cronRelayOutcome = "skipped";
     return false;
   }
   try {
-    const res = await fetch(scanRelayUrl(base), {
+    const res = await fetch(cronRelayUrl(base), {
       method: "POST",
-      headers: { [SCAN_RELAY_HEADER]: secret },
-      signal: AbortSignal.timeout(SCAN_RELAY_BOUND_MS),
+      headers: {
+        [CRON_RELAY_HEADER]: secret,
+        [CRON_RELAY_DELIVERY_HEADER]: delivery,
+      },
+      signal: AbortSignal.timeout(CRON_RELAY_BOUND_MS),
     });
     if (!res.ok) {
-      scanRelayOutcome = "failed";
+      cronRelayOutcome = "failed";
       console.error(
-        `[worker] scan relay answered ${res.status}; running the tick in the cron region`,
+        `[worker] ${delivery} relay answered ${res.status}; running it in the cron region`,
       );
       return false;
     }
     const body = (await res.json().catch(() => null)) as { ms?: number } | null;
-    // Log-only; the durable proof is the placed tick's own heartbeat
-    // (`relay: "inner"` + its NRT colo). `cf-placement` rides the response
-    // and is visible only to the caller — the placed handler cannot read its
-    // own placement, which is why /debug/db-latency's colo note warns against
-    // reading it there.
+    // Log-only; the durable proof is the run's own row (`relay: "inner"`,
+    // plus its placed colo where the row carries one). `cf-placement` rides
+    // the response and is visible only to the caller — the placed handler
+    // cannot read its own placement, which is why /debug/db-latency's colo
+    // note warns against reading it there.
     console.log(
-      `[worker] scan relay: the placed tick ran in ${body?.ms ?? "?"}ms (${res.headers.get("cf-placement") ?? "no placement header"})`,
+      `[worker] ${delivery} relay: the placed invocation ran it in ${body?.ms ?? "?"}ms (${res.headers.get("cf-placement") ?? "no placement header"})`,
     );
     return true;
   } catch (err) {
-    scanRelayOutcome = "failed";
+    cronRelayOutcome = "failed";
     console.error(
-      "[worker] scan relay failed; running the tick in the cron region:",
+      `[worker] ${delivery} relay failed; running it in the cron region:`,
       err instanceof Error ? err.message : err,
     );
     return false;
@@ -5838,43 +5913,55 @@ async function relayScanTick(env: Env): Promise<boolean> {
 }
 
 /**
- * The placed half: authenticate the relay and replay a scan delivery through
- * the scheduled handler with `relay: false` (see `scheduled`), so the tick
- * runs with the platform's own entry semantics inside THIS placed invocation.
- * The response carries the tick's wall time for the cron's log, and never
- * anything the tick itself measured — those land in the heartbeat.
+ * The placed half: authenticate the relay, resolve the named delivery to this
+ * module's own cron constant and replay it through the scheduled handler with
+ * `relay: false` (see `scheduled`), so the work runs with the platform's own
+ * entry semantics inside THIS placed invocation. The response carries the
+ * wall time for the cron's log, and never anything the run itself measured —
+ * those land in its own durable row.
  */
-async function handleScanRelay(
+async function handleCronRelay(
   request: Request,
   env: Env,
   ctx: ExecutionContextLike,
 ): Promise<Response> {
   if (
-    !isScanRelayRequest(
+    !isCronRelayRequest(
       request.method,
-      request.headers.get(SCAN_RELAY_HEADER),
+      request.headers.get(CRON_RELAY_HEADER),
       env.TELEGRAM_BOT_TOKEN,
     )
   ) {
     return new Response("Not Found", { status: 404 });
   }
+  const delivery = parseCronRelayDelivery(
+    request.headers.get(CRON_RELAY_DELIVERY_HEADER),
+  );
+  if (!delivery) {
+    return Response.json(
+      { ok: false, error: "unknown relay delivery" },
+      { status: 400 },
+    );
+  }
   const startedAt = Date.now();
-  scanRelayOutcome = "inner";
+  cronRelayOutcome = "inner";
   try {
-    await worker.scheduled({ cron: SCAN_CRON }, env, ctx, { relay: false });
-    return Response.json({ ok: true, ms: Date.now() - startedAt });
+    await worker.scheduled({ cron: DELIVERY_CRONS[delivery] }, env, ctx, {
+      relay: false,
+    });
+    return Response.json({ ok: true, delivery, ms: Date.now() - startedAt });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error("[worker] relayed scan tick failed:", message);
+    console.error(`[worker] relayed ${delivery} run failed:`, message);
     return Response.json(
       { ok: false, error: message, ms: Date.now() - startedAt },
       { status: 500 },
     );
   } finally {
     // Never leave the marker standing: any other invocation this isolate
-    // serves (a webhook, a rescue scan) must not inherit "inner" from a tick
-    // it did not run.
-    scanRelayOutcome = null;
+    // serves (a webhook, a rescue scan) must not inherit "inner" from a run
+    // it did not do.
+    cronRelayOutcome = null;
   }
 }
 
@@ -5886,15 +5973,16 @@ const worker = {
   ): Promise<Response> {
     await ensureInitialized(env);
     const url = new URL(request.url);
-    // THE RELAY'S PLACED HALF (see the relay block at the bottom): the cron
-    // scan tick arrives here as an HTTP request to this Worker's own URL.
+    // THE RELAY'S PLACED HALF (see the relay block at the bottom): each cron
+    // delivery (scan tick / tracker pass / maintenance legs) arrives here as
+    // an HTTP request to this Worker's own URL.
     // Routed BEFORE the rescue-scanner arm below ON PURPOSE: the relayed
-    // invocation drives its own tick, and arming maybeRunScanIfStale beside
-    // it would let a rescue scan race that tick inside the same isolate (the
+    // invocation drives its own run, and arming maybeRunScanIfStale beside it
+    // would let a rescue scan race that run inside the same isolate (the
     // rescue's dedupe reads the heartbeat, and the case it exists for — a
     // previous tick that died — is exactly when that heartbeat is stale).
-    if (url.pathname === SCAN_RELAY_PATH) {
-      return handleScanRelay(request, env, ctx);
+    if (url.pathname === CRON_RELAY_PATH) {
+      return handleCronRelay(request, env, ctx);
     }
     // Keep the scanner alive independently of cron delivery. waitUntil keeps
     // the isolate alive until the background scan settles — a bare `void`
@@ -7955,7 +8043,7 @@ const worker = {
     ctx: ExecutionContextLike,
     /**
      * Present only when the caller is this Worker's OWN relay route (see
-     * handleScanRelay): `relay: false` says this invocation IS the placed
+     * handleCronRelay): `relay: false` says this invocation IS the placed
      * half of a relay and must not relay again. The platform calls this
      * method with three arguments; the relay route is the only four-argument
      * call site, and it always passes false.
@@ -7983,21 +8071,33 @@ const worker = {
     );
     tickWaitUntil = (promise) => ctx.waitUntil(promise);
     // THE TRACKER'S OWN DELIVERY (see TRACKER_CRON): the pass, and nothing
-    // else. It returns BEFORE scheduledTicks, the cron-arrival stamp and the
+    // else. First its relay attempt (see the relay block at the bottom): the
+    // pass's own durable note read `db 738ms` per pass in the cron region, all
+    // of it round trips the placed path answers in single-digit ms, so the
+    // pass is replayed there. On ANY relay failure the branch falls through to
+    // the same local pass the Worker always ran. After the relay attempt the
+    // local run returns BEFORE scheduledTicks, the cron-arrival stamp and the
     // cadence gate, because all three count SCAN arrivals — the injected
     // cadence gate and the outage check both compare them, so a delivery that
     // never scans must not move them. This delivery's own liveness is the pass
     // row it writes (see runTrackerInvocation, and the tick's fallback).
     if (isTrackerCron(event.cron)) {
+      if (opts?.relay !== false && (await relayCronDelivery(env, "tracker"))) {
+        return;
+      }
       await runTrackerInvocation(env);
       return;
     }
     // THE MAINTENANCE DELIVERY (see MAINTENANCE_CRON): same shape and the same
-    // reason as the pass above — it returns BEFORE scheduledTicks, the
-    // cron-arrival stamp and the cadence gate, because all three count SCAN
-    // arrivals. Its own liveness is the row it writes, and the tick's fallback
-    // is what makes a missed delivery cost freshness instead of a leg.
+    // reason as the pass above — relay first, then the local legs — and the
+    // local run returns BEFORE scheduledTicks, the cron-arrival stamp and the
+    // cadence gate, because all three count SCAN arrivals. Its own liveness is
+    // the row it writes, and the tick's fallback is what makes a missed
+    // delivery cost freshness instead of a leg.
     if (isMaintenanceCron(event.cron)) {
+      if (opts?.relay !== false && (await relayCronDelivery(env, "maintenance"))) {
+        return;
+      }
       await runMaintenanceInvocation(env);
       return;
     }
@@ -8010,10 +8110,10 @@ const worker = {
     // relay that cannot run falls through to the same local tick this Worker
     // has always run, and the completion heartbeat's `relay` field names
     // which path actually ran it. `relay: false` is the placed invocation's
-    // own call back into this handler (see handleScanRelay) — it must never
+    // own call back into this handler (see handleCronRelay) — it must never
     // relay again.
     if (opts?.relay !== false) {
-      if (await relayScanTick(env)) {
+      if (await relayCronDelivery(env, "scan")) {
         // The placed invocation ran the whole tick — its own arrival stamp,
         // cadence gate, scan and completion flush — so this delivery is DONE.
         // Mark it returned (see shouldStampArrival): the next delivery needs

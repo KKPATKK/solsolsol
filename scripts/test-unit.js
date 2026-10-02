@@ -16311,12 +16311,14 @@ async function main() {
         ),
       "worker (the pass's own delivery runs ONE pass on its own budget)":
         workerSrc.includes(
-          'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass"},);',
+          'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass",relay:cronRelayOutcome??undefined},);',
         ),
       "worker (the scheduled handler routes that delivery before any scan bookkeeping)":
-        workerSrc.includes(
-          "if(isTrackerCron(event.cron)){awaitrunTrackerInvocation(env);return;}",
-        ),
+        workerSrc.indexOf("if(isTrackerCron(event.cron)){") >= 0 &&
+        workerSrc.indexOf("awaitrunTrackerInvocation(env);") >
+          workerSrc.indexOf("if(isTrackerCron(event.cron)){") &&
+        workerSrc.indexOf("awaitrunTrackerInvocation(env);") <
+          workerSrc.indexOf("scheduledTicks++;"),
     };
     const done = Object.entries(applied).filter(([, v]) => v);
     if (done.length === 0) {
@@ -16398,11 +16400,13 @@ async function main() {
       "scanner (the note asks the watcher)":
         scannerSrc.includes("constdiag=this.pushWatcher.passDiag?.()??null;"),
       "scanner (the durable note is the same line)":
-        // The call now carries the phase and the owner ("done", options?.via);
-        // what this check is about (ONE call site, the same errNote the log
-        // line uses) follows the call instead of pinning it back.
-        (scannerSrc.split('awaitthis.persistPassNote(errNote,startedAt,"done",options?.via);')
-          .length -
+        // The call now carries the phase, the owner and the relay reading
+        // ("done", options?.via, options?.relay); what this check is about
+        // (ONE call site, the same errNote the log line uses) follows the
+        // call instead of pinning it back.
+        (scannerSrc.split(
+          'awaitthis.persistPassNote(errNote,startedAt,"done",options?.via,options?.relay,);',
+        ).length -
           1) ===
           1 &&
         !scannerSrc.includes("awaitthis.persistPassNote(`err:${msg.slice(0,140)}`,startedAt);"),
@@ -17902,6 +17906,10 @@ async function main() {
     );
     assert.ok(scannerSrc.includes("diag.maintFresh = maintFresh"));
     assert.ok(scannerSrc.includes("diag.maintAgeMs ="));
+    assert.ok(
+      scannerSrc.includes("diag.maintRelay ="),
+      "the relay reading of the last maintenance invocation must be published",
+    );
     // The GeckoTerminal leg deliberately STAYS in the tick: its pools are that
     // minute's candidate list, not a side effect. Pin the decision so a later
     // refactor has to argue with a test.
@@ -18010,6 +18018,59 @@ async function main() {
     assert.equal(ran, 1, "the pass's own delivery owns the minute outright");
     assert.match(String(own), /^ok:1\/0/);
     assert.equal(JSON.parse(writes[0].value).via, "cron-pass");
+  });
+
+  await test("the relay reading rides the tracker pass row and the maintenance stamp", async () => {
+    const { Scanner, parseMaintenanceStamp } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const writes = [];
+    const db = {
+      setWorkerState: async (key, value) => {
+        writes.push({ key, value });
+      },
+    };
+    const scanner = new Scanner(
+      db, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      runTick: async () => ({
+        checked: 1, alerted: 0, trips: 1,
+        note: "rows 1/30 pairs 1/1 miss 0 lost 0 trips 1",
+        undeliveredTotal: 0, recoveredUndelivered: 0,
+      }),
+    };
+    scanner.lastSummary = {};
+    // The tracker delivery's row must say WHICH REGION ran the pass, exactly
+    // like the scan heartbeat does (the worker-side pin above is what
+    // supplies cronRelayOutcome; this is the row half of that wiring).
+    await scanner.runTrackerPass(Date.now() + 2_500, undefined, undefined, {
+      via: "cron-pass",
+      relay: "inner",
+    });
+    assert.equal(JSON.parse(writes[0].value).relay, "inner");
+    // A caller that cannot say (the tick fallback) leaves NO field, so the
+    // row's shape stays exactly what it was before the relay existed.
+    writes.length = 0;
+    await scanner.runTrackerPass(Date.now() + 2_500, undefined, undefined, {
+      via: "tick",
+    });
+    assert.equal("relay" in JSON.parse(writes[0].value), false);
+    // The maintenance stamp carries the same reading, validated on the way
+    // back out: an unknown value is dropped, never published.
+    const now = 1_790_000_000_000;
+    assert.deepEqual(
+      parseMaintenanceStamp(
+        JSON.stringify({ at: now, backfill: 1, crime: false, relay: "inner" }),
+      ),
+      { at: now, backfill: 1, crime: false, relay: "inner" },
+    );
+    assert.equal(
+      "relay" in parseMaintenanceStamp(JSON.stringify({ at: now, relay: "gone" })),
+      false,
+      "an unknown region tag is dropped, not passed through",
+    );
   });
 
   await test("subreqs: the fallback opens its window only where it commits (a ping that bails out must not roll the tick's)", () => {
@@ -19299,98 +19360,167 @@ async function main() {
     assert.equal(parseTraceColo(""), null);
   });
 
-  // ---------- the cron scan tick's relay into the placed fetch path ----------
+  // ---------- the cron deliveries' relay into the placed fetch path ----------
   //
   // 2026-10-02: placement measured the FETCH path at NRT with 12-15x shorter
   // statements, and the colo probe measured the cron path at ORD with its
-  // init/pool reads still in the ~1.4s class. The relay runs the tick through
-  // the placed fetch handler (a POST to this Worker's own URL, replayed into
-  // the scheduled handler) and must FAIL SAFE: any relay problem falls
-  // through to the same local tick the Worker always ran, so the worst case
-  // is the pre-relay shape. These pin the pure parts and the wiring the
-  // fail-safe depends on.
-  await test("scan relay: routing, auth and the fail-safe fallback are pinned", () => {
-    const { SCAN_RELAY_PATH, SCAN_CRON, scanRelayUrl, isScanRelayRequest } =
-      require("../dist/worker.js");
-    assert.equal(SCAN_RELAY_PATH, "/internal/scan-tick");
+  // init/pool reads still in the ~1.4s class. EVERY cron delivery (scan tick,
+  // tracker pass, maintenance legs) runs its work through the placed fetch
+  // handler (a POST to this Worker's own URL, replayed into the scheduled
+  // handler) and must FAIL SAFE: any relay problem falls through to the same
+  // local work the Worker always ran, so the worst case is the pre-relay
+  // shape. These pin the pure parts and the wiring the fail-safe depends on.
+  await test("cron relay: routing, auth, the delivery map and the fail-safe fallback are pinned", () => {
+    const {
+      CRON_RELAY_PATH,
+      SCAN_CRON,
+      DELIVERY_CRONS,
+      TRACKER_CRON,
+      MAINTENANCE_CRON,
+      cronRelayUrl,
+      isCronRelayRequest,
+      parseCronRelayDelivery,
+    } = require("../dist/worker.js");
+    assert.equal(CRON_RELAY_PATH, "/internal/cron-relay");
     assert.equal(SCAN_CRON, "* * * * *");
+    // The placed replay can ONLY name one of these three expressions — the
+    // wire carries a delivery NAME, never a cron string the handler trusts.
+    assert.deepEqual(DELIVERY_CRONS, {
+      scan: SCAN_CRON,
+      tracker: TRACKER_CRON,
+      maintenance: MAINTENANCE_CRON,
+    });
+    assert.equal(parseCronRelayDelivery("scan"), "scan");
+    assert.equal(parseCronRelayDelivery("tracker"), "tracker");
+    assert.equal(parseCronRelayDelivery("maintenance"), "maintenance");
     assert.equal(
-      scanRelayUrl("https://solana-meme-bot.cool1999k.workers.dev"),
-      "https://solana-meme-bot.cool1999k.workers.dev/internal/scan-tick",
+      parseCronRelayDelivery(TRACKER_CRON),
+      null,
+      "the wire names a delivery, never an expression",
+    );
+    assert.equal(parseCronRelayDelivery(""), null);
+    assert.equal(parseCronRelayDelivery(undefined), null);
+    assert.equal(
+      cronRelayUrl("https://solana-meme-bot.cool1999k.workers.dev"),
+      "https://solana-meme-bot.cool1999k.workers.dev/internal/cron-relay",
     );
     assert.equal(
-      scanRelayUrl("https://x.workers.dev/"),
-      "https://x.workers.dev/internal/scan-tick",
+      cronRelayUrl("https://x.workers.dev/"),
+      "https://x.workers.dev/internal/cron-relay",
       "a trailing slash must not double up",
     );
     assert.equal(
-      isScanRelayRequest("POST", "tok", "tok"),
+      isCronRelayRequest("POST", "tok", "tok"),
       true,
       "the cron presents the configured secret on a POST",
     );
-    assert.equal(isScanRelayRequest("GET", "tok", "tok"), false, "only POST drives a tick");
+    assert.equal(isCronRelayRequest("GET", "tok", "tok"), false, "only POST drives a delivery");
     assert.equal(
-      isScanRelayRequest("POST", "nope", "tok"),
+      isCronRelayRequest("POST", "nope", "tok"),
       false,
       "a wrong secret must not drive one",
     );
-    assert.equal(isScanRelayRequest("POST", null, "tok"), false);
+    assert.equal(isCronRelayRequest("POST", null, "tok"), false);
     assert.equal(
-      isScanRelayRequest("POST", "tok", undefined),
+      isCronRelayRequest("POST", "tok", undefined),
       false,
       "no configured secret = no route",
     );
   });
 
-  await test("scan relay: the handler relays before the local tick, and the route is wired", () => {
+  await test("cron relay: every delivery relays before its local work, and the route is wired", () => {
     const src = fs.readFileSync(
       path.join(__dirname, "..", "src", "worker.ts"),
       "utf8",
     );
+    const stripped = src
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "")
+      .replace(/\s+/g, "");
     // The relay is attempted ONLY by a delivery the platform itself made
     // (`relay: false` is the placed invocation's own call back in), and a
-    // false answer must fall through to the local tick — the block sits
-    // before scheduledTicks++ and returns only on success.
+    // false answer must fall through to the local work.
     assert.ok(
       src.includes("if (opts?.relay !== false)"),
       "only the platform's own delivery may relay",
     );
     assert.ok(
-      src.includes("if (await relayScanTick(env))"),
-      "the relay answer gates the return",
+      src.includes('if (await relayCronDelivery(env, "scan"))'),
+      "the scan relay answer gates the return",
     );
+    // The tracker and maintenance branches relay BEFORE they run their own
+    // body, and fall through to it when the relay says false.
+    const trackerAt = src.indexOf("if (isTrackerCron(event.cron)) {");
+    assert.ok(trackerAt > 0, "the tracker delivery must be routed");
+    const trackerRelayAt = src.indexOf(
+      'await relayCronDelivery(env, "tracker")',
+      trackerAt,
+    );
+    const trackerLocalAt = src.indexOf("await runTrackerInvocation(env);", trackerAt);
+    assert.ok(
+      trackerRelayAt > trackerAt && trackerLocalAt > trackerRelayAt,
+      "a failed tracker relay must fall through to the local pass",
+    );
+    const maintAt = src.indexOf("if (isMaintenanceCron(event.cron)) {");
+    assert.ok(maintAt > 0, "the maintenance delivery must be routed");
+    const maintRelayAt = src.indexOf(
+      'await relayCronDelivery(env, "maintenance")',
+      maintAt,
+    );
+    const maintLocalAt = src.indexOf(
+      "await runMaintenanceInvocation(env);",
+      maintAt,
+    );
+    assert.ok(
+      maintRelayAt > maintAt && maintLocalAt > maintRelayAt,
+      "a failed maintenance relay must fall through to the local legs",
+    );
+    // The local scan tick must stay reachable below the relay.
     const relayAt = src.indexOf("if (opts?.relay !== false)");
     const localAt = src.indexOf("scheduledTicks++;", relayAt);
     assert.ok(localAt > relayAt, "the local tick must stay reachable below the relay");
     // The placed half: an HTTP route, authenticated, and handled BEFORE the
-    // rescue scanner is armed (a rescue scan racing the tick it is about to
-    // run would break the tick's own single-owner assumption).
-    const routeAt = src.indexOf("if (url.pathname === SCAN_RELAY_PATH)");
+    // rescue scanner is armed (a rescue scan racing the run it is about to
+    // start would break the run's own single-owner assumption).
+    const routeAt = src.indexOf("if (url.pathname === CRON_RELAY_PATH)");
     assert.ok(routeAt > 0, "the relay route must exist");
     assert.ok(
       routeAt < src.indexOf("ctx.waitUntil(maybeRunScanIfStale(env, ctx))", routeAt),
       "the relay route must be handled before the rescue scanner is armed",
     );
     assert.ok(
-      src.includes(
-        "await worker.scheduled({ cron: SCAN_CRON }, env, ctx, { relay: false })",
+      stripped.includes(
+        "awaitworker.scheduled({cron:DELIVERY_CRONS[delivery]},env,ctx,{relay:false,});",
       ),
-      "the placed half replays the platform's own scheduled entry",
+      "the placed half replays the platform's own scheduled entry, through the delivery map",
     );
-    // The durable marker the post-deploy check reads from /health.
+    // The durable markers the post-deploy check reads: the scan heartbeat and
+    // the two special deliveries' own rows must name the path that ran them.
     assert.ok(
-      src.includes("relay: scanRelayOutcome"),
+      src.includes("relay: cronRelayOutcome"),
       "the completion heartbeat must name the path that ran the tick",
     );
-    // And the relay target must be configured, or the tick silently stays in
-    // the cron region ("skipped") — the rollback is deleting this key.
+    assert.ok(
+      stripped.includes(
+        'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass",relay:cronRelayOutcome??undefined},);',
+      ),
+      "the tracker pass row must name the path that ran the pass",
+    );
+    assert.ok(
+      stripped.includes(
+        "awaitscanner.runMaintenanceJobs(Date.now()+MAINTENANCE_BUDGET_MS,cronRelayOutcome??undefined,);",
+      ),
+      "the maintenance stamp must name the path that ran the legs",
+    );
+    // And the relay target must be configured, or every delivery silently
+    // stays in the cron region ("skipped") — the rollback is deleting this key.
     const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
-    const url = /^\s*SCAN_RELAY_URL\s*=\s*"([^"]+)"/m.exec(toml);
-    assert.ok(url, "wrangler.toml must carry SCAN_RELAY_URL");
+    const url = /^\s*CRON_RELAY_URL\s*=\s*"([^"]+)"/m.exec(toml);
+    assert.ok(url, "wrangler.toml must carry CRON_RELAY_URL");
     assert.ok(url[1].startsWith("https://"), "the relay URL must be https");
     assert.ok(
       !url[1].endsWith("/"),
-      "no trailing slash — the path is appended verbatim (scanRelayUrl tolerates one anyway)",
+      "no trailing slash — the path is appended verbatim (cronRelayUrl tolerates one anyway)",
     );
     assert.ok(
       /global_fetch_strictly_public/.test(toml),
