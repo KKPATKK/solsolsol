@@ -33,7 +33,12 @@ const {
   tickLegRows,
   tickLegRingSize,
   resetTickLegRing,
+  slowTickLegDue,
+  parseTickLegRing,
+  nextSlowTickRing,
   TICK_LEG_RING_SIZE,
+  TICK_LEG_SLOW_MS,
+  TICK_LEG_SLOW_RING_SIZE,
 } = require("../dist/worker.js");
 
 let passed = 0;
@@ -189,6 +194,46 @@ test("tickLegRows clamps its limit", () => {
   assert.equal(tickLegRows(5).length, 0);
 });
 
+test("the durable threshold: slow is due at 8s, not a millisecond before", () => {
+  assert.equal(slowTickLegDue(TICK_LEG_SLOW_MS - 1), false);
+  assert.equal(slowTickLegDue(TICK_LEG_SLOW_MS), true);
+  assert.equal(slowTickLegDue(14_182), true);
+});
+
+test("parseTickLegRing drops junk and keeps the newest rows", () => {
+  assert.deepEqual(parseTickLegRing(null), []);
+  assert.deepEqual(parseTickLegRing(""), []);
+  assert.deepEqual(parseTickLegRing("not json"), []);
+  assert.deepEqual(parseTickLegRing("{}"), []);
+  assert.deepEqual(parseTickLegRing('[1,null,{"at":"x"},{}]'), []);
+  const rows = [];
+  for (let i = 1; i <= TICK_LEG_SLOW_RING_SIZE + 5; i++) {
+    rows.push({ at: i, ms: 9000 + i });
+  }
+  const parsed = parseTickLegRing(JSON.stringify(rows));
+  assert.equal(parsed.length, TICK_LEG_SLOW_RING_SIZE);
+  assert.equal(parsed[0].at, 6); // the oldest 5 dropped
+  assert.equal(parsed[parsed.length - 1].at, TICK_LEG_SLOW_RING_SIZE + 5);
+});
+
+test("nextSlowTickRing appends this tick and trims the oldest", () => {
+  const row = buildTickLegRow(input({ at: 99, ms: 9000 }));
+  const seeded = JSON.stringify([
+    { at: 1, ms: 9000 },
+    { at: 2, ms: 9999 },
+  ]);
+  assert.deepEqual(nextSlowTickRing(seeded, row).map((r) => r.at), [1, 2, 99]);
+  // A full ring drops exactly one, the oldest.
+  const full = [];
+  for (let i = 1; i <= TICK_LEG_SLOW_RING_SIZE; i++) {
+    full.push({ at: i, ms: 9000 });
+  }
+  const trimmed = nextSlowTickRing(JSON.stringify(full), row);
+  assert.equal(trimmed.length, TICK_LEG_SLOW_RING_SIZE);
+  assert.equal(trimmed[0].at, 2);
+  assert.equal(trimmed[trimmed.length - 1].at, 99);
+});
+
 test("the flush records before the completion write, and the route exists", () => {
   const src = fs.readFileSync(
     path.join(__dirname, "..", "src", "worker.ts"),
@@ -205,6 +250,21 @@ test("the flush records before the completion write, and the route exists", () =
   assert.ok(
     src.includes('url.pathname === "/debug/tick-legs"'),
     "the /debug/tick-legs route must be registered",
+  );
+  // The durable half: the sink must be gated on the slow threshold (a write
+  // per tick would be the round-trip flood the ring exists to avoid), fired
+  // before the flush so the reserve still covers it.
+  const slowGateAt = src.indexOf("slowTickLegDue(legRow.ms)");
+  const sinkAt = src.indexOf("persistSlowTickLeg(legRow)");
+  assert.ok(slowGateAt > 0, "the durable sink is gated on the slow threshold");
+  assert.ok(sinkAt > slowGateAt, "a slow tick really fires the durable write");
+  assert.ok(
+    sinkAt < flushAt,
+    "the durable write is fired before the completion flush, not after it",
+  );
+  assert.ok(
+    src.includes("db?.getWorkerState(TICK_LEG_SLOW_KEY)"),
+    "the route reads the durable ring, not only the in-memory one",
   );
 });
 

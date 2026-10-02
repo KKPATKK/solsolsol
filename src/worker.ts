@@ -2311,6 +2311,88 @@ export function resetTickLegRing(): void {
 }
 
 /**
+ * The durable half of the ring (see /debug/tick-legs): a slow tick's row is
+ * written to worker_state under TICK_LEG_SLOW_KEY, because the in-memory ring
+ * above lives in the ISOLATE THAT TICKED — and that isolate is not the one
+ * answering HTTP reads (live 2026-10-02, right after the ring's own deploy:
+ * every /health sampled `scanCount 0` while the durable heartbeat's claim
+ * counter climbed, and /debug/tick-legs answered `count 0` on every request).
+ * A module-only ring could not answer the question it exists for, so the
+ * slow ticks — the ones anyone actually asks about — get a durable row.
+ *
+ * COST: two subrequests (one read to keep the previous rows, one write to
+ * append) on ticks that are rare by construction (TICK_LEG_SLOW_MS: 7 of 500
+ * live ticks, all inside the 2026-10-02 storm). Fired WITHOUT awaiting (the
+ * invocation's tickWaitUntil holds them open), and never on the tick's
+ * critical path.
+ */
+export const TICK_LEG_SLOW_KEY = "tick_leg_slow";
+export const TICK_LEG_SLOW_MS = 8_000;
+export const TICK_LEG_SLOW_RING_SIZE = 20;
+
+/** Whether this tick is slow enough to be worth the durable row. */
+export function slowTickLegDue(ms: number): boolean {
+  return ms >= TICK_LEG_SLOW_MS;
+}
+
+/**
+ * Tolerant parse of the durable ring (exported for the tests): a corrupt or
+ * truncated row must cost a reading, never the endpoint — junk rows are
+ * dropped and only the newest `max` are kept.
+ */
+export function parseTickLegRing(
+  raw: string | null,
+  max: number = TICK_LEG_SLOW_RING_SIZE,
+): TickLegRow[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (v): v is TickLegRow =>
+          typeof v === "object" &&
+          v !== null &&
+          typeof (v as TickLegRow).at === "number" &&
+          typeof (v as TickLegRow).ms === "number",
+      )
+      .slice(-max);
+  } catch {
+    return [];
+  }
+}
+
+/** The ring a slow tick produces from the one it replaces (append + trim). */
+export function nextSlowTickRing(
+  raw: string | null,
+  row: TickLegRow,
+  max: number = TICK_LEG_SLOW_RING_SIZE,
+): TickLegRow[] {
+  return [...parseTickLegRing(raw, max), row].slice(-max);
+}
+
+/**
+ * Append one slow row to the durable ring — best effort, never throws, never
+ * awaited on the tick's path. A lost slow-row is a lost reading, never a lost
+ * tick.
+ */
+export async function persistSlowTickLeg(row: TickLegRow): Promise<void> {
+  const client = db;
+  if (!client) return;
+  try {
+    const raw = await client.getWorkerState(TICK_LEG_SLOW_KEY);
+    await client.setWorkerState(
+      TICK_LEG_SLOW_KEY,
+      JSON.stringify(nextSlowTickRing(raw ?? null, row)),
+    );
+  } catch {
+    // Swallowed at the source: an unhandled rejection can take the isolate
+    // down with it, and this record is the least important thing the tick
+    // does.
+  }
+}
+
+/**
  * The tick's heartbeat read, shared between the three consumers that would
  * each otherwise pay their own round trip for the SAME worker_state row:
  * ensureInitialized's dead-tick recovery check, the cadence gate in the
@@ -4771,21 +4853,37 @@ async function runScan(
       // paying a round trip. Recorded for EVERY tick, cut/shed/early-return
       // included: those are exactly the shapes that produced no summary, and
       // the question "which leg held it" is asked about them the most.
-      recordTickLeg(
-        buildTickLegRow({
-          at: flushedAt,
-          via: scanVia,
-          ok: lastScanOk,
-          ms: flushedMs,
-          err: lastScanError,
-          cut: timedOut,
-          cutNote: cutStageNote || null,
-          preTick,
-          subs: subreqView().current.total,
-          summary,
-          skip: skipView?.reason ?? null,
-        }),
-      );
+      const legRow = buildTickLegRow({
+        at: flushedAt,
+        via: scanVia,
+        ok: lastScanOk,
+        ms: flushedMs,
+        err: lastScanError,
+        cut: timedOut,
+        cutNote: cutStageNote || null,
+        preTick,
+        subs: subreqView().current.total,
+        summary,
+        skip: skipView?.reason ?? null,
+      });
+      recordTickLeg(legRow);
+      // The durable half (see TICK_LEG_SLOW_KEY): the in-memory ring lives in
+      // the isolate that TICKED, which is not the one HTTP reads reach — so a
+      // slow tick also lands in worker_state. Fired, never awaited; the
+      // invocation's tickWaitUntil keeps it open when the handler handed one
+      // over (the same discipline as the deferred-write drain).
+      if (slowTickLegDue(legRow.ms)) {
+        const sink = persistSlowTickLeg(legRow);
+        if (tickWaitUntil) {
+          try {
+            tickWaitUntil(sink);
+          } catch {
+            void sink;
+          }
+        } else {
+          void sink;
+        }
+      }
       // The completion payload is built ONCE, here, and its byte size is
       // measured in front of the flush: a LOST flush is chased with the two
       // numbers only this tick can see — how big the batch was and what the
@@ -6189,12 +6287,27 @@ export default {
         TICK_LEG_RING_SIZE,
         Math.max(1, Number(url.searchParams.get("rows") ?? 60) || 60),
       );
+      // The durable half (see TICK_LEG_SLOW_KEY): `rows` is THIS isolate's
+      // in-memory ring, `slow` is the fleet's last TICK_LEG_SLOW_RING_SIZE
+      // slow ticks (>= TICK_LEG_SLOW_MS), newest first — the half that still
+      // answers when the request lands on an isolate that never ticked.
+      let slow: TickLegRow[] = [];
+      try {
+        const raw = await db?.getWorkerState(TICK_LEG_SLOW_KEY);
+        slow = parseTickLegRing(raw ?? null).reverse();
+      } catch {
+        // Debug route: an unreadable durable ring must not fail the
+        // in-memory half.
+      }
       return Response.json({
         ok: true,
         now: new Date().toISOString(),
         count: tickLegRingSize(),
         capacity: TICK_LEG_RING_SIZE,
+        slowMs: TICK_LEG_SLOW_MS,
+        slowCapacity: TICK_LEG_SLOW_RING_SIZE,
         rows: tickLegRows(limit),
+        slow,
       });
     }
 
