@@ -16307,17 +16307,17 @@ async function main() {
         scannerSrc.includes("this.pushWatcher.runTick(deadlineMs,keepAlive,subreqLeft)"),
       "worker (the tick supplies the counter, and the fallback window)":
         workerSrc.includes(
-          'awaitscanner.runTrackerPass(Date.now()+trackerBudgetMs,holdTick?(p:Promise<unknown>)=>holdTick(p):undefined,subreqRemaining,{peerPassFreshMs:TRACKER_PASS_FALLBACK_FRESH_MS,via:"tick",},);',
+          'awaitscanner.runTrackerPass(Date.now()+trackerBudgetMs,holdTick?(p:Promise<unknown>)=>holdTick(p):undefined,subreqRemaining,{peerPassFreshMs:TRACKER_PASS_FALLBACK_FRESH_MS,via:"tick",relay:relayTag??undefined,},);',
         ),
       "worker (the pass's own delivery runs ONE pass on its own budget)":
         workerSrc.includes(
-          'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass",relay:cronRelayOutcome??undefined},);',
+          'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass",relay:relayTag??undefined},);',
         ),
       "worker (the scheduled handler routes that delivery before any scan bookkeeping)":
         workerSrc.indexOf("if(isTrackerCron(event.cron)){") >= 0 &&
-        workerSrc.indexOf("awaitrunTrackerInvocation(env);") >
+        workerSrc.indexOf("awaitrunTrackerInvocation(env,relayTag);") >
           workerSrc.indexOf("if(isTrackerCron(event.cron)){") &&
-        workerSrc.indexOf("awaitrunTrackerInvocation(env);") <
+        workerSrc.indexOf("awaitrunTrackerInvocation(env,relayTag);") <
           workerSrc.indexOf("scheduledTicks++;"),
     };
     const done = Object.entries(applied).filter(([, v]) => v);
@@ -18043,8 +18043,8 @@ async function main() {
     };
     scanner.lastSummary = {};
     // The tracker delivery's row must say WHICH REGION ran the pass, exactly
-    // like the scan heartbeat does (the worker-side pin above is what
-    // supplies cronRelayOutcome; this is the row half of that wiring).
+    // like the scan heartbeat does (the worker-side pins above are what
+    // supply the region tag; this is the row half of that wiring).
     await scanner.runTrackerPass(Date.now() + 2_500, undefined, undefined, {
       via: "cron-pass",
       relay: "inner",
@@ -18317,8 +18317,8 @@ async function main() {
     // answerable from /health at all (26 of 76 completions were the fallback's
     // in the measured window).
     assert.ok(
-      workerSrc.includes('awaitrunScan(hbRaw,env,cronTick,"cron");'),
-      "the scheduled tick tags itself cron",
+      workerSrc.includes('awaitrunScan(hbRaw,env,cronTick,"cron",scanRelayTag);'),
+      "the scheduled tick tags itself cron (and threads its own relay region)",
     );
     assert.ok(
       workerSrc.includes('awaitrunScan(hbRaw,env,null,"http");'),
@@ -19445,7 +19445,7 @@ async function main() {
       "only the platform's own delivery may relay",
     );
     assert.ok(
-      src.includes('if (await relayCronDelivery(env, "scan"))'),
+      src.includes('const relay = await relayCronDelivery(env, "scan");'),
       "the scan relay answer gates the return",
     );
     // The tracker and maintenance branches relay BEFORE they run their own
@@ -19456,7 +19456,10 @@ async function main() {
       'await relayCronDelivery(env, "tracker")',
       trackerAt,
     );
-    const trackerLocalAt = src.indexOf("await runTrackerInvocation(env);", trackerAt);
+    const trackerLocalAt = src.indexOf(
+      "await runTrackerInvocation(env, relayTag);",
+      trackerAt,
+    );
     assert.ok(
       trackerRelayAt > trackerAt && trackerLocalAt > trackerRelayAt,
       "a failed tracker relay must fall through to the local pass",
@@ -19468,17 +19471,27 @@ async function main() {
       maintAt,
     );
     const maintLocalAt = src.indexOf(
-      "await runMaintenanceInvocation(env);",
+      "await runMaintenanceInvocation(env, relayTag);",
       maintAt,
     );
     assert.ok(
       maintRelayAt > maintAt && maintLocalAt > maintRelayAt,
       "a failed maintenance relay must fall through to the local legs",
     );
-    // The local scan tick must stay reachable below the relay.
-    const relayAt = src.indexOf("if (opts?.relay !== false)");
-    const localAt = src.indexOf("scheduledTicks++;", relayAt);
-    assert.ok(localAt > relayAt, "the local tick must stay reachable below the relay");
+    // The local scan tick must stay reachable below the scan relay, and the
+    // relay reading must be THREADED (parameters), never module state: the
+    // 2026-10-02 measurement — the tracker route cleared a scan tick's shared
+    // marker while the tick was still in flight — is exactly what this pins.
+    const scanRelayAt = src.indexOf('await relayCronDelivery(env, "scan")');
+    const localAt = src.indexOf("scheduledTicks++;", scanRelayAt);
+    assert.ok(
+      scanRelayAt > 0 && localAt > scanRelayAt,
+      "the local tick must stay reachable below the scan relay",
+    );
+    assert.ok(
+      !src.includes("cronRelayOutcome"),
+      "the region reading must be a parameter, never module state",
+    );
     // The placed half: an HTTP route, authenticated, and handled BEFORE the
     // rescue scanner is armed (a rescue scan racing the run it is about to
     // start would break the run's own single-owner assumption).
@@ -19490,25 +19503,25 @@ async function main() {
     );
     assert.ok(
       stripped.includes(
-        "awaitworker.scheduled({cron:DELIVERY_CRONS[delivery]},env,ctx,{relay:false,});",
+        'awaitworker.scheduled({cron:DELIVERY_CRONS[delivery]},env,ctx,{relay:false,relayTag:"inner",});',
       ),
       "the placed half replays the platform's own scheduled entry, through the delivery map",
     );
     // The durable markers the post-deploy check reads: the scan heartbeat and
     // the two special deliveries' own rows must name the path that ran them.
     assert.ok(
-      src.includes("relay: cronRelayOutcome"),
+      src.includes("relay: relayTag"),
       "the completion heartbeat must name the path that ran the tick",
     );
     assert.ok(
       stripped.includes(
-        'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass",relay:cronRelayOutcome??undefined},);',
+        'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass",relay:relayTag??undefined},);',
       ),
       "the tracker pass row must name the path that ran the pass",
     );
     assert.ok(
       stripped.includes(
-        "awaitscanner.runMaintenanceJobs(Date.now()+MAINTENANCE_BUDGET_MS,cronRelayOutcome??undefined,);",
+        "awaitscanner.runMaintenanceJobs(Date.now()+MAINTENANCE_BUDGET_MS,relayTag??undefined,);",
       ),
       "the maintenance stamp must name the path that ran the legs",
     );
