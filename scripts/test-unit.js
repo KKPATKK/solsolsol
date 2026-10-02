@@ -18244,10 +18244,13 @@ async function main() {
     // it comes from the LOCAL, never from module state: the pass's own
     // delivery lands on this isolate and overwrites module-scope readings
     // (measured: a tick's done heartbeat published owner:"pass").
+    // THREE sites since the 2026-10-02 tick-leg ring: both heartbeats plus
+    // the ring row the flush records (a slow tick's split must keep its
+    // trigger, or "cron vs fallback" is lost with the leg detail).
     assert.equal(
       workerSrc.split("via:scanVia,").length - 1,
-      2,
-      "the scanning heartbeat and the completion payload both carry via",
+      3,
+      "both heartbeats carry via, and the tick-leg ring row names its trigger",
     );
     assert.ok(workerSrc.includes("constscanVia:ScanTrigger=via;"), "via is captured as a local");
     // ...and the completion batch is told which counter to increment: the tag

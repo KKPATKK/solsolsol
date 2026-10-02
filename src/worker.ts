@@ -119,7 +119,7 @@ import { JupTokensClient } from "./jupfeeds";
 import { GmgnClient } from "./gmgn";
 import { AxiomClient, parseAxiomTokenInfo, type AxiomTokenInfo } from "./axiom";
 import { renderMessage } from "./render";
-import type { QualifyingCoin, ScanSummary } from "./scanner";
+import type { FrontLeg, QualifyingCoin, ScanSummary } from "./scanner";
 import { ArkhamClient } from "./arkham";
 import { CrimeWalletClient } from "./crimewallets";
 import { WalletAnalyzer } from "./walletanalysis";
@@ -2174,6 +2174,141 @@ let preTick: PreTickView = {
 };
 /** Handler entry of the tick in progress (0 = nothing recorded). */
 let preTickEntryAt = 0;
+
+/**
+ * PER-TICK LEG RING (see /debug/tick-legs). What the durable rows cannot
+ * carry: scan_history keeps 8 columns and the heartbeat keeps only the LATEST
+ * tick's legs — which is exactly why the 2026-10-02 429-storm slow ticks
+ * (8-14s, 00:49-01:06Z) could not be attributed after the fact: the split
+ * existed only while that tick's /health answered. This ring keeps the last
+ * TICK_LEG_RING_SIZE ticks of THIS isolate with the split intact — the front
+ * (preStart / preRace / steps), every scan leg (feeds / pool / poolWait /
+ * poolLegMs / pairs / pairs-jup / eval / db), the counters, the cut note and
+ * the subrequest spend.
+ *
+ * COST, stated plainly: module memory only — no Turso round trip, no
+ * subrequest, nothing added to the tick's critical path. The trade-off is the
+ * one every module-scoped counter in this file makes: the ring dies with the
+ * isolate (eviction or a deploy), so it answers "where did the ticks I just
+ * watched spend their time", never "what did the fleet do yesterday" —
+ * scan_history owns that half.
+ */
+export const TICK_LEG_RING_SIZE = 120;
+
+/** One recorded tick, shaped for a reader chasing "which leg held it". */
+export interface TickLegRow {
+  /** Completion time (epoch, same clock as scan_history.at). */
+  at: number;
+  /** Who ran this scan (cron | http | manual). */
+  via: string;
+  ok: boolean;
+  /** Tick wall time (startedAt → flush read; excludes preStart). */
+  ms: number;
+  err: string | null;
+  /** The race cut this tick (ok=false with the window in `err`). */
+  cut: boolean;
+  /** The in-flight stage at the cut (see Scanner.stageSnapshot), when cut. */
+  cutNote: string | null;
+  /** The scanner's early-return reason, when it returned early. */
+  skip: string | null;
+  /** Subrequests spent at completion. */
+  subs: number | null;
+  preStartMs: number | null;
+  preRaceMs: number | null;
+  raceMs: number | null;
+  steps: PreTickSteps | null;
+  profiles: number | null;
+  pool: number | null;
+  candidates: number | null;
+  pushed: number | null;
+  feedsMs: number | null;
+  preFeedMs: number | null;
+  poolMs: number | null;
+  poolWaitMs: number | null;
+  poolLegMs: Partial<Record<FrontLeg, number>> | null;
+  pairs: number | null;
+  pairsJup: number | null;
+  pairsMissing: number | null;
+  evalMs: number | null;
+  dbMs: number | null;
+}
+
+/**
+ * Pure projection for the ring (exported so the mapping is pinned offline, the
+ * same discipline as buildPreTickSplit): a tick with no summary — a cut, a
+ * shed, or an early return — must record `null` legs rather than fabricated
+ * zeros, because "no reading" and "spent 0ms" are different answers.
+ */
+export function buildTickLegRow(input: {
+  at: number;
+  via: string;
+  ok: boolean;
+  ms: number;
+  err: string | null;
+  cut: boolean;
+  cutNote: string | null;
+  preTick: PreTickView | null;
+  subs: number | null;
+  summary: ScanSummary | null;
+  skip: string | null;
+}): TickLegRow {
+  const s = input.summary;
+  const p = input.preTick;
+  return {
+    at: input.at,
+    via: input.via,
+    ok: input.ok,
+    ms: input.ms,
+    err: input.err,
+    cut: input.cut,
+    cutNote: input.cutNote,
+    skip: input.skip,
+    subs: input.subs,
+    preStartMs: p?.preStartMs ?? null,
+    preRaceMs: p?.preRaceMs ?? null,
+    raceMs: p?.raceMs ?? null,
+    steps: p ? { ...p.steps } : null,
+    profiles: s?.profiles ?? null,
+    pool: s?.pool ?? null,
+    candidates: s?.candidates ?? null,
+    pushed: s?.pushed ?? null,
+    feedsMs: s?.feedsMs ?? null,
+    preFeedMs: s?.preFeedMs ?? null,
+    poolMs: s?.poolMs ?? null,
+    poolWaitMs: s?.poolWaitMs ?? null,
+    poolLegMs: s?.poolLegMs ? { ...s.poolLegMs } : null,
+    pairs: s?.pairs ?? null,
+    pairsJup: s?.pairsJup ?? null,
+    pairsMissing: s?.pairsMissing ?? null,
+    evalMs: s?.evalMs ?? null,
+    dbMs: s?.dbMs ?? null,
+  };
+}
+
+const tickLegRing: TickLegRow[] = [];
+
+/** Append one tick, trimming the oldest past the capacity. */
+export function recordTickLeg(row: TickLegRow): void {
+  tickLegRing.push(row);
+  if (tickLegRing.length > TICK_LEG_RING_SIZE) {
+    tickLegRing.splice(0, tickLegRing.length - TICK_LEG_RING_SIZE);
+  }
+}
+
+/** The last `limit` ticks, newest first (the order /debug/tick-legs serves). */
+export function tickLegRows(limit: number): TickLegRow[] {
+  const n = Math.min(Math.max(1, Math.floor(limit) || 1), tickLegRing.length);
+  return tickLegRing.slice(tickLegRing.length - n).reverse();
+}
+
+export function tickLegRingSize(): number {
+  return tickLegRing.length;
+}
+
+/** Test seam: the ring is module state (same shape as poolfallback's reset). */
+export function resetTickLegRing(): void {
+  tickLegRing.length = 0;
+}
 
 /**
  * The tick's heartbeat read, shared between the three consumers that would
@@ -4630,6 +4765,27 @@ async function runScan(
       // src/skipcapture.ts). Read ONCE, outside the closure, so `skip` and
       // `skipAt` can never disagree about which early return they describe.
       const skipView = skipCaptureSnapshot();
+      // PER-TICK LEG RING (see TickLegRow): recorded BEFORE the flush, so a
+      // slow or lost completion write cannot take this tick's split with it —
+      // the ring is the one place the wall-time breakdown survives without
+      // paying a round trip. Recorded for EVERY tick, cut/shed/early-return
+      // included: those are exactly the shapes that produced no summary, and
+      // the question "which leg held it" is asked about them the most.
+      recordTickLeg(
+        buildTickLegRow({
+          at: flushedAt,
+          via: scanVia,
+          ok: lastScanOk,
+          ms: flushedMs,
+          err: lastScanError,
+          cut: timedOut,
+          cutNote: cutStageNote || null,
+          preTick,
+          subs: subreqView().current.total,
+          summary,
+          skip: skipView?.reason ?? null,
+        }),
+      );
       // The completion payload is built ONCE, here, and its byte size is
       // measured in front of the flush: a LOST flush is chased with the two
       // numbers only this tick can see — how big the batch was and what the
@@ -6017,6 +6173,29 @@ export default {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+
+    // PER-TICK LEG RING (see TickLegRow): the last ticks of THIS isolate with
+    // the leg split the durable rows cannot carry — the front's preStart/
+    // preRace/steps, every scan leg (feeds/pool/poolWait/poolLegMs/pairs/
+    // pairs-jup/eval/db), the counters, the cut note and the subrequest
+    // spend. The 2026-10-02 429-storm slow ticks (8-14s, 00:49-01:06Z) could
+    // not be attributed after the fact because the split lived only in
+    // /health's latest-tick fields; this route is where it survives (per
+    // isolate, capacity TICK_LEG_RING_SIZE, newest first, ?rows=N to size the
+    // answer).
+    if (url.pathname === "/debug/tick-legs") {
+      const limit = Math.min(
+        TICK_LEG_RING_SIZE,
+        Math.max(1, Number(url.searchParams.get("rows") ?? 60) || 60),
+      );
+      return Response.json({
+        ok: true,
+        now: new Date().toISOString(),
+        count: tickLegRingSize(),
+        capacity: TICK_LEG_RING_SIZE,
+        rows: tickLegRows(limit),
+      });
     }
 
     // GMGN connectivity probe — calls the real client from the worker's own
