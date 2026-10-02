@@ -6033,19 +6033,23 @@ async function main() {
     // bookkeeping that was the branch's only visible act.)
     assert.ok(
       workerSrc.includes(
-        'noteSkipReason("init-no-scanner");preTick.steps.bump=awaitbumpScheduledTickLegacy(env);',
+        'noteSkipReason("init-no-scanner");if(!clockDelivery){preTick.steps.bump=awaitbumpScheduledTickLegacy(env);',
       ),
       "the handler's no-scanner return says so",
     );
     // The cadence gate: pinned as a SLICE between the branch's own log line and
     // the arrival write it ends with — comments sit inside that window, so an
-    // adjacency pin would be measuring the comments instead of the code.
-    const gateAt = workerSrc.indexOf("crontickskipped—lastscanclaimed");
+    // adjacency pin would be measuring the comments instead of the code. The
+    // log line names its trigger since 2026-10-02 (see clockDelivery): the
+    // slice anchor is the message tail both triggers share.
+    const gateAt = workerSrc.indexOf("tickskipped—lastscanclaimed");
     const gateEnd = workerSrc.indexOf("writeScheduledTick(cronTick)", gateAt);
     assert.ok(gateAt >= 0 && gateEnd > gateAt, "the gate branch is there to pin");
     assert.ok(
-      workerSrc.slice(gateAt, gateEnd).includes('noteSkipReason("cron-gate");'),
-      "the gate skip says so",
+      workerSrc
+        .slice(gateAt, gateEnd)
+        .includes('noteSkipReason(clockDelivery?"clock-gate":"cron-gate");'),
+      "the gate skip says so — with the trigger's own reason string",
     );
     // runScan's own guard (the HTTP/manual path). Pinned by the pair that only
     // that branch has — reason immediately before the bare return (the
@@ -16406,9 +16410,13 @@ async function main() {
     const workerSrc = strip(fs.readFileSync(path.join(__dirname, "..", "src/worker.ts"), "utf8"));
     const dbSrc = strip(fs.readFileSync(path.join(__dirname, "..", "src/db.ts"), "utf8"));
     // The GATE, not merely a mention of the rule: the stripped whitespace turns
-    // the call into `if(shouldStampArrival(...)){`, so a condition that is
-    // present but neutralised (or moved out of the gate) still fails here.
-    const stampCall = workerSrc.indexOf("if(shouldStampArrival(scheduledTickFinishedAt,cronAt)){");
+    // the call into `if(!clockDelivery&&shouldStampArrival(...)){`, so a
+    // condition that is present but neutralised (or moved out of the gate)
+    // still fails here. The clock guard is part of the gate since 2026-10-02:
+    // a clock arrival carries no cron bookkeeping, so it must not stamp.
+    const stampCall = workerSrc.indexOf(
+      "if(!clockDelivery&&shouldStampArrival(scheduledTickFinishedAt,cronAt)){",
+    );
     // The init this stamp must precede is BOUNDED now (see
     // FRONT_INIT_BOUND_MS), so the anchor follows the recoveryAwait call — and
     // it is scoped to the SCHEDULED HANDLER, because the tracker's own delivery
@@ -18387,8 +18395,25 @@ async function main() {
       assert.ok(gate > 0 && gate < interval, `the threshold sits inside the interval (${interval})`);
       assert.equal(gate, scanGateMs(interval), "pure");
     }
-    // Below one cron period reads as one cron period (the cron IS the floor).
-    assert.equal(scanGateMs(1_000), scanGateMs(60_000));
+    // Below one cron period is the DO clock's regime now (2026-10-02, see
+    // TickClock): the interval IS the target and half of it stays as slack
+    // (the previous scan's own 3-4s completion offset has to fit inside), and
+    // a typo-sized value floors at the clock's own 15s.
+    assert.equal(scanGateMs(15_000), 7_500);
+    assert.equal(scanGateMs(20_000), 10_000);
+    assert.equal(scanGateMs(30_000), 15_000);
+    assert.equal(scanGateMs(1_000), scanGateMs(15_000));
+    for (const interval of [15_000, 20_000, 30_000, 45_000]) {
+      const gate = scanGateMs(interval);
+      assert.ok(
+        gate >= 5_000 && gate < interval,
+        `a sub-minute gate stays inside its interval (${interval} -> ${gate})`,
+      );
+      assert.ok(
+        interval - 4_000 >= gate,
+        `a clock tick clears its own gate after a 4s scan (${interval})`,
+      );
+    }
     // The fallback: two missed cadences, 120s floor — one late tick (<60s) is
     // not a rescue case, which is exactly what stops it taking over a minute
     // the tick still owns.
@@ -18396,6 +18421,157 @@ async function main() {
     assert.equal(scanRescueGapMs(90_000), 180_000);
     assert.equal(scanRescueGapMs(300_000), 600_000);
     assert.ok(scanRescueGapMs(60_000) > scanGateMs(60_000) * 2, "a rescue is never one gate late");
+  });
+
+  await test("the sub-minute clock: off by default, clamped when on, its period is the scan cadence", () => {
+    const {
+      clockTickMs,
+      scanGateMs,
+      TICK_CLOCK_MIN_MS,
+      TICK_CLOCK_MAX_MS,
+      TICK_CLOCK_NAME,
+      SCAN_GATE_SUBMIN_FLOOR_MS,
+    } = require("../dist/worker.js");
+    // OFF is both the default and the rollback: unset, "0", negative, empty
+    // and junk all read as 0 alarms, so a deployment without the var never
+    // arms the DO — the cron IS the cadence and nothing needs to be undone.
+    assert.equal(clockTickMs({}), 0);
+    assert.equal(clockTickMs({ CLOCK_TICK_SECONDS: "0" }), 0);
+    assert.equal(clockTickMs({ CLOCK_TICK_SECONDS: "-5" }), 0);
+    assert.equal(clockTickMs({ CLOCK_TICK_SECONDS: "junk" }), 0);
+    assert.equal(clockTickMs({ CLOCK_TICK_SECONDS: "" }), 0);
+    // A typo is CLAMPED, not trusted: 1s would be a hot alarm loop (each one
+    // costs a DO request) and 9999s a slower cron with extra parts.
+    assert.equal(clockTickMs({ CLOCK_TICK_SECONDS: "1" }), TICK_CLOCK_MIN_MS);
+    assert.equal(clockTickMs({ CLOCK_TICK_SECONDS: "30" }), 30_000);
+    assert.equal(clockTickMs({ CLOCK_TICK_SECONDS: "9999" }), TICK_CLOCK_MAX_MS);
+    assert.equal(TICK_CLOCK_MIN_MS, 15_000);
+    assert.equal(TICK_CLOCK_MAX_MS, 300_000);
+    assert.equal(TICK_CLOCK_NAME, "tick-clock");
+    assert.ok(SCAN_GATE_SUBMIN_FLOOR_MS === 5_000);
+    // WHILE THE CLOCK IS ON, ITS PERIOD IS THE SCAN CADENCE: the sub-minute
+    // gate keeps HALF the interval as slack (the cadence-gates test above pins
+    // the arithmetic; this pins the property the clock depends on — after a
+    // 4s scan, a tick one period later MUST clear its own gate, or the clock
+    // would silently run at every other tick).
+    for (const periodMs of [15_000, 20_000, 30_000, 45_000]) {
+      assert.ok(
+        periodMs - 4_000 >= scanGateMs(periodMs),
+        `a ${periodMs}ms tick clears its own gate after a 4s scan`,
+      );
+    }
+  });
+
+  await test("the sub-minute clock: the DO is bound, the cron keeps it armed, and only cron arrivals touch the cron bookkeeping", () => {
+    const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    // The binding and the migration are a PAIR: a class wrangler does not know
+    // about is a deploy error, and a class the Worker never exports is a
+    // binding that resolves to nothing.
+    const binding = /^\[\[durable_objects\.bindings\]\][\s\S]*?^name\s*=\s*"([^"]+)"[\s\S]*?^class_name\s*=\s*"([^"]+)"/m.exec(
+      toml,
+    );
+    assert.ok(binding, "wrangler.toml must bind the clock's class");
+    assert.equal(binding[1], "TICK_CLOCK");
+    assert.equal(binding[2], "TickClock");
+    const migration = /^\[\[migrations\]\][\s\S]*?^tag\s*=\s*"([^"]+)"[\s\S]*?^new_sqlite_classes\s*=\s*\[([^\]]*)\]/m.exec(
+      toml,
+    );
+    assert.ok(migration, "the class needs a migration entry");
+    assert.ok(migration[2].includes("TickClock"), "the migration creates TickClock");
+    // The switch is the clock's OWN var (SCAN_INTERVAL_SECONDS stays the
+    // clock-off cadence) and the deployed value is ON.
+    const tick = /^CLOCK_TICK_SECONDS\s*=\s*"([^"]+)"/m.exec(toml);
+    assert.ok(tick, "wrangler.toml must carry CLOCK_TICK_SECONDS");
+    assert.ok(Number(tick[1]) > 0, "the deployed clock is ON");
+    // The class exists under the binding's name, and the loop is wired the way
+    // the failure mode demands: every alarm body caught, the re-arm in
+    // `finally` (a throw is 6 retries and then a dead loop).
+    const { TickClock, TICK_CLOCK_ARM_PATH, TICK_CLOCK_STATUS_PATH } =
+      require("../dist/worker.js");
+    assert.equal(typeof TickClock, "function");
+    assert.equal(typeof TickClock.prototype.alarm, "function");
+    assert.equal(typeof TickClock.prototype.fetch, "function");
+    assert.equal(TICK_CLOCK_ARM_PATH, "/arm");
+    assert.equal(TICK_CLOCK_STATUS_PATH, "/status");
+    const stripped = fs
+      .readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "")
+      .replace(/\s+/g, "");
+    assert.ok(
+      stripped.includes('if(!clockDelivery)armTickClock(env,ctx);'),
+      "a CRON scan delivery is what re-arms the clock",
+    );
+    assert.ok(
+      stripped.includes('relayCronDelivery(this.env,"scan","clock")') &&
+        stripped.includes('relayCronDelivery(this.env,"tracker","clock")'),
+      "the alarm relays both deliveries as the clock",
+    );
+    assert.ok(
+      stripped.includes("awaitthis.state.storage.setAlarm(this.lastAlarmAt);"),
+      "the alarm re-arms itself inside finally",
+    );
+    // Run the object: OFF does nothing and arms nothing (the switch really
+    // reaches the alarm), ON relays both deliveries (skipped here — no relay
+    // configured in the test env) and arms exactly one period out, and /arm
+    // never moves a pending alarm.
+    const storage = {
+      alarmAt: null,
+      async getAlarm() {
+        return this.alarmAt;
+      },
+      async setAlarm(at) {
+        this.alarmAt = at;
+      },
+    };
+    return (async () => {
+      const off = new TickClock({ storage }, {});
+      await off.alarm();
+      assert.equal(storage.alarmAt, null, "a clock with no CLOCK_TICK_SECONDS must not arm");
+      const status = await (await off.fetch(new Request("https://tick-clock/status"))).json();
+      assert.equal(status.on, false);
+      assert.equal(status.tickMs, 0);
+      const on = new TickClock({ storage }, { CLOCK_TICK_SECONDS: "30" });
+      const before = Date.now();
+      await on.alarm();
+      assert.ok(
+        typeof storage.alarmAt === "number" && storage.alarmAt >= before + 30_000,
+        "the loop re-arms one period out",
+      );
+      const armedAt = storage.alarmAt;
+      const onStatus = await (await on.fetch(new Request("https://tick-clock/status"))).json();
+      assert.equal(onStatus.on, true);
+      assert.equal(onStatus.tickMs, 30_000);
+      assert.equal(onStatus.ticks, 1);
+      assert.deepEqual(onStatus.lastResults, { scan: "skipped", tracker: "skipped" });
+      const arm = await (
+        await on.fetch(new Request("https://tick-clock/arm", { method: "POST" }))
+      ).json();
+      assert.equal(arm.armed, false, "an armed loop is left alone");
+      assert.equal(storage.alarmAt, armedAt, "...and its pending alarm is not moved");
+    })();
+  });
+
+  await test("the clock's relays name their source, and the replay carries it into the trigger", () => {
+    const { parseCronRelaySource } = require("../dist/worker.js");
+    assert.equal(parseCronRelaySource("clock"), "clock");
+    assert.equal(parseCronRelaySource("cron"), null, "the cron is the default, not a value");
+    assert.equal(parseCronRelaySource(""), null);
+    assert.equal(parseCronRelaySource(null), null);
+    assert.equal(parseCronRelaySource(undefined), null);
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8");
+    assert.ok(
+      src.includes('const CRON_RELAY_SOURCE_HEADER = "x-cron-relay-source";'),
+      "the source travels in its own header",
+    );
+    assert.ok(
+      src.includes("...(source === null ? {} : { via: source }),"),
+      "the placed replay threads the source into the trigger",
+    );
+    assert.ok(
+      src.includes('...(fromClock ? { [CRON_RELAY_SOURCE_HEADER]: source } : {}),'),
+      "and only a clock relay sends the header",
+    );
   });
 
   await test("init boot cache: a REJECTED or HUNG boot stops being cached", async () => {
@@ -18505,8 +18681,10 @@ async function main() {
     // answerable from /health at all (26 of 76 completions were the fallback's
     // in the measured window).
     assert.ok(
-      workerSrc.includes('awaitrunScan(hbRaw,env,cronTick,"cron",scanRelayTag);'),
-      "the scheduled tick tags itself cron (and threads its own relay region)",
+      workerSrc.includes(
+        'awaitrunScan(hbRaw,env,cronTick,clockDelivery?"clock":"cron",scanRelayTag,);',
+      ),
+      "the scheduled tick tags itself cron — or clock when the DO clock asked — and threads its own relay region",
     );
     assert.ok(
       workerSrc.includes('awaitrunScan(hbRaw,env,null,"http");'),
@@ -18563,21 +18741,32 @@ async function main() {
     assert.equal(stmts[0].args.length + stmts[2].args.length, 1, "no read; one bind for the guard");
     assert.equal(
       new Set(Object.values(SCAN_TRIGGER_COUNTER_KEYS)).size,
-      3,
-      "one row per trigger — cron can never bump the fallback's counter",
+      4,
+      "one row per trigger — cron can never bump the fallback's or the clock's counter",
     );
     // Telemetry never throws and never invents a count.
-    assert.deepEqual(parseScanTriggerCounts(null), { cron: 0, http: 0, manual: 0 });
-    assert.deepEqual(parseScanTriggerCounts(undefined), { cron: 0, http: 0, manual: 0 });
+    assert.deepEqual(parseScanTriggerCounts(null), {
+      cron: 0,
+      http: 0,
+      manual: 0,
+      clock: 0,
+    });
+    assert.deepEqual(parseScanTriggerCounts(undefined), {
+      cron: 0,
+      http: 0,
+      manual: 0,
+      clock: 0,
+    });
     assert.deepEqual(
       parseScanTriggerCounts(
         new Map([
           [SCAN_TRIGGER_COUNTER_KEYS.cron, "12"],
           [SCAN_TRIGGER_COUNTER_KEYS.http, "junk"],
           [SCAN_TRIGGER_COUNTER_KEYS.manual, "-3"],
+          [SCAN_TRIGGER_COUNTER_KEYS.clock, "7"],
         ]),
       ),
-      { cron: 12, http: 0, manual: 0 },
+      { cron: 12, http: 0, manual: 0, clock: 7 },
     );
   });
 
@@ -18641,8 +18830,14 @@ async function main() {
         SCAN_TRIGGER_COUNTER_KEYS.cron,
         SCAN_TRIGGER_COUNTER_KEYS.http,
         SCAN_TRIGGER_COUNTER_KEYS.manual,
+        SCAN_TRIGGER_COUNTER_KEYS.clock,
       ]);
-      assert.deepEqual(parseScanTriggerCounts(states), { cron: 1, http: 1, manual: 0 });
+      assert.deepEqual(parseScanTriggerCounts(states), {
+        cron: 1,
+        http: 1,
+        manual: 0,
+        clock: 0,
+      });
       // And the tag itself is durable where /health reads it.
       const hb = await db.getWorkerState("scan_heartbeat");
       assert.equal(
@@ -19691,9 +19886,9 @@ async function main() {
     );
     assert.ok(
       stripped.includes(
-        'awaitworker.scheduled({cron:DELIVERY_CRONS[delivery]},env,ctx,{relay:false,relayTag:"inner",});',
+        'awaitworker.scheduled({cron:DELIVERY_CRONS[delivery]},env,ctx,{relay:false,relayTag:"inner",...(source===null?{}:{via:source}),});',
       ),
-      "the placed half replays the platform's own scheduled entry, through the delivery map",
+      "the placed half replays the platform's own scheduled entry, through the delivery map — and names the clock as the caller when the clock asked",
     );
     // The durable markers the post-deploy check reads: the scan heartbeat and
     // the two special deliveries' own rows must name the path that ran them.

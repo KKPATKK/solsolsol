@@ -187,6 +187,8 @@ interface Env {
   SCAN_INTERVAL_SECONDS?: string;
   SCAN_PROFILE_LIMIT?: string;
   CRON_RELAY_URL?: string;
+  /** The sub-minute clock's tick period in seconds (see TickClock). */
+  CLOCK_TICK_SECONDS?: string;
 }
 
 /** Minimal ScheduledEvent shape — avoids pulling in workers-types. */
@@ -289,6 +291,14 @@ const SCAN_TRIGGER_INTERVAL_MS = 60_000;
  * it — that is what keeps 90/120 skipping alternate ticks.
  */
 export const SCAN_CRON_PERIOD_MS = 60_000;
+/**
+ * The sub-minute clock's period bounds (see TickClock / clockTickMs): below
+ * 15s the scan's own 3-4s duration plus dispatch jitter leaves no room for a
+ * gate, and above 5 minutes the clock is a slower cron with extra parts. The
+ * tuned value lives in wrangler.toml (`CLOCK_TICK_SECONDS`).
+ */
+export const TICK_CLOCK_MIN_MS = 15_000;
+export const TICK_CLOCK_MAX_MS = 300_000;
 /**
  * The fallback's rescue threshold: how stale the last COMPLETED scan must be
  * before an HTTP request may run the scan itself. Two missed cadences, with a
@@ -2552,7 +2562,12 @@ export function frontModeOverrideRead(): { raw: string | null; at: number } | nu
  * scan's own flush batch — which is the same "as of the last confirmed write"
  * discipline the deferral snapshot documents.
  */
-let scanTriggerMirror: ScanTriggerCounts = { cron: 0, http: 0, manual: 0 };
+let scanTriggerMirror: ScanTriggerCounts = {
+  cron: 0,
+  http: 0,
+  manual: 0,
+  clock: 0,
+};
 
 /**
  * What the cadence gate still has to fetch itself, given what the tick's
@@ -2755,13 +2770,36 @@ export const SCAN_GATE_JITTER_MS = 30_000;
 /** Never let the gate land right on one cron period (see scanGateMs). */
 export const SCAN_GATE_MIN_MARGIN_MS = 10_000;
 /**
+ * Floor for a SUB-MINUTE gate (see scanGateMs): one scan takes 3-4s, so a
+ * threshold below this would let a second trigger start a scan on top of the
+ * completion it is still measuring. Only the clock's regime reaches it.
+ */
+export const SCAN_GATE_SUBMIN_FLOOR_MS = 5_000;
+/**
  * The cadence gate's threshold for a configured scan interval: scan when the
- * last COMPLETION is at least this old. Pure and exported so the two modes this
- * file must keep working — "scan on every tick" at the 60s default and "skip
- * every other tick" at 90s — are asserted in tests instead of watched live.
+ * last COMPLETION is at least this old. Pure and exported so the modes this
+ * file must keep working are asserted in tests instead of watched live: the
+ * 60s default ("scan on every tick"), 90s ("skip every other tick") and —
+ * since 2026-10-02 — the sub-minute clock's regime (see TickClock), where the
+ * interval IS the target and the gate keeps HALF of it as slack.
+ *
+ * WHY HALF BELOW ONE CRON PERIOD: the gate measures completion-to-entry, so
+ * the previous scan's own duration (~3-4s measured) plus dispatch jitter has
+ * to fit inside the slack. At 30s the gate lands at 15s — a healthy clock tick
+ * 30s after the last completion reads age ~26s and scans, and even a slow 8s
+ * scan (age ~22s) still does. The 60s-and-up arithmetic is untouched: the
+ * jitter budget there is what keeps 90s skipping every other tick instead of
+ * silently becoming 60s.
  */
 export function scanGateMs(scanGapMs: number): number {
-  const interval = Math.max(SCAN_CRON_PERIOD_MS, scanGapMs);
+  if (scanGapMs < SCAN_CRON_PERIOD_MS) {
+    const interval = Math.max(TICK_CLOCK_MIN_MS, scanGapMs);
+    return Math.max(
+      SCAN_GATE_SUBMIN_FLOOR_MS,
+      interval - Math.min(SCAN_GATE_JITTER_MS, Math.floor(interval / 2)),
+    );
+  }
+  const interval = scanGapMs;
   if (interval === SCAN_CRON_PERIOD_MS) {
     return interval - SCAN_GATE_JITTER_MS;
   }
@@ -5903,34 +5941,62 @@ export function parseCronRelayDelivery(
 }
 
 /**
+ * The header naming WHO is relaying (see TickClock): absent = the cron
+ * delivery itself, `clock` = the sub-minute clock's alarm. The placed route
+ * turns this into the replayed run's ScanTrigger, so `/health.scanTriggers`
+ * and the heartbeat's `via` can separate a clock scan from a cron one — the
+ * clock's arrivals deliberately carry NONE of the cron bookkeeping (see
+ * `scheduled`), so counting them as cron now would quietly corrupt the very
+ * readings (the tick ring, scheduled_tick_total, the pre-init stamp) that cron
+ * liveness is monitored with.
+ */
+const CRON_RELAY_SOURCE_HEADER = "x-cron-relay-source";
+
+/** Pure: the relay source a request names, or null when it is the cron. */
+export function parseCronRelaySource(
+  value: string | null | undefined,
+): "clock" | null {
+  return value === "clock" ? "clock" : null;
+}
+
+/**
  * The cron half: run this delivery through the placed fetch path. Returns
  * "relayed" when the placed invocation ran it (the caller must NOT run the
  * local work); otherwise the tag the LOCAL run must publish — "failed" when
  * the relay was refused/timed-out/erroring, "skipped" when it was not
  * configured at all. A return value, not module state: see THE MARKER in the
  * block comment above.
+ *
+ * `source` names WHO relays: null = the cron delivery itself (whose caller
+ * runs the local fallback on a non-"relayed" answer), "clock" = the
+ * sub-minute clock's alarm (see TickClock), which has NO local fallback — it
+ * is only a trigger, and on failure the cron delivery remains the cadence.
+ * The header is also what makes the replayed run's trigger honest (`via`).
  */
 async function relayCronDelivery(
   env: Env,
   delivery: CronRelayDelivery,
+  source: "clock" | null = null,
 ): Promise<"relayed" | "failed" | "skipped"> {
   const base = env.CRON_RELAY_URL;
   const secret = env.TELEGRAM_BOT_TOKEN;
   if (!base || !secret) {
     return "skipped";
   }
+  const fromClock = source === "clock";
   try {
     const res = await fetch(cronRelayUrl(base), {
       method: "POST",
       headers: {
         [CRON_RELAY_HEADER]: secret,
         [CRON_RELAY_DELIVERY_HEADER]: delivery,
+        ...(fromClock ? { [CRON_RELAY_SOURCE_HEADER]: source } : {}),
       },
       signal: AbortSignal.timeout(CRON_RELAY_BOUND_MS),
     });
     if (!res.ok) {
       console.error(
-        `[worker] ${delivery} relay answered ${res.status}; running it in the cron region`,
+        `[worker] ${delivery} relay${fromClock ? " (clock)" : ""} answered ${res.status}; ${fromClock ? "the cron delivery remains the cadence" : "running it in the cron region"}`,
       );
       return "failed";
     }
@@ -5946,7 +6012,7 @@ async function relayCronDelivery(
     return "relayed";
   } catch (err) {
     console.error(
-      `[worker] ${delivery} relay failed; running it in the cron region:`,
+      `[worker] ${delivery} relay${fromClock ? " (clock)" : ""} failed; ${fromClock ? "the cron delivery remains the cadence" : "running it in the cron region"}:`,
       err instanceof Error ? err.message : err,
     );
     return "failed";
@@ -5984,6 +6050,11 @@ async function handleCronRelay(
       { status: 400 },
     );
   }
+  // WHO is asking (see parseCronRelaySource): the clock's alarm or a cron
+  // delivery. It rides `opts.via` into the replayed run's ScanTrigger.
+  const source = parseCronRelaySource(
+    request.headers.get(CRON_RELAY_SOURCE_HEADER),
+  );
   const startedAt = Date.now();
   try {
     // `relayTag: "inner"` is the placed run's OWN region reading (see THE
@@ -5991,6 +6062,7 @@ async function handleCronRelay(
     await worker.scheduled({ cron: DELIVERY_CRONS[delivery] }, env, ctx, {
       relay: false,
       relayTag: "inner",
+      ...(source === null ? {} : { via: source }),
     });
     return Response.json({ ok: true, delivery, ms: Date.now() - startedAt });
   } catch (err) {
@@ -6000,6 +6072,292 @@ async function handleCronRelay(
       { ok: false, error: message, ms: Date.now() - startedAt },
       { status: 500 },
     );
+  }
+}
+
+/**
+ * ============================================================================
+ * THE SUB-MINUTE CLOCK (2026-10-02): a Durable Object's alarm drives the scan
+ * and tracker deliveries faster than a Cron Trigger can
+ * ============================================================================
+ *
+ * WHY IT EXISTS. A Cron Trigger is a five-field expression, so the fastest
+ * cadence this Worker's platform triggers can carry is once a minute (see
+ * [triggers].crons, and SCAN_INTERVAL_SECONDS's "the fastest cadence the 1-min
+ * cron can drive"). A Durable Object alarm has no such floor: the object
+ * re-arms itself for the next tick the moment the current one finishes
+ * (Cloudflare: "Alarms are more fine grained than Cron Triggers"). This is the
+ * Durable Object lever the placement block's NEXT STEP named — and it needs no
+ * Turso migration, because the clock only TRIGGERS: every tick it fires still
+ * runs on the placed fetch path (NRT, beside the database) through the same
+ * relay every cron delivery uses (see the relay block above).
+ *
+ * WHAT ONE TICK DOES: one relay POST per delivery — `scan` and `tracker`, in
+ * PARALLEL (they are independent invocations of this Worker; the platform
+ * already delivers those two crons on the same minute, so nothing about their
+ * concurrency is new) — and then it re-arms. It holds no state a tick needs,
+ * writes no rows of its own, and its work is visible exactly where the cron's
+ * is: the scan heartbeat (`via: "clock"`, `relay: "inner"`), the durable
+ * per-trigger counter (`scan_trigger_clock`) and the pass row's own timestamps.
+ *
+ * WHY THE CLOCK DOES NOT RUN THE TICK ITSELF: a Durable Object's location is
+ * fixed at creation (a hint, not a promise), while the whole 2026-10-02 relay
+ * exercise was about the tick's DB round trips running where they measure
+ * single-digit ms — NRT, beside the Turso group. Relaying keeps ONE execution
+ * site for the work and makes the clock purely a trigger; the price is one extra
+ * internal hop per tick (~50-100ms), paid because nothing else in this Worker
+ * can ask for the work at NRT on demand.
+ *
+ * THE GATE IS STILL THE CADENCE. A clock tick ASKS for a scan exactly like a
+ * cron tick; it does not force one. The threshold is `scanGateMs(clockTickMs)`
+ * (half the interval below one cron period), so a late alarm, a cron arrival in
+ * the same seconds, and a scan still in flight all end in the ordinary
+ * gate/scan-lock arbitration and can never overlap. The clock is therefore
+ * REPLACEABLE in both directions: if it dies, the cron's cadence continues from
+ * the same place — and every cron scan delivery re-arms it (see armTickClock);
+ * if the cron dies, the clock keeps scanning, and the HTTP rescue still exists
+ * for both dying together.
+ *
+ * CRON BOOKKEEPING IS THE CRON'S. A clock arrival carries NONE of it: no tick
+ * ring entry, no scheduled_tick_total bump, no pre-init arrival stamp and no
+ * `scheduledTickFinishedAt` move. Those readings exist to answer "is the cron
+ * trigger delivering, and do its ticks finish?", and a clock arrival recorded
+ * there would make a DEAD cron look alive — the exact misreading
+ * docs/uptime-monitor.md was written about. The clock's own liveness is its
+ * scan heartbeat pace, its trigger counter and /debug/clock.
+ *
+ * CONFIG: `CLOCK_TICK_SECONDS` (wrangler.toml [vars]). Unset, "0", junk or
+ * negative = the clock is OFF (the DO is never armed; rollback is deleting the
+ * key or setting 0, no code change). Clamped to [15s, 300s] so a typo can
+ * neither hot-loop alarms (each one costs a DO request) nor turn the clock into
+ * a slower cron. While it is ON its period IS the scan cadence (the gate
+ * follows it); SCAN_INTERVAL_SECONDS is the cadence when the clock is off.
+ *
+ * COST, so it can be judged: at 30s that is 2 alarms/minute (~87.6K/month), one
+ * DO request per alarm plus its two relay subrequests, and each relayed tick is
+ * an ordinary Worker request — the order of a tenth of the plan's included
+ * requests at the time of writing. The readings that decide whether the faster
+ * cadence is worth it are the scan_history spacing, `scanTriggers.clock`,
+ * /debug/dex429 and the tick's own summary: a faster cadence spends upstream
+ * calls and Turso rows 2-3x faster, and upstream 429s are this Worker's known
+ * ceiling.
+ *
+ * FAILURE SHAPE: every alarm body is caught (never rethrown) and the next alarm
+ * is set in `finally`. Cloudflare's rule is why: an alarm() that throws is
+ * retried up to 6 times and then the loop is DEAD until the next setAlarm — so
+ * a downstream outage, a relay timeout or a bug in this file must not be able
+ * to end the clock. A tick whose relays fail is simply lost (the cron carries
+ * the cadence), and the next cron scan re-arms an alarm that is somehow gone.
+ * `armIfUnset` never moves a pending alarm, so a healthy loop's phase cannot be
+ * reset by the cron.
+ */
+interface DurableObjectStorageLike {
+  getAlarm(): Promise<number | null>;
+  setAlarm(scheduledTimeMs: number): Promise<void>;
+}
+interface DurableObjectStateLike {
+  storage: DurableObjectStorageLike;
+}
+interface DurableObjectStubLike {
+  fetch(input: string | Request, init?: RequestInit): Promise<Response>;
+}
+interface DurableObjectNamespaceLike {
+  idFromName(name: string): unknown;
+  get(id: unknown): DurableObjectStubLike;
+}
+
+/** The clock's single instance: one alarm loop, one cadence. */
+export const TICK_CLOCK_NAME = "tick-clock";
+/**
+ * The DO's own fetch surface. Any origin works — the object routes on the
+ * pathname alone — so the constant exists to keep the callers from inventing
+ * strings.
+ */
+export const TICK_CLOCK_ORIGIN = "https://tick-clock";
+export const TICK_CLOCK_ARM_PATH = "/arm";
+export const TICK_CLOCK_STATUS_PATH = "/status";
+
+/**
+ * The clock's tick period in ms, 0 when the clock is off. Pure and exported
+ * for the unit test: unset / "0" / junk / negative all read as OFF (the
+ * rollback), and a value inside the supported range is clamped rather than
+ * trusted — a typo must not be able to hot-loop alarms or silently disable the
+ * cadence knob this Worker documents in SCAN_INTERVAL_SECONDS.
+ */
+export function clockTickMs(env: { CLOCK_TICK_SECONDS?: string }): number {
+  const raw = Number(env.CLOCK_TICK_SECONDS);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(
+    TICK_CLOCK_MAX_MS,
+    Math.max(TICK_CLOCK_MIN_MS, Math.round(raw * 1000)),
+  );
+}
+
+/**
+ * The clock's binding out of the env. The ONE cast in this file that reads a
+ * binding off `Env`: its `[key: string]: string | undefined` index signature is
+ * what keeps `Env` assignable to NodeJS.ProcessEnv for loadConfig, and a
+ * DurableObjectNamespace is not a string — so the binding is read here instead
+ * of widening the index signature (which would break that assignment). A
+ * deployment without the binding (an older version, a local dev run) reads as
+ * null and the clock is simply off.
+ */
+function tickClockBinding(env: Env): DurableObjectNamespaceLike | null {
+  const ns = (env as unknown as { TICK_CLOCK?: DurableObjectNamespaceLike })
+    .TICK_CLOCK;
+  return ns && typeof ns.idFromName === "function" && typeof ns.get === "function"
+    ? ns
+    : null;
+}
+
+/**
+ * Keep the clock armed: called by every CRON scan delivery (never by the
+ * clock's own), so a clock whose alarm was somehow lost comes back on the next
+ * minute. Fire-and-forget through ctx.waitUntil — the tick must never wait on
+ * the clock's storage — and `armIfUnset` on the other side never moves an alarm
+ * that is already pending, so a healthy loop keeps its phase.
+ *
+ * Cost: one DO request per cron minute (~43.2K/month at the 60s cron) — the
+ * price of the clock being self-healing instead of depending on a manual arm.
+ */
+function armTickClock(env: Env, ctx: ExecutionContextLike): void {
+  const ns = tickClockBinding(env);
+  if (!ns || clockTickMs(env) <= 0) return;
+  try {
+    const stub = ns.get(ns.idFromName(TICK_CLOCK_NAME));
+    ctx.waitUntil(
+      stub
+        .fetch(`${TICK_CLOCK_ORIGIN}${TICK_CLOCK_ARM_PATH}`, { method: "POST" })
+        .then(() => undefined)
+        .catch(() => undefined),
+    );
+  } catch (err) {
+    console.error(
+      "[worker] clock arm failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/**
+ * The sub-minute clock (see the block comment above). Exported under the name
+ * wrangler.toml's `[[durable_objects.bindings]] class_name` uses — the class
+ * name IS the contract, so it must not be renamed without that file.
+ */
+export class TickClock {
+  private readonly state: DurableObjectStateLike;
+  private readonly env: Env;
+  /**
+   * The status reading is deliberately MEMORY-ONLY (the alarm is the durable
+   * part): a per-tick storage write would buy nothing a reader of /debug/clock
+   * cannot get from the alarm time plus the scan heartbeat, and every storage
+   * op inside an alarm is a line item. It resets when the object is evicted,
+   * which is exactly when `alarmAt` (durable) becomes the reading that matters.
+   */
+  private ticks = 0;
+  private lastTickAt: number | null = null;
+  private lastAlarmAt: number | null = null;
+  private lastResults: { scan: string; tracker: string } | null = null;
+  private lastWorkMs: number | null = null;
+
+  constructor(state: DurableObjectStateLike, env: Env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === TICK_CLOCK_ARM_PATH) {
+      const armed = await this.armIfUnset();
+      return Response.json({ ok: true, armed, ...(await this.status()) });
+    }
+    if (url.pathname === TICK_CLOCK_STATUS_PATH) {
+      return Response.json({ ok: true, ...(await this.status()) });
+    }
+    return new Response("Not Found", { status: 404 });
+  }
+
+  /**
+   * Arm the loop IF nothing is pending. Never moves a live alarm: the cron
+   * calls this every minute, and resetting a pending alarm would push the next
+   * tick back to "one clock period from now" on every cron minute — i.e. it
+   * would halve the cadence it exists to raise.
+   */
+  private async armIfUnset(): Promise<boolean> {
+    if (clockTickMs(this.env) <= 0) return false;
+    if ((await this.state.storage.getAlarm()) !== null) return false;
+    // Alarm now, not now + period: the arm request is a fresh start, and the
+    // first tick should be the one that proves the loop works.
+    await this.state.storage.setAlarm(Date.now());
+    return true;
+  }
+
+  private async status(): Promise<Record<string, unknown>> {
+    const tickMs = clockTickMs(this.env);
+    let alarmAt: number | null = null;
+    try {
+      alarmAt = await this.state.storage.getAlarm();
+    } catch {
+      // An unreadable alarm time is reported as "not armed" — the caller (a
+      // human on /debug/clock) should see the null, not an exception.
+    }
+    return {
+      on: tickMs > 0,
+      tickMs,
+      relayConfigured: Boolean(
+        this.env.CRON_RELAY_URL && this.env.TELEGRAM_BOT_TOKEN,
+      ),
+      ticks: this.ticks,
+      lastTickAt: this.lastTickAt,
+      lastAlarmAt: this.lastAlarmAt,
+      lastWorkMs: this.lastWorkMs,
+      lastResults: this.lastResults,
+      alarmAt,
+      now: Date.now(),
+    };
+  }
+
+  async alarm(): Promise<void> {
+    const tickMs = clockTickMs(this.env);
+    try {
+      if (tickMs > 0) {
+        const startedAt = Date.now();
+        this.ticks += 1;
+        this.lastTickAt = startedAt;
+        // Parallel on purpose (see the block comment): the two deliveries are
+        // independent invocations, and awaiting them in series would make the
+        // alarm's own span the sum of two ticks' wall clocks.
+        const [scan, tracker] = await Promise.all([
+          relayCronDelivery(this.env, "scan", "clock"),
+          relayCronDelivery(this.env, "tracker", "clock"),
+        ]);
+        this.lastResults = { scan, tracker };
+        this.lastWorkMs = Date.now() - startedAt;
+      }
+    } catch (err) {
+      // NEVER rethrow (see the block comment): a throw is 6 retries and then a
+      // dead loop.
+      console.error(
+        "[worker] clock tick failed:",
+        err instanceof Error ? err.message : err,
+      );
+    } finally {
+      // Re-arm whether or not the work ran: the alarm IS the loop, and the
+      // cron's armTickClock is the backstop if even this fails. A disabled
+      // clock (`CLOCK_TICK_SECONDS` pulled mid-loop) stops here and only the
+      // cron can restart it — which is the intended kill switch.
+      if (tickMs > 0) {
+        try {
+          this.lastAlarmAt = Date.now() + tickMs;
+          await this.state.storage.setAlarm(this.lastAlarmAt);
+        } catch (err) {
+          console.error(
+            "[worker] clock re-arm failed; the next cron scan re-arms it:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+    }
   }
 }
 
@@ -7636,6 +7994,52 @@ const worker = {
       });
     }
 
+    // The sub-minute clock's own surface (see TickClock): /debug/clock reads
+    // the DO's status — on/off, when the next alarm is due, what its last
+    // tick's two relays answered, how many ticks this instance has run — and
+    // `?arm=1` arms it if nothing is pending (the same call the cron scan
+    // delivery makes every minute; it never moves a live alarm). The DO is
+    // asked DIRECTLY rather than read from a mirror: the alarm time is the one
+    // reading that says the loop is actually alive, and it exists only inside
+    // the object.
+    if (url.pathname === "/debug/clock") {
+      const ns = tickClockBinding(env);
+      const tickMs = clockTickMs(env);
+      if (!ns) {
+        return Response.json(
+          {
+            ok: false,
+            error: "TICK_CLOCK binding missing (deploy with the DO binding to use the clock)",
+            on: tickMs > 0,
+            tickMs,
+          },
+          { status: 503 },
+        );
+      }
+      try {
+        const stub = ns.get(ns.idFromName(TICK_CLOCK_NAME));
+        const arm = url.searchParams.get("arm");
+        const res = await stub.fetch(
+          `${TICK_CLOCK_ORIGIN}${arm ? TICK_CLOCK_ARM_PATH : TICK_CLOCK_STATUS_PATH}`,
+          { method: arm ? "POST" : "GET" },
+        );
+        const body = (await res.json().catch(() => null)) as Record<
+          string,
+          unknown
+        > | null;
+        return Response.json({ ok: res.ok, tickMs, ...(body ?? {}) });
+      } catch (err) {
+        return Response.json(
+          {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+            tickMs,
+          },
+          { status: 502 },
+        );
+      }
+    }
+
     // Manual scan trigger — runs the exact scheduled-path wrapper (runScan:
     // scan + heartbeat + scan_history), so it is both the diagnostic that
     // distinguishes "cron not firing" from "scan path broken" and the manual
@@ -8082,12 +8486,15 @@ const worker = {
     /**
      * Present only when the caller is this Worker's OWN relay route (see
      * handleCronRelay): `relay: false` says this invocation IS the placed
-     * half of a relay and must not relay again, and `relayTag` is the region
+     * half of a relay and must not relay again, `relayTag` is the region
      * reading that run must publish (always "inner" — the route runs on the
-     * placed fetch path). The platform calls this method with three
-     * arguments; the relay route is the only four-argument call site.
+     * placed fetch path), and `via: "clock"` says the caller is the
+     * sub-minute clock's alarm rather than a cron delivery (see TickClock) —
+     * the one difference the scan branch below acts on. The platform calls
+     * this method with three arguments; the relay route is the only
+     * four-argument call site.
      */
-    opts?: { relay?: boolean; relayTag?: PassRelayTag },
+    opts?: { relay?: boolean; relayTag?: PassRelayTag; via?: "clock" },
   ): Promise<void> {
     // Keep the invocation open for the tick's deferred writes (see
     // tickWaitUntil): a fire-and-forget drain is cancelled when the handler
@@ -8166,6 +8573,17 @@ const worker = {
     // The region reading the local scan publishes when the relay does not run
     // it (see THE MARKER): the placed replay's own `opts.relayTag`, or the
     // failed/skipped tag of the attempt below.
+    // WHICH TRIGGER ASKED (2026-10-02, see TickClock): "clock" is the DO
+    // clock's alarm arriving through the relay route (handleCronRelay parses
+    // it off the wire); absent is the platform's own cron delivery. The two
+    // differ in EXACTLY two ways below — a clock arrival carries NONE of the
+    // cron bookkeeping (the tick ring, scheduled_tick_total, the pre-init
+    // stamp, `scheduledTickFinishedAt`: recording it there would let a DEAD
+    // cron read as alive, the misreading docs/uptime-monitor.md exists for),
+    // and it is counted as its own ScanTrigger so the per-trigger counters
+    // still answer "how much of the scanning is actually cron". Everything
+    // else — the gate, the scan lock, runScan — is deliberately identical.
+    const clockDelivery = opts?.via === "clock";
     let scanRelayTag: PassRelayTag | null = opts?.relayTag ?? null;
     if (opts?.relay !== false) {
       const relay = await relayCronDelivery(env, "scan");
@@ -8179,7 +8597,12 @@ const worker = {
       }
       scanRelayTag = relay;
     }
-    scheduledTicks++;
+    // THE CLOCK'S ARM KEEPER (see armTickClock): a confirmed CRON scan
+    // delivery — relayed or local — is where a clock whose alarm was somehow
+    // lost comes back on, one DO request per cron minute. The clock's own
+    // ticks never arm (they ARE the alarm).
+    if (!clockDelivery) armTickClock(env, ctx);
+    if (!clockDelivery) scheduledTicks++;
     // Cron-arrival bookkeeping rides the scan-lock claim (see
     // Db.scheduledTickStatements), so a normal tick pays ZERO extra round trips
     // for it: it used to pay a read AND a write through its own raw client
@@ -8198,7 +8621,7 @@ const worker = {
     // ring hole and a 2h42m one, with scans still landing from the HTTP monitor).
     // This stamp is written BEFORE init, on the arrivals whose predecessor never
     // returned, so the two causes can be told apart afterwards.
-    if (shouldStampArrival(scheduledTickFinishedAt, cronAt)) {
+    if (!clockDelivery && shouldStampArrival(scheduledTickFinishedAt, cronAt)) {
       try {
         // The module handle is null on a cold isolate (init has not built it
         // yet), which is why the fallback builds one the same way
@@ -8240,9 +8663,14 @@ const worker = {
       // half the arrivals had never been delivered (measured 07:39-08:11 that
       // day). The reason rides the next completion's tail write (see
       // src/skipcapture.ts).
+      // A clock arrival records nothing on this arm either (see
+      // clockDelivery): the counter and the flag are the CRON's, and the next
+      // cron delivery records its own arrival.
       noteSkipReason("init-no-scanner");
-      preTick.steps.bump = await bumpScheduledTickLegacy(env);
-      scheduledTickFinishedAt = Date.now();
+      if (!clockDelivery) {
+        preTick.steps.bump = await bumpScheduledTickLegacy(env);
+        scheduledTickFinishedAt = Date.now();
+      }
       return;
     }
     // Cadence gate: the cron trigger fires every minute; SCAN_INTERVAL_SECONDS
@@ -8252,7 +8680,18 @@ const worker = {
     // cross-isolate source of truth (an in-memory timestamp can't gate
     // another isolate's cron delivery). The HTTP-driven fallback
     // (maybeRunScanIfStale) still rescues a dead cron within 2 min.
-    const scanGapMs = Math.max(60_000, (cfg?.scanIntervalSeconds ?? 60) * 1000);
+    //
+    // WITH THE CLOCK ON, THE CLOCK'S PERIOD IS THE CADENCE (2026-10-02, see
+    // TickClock): `scanGateMs` gets the clock's period, and its sub-minute
+    // arithmetic keeps HALF of it as slack — which is what lets a 20s/30s tick
+    // pass its own gate (completion-to-entry is the period minus the scan's
+    // ~3-4s) while still refusing two triggers inside the same seconds.
+    // SCAN_INTERVAL_SECONDS keeps its meaning for the clock-off deployment.
+    const clockMs = clockTickMs(env);
+    const scanGapMs =
+      clockMs > 0
+        ? clockMs
+        : Math.max(SCAN_CRON_PERIOD_MS, (cfg?.scanIntervalSeconds ?? 60) * 1000);
     // Gate against the previous COMPLETION minus the jitter budget (see
     // scanGateMs): a strict `scanGapMs` comparison skips a tick whenever the
     // previous scan landed late (2026-09-27 live: every :2x completion was
@@ -8299,40 +8738,51 @@ const worker = {
         ? ((JSON.parse(hbRaw) as { at?: number } | null)?.at ?? 0)
         : 0;
       hbAt = typeof at === "number" && at > 0 ? at : null;
-      cronTick = {
-        at: cronAt,
-        ring: [
-          ...parseScheduledTickRing(kb?.get("scheduled_tick_ring") ?? null),
-          cronAt,
-        ],
-      };
+      cronTick = clockDelivery
+        ? null
+        : {
+            at: cronAt,
+            ring: [
+              ...parseScheduledTickRing(kb?.get("scheduled_tick_ring") ?? null),
+              cronAt,
+            ],
+          };
       if (hbAt !== null && Date.now() - hbAt < gateMs) {
         console.log(
-          `[worker] cron tick skipped — last scan claimed ${Math.round((Date.now() - hbAt) / 1000)}s ago (< ${Math.round(gateMs / 1000)}s)`,
+          `[worker] ${clockDelivery ? "clock" : "cron"} tick skipped — last scan claimed ${Math.round((Date.now() - hbAt) / 1000)}s ago (< ${Math.round(gateMs / 1000)}s)`,
         );
         // Counted like every other early return (2026-09-27): in the 60s mode
         // this is rare and should read ~0, while in a 90s/120s deployment it is
         // the cadence knob WORKING — either way "how often does the gate skip"
-        // belongs in the same reading as the scanner's own reasons.
-        noteSkipReason("cron-gate");
-        // A skipped tick still ARRIVED — record it (ONE write, no read).
-        try {
-          await db?.writeScheduledTick(cronTick);
-        } catch (err) {
-          console.error("[worker] skipped-tick cron bookkeeping failed:", err);
+        // belongs in the same reading as the scanner's own reasons. A clock
+        // tick's skip gets its OWN reason string: the two triggers have
+        // different fixes, and the counters must tell "the cron is
+        // over-firing" apart from "the clock is over-firing".
+        noteSkipReason(clockDelivery ? "clock-gate" : "cron-gate");
+        // A skipped CRON tick still ARRIVED — record it (ONE write, no read).
+        // A clock arrival is not a cron arrival (see clockDelivery) and has
+        // nothing to record — `cronTick` is null for it by construction.
+        if (cronTick) {
+          try {
+            await db?.writeScheduledTick(cronTick);
+          } catch (err) {
+            console.error("[worker] skipped-tick cron bookkeeping failed:", err);
+          }
         }
-        // A SKIP is a return: this arrival is accounted for (its own write
-        // went out above), so the next arrival needs no pre-init stamp.
-        scheduledTickFinishedAt = Date.now();
+        // A SKIP is a return: a CRON arrival is accounted for (its own write
+        // went out above), so the next arrival needs no pre-init stamp. The
+        // clock's tick is not that flag's business (see clockDelivery).
+        if (!clockDelivery) scheduledTickFinishedAt = Date.now();
         return;
       }
     } catch {
       // Heartbeat unreadable — fail open and run the scan. The arrival is
       // recorded through the standalone raw-client bump: with worker_state
       // unreadable there is no ring to hand the claim, and no reason to trust
-      // the claim batch to run at all.
+      // the claim batch to run at all. A clock arrival has no arrival to
+      // record and simply falls through (see clockDelivery).
       cronTick = null;
-      preTick.steps.bump = await bumpScheduledTickLegacy(env);
+      if (!clockDelivery) preTick.steps.bump = await bumpScheduledTickLegacy(env);
     } finally {
       // Covers the `return` arm too: a SKIPPED tick still reports what its
       // gate read cost, which is the tick shape a reader is chasing.
@@ -8348,15 +8798,27 @@ const worker = {
     }
     scanRunning = true;
     try {
-      await runScan(hbRaw, env, cronTick, "cron", scanRelayTag);
+      // The trigger this scan is COUNTED under (see Db.ScanTrigger): the
+      // clock gets its own value so `/health.scanTriggers.clock` and the
+      // heartbeat's `via` answer "who is actually driving the cadence"
+      // directly, instead of leaving a reader to infer it from timing.
+      await runScan(
+        hbRaw,
+        env,
+        cronTick,
+        clockDelivery ? "clock" : "cron",
+        scanRelayTag,
+      );
     } finally {
       scanRunning = false;
     }
-    // The tick RETURNED: this isolate's newest scheduled arrival is accounted
-    // for, which is the flag that keeps the pre-init stamp off the next one
-    // (see shouldStampArrival). Set LAST on purpose — a tick that dies anywhere
+    // The tick RETURNED: this isolate's newest CRON arrival is accounted for,
+    // which is the flag that keeps the pre-init stamp off the next one (see
+    // shouldStampArrival). Set LAST on purpose — a tick that dies anywhere
     // above leaves the flag where it was, and that stale flag IS the witness.
-    scheduledTickFinishedAt = Date.now();
+    // A clock tick must not move it: the flag describes the cron trigger's
+    // deliveries, and a busy clock would hide a cron that stopped finishing.
+    if (!clockDelivery) scheduledTickFinishedAt = Date.now();
   },
 };
 

@@ -598,13 +598,19 @@ export function parseScheduledTickRing(raw: string | null): number[] {
  * `subreqs.current.owner:"pass"` on 2026-09-27), lands in the heartbeat's
  * `via`, and is counted durably by the statements below.
  */
-export type ScanTrigger = "cron" | "http" | "manual";
+export type ScanTrigger = "cron" | "http" | "manual" | "clock";
 
 /** The durable counter row per trigger (see scanTriggerStatements). */
 export const SCAN_TRIGGER_COUNTER_KEYS: Record<ScanTrigger, string> = {
   cron: "scan_trigger_cron",
   http: "scan_trigger_http",
   manual: "scan_trigger_manual",
+  // The sub-minute clock's own row (2026-10-02, worker.TickClock): a scan the
+  // DO relayed is not a cron arrival and not an HTTP rescue, and folding it
+  // into `cron` would make the ONE reading these counters exist for — "how
+  // much of the scanning is actually cron" — read wrong by exactly the share
+  // the clock drives.
+  clock: "scan_trigger_clock",
 };
 
 /** The counters as a key list, for the front read that publishes them. */
@@ -612,6 +618,7 @@ export const SCAN_TRIGGER_STATE_KEYS: readonly string[] = [
   SCAN_TRIGGER_COUNTER_KEYS.cron,
   SCAN_TRIGGER_COUNTER_KEYS.http,
   SCAN_TRIGGER_COUNTER_KEYS.manual,
+  SCAN_TRIGGER_COUNTER_KEYS.clock,
 ];
 
 /** The fleet-wide per-trigger scan counts (see parseScanTriggerCounts). */
@@ -619,6 +626,7 @@ export interface ScanTriggerCounts {
   cron: number;
   http: number;
   manual: number;
+  clock: number;
 }
 
 /**
@@ -688,6 +696,7 @@ export function parseScanTriggerCounts(
     cron: read(SCAN_TRIGGER_COUNTER_KEYS.cron),
     http: read(SCAN_TRIGGER_COUNTER_KEYS.http),
     manual: read(SCAN_TRIGGER_COUNTER_KEYS.manual),
+    clock: read(SCAN_TRIGGER_COUNTER_KEYS.clock),
   };
 }
 

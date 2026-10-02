@@ -49,6 +49,15 @@ compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 # 90 (every other tick) — the re-eval pool + Birdeye backfill keep coverage
 # during the gap.
 #
+# SINCE 2026-10-02 THE SCAN CADENCE CAN GO BELOW THIS 1-MINUTE FLOOR: the
+# sub-minute clock ([[durable_objects.bindings]] TICK_CLOCK + the
+# CLOCK_TICK_SECONDS var below) drives the scan and tracker deliveries through
+# the relay at a period of its own, while these expressions stay exactly as
+# they are — they are the BACKSTOP that keeps a 60s cadence whenever the clock
+# is off or its alarm is not armed. The clock retires no cron: the scan tick is
+# still what re-arms it (worker.armTickClock), the tracker pass's fallback row
+# still guards a dead pass trigger, and the maintenance legs still ride "*/5".
+#
 # "*/5 * * * *"  the MAINTENANCE delivery's OWN invocation (worker.
 #                MAINTENANCE_CRON, 2026-09-29): the interval-gated,
 #                side-effect-only legs — the Birdeye periodic backfill and the
@@ -158,8 +167,53 @@ crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 # maintenance legs. In every one, "inner" = the placed invocation ran it,
 # "failed"/"skipped" = the cron fell back to its own region. `mode = "smart"`
 # is still not the lever.
+#
+# DONE 2026-10-02 (SECOND HALF) — THE DURABLE-OBJECT LEVER IS LIVE, AS A
+# TRIGGER ONLY. The sub-minute clock (TICK_CLOCK below) uses the DO for what a
+# DO is good at here — an alarm with no 1-minute floor — while the WORK still
+# runs on this placed path through the same relay. No location hint is set on
+# the object on purpose: the clock's own data center cannot matter, because it
+# runs no tick; the region reading that does matter is the heartbeat's `colo`,
+# which stays NRT because the relayed invocation is what runs the scan.
 [placement]
 region = "aws:ap-northeast-1"
+
+# ---------------------------------------------------------------------------
+# THE SUB-MINUTE CLOCK (2026-10-02): a Durable Object whose alarm drives the
+# scan and tracker deliveries faster than the 1-minute cron floor.
+#
+# A Cron Trigger is a five-field expression — once a minute is the fastest this
+# Worker can be triggered — while a DO alarm has no such floor (Cloudflare:
+# "Alarms are more fine grained than Cron Triggers"). The clock relays every
+# tick to the placed fetch path through the SAME relay the cron deliveries use
+# (src/worker.ts TickClock), so the work still runs at NRT beside the database;
+# the DO itself is only a trigger. It writes no rows and carries none of the
+# cron bookkeeping ON PURPOSE — the tick ring, scheduled_tick_total and the
+# pre-init arrival stamp stay readings of the CRON trigger (see TickClock and
+# docs/uptime-monitor.md).
+#
+# CLOCK_TICK_SECONDS (in [vars] below) is the switch: unset / "0" / junk = off
+# (the DO is never armed; a rollback needs no code change). While it is on, its
+# period IS the scan cadence and the cron's 60s cadence is the backstop; every
+# cron scan re-arms a clock whose alarm disappeared (worker.armTickClock).
+#
+# WHAT IT COSTS at 30s: 2 alarms/minute (~87.6K/month), each one DO request
+# plus its two relay subrequests, and one Worker request per relayed tick — the
+# order of a tenth of the plan's included requests. It also spends upstream
+# calls and Turso rows 2x faster, and upstream 429s are this Worker's known
+# ceiling: read /debug/dex429, `scanTriggers.clock`, the scan_history spacing
+# and the tick summary before raising it further.
+[[durable_objects.bindings]]
+name = "TICK_CLOCK"
+class_name = "TickClock"
+
+# The clock's class migration. `new_sqlite_classes` (not `new_classes`): the
+# object stores ONE thing — its next alarm — and the SQLite-backed class is the
+# current default with the cheaper storage billing. Never delete or retag this
+# entry; a future change adds a new tag.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TickClock"]
 
 # Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
 # TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY, COINGECKO_API_KEY) must NOT
@@ -211,6 +265,19 @@ CRON_RELAY_URL = "https://solana-meme-bot.cool1999k.workers.dev"
 # 429s — restore it if those return; the gecko client's 5-min backoff and
 # the Birdeye backfill are the safety nets at the 60s cadence).
 SCAN_INTERVAL_SECONDS = "60"
+# The sub-minute clock's tick period, in seconds (src/worker.ts TickClock).
+# SET = ON; delete this key or set "0" to turn the clock off (the DO is then
+# never armed and the cron's SCAN_INTERVAL_SECONDS cadence takes over
+# completely). Clamped to [15, 300] so a typo cannot hot-loop alarms. While it
+# is on, its period IS the scan cadence — the gate follows it, keeping half a
+# period as slack below 60s — and SCAN_INTERVAL_SECONDS governs the clock-off
+# deployment. 30 = a scan and a tracker pass every ~30s (each tick's own work
+# adds ~3-4s): the first step above the cron floor, halving push/follow-up
+# latency. 20/15 are one var edit away — read /debug/dex429 and
+# summary.geoDue before spending them. After any change: /debug/clock's
+# `alarmAt` is the loop's own liveness reading, and /health.scanTriggers.clock
+# is the share of scans the clock drives.
+CLOCK_TICK_SECONDS = "30"
 # Max coverage: inspect the newest 200 Solana token profiles per scan
 # (the code caps this at 200). Deferred candidates stay in the re-eval
 # pool, so nothing is lost when a tick runs out of budget.
