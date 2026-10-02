@@ -19270,6 +19270,30 @@ async function main() {
     );
   });
 
+  // The other half of the region question (2026-10-02): the placement
+  // experiment priced the DISTANCE, this probe says WHERE the unplaced
+  // `scheduled` invocation runs — the number a Turso group move would have to
+  // aim at or it is worse than nothing. Only the parser is unit-testable; the
+  // fetch itself is live behaviour, read from /health.heartbeat.colo.
+  await test("parseTraceColo: the colo probe reads only a real trace answer", () => {
+    const { parseTraceColo } = require("../dist/worker.js");
+    assert.equal(
+      parseTraceColo(
+        "fl=123abc\nh=www.cloudflare.com\nip=1.2.3.4\nts=1234.5\nvisit_scheme=https\nuag=curl\ncolo=NRT\nsliver=none\nhttp=http/2\n",
+      ),
+      "NRT",
+      "the colo line is what identifies the data center",
+    );
+    assert.equal(parseTraceColo("colo=SJC\n"), "SJC");
+    assert.equal(parseTraceColo("colo=\n"), null, "an empty value is not a colo");
+    assert.equal(
+      parseTraceColo("fl=123\nh=www.cloudflare.com\n"),
+      null,
+      "no colo line, no reading",
+    );
+    assert.equal(parseTraceColo(""), null);
+  });
+
   // ---------- the heal's opening read is ONE request (src/db.ts + src/pushwatch.ts) ----------
   //
   // P0-1/P0-2 (2026-09-29). One pass's heal opening used to be FOUR Turso

@@ -4291,6 +4291,49 @@ async function runMaintenanceInvocation(env: Env): Promise<void> {
   }
 }
 
+/**
+ * Where THIS invocation ran — the reading a scheduled event cannot give
+ * itself.
+ *
+ * WHY IT EXISTS (2026-10-02): whether moving the Turso group near the cron
+ * path is worth its migration depends on a number nothing in this Worker
+ * measures — WHERE the unplaced `scheduled` invocation actually executes.
+ * The tick's DB timings can only say "far from the database" (init 1.2-1.5s a
+ * tick, against the placed fetch path's single-digit ms); they cannot say
+ * which region, and a region move aimed at the wrong one is worse than none.
+ * A scheduled event carries no `request.cf`, so the only way to see the colo
+ * is to ask an outside Cloudflare endpoint: /cdn-cgi/trace answers with
+ * `colo=XXX`, terminated by the data center nearest the subrequest's egress
+ * — i.e. this invocation's own.
+ *
+ * COST, stated so it can be judged: one subrequest per scan (of the paid
+ * 1,000), ~10-50ms, started at runScan's top and read by the completion
+ * payload — never awaited on a critical path, never fatal (null = did not
+ * answer). Delete this probe and its `colo` field once the region question
+ * is answered.
+ */
+const CRON_COLO_PROBE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
+const CRON_COLO_PROBE_BOUND_MS = 1_500;
+
+/** Pure parser for the trace body (exported for the unit test). */
+export function parseTraceColo(text: string): string | null {
+  const m = /^colo=(\S+)$/m.exec(text);
+  return m ? m[1] : null;
+}
+
+/** Best-effort: null means "did not answer", never a failed tick. */
+async function probeCronColo(): Promise<string | null> {
+  try {
+    const res = await fetch(CRON_COLO_PROBE_URL, {
+      signal: AbortSignal.timeout(CRON_COLO_PROBE_BOUND_MS),
+    });
+    if (!res.ok) return null;
+    return parseTraceColo(await res.text());
+  } catch {
+    return null;
+  }
+}
+
 async function runScan(
   prevHeartbeatRawArg?: string | null,
   envRef?: Env,
@@ -4324,6 +4367,15 @@ async function runScan(
     return;
   }
   const scanVia: ScanTrigger = via;
+  // Started BEFORE the claim and read at the flush, so the probe's ~10-50ms
+  // never sits on the wall-clock-critical path (see probeCronColo). The
+  // sentinel matters: a plain null at flush time would be indistinguishable
+  // from "still pending", and reading the previous tick's answer is exactly
+  // the misattribution this is meant to prevent.
+  let cronColo: string | null | "pending" = "pending";
+  void probeCronColo().then((c) => {
+    cronColo = c;
+  });
   // Cross-isolate single-flight: cron and the HTTP fallback may run on
   // DIFFERENT isolates that each read the same stale heartbeat and both
   // start a scan in the same second (observed 2026-09-03 — duplicate
@@ -4903,6 +4955,11 @@ async function runScan(
             // what /health serves between ticks, so the attribution rides it
             // too, not only the scanning row.
             via: scanVia,
+            // WHERE the invocation actually ran (see probeCronColo): the
+            // scheduled event carries no request, so this is the only place
+            // the region question can be answered from. Null = the probe had
+            // not settled by the flush, or answered nothing — never a guess.
+            colo: cronColo === "pending" ? null : cronColo,
             ok: lastScanOk,
             phase: "done",
             count: scanCount,
