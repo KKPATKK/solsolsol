@@ -71,8 +71,8 @@ compatibility_flags = ["nodejs_compat"]
 crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 
 # ---------------------------------------------------------------------------
-# PLACEMENT EXPERIMENT (2026-10-02): price the Worker↔database distance before
-# paying for an architecture change.
+# PLACEMENT (2026-10-02 experiment, KEPT): the fetch path now runs next to the
+# database, and the cron scan demonstrably does not.
 #
 # WHAT THIS IS. An explicit Placement Hint — `region`, not `mode = "smart"` —
 # which runs the Worker's FETCH path in the data center with the lowest latency
@@ -93,20 +93,29 @@ crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 # and operator /debug reads — so the explicit region is the deterministic read.
 # wrangler translates this to `placement.mode = "targeted"` in the API payload.
 #
-# WHAT IT DOES *NOT* MOVE (docs: "Placement only affects the execution of
-# fetch event handlers"): the cron `scheduled` invocations — the scan itself —
-# are NOT placed. This experiment measures the DISTANCE through an HTTP route
-# (/debug/db-latency: `colo` + `cfPlacement` + the four ops above), and the
-# result decides the follow-up: route the scan through the placed fetch path,
-# or move the scan into a Durable Object whose location hint can be set to
-# apac-ne. Keeping the scan on cron while this is measured means the experiment
-# reverts by deleting this block, with nothing else to undo.
+# WHAT IT DID (same route, 06:16-06:20Z, after the deploy of 3afb08e): select1
+# p50 8-9ms (min 6), readRow 9-10ms, writeUpsert 30-79ms, claimShapeTwoTrip
+# 53-70ms, claimShapeOneTrip 8-16ms with 6 samples per reading — a 12-15x
+# round-trip collapse, i.e. the distance WAS most of those numbers. The
+# RESPONSE carries `cf-placement: remote-` (visible only to the caller: the
+# handler cannot read it about itself, and `colo` keeps reporting the ENTRY
+# data center — LAX — which is why /debug/db-latency's own note warns against
+# reading placement off it).
 #
-# HOW TO READ IT. After deploy, /debug/db-latency must show cfPlacement
-# `remote-<colo>` (with `colo` a data center near Tokyo) and the four ops
-# collapsed to single-digit/low-tens ms. `local-LAX` with unchanged numbers
-# means the platform did not place this Worker, and that is the finding: the
-# distance cannot be bought this way.
+# WHAT IT DOES *NOT* MOVE (docs: "Placement only affects the execution of
+# fetch event handlers"), measured after the same deploy: the cron `scheduled`
+# invocation still runs away from the database — its front init read stepped
+# 1,495ms and its per-call dbSteps averages stayed in the ~1.4s class
+# (getWorkerStates, getReevalPool) against the placed path's ~8ms statements.
+# So the scan keeps paying the distance; this block only makes the HTTP path
+# (uptime-monitor rescue scans included) fast.
+#
+# NEXT STEP these numbers support: route the scan through a placed fetch path,
+# or move it into a Durable Object with an apac-ne location hint. `mode =
+# "smart"` is NOT the lever: it needs consistent traffic from multiple
+# locations, and this fetch path is low traffic (the explicit region is
+# deterministic). Revert = delete this block; the cron path never depended on
+# it.
 [placement]
 region = "aws:ap-northeast-1"
 

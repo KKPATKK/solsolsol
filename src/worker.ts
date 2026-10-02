@@ -7034,13 +7034,15 @@ export default {
       // `claimShapeSavingMs` is the difference between them, and `rawMs`
       // keeps every sample so a slow FIRST sample (connection setup on a cold
       // isolate) stays visible instead of being averaged into the median.
-      // `colo` (where Cloudflare ran this request) next to `dbRegion` (parsed
-      // from the connection URL) is the distance question itself, and
-      // `cfPlacement` is the PLACEMENT EXPERIMENT's proof (see the [placement]
-      // block in wrangler.toml): Cloudflare adds that header while placement is
-      // enabled — `remote-NRT` means the request was forwarded to the placed
-      // colo, `local-LAX` means it ran locally — so a moved number can be
-      // attributed instead of guessed at.
+      // `colo` (where the request ENTERED Cloudflare) next to `dbRegion`
+      // (parsed from the connection URL) is the distance question itself.
+      // CAVEAT, measured 2026-10-02 with the [placement] block live: `colo`
+      // reports the ENTRY data center, NOT where the code ran — the placed
+      // fetch path still reads `colo: LAX` while its round trips collapsed to
+      // single-digit ms because execution moved next to the database. The
+      // placement proof (`cf-placement: remote-…`) rides the RESPONSE, which a
+      // handler cannot read about itself, so read the `ops` below against the
+      // [placement] block's before/after table instead of trusting `colo`.
       //
       // Read-mostly: the only writes land on two fixed worker_state probe
       // rows, never seen_tokens — see src/dblatency.ts.
@@ -7071,7 +7073,6 @@ export default {
           at: new Date().toISOString(),
           colo:
             (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? null,
-          cfPlacement: request.headers.get("cf-placement"),
           dbRegion: dbRegionFromUrl(env.TURSO_DATABASE_URL),
           samples: measured.samples,
           ops,
