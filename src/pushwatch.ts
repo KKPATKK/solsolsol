@@ -1308,19 +1308,21 @@ export function notePeerPassYield(at: number, ageMs: number): void {
  *  4. A pin is never moved by a check write, and never taken from a
  *     non-DexScreener source (see pinnablePoolAddress).
  *  5. A lookup that did NOT answer serves each pool from its last ANSWERED
- *     snapshot when one is fresh (Scanner.poolPairsForTracker; `pin-snap N`
- *     in the note) — a 429 episode should idle the pin lane for a pass or
- *     two, not skip the whole pin set. Snapshots are memory, never evidence:
- *     an ANSWERED absence still re-pins (and drops the snapshot), and a
- *     snapshot-served row can never re-pin anything itself.
+ *     snapshot when one is fresh (Scanner.poolPairsForTracker; `pin-snap N
+ *     (oldest Xs)` in the note, where the parenthesised age is the oldest
+ *     served snapshot) — a 429 episode should idle the pin lane for a pass
+ *     or two, not skip the whole pin set. Snapshots are memory, never
+ *     evidence: an ANSWERED absence still re-pins (and drops the snapshot),
+ *     and a snapshot-served row can never re-pin anything itself.
  *
  * DELIBERATE CONSEQUENCES (not bugs): nothing about the stored series is
  * reset on a re-pin, so the one skipped pass is the entire switch protection;
  * and a row whose token has no pair ANYWHERE (neither the pin nor the token
  * batch resolves) skips every pass — it is not deleted and ages out via the
  * window prune. Rule 5 adds one more: a switch is discovered at most
- * PIN_SNAPSHOT_TTL_MS (90s) later than an answering lookup would have shown
- * it — and only when every lookup in that window was refused.
+ * PIN_SNAPSHOT_TTL_MS (120s since 2026-10-03) later than an answering lookup
+ * would have shown it — and only when every lookup in that window was
+ * refused.
  */
 export interface PushWatchRow {
   token: string;
@@ -2668,7 +2670,8 @@ export class PushWatcher {
      * answer (refused / out of window), which is NOT evidence of a switch.
      * On the unanswered path the Scanner's snapshot memory may fill keys
      * from each pool's LAST-ANSWERED state (rule 5) — `snapshots` counts
-     * those so the pass note can say so (`pin-snap N`).
+     * those (and `snapshotOldestMs` ages them) so the pass note can say so
+     * (`pin-snap N (oldest Xs)`).
      * Optional, so existing callers and test doubles keep their shape: with
      * it absent a pinned row still resolves whenever the token batch's own
      * pair IS the pin, and otherwise skips.
@@ -2686,6 +2689,13 @@ export class PushWatcher {
        * nothing snapshot-served may re-pin.
        */
       snapshots: number;
+      /**
+       * Age (ms) of the OLDEST snapshot among those `snapshots` — the note's
+       * `(oldest Xs)` half, so a pass riding the TTL boundary can be told
+       * from one served seconds after its answer. Optional so callers and
+       * test doubles written before it keep their shape; absent reads as 0.
+       */
+      snapshotOldestMs?: number;
     }>,
   ) {}
 
@@ -3755,10 +3765,12 @@ export class PushWatcher {
     /**
      * Pins this pass resolves from their last-answered snapshot because the
      * by-address lookup did not answer (see rule 5): counted into the note as
-     * `pin-snap N` so a refusal pass that still judges its rows is never read
-     * as a live answer.
+     * `pin-snap N (oldest Xs)` so a refusal pass that still judges its rows
+     * is never read as a live answer — nor as a fresh snapshot.
      */
     let pinSnapshots = 0;
+    /** Age (ms) of the OLDEST snapshot served this pass (0 = none). */
+    let pinOldestMs = 0;
     try {
       pairs = await this.pairsFor(
         tokens,
@@ -3778,6 +3790,7 @@ export class PushWatcher {
           );
           pinPairs = answer.pairs;
           pinSnapshots = answer.snapshots;
+          pinOldestMs = answer.snapshotOldestMs ?? 0;
         } catch {
           /* unresolved pins stay unresolved — rows skip, nothing re-pins */
         }
@@ -4801,7 +4814,8 @@ export class PushWatcher {
     // pool was not in an ANSWERED lookup; see the pool-pinning note) and the
     // confirmed switches re-pinned (repin), rows judged from a pin's
     // last-answered snapshot instead of skipping (pin-snap — the lookup was
-    // refused; see rule 5), cross-isolate claim races (lost),
+    // refused; see rule 5; the parenthesised `oldest Xs` is the age of the
+    // OLDEST snapshot served this pass), cross-isolate claim races (lost),
     // the pass running
     // out of budget before the rest of the rotation (budget-cut), rows
     // whose first observation landed after a tracking gap (backfill), and
@@ -4815,7 +4829,7 @@ export class PushWatcher {
     const note =
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       `${pinAddrs.length > 0 ? ` pins ${pinPairs.size}/${pinAddrs.length}` : ""}` +
-      `${pinSnapshots > 0 ? ` pin-snap ${pinSnapshots}` : ""}` +
+      `${pinSnapshots > 0 ? ` pin-snap ${pinSnapshots} (oldest ${Math.round(pinOldestMs / 1000)}s)` : ""}` +
       ` miss ${pairMiss} lost ${claimLost}` +
       `${pinSkip > 0 ? ` pin-skip ${pinSkip}` : ""}` +
       `${repins.length > 0 ? ` repin ${repins.length}` : ""}` +

@@ -7193,6 +7193,7 @@ async function main() {
       let res = await scanner.poolPairsForTracker(["COLD"], Date.now() + 800);
       assert.equal(res.pairs.has("COLD"), false, "no snapshot, no answer — the row still skips");
       assert.equal(res.snapshots, 0);
+      assert.equal(res.snapshotOldestMs, 0, "no snapshot served means no age to report");
 
       // An answered lookup with the pool: judged as before, and the answer is
       // remembered for the next refusal.
@@ -7200,13 +7201,23 @@ async function main() {
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.get("POOL").marketCap, 333_000, "an answered lookup is used as before");
       assert.equal(res.snapshots, 0, "nothing snapshot-served on an answered pass");
+      assert.equal(res.snapshotOldestMs, 0);
 
       // The 429 shape: the lookup did not answer, so the pool's last answer
-      // stands in. The row is judged instead of skipped.
+      // stands in. The row is judged instead of skipped. The snapshot is
+      // backdated to the shape the 120s TTL exists for — live 2026-10-03
+      // 01:57:53Z a refusal whose last answer was ~100s old skipped
+      // (`pins 4/26 pin-skip 22`); at 120s that same pass must judge, and the
+      // note's `(oldest Xs)` must carry the served snapshot's age.
+      scanner.pinSnapshots.get("POOL").at = Date.now() - 100_000;
       mode = "refused";
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
-      assert.equal(res.pairs.get("POOL").marketCap, 333_000, "the refusal must serve the last answer, not a skip");
+      assert.equal(res.pairs.get("POOL").marketCap, 333_000, "a ~100s-old snapshot must judge at the 120s TTL (the 01:57:53Z shape)");
       assert.equal(res.snapshots, 1, "and the pass note can name it (pin-snap)");
+      assert.ok(
+        res.snapshotOldestMs >= 99_000 && res.snapshotOldestMs <= 101_000,
+        `the note's oldest age must be the served snapshot's age: ${res.snapshotOldestMs}`,
+      );
 
       // An ANSWERED absence is the switch evidence the snapshot must never
       // paper over — and it clears the entry.
@@ -7220,6 +7231,7 @@ async function main() {
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.has("POOL"), false, "a gone pool must not be resurrected from a snapshot");
       assert.equal(res.snapshots, 0);
+      assert.equal(res.snapshotOldestMs, 0);
 
       // The TTL: a snapshot older than PIN_SNAPSHOT_TTL_MS is not served
       // (the row falls back to skipping) and is dropped on sight.
@@ -7229,6 +7241,7 @@ async function main() {
       });
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.has("POOL"), false, "an expired snapshot is not evidence");
+      assert.equal(res.snapshotOldestMs, 0, "an expired snapshot reports no age either");
       assert.equal(scanner.pinSnapshots.has("POOL"), false, "and it is evicted on sight");
     } finally {
       await t.cleanup();
@@ -7321,6 +7334,23 @@ async function main() {
       assert.equal(res.snapshots, 1);
       assert.equal(res.pairs.get("P2").marketCap, 333_000);
 
+      // An aged-but-fresh carrier entry is served, and its age rides the
+      // return so the note can print it.
+      store.set(
+        PIN_SNAPSHOT_CACHE_URL,
+        JSON.stringify({
+          v: 1,
+          items: { AGED: { at: Date.now() - 60_000, pair: mkPool("AGED", 5) } },
+        }),
+      );
+      const e1 = makeScanner("refused", []);
+      res = await e1.poolPairsForTracker(["AGED"], Date.now() + 800);
+      assert.equal(res.pairs.get("AGED").marketCap, 5, "a fresh carrier entry is served");
+      assert.ok(
+        res.snapshotOldestMs >= 59_000 && res.snapshotOldestMs <= 61_000,
+        `the shared snapshot's age must ride the return: ${res.snapshotOldestMs}`,
+      );
+
       // The carrier's entries obey the same TTL: an old entry is a miss.
       store.set(
         PIN_SNAPSHOT_CACHE_URL,
@@ -7333,6 +7363,7 @@ async function main() {
       res = await e.poolPairsForTracker(["OLD"], Date.now() + 800);
       assert.equal(res.pairs.has("OLD"), false, "an expired shared snapshot is not evidence");
       assert.equal(res.snapshots, 0);
+      assert.equal(res.snapshotOldestMs, 0);
     } finally {
       delete globalThis.caches;
       await t.cleanup();
@@ -10086,15 +10117,16 @@ async function main() {
     const poolPairsFor = async (addrs) => {
       pinLookups.push([...addrs]);
       // Rule 5 (docs/pool-pin-2026-10-02.md): a lookup that did not answer
-      // may serve the pool's last-answered snapshot (Scanner supplies it),
-      // and `snapshots` is how many came from there.
+      // may serve the pool's last-answered snapshot (Scanner supplies it);
+      // `snapshots` is how many came from there, and `snapshotOldestMs` is
+      // the age of the oldest one (the note's `(oldest Xs)`).
       if (pinLookups.length === 1)
-        return { pairs: new Map([["pool-A", pinA]]), snapshots: 0 }; // alive
+        return { pairs: new Map([["pool-A", pinA]]), snapshots: 0, snapshotOldestMs: 0 }; // alive
       if (pinLookups.length === 2)
-        return { pairs: new Map([["pool-A", null]]), snapshots: 0 }; // answered, absent = switch
+        return { pairs: new Map([["pool-A", null]]), snapshots: 0, snapshotOldestMs: 0 }; // answered, absent = switch
       if (pinLookups.length === 5)
-        return { pairs: new Map([["pool-A", pinA]]), snapshots: 1 }; // refused; snapshot stood in
-      return { pairs: new Map(), snapshots: 0 }; // not answered — no evidence
+        return { pairs: new Map([["pool-A", pinA]]), snapshots: 1, snapshotOldestMs: 87_000 }; // refused; snapshot stood in
+      return { pairs: new Map(), snapshots: 0, snapshotOldestMs: 0 }; // not answered — no evidence
     };
     const pw = new PushWatcher(
       db, watchBot, null, loadConfig({}), pairsFor, null, poolPairsFor,
@@ -10160,7 +10192,7 @@ async function main() {
     const aaa5 = updated.find(([t]) => t === "AAA")?.[1];
     assert.ok(aaa5, `a snapshot must keep the row judged through a refusal: ${fifth.note}`);
     assert.equal(aaa5.lastMcap, 333_000, "the snapshot is the pool's own last answer");
-    assert.match(String(fifth.note), /pin-snap 1/);
+    assert.match(String(fifth.note), /pin-snap 1 \(oldest 87s\)/);
     assert.doesNotMatch(String(fifth.note), /pin-skip/);
     assert.equal(repins.length, 1, "a snapshot-served row must never re-pin");
   });

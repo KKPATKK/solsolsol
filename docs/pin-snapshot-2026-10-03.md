@@ -2,6 +2,9 @@
 
 > 承接 `docs/pool-pin-2026-10-02.md`（pool pin 本體）。呢個係上線後一個鐘觀察（commit
 > `541f11d`）量到嘅缺口，同埋補法。
+>
+> **更新（2026-10-03 同日第二版）**：TTL 90s → 120s，note 加 `(oldest Xs)` 量度；
+> §1–§7.1 寫嘅 90s 係當時狀態，新狀態見 §9。
 
 ## 1. 問題（量度，唔係推斷）
 
@@ -66,7 +69,8 @@ pool address → { pair: PairInfo, at: number }
 
 ### 2.3 讀數
 
-Pass note 新增 `pin-snap N`（今 pass 有幾多個 pin 係由 snapshot 判），放喺 `pins a/b` 後面：
+Pass note 新增 `pin-snap N`（今 pass 有幾多個 pin 係由 snapshot 判），放喺 `pins a/b` 後面；
+2026-10-03 同日再加 `(oldest Xs)`（最舊 served snapshot 嘅年齡），見 §9：
 
 - 正常 pass：`pins 23/23`（無 `pin-snap`）＝全部即時答案。
 - 429 pass（有 snapshot）：`pins 23/23 pin-snap 23`、冇 `pin-skip`。
@@ -84,7 +88,7 @@ Pass note 新增 `pin-snap N`（今 pass 有幾多個 pin 係由 snapshot 判）
 
 ## 4. 成本 / 風險（設計上接受）
 
-1. 換池最多遲 `PIN_SNAPSHOT_TTL_MS`（90s）被發現——而且只有成個窗口嘅 lookup 全部被拒先會發生。
+1. 換池最多遲 `PIN_SNAPSHOT_TTL_MS` 被發現（90s→120s，見 §9）——而且只有成個窗口嘅 lookup 全部被拒先會發生。
 2. 記憶係 plain map、per-isolate：deploy／isolate recycle 由空開始，唔會跨 isolate 共用。
 3. 冇新 request、冇新 DB 寫、冇 schema 改動。
 4. Colo carrier：**冇答**嘅 pass 加 1 個 cache 讀；有郁過 map 嘅 pass 加 1 讀 1 寫
@@ -137,3 +141,35 @@ Deploy ffd83e7（CI run 37085674142 success，version `90cdf267-8308-4950-853f-8
    加大 `PIN_SNAPSHOT_TTL_MS`（代價＝用更舊嘅池數判卡）。
 3. Carrier 寫入要 await（2e58cd1 嘅修正）：呢個 write 喺 tick 尾巴，fire-and-forget 有機會
    隨 invocation 取消而永遠寫唔到。
+
+## 9. 2026-10-03（同日第二版）：TTL 90s → 120s＋`(oldest Xs)` 量度
+
+### 9.1 決定
+
+起因：§7.1 嗰個邊界（01:57:53，最後成功答案 ~100s → 全員 skip）同一次評估。結論：
+
+- **120s = pair cache 嘅窗（`PAIR_BATCH_CACHE_TTL_S`）**，即係設計上講嘅「snapshot 唔應該老過
+  可以替代佢嘅 cache 內容」嗰條界——90 → 120 係行到去界，冇越界。
+- **>120s 唔做**：要 cover 多分鐘風暴就要 300s+，代價＝用最多 5 分鐘前嘅池數判卡；而且
+  mega-storm（全 colo 過 TTL 冇答案）照樣 skip，邊際收益遞減；carrier 嘅 stale-write race
+  窗口（§2.1b）亦同 TTL 一齊放大。
+- 代價（設計上接受）：判數可以舊到 120s；換池被舊 snapshot 遮蓋嘅窗口亦係 ≤120s。
+
+### 9.2 改動
+
+| 檔案 | 變更 |
+|---|---|
+| `src/scanner.ts` | `PIN_SNAPSHOT_TTL_MS` 90_000 → 120_000（carrier `Cache-Control: max-age=max(60, TTL/1000)` **自動跟**）；`poolPairsForTracker` 回傳多 `snapshotOldestMs`（今 pass served snapshot 中最舊嘅 age）；`serveSnapshotsFor`／`servePinSnapshots` 回傳 `{ served, oldestMs }` |
+| `src/pushwatch.ts` | `poolPairsFor` 契約加 optional `snapshotOldestMs`；note `pin-snap N` → `pin-snap N (oldest Xs)` |
+| `scripts/test-unit.js` | snapshot test 加 ~100s 案例（120s TTL 下必須判＋age 讀數）＋ colo 載體 60s 案例；PushWatcher 五 pass 劇本 pass 5 驗 `(oldest 87s)` |
+
+### 9.3 驗收（上線後睇）
+
+1. 429 拒絕 pass 嘅 note：`pins N/N pin-snap K (oldest Xs)`。
+2. 01:57:53 型（最後答案 ~100s）唔再全員 skip——`pin-skip` 應該喺呢種邊界消失。
+3. age 讀數本身：正常 429 期間 `oldest` 係幾十秒；接近 120 就係長 episode 尾，超出即係 bug
+   （TTL 過濾失效）。
+
+### 9.4 Rollback
+
+改返 `PIN_SNAPSHOT_TTL_MS = 90_000` 即可；note 嘅 `(oldest Xs)` 對舊 code 無害（純字串）。

@@ -699,14 +699,21 @@ export class DeferredPushLedger {
 const TRACKER_GECKO_LOOKUPS = 2;
 /**
  * How long the pin lane may serve a pool from its last ANSWERED snapshot
- * while the by-address lookup refuses (see poolPairsForTracker). 90s sits
- * between the two clocks around it: the pair lanes' own edge cache is 120s
- * (PAIR_BATCH_CACHE_TTL_S — a snapshot must never outlive cache content that
- * would have replaced it with a better answer), and a pass runs ~75s apart
- * while live 429 episodes run tens of seconds, so a shorter TTL would just
- * reintroduce the mass skip this exists to remove.
+ * while the by-address lookup refuses (see poolPairsForTracker).
+ *
+ * 120s is the pair lanes' own edge-cache window (PAIR_BATCH_CACHE_TTL_S): a
+ * snapshot must never outlive cache content that would have replaced it with
+ * a better answer, so that cache's TTL is this constant's ceiling — and the
+ * 2026-10-03 decision (operator) moved it from 90s TO that ceiling. The
+ * boundary the change fixes is measured: live 01:57:53Z a refusal whose last
+ * answer was ~100s old served nothing (`pins 4/26 pin-skip 22`); at 120s
+ * that pass judges from the snapshot instead. What is deliberately NOT bought
+ * is longer coverage: going past 120s breaks the cache bound above, and a
+ * multi-minute blackout would still end in skips, so the evaluation put the
+ * line here (the carrier's stale-write race window grows with this value
+ * too).
  */
-export const PIN_SNAPSHOT_TTL_MS = 90_000;
+export const PIN_SNAPSHOT_TTL_MS = 120_000;
 /**
  * Cap on that memory (see pinSnapshots). Bounded exactly like the client's
  * pair cache: a long-lived isolate must not accumulate one entry per pool it
@@ -3942,14 +3949,20 @@ export class Scanner {
    *     the wire would have exposed is discovered up to PIN_SNAPSHOT_TTL_MS
    *     later — and only when every lookup inside that window was refused.
    *
-   * Returns the map plus how many of its entries came from a snapshot, so the
-   * pass note can name them (`pin-snap N`, see pushwatch.ts) — an answered
-   * pass and a snapshot-served one must not read alike.
+   * Returns the map plus how many of its entries came from a snapshot and how
+   * old the OLDEST of those was, so the pass note can name them (`pin-snap N
+   * (oldest Xs)`, see pushwatch.ts) — an answered pass, a snapshot-served one
+   * and one riding the TTL boundary must not read alike.
    */
   private async poolPairsForTracker(
     addresses: string[],
     deadlineMs?: number,
-  ): Promise<{ pairs: Map<string, PairInfo | null>; snapshots: number }> {
+  ): Promise<{
+    pairs: Map<string, PairInfo | null>;
+    snapshots: number;
+    /** Age (ms) of the OLDEST snapshot served this pass; 0 = none served. */
+    snapshotOldestMs: number;
+  }> {
     const out = new Map<string, PairInfo | null>();
     const missing: string[] = [];
     const byPool = new Map<string, PairInfo>();
@@ -3965,8 +3978,11 @@ export class Scanner {
       if (hit) out.set(a, hit);
       else missing.push(a);
     }
-    if (missing.length === 0) return { pairs: out, snapshots: 0 };
+    if (missing.length === 0)
+      return { pairs: out, snapshots: 0, snapshotOldestMs: 0 };
     let snapshots = 0;
+    /** Age (ms) of the OLDEST snapshot served this pass (0 = none). */
+    let snapshotOldestMs = 0;
     /**
      * The pass moved the map (recorded an answer, or dropped a confirmed
      * absence): the colo carrier is republished so other isolates see it.
@@ -3999,10 +4015,16 @@ export class Scanner {
       // Partial answers (a multi-batch call that broke midway reports
       // answered:false) still count the hits above as answers; only the pools
       // NOTHING came back for get the snapshot.
-      if (!res.answered) snapshots = await this.serveSnapshotsFor(out, missing, absent);
+      if (!res.answered) {
+        const served = await this.serveSnapshotsFor(out, missing, absent);
+        snapshots = served.served;
+        snapshotOldestMs = served.oldestMs;
+      }
     } catch {
       /* refused — serve the pools' last ANSWERED state (rule 4) */
-      snapshots = await this.serveSnapshotsFor(out, missing, absent);
+      const served = await this.serveSnapshotsFor(out, missing, absent);
+      snapshots = served.served;
+      snapshotOldestMs = served.oldestMs;
     }
     this.trimPinSnapshots();
     if (dirty) {
@@ -4016,7 +4038,7 @@ export class Scanner {
       await this.mergePinSnapshotsFromEdge(absent);
       await this.writePinSnapshotsToEdge();
     }
-    return { pairs: out, snapshots };
+    return { pairs: out, snapshots, snapshotOldestMs };
   }
 
   /**
@@ -4024,13 +4046,14 @@ export class Scanner {
    * then — only for pools it could not cover — the colo carrier, so a cold
    * isolate answers a refusal with another isolate's recent answers. One
    * cache read on the refusal path only; resolutions already in `out` are
-   * never second-guessed.
+   * never second-guessed. Returns how many pins were served and the age of
+   * the OLDEST one (the note's `(oldest Xs)`).
    */
   private async serveSnapshotsFor(
     out: Map<string, PairInfo | null>,
     addresses: string[],
     absent: string[],
-  ): Promise<number> {
+  ): Promise<{ served: number; oldestMs: number }> {
     if (addresses.some((a) => !out.has(a))) {
       await this.mergePinSnapshotsFromEdge(absent);
     }
@@ -4131,26 +4154,31 @@ export class Scanner {
   /**
    * Fill still-unresolved pins from their snapshots (rule 4), dropping any
    * entry past PIN_SNAPSHOT_TTL_MS on sight. Only pools with NO answer at all
-   * are touched, so a hit or an answered absence always wins.
+   * are touched, so a hit or an answered absence always wins. Returns the
+   * count served and the age of the OLDEST one, so the pass note can print
+   * `pin-snap N (oldest Xs)` and a boundary ride is visible.
    */
   private servePinSnapshots(
     out: Map<string, PairInfo | null>,
     addresses: string[],
-  ): number {
+  ): { served: number; oldestMs: number } {
     const now = Date.now();
     let served = 0;
+    let oldestMs = 0;
     for (const a of addresses) {
       if (out.has(a)) continue;
       const snap = this.pinSnapshots.get(a);
       if (!snap) continue;
-      if (now - snap.at > PIN_SNAPSHOT_TTL_MS) {
+      const ageMs = now - snap.at;
+      if (ageMs > PIN_SNAPSHOT_TTL_MS) {
         this.pinSnapshots.delete(a);
         continue;
       }
       out.set(a, snap.pair);
       served += 1;
+      if (ageMs > oldestMs) oldestMs = ageMs;
     }
-    return served;
+    return { served, oldestMs };
   }
 
   /** Bound the snapshot map, oldest first (see PIN_SNAPSHOT_MAX). */
