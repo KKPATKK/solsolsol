@@ -173,3 +173,13 @@ Deploy ffd83e7（CI run 37085674142 success，version `90cdf267-8308-4950-853f-8
 ### 9.4 Rollback
 
 改返 `PIN_SNAPSHOT_TTL_MS = 90_000` 即可；note 嘅 `(oldest Xs)` 對舊 code 無害（純字串）。
+
+### 9.5 上線後讀數（2026-10-03，CI run 37095053601，version `6c00e9c5-b3dc-4cff-8875-0b6120edd1b2`）
+
+| 時間（Z） | 讀數 |
+|---|---|
+| 04:05:52 | `pins 24/24 pin-snap 2 (oldest 59s)`（新格式首次線上出現） |
+| 04:06:08 | `pin-snap 2 (oldest 75s)` |
+| 04:06:41 | `pin-snap 16 (oldest 109s)` ← **109s 老過舊 90s TTL**：舊 code 會踢走佢，呢個 pass 同時證明 120s 生效＋age 讀數準確；`pin-skip` 0、`rows 24/24` |
+
+部署後頭幾個 pass（04:02–04:05）係 `pins 24/24` 真答案、冇 `pin-snap`——note 冇 age 係正常（冇 snapshot 被 serve）。
