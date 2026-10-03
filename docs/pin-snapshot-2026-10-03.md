@@ -34,6 +34,25 @@ pool address → { pair: PairInfo, at: number }
   （過期 entry 即場清）。
 - **上限**：`PIN_SNAPSHOT_MAX` 512，oldest-first evict（同 pair cache 同一紀律）。
 
+### 2.1b Colo carrier（多 isolate 共享）
+
+記憶係 per-isolate，唔夠：實測 2026-10-03（deploy 後幾分鐘）一個 isolate 答完，下一個 pass
+喺另一個 isolate 被拒 → 照樣 `pins 0/23 pin-skip 23`；同一段時間 `/health` 連續讀數出現
+計數器倒退（`poolCache.hits` 3→0、`preTick.at` 新→舊），證明同時有幾個 isolate 服務 tick。
+所以 map 加一層 colo 載體：
+
+- `PIN_SNAPSHOT_CACHE_URL`（`caches.default`，同 reeval pool snapshot 同一 pattern）：
+  一個 entry 載住近期答案（`PIN_SNAPSHOT_EDGE_MAX` 128、newest first），Cache-Control
+  90s；entry 本身過期遲早會回歸 miss，但 serve 嗰陣仍然逐條用 `at` 過濾。
+- **讀**：只喺冇答嗰條路（仍有未解池先讀）→ merge 入本地 map（過期唔收、本地較新唔覆蓋）
+  → 再 serve。
+- **寫**：pass 有郁過 map（記新答案或確認缺席）先寫；寫之前**先 merge 一次**（union——
+  一個只有兩條答案嘅 pass 唔可以蓋掉另一個 isolate 嘅 20 條），並**跳過今 pass 確認
+  缺席嘅池**。
+- 冇 Cache API（Node entry／unit tests）→ 行為同以前一樣；cache 讀寫錯誤只 log 唔 throw。
+- 已知 race：另一個 isolate 同時寫返舊 entry，可以令一次確認換池喺 ≤90s 內被舊
+  snapshot 蓋返一次——同 TTL 本身嘅「換池最多遲 90s」界限一致，唔另設機制。
+
 ### 2.2 同 pin 政策嘅關係（重點）
 
 - Snapshot **只係「判數」用途，唔係證據**：唯一 repin 觸發仍然係 **answered 且缺席**（`null`）。
@@ -58,7 +77,7 @@ Pass note 新增 `pin-snap N`（今 pass 有幾多個 pin 係由 snapshot 判）
 
 | 檔案 | 變更 |
 |---|---|
-| `src/scanner.ts` | `PIN_SNAPSHOT_TTL_MS`（90s）／`PIN_SNAPSHOT_MAX`（512）；`pinSnapshots` map；`poolPairsForTracker` 記／清／serve snapshot，回傳 `{ pairs, snapshots }`；`rememberPinAnswer`／`servePinSnapshots`／`trimPinSnapshots` |
+| `src/scanner.ts` | `PIN_SNAPSHOT_TTL_MS`（90s）／`PIN_SNAPSHOT_MAX`（512）；`pinSnapshots` map；`poolPairsForTracker` 記／清／serve snapshot，回傳 `{ pairs, snapshots }`；`rememberPinAnswer`／`servePinSnapshots`／`trimPinSnapshots`；colo carrier：`PIN_SNAPSHOT_CACHE_URL`／`PIN_SNAPSHOT_EDGE_MAX`＋`mergePinSnapshotsFromEdge`／`writePinSnapshotsToEdge`／`serveSnapshotsFor` |
 | `src/pushwatch.ts` | `poolPairsFor` 契約改為 `{ pairs, snapshots }`；note 加 `pin-snap N`；pin 規則註釋加規則 5 |
 | `scripts/test-unit.js` | Scanner 新 test（答→記；拒→serve；答缺席→清＋唔可以被 snapshot 復活；TTL 過期→skip）；PushWatcher 五 pass 劇本加 snapshot pass |
 
@@ -67,15 +86,33 @@ Pass note 新增 `pin-snap N`（今 pass 有幾多個 pin 係由 snapshot 判）
 1. 換池最多遲 `PIN_SNAPSHOT_TTL_MS`（90s）被發現——而且只有成個窗口嘅 lookup 全部被拒先會發生。
 2. 記憶係 plain map、per-isolate：deploy／isolate recycle 由空開始，唔會跨 isolate 共用。
 3. 冇新 request、冇新 DB 寫、冇 schema 改動。
+4. Colo carrier：**冇答**嘅 pass 加 1 個 cache 讀；有郁過 map 嘅 pass 加 1 讀 1 寫
+   （Cache API，colo-local，唔計 fetch subrequest）。冇 Cache API 就全部降級做純記憶。
 
 ## 5. 驗收（上線後睇）
 
 1. 429 episode 期間 note：`pins 23/23 pin-snap N`、`pin-skip` 大幅回落（對比觀察期 3/16 good）。
-2. 剛 deploy／recycle 後第一個 429 pass 仍可以 `pin-skip`（snapshot 未建立）——一個 good pass
-   之後就唔應該再全員 skip。
+2. 冷 isolate（記憶空、但 colo 載體 90s 內有答案）嘅 429 pass 亦應該 `pin-snap N>0`
+   ——未夠時先 `pin-skip`；全員 skip 只應喺「成個 colo 90s 內都冇答過」先出現。
 3. 真換池嗰 pass 照樣 `pin-skip 1` ＋ `repin 1`（snapshot 唔會遮蓋確認換池）。
 
 ## 6. Rollback
 
-Deploy 上一版 code 即可：純記憶、無 DB 欄、無 migration。`pin-snap` 只係 note 字串，舊 code
-唔識讀亦無害。
+Deploy 上一版 code 即可：純記憶＋colo cache、無 DB 欄、無 migration。`pin-snap` 只係 note
+字串，舊 code 唔識讀亦無害。
+
+## 7. 量度記錄（2026-10-03 上線後）
+
+Deploy ffd83e7（CI run 37085674142 success，version `90cdf267-8308-4950-853f-81839229cefb`）
+後即場抽樣：
+
+| 時間（Z） | 讀數 |
+|---|---|
+| 01:23:23 | `rows 23/23 pairs 23/23 pins 22/22 pin-snap 3`（功能首次喺線上生效） |
+| 01:23:57 | `pins 22/22 pin-snap 3` |
+| 01:25:39 | `rows 2/25 pins 0/23 pin-skip 23`（冷 isolate／記憶未建） |
+| 01:26:44 / 01:27:16 | `rows 2/25 pins 0/23 pin-skip 23` ×2 |
+| 01:27:52–01:28:57 | `rows 25/25 pins 23/23`（429 window 過去） |
+
+→ 記憶層有效（`pin-snap 3`），但 per-isolate 令拒絕嗰 pass 落喺冷 isolate 時仍然全員 skip。
+所以就加咗 §2.1b 嘅 colo carrier；cold-isolate 讀數要用再落一版嘅 deploy 驗。

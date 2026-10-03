@@ -7235,6 +7235,110 @@ async function main() {
     }
   });
 
+  await test("Scanner.poolPairsForTracker: the snapshot travels between isolates through the colo cache", async () => {
+    // The memory alone is per ISOLATE, and Cloudflare runs these ticks across
+    // several (measured 2026-10-03, minutes after the snapshot shipped: an
+    // answered pass recorded the pools in one isolate while the next pass — a
+    // refusal — reported `pins 0/23 pin-skip 23` from another). The colo
+    // carrier is what lets a cold isolate serve a refusal.
+    const { Scanner, PIN_SNAPSHOT_CACHE_URL, PIN_SNAPSHOT_TTL_MS } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const store = new Map();
+    globalThis.caches = {
+      default: {
+        async match(request) {
+          const body = store.get(request.url);
+          return body === undefined ? null : new Response(body);
+        },
+        async put(request, response) {
+          store.set(request.url, await response.text());
+        },
+      },
+    };
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const mkPool = (pool, mcap) => ({
+        pairAddress: pool,
+        marketCap: mcap,
+        feedSource: "dexscreener",
+      });
+      const makeScanner = (mode, known) => {
+        const dex = new DexScreenerClient(cfg);
+        dex.fetchPairsByAddresses = async (addrs) =>
+          mode === "refused"
+            ? { pairs: new Map(), answered: false }
+            : {
+                pairs: new Map(
+                  addrs.filter((a) => known.includes(a)).map((a) => [a, mkPool(a, 333_000)]),
+                ),
+                answered: true,
+              };
+        const s = new Scanner(
+          db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+          null, null, null, null, null, null, null,
+        );
+        s.lastPairs = new Map();
+        return s;
+      };
+
+      // Isolate A answers for P1/P2 and publishes the carrier.
+      const a = makeScanner("answered", ["P1", "P2"]);
+      let res = await a.poolPairsForTracker(["P1", "P2"], Date.now() + 800);
+      assert.equal(res.snapshots, 0, "an answered pass serves live data");
+      await new Promise((r) => setImmediate(r));
+      const published = store.get(PIN_SNAPSHOT_CACHE_URL);
+      assert.ok(published, "the answered pass must publish the colo carrier");
+      assert.ok(published.includes("P1") && published.includes("P2"));
+
+      // Isolate B — cold memory, refused lookup: the carrier answers.
+      const b = makeScanner("refused", []);
+      res = await b.poolPairsForTracker(["P1", "P2"], Date.now() + 800);
+      assert.equal(res.pairs.get("P1").marketCap, 333_000, "a cold isolate must serve the shared snapshot");
+      assert.equal(res.pairs.get("P2").marketCap, 333_000);
+      assert.equal(res.snapshots, 2, "both count as snapshot-served for the note");
+
+      // A CONFIRMED absence must win over the carrier: isolate C answers
+      // absent for P1 and republishes the union without it (C's own memory
+      // has only what the carrier gave it — the erase is the absence rule,
+      // not a local leftover).
+      const c = makeScanner("answered", ["P2"]);
+      res = await c.poolPairsForTracker(["P1"], Date.now() + 800);
+      assert.equal(res.pairs.get("P1"), null, "an answered absence is still a confirmed switch");
+      await new Promise((r) => setImmediate(r));
+      assert.equal(
+        JSON.parse(store.get(PIN_SNAPSHOT_CACHE_URL)).items.P1,
+        undefined,
+        "the republished carrier must not carry a pool this pass confirmed gone",
+      );
+
+      // Isolate D — cold, refused: P1 stays gone (its row will be re-pinned),
+      // while P2 is still served from the carrier.
+      const d = makeScanner("refused", []);
+      res = await d.poolPairsForTracker(["P1", "P2"], Date.now() + 800);
+      assert.equal(res.pairs.has("P1"), false, "a confirmed absence must not be resurrected via the carrier");
+      assert.equal(res.snapshots, 1);
+      assert.equal(res.pairs.get("P2").marketCap, 333_000);
+
+      // The carrier's entries obey the same TTL: an old entry is a miss.
+      store.set(
+        PIN_SNAPSHOT_CACHE_URL,
+        JSON.stringify({
+          v: 1,
+          items: { OLD: { at: Date.now() - PIN_SNAPSHOT_TTL_MS - 1, pair: mkPool("OLD", 1) } },
+        }),
+      );
+      const e = makeScanner("refused", []);
+      res = await e.poolPairsForTracker(["OLD"], Date.now() + 800);
+      assert.equal(res.pairs.has("OLD"), false, "an expired shared snapshot is not evidence");
+      assert.equal(res.snapshots, 0);
+    } finally {
+      delete globalThis.caches;
+      await t.cleanup();
+    }
+  });
+
   await test("Scanner.bestEffort: a hung chain step resolves with its fallback at the chain deadline", async () => {
     // The 2026-09-16 zero-push shape: the candidate chain awaits ~11 live
     // calls SERIALLY (RugCheck, crime checkToken, Axiom, Birdeye ×2, GMGN,

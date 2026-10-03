@@ -714,6 +714,26 @@ export const PIN_SNAPSHOT_TTL_MS = 90_000;
  */
 export const PIN_SNAPSHOT_MAX = 512;
 /**
+ * The pin snapshot's colo cache (caches.default) — the same pattern as the
+ * re-eval pool snapshot above, for the same reason. The map below is per
+ * ISOLATE, and Cloudflare runs these ticks across several: measured
+ * 2026-10-03, minutes after the snapshot shipped, an answered pass recorded
+ * the pools in one isolate while the next pass — a refusal — reported
+ * `pins 0/23 pin-skip 23` from another, i.e. the mass skip survived wherever
+ * the refusing tick landed cold. One carrier holds every recent answer, so
+ * any isolate in the colo can serve a refusal.
+ *
+ * Failure stays safe and quiet: a runtime without the Cache API (the Node
+ * entry, tests) behaves exactly as before this carrier existed, a malformed
+ * body is a miss, and cache errors log instead of throwing.
+ */
+export const PIN_SNAPSHOT_CACHE_URL = "https://pin-snapshot.internal/v1";
+/**
+ * Cap on the carrier, newest answers first. The active pin set is tens of
+ * pools; 128 is headroom, not a target.
+ */
+export const PIN_SNAPSHOT_EDGE_MAX = 128;
+/**
  * How far PAST its own deadline a pass may run before Scanner.runTrackerPass
  * abandons waiting for it — the pass's watchdog (see racePassWatchdog).
  *
@@ -3947,6 +3967,18 @@ export class Scanner {
     }
     if (missing.length === 0) return { pairs: out, snapshots: 0 };
     let snapshots = 0;
+    /**
+     * The pass moved the map (recorded an answer, or dropped a confirmed
+     * absence): the colo carrier is republished so other isolates see it.
+     */
+    let dirty = false;
+    /**
+     * Pools this pass CONFIRMED absent. They stay out of every carrier merge
+     * (see mergePinSnapshotsFromEdge): an answered absence is the one thing a
+     * snapshot must never undo, and another isolate's stale carrier entry is
+     * exactly how it could come back.
+     */
+    const absent: string[] = [];
     try {
       const res = await this.dex.fetchPairsByAddresses(missing, deadlineMs);
       for (const a of missing) {
@@ -3954,23 +3986,137 @@ export class Scanner {
         if (hit) {
           out.set(a, hit);
           this.rememberPinAnswer(a, hit);
+          dirty = true;
         } else if (res.answered) {
           out.set(a, null); // asked & absent — a switch
           // ...and the pool's snapshot dies with it: a later refusal must
           // never resurrect a pool an answered response has dropped.
           this.pinSnapshots.delete(a);
+          absent.push(a);
+          dirty = true;
         }
       }
       // Partial answers (a multi-batch call that broke midway reports
       // answered:false) still count the hits above as answers; only the pools
       // NOTHING came back for get the snapshot.
-      if (!res.answered) snapshots = this.servePinSnapshots(out, missing);
+      if (!res.answered) snapshots = await this.serveSnapshotsFor(out, missing, absent);
     } catch {
       /* refused — serve the pools' last ANSWERED state (rule 4) */
-      snapshots = this.servePinSnapshots(out, missing);
+      snapshots = await this.serveSnapshotsFor(out, missing, absent);
     }
     this.trimPinSnapshots();
+    if (dirty) {
+      // Publish the UNION: fold the carrier in first so one isolate's few
+      // answers cannot erase another's entries, minus the pools this pass
+      // confirmed absent.
+      await this.mergePinSnapshotsFromEdge(absent);
+      this.writePinSnapshotsToEdge();
+    }
     return { pairs: out, snapshots };
+  }
+
+  /**
+   * The unanswered path's serve, in two layers (rule 4): the local map first,
+   * then — only for pools it could not cover — the colo carrier, so a cold
+   * isolate answers a refusal with another isolate's recent answers. One
+   * cache read on the refusal path only; resolutions already in `out` are
+   * never second-guessed.
+   */
+  private async serveSnapshotsFor(
+    out: Map<string, PairInfo | null>,
+    addresses: string[],
+    absent: string[],
+  ): Promise<number> {
+    if (addresses.some((a) => !out.has(a))) {
+      await this.mergePinSnapshotsFromEdge(absent);
+    }
+    return this.servePinSnapshots(out, addresses);
+  }
+
+  /**
+   * Fold the colo carrier's entries into this isolate's map (see
+   * PIN_SNAPSHOT_CACHE_URL). Entries are age-filtered HERE as well as at
+   * serve time — the carrier's own TTL only decides how long it lingers — and
+   * a local entry that is at least as fresh always wins. `skip` names the
+   * pools this pass CONFIRMED absent: their entries must not come back, not
+   * even from another isolate's older carrier. Never throws.
+   */
+  private async mergePinSnapshotsFromEdge(skip: string[] = []): Promise<void> {
+    const cache = poolEdgeCache();
+    if (!cache) return;
+    const skipSet = skip.length > 0 ? new Set(skip) : null;
+    try {
+      const hit = await cache.match(new Request(PIN_SNAPSHOT_CACHE_URL));
+      if (!hit) return;
+      const body = (await hit.json()) as { items?: unknown } | null;
+      const items = body && typeof body === "object" ? body.items : null;
+      if (!items || typeof items !== "object") return;
+      const now = Date.now();
+      for (const [pool, raw] of Object.entries(items as Record<string, unknown>)) {
+        if (pool.length === 0) continue;
+        if (skipSet && skipSet.has(pool)) continue;
+        const entry = raw as { at?: unknown; pair?: unknown } | null;
+        const at = entry && typeof entry.at === "number" ? entry.at : NaN;
+        const pair = entry ? entry.pair : null;
+        if (!Number.isFinite(at) || now - at > PIN_SNAPSHOT_TTL_MS) continue;
+        if (!pair || typeof pair !== "object") continue;
+        if (typeof (pair as PairInfo).pairAddress !== "string") continue;
+        const mine = this.pinSnapshots.get(pool);
+        if (mine && mine.at >= at) continue;
+        this.pinSnapshots.set(pool, { pair: pair as PairInfo, at });
+      }
+      this.trimPinSnapshots();
+    } catch (err) {
+      console.error(
+        "[scanner] pin snapshot cache read failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
+   * Publish the map so the OTHER isolates can serve the next refusal (see
+   * PIN_SNAPSHOT_CACHE_URL). Called only when a pass actually moved the map
+   * — a recorded answer or a confirmed absence — and not awaited, exactly
+   * like the pool snapshot's write: the put is colo-local, and a put that
+   * never lands costs one cold refusal and nothing else.
+   */
+  private writePinSnapshotsToEdge(): void {
+    const cache = poolEdgeCache();
+    if (!cache) return;
+    const now = Date.now();
+    const fresh = [...this.pinSnapshots.entries()]
+      .filter(([, s]) => now - s.at <= PIN_SNAPSHOT_TTL_MS)
+      .sort((a, b) => b[1].at - a[1].at)
+      .slice(0, PIN_SNAPSHOT_EDGE_MAX);
+    if (fresh.length === 0) return;
+    const items: Record<string, { at: number; pair: PairInfo }> = {};
+    for (const [pool, s] of fresh) items[pool] = { at: s.at, pair: s.pair };
+    const ttlS = Math.max(
+      POOL_EDGE_CACHE_MIN_TTL_S,
+      Math.round(PIN_SNAPSHOT_TTL_MS / 1000),
+    );
+    const fail = (err: unknown) => {
+      console.error(
+        "[scanner] pin snapshot cache write failed:",
+        err instanceof Error ? err.message : err,
+      );
+    };
+    try {
+      cache
+        .put(
+          new Request(PIN_SNAPSHOT_CACHE_URL),
+          new Response(JSON.stringify({ v: 1, items }), {
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "max-age=" + ttlS,
+            },
+          }),
+        )
+        .catch(fail);
+    } catch (err) {
+      fail(err);
+    }
   }
 
   /** Record a pool's by-address answer as its last stand-in for a refusal. */
