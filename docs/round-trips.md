@@ -3988,7 +3988,7 @@ curl -s .../debug/feed-stats | jq '.byFeed[] | select(.feed=="boosts")'
 
 ### 六、界線（老實講）
 
-- **未 cover ①：1200ms 天花板 tick 照樣 drop**（cap 擋）。嗰啲 tick 係一個 isolate/一段時間內 3 次以上 429 先出現；喺嗰個 gap 之下，tick 嘅 1600ms feed window 真係塞唔落「第二支 list 請求」。
+- ~~**未 cover ①：1200ms 天花板 tick 照樣 drop**（cap 擋）。~~ **已修（2026-10-03）**：呢個唔係「取捨」，係算術上永遠唔成立 —— 天花板最壞情況 1200 + 480 = **1680ms**，而 shared feed window 係 **1600ms**，所以天花板之下係**每個 tick 都 drop**（live：連續 28 tick `boosts 0`、`dropsByLeg.boosts` +1/tick；spacing 落返 750 即刻回 22 行）。修法係呢條 leg 有自己嘅窗口 `BOOST_FEED_WINDOW_MS = DEX_ADAPTIVE_MAX_MS + BOOST_FEED_ATTEMPT_MS + 320` = **2000ms**（仍然係 cap、仍然 named drop、仍然 clamp 去 `frontDeadline`），見 `docs/boosts-ceiling-window-2026-10-03.md`。
 - **未 cover ②：`fetchFeedCapped` 嘅 250ms floor** —— 如果 fan-out 到達時 feed window 剩 ≤ 250ms，boosts（同其他非 in-flight leg）根本唔會被叫，而且**唔會**計 drop。呢條路徑今日未見過（profiles 自預算 ≤ 480 ⇒ 到達時通常剩 > 1000ms），但佢係一個冇名嘅第二條 drop 路。
 - **未 cover ③：上游本身**。`refused 366 / hitPct 99.9%` 講嘅係共享 Worker egress IP 被 DexScreener 拒（同 §gecko-429 同一類問題），呢個 fix 只係令「自適應 gap」唔再變成「條 leg 靜靜死」；唔會減少 429。
 - **收益細，要講清楚**：boosts 累計只發現 41 枚幣、push 1 次（5 日），係一條細 lane；今次係把它嘅行為修正成「可以問就問」，唔係話佢值好多卡。

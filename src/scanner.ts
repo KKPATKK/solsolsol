@@ -12,6 +12,8 @@ import {
   type TokenStats,
 } from "./db";
 import {
+  BOOST_FEED_ATTEMPT_MS,
+  DEX_ADAPTIVE_MAX_MS,
   DexScreenerClient,
   consumeListCacheDelta,
   parseProfileFeedSnapshot,
@@ -178,7 +180,10 @@ const SCAN_TIMEOUT_MS = 25_000;
  * 2026-09-28 (later, same day): that slack is then deliberately SPENT on
  * coverage instead of left unused — FEED_DEADLINE_MS 900 → 1_600,
  * POOL_FETCH_BUDGET_MS 1_600 → 2_400, PAIRS_FETCH_BUDGET_MS 1_000 → 2_000
- * (sum 6_000 of the 6_400ms window). Each cap keeps its documented meaning —
+ * (sum 6_000 of the 6_400ms window; the boosts leg additionally carries its
+ * OWN 2_000ms window inside the feed phase since 2026-10-03 — see
+ * BOOST_FEED_WINDOW_MS, which is the leg's ceiling arithmetic, not slack
+ * taken from anything else). Each cap keeps its documented meaning —
  * a ceiling for a SLOW phase, never a cost on a healthy one — so this is not a
  * trade against the gates: it
  * changes only what happens on the ticks where an upstream was slow enough
@@ -923,6 +928,50 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  * the routine reading rather than the exception.
  */
 const FEED_DEADLINE_MS = 1_600;
+/**
+ * The BOOSTS list leg's OWN window (2026-10-03) — not the shared feed
+ * deadline's, because the shared one can never hold this leg's worst case.
+ *
+ * WHY (see BOOST_FEED_SELF_BUDGET_MS for the mechanism): the boosts budget is
+ * its queue SLOT plus one attempt, and the slot is set by the tick's FIRST
+ * DexScreener request — the profiles fetch, dispatched at tick start. So the
+ * leg's worst case is the adaptive ladder's ceiling (DEX_ADAPTIVE_MAX_MS 1200)
+ * plus BOOST_FEED_ATTEMPT_MS (480) = 1680ms after tick start, while
+ * FEED_DEADLINE_MS is 1600. The arithmetic is not marginal, it is permanent:
+ * any tick whose queue sits on the ceiling drops the leg BEFORE SENDING IT, so
+ * the lane reads `boosts 0` with `http429` flat and `dropsByLeg.boosts`
+ * climbing once per tick — measured live 2026-10-03 (intervalMs 1200 →
+ * `boosts 0`, drops +1/tick for 28 ticks; the same feed at intervalMs 750 →
+ * `boosts 22`).
+ *
+ * WHY A WIDER WINDOW IS THE FIX AND NOT A BIGGER CONSTANT: the drop was
+ * written to protect the legs BEHIND the boosts list, and there are none — the
+ * pair phase is enqueued after the feed phase joins (see the fan-out comment).
+ * So the old cap bought no headroom for anything and cost the tick its entire
+ * boosts list. 2_000 holds the ceiling arithmetic (1680) with ~320ms of slack
+ * for the pre-feed steps (live `preFeedMs` 7-62ms) and keeps the front's cap
+ * sum inside FRONT_PHASE_WINDOW_MS (2_000 + POOL_FETCH_BUDGET_MS 2_400 +
+ * PAIRS_FETCH_BUDGET_MS 2_000 = 6_400), which is the property
+ * SCAN_GATE_RESERVE_MS exists to preserve.
+ *
+ * THE COST, NAMED: on a ceiling tick the feed phase can now run to ~1680ms
+ * instead of ending the instant the leg was dropped, so the pair phase STARTS
+ * later by about one gap + an attempt. What it does not lose is window: the
+ * pair phase begins after the feed/pool joins (~2.4s worst case), its own cap
+ * is PAIRS_FETCH_BUDGET_MS 2_000, and FRONT_PHASE_WINDOW_MS is 6_400 — so its
+ * 2_000ms still fit with seconds to spare and the gates' reserve
+ * (SCAN_GATE_RESERVE_MS) is untouched. The reading that moves is `feedsMs`:
+ * it can reach ~1_680ms on a ceiling tick where it used to cap at the 1_600ms
+ * feed deadline, and that rise is the leg actually being served.
+ *
+ * SIZED FROM THE ARITHMETIC, not a literal: `DEX_ADAPTIVE_MAX_MS +
+ * BOOST_FEED_ATTEMPT_MS` is exactly the leg's worst case, plus
+ * BOOST_FEED_WINDOW_SLACK_MS for the pre-feed steps. If either number moves,
+ * this window follows instead of quietly re-dropping the leg.
+ */
+const BOOST_FEED_WINDOW_SLACK_MS = 320;
+export const BOOST_FEED_WINDOW_MS =
+  DEX_ADAPTIVE_MAX_MS + BOOST_FEED_ATTEMPT_MS + BOOST_FEED_WINDOW_SLACK_MS;
 /**
  * Wall-clock cap for the re-eval pool DB read and the token_stats prune
  * (both race against this deadline; see the call sites). Evidence
@@ -4976,27 +5025,32 @@ export class Scanner {
       // Sized by DEXSCREENER_BOOSTS_LIMIT (0 = disabled); best-effort — a
       // failure is [] and the tick continues.
       //
-      // `feedDeadline` is passed INTO the fetch as well as used as this job's
-      // race: the boosts leg is the tick's SECOND DexScreener request and pays a
-      // throttle gap, so its budget is that gap plus an attempt — and this tick's
-      // window is the cap on what it may pay (see BOOST_FEED_SELF_BUDGET_MS).
-      // The leg does the drop itself, so a gap the window cannot hold reads as
-      // `dropsByLeg.boosts` instead of as an empty list.
+      // This leg gets its OWN window, not the shared `feedDeadline` (see
+      // BOOST_FEED_WINDOW_MS): its worst case is the throttle's CEILING plus an
+      // attempt, which does NOT fit the shared feed window — so the shared
+      // window dropped it on every ceiling tick, before sending it. The window
+      // is passed INTO the fetch as well as used as this job's race, so a gap
+      // it cannot hold still reads as `dropsByLeg.boosts` instead of as an
+      // empty list (see BOOST_FEED_SELF_BUDGET_MS).
       let boostProfiles: TokenProfile[] = [];
       if (
         this.dex &&
         this.config.dexscreenerBoostsLimit > 0 &&
         !dropOptionalLeg("boosts")
       ) {
+        const boostsDeadline = Math.min(
+          startedAt + BOOST_FEED_WINDOW_MS,
+          frontDeadline,
+        );
         feedJobs.push(
           this.fetchFeedCapped(
             async () =>
               this.dex!.fetchBoostedTokens(
                 this.config.dexscreenerBoostsLimit,
-                feedDeadline,
+                boostsDeadline,
               ),
             [],
-            feedDeadline,
+            boostsDeadline,
           )
             .then((p) => {
               boostProfiles = p;

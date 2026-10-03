@@ -918,11 +918,47 @@ async function dexListCacheTest() {
     "both requests reached the network — the leg pays the gap instead of vanishing behind it",
   );
 
+  // ---------- the CEILING fits the scanner's OWN window (2026-10-03) --------
+  // The 2026-09-30 fix above covered the ladder's middle steps; the top step
+  // stayed broken. At intervalMs 1200 the slot + attempt is 1680ms, while the
+  // scanner used to hand this leg the SHARED feed deadline (1600) — so every
+  // ceiling tick dropped the leg before sending it, permanently. Live: 28
+  // consecutive ticks at `intervalMs 1200` read `boosts 0` with
+  // `dropsByLeg.boosts` +1/tick, and the same feed read `boosts 22` the moment
+  // the spacing stepped back to 750.
+  const { BOOST_FEED_WINDOW_MS } = require("../dist/scanner.js");
+  const { DEX_ADAPTIVE_MAX_MS, BOOST_FEED_ATTEMPT_MS } = require("../dist/dexscreener.js");
+  assert.ok(
+    BOOST_FEED_WINDOW_MS > DEX_ADAPTIVE_MAX_MS + BOOST_FEED_ATTEMPT_MS,
+    "the window the scanner hands the boosts leg must hold the ladder's CEILING plus an attempt — a window at or below it is the permanent per-tick drop this case exists to prevent",
+  );
+  const ceilingUrls = [];
+  globalThis.fetch = async (url) => {
+    ceilingUrls.push(String(url));
+    return json([{ chainId: "solana", tokenAddress: "EDGE_H" }]);
+  };
+  dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "1200" }));
+  await dex.fetchLatestSolanaProfiles(); // takes the tick's first slot (t0)
+  // The scanner's window, measured from the same moment it measures from.
+  const ceilingBoost = await dex.fetchBoostedTokens(20, Date.now() + BOOST_FEED_WINDOW_MS);
+  const ceilingStats = dex.getStats();
+  assert.deepEqual(
+    ceilingBoost.map((p) => p.tokenAddress),
+    ["EDGE_H"],
+    "at the CEILING the leg is still ASKED and answered — the old shared 1600ms window dropped it here on every tick",
+  );
+  assert.equal(ceilingStats.budgetDrops, 0, "and nothing is counted as a drop at the ceiling any more");
+  assert.deepEqual(
+    ceilingUrls.map((u) => (u.includes("token-boosts") ? "boosts" : "profiles")),
+    ["profiles", "boosts"],
+    "both requests reached the network at the ceiling — this is the coverage the fix restores",
+  );
+
   // ...and the CAP still ends the leg when the gap cannot fit the caller's OWN
-  // window: at the 1200ms ceiling the slot + attempt outlives the feed phase, so
-  // the answer would be raced away and the pair phase would pay the gap anyway.
-  // That case must stay a NAMED drop (dropsByLeg.boosts), never an empty list —
-  // "never asked" and "the upstream returned nothing" cannot look alike.
+  // window: a window far shorter than the gap must stay a NAMED drop
+  // (dropsByLeg.boosts), never an empty list — "never asked" and "the upstream
+  // returned nothing" cannot look alike. (The scanner no longer hands in a
+  // window this short; this pins the mechanism itself.)
   let capOnlyProfiles = 0;
   globalThis.fetch = async (url) => {
     if (!String(url).includes("token-boosts")) capOnlyProfiles++; // the boosts leg must not be sent

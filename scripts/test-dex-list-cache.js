@@ -437,6 +437,36 @@ async function main() {
     );
   });
 
+  // ---------- the boosts leg's window is its OWN, not the feed phase's -------
+  await test("src/scanner.ts: the boosts leg is handed BOOST_FEED_WINDOW_MS, not the shared feed deadline", () => {
+    // 2026-10-03, live: at the adaptive ceiling (intervalMs 1200) the leg's
+    // worst case is 1200 + 480 = 1680ms, while the shared FEED_DEADLINE_MS is
+    // 1600 — so every ceiling tick dropped the leg BEFORE SENDING IT, and the
+    // lane read `boosts 0` with `dropsByLeg.boosts` +1/tick for as long as the
+    // spacing stayed raised. The window is what makes the difference between
+    // coverage and a structurally silent lane, so pin the CALL SITE: a future
+    // edit that hands back `feedDeadline` would restore the bug with every
+    // unit test still green (they drive the client, not the fan-out).
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    const call = src.indexOf("this.dex!.fetchBoostedTokens(");
+    assert.ok(call > 0, "the boosts leg must still be dispatched");
+    const windowArg = src.slice(call, call + 400);
+    assert.ok(
+      windowArg.includes("boostsDeadline"),
+      "the boosts fetch takes its own window variable, not the shared feed deadline",
+    );
+    assert.ok(
+      !windowArg.includes("feedDeadline"),
+      "the shared feed deadline must not be the window this leg is capped by — it cannot hold the ceiling arithmetic",
+    );
+    const decl = src.indexOf("const boostsDeadline = Math.min(");
+    assert.ok(decl > 0, "the window is declared at the call site");
+    assert.ok(
+      src.slice(decl, decl + 200).includes("startedAt + BOOST_FEED_WINDOW_MS"),
+      "and it is measured from tick start — the moment the profiles dispatch (and so the leg's slot) is measured from",
+    );
+  });
+
   // ---------- the reader ----------
   await test("src/worker.ts: /health reads them off the batch it already pays for", () => {
     const src = fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8");

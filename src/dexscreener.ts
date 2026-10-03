@@ -202,9 +202,29 @@ export const PROFILE_FEED_REUSE_MS = 30 * 60_000;
  * SO THE BUDGET IS THE SLOT, NOT A CONSTANT: the deadline in fetchBoostedTokens
  * is this leg's own slot (Throttle.nextSlotAt) plus one attempt
  * (BOOST_FEED_ATTEMPT_MS) — what the leg must actually wait for — and the
- * caller's feed window is passed in as a CAP, so a gap the tick cannot afford
- * still ends the leg rather than spending a slot whose answer the scanner's own
- * race would throw away.
+ * caller's window is passed in as a CAP, so a gap the tick cannot afford still
+ * ends the leg rather than spending a slot whose answer the scanner's own race
+ * would throw away.
+ *
+ * THAT CAP WAS STILL THE SHARED FEED WINDOW, AND IT WAS SMALLER THAN THE
+ * CEILING (2026-10-03). The 2026-09-30 change fixed the LADDER's middle steps
+ * (640/1024 fit a 1600ms window) but not its top: the leg's worst case is
+ * DEX_ADAPTIVE_MAX_MS (1200) + BOOST_FEED_ATTEMPT_MS (480) = 1680ms after tick
+ * start, while the scanner's FEED_DEADLINE_MS is 1600. So on any tick whose
+ * queue sat at the ceiling the leg was dropped BEFORE SENDING IT — permanently,
+ * once per tick, for as long as the spacing stayed raised. Measured live: 28
+ * consecutive ticks at `intervalMs 1200` read `boosts 0` with
+ * `dropsByLeg.boosts` climbing +1/tick, and the same feed read `boosts 22` the
+ * moment the spacing stepped back to 750. That is the state this comment's
+ * "so a gap the tick cannot afford still ends the leg" described as a choice,
+ * while in practice it was the routine reading on any refused day.
+ *
+ * The scanner now hands this leg its OWN window (BOOST_FEED_WINDOW_MS, sized
+ * to the ceiling arithmetic) instead of the shared feed deadline, because
+ * nothing is queued behind the boosts list — the pair phase is enqueued after
+ * the feed phase joins — so the old cap bought no headroom for anything and
+ * cost the tick the whole lane. The cap itself stays: a window that cannot hold
+ * the gap must still end the leg as a NAMED drop, never as an empty list.
  */
 export const BOOST_FEED_SELF_BUDGET_MS = 480;
 
@@ -215,8 +235,13 @@ export const BOOST_FEED_SELF_BUDGET_MS = 480;
  * constant, so the same arithmetic holds at the 250ms base and on the widened
  * ladder: the leg asks for its slot + an attempt, and is dropped only when that
  * does not fit the window it was handed.
+ *
+ * EXPORTED because the caller's window is sized from it (see the scanner's
+ * BOOST_FEED_WINDOW_MS): the ceiling arithmetic is `DEX_ADAPTIVE_MAX_MS +
+ * BOOST_FEED_ATTEMPT_MS`, and a window written as a bare literal would silently
+ * stop covering the leg the day either number moves.
  */
-const BOOST_FEED_ATTEMPT_MS = 480;
+export const BOOST_FEED_ATTEMPT_MS = 480;
 
 /**
  * Edge-cache TTL for the two LIST feeds (`/token-profiles/latest/v1`,
@@ -1848,9 +1873,9 @@ export class DexScreenerClient {
    * is skipped, not mis-aged, see the stats loop in scanner.ts).
    *
    * `feedWindowDeadline` (optional, ms epoch) is the caller's own window — the
-   * scanner's `feedDeadline`. See BOOST_FEED_SELF_BUDGET_MS for why the budget
-   * is the queue SLOT plus an attempt, and why a gap that does not fit that
-   * window ends the leg instead of spending a slot the tick cannot use.
+   * scanner hands it BOOST_FEED_WINDOW_MS (its own, sized to the ladder's
+   * ceiling plus an attempt), NOT the shared feed deadline it used to pass. See
+   * BOOST_FEED_SELF_BUDGET_MS for the arithmetic and why the cap stays.
    */
   async fetchBoostedTokens(
     limit: number,
@@ -1875,6 +1900,12 @@ export class DexScreenerClient {
     // attempt that was never sent — because the other reading, an empty boosts
     // list, is exactly what a healthy upstream returning nothing looks like
     // (see noteDrop).
+    //
+    // THIS CAP IS WHY THE LADDER'S CEILING USED TO DROP EVERY TICK
+    // (2026-10-03): at intervalMs 1200 the slot + attempt is 1680ms, so a
+    // caller handing in the 1600ms shared feed window dropped the leg on every
+    // ceiling tick — see BOOST_FEED_SELF_BUDGET_MS. The scanner's window is now
+    // BOOST_FEED_WINDOW_MS (2000), sized for this arithmetic.
     if (feedWindowDeadline !== undefined && deadline > feedWindowDeadline) {
       this.noteDrop("/token-boosts/latest/v1");
       return [];
