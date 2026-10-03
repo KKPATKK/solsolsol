@@ -4008,9 +4008,13 @@ export class Scanner {
     if (dirty) {
       // Publish the UNION: fold the carrier in first so one isolate's few
       // answers cannot erase another's entries, minus the pools this pass
-      // confirmed absent.
+      // confirmed absent. Both calls are AWAITED, unlike the pool snapshot's
+      // write: this one sits at the very tail of the tick, where an un-awaited
+      // put can be cancelled with the invocation before it lands — which
+      // would leave the carrier permanently stale. A colo-local put costs
+      // milliseconds, well inside the pass's own budget.
       await this.mergePinSnapshotsFromEdge(absent);
-      this.writePinSnapshotsToEdge();
+      await this.writePinSnapshotsToEdge();
     }
     return { pairs: out, snapshots };
   }
@@ -4077,11 +4081,10 @@ export class Scanner {
   /**
    * Publish the map so the OTHER isolates can serve the next refusal (see
    * PIN_SNAPSHOT_CACHE_URL). Called only when a pass actually moved the map
-   * — a recorded answer or a confirmed absence — and not awaited, exactly
-   * like the pool snapshot's write: the put is colo-local, and a put that
-   * never lands costs one cold refusal and nothing else.
+   * — a recorded answer or a confirmed absence. AWAITED by the caller (see
+   * there): a failed put costs one cold refusal, and never throws here.
    */
-  private writePinSnapshotsToEdge(): void {
+  private async writePinSnapshotsToEdge(): Promise<void> {
     const cache = poolEdgeCache();
     if (!cache) return;
     const now = Date.now();
@@ -4103,17 +4106,15 @@ export class Scanner {
       );
     };
     try {
-      cache
-        .put(
-          new Request(PIN_SNAPSHOT_CACHE_URL),
-          new Response(JSON.stringify({ v: 1, items }), {
-            headers: {
-              "Content-Type": "application/json",
-              "Cache-Control": "max-age=" + ttlS,
-            },
-          }),
-        )
-        .catch(fail);
+      await cache.put(
+        new Request(PIN_SNAPSHOT_CACHE_URL),
+        new Response(JSON.stringify({ v: 1, items }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "max-age=" + ttlS,
+          },
+        }),
+      );
     } catch (err) {
       fail(err);
     }

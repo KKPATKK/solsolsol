@@ -48,7 +48,8 @@ pool address → { pair: PairInfo, at: number }
   → 再 serve。
 - **寫**：pass 有郁過 map（記新答案或確認缺席）先寫；寫之前**先 merge 一次**（union——
   一個只有兩條答案嘅 pass 唔可以蓋掉另一個 isolate 嘅 20 條），並**跳過今 pass 確認
-  缺席嘅池**。
+  缺席嘅池**。merge 同 write 都係 **await**（唔同 reeval 嘅 fire-and-forget：呢度喺
+  tick 尾巴，唔 await 有機會被 invocation 取消——寫唔到就載體永遠 stale）。
 - 冇 Cache API（Node entry／unit tests）→ 行為同以前一樣；cache 讀寫錯誤只 log 唔 throw。
 - 已知 race：另一個 isolate 同時寫返舊 entry，可以令一次確認換池喺 ≤90s 內被舊
   snapshot 蓋返一次——同 TTL 本身嘅「換池最多遲 90s」界限一致，唔另設機制。
