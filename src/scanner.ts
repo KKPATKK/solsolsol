@@ -698,6 +698,22 @@ export class DeferredPushLedger {
  */
 const TRACKER_GECKO_LOOKUPS = 2;
 /**
+ * How long the pin lane may serve a pool from its last ANSWERED snapshot
+ * while the by-address lookup refuses (see poolPairsForTracker). 90s sits
+ * between the two clocks around it: the pair lanes' own edge cache is 120s
+ * (PAIR_BATCH_CACHE_TTL_S — a snapshot must never outlive cache content that
+ * would have replaced it with a better answer), and a pass runs ~75s apart
+ * while live 429 episodes run tens of seconds, so a shorter TTL would just
+ * reintroduce the mass skip this exists to remove.
+ */
+export const PIN_SNAPSHOT_TTL_MS = 90_000;
+/**
+ * Cap on that memory (see pinSnapshots). Bounded exactly like the client's
+ * pair cache: a long-lived isolate must not accumulate one entry per pool it
+ * has EVER seen. 512 is several times any plausible active pin set.
+ */
+export const PIN_SNAPSHOT_MAX = 512;
+/**
  * How far PAST its own deadline a pass may run before Scanner.runTrackerPass
  * abandons waiting for it — the pass's watchdog (see racePassWatchdog).
  *
@@ -2645,6 +2661,17 @@ export class Scanner {
    */
   private lastPairs = new Map<string, PairInfo>();
   /**
+   * The pin lane's last-ANSWERED memory (see poolPairsForTracker): each
+   * pinned pool mapped to the pair info of the last BY-ADDRESS answer that
+   * actually contained it, and when that answer arrived. Served only on the
+   * UNANSWERED path — an answered absence still counts as the confirmed
+   * switch that re-pins (and clears the entry) — so it can never become repin
+   * evidence or resurrect a pool DexScreener has dropped. Per-isolate, plain
+   * memory: a deploy or an isolate recycle starts it empty and rows skip
+   * exactly as they did before (see rule 4).
+   */
+  private pinSnapshots = new Map<string, { pair: PairInfo; at: number }>();
+  /**
    * Cross-tick bookkeeping for deferred initial cards (see
    * DeferredPushLedger): the deferral writes nothing, so this is the only
    * place that can say whether the deferred coin ever came back.
@@ -3870,7 +3897,7 @@ export class Scanner {
    * that pool (a confirmed switch); a missing key = the lookup did not answer
    * (a refusal or a spent window), which is evidence of nothing.
    *
-   * Three rules, in order:
+   * Four rules, in order:
    *  1. What this tick already fetched is served first — the scan front's own
    *     pair phase carries the tracker's coins (see lastPairs), and when a
    *     row's pool IS the token's representative pool, the front has already
@@ -3881,14 +3908,28 @@ export class Scanner {
    *     (fetchPairsByAddresses) — one request for ≤30 pools.
    *  3. NO Jupiter/Gecko fallback, unlike pairsForTracker: those legs cannot
    *     answer "is this POOL still in DexScreener's response" — they answer
-   *     per token and may name a different pool entirely. Unanswered pins stay
-   *     unanswered: the row skips this pass (never a stranger pool's numbers)
-   *     and the next pass asks again.
+   *     per token and may name a different pool entirely.
+   *  4. An UNANSWERED lookup (a 429 refusal or a spent window — the common
+   *     shape of an episode) serves each pool from its last ANSWERED
+   *     snapshot, up to PIN_SNAPSHOT_TTL_MS old, instead of leaving every
+   *     pinned row to skip: live 2026-10-03 the token lane rode the edge
+   *     cache (`pairs 23/23`) while the pin lane's real request was refused
+   *     pass after pass, and the whole pin set skipped (`pins 0/23 pin-skip
+   *     23`). The snapshot is memory, never evidence: it is read ONLY on the
+   *     unanswered path, an ANSWERED absence still returns `null` (and drops
+   *     the entry), so the only thing it can do is keep a row JUDGED off its
+   *     own pool's last numbers. Its cost is bounded: a confirmed switch that
+   *     the wire would have exposed is discovered up to PIN_SNAPSHOT_TTL_MS
+   *     later — and only when every lookup inside that window was refused.
+   *
+   * Returns the map plus how many of its entries came from a snapshot, so the
+   * pass note can name them (`pin-snap N`, see pushwatch.ts) — an answered
+   * pass and a snapshot-served one must not read alike.
    */
   private async poolPairsForTracker(
     addresses: string[],
     deadlineMs?: number,
-  ): Promise<Map<string, PairInfo | null>> {
+  ): Promise<{ pairs: Map<string, PairInfo | null>; snapshots: number }> {
     const out = new Map<string, PairInfo | null>();
     const missing: string[] = [];
     const byPool = new Map<string, PairInfo>();
@@ -3904,18 +3945,74 @@ export class Scanner {
       if (hit) out.set(a, hit);
       else missing.push(a);
     }
-    if (missing.length === 0) return out;
+    if (missing.length === 0) return { pairs: out, snapshots: 0 };
+    let snapshots = 0;
     try {
       const res = await this.dex.fetchPairsByAddresses(missing, deadlineMs);
       for (const a of missing) {
         const hit = res.pairs.get(a);
-        if (hit) out.set(a, hit);
-        else if (res.answered) out.set(a, null); // asked & absent — a switch
+        if (hit) {
+          out.set(a, hit);
+          this.rememberPinAnswer(a, hit);
+        } else if (res.answered) {
+          out.set(a, null); // asked & absent — a switch
+          // ...and the pool's snapshot dies with it: a later refusal must
+          // never resurrect a pool an answered response has dropped.
+          this.pinSnapshots.delete(a);
+        }
       }
+      // Partial answers (a multi-batch call that broke midway reports
+      // answered:false) still count the hits above as answers; only the pools
+      // NOTHING came back for get the snapshot.
+      if (!res.answered) snapshots = this.servePinSnapshots(out, missing);
     } catch {
-      /* refused — every remaining pin stays unresolved (see rule 3) */
+      /* refused — serve the pools' last ANSWERED state (rule 4) */
+      snapshots = this.servePinSnapshots(out, missing);
     }
-    return out;
+    this.trimPinSnapshots();
+    return { pairs: out, snapshots };
+  }
+
+  /** Record a pool's by-address answer as its last stand-in for a refusal. */
+  private rememberPinAnswer(pool: string, pair: PairInfo): void {
+    // Re-insert so the cap's oldest-first eviction sees the freshest write
+    // last (Map order), the same discipline as the client's pair cache.
+    this.pinSnapshots.delete(pool);
+    this.pinSnapshots.set(pool, { pair, at: Date.now() });
+  }
+
+  /**
+   * Fill still-unresolved pins from their snapshots (rule 4), dropping any
+   * entry past PIN_SNAPSHOT_TTL_MS on sight. Only pools with NO answer at all
+   * are touched, so a hit or an answered absence always wins.
+   */
+  private servePinSnapshots(
+    out: Map<string, PairInfo | null>,
+    addresses: string[],
+  ): number {
+    const now = Date.now();
+    let served = 0;
+    for (const a of addresses) {
+      if (out.has(a)) continue;
+      const snap = this.pinSnapshots.get(a);
+      if (!snap) continue;
+      if (now - snap.at > PIN_SNAPSHOT_TTL_MS) {
+        this.pinSnapshots.delete(a);
+        continue;
+      }
+      out.set(a, snap.pair);
+      served += 1;
+    }
+    return served;
+  }
+
+  /** Bound the snapshot map, oldest first (see PIN_SNAPSHOT_MAX). */
+  private trimPinSnapshots(): void {
+    if (this.pinSnapshots.size <= PIN_SNAPSHOT_MAX) return;
+    for (const k of this.pinSnapshots.keys()) {
+      if (this.pinSnapshots.size <= PIN_SNAPSHOT_MAX) break;
+      this.pinSnapshots.delete(k);
+    }
   }
 
   /**

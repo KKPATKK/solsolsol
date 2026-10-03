@@ -7155,6 +7155,86 @@ async function main() {
     }
   });
 
+  await test("Scanner.poolPairsForTracker: a refused lookup serves the pool's last ANSWERED snapshot, never over a confirmed switch", async () => {
+    // Live 2026-10-03: during 429 episodes the token lane rode the edge cache
+    // (`pairs 23/23`) while the pin lane's real request was refused pass after
+    // pass, so EVERY pinned row skipped (`pins 0/23 pin-skip 23`) on ~13 of 16
+    // passes. The snapshot keeps rows judged through the episode off their own
+    // pool's last answer (≤ PIN_SNAPSHOT_TTL_MS old), and it must never turn
+    // into repin evidence: only an ANSWERED absence is a switch.
+    const { Scanner, PIN_SNAPSHOT_TTL_MS } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      const pair = {
+        pairAddress: "POOL",
+        marketCap: 333_000,
+        feedSource: "dexscreener",
+      };
+      let mode = "hit";
+      dex.fetchPairsByAddresses = async () =>
+        mode === "hit"
+          ? { pairs: new Map([["POOL", pair]]), answered: true }
+          : mode === "absent"
+            ? { pairs: new Map(), answered: true }
+            : { pairs: new Map(), answered: false };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, null, null,
+      );
+      scanner.lastPairs = new Map();
+
+      // Cold memory (fresh isolate): a refusal is still a skip — the memory
+      // invents nothing.
+      mode = "refused";
+      let res = await scanner.poolPairsForTracker(["COLD"], Date.now() + 800);
+      assert.equal(res.pairs.has("COLD"), false, "no snapshot, no answer — the row still skips");
+      assert.equal(res.snapshots, 0);
+
+      // An answered lookup with the pool: judged as before, and the answer is
+      // remembered for the next refusal.
+      mode = "hit";
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(res.pairs.get("POOL").marketCap, 333_000, "an answered lookup is used as before");
+      assert.equal(res.snapshots, 0, "nothing snapshot-served on an answered pass");
+
+      // The 429 shape: the lookup did not answer, so the pool's last answer
+      // stands in. The row is judged instead of skipped.
+      mode = "refused";
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(res.pairs.get("POOL").marketCap, 333_000, "the refusal must serve the last answer, not a skip");
+      assert.equal(res.snapshots, 1, "and the pass note can name it (pin-snap)");
+
+      // An ANSWERED absence is the switch evidence the snapshot must never
+      // paper over — and it clears the entry.
+      mode = "absent";
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(res.pairs.get("POOL"), null, "an answered absence is still a confirmed switch");
+      assert.equal(res.snapshots, 0);
+
+      // Refused again: the confirmed switch must NOT be undone by memory.
+      mode = "refused";
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(res.pairs.has("POOL"), false, "a gone pool must not be resurrected from a snapshot");
+      assert.equal(res.snapshots, 0);
+
+      // The TTL: a snapshot older than PIN_SNAPSHOT_TTL_MS is not served
+      // (the row falls back to skipping) and is dropped on sight.
+      scanner.pinSnapshots.set("POOL", {
+        pair,
+        at: Date.now() - PIN_SNAPSHOT_TTL_MS - 1,
+      });
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(res.pairs.has("POOL"), false, "an expired snapshot is not evidence");
+      assert.equal(scanner.pinSnapshots.has("POOL"), false, "and it is evicted on sight");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("Scanner.bestEffort: a hung chain step resolves with its fallback at the chain deadline", async () => {
     // The 2026-09-16 zero-push shape: the candidate chain awaits ~11 live
     // calls SERIALLY (RugCheck, crime checkToken, Axiom, Birdeye ×2, GMGN,
@@ -9901,9 +9981,16 @@ async function main() {
     const pinLookups = [];
     const poolPairsFor = async (addrs) => {
       pinLookups.push([...addrs]);
-      if (pinLookups.length === 1) return new Map([["pool-A", pinA]]); // alive
-      if (pinLookups.length === 2) return new Map([["pool-A", null]]); // answered, absent = switch
-      return new Map(); // not answered — no evidence
+      // Rule 5 (docs/pool-pin-2026-10-02.md): a lookup that did not answer
+      // may serve the pool's last-answered snapshot (Scanner supplies it),
+      // and `snapshots` is how many came from there.
+      if (pinLookups.length === 1)
+        return { pairs: new Map([["pool-A", pinA]]), snapshots: 0 }; // alive
+      if (pinLookups.length === 2)
+        return { pairs: new Map([["pool-A", null]]), snapshots: 0 }; // answered, absent = switch
+      if (pinLookups.length === 5)
+        return { pairs: new Map([["pool-A", pinA]]), snapshots: 1 }; // refused; snapshot stood in
+      return { pairs: new Map(), snapshots: 0 }; // not answered — no evidence
     };
     const pw = new PushWatcher(
       db, watchBot, null, loadConfig({}), pairsFor, null, poolPairsFor,
@@ -9949,8 +10036,8 @@ async function main() {
     assert.equal(aaa3.lastMcap, 111_000, "the new pin's numbers are the row's evidence");
     assert.doesNotMatch(String(third.note), /pin-skip/);
 
-    // Pass 4 — an UNANSWERED lookup is not evidence of a switch: the row
-    // skips, but its pin is left exactly where it was.
+    // Pass 4 — an UNANSWERED lookup with NO snapshot is not evidence of a
+    // switch: the row skips, but its pin is left exactly where it was.
     rows[0].poolAddress = "pool-UNANSWERED";
     updated.length = 0;
     const fourth = await pw.runTick();
@@ -9958,6 +10045,20 @@ async function main() {
     assert.match(String(fourth.note), /pin-skip 1/);
     assert.doesNotMatch(String(fourth.note), /repin/);
     assert.equal(repins.length, 1, "an unresolved lookup must never re-pin");
+
+    // Pass 5 — the SNAPSHOT path (rule 5): the lookup did not answer, but the
+    // lane has a fresh last-answered snapshot for the pin, so the row is
+    // judged through the refusal instead of skipping — off its own pool's
+    // numbers — and the note names the source instead of hiding it.
+    rows[0].poolAddress = "pool-A";
+    updated.length = 0;
+    const fifth = await pw.runTick();
+    const aaa5 = updated.find(([t]) => t === "AAA")?.[1];
+    assert.ok(aaa5, `a snapshot must keep the row judged through a refusal: ${fifth.note}`);
+    assert.equal(aaa5.lastMcap, 333_000, "the snapshot is the pool's own last answer");
+    assert.match(String(fifth.note), /pin-snap 1/);
+    assert.doesNotMatch(String(fifth.note), /pin-skip/);
+    assert.equal(repins.length, 1, "a snapshot-served row must never re-pin");
   });
 
   await test("Db.push_watch pool pin: stored at enrollment, write-once by checks, re-pinned by CAS", async () => {

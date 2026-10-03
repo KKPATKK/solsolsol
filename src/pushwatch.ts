@@ -1307,12 +1307,20 @@ export function notePeerPassYield(at: number, ageMs: number): void {
  *     the pin stays where it was.
  *  4. A pin is never moved by a check write, and never taken from a
  *     non-DexScreener source (see pinnablePoolAddress).
+ *  5. A lookup that did NOT answer serves each pool from its last ANSWERED
+ *     snapshot when one is fresh (Scanner.poolPairsForTracker; `pin-snap N`
+ *     in the note) — a 429 episode should idle the pin lane for a pass or
+ *     two, not skip the whole pin set. Snapshots are memory, never evidence:
+ *     an ANSWERED absence still re-pins (and drops the snapshot), and a
+ *     snapshot-served row can never re-pin anything itself.
  *
  * DELIBERATE CONSEQUENCES (not bugs): nothing about the stored series is
  * reset on a re-pin, so the one skipped pass is the entire switch protection;
  * and a row whose token has no pair ANYWHERE (neither the pin nor the token
  * batch resolves) skips every pass — it is not deleted and ages out via the
- * window prune.
+ * window prune. Rule 5 adds one more: a switch is discovered at most
+ * PIN_SNAPSHOT_TTL_MS (90s) later than an answering lookup would have shown
+ * it — and only when every lookup in that window was refused.
  */
 export interface PushWatchRow {
   token: string;
@@ -2658,6 +2666,9 @@ export class PushWatcher {
      * address. `null` for a pool the endpoint ANSWERED about and did not
      * return (a confirmed switch); a missing key means the lookup did not
      * answer (refused / out of window), which is NOT evidence of a switch.
+     * On the unanswered path the Scanner's snapshot memory may fill keys
+     * from each pool's LAST-ANSWERED state (rule 5) — `snapshots` counts
+     * those so the pass note can say so (`pin-snap N`).
      * Optional, so existing callers and test doubles keep their shape: with
      * it absent a pinned row still resolves whenever the token batch's own
      * pair IS the pin, and otherwise skips.
@@ -2666,7 +2677,16 @@ export class PushWatcher {
       addresses: string[],
       /** Optional epoch-ms cap for this call (see TRACKER_PAIRS_BUDGET_MS). */
       deadlineMs?: number,
-    ) => Promise<Map<string, import("./dexscreener").PairInfo | null>>,
+    ) => Promise<{
+      pairs: Map<string, import("./dexscreener").PairInfo | null>;
+      /**
+       * How many of `pairs` came from a last-answered SNAPSHOT because this
+       * pass's lookup did not answer (see Scanner.poolPairsForTracker):
+       * a reading, never an input — rows judged off these are judged, but
+       * nothing snapshot-served may re-pin.
+       */
+      snapshots: number;
+    }>,
   ) {}
 
   private hasTrade(): boolean {
@@ -3732,6 +3752,13 @@ export class PushWatcher {
       ),
     ];
     let pinPairs = new Map<string, import("./dexscreener").PairInfo | null>();
+    /**
+     * Pins this pass resolves from their last-answered snapshot because the
+     * by-address lookup did not answer (see rule 5): counted into the note as
+     * `pin-snap N` so a refusal pass that still judges its rows is never read
+     * as a live answer.
+     */
+    let pinSnapshots = 0;
     try {
       pairs = await this.pairsFor(
         tokens,
@@ -3745,10 +3772,12 @@ export class PushWatcher {
       // the loop reads as "not evidence", never as "gone".
       if (pinAddrs.length > 0 && typeof this.poolPairsFor === "function") {
         try {
-          pinPairs = await this.poolPairsFor(
+          const answer = await this.poolPairsFor(
             pinAddrs,
             Date.now() + TRACKER_PAIRS_BUDGET_MS,
           );
+          pinPairs = answer.pairs;
+          pinSnapshots = answer.snapshots;
         } catch {
           /* unresolved pins stay unresolved — rows skip, nothing re-pins */
         }
@@ -4770,7 +4799,9 @@ export class PushWatcher {
     // stop for hours. One line names every skip reason: tokens the batch did
     // not return (miss), rows the pool pin skipped (pin-skip — their pinned
     // pool was not in an ANSWERED lookup; see the pool-pinning note) and the
-    // confirmed switches re-pinned (repin), cross-isolate claim races (lost),
+    // confirmed switches re-pinned (repin), rows judged from a pin's
+    // last-answered snapshot instead of skipping (pin-snap — the lookup was
+    // refused; see rule 5), cross-isolate claim races (lost),
     // the pass running
     // out of budget before the rest of the rotation (budget-cut), rows
     // whose first observation landed after a tracking gap (backfill), and
@@ -4784,6 +4815,7 @@ export class PushWatcher {
     const note =
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       `${pinAddrs.length > 0 ? ` pins ${pinPairs.size}/${pinAddrs.length}` : ""}` +
+      `${pinSnapshots > 0 ? ` pin-snap ${pinSnapshots}` : ""}` +
       ` miss ${pairMiss} lost ${claimLost}` +
       `${pinSkip > 0 ? ` pin-skip ${pinSkip}` : ""}` +
       `${repins.length > 0 ? ` repin ${repins.length}` : ""}` +
