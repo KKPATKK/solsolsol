@@ -73,6 +73,28 @@ curl -s .../debug/feed-stats | jq '.byFeed[] | select(.feed=="boosts")'
 - `feedsMs` 喺天花板 tick 可以升到 ~1680ms（leg 真係出咗網），呢個係預期，唔係 regression。
 - 讀數限制：`/health` 嘅 `dex` block 係 **per-isolate** 計數（isolate 約 30s 換一次），所以 `dropsByLeg.boosts` 睇「同一 isolate 內仲有冇升」；跨 isolate 嘅長期趨勢睇 `/debug/feed-stats` 嘅 `boosts.coins`。
 
+### 5.5 上線讀數（2026-10-03，deploy `a061aba4-78fb-4ae9-887d-38dee93a86c7` 之後）
+
+| 時間 (Z) | `intervalMs` | `boosts` | `dropsByLeg.boosts` | `lastListCacheStatus` | `feedsMs` |
+|---|---|---|---|---|---|
+| 10:50:07 | 1200 | **22** | 0 | HIT | 1194 |
+| 10:50:24 | 1200 | 0 | 0 | **HTTP-429** | 1197 |
+| 10:51:34 | 1200 | **22** | 0 | HIT | 1208 |
+| 10:53:06 | 750 | **22** | 0 | HIT | 1591 |
+| 10:53:55 | 1200 | 0 | 0 | **HTTP-429** | 1195 |
+| 10:54:44 | 1200 | **22** | 0 | HIT | 1220 |
+| 10:55:17 | 1200 | **22** | 0 | HIT | 1201 |
+| 10:56:28 | 1200 | 0 | 0 | **HTTP-429** | 1195 |
+| 10:56:46 | 1200 | **22** | 0 | HIT | 1191 |
+| 10:57:20 | 1200 | **22** | 0 | HIT | 1195 |
+| 10:58:30 | 1200 | 0 | 0 | **HTTP-429** | 1191 |
+
+- **天花板（1200）之下交付成功**：多個 tick `boosts 22`，`dropsByLeg.boosts` 全程 **0**。對照改前：同一情境係 `boosts 0` 且 `dropsByLeg.boosts` **每 tick +1**。
+- **答 0 嘅時候係「問過被拒」，唔係「冇送出」**：所有 `boosts 0` 樣本都配 `lastListCacheStatus = HTTP-429`（`listCacheRefused` 跟住升），即條 leg 真係出到網、origin 拒 —— 呢個係**唔同嘅讀數**，亦係分流原則想見到嘅形狀。
+- **健康 tick 不變**：`intervalMs 750` 一樣 `boosts 22 / 0 drops`。
+- `feedsMs` 如預期升：天花板 tick 1.19–1.22s，未見觸及 2000 上限（亦未見 1680 最壞情況，因為 429 一出現通常即刻被拒而唔係等到 abort）。
+- **`/debug/feed-stats` boosts lane 係 lifetime 累計**（`coins 31, pushed 3`），短期升幅唔可以當逐 tick 讀數。
+
 ## 六、界線（老實講）
 
 - **未 cover ①：`fetchFeedCapped` 嘅 250ms floor**（同 §4.58 一樣）—— 如果 fan-out 到達時窗口剩 ≤ 250ms，boosts 根本唔會被叫，而且唔會計 drop。今日未見過（`preFeedMs` 7–62ms）。
