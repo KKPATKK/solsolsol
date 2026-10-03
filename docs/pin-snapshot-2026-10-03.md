@@ -117,3 +117,23 @@ Deploy ffd83e7（CI run 37085674142 success，version `90cdf267-8308-4950-853f-8
 
 → 記憶層有效（`pin-snap 3`），但 per-isolate 令拒絕嗰 pass 落喺冷 isolate 時仍然全員 skip。
 所以就加咗 §2.1b 嘅 colo carrier；cold-isolate 讀數要用再落一版嘅 deploy 驗。
+
+### 7.1 Colo carrier 上線後（47d3d65 / 2e58cd1，CI 全 success）
+
+| 時間（Z） | 讀數 |
+|---|---|
+| 01:40:52 | `rows 0/25 pairs 25/25 pins 24/24 pin-snap 24 pin-skip 0`（429 期間） |
+| 01:42:34 | `rows 25/25 pairs 8/25 pins 25/25 pin-snap 17`（token lane 餓死、pin 層頂住） |
+| 01:56:52 | `rows 26/26 pins 26/26 pin-snap 22`（429 lastAt 01:54:52） |
+| 01:57:21 | `rows 26/26 pins 26/26 pin-snap 26`（全體由 snapshot 判） |
+| 01:57:53 | `pins 4/26 pin-skip 22`（上次成功答案距今 ~100s，TTL 90s 過期 → 照舊 skip） |
+
+結論：
+
+1. 功能成立——429 期間 pin lane 唔再全員 skip，行照判（連 token lane 剩 `pairs 8/25` 仍
+   `rows 25/25 pin-snap 17`）；`pin-skip 0` 喺抽樣過半數 pass 出現。
+2. **TTL 90s 係真正嘅界**：最後一次成功答案過咗 90s，snapshot 全部過期 → 拒絕 pass 回歸
+   `pin-skip`（01:57:53 實例）。即係長 episode 只 cover 頭 ~2–3 個 pass；要 cover 更長就要
+   加大 `PIN_SNAPSHOT_TTL_MS`（代價＝用更舊嘅池數判卡）。
+3. Carrier 寫入要 await（2e58cd1 嘅修正）：呢個 write 喺 tick 尾巴，fire-and-forget 有機會
+   隨 invocation 取消而永遠寫唔到。
