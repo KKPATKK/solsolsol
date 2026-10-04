@@ -115,3 +115,17 @@ MISS 收到（順手寫入 edge，TTL 120s）→ 11:51:3x 由 edge HIT 拎到（
 - 若上游持續唔更新 cache，>`bound` 嘅 copy 會被拒直到真係拎到新數 —— 方向係
   fail-quiet（延遲，唔係遺失）：所有 stage marks 係 persistent，跨過嘅檻會喺
   下一個新鮮讀數一次過補發。
+
+## 6. Post-deploy 驗收（2026-10-04 00:44Z）
+
+- 部署：`c1a774a`（CI run 37165782859：Typecheck／Unit tests／Deploy 全 success），
+  Worker version `d812f0a3-…`，uploaded 00:44:09Z。
+- Live pass note（00:49:11Z）：
+  `ok:27/1 rows 27/27 pairs 27/27 pins 27/27 pin-snap 26 (oldest 64s) miss 0 lost 0 muted 1` ——
+  **冇 `stale`**，即部署以嚟未出現 >180s 讀數；個字只會喺真拒判嗰下出現。
+- DUST 對外抽查（00:51:2xZ）：row `lastMcap 107,126`（fetch 前 3 秒讀到），
+  DexScreener 即時 `marketCap 108,473` → 差 1.2%；上游回應
+  `cache-control: public, max-age=30`、`cf-cache-status: EXPIRED`、冇 `age` 有 `date`
+  （content clock 會 fallback 去 `date`）。
+- 未觀察到：live 上真嘅 `stale N` 拒判（要等一個 >180s 內容嘅讀數）。守衛由
+  3 個 unit test ＋ negative control（拔守衛即出卡）覆蓋。
