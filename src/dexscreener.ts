@@ -62,6 +62,87 @@ export interface PairInfo {
    * Absent (legacy fixtures, synthetic pairs) = treated as DexScreener.
    */
   feedSource?: "dexscreener" | "jupiter" | "gecko";
+  /**
+   * When the VALUES in this row were generated upstream, in epoch ms —
+   * recovered from the response's own HTTP clocks (`age` / `date`, see
+   * getJson), which every cache layer preserves. Absent = unknown (fixtures,
+   * synthetic rows, and the Jupiter/Gecko legs, which are fetched live).
+   *
+   * WHY IT EXISTS (2026-10-03, DUST — docs/stale-readings-2026-10-03.md):
+   * three cache layers sit between the tracker and the market (upstream 30s +
+   * colo edge 120s + this client's in-memory 180s) and they STACK, while every
+   * stamp in the chain recorded its OWN receipt — so a row could be ~5 minutes
+   * stale and read "fresh" at every layer. Live: two 💀 cards quoted 現
+   * $121.02K against a pool trading $290K-430K in the same minutes; the
+   * reading was ~4 minutes old. The push-watch rules refuse to judge a reading
+   * older than PUSH_WATCH_MAX_READING_AGE_MS, and this is how they know.
+   */
+  contentAt?: number;
+}
+
+/**
+ * The oldest pair content this client will serve, or any rule may judge, in
+ * ms — measured from the reading's own content clock (`PairInfo.contentAt`),
+ * never from when a layer happened to hand it over.
+ *
+ * WHY IT EXISTS (2026-10-03, DUST — docs/stale-readings-2026-10-03.md). Three
+ * caches sit between the tracker and the market and they STACK: DexScreener's
+ * own `max-age=30`, this Worker's colo edge entry (PAIR_BATCH_CACHE_TTL_S,
+ * 120s) and this client's in-memory map (PAIR_CACHE_TTL_MS, 180s). Each one
+ * stamped its own receipt, so a reading could be minutes old and read "fresh"
+ * at every layer — and nothing in the chain could even SAY how old it was.
+ * Live: two 💀 cards quoted 現 $121.02K while the pool traded $290K–430K in the
+ * same minutes (the $121K number was the market ~4 minutes earlier), and the
+ * revival target they armed ($181.53K) sat BELOW the live price the whole
+ * time, so the very next fresh reading would have "revived" the coin.
+ *
+ * WHERE 180s COMES FROM — it is arithmetic over the chain's own windows, not
+ * an opinion. The worst content this chain can produce at a CACHE HIT is
+ * (edge write age ≤ 120s) + (the upstream age that entry was written with,
+ * measured 0–26s on real hits) ≈ 146s; and an entry can only be written at
+ * all on an edge MISS, i.e. with content the origin had just generated. So
+ * content older than ~150s means the edge entry that produced it is ALREADY
+ * expired, and asking again reaches the origin (see the freshness gate in
+ * fetchPairsForTokens — which is exactly what that gate does). 180s sits
+ * above that 146s worst case — so no legitimate hit is ever refused — and
+ * well below the 4+ minutes the DUST cards were reading.
+ *
+ * TWO USES, one meaning ("this content is too old to be evidence: get a
+ * fresher one, or don't judge"):
+ *  1. fetchPairsForTokens treats an in-memory HIT this old as a MISS, so the
+ *     tracker re-asks the wire instead of re-serving the stale copy. Since
+ *     the edge entry behind it is already expired (above), the re-ask is a
+ *     real refresh, not a wasted request.
+ *  2. The push-watch rules REFUSE to judge a reading this old AT ALL
+ *     (fail-quiet — no card of any kind, the row is left completely
+ *     untouched and re-read next pass; see pushwatch's
+ *     PUSH_WATCH_MAX_READING_AGE_MS), so nothing is ever derived from
+ *     minutes-old numbers even if some other carrier (a pin snapshot, a
+ *     served lastPairs map) hands one over.
+ *
+ * UNKNOWN IS NOT STALE: a row with no `contentAt` at all (fixtures, synthetic
+ * pairs, the Jupiter/Gecko legs, which are fetched live) is never refused —
+ * the same "missing data never judges" direction the liquidity guards take.
+ * Only a reading we can actually DATE may be refused for its age.
+ */
+export const PAIR_CONTENT_MAX_AGE_MS = 180_000;
+
+/**
+ * How old a pair's CONTENT is (ms), from the reading's own `contentAt` — never
+ * from when this isolate received it, which is the stamp every cache layer in
+ * the chain rewrites (see PairInfo.contentAt). Null = unknown: the row carried
+ * no clock at all (fixtures, synthetic rows, the Jupiter/Gecko legs), which is
+ * neither fresh nor stale — callers that must judge (pushwatch) fail OPEN on
+ * unknown and only refuse a reading they can actually date.
+ */
+export function pairContentAgeMs(
+  pair: { contentAt?: number },
+  now: number,
+): number | null {
+  if (typeof pair.contentAt !== "number" || !Number.isFinite(pair.contentAt)) {
+    return null;
+  }
+  return Math.max(0, now - pair.contentAt);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -1224,8 +1305,16 @@ function pairDepth(pair: { liquidity: { usd: number | null } }): number {
  * omits it (the gate rejects 0 rather than quietly substituting FDV), `fdv`
  * is its own quantity, and a drained pool's liquidity 0 is PRESERVED (it is
  * the 💧 rules' evidence — never "unknown").
+ *
+ * `contentAt` (epoch ms) is the response's own content timestamp, recovered by
+ * the caller from its HTTP `age`/`date` clocks (see getJson) and attached here
+ * so the reading's age travels WITH the row through every cache the client
+ * keeps (see PairInfo.contentAt). Omitted = unknown.
  */
-function parseDexPair(raw: Record<string, unknown>): PairInfo | null {
+function parseDexPair(
+  raw: Record<string, unknown>,
+  contentAt?: number,
+): PairInfo | null {
   if (raw.chainId !== "solana") return null;
   const baseToken = raw.baseToken as
     | { address?: string; name?: string; symbol?: string }
@@ -1283,6 +1372,12 @@ function parseDexPair(raw: Record<string, unknown>): PairInfo | null {
     // feedSource note on PairInfo).
     feedSource: "dexscreener",
     pairCreatedAt: Number(raw.pairCreatedAt ?? 0),
+    // Absent (not `undefined`) when the caller could not date the response:
+    // the spread keeps the key out of the object entirely, so nothing that
+    // serializes a pair writes a null-ish stamp (see the field's own note).
+    ...(typeof contentAt === "number" && Number.isFinite(contentAt)
+      ? { contentAt }
+      : {}),
   };
 }
 
@@ -1660,6 +1755,28 @@ export class DexScreenerClient {
    * (DEX_429_RECORD_MIN_GAP_MS); the counter still increments per response, so
    * the drip stays visible even while the notify is debounced.
    */
+  /**
+   * The epoch ms a response's CONTENT was generated upstream, recovered from
+   * the response's own HTTP clocks — the one reading every cache layer on the
+   * way preserves (see PairInfo.contentAt).
+   *
+   * `age` is the time since the origin generated (or validated) the body, so
+   * `now - age` IS that generation time and needs no clock agreement with the
+   * origin. `date` is the fallback for a response that carries no age (a fresh
+   * origin answer); note that `date + age` would be the SERVE time — exactly
+   * the receipt-stamp mistake this field exists to avoid. Null = the response
+   * carried neither clock (a synthetic Response in tests).
+   */
+  private static responseContentAt(res: Response, now: number): number | null {
+    const ageRaw = res.headers.get("age");
+    if (ageRaw !== null) {
+      const ageS = Number(ageRaw);
+      if (Number.isFinite(ageS) && ageS >= 0) return now - ageS * 1000;
+    }
+    const dateMs = Date.parse(res.headers.get("date") ?? "");
+    return Number.isFinite(dateMs) ? dateMs : null;
+  }
+
   private note429(batchLane: boolean): void {
     const now = Date.now();
     this.http429Total++;
@@ -1702,6 +1819,14 @@ export class DexScreenerClient {
     path: string,
     deadline?: number,
     edgeCacheTtlS?: number,
+    /**
+     * Filled with the 2xx response's CONTENT timestamp (see
+     * responseContentAt and PairInfo.contentAt) — a holder, because the value
+     * belongs to the caller's response and this method's return type is the
+     * parsed body. Only ever written on a 2xx that reaches the body read, so a
+     * refusal or a spent budget can never overwrite a caller's prior stamp.
+     */
+    pairContentAt?: { at: number | null },
   ): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1815,6 +1940,13 @@ export class DexScreenerClient {
         }
         if (!res.ok) {
           return null; // deterministic client error — retrying won't help
+        }
+        // Date the CONTENT, not the receipt (see PairInfo.contentAt). The
+        // response's own clocks are the only reading that survives the three
+        // cache layers this client sits behind: every layer re-stamps when it
+        // SERVED the body, none of them changes when the body was generated.
+        if (pairContentAt) {
+          pairContentAt.at = DexScreenerClient.responseContentAt(res, Date.now());
         }
         // A 2xx is the ONLY reading that relaxes the spacing (see
         // AdaptiveSpacing): a 404 for a delisted token is "not refused", not
@@ -2109,10 +2241,22 @@ export class DexScreenerClient {
     for (const a of addresses) {
       const hit = this.pairCache.get(a);
       if (hit && now - hit.at < PAIR_CACHE_TTL_MS) {
-        result.set(a, hit.pair);
-      } else {
-        misses.push(a);
+        // …but only while the CONTENT it holds is still fresh enough to
+        // serve (see PAIR_CONTENT_MAX_AGE_MS). The entry's own write age is
+        // not that reading: a body fetched just now can already be minutes
+        // old (the edge handed over a near-expiry entry), and this map used
+        // to re-serve it for another 180s on top — the DUST cards' ~4-minute
+        // reading in one line. An entry past the bound is treated as a MISS
+        // so the wire is asked again; the edge entry behind it has always
+        // expired by then (the bound is sized above that window), so the
+        // re-ask is a real refresh. Undated entries are served as before.
+        const age = pairContentAgeMs(hit.pair, now);
+        if (age === null || age <= PAIR_CONTENT_MAX_AGE_MS) {
+          result.set(a, hit.pair);
+          continue;
+        }
       }
+      misses.push(a);
     }
     if (misses.length === 0) return result;
     // Blocked by a recent hard 429: don't hammer the endpoint (and don't
@@ -2160,6 +2304,14 @@ export class DexScreenerClient {
         if (this.throttle.nextSlotAt() >= deadline) return;
         const batch = batches[nextBatch++];
         let data: { pairs?: Array<Record<string, unknown>> } | null;
+        /**
+         * This batch's content timestamp (see PairInfo.contentAt), filled by
+         * getJson from the response's own clocks and attached to every row
+         * below — the reading's age must travel WITH the pair, because the
+         * in-memory cache re-serves the same object and a later caller cannot
+         * tell a fresh fetch from a stale hit otherwise.
+         */
+        const contentAt: { at: number | null } = { at: null };
         try {
           data = (await this.getJson(
             `/latest/dex/tokens/${batch.join(",")}`,
@@ -2169,6 +2321,7 @@ export class DexScreenerClient {
             // ticks, so a cold isolate rides the previous tick's fetch instead
             // of paying the shared egress (and its 429s) again.
             PAIR_BATCH_CACHE_TTL_S,
+            contentAt,
           )) as { pairs?: Array<Record<string, unknown>> } | null;
         } catch (err) {
           // A rate-limited batch means the remaining ones will 429 too — stop
@@ -2185,7 +2338,7 @@ export class DexScreenerClient {
         if (!Array.isArray(pairs)) continue;
 
         for (const raw of pairs) {
-          const info = parseDexPair(raw);
+          const info = parseDexPair(raw, contentAt.at ?? undefined);
           if (!info) continue;
           // DEEPEST POOL WINS — the pair that REPRESENTS a token is the one
           // with the most liquidity behind it, not whichever array position
@@ -2302,12 +2455,15 @@ export class DexScreenerClient {
         break;
       }
       let data: unknown;
+      /** The batch's content timestamp — same contract as the token lane's. */
+      const contentAt: { at: number | null } = { at: null };
       try {
         data = await this.getJson(
           `/latest/dex/pairs/solana/${batch.join(",")}`,
           deadline,
           // See PAIR_BATCH_CACHE_TTL_S / the note above.
           PAIR_BATCH_CACHE_TTL_S,
+          contentAt,
         );
       } catch {
         // A 429 has already armed the block and the spacing (see note429),
@@ -2329,7 +2485,10 @@ export class DexScreenerClient {
       }
       for (const raw of list) {
         if (raw === null || typeof raw !== "object") continue;
-        const info = parseDexPair(raw as Record<string, unknown>);
+        const info = parseDexPair(
+          raw as Record<string, unknown>,
+          contentAt.at ?? undefined,
+        );
         if (!info || info.pairAddress.length === 0) continue;
         pairs.set(info.pairAddress, info);
       }

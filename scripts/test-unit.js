@@ -4713,6 +4713,96 @@ async function main() {
     );
   });
 
+  await test("DexScreenerClient: a pair batch is dated by its CONTENT, and an over-age cache hit is re-asked", async () => {
+    // 2026-10-03 DUST (docs/stale-readings-2026-10-03.md): three caches —
+    // DexScreener's own max-age=30, the colo edge entry (PAIR_BATCH_CACHE_TTL_S)
+    // and this client's in-memory map (PAIR_CACHE_TTL_MS) — each stamped its
+    // own RECEIPT, so a reading minutes old read "fresh" at every layer and
+    // the tracker judged two 💀 cards off it ($121.02K quoted while the pool
+    // traded $290K–430K). The response's own `age` header is the one clock
+    // every layer preserves; it now rides the parsed row (PairInfo.contentAt),
+    // and an in-memory hit that has outlived PAIR_CONTENT_MAX_AGE_MS is a MISS
+    // — the wire is asked again instead of the stale copy re-served.
+    const {
+      DexScreenerClient: DexClient,
+      PAIR_CONTENT_MAX_AGE_MS: MAX_AGE,
+      pairContentAgeMs: ageOf,
+    } = require("../dist/dexscreener.js");
+    assert.equal(MAX_AGE, 180_000, "the bound is the shared 180s (see its own note)");
+    const origFetch = globalThis.fetch;
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" });
+    const row = {
+      chainId: "solana", url: "", pairAddress: "POOLA",
+      baseToken: { address: "TOKENA", name: "A", symbol: "A" },
+      priceUsd: "0.0001", marketCap: 121_023,
+      volume: { h24: 1_000, h1: 100, m5: 10 },
+      priceChange: { m5: -1, h1: -2 },
+      txns: { m5Buys: 1, m5Sells: 1, h1Buys: 5, h1Sells: 5 },
+      liquidity: { usd: 30_000 }, pairCreatedAt: 0,
+    };
+    let ageS = 90;
+    let dated = true;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      const headers = { "Content-Type": "application/json", "cf-cache-status": "HIT" };
+      if (dated) headers.age = String(ageS);
+      return new Response(JSON.stringify({ pairs: [row] }), { status: 200, headers });
+    };
+    try {
+      const dex = new DexClient(cfg);
+      const t0 = Date.now();
+      const first = await dex.fetchPairsForTokens(["TOKENA"]);
+      const p1 = first.get("TOKENA");
+      const a1 = ageOf(p1, Date.now());
+      assert.ok(
+        a1 !== null && a1 >= 85_000 && a1 <= 100_000,
+        `age: 90 rides the row as its content age (got ${a1}ms)`,
+      );
+      // A second call inside the in-memory TTL is served from memory — and it
+      // must NOT re-stamp the age: the content clock is a property of the data,
+      // not of the serve.
+      const cached = await dex.fetchPairsForTokens(["TOKENA"]);
+      assert.equal(calls, 1, "a fresh entry is served from memory");
+      assert.equal(cached.get("TOKENA").contentAt, p1.contentAt, "and the content clock rides the hit");
+
+      // The layered case: the edge is now handing over a body older than the
+      // bound (an upstream that stopped refreshing). The entry is stored as
+      // fetched, and the NEXT call refuses it — the wire is asked again,
+      // which reaches the origin because the edge entry behind it has expired
+      // by the time content is this old (see PAIR_CONTENT_MAX_AGE_MS).
+      const staleDex = new DexClient(cfg);
+      calls = 0;
+      ageS = MAX_AGE / 1000 + 60;
+      const staleHit = await staleDex.fetchPairsForTokens(["TOKENA"]);
+      assert.equal(calls, 1);
+      assert.ok(ageOf(staleHit.get("TOKENA"), Date.now()) > MAX_AGE, "the old body is dated old, not fresh");
+      await staleDex.fetchPairsForTokens(["TOKENA"]);
+      assert.equal(calls, 2, "an over-age memory hit is a MISS, so the wire is asked again");
+
+      // Undated responses (no age/date at all) are never refused: the field
+      // is missing because nothing could date it, not because it was old.
+      const undatedDex = new DexClient(cfg);
+      calls = 0;
+      dated = false;
+      const undated = await undatedDex.fetchPairsForTokens(["TOKENA"]);
+      assert.equal(undated.get("TOKENA").contentAt, undefined, "no clock, no stamp");
+      await undatedDex.fetchPairsForTokens(["TOKENA"]);
+      assert.equal(calls, 1, "and undated entries are served from memory as before");
+
+      // The pin lane (by-address) is dated by the same rule — its rows feed
+      // the tracker's pinned pools.
+      dated = true;
+      ageS = 45;
+      const byAddr = await new DexClient(cfg).fetchPairsByAddresses(["POOLA"]);
+      const pool = byAddr.pairs.get("POOLA");
+      const a2 = ageOf(pool, Date.now());
+      assert.ok(a2 !== null && a2 >= 40_000 && a2 <= 55_000, `by-address rows carry the clock too (got ${a2}ms)`);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   await test("AdaptiveSpacing: a refusal widens the dispatch spacing, a healthy streak walks it back", () => {
     // The spacing was one config constant and the only reaction to a 429 was
     // a 90s cache-only block, so the queue walked straight back into the same
@@ -12834,6 +12924,141 @@ async function main() {
     assert.match(f.alerts[0].text, /39\.00K/);
     assert.equal(f.stopTracking, false);
     assert.equal(f.deadTroughMcap, 39_000);
+  });
+
+  await test("evaluateWatch: a stale reading cannot call a coin dead or revive it (DUST, 2026-10-03)", () => {
+    // The live reading: peak $330.34K, live $121.02K = -63%, a clean 💀 —
+    // EXCEPT the numbers were ~4 minutes old while the pool traded
+    // $290K–430K. The card went out quoting 現 $121.02K and armed a revival
+    // target ($181.53K) BELOW the live price, so the next fresh reading would
+    // have "revived" the coin. See PUSH_WATCH_MAX_READING_AGE_MS.
+    const {
+      PUSH_WATCH_MAX_READING_AGE_MS: MAX_AGE,
+    } = require("../dist/pushwatch.js");
+    const { PAIR_CONTENT_MAX_AGE_MS } = require("../dist/dexscreener.js");
+    assert.equal(
+      MAX_AGE,
+      PAIR_CONTENT_MAX_AGE_MS,
+      "one number: content the client will not serve is content the rules must not judge",
+    );
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "DUST", pushedAt: 0,
+      mcapAtPush: 177_869, peakMcap: 330_340, lastLiquidity: 30_000,
+      lastVol5m: 5_000, deadTroughMcap: null,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: 0, followupsSent: 0, lastState: null,
+      upStages: null, sellDomStreak: 0,
+      ...over,
+    });
+    const live = (over = {}) => ({
+      mcap: 121_023, liquidity: 30_000, chg5m: -30, vol5m: 9_000,
+      buysH1: 40, sellsH1: 120,
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+
+    // 4 minutes old: the 💀 is WITHHELD and the eval says so on its way out,
+    // so the caller can leave the row (measurements included) untouched.
+    const stale = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: 240_000 });
+    assert.deepEqual(stale.alerts, [], "no 💀 card off a stale reading");
+    assert.equal(stale.readingStale, true, "the eval marks the refusal for the caller");
+    assert.equal(stale.lastState, null, "the row is not moved into the silent watch");
+    assert.equal(stale.deadTroughMcap, null, "nor is a revival anchor armed");
+
+    // The SAME numbers dated now: the 💀 card is exactly as it always was.
+    // This is the negative control — the gate, not the numbers, suppressed it.
+    const fresh = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: 30_000 });
+    assert.equal(fresh.alerts.length, 1);
+    assert.equal(fresh.alerts[0].sig, "dead");
+    assert.match(fresh.alerts[0].text, /💀 走死 DUST/);
+    assert.equal(fresh.deadTroughMcap, 121_023, "and the trough is armed as usual");
+    assert.equal(fresh.readingStale, undefined, "nothing is marked on an ordinary pass");
+
+    // The boundary: exactly at the bound is judged, one ms past is refused.
+    const edge = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: MAX_AGE });
+    assert.equal(edge.alerts[0].sig, "dead", "age == bound is still fresh enough");
+    const past = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: MAX_AGE + 1 });
+    assert.deepEqual(past.alerts, [], "one millisecond past it is not");
+
+    // Undated readings (fixtures, synthetic rows, the Jupiter/Gecko legs) are
+    // judged exactly as before: fail OPEN, the "missing data never judges"
+    // direction — only a reading we can DATE may be refused for its age.
+    const undated = evaluateWatch(row(), 11_000_000, live(), cfg);
+    assert.equal(undated.alerts[0].sig, "dead", "an undatable reading is never refused");
+
+    // The revival side: a dead row whose reading says it recovered past
+    // trough × 1.5 (the mid-pass $381K copy in the live incident).
+    const dead = row({ lastState: "dead", deadTroughMcap: 121_023 });
+    const reviveStale = evaluateWatch(dead, 11_000_000, live({ mcap: 381_369 }), { ...cfg, readingAgeMs: 300_000 });
+    assert.deepEqual(reviveStale.alerts, [], "no 🟢 card off a stale reading");
+    assert.equal(reviveStale.readingStale, true);
+    assert.equal(reviveStale.lastState, "dead", "a stale reading cannot un-dead the row");
+    assert.equal(reviveStale.deadTroughMcap, 121_023, "nor move the revival anchor");
+    assert.equal(reviveStale.resetBaselineMcap, undefined, "nor re-base the row");
+    const reviveFresh = evaluateWatch(dead, 11_000_000, live({ mcap: 381_369 }), { ...cfg, readingAgeMs: 30_000 });
+    assert.equal(reviveFresh.alerts[0].sig, "revive", "a FRESH reversal still revives");
+    assert.equal(reviveFresh.resetBaselineMcap, 381_369);
+    // NO card at all off a stale reading — not just no 💀. The rules derive a
+    // ⚠️ w45 off these same numbers one step earlier (a live -63% drawdown),
+    // and its card quotes the same wrong 現價 the operator reported; a 🚀 the
+    // same. The stage marks are persistent, so nothing is lost by waiting for
+    // a fresh reading: the card lands (naming every stage it swallowed) then.
+    const lateWeak = evaluateWatch(row({ upStages: "w35" }), 11_000_000, live(), { ...cfg, readingAgeMs: 300_000 });
+    assert.deepEqual(lateWeak.alerts, [], "the ⚠️ that would quote the same wrong number is withheld too");
+    const lateRocket = evaluateWatch(
+      row({ peakMcap: 100_000, mcapAtPush: 100_000 }),
+      11_000_000,
+      live({ mcap: 190_000, chg5m: 12 }),
+      { ...cfg, readingAgeMs: 300_000 },
+    );
+    assert.deepEqual(lateRocket.alerts, [], "and every other card with it");
+    // …while the same row on a FRESH reading is announced exactly as before.
+    const freshRocket = evaluateWatch(
+      row({ peakMcap: 100_000, mcapAtPush: 100_000 }),
+      11_000_000,
+      live({ mcap: 190_000, chg5m: 12 }),
+      { ...cfg, readingAgeMs: 30_000 },
+    );
+    assert.equal(freshRocket.alerts[0].sig, "up50");
+  });
+
+  await test("PushWatcher: an over-age reading skips its row untouched and is named (`stale N`)", async () => {
+    // The pass-level half of the same rule: a row judged off an over-age
+    // reading is not "checked" at all — no claim, no write, no card and no
+    // position lost (it stays at the front of the rotation) — and the note
+    // names it, so a starved pass can never read as healthy (`ok:N/N`).
+    const { PUSH_WATCH_MAX_READING_AGE_MS: MAX_AGE } = require("../dist/pushwatch.js");
+    const deadRow = () =>
+      termRow({ peakMcap: 330_340, mcapAtPush: 177_869, upStages: null, lastLiquidity: 30_000 });
+    const pairAt = (token, contentAt) => ({
+      ...termPair(token, 30_000),
+      marketCap: 121_023,
+      contentAt,
+    });
+    const makeWatcher = (db, onSend) =>
+      new PushWatcher(db, { api: { sendMessage: onSend } }, null, loadConfig({}),
+        async (addrs) => new Map(addrs.map((a) => [a, pairAt(a, staleAt)])), null);
+
+    let staleAt = Date.now() - MAX_AGE - 60_000;
+    let staleSends = 0;
+    const staleDb = termDb([deadRow()]);
+    const staleOut = await makeWatcher(staleDb, async () => { staleSends += 1; return { message_id: 1 }; })
+      .runTick(Date.now() + 1_500);
+    assert.equal(staleSends, 0, "no 💀 card off the stale reading");
+    assert.equal(staleOut.checked, 0, "the row is not checked");
+    assert.equal(staleDb.updated.length, 0, "nothing is written — not even the measurements");
+    assert.match(String(staleOut.note), / stale 1/, `the note names it: ${staleOut.note}`);
+
+    // Same row, same numbers, dated now: the 💀 card goes out and the row is
+    // written. The negative control for the whole pass.
+    staleAt = Date.now() - 30_000;
+    let freshSends = 0;
+    const freshDb = termDb([deadRow()]);
+    const freshOut = await makeWatcher(freshDb, async () => { freshSends += 1; return { message_id: 2 }; })
+      .runTick(Date.now() + 1_500);
+    assert.equal(freshSends, 1, "a fresh reading fires the 💀 card");
+    assert.equal(freshOut.checked, 1);
+    assert.doesNotMatch(String(freshOut.note), / stale /, `and nothing claims a refusal: ${freshOut.note}`);
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {

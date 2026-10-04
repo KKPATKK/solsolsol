@@ -1,4 +1,8 @@
 import type { AppConfig } from "./config";
+// The reading's own content clock (see PUSH_WATCH_MAX_READING_AGE_MS): the
+// rules must judge the market as it was when the numbers were generated, not
+// when the cache chain finally handed them over.
+import { PAIR_CONTENT_MAX_AGE_MS, pairContentAgeMs } from "./dexscreener";
 // Two VALUES off ./db (not just the type): the heal now receives the raw
 // `push_audit` and unconfirmed rows inside its opening batch and parses them
 // here, and the parse must be the SAME one Db.getInitialPushAuditTokens and
@@ -936,6 +940,46 @@ const DIVERGENCE_MIN_DROP_PCT = 0.10;
  */
 const WEAK_DRAWDOWN_PCT = 35;
 const DEAD_DRAWDOWN_PCT = 48;
+/**
+ * The oldest a pair reading may be for the rules to JUDGE a row with it —
+ * measured from the reading's own content clock (`PairInfo.contentAt`, see
+ * src/dexscreener.ts), not from when this pass received it.
+ *
+ * WHY IT EXISTS (2026-10-03, DUST — docs/stale-readings-2026-10-03.md). The
+ * tracker judged a row off whatever pair the caches handed it, and the three
+ * layers between it and the market (upstream max-age 30s + colo edge 120s +
+ * the client's in-memory 180s) STACK: each one stamped its own receipt, so a
+ * reading could be minutes old and read fresh at every layer. Live, in one
+ * minute: a 💀 card quoted 現 $121.02K against a pool trading $290K–430K, and
+ * the revival target armed off it ($181.53K) was BELOW the market the whole
+ * time — while the pass between the two cards read $381K off a fresher copy.
+ * That swing (121K → 381K → 121K) is one coin and one minute of real tape.
+ *
+ * The bound is PAIR_CONTENT_MAX_AGE_MS, SHARED with the client's own serve
+ * gate so the two can never disagree about what "too old" means: the client
+ * refuses to re-serve such content from its in-memory cache and the rules
+ * refuse to judge from it. One number, one meaning — content the client will
+ * not hand over is content the rules must not act on.
+ *
+ * WHAT IT GATES: the WHOLE ROW — every card and every column. The incident
+ * is the reason it is not scoped to 💀/🟢: every card quotes 現價, and the
+ * same stale $121.02K would have printed on the ⚠️ w45 card the rules derive
+ * one step before the 💀 (a live -63% off the same numbers). A card off a
+ * stale reading is not "late news about a real level" — the level is the
+ * stale part. So the refusal announces NOTHING and the row is written NOTHING
+ * (measurements included — they come off the same reading; see
+ * WatchEval.readingStale), leaving it exactly as it was and at the FRONT of
+ * the rotation, where the next pass re-derives it from the freshest content
+ * the chain can hand over. Delay, never loss: every stage mark is persistent,
+ * so a band crossed while the reading was stale is announced (naming every
+ * stage it swallowed) as soon as a fresh reading arrives.
+ *
+ * UNKNOWN IS NOT STALE: a row with no `contentAt` at all (fixtures, synthetic
+ * pairs, the Jupiter/Gecko legs) fails OPEN, the same "missing data never
+ * judges" direction the liquidity guards take — only a reading we can actually
+ * DATE may be refused for its age.
+ */
+export const PUSH_WATCH_MAX_READING_AGE_MS = PAIR_CONTENT_MAX_AGE_MS;
 /** A coin must have run up at least this much before "weak" can fire. */
 const WEAK_MIN_RUNUP_PCT = 15;
 /** Liquidity crash: current < 45% of the last check AND last ≥ $5K. */
@@ -1428,6 +1472,18 @@ export interface WatchEval {
    * leave the column holding a live attempt the caller must preserve.
    */
   carriedAttempts?: Array<{ sig: string; at: number }>;
+  /**
+   * THIS reading was too old to judge the state-changing transitions (see
+   * PUSH_WATCH_MAX_READING_AGE_MS): the evaluation announces nothing and the
+   * caller must write NOTHING for the row — no check write, no measurement
+   * columns, no claim. Everything on the eval is therefore the row's own
+   * state, untouched; the field is what the caller reads to skip the row
+   * instead of persisting a reading that was already refused.
+   *
+   * Absent on every ordinary evaluation (fresh or undated), so callers written
+   * before this rule keep their exact behavior.
+   */
+  readingStale?: true;
 }
 
 function pct(n: number): string {
@@ -1599,6 +1655,14 @@ export function evaluateWatch(
     cooldownMs: number;
     liqFloorUsd?: number;
     /**
+     * Age (ms) of THIS reading's content, when it can be dated (`null` =
+     * unknown, which never refuses. See PUSH_WATCH_MAX_READING_AGE_MS).
+     * A dated reading older than that constant refuses the death and
+     * resurrection transitions — and the whole pass writes nothing for the
+     * row (see WatchEval.readingStale).
+     */
+    readingAgeMs?: number | null;
+    /**
      * Delivery proof for the attempt marks, keyed per CARD
      * (`deferrallog.cardProofKey(token, sig)`) → the newest `at` the audit ring
      * shows a follow-up card Telegram ACCEPTED for that row AND that
@@ -1620,6 +1684,42 @@ export function evaluateWatch(
   const drawdownFromPeak =
     peakMcap > 0 ? (live.mcap / peakMcap - 1) * 100 : 0;
   const cooledDown = now - row.lastAlertAt >= cfg.cooldownMs;
+  /**
+   * Whether this reading is too old to judge AT ALL (see
+   * PUSH_WATCH_MAX_READING_AGE_MS). Undated readings are never stale: only a
+   * reading we can date may be refused, and the caller hands the age in from
+   * the pair's own content clock.
+   *
+   * A refusal is the WHOLE row, not just the state transitions — because every
+   * card quotes 現價, and the live DUST cards are the proof: the same stale
+   * $121.02K printed on a 💀, and would have printed on the ⚠️ w45 that the
+   * rules derive one step earlier (a live -63% drawdown off the same numbers).
+   * A card is not "late news about a real level" when the level itself is the
+   * stale part. So the eval announces nothing and the caller writes NOTHING —
+   * not even the measurement columns, which are derived from this same reading
+   * — leaving the row exactly as it was and at the front of the rotation, where
+   * the next pass re-derives it from the freshest content the chain can hand
+   * over. Delay, never loss: every mark above is persistent, so a stage crossed
+   * while the reading was stale is announced (with every stage it swallowed)
+   * the moment a fresh reading arrives.
+   */
+  const readingStale =
+    typeof cfg.readingAgeMs === "number" &&
+    Number.isFinite(cfg.readingAgeMs) &&
+    cfg.readingAgeMs > PUSH_WATCH_MAX_READING_AGE_MS;
+  if (readingStale) {
+    return {
+      alerts: [],
+      peakMcap,
+      followupsSent: row.followupsSent,
+      lastState: row.lastState,
+      lastAlertAt: row.lastAlertAt,
+      stopTracking: false,
+      deadTroughMcap: row.deadTroughMcap ?? null,
+      sellDomStreak: row.sellDomStreak ?? 0,
+      readingStale: true,
+    };
+  }
   let lastState = row.lastState;
   let lastAlertAt = row.lastAlertAt;
   let followupsSent = row.followupsSent;
@@ -1965,6 +2065,11 @@ export function evaluateWatch(
     // nothing. When neither is a reading there is no target at all, and the
     // row stays dead and silent — the fail-quiet direction, which is the same
     // "missing data never judges" rule the liquidity guards use.
+    //
+    // (A stale reading never reaches here at all: the whole row is refused up
+    // top, see PUSH_WATCH_MAX_READING_AGE_MS — a resurrection is a persistent
+    // state change re-basing every later card, so it must never come off a
+    // copy the caches have been re-serving for minutes.)
     const troughBase = row.deadTroughMcap ?? row.mcapAtPush;
     const target =
       (troughBase > 0 ? troughBase : row.mcapAtPush) * RESURRECTION_MULT;
@@ -2012,6 +2117,11 @@ export function evaluateWatch(
   // (the row then enters the silent watch above) — deep-flush V-reversals are
   // common, so recovery to trough × 1.5 resurrects it. Peak is always ≥ push
   // mcap, so this also catches never-ran-up straight dumps.
+  //
+  // The DUST cards were this rule reading a CACHE, not the market: -63% at
+  // $121.02K while the pool traded $290K–430K, with a revival target armed
+  // BELOW the live price. A reading that old never reaches this rule at all
+  // now — see PUSH_WATCH_MAX_READING_AGE_MS.
   if (drawdownFromPeak <= -DEAD_DRAWDOWN_PCT) {
     fire(
       "dead",
@@ -3850,6 +3960,19 @@ export class PushWatcher {
      */
     let pinSkip = 0;
     /**
+     * Rows this pass REFUSED to judge because their reading was too old (see
+     * PUSH_WATCH_MAX_READING_AGE_MS): the card that would have come off it is
+     * withheld and the row is left COMPLETELY untouched — not even the
+     * measurement columns — so the next pass, which finds it at the front of
+     * the rotation, judges it off whatever the cache chain hands over then.
+     * Reported as `stale N` beside `pin-snap N`, for the same reason that
+     * counter exists: a pass that judged its rows and one that refused them
+     * must not read alike. Sized so it can only fire on the reading that would
+     * have judged a death/revival, never on the measurement-only rules — the
+     * eval says so per row (WatchEval.readingStale).
+     */
+    let staleSkipped = 0;
+    /**
      * Confirmed switches whose re-pin write this pass lands (`repin N` in the
      * note): rows whose pinned pool left an ANSWERED response AND whose token
      * batch names a new pool. Written as ONE batched CAS after the loop (see
@@ -4217,8 +4340,30 @@ export class PushWatcher {
           buysH1: pair.txns.h1Buys,
           sellsH1: pair.txns.h1Sells,
         },
-        { cooldownMs: cfg.cooldownMin * 60_000, followupProofAt },
+        {
+          cooldownMs: cfg.cooldownMin * 60_000,
+          followupProofAt,
+          // The reading's own content clock, not its receipt (see
+          // PUSH_WATCH_MAX_READING_AGE_MS): the pass hands the eval the age so
+          // a reading the caches have been re-serving for minutes cannot judge
+          // a death or a revival. Undated readings (Jupiter/Gecko legs, legacy
+          // fixtures) are null and never refused.
+          readingAgeMs: pairContentAgeMs(pair, now),
+        },
       );
+
+      // THE STALE READING: announce nothing, write NOTHING (see
+      // WatchEval.readingStale and PUSH_WATCH_MAX_READING_AGE_MS). The row
+      // rides `continue`, not the silent-check path below — that path WRITES
+      // the measurement columns, and every number on this eval came off the
+      // very reading that was just refused. Leaving the row untouched keeps
+      // its place at the front of the rotation, so the next pass (within a
+      // rotation, i.e. minutes) re-derive it from fresh content instead of
+      // persisting a stale peak/trough/state for the rest of the window.
+      if (evalResult.readingStale) {
+        staleSkipped += 1;
+        continue;
+      }
 
       // Backfill pass (see STALE_BACKFILL_MS): a row the tracker has never
       // evaluated (last_mcap is written by every real pass) whose push is
@@ -4830,6 +4975,7 @@ export class PushWatcher {
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       `${pinAddrs.length > 0 ? ` pins ${pinPairs.size}/${pinAddrs.length}` : ""}` +
       `${pinSnapshots > 0 ? ` pin-snap ${pinSnapshots} (oldest ${Math.round(pinOldestMs / 1000)}s)` : ""}` +
+      `${staleSkipped > 0 ? ` stale ${staleSkipped}` : ""}` +
       ` miss ${pairMiss} lost ${claimLost}` +
       `${pinSkip > 0 ? ` pin-skip ${pinSkip}` : ""}` +
       `${repins.length > 0 ? ` repin ${repins.length}` : ""}` +
