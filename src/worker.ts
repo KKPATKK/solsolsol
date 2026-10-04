@@ -7308,6 +7308,13 @@ const worker = {
     // because a path can be refused differently from new_pools — the 401 this
     // route was built for was read off whichever leg asked last.
     //
+    // `?bust=1` appends a unique `cb=` value, so every reading is an ORIGIN
+    // answer: without it the first matrix came back `cf-cache-status: HIT` for
+    // every variant — keyed, keyless and both headers alike — because
+    // CoinGecko publishes `s-maxage=60` and the cache answers before any auth
+    // is checked. A cached 200 proves nothing about the key; a busted one is
+    // the only route to the 401/429 the feed actually hits.
+    //
     // Read-only: raw fetches, no client counters, no backoff state, no cache —
     // the same contract as /debug/gecko-alt. Keyed variants spend a few calls
     // of the key's quota.
@@ -7317,6 +7324,7 @@ const worker = {
       const configuredHeader =
         plan === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
       const mint = (url.searchParams.get("mint") ?? "").trim();
+      const bust = url.searchParams.get("bust") === "1" ? `&cb=${Date.now()}` : "";
       const hosts: Array<{ host: string; base: string }> = [
         { host: "primary", base: "https://api.geckoterminal.com/api/v2" },
         { host: "alt-public", base: GECKO_ALT_BASE_URL },
@@ -7386,14 +7394,18 @@ const worker = {
           const paths: Record<string, unknown> = {};
           await Promise.all(
             variants.map(async (v) => {
-              paths[v] = await probe(h.base, "/networks/solana/new_pools?page=1", v);
+              paths[v] = await probe(
+                h.base,
+                `/networks/solana/new_pools?page=1${bust}`,
+                v,
+              );
             }),
           );
           const row: Record<string, unknown> = { host: h.host, base: h.base, newPools: paths };
           if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
             row.snapshot = await probe(
               h.base,
-              `/networks/solana/tokens/${mint}`,
+              `/networks/solana/tokens/${mint}${bust}`,
               "configured",
             );
           }
@@ -7405,6 +7417,7 @@ const worker = {
         keyed: key !== null,
         plan,
         configuredHeader,
+        busted: bust !== "",
         matrix,
       });
     }
