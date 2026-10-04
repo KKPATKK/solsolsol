@@ -105,7 +105,14 @@ import {
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { MeteoraClient } from "./meteora";
-import { GeckoTerminalClient, GECKO_ALT_BASE_URL, GECKO_CACHE_TTL_S, GECKO_USER_AGENT } from "./geckoterminal";
+import {
+  GeckoTerminalClient,
+  GECKO_ALT_BASE_URL,
+  GECKO_CACHE_TTL_S,
+  GECKO_USER_AGENT,
+  COINGECKO_DEMO_HEADER,
+  COINGECKO_PRO_HEADER,
+} from "./geckoterminal";
 // Heal-path counters: module scope in the tracker, read here so /health can
 // answer "did the self-heal reuse the push-time baseline, and how often".
 import {
@@ -7280,6 +7287,126 @@ const worker = {
         probe(true, true),
       ]);
       return Response.json({ target, userAgent: GECKO_USER_AGENT, ua, noUa, uaCached });
+    }
+
+    // KEYED-HOST PROBE (2026-10-04): which (host, key-header) pairing the
+    // DEPLOYED CoinGecko key is actually accepted on.
+    //
+    // WHY: /health can say the primary 429-walls while the alt answered 401,
+    // but it cannot say WHICH refusal the key itself caused. The client sends
+    // exactly ONE header — x-cg-demo-api-key or x-cg-pro-api-key, chosen by
+    // COINGECKO_API_PLAN (`demo` by default) — so a plan/key mismatch is
+    // invisible from the counters: a demo key sent as pro (or the reverse) is
+    // refused at every host while `summary.gecko` only shows the refusal. This
+    // route replays the deployed key through every Host × Header pair, so the
+    // pair answering 200 names the key's real plan — and the pair the client
+    // SHOULD be sending. It also echoes the configured plan/header NAMES (never
+    // the key itself), which is how a dashboard-only COINGECKO_API_PLAN var is
+    // confirmed from the outside.
+    //
+    // `?mint=<address>` adds the post-push snapshot path (the tracker's leg),
+    // because a path can be refused differently from new_pools — the 401 this
+    // route was built for was read off whichever leg asked last.
+    //
+    // Read-only: raw fetches, no client counters, no backoff state, no cache —
+    // the same contract as /debug/gecko-alt. Keyed variants spend a few calls
+    // of the key's quota.
+    if (url.pathname === "/debug/gecko-key") {
+      const key = cfg?.coingeckoApiKey ?? null;
+      const plan = cfg?.coingeckoApiPlan ?? "demo";
+      const configuredHeader =
+        plan === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
+      const mint = (url.searchParams.get("mint") ?? "").trim();
+      const hosts: Array<{ host: string; base: string }> = [
+        { host: "primary", base: "https://api.geckoterminal.com/api/v2" },
+        { host: "alt-public", base: GECKO_ALT_BASE_URL },
+        { host: "alt-pro", base: "https://pro-api.coingecko.com/api/v3/onchain" },
+      ];
+      // The header each variant sends: `configured` is what the client sends
+      // today, `demo`/`pro` isolate the header question, `keyless` is the
+      // baseline (a clean keyless reading proves the host serves the path at
+      // all — the 2026-10-04 storm reads keyless as 429, never as 401).
+      const headerFor = (label: string): string | null => {
+        if (label === "keyless") return null;
+        if (label === "configured") return configuredHeader;
+        return label === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
+      };
+      const probe = async (base: string, path: string, label: string) => {
+        const name = headerFor(label);
+        const headers: Record<string, string> = {
+          Accept: "application/json",
+          "User-Agent": GECKO_USER_AGENT,
+        };
+        if (name !== null && key !== null) headers[name] = key;
+        try {
+          const res = await fetch(`${base}${path}`, {
+            headers,
+            signal: AbortSignal.timeout(10_000),
+          });
+          const text = await res.text();
+          let count: number | null = null;
+          let apiError: unknown = null;
+          try {
+            const parsed = JSON.parse(text) as {
+              data?: unknown[];
+              status?: unknown;
+              title?: unknown;
+            };
+            count = Array.isArray(parsed?.data) ? parsed.data.length : null;
+            const st = parsed?.status;
+            apiError =
+              st !== null && typeof st === "object"
+                ? {
+                    errorCode: (st as { error_code?: unknown }).error_code ?? null,
+                    errorMessage:
+                      (st as { error_message?: unknown }).error_message ?? null,
+                  }
+                : (st ?? parsed?.title ?? null);
+          } catch {
+            // non-JSON body
+          }
+          return {
+            header: name,
+            status: res.status,
+            ok: res.ok,
+            cacheStatus: res.headers.get("cf-cache-status"),
+            count,
+            apiError,
+          };
+        } catch (err) {
+          return {
+            header: name,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      };
+      const variants = ["configured", "demo", "pro", "keyless"];
+      const matrix: Array<Record<string, unknown>> = await Promise.all(
+        hosts.map(async (h) => {
+          const paths: Record<string, unknown> = {};
+          await Promise.all(
+            variants.map(async (v) => {
+              paths[v] = await probe(h.base, "/networks/solana/new_pools?page=1", v);
+            }),
+          );
+          const row: Record<string, unknown> = { host: h.host, base: h.base, newPools: paths };
+          if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+            row.snapshot = await probe(
+              h.base,
+              `/networks/solana/tokens/${mint}`,
+              "configured",
+            );
+          }
+          return row;
+        }),
+      );
+      return Response.json({
+        ok: true,
+        keyed: key !== null,
+        plan,
+        configuredHeader,
+        matrix,
+      });
     }
 
     // Discovery-source probe: every candidate "new pools / new coins" feed is
