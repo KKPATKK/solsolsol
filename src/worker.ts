@@ -7325,29 +7325,68 @@ const worker = {
         plan === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
       const mint = (url.searchParams.get("mint") ?? "").trim();
       const bust = url.searchParams.get("bust") === "1" ? `&cb=${Date.now()}` : "";
+      // `?seq=1` serialises the requests with a gap instead of firing them in
+      // parallel. WHY: the first busted run sent 4 parallel probes per host and
+      // EVERY primary variant came back 429 — which its own keyless reading
+      // already produces, so a self-inflicted burst would be indistinguishable
+      // from the wall the feed actually hits. `?only=demo` narrows the set the
+      // same way when one pairing is the question.
+      const seq = url.searchParams.get("seq") === "1";
+      const allVariants = ["configured", "demo", "pro", "keyless", "param-demo", "param-pro"];
+      const only = (url.searchParams.get("only") ?? "")
+        .split(",")
+        .map((v) => v.trim())
+        .filter((v) => allVariants.includes(v));
+      const variants = only.length > 0 ? only : allVariants;
       const hosts: Array<{ host: string; base: string }> = [
         { host: "primary", base: "https://api.geckoterminal.com/api/v2" },
         { host: "alt-public", base: GECKO_ALT_BASE_URL },
         { host: "alt-pro", base: "https://pro-api.coingecko.com/api/v3/onchain" },
       ];
+      // Certainly-not-secret shape facts about the stored key: a mangled secret
+      // (quotes, an embedded newline/space, a truncated paste) is refused with
+      // the same 401 as a valid-but-wrong-plan key, and the two need different
+      // fixes. Booleans + lengths only — no key material.
+      const keyShape = key === null
+        ? null
+        : {
+            length: key.length,
+            trimmedLength: key.trim().length,
+            startsWithCG: key.startsWith("CG-"),
+            alnumDashOnly: /^[A-Za-z0-9-]+$/.test(key),
+          };
       // The header each variant sends: `configured` is what the client sends
       // today, `demo`/`pro` isolate the header question, `keyless` is the
       // baseline (a clean keyless reading proves the host serves the path at
-      // all — the 2026-10-04 storm reads keyless as 429, never as 401).
+      // all — the 2026-10-04 storm reads keyless as 429, never as 401), and the
+      // `param-*` pair asks whether CoinGecko wants the key in the QUERY for
+      // this path (`?x_cg_demo_api_key=`) instead of a header — the docs' other
+      // supported form, untested until now.
       const headerFor = (label: string): string | null => {
-        if (label === "keyless") return null;
+        if (label === "keyless" || label.startsWith("param-")) return null;
         if (label === "configured") return configuredHeader;
         return label === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
       };
+      const paramFor = (label: string): string | null =>
+        label === "param-demo"
+          ? "x_cg_demo_api_key"
+          : label === "param-pro"
+            ? "x_cg_pro_api_key"
+            : null;
       const probe = async (base: string, path: string, label: string) => {
         const name = headerFor(label);
+        const param = paramFor(label);
         const headers: Record<string, string> = {
           Accept: "application/json",
           "User-Agent": GECKO_USER_AGENT,
         };
         if (name !== null && key !== null) headers[name] = key;
+        const target =
+          param !== null && key !== null
+            ? `${base}${path}${path.includes("?") ? "&" : "?"}${param}=${encodeURIComponent(key)}`
+            : `${base}${path}`;
         try {
-          const res = await fetch(`${base}${path}`, {
+          const res = await fetch(target, {
             headers,
             signal: AbortSignal.timeout(10_000),
           });
@@ -7375,6 +7414,7 @@ const worker = {
           }
           return {
             header: name,
+            query: param,
             status: res.status,
             ok: res.ok,
             cacheStatus: res.headers.get("cf-cache-status"),
@@ -7384,40 +7424,52 @@ const worker = {
         } catch (err) {
           return {
             header: name,
+            query: param,
             error: err instanceof Error ? err.message : String(err),
           };
         }
       };
-      const variants = ["configured", "demo", "pro", "keyless"];
-      const matrix: Array<Record<string, unknown>> = await Promise.all(
-        hosts.map(async (h) => {
-          const paths: Record<string, unknown> = {};
-          await Promise.all(
-            variants.map(async (v) => {
-              paths[v] = await probe(
-                h.base,
-                `/networks/solana/new_pools?page=1${bust}`,
-                v,
-              );
-            }),
-          );
-          const row: Record<string, unknown> = { host: h.host, base: h.base, newPools: paths };
-          if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
-            row.snapshot = await probe(
-              h.base,
-              `/networks/solana/tokens/${mint}${bust}`,
-              "configured",
-            );
+      const run = async (base: string, path: string): Promise<Record<string, unknown>> => {
+        const out: Record<string, unknown> = {};
+        if (seq) {
+          for (const v of variants) {
+            out[v] = await probe(base, path, v);
+            await new Promise((r) => setTimeout(r, 1_200));
           }
-          return row;
-        }),
-      );
+          return out;
+        }
+        await Promise.all(
+          variants.map(async (v) => {
+            out[v] = await probe(base, path, v);
+          }),
+        );
+        return out;
+      };
+      const matrix: Array<Record<string, unknown>> = [];
+      for (const h of hosts) {
+        const row: Record<string, unknown> = {
+          host: h.host,
+          base: h.base,
+          newPools: await run(h.base, `/networks/solana/new_pools?page=1${bust}`),
+        };
+        if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+          row.snapshot = await probe(
+            h.base,
+            `/networks/solana/tokens/${mint}${bust}`,
+            "configured",
+          );
+        }
+        matrix.push(row);
+      }
       return Response.json({
         ok: true,
         keyed: key !== null,
         plan,
         configuredHeader,
         busted: bust !== "",
+        sequential: seq,
+        variants,
+        keyShape,
         matrix,
       });
     }
