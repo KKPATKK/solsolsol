@@ -646,16 +646,20 @@ export class GeckoTerminalClient {
    * JSON on success, null on rate-limit (escalating the backoff window) or any
    * other failure — callers degrade to [] without throwing.
    *
-   * ONE FALLBACK HOST, ONLY WHILE THE PRIMARY IS PAUSED (2026-09-21): the
-   * limiter is an IP quota on GeckoTerminal's side, and a poisoned quota never
-   * heals through the edge cache (a MISS reaches the origin, the origin 429s,
+   * ONE FALLBACK HOST, ON A PRIMARY REFUSAL OR WHILE THE PRIMARY IS PAUSED
+   * (2026-09-21; the same-call fall-through added 2026-10-04): the limiter is
+   * an IP quota on GeckoTerminal's side, and a poisoned quota never heals
+   * through the edge cache (a MISS reaches the origin, the origin 429s,
    * nothing is cached for the next request to HIT). CoinGecko's Onchain API
-   * serves the same `new_pools` payload from a different hostname, so while
-   * the primary is paused an eligible path is asked there instead. The
-   * primary's backoff is NOT cleared by an alternate success — its escalation
-   * is a fact about the primary — and the alternate has its OWN pause that is
-   * armed only by its own 429, so the cost when both are blocked is one probe
-   * per alternate window, not one per tick.
+   * serves the same `new_pools` payload from a different hostname, so an
+   * eligible path is asked there instead: immediately, when THIS call's own
+   * primary attempt came back refused (see get — the arrival that used to
+   * never happen, because a refusal's retry is aimed at the pause end), or
+   * for a call that arrives while the primary is still paused, on the
+   * alternate directly. The primary's backoff is NOT cleared by an alternate
+   * success — its escalation is a fact about the primary — and the alternate
+   * has its OWN pause that is armed only by its own 429, so the cost when
+   * both are blocked is one probe per alternate window, not one per tick.
    *
    * KEYED MODE (see AppConfig.coingeckoApiKey): with a CoinGecko key every
    * request carries it, so the quota is the key's rather than the shared
@@ -680,7 +684,32 @@ export class GeckoTerminalClient {
       this.altAttempts += 1;
       return this.attempt(this.altBaseUrl, path, true, geckoCacheTtlS(path));
     }
-    return this.attempt(BASE_URL, path, false, geckoCacheTtlS(path));
+    const primary = await this.attempt(BASE_URL, path, false, geckoCacheTtlS(path));
+    if (primary !== null) return primary;
+    // A REFUSED PRIMARY FALLS THROUGH TO THE MIRROR IN THIS SAME CALL
+    // (2026-10-04). WHY: the alternate used to be asked only by a LATER call
+    // that happened while the primary was still paused — but a refusal's retry
+    // is aimed AT the pause end (see Scanner.rearmGeckoDiscovery /
+    // geckoDiscoveryRetryStamp), and the keyed pause (60s) is far shorter than
+    // the 5-minute cadence gate, so the retry tick always lands AFTER the
+    // pause: every retry went back to the primary, and a working mirror — the
+    // whole point of the key — was never asked. Measured after the 2026-10-04
+    // key fix: the demo key answers 200 on the alternate host at the origin
+    // while `summary.gecko` showed `altAttempts 0` and `geo 0` for the whole
+    // post-deploy window. Falling through costs one extra request ONLY when
+    // the primary refused anyway (a non-429 hard refusal arms no pause, so it
+    // does not trigger this), and the alternate's own pause — armed by its own
+    // 429 or hard refusal — keeps a dead mirror to one probe per window,
+    // never one per tick.
+    if (
+      !this.rateLimited() ||
+      Date.now() < this.altRateLimitedUntil ||
+      !geckoAltEligible(path, this.apiKey !== null)
+    ) {
+      return null;
+    }
+    this.altAttempts += 1;
+    return this.attempt(this.altBaseUrl, path, true, geckoCacheTtlS(path));
   }
 
   /**

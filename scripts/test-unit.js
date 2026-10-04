@@ -3463,9 +3463,17 @@ async function main() {
         first.backoffUntil - t0 >= GECKO_RATE_LIMIT_BACKOFF_MS * 0.85,
         `the first window is still the 5-minute base (got ${first.backoffUntil - t0}ms)`,
       );
-      // Backed off: neither endpoint may spend a request.
+      // Backed off: neither endpoint may spend a request. The refused
+      // new_pools call cost TWO — the primary's 429 and the mirror probe the
+      // same-call fall-through spent (see the dedicated test) — and that probe
+      // 429'd too, so the mirror is paused as well.
       await client.fetchTrendingPools(20);
-      assert.equal(client.stats().requests, 1, "a backed-off call must not spend a request");
+      assert.equal(client.stats().requests, 2, "a backed-off call must not spend a request");
+      assert.equal(
+        client.stats().alt429,
+        1,
+        "the fall-through's refusal is the mirror's, never the primary's",
+      );
       // Expire the window and 429 again: the next window is longer.
       client.rateLimitedUntil = Date.now() - 1;
       await client.fetchNewPools(1);
@@ -3602,6 +3610,10 @@ async function main() {
     assert.ok(
       scannerSrc.includes("awaitthis.rearmGeckoDiscovery(Date.now())"),
       "the gecko closure must re-arm after its page loop, or a refusal still burns the interval",
+    );
+    assert.ok(
+      scannerSrc.includes("if(p.length===0){"),
+      "and ONLY an empty tick re-arms: a delivered window (mirror included) keeps the full interval",
     );
     assert.ok(
       scannerSrc.includes("this.gecko.pauseEndsAt(now)"),
@@ -13318,6 +13330,11 @@ async function main() {
       assert.equal((await client.fetchNewPools(1)).length, 0);
       const primaryPauseUntil = client.rateLimitedUntil;
       assert.ok(primaryPauseUntil > Date.now(), "the first 429 pauses the primary");
+      // The refusal's OWN call already probed the mirror (see the same-call
+      // fall-through), and THAT probe 429'd — so the mirror carries its own
+      // window now. Release it to isolate the paused-branch route this test
+      // pins.
+      client.altRateLimitedUntil = Date.now() - 1;
       // The primary stays poisoned; the alternate host answers new_pools.
       global.fetch = async (url) => {
         calls.push(String(url));
@@ -13331,7 +13348,7 @@ async function main() {
       assert.ok(calls[beforeAlt].startsWith("https://api.coingecko.com/api/v3/onchain"));
       const served = geckoFeedStats();
       assert.equal(served.lastHost, "alt");
-      assert.equal(served.altAttempts, 1);
+      assert.equal(served.altAttempts, 2, "the fall-through's probe plus this one");
       assert.equal(served.altOk, 1);
       assert.equal(client.rateLimitedUntil, primaryPauseUntil, "an alternate success does not clear the primary's pause");
       // trending_pools is 401 keyless on the alternate host → no request at all.
@@ -13351,7 +13368,7 @@ async function main() {
       assert.equal(calls.length, callsAfterAlt429, "the alternate's 429 stops the probing");
       assert.ok(client.altRateLimitedUntil > Date.now(), "the fallback has its own pause");
       const poisoned = geckoFeedStats();
-      assert.equal(poisoned.alt429, 1);
+      assert.equal(poisoned.alt429, 2, "the fall-through's probe plus this one");
       assert.equal(poisoned.http429, 1, "the fallback's 429 is not counted against the primary");
       // A HARD REFUSAL (the live 403 from the worker's own egress) must pause
       // the fallback exactly like a 429 does — otherwise it spends one request
@@ -13372,6 +13389,66 @@ async function main() {
       assert.equal(refused.altLastStatus, 403);
       assert.equal(refused.altFailures, 2, "a 429 and a refusal share one escalation");
       assert.equal(refused.http429, 1, "a refusal is never counted as a primary 429");
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("GeckoTerminalClient: a refused primary falls through to the mirror IN THE SAME CALL", async () => {
+    // The keyed discovery leg's whole recovery path (2026-10-04): the keyed
+    // pause (60s) is far shorter than the 5-minute cadence gate, so the retry
+    // tick always lands AFTER the pause — no later "paused" call ever comes,
+    // and the working mirror was never asked (live after the key fix:
+    // `altAttempts 0`, `geo 0`, while the same key answered 200 on the
+    // alternate host at the origin).
+    const calls = [];
+    const origFetch = global.fetch;
+    const okBody = JSON.stringify({ data: [{ id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump", type: "pool", attributes: { pool_created_at: "2026-08-15T16:21:21Z" }, relationships: { base_token: { data: { id: "solana_5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump" } } } }] });
+    try {
+      const client = new GeckoTerminalClient({
+        geckoterminalRequestIntervalMs: 0,
+        coingeckoApiKey: "CG-test",
+      });
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return String(url).startsWith("https://api.geckoterminal.com/")
+          ? new Response(JSON.stringify({ status: { error_code: 429 } }), { status: 429 })
+          : new Response(okBody, { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      const pools = await client.fetchNewPools(1);
+      assert.equal(pools.length, 1, "the mirror delivered inside the refusal's own call");
+      assert.equal(calls.length, 2, "exactly two requests: the refused primary, then the mirror");
+      assert.ok(calls[0].startsWith("https://api.geckoterminal.com/"), "the free host is still tried first");
+      assert.ok(
+        calls[1].startsWith("https://api.coingecko.com/api/v3/onchain"),
+        "and the refusal is what sends the very next request to the mirror",
+      );
+      const served = geckoFeedStats();
+      assert.equal(served.lastHost, "alt");
+      assert.equal(served.altAttempts, 1);
+      assert.equal(served.altOk, 1);
+      assert.equal(served.http429, 1, "the primary's refusal is still counted against the primary");
+      assert.ok(served.lastOkAt > 0);
+      assert.ok(client.rateLimitedUntil > Date.now(), "a mirror success does not clear the primary's pause");
+      // The next call arrives while the primary is paused → straight to the
+      // mirror, with no second primary attempt.
+      let before = calls.length;
+      assert.equal((await client.fetchNewPools(1)).length, 1);
+      assert.equal(calls.length, before + 1);
+      assert.ok(calls[before].startsWith("https://api.coingecko.com/api/v3/onchain"));
+      // A mirror that refuses stops being probed: its own window bounds the
+      // fall-through to one probe, never one per call.
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return new Response("{\"status\":{\"error_code\":429}}", { status: 429 });
+      };
+      before = calls.length;
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal(calls.length, before + 1, "the mirror is probed once");
+      assert.equal(geckoFeedStats().alt429, 1);
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal((await client.fetchNewPools(1)).length, 0);
+      assert.equal(calls.length, before + 1, "...and its refusal stops the probing");
     } finally {
       global.fetch = origFetch;
     }

@@ -4910,8 +4910,21 @@ export class Scanner {
               // nothing this can do is able to discard a delivery; and AWAITED,
               // so the retry rides this tick's ONE front write instead of
               // landing after it.
-              const geckoRetryAt = await this.rearmGeckoDiscovery(Date.now());
-              if (geckoRetryAt !== null) diag.geoRetryAt = geckoRetryAt;
+              //
+              // ONLY A TICK THAT CAME BACK EMPTY RE-ARMS (2026-10-04). Since
+              // the client falls through to the mirror in the refusal's own
+              // call (see GeckoTerminalClient.get), a DELIVERY can coexist
+              // with a PAUSED primary — and re-arming onto that pause's 60s
+              // end would turn every delivered window into a per-minute fetch,
+              // 5x the key's paid cadence (~43K calls/month against the demo
+              // plan's 10K quota). The short wait exists for refusals; a
+              // delivery already has its answer, so the gate keeps the full
+              // interval. An empty 200 page leaves the client unpaused and is
+              // a no-op here either way (see rearmGeckoDiscovery).
+              if (p.length === 0) {
+                const geckoRetryAt = await this.rearmGeckoDiscovery(Date.now());
+                if (geckoRetryAt !== null) diag.geoRetryAt = geckoRetryAt;
+              }
             })
             .catch((err: unknown) => {
               console.error(
