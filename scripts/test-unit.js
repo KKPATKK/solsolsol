@@ -17,7 +17,7 @@ const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("..
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
-const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS } = require("../dist/geckoterminal.js");
+const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
@@ -13408,6 +13408,29 @@ async function main() {
       await demo.fetchTrendingPools(20);
       assert.equal(seen.length, 1);
       assert.ok(seen[0].url.startsWith("https://api.coingecko.com/api/v3/onchain"), "a keyed mirror answers on the other host");
+      // THE MIRROR FOLLOWS THE PLAN (2026-10-04): each host takes only its own
+      // key header, so a Pro deployment whose mirror stayed public could never
+      // be served by it. geckoAltBaseUrl is the pairing; this pins that the
+      // client actually asks the host its header is valid on.
+      assert.equal(geckoAltBaseUrl("demo"), GECKO_ALT_BASE_URL);
+      assert.equal(geckoAltBaseUrl("pro"), GECKO_PRO_ALT_BASE_URL);
+      assert.equal(
+        GECKO_PRO_ALT_BASE_URL,
+        "https://pro-api.coingecko.com/api/v3/onchain",
+      );
+      pro.rateLimitedUntil = Date.now() + 60_000;
+      seen.length = 0;
+      await pro.fetchNewPools(1);
+      assert.equal(seen.length, 1);
+      assert.ok(
+        seen[0].url.startsWith("https://pro-api.coingecko.com/api/v3/onchain"),
+        "a Pro plan mirrors on the host that accepts its header",
+      );
+      assert.equal(
+        seen[0].headers["x-cg-pro-api-key"],
+        "CG-test",
+        "...with the Pro header, on the host that takes it",
+      );
     } finally {
       global.fetch = origFetch;
     }

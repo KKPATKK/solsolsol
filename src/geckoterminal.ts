@@ -121,6 +121,19 @@ export const GECKO_SNAPSHOT_CACHE_TTL_S = 60;
 export const GECKO_ALT_BASE_URL = "https://api.coingecko.com/api/v3/onchain";
 /** Paths the alternate host serves without an API key (see GECKO_ALT_BASE_URL). */
 const ALT_ELIGIBLE_PREFIX = "/networks/solana/new_pools";
+/** Mirror host for a PRO plan key (see geckoAltBaseUrl). */
+export const GECKO_PRO_ALT_BASE_URL = "https://pro-api.coingecko.com/api/v3/onchain";
+/**
+ * Which host the alternate fallback asks, by plan (pure — unit-tested). The
+ * header the client sends and the host it sends it to must agree: CoinGecko's
+ * public onchain host takes only a demo key and the pro host only a pro key
+ * (measured 2026-10-04 — see /debug/gecko-key), so a plan=pro deployment that
+ * kept the public mirror could never be served by it. That mismatch is
+ * invisible in /health: both hosts just refuse, and the note shows refusals.
+ */
+export function geckoAltBaseUrl(plan: "demo" | "pro"): string {
+  return plan === "pro" ? GECKO_PRO_ALT_BASE_URL : GECKO_ALT_BASE_URL;
+}
 /**
  * Descriptive User-Agent both hosts require.
  *
@@ -520,6 +533,8 @@ export class GeckoTerminalClient {
   private last429At = 0;
   private lastOkAt = 0;
   private backoffMs = 0;
+  /** The mirror host this deployment's plan uses (see geckoAltBaseUrl). */
+  private readonly altBaseUrl: string;
   /** See GeckoFeedStats.lastHost / alt* — the fallback host's own state. */
   private lastHost: "primary" | "alt" | null = null;
   private altAttempts = 0;
@@ -537,6 +552,8 @@ export class GeckoTerminalClient {
     this.apiKey = config.coingeckoApiKey ?? null;
     this.apiKeyHeader =
       config.coingeckoApiPlan === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
+    // The header and the mirror host move together (see geckoAltBaseUrl).
+    this.altBaseUrl = geckoAltBaseUrl(config.coingeckoApiPlan);
     // Publish this client's feed state (see geckoFeedStats).
     lastClient = this;
   }
@@ -661,7 +678,7 @@ export class GeckoTerminalClient {
         return null;
       }
       this.altAttempts += 1;
-      return this.attempt(GECKO_ALT_BASE_URL, path, true, geckoCacheTtlS(path));
+      return this.attempt(this.altBaseUrl, path, true, geckoCacheTtlS(path));
     }
     return this.attempt(BASE_URL, path, false, geckoCacheTtlS(path));
   }

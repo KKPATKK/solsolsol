@@ -252,8 +252,10 @@ export interface AppConfig {
   coingeckoApiKey?: string;
   /**
    * Which CoinGecko plan `coingeckoApiKey` belongs to (COINGECKO_API_PLAN,
-   * "demo" by default, "pro" for a paid key). It only selects the header
-   * name (`x-cg-demo-api-key` / `x-cg-pro-api-key`).
+   * "demo" by default, "pro" for a paid key). It selects the header name
+   * (`x-cg-demo-api-key` / `x-cg-pro-api-key`) AND the alternate-host mirror
+   * that header is valid on (see geckoAltBaseUrl) — the two must agree, so a
+   * key whose plan is entered wrong is refused everywhere.
    */
   coingeckoApiPlan: "demo" | "pro";
   /**
