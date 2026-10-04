@@ -519,9 +519,9 @@ async function main() {
       null,
       null,
     );
-    // Fresh objects per call: matchCoins WRITES into all three (fails, rejects,
-    // agedEval), and a shared one would make the second reading differ from the
-    // first for reasons that are not CPU.
+    // Fresh objects per call: matchCoins WRITES into all four (fails, rejects,
+    // agedEval, staleReadings), and a shared one would make the second reading
+    // differ from the first for reasons that are not CPU.
     const runEval = (list) => {
       // Kept in lockstep with ScanSummary["fails"] in src/scanner.ts: matchCoins
       // increments these by key, so a missing key here would silently record
@@ -533,6 +533,7 @@ async function main() {
       };
       const rejects = [];
       const agedEval = { count: 0 };
+      const staleReadings = { count: 0 };
       const out = scanner.matchCoins(
         list,
         pairsByToken,
@@ -541,6 +542,7 @@ async function main() {
         fails,
         rejects,
         agedEval,
+        staleReadings,
         // REJECT_LOG_MAX is 20 in src/scanner.ts (the comment around it still
         // says 50). The split only decides WHICH coins may log a reason — the
         // per-coin work runs either way — so the CPU reading does not depend on

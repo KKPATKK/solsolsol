@@ -63,7 +63,7 @@ MISS 收到（順手寫入 edge，TTL 120s）→ 11:51:3x 由 edge HIT 拎到（
 
 ### 3.2 太舊就唔准用（`PAIR_CONTENT_MAX_AGE_MS = 180_000`）
 
-一個數，兩個用法：
+一個數，三個用法（第三個係 2026-10-04 延伸，見 §7）：
 
 1. **唔准再派**（`dexscreener.ts`）：in-memory cache hit 但內容 >180s =
    MISS，照去問 wire。呢個係安全嘅，因為 edge 條目喺內容去到 180s 前必定
@@ -76,6 +76,10 @@ MISS 收到（順手寫入 edge，TTL 120s）→ 11:51:3x 由 edge HIT 拎到（
 
    `PUSH_WATCH_MAX_READING_AGE_MS` 直接 = `PAIR_CONTENT_MAX_AGE_MS`（一個數，
    兩個 module 唔會講兩套）。
+3. **唔准判（scan 前端）**（`scanner.ts`）：`matchCoins` 收到嘅 pair 內容
+   >180s → 成個 coin 唔判：唔跑任何 gate、唔 log reject（reject ring 係記錄
+   「判過嘅嘢」，呢隻 coin 未判過）、fails 唔動，coin 留喺 pool 下個 rotation
+   用新讀數重判。`SCAN_MAX_READING_AGE_MS = PAIR_CONTENT_MAX_AGE_MS`。
 
 - **unknown 唔算 stale**（fail-open）：fixtures／synthetic／Jupiter・Gecko legs
   冇 `contentAt` → 照舊判。呢個係「missing data never judges」嘅方向：只有
@@ -110,8 +114,9 @@ MISS 收到（順手寫入 edge，TTL 120s）→ 11:51:3x 由 edge HIT 拎到（
 
 - `contentAt` 只覆蓋 DexScreener legs（Jupiter／Gecko 係 live fetch，冇 cache
   分層，維持 unknown）。
-- 前端 scan gates 用嘅 pair 一樣會經同一條 cache 鏈，但 gates 嘅門檻（mcap／
-  LP）本身係遲滯型，未見同類事故；今次只收 tracker 卡片嗰條路。
+- 前端 scan gates（2026-10-04 延伸，見 §7）：`matchCoins` 嘅所有 gate 而家
+  一樣拒判 >180s 內容嘅讀數。DexScreener 條 pair lane 本身會 re-ask 過期
+  hit，所以健康 tick 呢個 counter 預期係 0。
 - 若上游持續唔更新 cache，>`bound` 嘅 copy 會被拒直到真係拎到新數 —— 方向係
   fail-quiet（延遲，唔係遺失）：所有 stage marks 係 persistent，跨過嘅檻會喺
   下一個新鮮讀數一次過補發。
@@ -129,3 +134,25 @@ MISS 收到（順手寫入 edge，TTL 120s）→ 11:51:3x 由 edge HIT 拎到（
   （content clock 會 fallback 去 `date`）。
 - 未觀察到：live 上真嘅 `stale N` 拒判（要等一個 >180s 內容嘅讀數）。守衛由
   3 個 unit test ＋ negative control（拔守衛即出卡）覆蓋。
+
+## 7. 延伸：scan 前端 gates（2026-10-04）
+
+- **做咗咩**：`src/scanner.ts` 加 `SCAN_MAX_READING_AGE_MS =
+  PAIR_CONTENT_MAX_AGE_MS`；`matchCoins` 攞到 pair 之後即刻度
+  `pairContentAgeMs(pair, now)`，>bound 就 `continue`：唔跑 gate、唔 log
+  reject、唔動 fails，coin 留喺 re-evaluation pool 下個 rotation 重判。
+  Counter `staleReadings` 上 `ScanSummary`（`/health` 嘅 summary 直接讀到）。
+- **點解要 gate 喺決策點**：fetch lane 嘅 re-ask 係「一個 carrier 嘅屬性」；
+  `matchCoins` 係判決本身，一個 reject 嘅代價同遲一張卡唔同——reject 綁到
+  下個 rotation，而且係 scan 唯一冇得即刻 undo 嘅嘢。
+- **Unknown 照判**（無 `contentAt`：Jupiter／Gecko legs、fixtures）——同
+  pushwatch 一樣 fail-open。
+- **測試**：`Scanner.matchCoins: a stale reading is never judged, and the skip
+  is named` —— fresh 同 stale 用同一 fixture 淨係換鐘：stale → 0 candidates、
+  `staleReadings 1`、`agedEval 0`、冇 reject、fails 全 0；邊界 ±1s；undated
+  照判；stale 兼本身會 fail mcap 嘅形狀一樣唔 log。**Negative control**：喺
+  dist 撬開守衛 → 同一條 4 分鐘讀數即刻 qualify（candidates 1）＋ stale 兼
+  fail 嘅形狀即刻出 reject（1）——證實守衛正係 suppressor。
+  `491 passed / 0 failed`。
+- **未做**：pool discovery 嘅 prune 用 `token_stats.last_liquidity_usd`（recorded
+  series，唔係 live pair 讀數），維持唔收。

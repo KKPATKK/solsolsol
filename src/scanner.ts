@@ -15,7 +15,9 @@ import {
   BOOST_FEED_ATTEMPT_MS,
   DEX_ADAPTIVE_MAX_MS,
   DexScreenerClient,
+  PAIR_CONTENT_MAX_AGE_MS,
   consumeListCacheDelta,
+  pairContentAgeMs,
   parseProfileFeedSnapshot,
   peekListCacheDelta,
   DEX_LIST_CACHE_HITS_KEY,
@@ -1993,6 +1995,18 @@ export interface ScanSummary {
   /** Evaluations that passed the age gate (age ≥ min) this scan — proves
    * in-window coins are actually being evaluated, not silently skipped. */
   agedEval: number;
+  /**
+   * Feed+pool coins whose pair reading this scan REFUSED to judge because its
+   * CONTENT was older than SCAN_MAX_READING_AGE_MS (see matchCoins — the DUST
+   * stale readings, docs/stale-readings-2026-10-03.md). 0 on a healthy tick:
+   * the fetch lane already re-asks over-age cache hits, so this is the
+   * decision-point rule that keeps ANY carrier from feeding a minutes-old
+   * number to the gates. A coin skipped here is untouched — no rejection, no
+   * fail counter, no stale pin — and re-evaluated next rotation with a fresh
+   * reading, which is why `agedEval` does not move either: nothing was
+   * judged, and the two readings must never be confused.
+   */
+  staleReadings?: number;
   candidates: number;
   pushed: number;
   /** Post-push tracker pass result: "ok:<checked>/<alerted>" or "err:<msg>". */
@@ -2613,6 +2627,32 @@ function describePushError(err: unknown): PushErrorInfo {
  * stamp only when a caller provides it.
  */
 export type PassRelayTag = "inner" | "failed" | "skipped";
+
+/**
+ * The oldest pair CONTENT the scan's front gates may judge, in ms — the same
+ * bound the tracker uses (PAIR_CONTENT_MAX_AGE_MS in dexscreener.ts: one
+ * constant for every module that judges a pair reading, so the scan and the
+ * cards can never disagree about what "stale" means).
+ *
+ * WHY IT EXISTS (2026-10-04, follow-up to the DUST stale readings —
+ * docs/stale-readings-2026-10-03.md): matchCoins decides liquidity, 24h
+ * volume, market cap, age, momentum and valuation from ONE pair reading, and
+ * the rejection it hands out is binding for a rotation — a healthy coin held
+ * out of its window (or a dead one qualified off a pump that already
+ * reversed) is the same damage the stale DUST cards did to the push-watch
+ * rules, one decision earlier. The fetch lane already re-asks an over-age
+ * in-memory hit (see fetchPairsForTokens), but that is a property of ONE
+ * carrier; this is the DECISION POINT, so the rule is enforced here too — on
+ * the reading actually being judged, whatever carried it.
+ *
+ * A reading past the bound is NOT judged: no gate runs, no rejection is
+ * logged, the counters stay put, and the coin keeps its pool slot for the
+ * next rotation (fail-quiet — a delay, never a wrong rejection; a wrong
+ * rejection is the one outcome a scan cannot undo before the next tick).
+ * Undated readings (no contentAt: the Jupiter/Gecko legs, fixtures) are never
+ * refused — only a reading we can actually date is ever refused for its age.
+ */
+export const SCAN_MAX_READING_AGE_MS = PAIR_CONTENT_MAX_AGE_MS;
 
 /**
  * How a tracker pass was started (see Scanner.runTrackerPass, and
@@ -4387,6 +4427,7 @@ export class Scanner {
       backfill: 0,
       pool: 0,
       agedEval: 0,
+      staleReadings: 0,
       candidates: 0,
       pushed: 0,
       fails: {
@@ -5782,6 +5823,11 @@ export class Scanner {
       }
 
       const agedEval = { count: 0 };
+      // Readings this evaluation refused as stale (see
+      // SCAN_MAX_READING_AGE_MS): counted apart from the gates' own `fails`
+      // so "the gates judged nothing" and "the gates rejected everything"
+      // never read alike (published as diag.staleReadings below).
+      const staleReadings = { count: 0 };
       // Owed coins this evaluation is about to judge (see noteDeferredCoin):
       // read as a diff of the ledger's cumulative counter, so a rebuilt
       // scanner — whose counters restart at zero — cannot skew it.
@@ -5794,12 +5840,14 @@ export class Scanner {
         diag.fails,
         diag.rejects,
         agedEval,
+        staleReadings,
         // Feed coins log into the leftover slots only — the pool slice has a
         // guaranteed share of the reject list (see rejectBudgetBeforeEval).
         // scannedProfiles = [...feedOnly, ...poolSlice]: the tail is the pool.
         { feedBudgetStart: rejectBudgetBeforeEval, poolStartIdx: feedOnly.length },
       );
       diag.agedEval = agedEval.count;
+      diag.staleReadings = staleReadings.count;
       diag.candidates = candidates.length;
       // The prune's counters belong to THIS tick, so they are refreshed
       // here — the same pattern the recovery path uses for
@@ -7392,6 +7440,8 @@ export class Scanner {
     fails: ScanSummary["fails"],
     rejects: RejectionEntry[],
     agedEval: { count: number },
+    /** Readings refused as stale this scan (see SCAN_MAX_READING_AGE_MS). */
+    staleReadings: { count: number },
     /**
      * Reject-log budget split (see rejectBudgetBeforeEval at the call site):
      * `poolStartIdx` marks where the pool slice begins inside `profiles`, and
@@ -7447,6 +7497,19 @@ export class Scanner {
         );
       }
       if (!pair) continue;
+      // CONTENT-AGE GATE (2026-10-04, see SCAN_MAX_READING_AGE_MS): every
+      // gate below is a judgment about THIS reading, and its verdict binds
+      // until the coin's next rotation — so a reading whose CONTENT is older
+      // than the bound is not judged at all. No gate runs, no rejection is
+      // logged (the reject ring records JUDGMENTS; this coin was never
+      // judged), the fails counters stay where they were, and the coin keeps
+      // its pool slot: a fresh reading next tick decides. Undated readings
+      // (Jupiter/Gecko legs, fixtures) are never refused.
+      const readingAgeMs = pairContentAgeMs(pair, Date.now());
+      if (readingAgeMs !== null && readingAgeMs > SCAN_MAX_READING_AGE_MS) {
+        staleReadings.count += 1;
+        continue;
+      }
       const stats = statsByToken.get(profile.tokenAddress);
       if (!stats) continue;
       // Comparable-only (see gateLiquidityUsd): a Jupiter/Gecko pair's number

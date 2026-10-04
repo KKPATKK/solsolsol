@@ -75,7 +75,8 @@ export interface PairInfo {
    * stale and read "fresh" at every layer. Live: two 💀 cards quoted 現
    * $121.02K against a pool trading $290K-430K in the same minutes; the
    * reading was ~4 minutes old. The push-watch rules refuse to judge a reading
-   * older than PUSH_WATCH_MAX_READING_AGE_MS, and this is how they know.
+   * older than PUSH_WATCH_MAX_READING_AGE_MS, the scan's front gates refuse
+   * one older than SCAN_MAX_READING_AGE_MS, and this is how they know.
    */
   contentAt?: number;
 }
@@ -107,7 +108,7 @@ export interface PairInfo {
  * above that 146s worst case — so no legitimate hit is ever refused — and
  * well below the 4+ minutes the DUST cards were reading.
  *
- * TWO USES, one meaning ("this content is too old to be evidence: get a
+ * THREE USES, one meaning ("this content is too old to be evidence: get a
  * fresher one, or don't judge"):
  *  1. fetchPairsForTokens treats an in-memory HIT this old as a MISS, so the
  *     tracker re-asks the wire instead of re-serving the stale copy. Since
@@ -119,6 +120,13 @@ export interface PairInfo {
  *     PUSH_WATCH_MAX_READING_AGE_MS), so nothing is ever derived from
  *     minutes-old numbers even if some other carrier (a pin snapshot, a
  *     served lastPairs map) hands one over.
+ *  3. The SCAN's front gates REFUSE to judge a candidate from a reading this
+ *     old (fail-quiet: no gate runs, no rejection is logged and the coin
+ *     keeps its pool slot for the next rotation; see scanner's
+ *     SCAN_MAX_READING_AGE_MS). The fetch lane's re-ask above covers its own
+ *     cache; this is the decision point, so the rule covers whatever carried
+ *     the reading — and a REJECTION, unlike a card, cannot be taken back
+ *     before the coin's next rotation.
  *
  * UNKNOWN IS NOT STALE: a row with no `contentAt` at all (fixtures, synthetic
  * pairs, the Jupiter/Gecko legs, which are fetched live) is never refused —

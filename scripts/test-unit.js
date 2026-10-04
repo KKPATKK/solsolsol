@@ -5364,6 +5364,151 @@ async function main() {
     }
   });
 
+  await test("Scanner.matchCoins: a stale reading is never judged, and the skip is named", () => {
+    // WHY (2026-10-04, follow-up to the DUST stale readings — see
+    // docs/stale-readings-2026-10-03.md): the fetch lane re-asks an over-age
+    // cache hit, but matchCoins is the DECISION POINT — every gate judges one
+    // pair reading, and the rejection it hands out binds until the coin's
+    // next rotation (a wrong REJECTION is the one outcome a scan cannot undo),
+    // so the rule is enforced on the reading actually being judged, whatever
+    // carried it: no gate runs, no rejection is logged, the coin keeps its
+    // pool slot and is re-read next tick.
+    const { Scanner, SCAN_MAX_READING_AGE_MS } = require("../dist/scanner.js");
+    const { PAIR_CONTENT_MAX_AGE_MS } = require("../dist/dexscreener.js");
+    assert.equal(
+      SCAN_MAX_READING_AGE_MS,
+      PAIR_CONTENT_MAX_AGE_MS,
+      "one bound, two modules — the scan and the cards cannot disagree about 'stale'",
+    );
+    const cfg = loadConfig({});
+    const scanner = new Scanner(
+      { setWorkerState: async () => {} },
+      { api: { sendMessage: async () => ({}) } },
+      null,
+      cfg,
+      null,
+      null,
+      null,
+    );
+    const now = Date.now();
+    const chats = [
+      {
+        chatId: "c",
+        minLiquidityUsd: 10_000,
+        minVolume24hUsd: 100_000,
+        minMarketCapUsd: 20_000,
+        maxMarketCapUsd: 5_000_000,
+        minAgeMinutes: 10,
+        maxAgeMinutes: 1_000,
+        min5mVolUsd: 500,
+        min1hVolUsd: 10_000,
+        min5mChgPct: 5,
+        min1hChgPct: 5,
+      },
+    ];
+    // One shape, one clock: everything about this coin passes every gate, so
+    // ANY difference in outcome below is the content-age gate and nothing
+    // else. `contentAt: undefined` = undated (the Jupiter/Gecko legs).
+    const coin = (contentAt, over = {}) => ({
+      tokenAddress: "TOK",
+      symbol: "TOK",
+      pair: {
+        chainId: "solana",
+        url: "",
+        pairAddress: "p-TOK",
+        baseToken: { address: "TOK", name: "TOK", symbol: "TOK" },
+        priceUsd: "0.001",
+        marketCap: 100_000,
+        fdv: 100_000,
+        volume: { m5: 2_000, h1: 50_000, h24: 1_000_000 },
+        priceChange: { m5: 6, h1: 8 },
+        txns: { m5Buys: 10, m5Sells: 8, h1Buys: 100, h1Sells: 80 },
+        liquidity: { usd: 50_000 },
+        pairCreatedAt: now - 30 * 60_000,
+        ...(contentAt === undefined ? {} : { contentAt }),
+        ...over,
+      },
+    });
+    const run = (entry) => {
+      const fails = {
+        mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, flurry: 0,
+        liqRatio: 0, sus: 0, organic: 0, other: 0,
+      };
+      const rejects = [];
+      const agedEval = { count: 0 };
+      const staleReadings = { count: 0 };
+      const out = scanner.matchCoins(
+        [{ tokenAddress: entry.tokenAddress, symbol: entry.symbol }],
+        new Map([[entry.tokenAddress, entry.pair]]),
+        new Map([[entry.tokenAddress, { token: entry.tokenAddress }]]),
+        chats,
+        fails,
+        rejects,
+        agedEval,
+        staleReadings,
+      );
+      return { out, fails, rejects, agedEval, staleReadings };
+    };
+
+    // Negative control: the same coin on a FRESH clock is judged and
+    // qualifies — so the refusals below are the clock and nothing else.
+    const fresh = run(coin(now - 30_000));
+    assert.equal(fresh.out.length, 1, "fresh reading: judged and qualified");
+    assert.equal(fresh.agedEval.count, 1);
+    assert.equal(fresh.staleReadings.count, 0);
+
+    // The DUST shape: a ~4-minute-old reading must not produce a verdict.
+    const stale = run(coin(now - 240_000));
+    assert.equal(stale.out.length, 0, "nothing qualifies off a stale reading");
+    assert.equal(stale.staleReadings.count, 1, "and the refusal is counted, not silent");
+    assert.equal(stale.agedEval.count, 0, "NOT a judgment: the age gate never ran");
+    assert.deepEqual(
+      stale.rejects,
+      [],
+      "nothing is logged as a rejection — the reject ring records judgments",
+    );
+    assert.equal(
+      Object.values(stale.fails).reduce((a, b) => a + b, 0),
+      0,
+      "no fail counter moved: unjudged is not rejected",
+    );
+
+    // Boundary: inside the bound judges, past it refuses. (Fixture time runs
+    // milliseconds before the call's own Date.now(), so the exact millisecond
+    // is not assertable — the 1s margin is the honest shape of the rule.)
+    const inside = run(coin(now - PAIR_CONTENT_MAX_AGE_MS + 1_000));
+    assert.equal(inside.out.length, 1, "1s inside the bound still judges");
+    const past = run(coin(now - PAIR_CONTENT_MAX_AGE_MS - 1_000));
+    assert.equal(past.out.length, 0, "1s past the bound refuses");
+    assert.equal(past.staleReadings.count, 1);
+
+    // Unknown is not stale: an undated reading (Jupiter/Gecko legs, fixtures)
+    // fails OPEN, the same direction every other missing-data guard takes.
+    const undated = run(coin(undefined));
+    assert.equal(undated.out.length, 1, "undated reading: judged");
+    assert.equal(undated.staleReadings.count, 0);
+
+    // And a stale reading that WOULD have failed a gate is still not logged:
+    // the refusal is about the evidence, never about the coin's odds.
+    const staleRich = run(coin(now - 240_000, { marketCap: 9_000_000 }));
+    assert.deepEqual(
+      staleRich.rejects,
+      [],
+      "a gate-failing shape logs nothing while its reading is stale",
+    );
+
+    // Wiring: the refusal count must ride the scan summary (the object
+    // /health serves) — a rule that fires with no reading is not observable.
+    const scannerSrc = fs.readFileSync(
+      path.join(__dirname, "..", "src", "scanner.ts"),
+      "utf8",
+    );
+    assert.ok(
+      scannerSrc.includes("diag.staleReadings = staleReadings.count;"),
+      "the refusal count rides the scan summary",
+    );
+  });
+
   await test("Scanner: a race-cut tick flushes the candidate-chain step it was inside", async () => {
     // The chain is the tick's longest serial section (eleven awaited upstream
     // steps) and the thing the worker's race cuts, but a cut tick only
