@@ -684,6 +684,9 @@ PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
 #             `pb` mark AND the shared `lastAlertAt` pace clock
 #             (PULLBACK_PACE_MS 10 min): fire() still stamps both, so lifting
 #             the mute waits for the NEXT episode instead of replaying this one.
+#   strongbuy = 💪 強烈買入訊號 (2nd 🟢 revival, no 🚀 card between). Muting it
+#             still lands `revives_since_up` (the count resets, the next pair
+#             starts a new episode), so lifting the mute never replays it.
 # SET 2026-09-30 at the operator's request (「暫時不想收到」; extended the same
 # day with 「暫時不需要推送：賣壓主導、動能轉弱」, then with
 # 「暫時不需要推送跟進卡：🪝 回調轉強」). A muted card is

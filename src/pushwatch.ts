@@ -60,6 +60,8 @@ import {
  *                       floor breach (< $10K) → drained LP, mcap unreliable,
  *                       tracking stops
  *   📈 holders        — holder count +10% / +25% / +50% vs push (Birdeye)
+ *   💪 strong-buy     — a SECOND 🟢 dead-state revival with no 🚀 runup card
+ *                       in between (a coin washed out twice and still bid)
  */
 
 /**
@@ -1249,6 +1251,30 @@ const SELL_DOM_PACE_MS = 60 * 60_000;
 const RESURRECTION_MULT = 1.5; // revival floor = trough (or push baseline) x this
 
 /**
+ * 💪 強烈買入訊號 (operator request, 2026-10-05): how many 🟢 revival cards a
+ * row may announce with NO 🚀 續漲 card between them before the last one
+ * escalates into a strong-buy card.
+ *
+ * WHAT IT IS READING: a dead-state revival is a V-reversal off a flushed
+ * trough, and on a meme tape a single one is often a liquidity-free bounce
+ * that dies again. TWO of them with no runup milestone in between is the
+ * shape the 🚀 ladder cannot report — a coin washed out twice and still bid
+ * — which is why the second revival is the entry signal the operator asked
+ * for. Requiring the runup NOT to have happened is the other half: a coin
+ * that crossed a +50% stage between the two revivals already told its story,
+ * and the pattern this card flags (double bottom, no markup in between) is
+ * gone.
+ *
+ * THE MEMORY is `push_watch.revives_since_up` (persistent, like the stage
+ * marks): a revival that fired while the reading was stale, or whose send
+ * was rolled back, does not count. The two rules that END the pattern both
+ * reset it — a 🚀 card (the runup this rule waits for) and the strong-buy
+ * card itself (one signal per episode; the next pair of revivals starts a
+ * new one).
+ */
+export const STRONG_BUY_REVIVES = 2;
+
+/**
  * The durable `worker_state` row `/health.pushWatchPass` and /debug read,
  * and the RUNNING stamp a passing pass writes into it.
  *
@@ -1395,6 +1421,13 @@ export interface PushWatchRow {
   /** CSV of 🚀 stages already announced (up50,up100,…). Persistent so a
    * ⚠️/🔥 overwrite of lastState cannot re-announce the same milestone. */
   upStages: string | null;
+  /**
+   * 🟢 revivals announced since the last 🚀 runup card — the 💪 strong-buy
+   * rule's memory (see STRONG_BUY_REVIVES). Optional so hand-built fixtures
+   * and reads from before the column existed default to 0 (the DB column is
+   * NOT NULL DEFAULT 0).
+   */
+  revivesSinceUp?: number | null;
 }
 
 export interface WatchAlert {
@@ -1406,7 +1439,8 @@ export interface WatchAlert {
     | "liquidity"
     | "holders"
     | "ignition"
-    | "sell-pressure";
+    | "sell-pressure"
+    | "strong-buy";
   text: string;
   /**
    * WHICH TRANSITION this card announces — its identity across a re-derivation.
@@ -1461,6 +1495,13 @@ export interface WatchEval {
   sellDomStreak: number;
   /** CSV to persist into up_stages (undefined = keep; '' = clear, resurrection). */
   announcedUpStages?: string;
+  /**
+   * New 🟢-revival count to persist (see STRONG_BUY_REVIVES). undefined = the
+   * pattern did not move, so the column is left as it is; the paths that set
+   * it are exactly the two that announce a card living in the pattern — a
+   * revival (counts up) and a 🚀 runup card (resets).
+   */
+  revivesSinceUp?: number;
   /**
    * The row's in-flight attempt marks this evaluation did NOT announce and did
    * not re-arm (see carriedAttempts): the marks a ROLLBACK has to carry along.
@@ -1620,6 +1661,7 @@ export const CARRIED_ATTEMPT_SIGS: ReadonlySet<string> = new Set([
   "sell", // re-armed when the sell streak breaks
   "dead", // 💀 : the revival clears the column
   "revive", // re-armed by the next 💀 card
+  "strongbuy", // re-armed by the 🚀 runup card that ends its episode
   "liqwarn",
   "drain", // re-armed by the drain disarm
   "hold", // re-armed by its own announcement (the holder baseline rolls)
@@ -1725,6 +1767,9 @@ export function evaluateWatch(
   let followupsSent = row.followupsSent;
   let resetBaselineHolders: number | undefined;
   let announcedUpStages: string | undefined;
+  /** The 💪 pattern's memory (see STRONG_BUY_REVIVES): only the two cards
+   * that live inside the pattern move it, every other path carries it. */
+  let revivesSinceUp = row.revivesSinceUp ?? 0;
 
   // The attempt marks this row's last pass left behind (see CUT_MARK_PREFIX):
   // a send whose outcome was unknown means the card may already be in the chat,
@@ -2083,6 +2128,23 @@ export function evaluateWatch(
         `🟢 死而復生 ${symbol} | 從低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），以現價 ${fmtUsd(live.mcap)} 為新基準繼續追蹤`,
         "revive",
       );
+      // THIS revival is the one the count must see (the card above is derived
+      // from the row's stored count, so the two are one step apart by design).
+      revivesSinceUp += 1;
+      // 第二次連續死而復生（期間無 🚀 續漲）→ 強烈買入訊號. Fires WITH the
+      // revival card, not instead of it: the operator asked for the extra
+      // signal on top of the transition, and the 💪 card is the only one that
+      // names the pattern (see STRONG_BUY_REVIVES). The count resets to 0 as
+      // the episode is consumed — the NEXT pair of revivals is a new one.
+      if (revivesSinceUp >= STRONG_BUY_REVIVES) {
+        const troughLabel = fmtUsd(row.deadTroughMcap ?? live.mcap);
+        fire(
+          "strong-buy",
+          `💪 強烈買入訊號 ${symbol} | 連續第二次 🟢 死而復生（期間無 🚀 續漲）| 低點 ${troughLabel} → 現 ${fmtUsd(live.mcap)}（復活基準 ${fmtUsd(row.mcapAtPush)} ×${pushX}）| 5m ${pct(live.chg5m)} 量 ${fmtUsd(live.vol5m)} 買賣比 ${entryBs} | 失效 跌破 ${troughLabel}`,
+          "strongbuy",
+        );
+        revivesSinceUp = 0;
+      }
       return {
         alerts,
         peakMcap: live.mcap,
@@ -2097,6 +2159,7 @@ export function evaluateWatch(
         // ladder restarts from the new base), so the value rides the same
         // write instead of costing a column of its own. See BASE_MARK_PREFIX.
         announcedUpStages: baseMarkFor(live.mcap),
+        revivesSinceUp,
       };
     }
     const trough = Math.min(row.deadTroughMcap ?? live.mcap, live.mcap);
@@ -2254,6 +2317,13 @@ export function evaluateWatch(
       // above it, so announcing the crossing once loses nothing.
       for (let j = 0; j <= i; j++) firedStages.add(`up${RISING_STAGES[j]}`);
       lastState = state;
+      // A 🚀 續漲 card IS the runup the 💪 rule waits for: the revival count
+      // resets, and an attempt mark for a never-written strong-buy is re-armed
+      // (its episode is over by definition — see carriedAttempts).
+      if (revivesSinceUp > 0) {
+        revivesSinceUp = 0;
+        rearmedSigs.add("strongbuy");
+      }
       break; // one card per crossing, however many stages it spans
     }
   }
@@ -2465,6 +2535,8 @@ export function evaluateWatch(
     // A stage change owns the column when one happened; otherwise the drain
     // rule's disarm is the only edit that has to land.
     announcedUpStages: announcedUpStages ?? drainDisarm,
+    // The 💪 pattern's memory (undefined = untouched; see WatchEval).
+    revivesSinceUp,
     // What a rollback must carry (see carriedAttempts).
     carriedAttempts: carriedAttempts(),
   };
@@ -4463,6 +4535,13 @@ export class PushWatcher {
           ? (row.deadTroughMcap ?? null)
           : (evalResult.deadTroughMcap ?? null),
         sellDomStreak: hold ? row.sellDomStreak : evalResult.sellDomStreak,
+        // The 💪 pattern's memory: only an announced revival moves it (and a
+        // 🚀 card resets it), so a rollback or a backfill — neither of which
+        // announced anything — leaves the row's own count in place.
+        revivesSinceUp:
+          hold || backfill
+            ? (row.revivesSinceUp ?? 0)
+            : (evalResult.revivesSinceUp ?? row.revivesSinceUp ?? 0),
         lastMcap: pair.marketCap,
         // Pin-on-first-sight: a legacy row (NULL pin) is pinned to the pool
         // it was actually judged on; a pinned row's value is write-once here
@@ -4556,6 +4635,7 @@ export class PushWatcher {
           mcapAtPush: evalResult.resetBaselineMcap,
         holdersAtPush: evalResult.resetBaselineHolders,
           upStages: evalResult.announcedUpStages,
+          revivesSinceUp: evalResult.revivesSinceUp,
           deadTroughMcap: evalResult.deadTroughMcap ?? null,
           sellDomStreak: evalResult.sellDomStreak,
           lastMcap: pair.marketCap,

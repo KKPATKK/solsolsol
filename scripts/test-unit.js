@@ -10497,6 +10497,58 @@ async function main() {
     }
   });
 
+  await test("Db.push_watch revives_since_up: the 💪 pattern's memory round-trips (write, keep, reset)", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "STRONG",
+        chatId: "c",
+        symbol: "S",
+        pushedAt: Date.now(),
+        mcapAtPush: 1_000,
+        liquidityUsd: 100,
+      });
+      const read = async () =>
+        (await db.listPushWatch(10)).find((r) => r.token === "STRONG");
+      assert.equal((await read()).revivesSinceUp, 0, "a fresh row starts at 0 (NOT NULL DEFAULT)");
+
+      // A revival's write lands the count.
+      await db.updatePushWatchCheck("STRONG", {
+        peakMcap: 1_000,
+        lastLiquidity: 100,
+        revivesSinceUp: 1,
+      });
+      assert.equal((await read()).revivesSinceUp, 1);
+
+      // A writer that does not know the pattern (undefined) must leave it —
+      // that is what every early return and every non-tracker writer passes.
+      await db.updatePushWatchCheck("STRONG", { peakMcap: 1_200, lastLiquidity: 100 });
+      assert.equal((await read()).revivesSinceUp, 1, "undefined = keep");
+
+      // The silent path's batched claim carries it too, and a 0 is a real
+      // value (the reset the runup and the signal itself both write).
+      await db.claimPushWatchChecksMany([
+        {
+          token: "STRONG",
+          expectedLastChecked: (await read()).lastChecked,
+          now: Date.now(),
+          v: { peakMcap: 1_200, lastLiquidity: 100, revivesSinceUp: 2 },
+        },
+      ]);
+      assert.equal((await read()).revivesSinceUp, 2, "the batched claim writes the count");
+      await db.updatePushWatchCheck("STRONG", {
+        peakMcap: 1_200,
+        lastLiquidity: 100,
+        revivesSinceUp: 0,
+      });
+      assert.equal((await read()).revivesSinceUp, 0, "the reset lands as a value, not as a keep");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("PushWatcher: the pair batch's deadline is measured from the CALL, not the pass start", async () => {
     // The setup stages (listing, recap/prune, terminal settle, self-heal) run
     // BEFORE the batch and routinely cost 400-700ms. A deadline derived from
@@ -13081,6 +13133,61 @@ async function main() {
     assert.match(f.alerts[0].text, /39\.00K/);
     assert.equal(f.stopTracking, false);
     assert.equal(f.deadTroughMcap, 39_000);
+  });
+
+  await test("evaluateWatch: a second revival with no runup between fires 💪 強烈買入訊號", () => {
+    const { STRONG_BUY_REVIVES } = require("../dist/pushwatch.js");
+    assert.equal(STRONG_BUY_REVIVES, 2, "the operator rule is: the SECOND revival");
+    const row = (over = {}) => ({
+      token: "T", chatId: "c", symbol: "X", pushedAt: 0,
+      mcapAtPush: 50_000, peakMcap: 90_000, lastLiquidity: 20_000,
+      lastVol5m: 3_000, deadTroughMcap: 30_000,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3600_000, followupsSent: 1, lastState: "dead",
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+    const recovery = { mcap: 46_000, liquidity: 25_000, chg5m: 15, vol5m: 40_000, buysH1: 200, sellsH1: 40 };
+
+    // FIRST revival: the 🟢 card alone, and the count moves to 1.
+    const first = evaluateWatch(row({ revivesSinceUp: 0 }), 1000, recovery, cfg);
+    assert.deepEqual(first.alerts.map((a) => a.sig), ["revive"]);
+    assert.equal(first.revivesSinceUp, 1, "one revival since the last runup");
+
+    // The row as the first revival's write leaves it (baseline moved), judged
+    // at a SECOND recovery above trough × 1.5: the 🟢 card AND the 💪 card.
+    const second = evaluateWatch(
+      row({ revivesSinceUp: 1, mcapAtPush: 46_000, peakMcap: 46_000, lastAlertAt: 1_000 }),
+      2000,
+      recovery,
+      cfg,
+    );
+    assert.deepEqual(second.alerts.map((a) => a.sig), ["revive", "strongbuy"],
+      "the signal rides WITH the second revival card, not instead of it");
+    assert.equal(second.alerts[1].kind, "strong-buy");
+    assert.match(second.alerts[1].text, /強烈買入訊號 X/);
+    assert.match(second.alerts[1].text, /連續第二次 🟢 死而復生/);
+    assert.equal(second.revivesSinceUp, 0,
+      "one signal per episode: the next pair of revivals starts a new one");
+
+    // A 🚀 續漲 card BETWEEN the two revivals is exactly what the operator
+    // excluded: the runup resets the count, so this revival pair is over.
+    const runup = evaluateWatch(
+      row({ lastState: null, deadTroughMcap: null, mcapAtPush: 46_000, peakMcap: 46_000, lastAlertAt: 1_000, revivesSinceUp: 1, upStages: baseMarkFor(46_000) }),
+      2000,
+      { mcap: 100_000, liquidity: 25_000, chg5m: 15, buysH1: 200, sellsH1: 100 },
+      cfg,
+    );
+    assert.match(runup.alerts[0].text, /🚀 續漲 X/);
+    assert.equal(runup.revivesSinceUp, 0, "the runup card ends the no-runup episode");
+    assert.ok(runup.alerts.every((a) => a.sig !== "strongbuy"),
+      "no signal when a 🚀 card landed between the revivals");
+
+    // ...and after that reset the next revival is a NEW first one, not a
+    // second: the count is the whole memory, and it starts from 0 again.
+    const afterRunup = evaluateWatch(row({ revivesSinceUp: 0 }), 3000, recovery, cfg);
+    assert.deepEqual(afterRunup.alerts.map((a) => a.sig), ["revive"]);
+    assert.equal(afterRunup.revivesSinceUp, 1);
   });
 
   await test("evaluateWatch: a stale reading cannot call a coin dead or revive it (DUST, 2026-10-03)", () => {

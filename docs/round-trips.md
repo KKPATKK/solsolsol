@@ -4073,3 +4073,51 @@ curl -s .../debug/scan-history?rows=40 | jq -r '.rows[] | select(.ok==false) | "
 - **粒度係 4 格**（同 phase ladder 一樣），唔係逐個 await 一個名；更深嘅要配合同一條 err 內嘅 front split／`subreqs` 睇。
 - **`ms` 係「入咗呢個 stage 之後幾耐」**（即卡住嗰個 stage 已經燒咗幾多），唔係嗰個 await 嘅時間；**pre-race 卡住唔會出現在呢個 clause**（嗰個問題由 err 內嘅 front split 答）。
 - **Turso 係唯一落地點**：row 落唔到（flush 死）時，ladder record 都會帶呢條 err，但佢有 320 字上限 —— 睇唔到 clause 就係嗰個上限剪咗尾，正常路徑（row 落得到）冇呢個問題。
+
+## 4.61 💪 強烈買入訊號：第二次 🟢 死而復生、期間無 🚀 續漲（2026-10-05）
+
+### 一、需求（operator 原話）
+
+「想加一張追蹤器的推送卡，條件是：如果一隻推送了的合資格幣紀錄到發出第二次『死而復生』的跟蹤推送而兩次『死而復生』之間沒有出現過『續漲』的推送，就發出『強烈買入訊號』的推送」。
+
+即係話：**同一隻幣、連續兩次 🟢 復活卡、中間冇 🚀 續漲卡** ⇒ 第二張 🟢 之上再出一張 💪。
+
+### 二、做法
+
+| 檔案 | 改動 |
+|---|---|
+| `src/db.ts` | `push_watch` 加欄位 `revives_since_up INTEGER NOT NULL DEFAULT 0`（DDL 入面都有，舊 row 靠 default 讀 0）；`addColumnIfMissing("push_watch", …)`（`push_watch` 已在 `COLUMN_PROBE_TABLES`，recycle 走同一個 probe）；`PushWatchCheckValues` / `PushWatchListRow` / `mapPushWatchRows` 加欄位；`pushWatchCheckSet` 加 `revives_since_up = COALESCE(?, revives_since_up)`（`undefined` = 唔郁，數字包括 `0` 照寫） |
+| `src/pushwatch.ts` | 新常數 `STRONG_BUY_REVIVES = 2`；`PushWatchRow` 加 `revivesSinceUp?`；`WatchEval` 加 `revivesSinceUp?`；`WatchAlert.kind` 加 `"strong-buy"`；`CARRIED_ATTEMPT_SIGS` 加 `"strongbuy"`；`evaluateWatch` 嘅 🟢 分支 `revivesSinceUp += 1`，達 2 就 fire 💪 再歸 0；🚀 階梯 fire 時 `revivesSinceUp = 0` ＋ `rearmedSigs.add("strongbuy")`；row loop 嘅 `checkFields` 同 lost-reservation 寫入都帶住佢 |
+
+要點：
+
+1. **記憶係一 column**（`revives_since_up`），同 🚀 stages 一樣係持久狀態，唔係 isolate 內計數 —— 復活卡寄出嗰刻（claim/reserve 之後）先算數，rollback（send 被切）同 backfill 都還原 row 自己嗰個值，所以「冇出過嘅卡」唔會偷加一次。
+2. **兩張卡一齊出**：第二張 🟢 照出，💪 係「之上再加」而唔係取代（需求寫明「紀錄到發出第二次死而復生」⇒ 嗰張卡要出）。`fire()` 順序係 🟢 → 💪，兩張各自有 sig（`revive` / `strongbuy`），audit ring 可以分開查。
+3. **「續漲」＝ 🚀 續漲卡**（`up50/100/200/400` 階梯）—— 只有佢會歸 0 同 re-arm。♻️ 破前高、🪝 回調轉強、🔥 量能點火 都**唔算**：佢哋唔係「續漲」卡，而且一個真嘅 runup 一定會撞到 +50% 階梯（基準係復活時重設嘅 `mcapAtPush`）。呢個係刻意嘅收窄，要改就改上面嗰兩行。
+4. **一張訊號 per episode**：出完 💪 歸 0 ⇒ 下次要再儲兩次 🟢 才會有新訊號；唔會同一對復活重覆出卡。
+5. **冇加 cooldown**：🟢 本身就唔受 `cooldownMs` 管（佢係狀態轉移），💪 行同一條路。
+6. **可靜音**：sig 係 `strongbuy`，`PUSH_WATCH_MUTE=…,strongbuy` 收卡但照樣寫 `revives_since_up`（同 §4.53 一樣，un-mute 之後等下一個 episode，唔會補發）。
+
+### 三、測試（main suite 492 → **494 passed, 0 failed**；schema-gate 7、deferred-priority、tick-path、tick-legs 9、health-front 5 全綠）
+
+- `evaluateWatch: a second revival with no runup between fires 💪 強烈買入訊號` —— 第一次 🟢：`alerts == ["revive"]`、`revivesSinceUp 0 → 1`；第二次 🟢（同一個 trough 再收復）：`alerts == ["revive","strongbuy"]`、`kind "strong-buy"`、文案含「連續第二次 🟢 死而復生」、`revivesSinceUp → 0`；中間有 🚀 卡（live 100K vs 基準 46K，一卡吞 up50+up100）：`revivesSinceUp → 0` 且**冇** `strongbuy`；之後再 🟢 又係新嘅第一次（→ 1）。
+- `Db.push_watch revives_since_up: the 💪 pattern's memory round-trips (write, keep, reset)` —— fresh row 讀 0；`updatePushWatchCheck({revivesSinceUp: 1})` 落 1；唔帶欄位嘅寫入照 keep 1；`claimPushWatchChecksMany`（silent 批次）照寫 2；`revivesSinceUp: 0` 係真值、真係寫低（reset 唔會被 COALESCE 食咗）。
+
+### 四、驗收（deploy 後）
+
+```bash
+# 1) 欄位存在、每行有數
+curl -s .../debug/push-watch | jq '.rows[] | select(.symbol!="") | {symbol, lastState, revivesSinceUp}'
+# 2) 💪 真卡落 ring（sig 係 strongbuy）
+curl -s .../debug/push-audit | jq '.rows[] | select(.sig=="strongbuy")'
+# 3) mute 生效（如要）
+curl -s .../debug/push-watch | jq '.mutedSigs'
+```
+
+### 五、界線（老實講）
+
+- **計數係「出咗卡嘅復活」**：claim＋reserve 成功、卡交出（或者被 dedupe 證明已到）才算；readingStale（讀數 >180s）整行唔寫，deferral（有卡喺飛）整行唔動 —— 兩種都唔會偷加。
+- **中途有寫入遺失會偏保守**：pass 喺 reserve 之後、final write 之前死咗，row 可能停在「未加數」嘅舊值；結果只會係**遲一張**（下一次復活先達 2），唔會早出或漏出。
+- **舊 row（deploy 前已追蹤）由 0 起**：所以上線後第一對復活就可能出卡 —— 呢個係想要嘅行為（之前嘅復活冇計落 memory，無法回溯）。
+- **改嘅係一張新卡 + 一個新 column**：現有 🟢/🚀/💀 規則、threshold、cooldown 全部零改動；round trips：每 tick 每 row 唔多唔少（同一個 UPDATE 多一格），silent 批次一樣係一 trip。
+- **文案講「第二次」**：count 由 0 起、出完即歸 0，所以 fire 嘅一刻一定是 1→2；`>= 2` 係 defensive（例如手改 DB 嘅 row）。

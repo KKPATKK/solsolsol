@@ -557,6 +557,14 @@ interface PushWatchCheckValues {
   holdersAtPush?: number;
   /** CSV of 🚀 stages already announced (undefined = keep; '' = clear). */
   upStages?: string | null;
+  /**
+   * 🟢 revivals announced since the last 🚀 runup card — the 💪 strong-buy
+   * rule's memory (see pushwatch.STRONG_BUY_REVIVES). A NUMBER here always
+   * lands (0 included: the two rules that consume the pattern both reset it);
+   * undefined = leave the column alone, which is what every writer that does
+   * not run the rule engine (and every early return) passes.
+   */
+  revivesSinceUp?: number;
   /** New 🧨 sell-pressure streak count (persisted as-is). */
   sellDomStreak?: number;
   /** Latest observed mcap (🏁 recap final value). */
@@ -910,6 +918,12 @@ export interface PushWatchListRow {
     followupsSent: number;
     lastState: string | null;
     upStages: string | null;
+    /**
+     * 🟢 revivals announced since the last 🚀 runup card (the 💪 strong-buy
+     * rule's memory). 0 for a row that has none — every row inserted before
+     * the column existed reads as 0 through the NOT NULL DEFAULT.
+     */
+    revivesSinceUp: number;
     /**
      * The pool this row is PINNED to (see the pool-pinning note in
      * src/pushwatch.ts). Null = legacy row, pinned on its first successful
@@ -2025,6 +2039,7 @@ export class Db {
           sell_dom_streak INTEGER NOT NULL DEFAULT 0,
           last_mcap REAL,
           up_stages TEXT,
+          revives_since_up INTEGER NOT NULL DEFAULT 0,
           pool_address TEXT
         );`,
         `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
@@ -2384,6 +2399,14 @@ export class Db {
       "INTEGER NOT NULL DEFAULT 0",
     );
     await this.addColumnIfMissing("push_watch", "last_mcap", "REAL");
+    // push_watch.revives_since_up — the 💪 strong-buy rule's memory (🟢
+    // revivals since the last 🚀 runup card). Unconditional because
+    // addColumnIfMissing is idempotent; existing rows read the 0 default.
+    await this.addColumnIfMissing(
+      "push_watch",
+      "revives_since_up",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
     // push_watch.pool_address — the pool a row is PINNED to (the pool its
     // push was based on, see the pool-pinning note in src/pushwatch.ts).
     // Written at enrollment, on a legacy row's first successful check write
@@ -4695,6 +4718,7 @@ export class Db {
         followupsSent: Number(r.followups_sent ?? 0),
         lastState: r.last_state === null || r.last_state === undefined ? null : String(r.last_state),
         upStages: r.up_stages === null || r.up_stages === undefined ? null : String(r.up_stages),
+        revivesSinceUp: Number(r.revives_since_up ?? 0),
         poolAddress:
           r.pool_address === null || r.pool_address === undefined
             ? null
@@ -4723,6 +4747,7 @@ export class Db {
               holders_at_push = COALESCE(?, holders_at_push),
               sell_dom_streak = ?,
               up_stages = COALESCE(?, up_stages),
+              revives_since_up = COALESCE(?, revives_since_up),
               last_mcap = ?,
               pool_address = COALESCE(pool_address, ?)`,
       args: [
@@ -4738,6 +4763,7 @@ export class Db {
         v.holdersAtPush ?? null,
         v.sellDomStreak ?? 0,
         v.upStages ?? null,
+        v.revivesSinceUp ?? null,
         v.lastMcap ?? null,
         v.poolAddress ?? null,
       ],
