@@ -16611,6 +16611,69 @@ async function main() {
     );
   });
 
+  await test("debug scans: /debug/pool and /debug/feed-stats answer from a durable TTL cache", async () => {
+    // Both endpoints aggregate over the WHOLE token_stats table (measured
+    // 2026-10-06: 82,711 rows; ~0.6s and ~1.0s live against a ~0.2s /health),
+    // and both were ungated — so any poll loop re-read the entire table on
+    // every request. The durable TTL cache is the fix, and these pins keep it
+    // wired: it is consulted BEFORE the expensive read, it lives in a
+    // worker_state row (a HIT from any isolate, not a per-isolate memo), and a
+    // hit is labelled so a reader can tell a snapshot from a live number.
+    const strip = (text) => text.replace(/\/\/[^\n]*/g, "").replace(/\s+/g, "");
+    const src = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8"),
+    );
+    assert.ok(
+      src.includes("constDEBUG_SCAN_CACHE_TTL_MS=5*60_000;"),
+      "the cache window is a named constant, not a literal TTL",
+    );
+    assert.ok(
+      src.includes('constDEBUG_SCAN_CACHE_PREFIX="debug_scan_cache:";'),
+      "the cache row is namespaced in worker_state",
+    );
+    // The helper reads and seeds the SHARED row (durable), never isolate state.
+    assert.ok(
+      src.includes("awaittarget.getWorkerState(DEBUG_SCAN_CACHE_PREFIX+name)") &&
+        src.includes(
+          "awaittarget.setWorkerState(DEBUG_SCAN_CACHE_PREFIX+name,JSON.stringify({at:Date.now(),body}),)",
+        ),
+      "the cache must live in a worker_state row, or a cold isolate still scans",
+    );
+    // /debug/pool: the cache is consulted BEFORE the probe Db is built, so a
+    // hit skips the client init as well as the whole-table histogram scan.
+    const poolAt = src.indexOf('url.pathname==="/debug/pool"');
+    const poolCacheAt = src.indexOf(
+      'readDebugScanCache<Record<string,unknown>>("pool")',
+      poolAt,
+    );
+    const probeAt = src.indexOf(
+      "constprobe=newDb(env.TURSO_DATABASE_URL,env.TURSO_AUTH_TOKEN);",
+      poolAt,
+    );
+    assert.ok(
+      poolCacheAt > poolAt && probeAt > poolCacheAt,
+      "/debug/pool must answer from the cache before building the probe",
+    );
+    // /debug/feed-stats: the cache is consulted BEFORE the full-table scan.
+    const feedAt = src.indexOf('url.pathname==="/debug/feed-stats"');
+    const feedCacheAt = src.indexOf(
+      'readDebugScanCache<Array<{feed:string;coins:number;pushed:number}>>("feed-stats")',
+      feedAt,
+    );
+    const attribAt = src.indexOf("awaitdb?.getFeedAttribution()", feedAt);
+    assert.ok(
+      feedCacheAt > feedAt && attribAt > feedCacheAt,
+      "/debug/feed-stats must answer from the cache before the full scan",
+    );
+    // A cached answer says so, with its age, so a reader never mistakes a
+    // snapshot for the live number.
+    assert.ok(
+      src.includes("cached:true,cacheAgeMs:cached.ageMs,") &&
+        src.includes("cached:false"),
+      "a cached response must be labelled, and a fresh one marked so too",
+    );
+  });
+
   await test("Scanner: the trending leg reads a deep page and only the band reaches the pipeline", async () => {
     // The wiring, end to end: config limit → client → band filter → `jupTrend`
     // reading. Before this, the leg asked for the top 15 and passed NO band, so

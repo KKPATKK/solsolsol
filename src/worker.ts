@@ -275,6 +275,71 @@ let dbLatencyLastRunAt = 0;
  */
 const BACKFILL_DEBUG_COOLDOWN_MS = 5 * 60_000;
 let backfillDebugLastRunAt = 0;
+/**
+ * Durable TTL cache for the two /debug endpoints whose read is a FULL-TABLE
+ * SCAN of `token_stats`, and which were completely ungated until now:
+ *
+ *   /debug/pool       — getPoolHistogram: COUNT(*) over the whole table plus a
+ *                       NOT EXISTS probe per row. Measured 2026-10-06 at
+ *                       82,711 rows read for a ~0.6s response, and it ALSO
+ *                       builds a fresh Db and awaits its init on every call.
+ *   /debug/feed-stats — getFeedAttribution: the same full scan LEFT JOINed to
+ *                       seen_tokens (~1.0s live).
+ *
+ * Both answer slowly-changing aggregates (the pool histogram moves with the
+ * rotation; the per-feed coin counts move with discovery), yet the endpoints
+ * exist to be POLLED — which is exactly what made them expensive: a minute-by-
+ * minute reader re-read the entire table every request for a number that had
+ * barely moved. This is the single largest avoidable Turso rows-read on the box.
+ *
+ * WHY DURABLE (a worker_state row) and not an isolate memo: the fleet answers
+ * these from whichever isolate Cloudflare routes to, so a per-isolate memo
+ * misses on every cold isolate and still lets the scan through. One shared row
+ * is a HIT from any isolate. A hit costs ONE keyed row read against the
+ * whole-table scan it replaces; a miss pays the scan once and re-seeds the row
+ * for the rest of the window.
+ *
+ * A cached response carries `cached: true` and `cacheAgeMs`, and its own `now`
+ * still names the moment the numbers were TAKEN — so the pool histogram's `now`
+ * stays consistent with its buckets instead of drifting to read-time. Cache
+ * errors are never fatal: an unreadable row is a miss, and a failed seed only
+ * means the next poll recomputes.
+ */
+const DEBUG_SCAN_CACHE_TTL_MS = 5 * 60_000;
+const DEBUG_SCAN_CACHE_PREFIX = "debug_scan_cache:";
+
+/** The cached body plus how stale it is, or null on a miss/expiry/error. */
+async function readDebugScanCache<T>(
+  name: string,
+): Promise<{ body: T; ageMs: number } | null> {
+  const target = db;
+  if (!target) return null;
+  try {
+    const raw = await target.getWorkerState(DEBUG_SCAN_CACHE_PREFIX + name);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { at?: unknown; body?: T };
+    if (typeof parsed.at !== "number" || parsed.body === undefined) return null;
+    const ageMs = Date.now() - parsed.at;
+    if (ageMs < 0 || ageMs >= DEBUG_SCAN_CACHE_TTL_MS) return null;
+    return { body: parsed.body, ageMs };
+  } catch {
+    return null;
+  }
+}
+
+/** Seed the row (best-effort — see the block comment above). */
+async function writeDebugScanCache<T>(name: string, body: T): Promise<void> {
+  const target = db;
+  if (!target) return;
+  try {
+    await target.setWorkerState(
+      DEBUG_SCAN_CACHE_PREFIX + name,
+      JSON.stringify({ at: Date.now(), body }),
+    );
+  } catch {
+    /* best-effort: a failed seed only means the next poll recomputes */
+  }
+}
 /** Minimum gap between fallback scans triggered from the fetch path. */
 // How often the HTTP-triggered fallback may LOOK. Cron (1/min) is the primary
 // driver, and since 2026-09-27 the fallback is a RESCUE rather than a cadence
@@ -7900,9 +7965,25 @@ const worker = {
       }
     }
     if (url.pathname === "/debug/feed-stats") {
+      // Durable TTL cache FIRST (see DEBUG_SCAN_CACHE_*): the read behind this
+      // endpoint is a full-table scan of token_stats, so a poll loop must be
+      // answered from the shared row rather than re-scanning per request.
+      const cached = await readDebugScanCache<
+        Array<{ feed: string; coins: number; pushed: number }>
+      >("feed-stats");
+      if (cached) {
+        return Response.json({
+          ok: true,
+          byFeed: cached.body,
+          cached: true,
+          cacheAgeMs: cached.ageMs,
+        });
+      }
       try {
         const rows = await db?.getFeedAttribution();
-        return Response.json({ ok: true, byFeed: rows ?? [] });
+        const body = rows ?? [];
+        await writeDebugScanCache("feed-stats", body);
+        return Response.json({ ok: true, byFeed: body, cached: false });
       } catch (err) {
         return Response.json(
           { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -8528,6 +8609,17 @@ const worker = {
       if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
         return Response.json({ ok: false, error: "TURSO not configured" });
       }
+      // Durable TTL cache FIRST, before the probe Db is even constructed: a
+      // hit skips the client init AND the whole-table histogram scan (see
+      // DEBUG_SCAN_CACHE_*).
+      const cached = await readDebugScanCache<Record<string, unknown>>("pool");
+      if (cached) {
+        return Response.json({
+          ...cached.body,
+          cached: true,
+          cacheAgeMs: cached.ageMs,
+        });
+      }
       const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
       // Db.get() requires the client to be connected (init does this; the
       // lazy connect() used by other probe methods doesn't set it).
@@ -8624,7 +8716,7 @@ const worker = {
           err instanceof Error ? err.message : err,
         );
       }
-      return Response.json({
+      const body = {
         ok: true,
         now: new Date(now).toISOString(),
         total: hist.total,
@@ -8643,7 +8735,9 @@ const worker = {
         mcapCeilingUsd: poolMaxMcapUsd * 2,
         liquidityPruneRatio: POOL_LIQUIDITY_PRUNE_RATIO,
         liquidityFloorUsd: poolMinLiquidityUsd * POOL_LIQUIDITY_PRUNE_RATIO,
-      });
+      };
+      await writeDebugScanCache("pool", body);
+      return Response.json({ ...body, cached: false });
     }
 
     // An unrouted /debug path is a 404, answered BEFORE the webhook fallback
