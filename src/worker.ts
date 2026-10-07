@@ -7559,7 +7559,19 @@ const worker = {
         label: string,
         target: string,
         pick: (json: unknown) => ProbeReport,
+        // A COMPARISON TARGET is allowed to be dead on purpose. Some entries
+        // below exist only to keep a replacement host's reading comparable
+        // (the legacy pump.fun host is the live example), and their failure is
+        // the documented state rather than an alarm — so a probe that says so
+        // tags EVERY non-200 answer with `expected: true` + the reason, and a
+        // reader (or a monitor) can tell a deliberately dead control apart
+        // from a live feed that actually broke.
+        expectedDead?: string,
       ): Promise<ProbeReport> => {
+        const dead = (rep: ProbeReport): ProbeReport =>
+          expectedDead === undefined
+            ? rep
+            : { ...rep, expected: true, expectedNote: expectedDead };
         try {
           const res = await fetch(target, {
             headers: { Accept: "application/json", "User-Agent": GECKO_USER_AGENT },
@@ -7567,18 +7579,18 @@ const worker = {
           });
           const text = await res.text();
           if (!res.ok) {
-            return { label, status: res.status, bytes: text.length, body: text.slice(0, 120) };
+            return dead({ label, status: res.status, bytes: text.length, body: text.slice(0, 120) });
           }
           let parsed: unknown = null;
           try {
             parsed = JSON.parse(text);
           } catch {
             // non-JSON body (challenge page / HTML)
-            return { label, status: res.status, bytes: text.length, body: text.slice(0, 120) };
+            return dead({ label, status: res.status, bytes: text.length, body: text.slice(0, 120) });
           }
           return { label, status: res.status, bytes: text.length, ...pick(parsed) };
         } catch (err) {
-          return { label, error: err instanceof Error ? err.message : String(err) };
+          return dead({ label, error: err instanceof Error ? err.message : String(err) });
         }
       };
       // pump.fun rows carry `created_timestamp` in ms → the age of the newest
@@ -7646,7 +7658,19 @@ const worker = {
           "https://frontend-api-v3.pump.fun/coins?limit=20&offset=0&sort=created_timestamp&order=DESC",
           coins,
         ),
-        probe("pumpfun-legacy", "https://frontend-api.pump.fun/coins?limit=20&offset=0", coins),
+        // DEAD ON PURPOSE (2026-09-21): the host this client used BEFORE v3
+        // answers 530 / Cloudflare error 1016 (origin DNS gone), and it is kept
+        // here as the comparison that makes pumpfun-v3's 200 mean something —
+        // production never calls it, because src/pumpfun.ts's BASE_URL is the
+        // v3 host (see that file's header). Marked expected-dead so the 530
+        // reads as the documented control it is instead of as a feed that
+        // broke.
+        probe(
+          "pumpfun-legacy",
+          "https://frontend-api.pump.fun/coins?limit=20&offset=0",
+          coins,
+          "legacy host — 530 / CF error 1016 since 2026-09-21; production uses the v3 host (src/pumpfun.ts BASE_URL)",
+        ),
         probe(
           "dexscreener-boosts",
           "https://api.dexscreener.com/token-boosts/latest/v1",
