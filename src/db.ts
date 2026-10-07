@@ -880,6 +880,30 @@ export const DEX_PROFILES_LAST_KEY = "dex_profiles_last";
  */
 export const GECKO_DISCOVERY_AT_KEY = "gecko_discovery_at";
 
+/**
+ * The DexScreener BOOSTS lane's cadence stamp (see Scanner.boostsDiscoveryDue +
+ * DEXSCREENER_BOOSTS_INTERVAL_SECONDS in src/config.ts).
+ *
+ * SAME SHAPE, SAME REASON as GECKO_DISCOVERY_AT_KEY above, and the reason is
+ * the HOST rather than a key: /token-boosts/latest/v1 lives on
+ * api.dexscreener.com, whose limiter is charged per SOURCE IP — an address this
+ * Worker shares with the whole fleet, so `pairCacheRefused` and
+ * `listCacheRefused` climb no matter how carefully this client spaces its own
+ * calls (measured 2026-09-25, docs/profiles-feed-zeros.md). At one request per
+ * tick the boosts lane is HALF of this Worker's calls to that host for a lane
+ * whose lifetime yield is a few dozen coins and a handful of cards
+ * (`/debug/feed-stats` boosts), so the cadence is the honest trade: a boosted
+ * mint is only judged once it ages into the qualifying window, which makes
+ * registering it minutes late free — exactly the arithmetic that let gecko's
+ * keyed leg drop to one fetch per 5 minutes.
+ *
+ * DURABLE for the gecko row's reason: isolates churn every ~30s, so a
+ * per-isolate stamp would reset long before the window elapsed and the gate
+ * would never hold. The row rides SCAN_FRONT_GATE_KEYS' existing IN-list, so
+ * the question costs zero extra round trips.
+ */
+export const DEX_BOOSTS_AT_KEY = "dex_boosts_at";
+
 export const SCAN_FRONT_GATE_KEYS = [
   "schema_alter_v2_done",
   "token_stats_last_prune",
@@ -889,6 +913,10 @@ export const SCAN_FRONT_GATE_KEYS = [
   // decide whether this tick may spend a gecko fetch, written on the ticks
   // that do. One row on an IN-list that is already paid for.
   GECKO_DISCOVERY_AT_KEY,
+  // The boosts lane's cadence stamp (DEX_BOOSTS_AT_KEY above): read to decide
+  // whether this tick may spend a /token-boosts fetch, written on the ticks
+  // that do. One more row on the same IN-list, never a request of its own.
+  DEX_BOOSTS_AT_KEY,
   // The tracker pass's own row (pushwatch.TRACKER_PASS_STATE_KEY, spelled as
   // the literal because that module imports THIS one). It is READ, not gated
   // on: a tick's fallback pass asks it whether the pass's own cron delivery

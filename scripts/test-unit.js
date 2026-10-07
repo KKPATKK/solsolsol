@@ -16458,6 +16458,70 @@ async function main() {
     assert.equal(POOL_LIQUIDITY_PRUNE_RATIO, 0.8, "the pool's liquidity prune ratio (0.6 -> 0.8)");
   });
 
+  await test("boostsDiscoveryDue: fail-open on every reading it cannot trust", () => {
+    const { boostsDiscoveryDue, geckoDiscoveryDue } = require("../dist/scanner.js");
+    const MIN = 60_000;
+    const now = 1_800_000_000_000;
+    assert.equal(boostsDiscoveryDue(0, now, 5 * MIN), true, "no stamp row -> due");
+    assert.equal(boostsDiscoveryDue(Number.NaN, now, 5 * MIN), true, "a junk row -> due");
+    assert.equal(
+      boostsDiscoveryDue(now - 299_000, now, 5 * MIN),
+      false,
+      "inside the window -> no request sent at all",
+    );
+    assert.equal(
+      boostsDiscoveryDue(now - 300_000, now, 5 * MIN),
+      true,
+      "the window boundary is inclusive",
+    );
+    assert.equal(
+      boostsDiscoveryDue(now + 60_000, now, 5 * MIN),
+      true,
+      "a FUTURE stamp -> due, never parked",
+    );
+    assert.equal(
+      boostsDiscoveryDue(now - 60_000, now, 0),
+      true,
+      "0 interval = no gate (the pre-gate one-fetch-per-tick shape)",
+    );
+    assert.equal(boostsDiscoveryDue(now - 60_000, now, Number.NaN), true, "a junk interval = no gate");
+    // The two gates are the same arithmetic for DIFFERENT reasons — gecko's is
+    // quota-bound on a key, this one is rate-bound on the shared egress IP. Pin
+    // that they still agree on the readings that matter, so a future edit to
+    // one cadence cannot silently move the other's.
+    for (const [last, interval] of [
+      [0, 300_000],
+      [now - 299_999, 300_000],
+      [now - 300_000, 300_000],
+      [now - 600_000, 0],
+      [now + 1, 300_000],
+    ]) {
+      assert.equal(
+        boostsDiscoveryDue(last, now, interval),
+        geckoDiscoveryDue(last, now, interval),
+        `the two discovery gates must agree at (age ${last - now}ms, interval ${interval}ms)`,
+      );
+    }
+  });
+
+  await test("loadConfig: the boosts interval defaults to 5 minutes and fails closed", () => {
+    assert.equal(loadConfig({}).dexscreenerBoostsIntervalMs, 300_000);
+    assert.equal(
+      loadConfig({ DEXSCREENER_BOOSTS_INTERVAL_SECONDS: "60" }).dexscreenerBoostsIntervalMs,
+      60_000,
+    );
+    assert.equal(
+      loadConfig({ DEXSCREENER_BOOSTS_INTERVAL_SECONDS: "0" }).dexscreenerBoostsIntervalMs,
+      0,
+      "0 is the explicit no-gate value",
+    );
+    assert.equal(
+      loadConfig({ DEXSCREENER_BOOSTS_INTERVAL_SECONDS: "nope" }).dexscreenerBoostsIntervalMs,
+      300_000,
+      "junk fails CLOSED to the default, never open to a fetch every tick",
+    );
+  });
+
   await test("loadConfig: the gecko discovery interval defaults to 5 minutes", () => {
     assert.equal(loadConfig({}).geckoterminalDiscoveryIntervalMs, 300_000);
     assert.equal(
@@ -16583,6 +16647,32 @@ async function main() {
       dbSrc.includes('GECKO_DISCOVERY_AT_KEY="gecko_discovery_at"') &&
         dbSrc.includes("GECKO_DISCOVERY_AT_KEY,"),
       "the row must be declared AND riding SCAN_FRONT_GATE_KEYS (or it costs a read of its own)",
+    );
+    // The boosts cadence gate (2026-10-07): the same shape as gecko's, for a
+    // RATE-bound reason instead — boosts is the tick's second request to
+    // api.dexscreener.com, whose limiter is charged per shared SOURCE IP. Pin
+    // the same three things gecko's pins: the gate consults the durable stamp
+    // AND the configured interval, an attempt is stamped on the front's single
+    // write, and the row rides SCAN_FRONT_GATE_KEYS. A future edit that hands
+    // back the old unconditional fetch would restore one request per tick with
+    // every other test still green (they drive the client, not the fan-out).
+    assert.ok(
+      scannerSrc.includes(
+        "boostsDiscoveryDue(boostsLastAt,Date.now(),this.config.dexscreenerBoostsIntervalMs,)",
+      ),
+      "the boosts cadence gate must consult the durable stamp AND the configured interval",
+    );
+    assert.ok(
+      scannerSrc.includes("awaitthis.stampFront(DEX_BOOSTS_AT_KEY,String(Date.now()))"),
+      "a boosts attempt must be stamped on the scan front's single write",
+    );
+    assert.ok(
+      dbSrc.includes('DEX_BOOSTS_AT_KEY="dex_boosts_at"') && dbSrc.includes("DEX_BOOSTS_AT_KEY,"),
+      "the boosts row must be declared AND riding SCAN_FRONT_GATE_KEYS (or it costs a read of its own)",
+    );
+    assert.ok(
+      toml.includes('DEXSCREENER_BOOSTS_INTERVAL_SECONDS = "300"'),
+      "wrangler.toml must run the boosts gate at the measured 5-minute cadence, not leave it implicit",
     );
     assert.ok(
       scannerSrc.includes("if(diag.geo>0)return;") &&

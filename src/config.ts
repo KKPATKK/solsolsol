@@ -317,6 +317,46 @@ export interface AppConfig {
    */
   dexscreenerBoostsLimit: number;
   /**
+   * Minimum spacing between DexScreener boosts-lane FETCHES, in ms
+   * (DEXSCREENER_BOOSTS_INTERVAL_SECONDS, default 300 = one fetch per 5 min;
+   * 0 = no gate, i.e. one per tick — the pre-gate behaviour).
+   *
+   * WHY THE GATE EXISTS. The lane is the tick's SECOND request to
+   * api.dexscreener.com, and that host's limiter is charged per SOURCE IP —
+   * shared across the whole Worker fleet — so a per-tick boosts fetch is half
+   * of this Worker's contribution to a bucket strangers spend anyway
+   * (`pairCacheRefused`/`listCacheRefused` climb regardless of the spacing
+   * this client chooses; measured 2026-09-25, docs/profiles-feed-zeros.md).
+   * The lane's lifetime yield is a few dozen coins (`/debug/feed-stats`
+   * boosts), so the request rate is the only honest dial left — the row size
+   * already sits at the upstream's own ceiling and buys nothing (see
+   * dexscreenerBoostsLimit).
+   *
+   * WHY THE GATE COSTS NOTHING IN COVERAGE. A boosted mint carries no metrics
+   * and no timestamp (dexscreener.fetchBoostedTokens), so its age comes from
+   * the pair — and the scanner only judges a coin once it ages into the 30h
+   * qualifying window. A mint registered up to one interval late is therefore
+   * judged on exactly the same ticks, which is the identical argument that let
+   * gecko's keyed new-pools leg drop to one fetch per 5 minutes
+   * (geckoterminalDiscoveryIntervalMs). Ticks the gate holds back are covered
+   * by the always-on lanes: profiles stays per-tick, Jupiter recent/trending
+   * are per-tick, and jupTrend is the momentum analogue this lane shares its
+   * job with.
+   *
+   * The gate is DURABLE (Db.DEX_BOOSTS_AT_KEY), not per-isolate, for the reason
+   * geckoterminalDiscoveryIntervalMs documents: isolates churn every ~30s, so a
+   * per-isolate window would never elapse and the rate reduction would not
+   * exist. It rides the scan front's single read + single write.
+   *
+   * HOW TO READ IT: on a tick the gate holds back, `summary.boosts` is 0 and
+   * `summary.boostsDue` is false, and NO request is made (`dropsByLeg.boosts`
+   * stays flat — a gated tick is not a dropped one). `boosts 0` with
+   * `boostsDue true` is the other reading: a fetch that was allowed and came
+   * back refused or empty. Comparing `/debug/dex429` before and after a change
+   * to this value is the measurement that says whether it bought anything.
+   */
+  dexscreenerBoostsIntervalMs: number;
+  /**
    * Re-evaluation pool cap: how many never-pushed tokens nearing/inside the
    * qualifying age window to keep tracking (RE_EVAL_POOL_SIZE). Pool rows
    * are ordered by distance to the window entry, so the most relevant coins
@@ -765,6 +805,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawGeoDiscoverySec = Number(
     env.GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS ?? 300,
   );
+  const rawBoostsIntervalSec = Number(
+    env.DEXSCREENER_BOOSTS_INTERVAL_SECONDS ?? 300,
+  );
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
   const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
   const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
@@ -819,6 +862,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dexscreenerBoostsLimit: Number.isFinite(Number(env.DEXSCREENER_BOOSTS_LIMIT ?? 0))
       ? Math.max(0, Math.min(Math.floor(Number(env.DEXSCREENER_BOOSTS_LIMIT ?? 0)), 30))
       : 0,
+    // Same discipline as geckoterminalDiscoveryIntervalMs below: "0" is the
+    // documented no-gate value, and a JUNK value fails CLOSED to the 300s
+    // default rather than open to a per-tick fetch — an unparseable knob must
+    // not silently restore the request rate this gate exists to remove.
+    dexscreenerBoostsIntervalMs:
+      Number.isFinite(rawBoostsIntervalSec) && rawBoostsIntervalSec > 0
+        ? Math.floor(rawBoostsIntervalSec) * 1000
+        : env.DEXSCREENER_BOOSTS_INTERVAL_SECONDS === "0"
+          ? 0
+          : 300_000,
     // Ceiling 1200 (was 1000) since 2026-09-29: the hot band had outgrown its
     // 300-row LIMIT and was clipping its own eligible tier (see
     // POOL_HOT_ABOVE_MS in src/db.ts), so the hot budget went to 460 and the

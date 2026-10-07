@@ -3,6 +3,7 @@ import { tradeKeyboard } from "./bot";
 import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import {
+  DEX_BOOSTS_AT_KEY,
   DEX_PROFILES_LAST_KEY,
   GECKO_DISCOVERY_AT_KEY,
   SCAN_FRONT_GATE_KEYS,
@@ -1631,6 +1632,32 @@ export function geckoDiscoveryDue(
 }
 
 /**
+ * Whether the DexScreener boosts lane may spend a fetch this tick (pure —
+ * unit-tested). Same contract as geckoDiscoveryDue above: `intervalMs` is
+ * AppConfig.dexscreenerBoostsIntervalMs, 0 = no gate, and every reading it
+ * cannot trust (an absent row, a non-numeric row, a stamp in the FUTURE from
+ * clock skew) says DUE — the fail-open direction, because the cost of one extra
+ * fetch is one request while the cost of the other direction is a lane that
+ * silently stops for the length of the skew.
+ *
+ * Deliberately its own named function rather than a shared helper: the two
+ * gates are the same arithmetic for DIFFERENT reasons — gecko's is quota-bound
+ * on a key, this one is rate-bound on the shared egress IP — and a future
+ * change to either cadence should not be able to move the other's by accident.
+ */
+export function boostsDiscoveryDue(
+  lastAttemptMs: number,
+  nowMs: number,
+  intervalMs: number,
+): boolean {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return true;
+  if (!Number.isFinite(lastAttemptMs) || lastAttemptMs <= 0) return true;
+  const age = nowMs - lastAttemptMs;
+  if (age < 0) return true;
+  return age >= intervalMs;
+}
+
+/**
  * The durable stamp a REFUSED fetch should leave, so the leg is due again when
  * the host's own pause is over instead of a full interval later (pure —
  * unit-tested; null = leave the dispatch stamp alone).
@@ -1778,6 +1805,14 @@ export interface ScanSummary {
    * `subreqSkip`.
    */
   boosts: number;
+  /**
+   * Whether the boosts cadence gate allowed a fetch on this tick
+   * (DEXSCREENER_BOOSTS_INTERVAL_SECONDS + Db.DEX_BOOSTS_AT_KEY). false = the
+   * tick was inside the window, so the lane cost nothing at all: read together
+   * with `boosts`, `boosts 0` + `boostsDue false` is the gate working while
+   * `boosts 0` + `boostsDue true` is a fetch that came back empty or refused.
+   */
+  boostsDue?: boolean;
   /** pump.fun discovery feed size this scan (0 when blocked/unconfigured). */
   pump: number;
   /**
@@ -5095,22 +5130,46 @@ export class Scanner {
       // it cannot hold still reads as `dropsByLeg.boosts` instead of as an
       // empty list (see BOOST_FEED_SELF_BUDGET_MS).
       let boostProfiles: TokenProfile[] = [];
-      if (
-        this.dex &&
+      // THE CADENCE GATE (see dexscreenerBoostsIntervalMs and
+      // Db.DEX_BOOSTS_AT_KEY): boosts is the tick's SECOND request to
+      // api.dexscreener.com, whose limiter is charged per SOURCE IP — an
+      // address this Worker shares with the whole fleet — so the lane is spent
+      // at most once per window across every isolate. The row rides the front's
+      // single read above and its single write below, so the question costs no
+      // round trip of its own. A held-back tick deliberately makes NO request
+      // and reads `diag.boostsDue` false: that is what tells the gate working
+      // apart from an upstream that answered nothing.
+      const boostsLastAt = Number(front.gates.get(DEX_BOOSTS_AT_KEY) ?? 0);
+      const boostsDue =
+        this.dex !== null &&
         this.config.dexscreenerBoostsLimit > 0 &&
-        !dropOptionalLeg("boosts")
-      ) {
+        boostsDiscoveryDue(
+          boostsLastAt,
+          Date.now(),
+          this.config.dexscreenerBoostsIntervalMs,
+        );
+      diag.boostsDue = boostsDue;
+      if (boostsDue && !dropOptionalLeg("boosts")) {
         const boostsDeadline = Math.min(
           startedAt + BOOST_FEED_WINDOW_MS,
           frontDeadline,
         );
         feedJobs.push(
           this.fetchFeedCapped(
-            async () =>
-              this.dex!.fetchBoostedTokens(
+            async () => {
+              // Stamped at DISPATCH, inside the closure, for the reasons the
+              // gecko gate above documents: fetchFeedCapped refuses to call
+              // this when the feed window has nothing left, and a tick that
+              // never reached the network must not burn the window — while an
+              // attempt that DOES reach it may still have been billed (the
+              // adaptive spacing exists precisely because 429s are routine on
+              // this host), so the stamp is spent at dispatch, not on success.
+              await this.stampFront(DEX_BOOSTS_AT_KEY, String(Date.now()));
+              return this.dex!.fetchBoostedTokens(
                 this.config.dexscreenerBoostsLimit,
                 boostsDeadline,
-              ),
+              );
+            },
             [],
             boostsDeadline,
           )

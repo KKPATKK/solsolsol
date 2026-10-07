@@ -310,6 +310,36 @@ SCAN_PROFILE_LIMIT = "200"
 # with scanMs and subreqSkip; set this back to "0" if scanMs climbs or the leg
 # starts appearing in subreqSkip.
 DEXSCREENER_BOOSTS_LIMIT = "30"
+# Minimum spacing between boosts-lane FETCHES, in seconds (code default 300 =
+# one fetch per 5 min; 0 = no gate, one per tick — the pre-2026-10-07 shape).
+#
+# WHY. boosts is the tick's SECOND request to api.dexscreener.com, and that
+# host limits per SOURCE IP — an address this Worker shares with the whole
+# fleet — so the lane's request rate is the only honest dial left. Measured
+# 2026-10-07: `dex.http429 110`, `blockedForMs 89283` (the client parked in its
+# 90s cache-only backoff), `listCacheRefused 50`, `pairCacheRefused 60`, with
+# the leg itself reading `boosts 0` on the refused ticks. The row size buys
+# nothing (the Solana subset is under 20 whatever `DEXSCREENER_BOOSTS_LIMIT`
+# asks for) and the lane's lifetime yield is a few dozen coins, so the cadence
+# is what to change, not the size.
+#
+# WHY IT COSTS NO COVERAGE. A boosted mint carries no timestamp; its age comes
+# from the pair, and the scanner only judges a coin once it ages into the 30h
+# qualifying window — so a mint registered up to 5 minutes late is judged on
+# exactly the same ticks. Identical arithmetic to the gecko keyed leg's 5-minute
+# cadence below (GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS), which is where this
+# shape is copied from. Ticks the gate holds back keep profiles, Jupiter
+# recent/trending and the pool rotation untouched.
+#
+# HOW TO READ IT. A held-back tick reads `summary.boosts 0` WITH
+# `summary.boostsDue false` and makes NO request (`dropsByLeg.boosts` flat — a
+# gated tick is not a dropped one). `boosts 0` with `boostsDue true` is the
+# other reading: a fetch that was allowed and came back refused or empty.
+# Compare `/debug/dex429` (`lastHour`, `total`) before and after changing this
+# value — that is the reading that says whether the gate bought anything.
+# The gate is DURABLE (worker_state `dex_boosts_at`), because isolates churn
+# every ~30s. Set "0" to restore a fetch on every tick.
+DEXSCREENER_BOOSTS_INTERVAL_SECONDS = "300"
 # Re-evaluation pool: never-pushed coins nearing/inside the qualifying age
 # window that the bot keeps tracking until they qualify (code default 40,
 # max 1200). Ordered by relevance, so the closest-to-qualifying coins are
