@@ -72,7 +72,7 @@ scanner 只會喺幣 age 入咗 30h qualifying window 之後才判斷 —— 遲
 | Push | `543190c..64a4401 → origin/main`（fast-forward） |
 | Deploy run | [37690651363](https://github.com/KKPATKK/solsolsol/actions/runs/37690651363) — **success**，1m38s，headSha `64a4401`（typecheck／test:unit／`wrangler deploy`／3 個 secret 寫入全綠） |
 
-## 五、上線後 live 讀數（2026-10-07，21:37–21:47Z）
+## 五、上線後 live 讀數（2026-10-07，21:37Z–23:23Z）
 
 ### 5.1 新 version 已上線嘅證
 
@@ -116,11 +116,49 @@ row 只可能由呢個新 code 建立，所以：
 cron 60s）會喺窗口一開嘅 ~30–60s 內就攞走佢 —— 呢點本身就係「閘交替行緊」嘅證據，
 反而「長時間唔重開」先係 bug 嘅形狀。
 
+（呢個推斷後來有直接讀數：22:58:41Z 撞到 `boostsDue true` ＋ `boosts 26`，見 §5.5。）
+
 ### 5.4 `/debug/feed-stats`（21:40:10Z）
 
 `boosts coins 37 / pushed 4` —— 同「lifetime 幾十粒幣」嘅前提一致。（同
 `boosts-ceiling-window` doc §5.5 一樣：呢個係 lifetime 累計，短期升幅唔可以當
 逐 tick 讀數。）
+
+### 5.5 閘交替（直接讀數）：22:58:41Z `boostsDue true` ＋ `boosts 26`
+
+| 時刻 (Z) | `ms` | `boosts` | `boostsDue` |
+|---|---|---|---|
+| 22:58:41 | 3759 | **26** | **true** |
+| 23:23:15 | 2179 | 0 | false |
+
+兩行都係真 tick（`ms` 秒級，符合 §6 嘅讀取規則）。22:58:41Z 嗰行係 §5.3 時序推斷嘅
+**直接讀數版**：窗口一開，條 leg 即刻交付 26 行（同 `/debug/pool-source` 嘅
+`dexscreener-boosts` count 26 一致），放行嗰個 tick `dropsByLeg.boosts 0`；跟住嗰個
+tick 又見到閘揸住（`false`）—— 「過期 → 重開 → 消費 → 再揸住」呢個循環，而家兩個
+方向都有讀數，唔再只係時序推斷。
+
+### 5.6 429 量度：post-gate 1.8 小時，`lastHour` 首次跌出 ring 上限
+
+方法照 §6（`total` 差值、同類時段、Poisson）：
+
+| 窗口 | `total` 由 → 到 | 長度 | 事件/h |
+|---|---|---|---|
+| pre-gate 參考（10-05 12:00Z → 10-07 21:36:43Z） | 8799 → 12211 | 57.6h | **59.2** |
+| post-gate（21:36:43Z → 22:58:41Z） | 12211 → 12277 | 1.37h | **48.3** |
+| post-gate（21:36:43Z → 23:23:15Z） | 12211 → 12300 | 1.78h | **50.1** |
+
+- **`lastHour` 嘅轉折點**：21:39Z／22:32Z 兩個抽樣都係 50/50/50（飽和、冇分辨力），
+  22:58:41Z **第一次跌出上限讀 46**、23:23:15Z 讀 49 —— 一跌到 50 以下，嗰個讀數就
+  係**實數**（唔再係「≥50/h」嘅下限）。`last6h`／`last24h` 照舊 50，係 ring 得 50 個
+  episode 嘅飽和值，冇分辨力。
+- **形狀**：ring 嘅 last-20 span 亦一齊落：pre-gate 11.2 分鐘（101.9/h）→ 18.5 分鐘
+  （61.7/h）→ 而家 21.1 分鐘（**57.0/h**）。
+- **界線**：n=89 ⇒ Poisson ±1/√89 ≈ ±11%（區間 ~45–55/h）；1.8h 仍然短過 §6 要嘅 3h
+  窗口 ⇒ **方向係跌（−15%），幅度未可下結論**。要 attribution 就照 §6 開同等長度嘅
+  control 窗口再比。
+- 同場（23:23:15Z 嗰個 tick）：`profiles 23`、`pairs 185`、`geo 0／geoDue false`
+  （gecko 閘亦揸住）、per-isolate `http429 9`／`blockedForMs 61658`（isolate 自己嘅
+  短窗讀數，唔係全量）。
 
 ## 六、Operator 點讀呢個閘
 
@@ -132,7 +170,9 @@ cron 60s）會喺窗口一開嘅 ~30–60s 內就攞走佢 —— 呢點本身�
   `last24h` 係喺 ring 上面數（`/debug/dex429` 嘅 `countSince`），而 ring 由
   `db.bumpDex429` 以 `slice(-50)` 封頂 —— 三個數字**最多 50**，所以 pre 同 post 都
   飽和讀 50（實測 21:39Z／22:32Z 兩個抽樣都係 50/50/50），只可以講「仍然 ≥50/h」，
-  **證明唔到減幅**。體積要用 `total`：`(total₂ − total₁) ÷ 窗長` ＝ 事件/h，窗口要
+  **證明唔到減幅**（post-gate 1.8h 後 `lastHour` 開始跌出上限：22:58:41Z 讀 46、
+  23:23:15Z 讀 49 —— 一跌到 50 以下嗰刻，個讀數就係實數，見 §5.6；主證據照舊係
+  `total`）。體積要用 `total`：`(total₂ − total₁) ÷ 窗長` ＝ 事件/h，窗口要
   ≥3 個鐘同揀同類時段（deploy 前參考：10-05 12:00Z `8799` → 10-07 21:36Z `12211`
   ＝ 59.2/h）。樣本細要認 Poisson（n 個事件 ⇒ ±1/√n；n≈50 ⇒ ±14%），配
   `summary.boostsDue` 一齊讀。形狀／局部密度就睇 ring 嘅 last-20 span（pre-gate
@@ -147,10 +187,11 @@ cron 60s）會喺窗口一開嘅 ~30–60s 內就攞走佢 —— 呢點本身�
 
 ## 七、界線（老實講）
 
-- **429 減幅未量到**：deploy 後只係十幾分鐘嘅樣本，shared IP bucket 要長窗口先
-  睇得出（方法見上）。呢份 doc 唔聲稱「429 跌咗幾多」。
-- **未捉到字面嘅 `boostsDue true` 一刻**：理由見 §5.3；重開係由 stamp 時序證明，
-  唔係靠一次撞彩讀數。
+- **429 減幅未可下結論**：post-gate 1.8h ＝ 50.1/h（pre-gate 參考 59.2/h，−15%），
+  方向係跌，但窗口短過 §6 要嘅 ≥3h、Poisson ±11% ⇒ 幅度未定（見 §5.6）。呢份 doc
+  唔聲稱「429 跌咗幾多」。
+- **`boostsDue true` 一刻**：22:58:41Z 直接撞到一次（`boosts 26`，見 §5.5）——
+  之前只有 §5.3 嘅時序推斷，而家有直接讀數；但佢仍然係隨機撞，唔係每次 poll 都見到。
 - **上游照樣可以拒**：呢個閘只減**本 Worker 嘅貢獻**（由 ~2 支/tick 降到 ~1.03 支/tick），
   陌生人貢獻佔多數，所以 `http429` 唔會變 0。
 - **未郁**：lever B（關 boosts）、lever C（profiles 節奏）、lever D（DexScreener key，
