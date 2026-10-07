@@ -128,8 +128,17 @@ cron 60s）會喺窗口一開嘅 ~30–60s 內就攞走佢 —— 呢點本身�
 - `summary.boosts 0` **＋** `boostsDue true` ＝ 允許咗嘅 fetch 空手／被拒返（例如 client
   正喺 90s cache-only backoff）—— 呢個係 upstream 讀數，唔係閘壞。
 - `summary.boosts > 0` ＝ 交付咗（例如 `/debug/pool-source` 探針嗰種 26 行）。
-- **429 減幅嘅量法**：過幾個鐘對比 `/debug/dex429` 嘅 `lastHour`／`total`（同
-  deploy 前 `total 12211`、`lastHour 50` 比），配 `summary.boostsDue` 一齊讀。
+- **429 減幅嘅量法 —— 用 `total` 差值，唔好用 `lastHour`**：`lastHour`／`last6h`／
+  `last24h` 係喺 ring 上面數（`/debug/dex429` 嘅 `countSince`），而 ring 由
+  `db.bumpDex429` 以 `slice(-50)` 封頂 —— 三個數字**最多 50**，所以 pre 同 post 都
+  飽和讀 50（實測 21:39Z／22:32Z 兩個抽樣都係 50/50/50），只可以講「仍然 ≥50/h」，
+  **證明唔到減幅**。體積要用 `total`：`(total₂ − total₁) ÷ 窗長` ＝ 事件/h，窗口要
+  ≥3 個鐘同揀同類時段（deploy 前參考：10-05 12:00Z `8799` → 10-07 21:36Z `12211`
+  ＝ 59.2/h）。樣本細要認 Poisson（n 個事件 ⇒ ±1/√n；n≈50 ⇒ ±14%），配
+  `summary.boostsDue` 一齊讀。形狀／局部密度就睇 ring 嘅 last-20 span（pre-gate
+  11.2 分鐘 20 事件 ＝ 101.9/h；post-gate 18.5 分鐘 ＝ 61.7/h）。要 attribution 嘅
+  話，開一個同等長度嘅 control 窗口（`DEXSCREENER_BOOSTS_INTERVAL_SECONDS = "0"`，
+  見下面 Rollback）再比兩個窗口嘅 `total/h`。
 - **Rollback**：`DEXSCREENER_BOOSTS_INTERVAL_SECONDS = "0"` ＝ 還原 pre-gate
   一 tick 一 fetch 嘅形狀（code 唔使改）。
 - **手動 `/debug/tick` 嘅陷阱**：有 25s cooldown，而且可能撞正 in-flight scan 而
