@@ -4667,6 +4667,14 @@ export class Scanner {
       );
       const poolReadStartedAt = Date.now();
       let poolReadMs = 0;
+      // The market-cap floor's partial index (see Db.ensurePoolBandIndex,
+      // 2026-10-07): fired OFF the read's critical path and memoized per
+      // isolate, so a cold start's first sweep keeps the old full-range walk
+      // and a slot later the band skips the ~14k rows the floor rejects.
+      // Best-effort by construction: this is an optimization, never a gate.
+      void this.db
+        .ensurePoolBandIndex(poolMinMcapUsd * POOL_MCAP_PRUNE_RATIO)
+        .catch(() => undefined);
       const poolRead = this.fetchFeedCapped(
         () =>
           // Dead-tick fix 2026-09-13: a budget-tripped tick used to keep

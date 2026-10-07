@@ -390,6 +390,31 @@ const DEAD_LIQUIDITY_USD = 1_000;
  */
 const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR last_liquidity_usd >= ${DEAD_LIQUIDITY_USD})`;
 
+/**
+ * The market-cap floor's SQL half, as a LITERAL — and why it has to be one.
+ *
+ * 2026-10-07 (measured): a sweep billed ~18.5k rows to return 1.2k, because
+ * `max_mcap_observed >= ?` can only be applied AFTER the launch_ms index range
+ * has been walked — ~86% of every band's candidates are rows whose known peak
+ * is under the floor. A PARTIAL index is the only access path that skips them,
+ * and SQLite matches one only when the query's predicate is the SAME
+ * expression: a bound parameter matches a pinned constant only while the
+ * planner sees that same value, the literal always does (and a DIFFERENT value
+ * falls back to the full walk rather than answering from a stale index —
+ * verified locally and on prod). So this ONE helper renders the floor (both
+ * callers and the index DDL), and the two cannot drift. A stale index — one pinned to a floor the caller no longer passes —
+ * is never chosen, because the implication cannot be proven, so a changed gate
+ * costs the old full walk and never a wrong answer.
+ */
+export function mcapFloorLiteral(minQualifyMcap: number): string {
+  return String(minQualifyMcap);
+}
+
+/** The index NAME for a floor: identifiers cannot carry the decimal point. */
+export function poolBandIndexName(minQualifyMcap: number): string {
+  return `idx_pool_band_m${mcapFloorLiteral(minQualifyMcap).replace(".", "_")}`;
+}
+
 /** Opening stats captured the first time the scanner ever saw a token. */
 export interface TokenStats {
   token: string;
@@ -1665,6 +1690,52 @@ export class Db {
   }
 
   /**
+   * The band query's partial index — the one access path that skips the rows
+   * the market-cap floor is going to reject anyway (2026-10-07).
+   *
+ * WHAT IT BUYS (measured 2026-10-07, scripts/pool-read-cost.js burst + the
+ * platform's rows_read): 18.5k rows per pool read before, 5.75k after — 3.2x
+ * off the single largest reader the bot has, with the A/B check confirming the
+ * same 518 near-band tokens come back token-for-token through either index.
+ * The band's range is launch_ms and the floor is on max_mcap_observed, so
+ * without this the floor is a post-walk filter over ~86% dead candidates; a
+ * partial index pinned to the floor's literal (see mcapFloorLiteral) lets the
+ * range walk only the rows the floor admits.
+   *
+   * WHERE IT IS CALLED FROM: the SCANNER, once per isolate per floor — not from
+   * getReevalPoolBatched, because the audit instruments drive that method at a
+   * LADDER of ratios (pool-mcap-floor.js) and would each mint an index for a
+   * floor production never uses.
+   *
+   * FAILURE IS CHEAP AND SILENT-ISH: the index is an optimization, so a failure
+   * only means the next sweep keeps the pre-2026-10-07 plan; the retry interval
+   * keeps a broken DDL from being re-attempted on every tick.
+   */
+  private poolBandIndexFloor: number | null = null;
+  private poolBandIndexRetryAt = 0;
+  async ensurePoolBandIndex(minQualifyMcap: number): Promise<void> {
+    if (!Number.isFinite(minQualifyMcap)) return;
+    if (this.poolBandIndexFloor === minQualifyMcap) return;
+    if (Date.now() < this.poolBandIndexRetryAt) return;
+    const name = poolBandIndexName(minQualifyMcap);
+    try {
+      await this.get().execute({
+        sql: `CREATE INDEX IF NOT EXISTS ${name} ON token_stats(launch_ms)
+              WHERE (max_mcap_observed IS NULL OR max_mcap_observed >= ${mcapFloorLiteral(minQualifyMcap)})`,
+        args: [],
+      });
+      this.poolBandIndexFloor = minQualifyMcap;
+      console.log(`[db] pool band index ready: ${name}`);
+    } catch (err) {
+      this.poolBandIndexRetryAt = Date.now() + 30 * 60_000;
+      console.warn(
+        "[db] pool band index unavailable (band walks stay full-range):",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
    * One-round-trip variant of getReevalPool (2026-09-19).
    *
    * Why a second method and not a reshape of getReevalPool: the original plus
@@ -1757,9 +1828,12 @@ export class Db {
     const statements = bands.map((b) => {
       const clauses: string[] = [DEAD_POOL_CLAUSE];
       const args: Array<string | number> = [b.lo, b.hi, opts.sinceMs];
+      // Literal floor, no argument — see mcapFloorLiteral. Both builders must
+      // carry the SAME shape or the drift guard pins them apart.
       if (opts.minQualifyMcap !== undefined) {
-        clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed >= ?)`);
-        args.push(opts.minQualifyMcap);
+        clauses.push(
+          `(max_mcap_observed IS NULL OR max_mcap_observed >= ${mcapFloorLiteral(opts.minQualifyMcap)})`,
+        );
       }
       if (opts.maxQualifyMcap !== undefined) {
         clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed <= ?)`);
@@ -4348,8 +4422,12 @@ export class Db {
     // path measure a pool larger than the tick's (found while measuring the
     // band sizes behind POOL_BAND_ROTATE_BUCKETS).
     const clauses: string[] = [DEAD_POOL_CLAUSE];
+    // A LITERAL, not a bound argument — see mcapFloorLiteral: this is what lets
+    // Db.ensurePoolBandIndex's partial index cover the band's range.
     if (opts.minQualifyMcap !== undefined)
-      clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed >= ?)`);
+      clauses.push(
+        `(max_mcap_observed IS NULL OR max_mcap_observed >= ${mcapFloorLiteral(opts.minQualifyMcap)})`,
+      );
     if (opts.maxQualifyMcap !== undefined)
       clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed <= ?)`);
     if (opts.minQualifyLiquidity !== undefined)
@@ -4359,7 +4437,8 @@ export class Db {
     const qualifyClause = clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : "";
     const seen = this.seenExclusion(opts.seenChatIds);
     const args: Array<string | number> = [lo, hi, opts.sinceMs];
-    if (opts.minQualifyMcap !== undefined) args.push(opts.minQualifyMcap);
+    // No argument for minQualifyMcap: it rides the SQL as a literal (see
+    // mcapFloorLiteral) so the partial index can cover this range.
     if (opts.maxQualifyMcap !== undefined) args.push(opts.maxQualifyMcap);
     if (opts.minQualifyLiquidity !== undefined)
       args.push(opts.minQualifyLiquidity);
