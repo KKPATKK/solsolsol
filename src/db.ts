@@ -5589,12 +5589,18 @@ export class Db {
     buckets: Record<string, number>;
     eligibleInWindow: number;
     /**
-     * Rows the freshness mark holds OUT of the pool right now (`deadMarked`)
-     * and rows one empty sweep away from it (`deadPending`) — see
-     * DEAD_POOL_MISS_MAX. Read together with `total`/`eligibleInWindow` they
-     * are the reading that says whether the mark is pruning a corpse
-     * population or quietly eating the window: both ride the full-table scan
-     * this endpoint already pays for, so the reading is free.
+     * The pool's own dead predicate, counted — see DEAD_POOL_MARK.
+     *
+     * `deadMarked` = rows the re-eval pool query holds OUT right now. That is
+     * the $1K liquidity FLOOR (which has pruned since 2026-09-19) PLUS the
+     * freshness bound — so on a database whose `sweeps_since_reading` was just
+     * created (every row at its 0 default) it reads exactly the floor's
+     * steady-state population, and only a strike of empty sweeps moves it.
+     * `deadPending` = rows inside the freshness window (0 < streak < bound),
+     * i.e. the rows the sweep-by-sweep count is watching. Read against
+     * `total`/`eligibleInWindow` they answer "is this block of the table
+     * corpses, and is the freshness half finding any of its own": both ride
+     * the full-table scan this endpoint already pays for, so they are free.
      */
     deadMarked: number;
     deadPending: number;

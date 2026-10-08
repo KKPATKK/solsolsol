@@ -82,8 +82,9 @@ cron/DO clock 嘅節奏無關。
 ## 七、部署後要讀嘅數（本文未量）
 
 1. `/debug/pool` 嘅新欄 `deadMarked` / `deadPending`（同 `total` / `eligibleInWindow` 一齊讀；
-   端點有 5 分鐘 durable TTL）。**預期**：deploy 後 `deadMarked` 由 0 慢慢升到一個細數
-   （屍體先要連續三次空 sweep），`deadPending` ≤ 約 3 × 每日死亡數。
+   端點有 5 分鐘 durable TTL）。**預期**：`deadMarked` **唔係由 0 起**——佢係池嗰條死謂詞
+   嘅人口（$1K 地板 ＋ 新鮮度界），所以一開始就係地板本來剔走嗰堆，之後先隨空 sweep 再升；
+   真正要睇嘅增量係「`deadMarked` 高出地板人口嘅部分」同 `deadPending` ≤ 約 3 × 每日死亡數。
 2. `/health` 摘要嘅 `diag.poolMisses`（同 `poolSliced` / `pairsMissing` 一齊讀）。
    **預期**：健康 tick 係細數（0–3）；429 窗係 **0**（守衛）；長期高企而 `pairsJup` 冇補上
    ⇒ 睇係 lane 有事定係真屍體。
@@ -137,3 +138,31 @@ lane（例如將來將 Jupiter 腿併入 front pair lane——本 repo 常做嘅
 幣」，而 Jupiter 答到＝池讀得到。所以「只有 Jupiter 腿答得到」嘅幣會**凍結**標記：唔會被推
 死，亦唔會被清。刻意嘅 fail-safe 方向，同「缺失數據不判斷」一致；下一個 DS-served sweep 就
 會照常記錄同清 0。
+
+---
+
+## 十、部署同第一組生產讀數（2026-10-08）
+
+`39834c6`（ff 落 `main`）→ GitHub Actions「Deploy Worker to Cloudflare」run `37861409692`
+**success**（即 `npm ci` ＋ `typecheck` ＋ `test:unit` ＋ `wrangler deploy` ＋ 三個
+best-effort secret 全部綠）。部署後即刻抽嘅兩個公開讀數：
+
+| 端點 | 讀數 |
+|---|---|
+| `/debug/pool`（`cached: false`，23:51:07Z） | `ok true`；`total 77801`；`eligibleInWindow 70475`；**`deadMarked 522`**、**`deadPending 0`**；`poolQueryCount 1154`（limit 1200）；`mcapFloorUsd 48000`、`liquidityFloorUsd 8000` |
+| `/health`（tick `via cron`、`relay inner`、`colo NRT`、`ms 3396`） | summary 有 **`poolMisses 0`**；`pairs 183`／`pairsJup 173`／`pairsMissing 0`（健康批次）；`staleReadings 0`；`pool 1222`、`poolSliced 90`；`getReevalPool 46ms` |
+
+點讀：
+
+- **代碼同 migration 都 live**：`/debug/pool` 兩個新欄係新 code 先有，而佢哋條 SQL 直接
+  `SUM … sweeps_since_reading …` —— 呢個呼叫返到數，即係 `addColumnIfMissing` 已經喺
+  prod 建好新欄（唔會 throw），而且池 query 本身健康（1154/1200 行，46ms）。
+- **`deadMarked 522` 唔係「新鮮度標記剔咗 522 隻」**：佢係池嗰條死謂詞嘅人口，而
+  `sweeps_since_reading` 啱啱才建、全部 row 都係 0 default——所以呢 522 隻全部係 **$1K 地板
+  本來就剔走**嘅（同改動前一樣），新鮮度半邊今日嘅增量係 **0**。`deadPending 0` 亦一致：
+  冇任何池幣行過空 sweep。
+- **`poolMisses 0`**：呢個 tick `pairsMissing 0`（pair lane 答齊全），所以「掃咗但冇讀數」係
+  0——守衛同預期一致；要見到非 0 就要等有幣嘅 pair 真嘅消失（或者 lane 局部拒絕）。
+- **候選純度嘅提升仍然未量**：呢個 tick pool 1222／slice 90／candidates 0，同改動前冇
+  baseline 對比，所以本文唔聲稱任何提升幅度；要量就要睇幾日 `deadMarked` 高出地板人口嘅部分
+  同 `poolMisses` 嘅分佈。

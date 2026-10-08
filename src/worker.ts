@@ -8828,11 +8828,12 @@ const worker = {
         neverPushed: hist.neverPushed,
         buckets: hist.buckets,
         eligibleInWindow: hist.eligibleInWindow,
-        // The freshness mark's population (2026-10-08 — see
-        // db.DEAD_POOL_MISS_MAX): rows held out of the sweep for coming back
-        // empty too many times, and rows one empty sweep away. They are what
-        // makes a poolQueryCount that fell interpretable: it fell because
-        // these rows left, not because the floors moved.
+        // The pool's dead predicate, counted (2026-10-08 — see
+        // db.DEAD_POOL_MARK): rows the sweep holds out (the $1K floor, which
+        // has always pruned, PLUS the freshness bound) and rows one empty
+        // sweep away from it. They are what makes a poolQueryCount that fell
+        // interpretable: it fell because these rows left, not because the
+        // floors moved.
         deadMarked: hist.deadMarked,
         deadPending: hist.deadPending,
         // The budget the query above actually ran with (see its `limit`):
