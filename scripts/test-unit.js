@@ -4353,6 +4353,238 @@ async function main() {
     await t.cleanup();
   });
 
+  // The freshness mark (2026-10-08, db.DEAD_POOL_MISS_MAX). The floor above
+  // only judges a reading the scan can still SEE; a coin whose pair VANISHES
+  // never gets a new reading, so its last live one kept vouching for it in
+  // every rotation forever. The mark counts consecutive sweeps that came back
+  // EMPTY and the pool query drops the coin at the bound — while the one thing
+  // that clears it is a fresh READING, and a row nobody has measured keeps the
+  // fail-open behavior whatever its streak.
+  await test("pool: a coin whose sweeps keep coming back empty is marked dead, and a reading clears it", async () => {
+    const { DEAD_POOL_MISS_MAX } = require("../dist/db.js");
+    const t = tmpDb();
+    const db = new Db("file:injected", undefined, t.client);
+    await db.init();
+    const now = Date.now();
+    const seed = async (token, ageMin, lastLiq, streak) => {
+      const launch = now - ageMin * 60_000;
+      await t.client.execute({
+        sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed, last_liquidity_usd, sweeps_since_reading)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [token, launch, 10_000, ageMin, launch, 120_000, 250_000, lastLiq, streak],
+      });
+    };
+    // Every coin carries the SAME peak and a live-looking reading, so only the
+    // streak can decide — not the floor and not either high-water prune. All
+    // four sit in the same band so the rotation cannot be what hides one.
+    await seed("FRESH", 100, 25_000, 0);
+    await seed("ONESHORT", 102, 25_000, DEAD_POOL_MISS_MAX - 1);
+    await seed("MARKED", 104, 25_000, DEAD_POOL_MISS_MAX);
+    await seed("NOMEASURE", 106, null, DEAD_POOL_MISS_MAX + 2);
+    const opts = {
+      sinceMs: now - 30 * 3600_000,
+      minLaunchMs: now - (1560 + 180) * 60_000,
+      maxLaunchMs: now - (80 - 180) * 60_000,
+      windowEntryLaunchMs: now - 80 * 60_000,
+      limit: 1000,
+      nearSlots: 2,
+      farSlots: 12,
+      rotationPeriodMs: 1e12,
+      minQualifyMcap: 30_000,
+      maxQualifyMcap: 500_000,
+      minQualifyLiquidity: 5_000,
+      seenChatIds: ["chat-1"],
+      now,
+    };
+    const before = (await db.getReevalPoolBatched(opts)).map((r) => r.token);
+    assert.ok(before.includes("FRESH"), "a coin with a fresh reading is swept");
+    assert.ok(
+      before.includes("ONESHORT"),
+      `one empty sweep is not a verdict (bound ${DEAD_POOL_MISS_MAX})`,
+    );
+    assert.ok(!before.includes("MARKED"), "a coin AT the bound leaves the sweep");
+    assert.ok(
+      before.includes("NOMEASURE"),
+      "a row nobody has measured keeps the fail-open behavior, whatever its streak says",
+    );
+
+    // The advance: one statement, +1 per listed coin, and only for the coins
+    // the sweep actually asked for (the scanner owns that list).
+    assert.equal(await db.noteSweptWithoutReading([]), 0, "an empty list is a no-op");
+    assert.equal(
+      await db.noteSweptWithoutReading(["FRESH", "ONESHORT", "MARKED"]),
+      3,
+      "every listed coin is advanced",
+    );
+    const after = (await db.getReevalPoolBatched(opts)).map((r) => r.token);
+    assert.ok(after.includes("FRESH"), "the first empty sweep still sweeps (it is a signal, not a verdict)");
+    assert.ok(!after.includes("ONESHORT"), "the coin that reached the bound leaves the sweep");
+    assert.ok(!after.includes("MARKED"), "past the bound stays out");
+
+    // ...and a READING is the only thing that clears it (recordObservedLiquidity
+    // is the mark's one reset site, in the same statement as the value).
+    await db.recordObservedLiquidity([{ token: "ONESHORT", liquidityUsd: 30_000 }]);
+    const cleared = (await db.getReevalPoolBatched(opts)).map((r) => r.token);
+    assert.ok(cleared.includes("ONESHORT"), "a fresh reading clears the mark on the same write");
+
+    // The population readings /debug/pool publishes ride the same scan and are
+    // read from the same two constants: FRESH is the only row inside the mark's
+    // (0, bound) window, MARKED the only held-out one. NOMEASURE is neither — a
+    // NULL reading is not counted by either counter, which is exactly how the
+    // mark stays unable to judge an unmeasured row.
+    const hist = await db.getPoolHistogram(now, ["chat-1"]);
+    assert.equal(hist.deadPending, 1, "one row is one empty sweep into the mark");
+    assert.equal(hist.deadMarked, 1, "one row is held out of the sweep");
+    await t.cleanup();
+  });
+
+  // The observed-liquidity write's provenance guard (2026-10-08):
+  // `last_liquidity_usd` feeds the re-eval pool's dead-pool floor AND the
+  // freshness mark that rides it, both DexScreener-calibrated, so a
+  // Jupiter/Gecko reading (~half / under-reported) may never reach it — the
+  // same rule the scanner's high-water raise and the tracker's liquidity rules
+  // already enforce, from the same source of truth (liquidityIsComparable).
+  await test("worker.observedLiquidityUsd: only the calibrated leg may be recorded", () => {
+    const { observedLiquidityUsd } = require("../dist/worker.js");
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 25_000 }, feedSource: "dexscreener" }),
+      25_000,
+      "the calibrated leg is what the column is for",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 25_000 } }),
+      25_000,
+      "an untagged pair (fixtures, synthetic, legacy) counts as DexScreener's",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 0 }, feedSource: "dexscreener" }),
+      0,
+      "a drained pool's $0 IS a reading — it is the corpse signal the floor drops the coin on",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 12_500 }, feedSource: "jupiter" }),
+      undefined,
+      "Jupiter's ~0.5x reading must not be written (it would push a live $25K pool under $1K's cousin)",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 4_000 }, feedSource: "gecko" }),
+      undefined,
+      "Gecko's reserve is a third metric, not a smaller pool",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: null }, feedSource: "dexscreener" }),
+      undefined,
+      "an answered pair with no reading leaves the column alone (fail-open)",
+    );
+    assert.equal(observedLiquidityUsd({ liquidity: null }), undefined, "no liquidity field at all is not a $0");
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: Number.NaN } }),
+      undefined,
+      "a non-finite reading is never written",
+    );
+    // ...and the tick's only producer must go THROUGH it: a raw
+    // `pair.liquidity?.usd` in that wrapper is exactly the leak this closes.
+    const workerSrc = fs
+      .readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "")
+      .replace(/\s+/g, "");
+    assert.ok(
+      workerSrc.includes("constliq=observedLiquidityUsd(pair);") &&
+        workerSrc.includes("if(liq!==undefined)observedLiquidity.set(token,liq);"),
+      "the flush's producer must read the guarded helper",
+    );
+    assert.equal(
+      (workerSrc.match(/pair\.liquidity\?\.usd/g) || []).length,
+      1,
+      "...and the raw pair read must exist in exactly ONE place — the guarded helper itself (a second one is the leak)",
+    );
+  });
+
+  // The freshness mark's INPUT (scanner.poolSweepMisses): which pool coins a
+  // sweep asked for and got nothing back for. The coverage guard is the part
+  // that must not drift: a refused batch is a fact about the TRANSPORT, and a
+  // 429 window must not advance a single coin's mark.
+  await test("Scanner.poolSweepMisses: only a HEALTHY batch can mark a pool coin", () => {
+    const { poolSweepMisses, POOL_SWEEP_HEALTHY_COVERAGE } = require("../dist/scanner.js");
+    const answers = new Map([
+      ["A", {}],
+      ["B", {}],
+    ]);
+    assert.deepEqual(
+      poolSweepMisses(["A", "C"], answers, 10, 10),
+      ["C"],
+      "a pool coin the answer left out is a miss",
+    );
+    assert.deepEqual(
+      poolSweepMisses(["A", "C"], answers, 5, 10),
+      ["C"],
+      "coverage exactly at the floor still counts — the Jupiter fallback fires BELOW it",
+    );
+    assert.deepEqual(
+      poolSweepMisses(["A", "C"], answers, POOL_SWEEP_HEALTHY_COVERAGE * 10 - 0.001, 10),
+      [],
+      "below the floor the whole list is dropped: a refused sweep advances nothing",
+    );
+    assert.deepEqual(poolSweepMisses([], answers, 10, 10), [], "an empty slice has no misses");
+    assert.deepEqual(
+      poolSweepMisses(["A"], answers, 0, 0),
+      [],
+      "a sweep that asked for nothing cannot fail",
+    );
+  });
+
+  // The wiring, pinned where the rule cannot pin it: the list must be built
+  // from the ROTATION SLICE (never from the feed's coins, whose missing pair is
+  // their normal state), drained ONCE by the tick's tail, and the pool query's
+  // ONE clause must carry the mark into BOTH builders plus the histogram.
+  await test("freshness mark: one sweep produces both halves, one clause drives every reader", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", "src", p), "utf8"));
+    const scannerSrc = read("scanner.ts");
+    const workerSrc = read("worker.ts");
+    const dbSrc = read("db.ts");
+    assert.ok(
+      scannerSrc.includes(
+        "this.pendingPoolSweepMisses=poolSweepMisses(poolSlice.map((p)=>p.tokenAddress),pairsByToken,pairsByToken.size,addresses.length,",
+      ),
+      "the scanner must build the list from the rotation slice and the final pair answer",
+    );
+    assert.ok(
+      (scannerSrc.match(/takePoolSweepMisses\(\)/g) || []).length === 1 &&
+        scannerSrc.includes("this.pendingPoolSweepMisses=[];"),
+      "the take-once accessor must be the only reader and must clear the list",
+    );
+    assert.ok(
+      workerSrc.includes("flushObservedLiquidity(scanner)") &&
+        workerSrc.includes("db.noteSweptWithoutReading(missed)") &&
+        workerSrc.includes("db.recordObservedLiquidity(rows)"),
+      "the tick's tail must write the advance and the reset from the same sweep",
+    );
+    assert.ok(
+      (dbSrc.match(/\$\{DEAD_POOL_MARK\}/g) || []).length === 2,
+      "the clause and the histogram's counter must read the SAME mark expression",
+    );
+    assert.ok(
+      (dbSrc.match(/\[DEAD_POOL_CLAUSE\]/g) || []).length === 2,
+      "both pool builders must carry the clause (the drift guard)",
+    );
+    assert.ok(
+      scannerSrc.includes('POOL_QUERY_SHAPE_VERSION="v2-2026-10-08-dead-mark"') &&
+        scannerSrc.includes("poolKeyHash(POOL_QUERY_SHAPE_VERSION+"),
+      "the pool snapshot key must carry the SQL's own shape version, or a snapshot taken with the OLD predicate answers the new one",
+    );
+    assert.ok(
+      dbSrc.includes("sweeps_since_reading=sweeps_since_reading+1") &&
+        dbSrc.includes("sweeps_since_reading=0"),
+      "advance and reset must live in the SQL, not in the caller",
+    );
+  });
+
   // Axiom kill switch (AXIOM_ENABLED, default on). Off must mean the Worker
   // never builds the Axiom client: the session costs one /token-info call per
   // final candidate and fires a "session dead" admin alert once it expires,

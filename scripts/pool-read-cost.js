@@ -102,7 +102,7 @@ function bandSql(orderSql) {
   return `SELECT * FROM token_stats
             WHERE launch_ms BETWEEN ? AND ?
               AND first_seen_at > ?
-              AND (last_liquidity_usd IS NULL OR last_liquidity_usd >= ?)
+              AND ${DEAD_POOL_CLAUSE}
               AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)
               AND (max_mcap_observed IS NULL OR max_mcap_observed <= ?)
               AND (max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)
@@ -111,10 +111,15 @@ function bandSql(orderSql) {
             LIMIT ?`;
 }
 
-// Mirrored from src/db.ts: constant-only, so it is literal text in the SQL —
-// which is exactly why a partial index on it needs no dynamic DDL.
+// Mirrored from src/db.ts (2026-10-08): constant-only, so it is literal text
+// in the SQL — which is exactly why a partial index on it needs no dynamic
+// DDL. The freshness half is the mark the scanner advances on an empty sweep
+// (a HEALTHY batch only) and clears on a reading, so the pool this instrument
+// counts is the one the tick reads, corpses included.
 const DEAD_LIQUIDITY_USD = 1_000;
-const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR last_liquidity_usd >= ${DEAD_LIQUIDITY_USD})`;
+const DEAD_POOL_MISS_MAX = 3;
+const DEAD_POOL_MARK = `(last_liquidity_usd IS NOT NULL AND (last_liquidity_usd < ${DEAD_LIQUIDITY_USD} OR sweeps_since_reading >= ${DEAD_POOL_MISS_MAX}))`;
+const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR NOT (${DEAD_POOL_MARK}))`;
 
 const PRUNES = `AND (last_liquidity_usd IS NULL OR last_liquidity_usd >= ?)
           AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)
@@ -328,7 +333,10 @@ async function main() {
 
   const plan = await client.execute({
     sql: `EXPLAIN QUERY PLAN ${bandSql("ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC, ((UNICODE(SUBSTR(token, -1)) + ?) % 8)")}`,
-    args: [hotLo, hotHi, spanLo, ...pruneArgs, 0, hotLimit],
+    // pruneArgs[0] is the dead-liquidity floor this statement no longer binds
+    // (see DEAD_POOL_CLAUSE): the clause is literal text, so the arg list skips
+    // it rather than shifting every floor behind it by one.
+    args: [hotLo, hotHi, spanLo, ...pruneArgs.slice(1), 0, hotLimit],
   });
   const details = plan.rows.map((r) => String(r.detail ?? r.DETAIL ?? JSON.stringify(r)));
   console.log("");

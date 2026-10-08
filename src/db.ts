@@ -383,12 +383,66 @@ const POOL_ROTATION_PERIOD_MS = 300_000;
 const DEAD_LIQUIDITY_USD = 1_000;
 
 /**
- * The pool pre-filter that a recent reading drives (see DEAD_LIQUIDITY_USD).
- * Constant-only, so it needs no bound argument in either query builder — and
- * both MUST carry it, or the batched path would re-admit the corpses the
- * per-band path drops (the same drift the pair of builders is tested for).
+ * How many consecutive pool sweeps may come back with NO reading at all before
+ * a stored reading stops vouching for a coin (2026-10-08).
+ *
+ * WHY A FRESHNESS MARK WAS NEEDED: the floor above only judges a coin the
+ * scan can still SEE. A coin whose pair vanishes entirely — the pool closed,
+ * the mint drained out of DexScreener's answer, no venue left to read — comes
+ * back from the pair fetch with nothing, so `last_liquidity_usd` is never
+ * overwritten and the last reading it DID get (≥ $1K, above the floor) keeps
+ * the corpse in every rotation forever: rows-read, a pair-fetch slot and a
+ * reject per sweep, for a coin that can no longer qualify. The other prunes
+ * cannot answer this either — `max_mcap_observed` / `max_liquidity_observed`
+ * are lifetime high-water marks by construction.
+ *
+ * WHY SWEEPS AND NOT A WALL-CLOCK TTL: the mark counts sweeps that came back
+ * EMPTY, so it advances only when the pool actually asked AND the transport
+ * answered for everything else (see scanner.poolSweepMisses). A stalled scan —
+ * cron outage, degraded database — advances nothing, so a quiet period can
+ * never mass-evict live coins; a wall-clock bound would instead have to guess
+ * an interval longer than the worst rotation recurrence and would still age
+ * out every coin that window failed to reach. Sweeps are also the unit the
+ * pool is denominated in: the rotation, not the clock, decides how often a
+ * coin is looked at.
+ *
+ * WHY THREE: the healthy-batch guard means one bad batch (a 429 window, the
+ * deadline cutting the tail) can never mark anything. What is left is a
+ * COIN-LEVEL absence — three consecutive sweeps of the same coin, each a full
+ * rotation apart (~13 minutes at the 90-coin slice against a 1,200-coin
+ * pool), came back with no pair at all. A live coin the pair lane can serve
+ * does not do that; a closed pool does nothing else.
+ *
+ * WHY A MARK INSTEAD OF A DELETE: the row carries every other prune's input
+ * (launch_ms window, mcap high-water, first-seen age). Deleting it would
+ * re-register the mint as a fresh discovery — resetting firstSeenAt, which is
+ * the age gate's own basis. The mark is a column, the eviction is the pool
+ * query's predicate, and a discovery feed that finds the coin again clears it
+ * on the first fresh reading (the same "excluded until the feed finds it
+ * again" trade-off the mcap and liquidity prunes already make).
  */
-const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR last_liquidity_usd >= ${DEAD_LIQUIDITY_USD})`;
+export const DEAD_POOL_MISS_MAX = 3;
+
+/**
+ * The freshness mark's SQL half, built from the two constants above so the
+ * predicate, the histogram's counting and the offline instruments cannot
+ * drift. Three-valued logic is load-bearing: a NULL `last_liquidity_usd`
+ * (nobody has measured this row since the column existed) makes the mark
+ * NULL, and every reader below reads that as ALIVE — the fail-open discipline
+ * the rest of the prunes follow.
+ */
+const DEAD_POOL_MARK =
+  `(last_liquidity_usd IS NOT NULL AND ` +
+  `(last_liquidity_usd < ${DEAD_LIQUIDITY_USD} OR sweeps_since_reading >= ${DEAD_POOL_MISS_MAX}))`;
+
+/**
+ * The pool pre-filter that a recent reading AND its freshness drive (see
+ * DEAD_LIQUIDITY_USD / DEAD_POOL_MISS_MAX). Constant-only, so it needs no
+ * bound argument in either query builder — and both MUST carry it, or the
+ * batched path would re-admit the corpses the per-band path drops (the same
+ * drift the pair of builders is tested for).
+ */
+const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR NOT (${DEAD_POOL_MARK}))`;
 
 /**
  * The market-cap floor's SQL half, as a LITERAL — and why it has to be one.
@@ -2467,6 +2521,17 @@ export class Db {
     // still there?" — this column can, and it is what the pool's dead-pool
     // prune reads. Unconditional because addColumnIfMissing is idempotent.
     await this.addColumnIfMissing("token_stats", "last_liquidity_usd", "REAL");
+    // Freshness OF that reading (2026-10-08): how many consecutive pool sweeps
+    // have come back with NO reading for this coin (see DEAD_POOL_MISS_MAX).
+    // The column above judges what a reading SAID; this one judges whether the
+    // reading is still being CONFIRMED — a coin whose pair has vanished never
+    // gets a new reading, so without this the last live one vouches for it
+    // forever. Unconditional — addColumnIfMissing is idempotent.
+    await this.addColumnIfMissing(
+      "token_stats",
+      "sweeps_since_reading",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
     // Feed attribution: which discovery feed first registered each coin
     // (per-feed quality stats). Unconditional — idempotent.
     await this.addColumnIfMissing("token_stats", "discovered_via", "TEXT");
@@ -2582,6 +2647,13 @@ export class Db {
    * this AFTER the tick (it can never delay a card's claim). Same
    * fire-and-forget contract as the deferred-write drain: a lost isolate
    * simply re-observes on the next tick.
+   *
+   * It is also the ONLY thing that clears the freshness mark (2026-10-08):
+   * the same statement resets `sweeps_since_reading` to 0, because a reading
+   * that arrived IS the proof the pool asked for in the first place. Keeping
+   * the reset here rather than in a second statement is what makes the mark
+   * impossible to leave stuck on a coin the pair lane is demonstrably still
+   * serving (see DEAD_POOL_MISS_MAX).
    */
   async recordObservedLiquidity(
     rows: Array<{ token: string; liquidityUsd: number }>,
@@ -2596,9 +2668,41 @@ export class Db {
       for (const r of slice) args.push(r.token, r.liquidityUsd);
       for (const r of slice) args.push(r.token);
       const res = await this.get().execute({
-        sql: `UPDATE token_stats SET last_liquidity_usd = CASE token ${cases} END
+        sql: `UPDATE token_stats SET last_liquidity_usd = CASE token ${cases} END,
+              sweeps_since_reading = 0
               WHERE token IN (${slice.map(() => "?").join(",")})`,
         args,
+      });
+      updated += Number(res.rowsAffected ?? 0);
+    }
+    return updated;
+  }
+
+  /**
+   * Advance the freshness mark for pool coins a sweep ASKED for and got no
+   * reading back for (2026-10-08 — see DEAD_POOL_MISS_MAX).
+   *
+   * The caller is worker.flushObservedLiquidity, from the list the scanner
+   * built in poolSweepMisses: pool coins handed to the pair fetch whose token
+   * was absent from the answer on a HEALTHY batch. The guard lives in the
+   * scanner (it owns the coverage reading); this method only counts what it is
+   * given, so the rule and the SQL stay one thing each.
+   *
+   * A `+ 1` per coin per sweep, chunked into the same one-round-trip shape as
+   * recordObservedLiquidity, and fire-and-forget for the same reason: a lost
+   * write costs one sweep of freshness on a mark that is recomputed on every
+   * rotation, never a wrong verdict. The reset back to 0 is NOT here — only a
+   * real reading may clear the mark (see recordObservedLiquidity).
+   */
+  async noteSweptWithoutReading(tokens: string[], chunk = 120): Promise<number> {
+    if (tokens.length === 0) return 0;
+    let updated = 0;
+    for (let i = 0; i < tokens.length; i += chunk) {
+      const slice = tokens.slice(i, i + chunk);
+      const res = await this.get().execute({
+        sql: `UPDATE token_stats SET sweeps_since_reading = sweeps_since_reading + 1
+              WHERE token IN (${slice.map(() => "?").join(",")})`,
+        args: [...slice],
       });
       updated += Number(res.rowsAffected ?? 0);
     }
@@ -5484,6 +5588,16 @@ export class Db {
     neverPushed: number;
     buckets: Record<string, number>;
     eligibleInWindow: number;
+    /**
+     * Rows the freshness mark holds OUT of the pool right now (`deadMarked`)
+     * and rows one empty sweep away from it (`deadPending`) — see
+     * DEAD_POOL_MISS_MAX. Read together with `total`/`eligibleInWindow` they
+     * are the reading that says whether the mark is pruning a corpse
+     * population or quietly eating the window: both ride the full-table scan
+     * this endpoint already pays for, so the reading is free.
+     */
+    deadMarked: number;
+    deadPending: number;
   }> {
     const H = 3600_000;
     const res = await this.get().execute({
@@ -5495,7 +5609,12 @@ export class Db {
         SUM(CASE WHEN launch_ms > ? AND launch_ms <= ? THEN 1 ELSE 0 END) AS b6_12h,
         SUM(CASE WHEN launch_ms > ? AND launch_ms <= ? THEN 1 ELSE 0 END) AS b12_24h,
         SUM(CASE WHEN launch_ms > ? AND launch_ms <= ? THEN 1 ELSE 0 END) AS b24_43h,
-        SUM(CASE WHEN launch_ms <= ? THEN 1 ELSE 0 END) AS b_over43h
+        SUM(CASE WHEN launch_ms <= ? THEN 1 ELSE 0 END) AS b_over43h,
+        SUM(CASE WHEN ${DEAD_POOL_MARK} THEN 1 ELSE 0 END) AS dead_marked,
+        SUM(CASE WHEN last_liquidity_usd IS NOT NULL
+                  AND sweeps_since_reading > 0
+                  AND sweeps_since_reading < ${DEAD_POOL_MISS_MAX}
+                 THEN 1 ELSE 0 END) AS dead_pending
       FROM token_stats`,
       args: [
         now - 3 * H,
@@ -5531,6 +5650,8 @@ export class Db {
         ">43h": Number(r.b_over43h ?? 0),
       },
       eligibleInWindow: Number(elig.rows[0]?.n ?? 0),
+      deadMarked: Number(r.dead_marked ?? 0),
+      deadPending: Number(r.dead_pending ?? 0),
     };
   }
 

@@ -1112,12 +1112,28 @@ export function poolKeyHash(text: string): string {
 }
 
 /**
+ * The pool SQL's SHAPE version — the half of the snapshot key the bound
+ * fingerprint below cannot see.
+ *
+ * The fingerprint covers the ARGUMENTS a caller passes; this covers the
+ * PREDICATE body, which a build can change without touching one. 2026-10-08:
+ * DEAD_POOL_CLAUSE grew the freshness mark (`sweeps_since_reading`), so a
+ * snapshot written by the previous build answers a DIFFERENT query — one that
+ * still admits the corpses the new predicate drops — and without a version bump
+ * the satellite cache would serve it for up to its TTL after the deploy, which
+ * is exactly the window an operator reads to judge the change. Bump this
+ * whenever the pool SQL's shape changes, not only its bounds.
+ */
+export const POOL_QUERY_SHAPE_VERSION = "v2-2026-10-08-dead-mark";
+
+/**
  * The STABLE half of a pool query, as a key fragment.
  *
  * Every bound in this query is expressed as an offset from the tick's clock,
  * so the absolute values drift every tick while the query they describe does
  * not: a fingerprint over the absolutes would miss every tick and cache
- * nothing. Only a chat-settings (or config) change moves what this covers.
+ * nothing. Only a chat-settings (or config) change moves what this covers —
+ * plus POOL_QUERY_SHAPE_VERSION, which moves it on a change to the SQL itself.
  * seenChatIds is SORTED because the SQL IN-list does not care about order and
  * the front read does not guarantee one.
  */
@@ -1152,7 +1168,9 @@ export function poolQueryFingerprint(
     opts.minQualifyLiquidity ?? "",
   ].join(",");
   const ids = [...(opts.seenChatIds ?? [])].sort().join("+");
-  return poolKeyHash(ids + "|" + relative + "|" + gates);
+  return poolKeyHash(
+    POOL_QUERY_SHAPE_VERSION + "|" + ids + "|" + relative + "|" + gates,
+  );
 }
 
 /**
@@ -1474,6 +1492,59 @@ export const POOL_LIQUIDITY_PRUNE_RATIO = 0.8;
  * for a filter no later sweep can undo.
  */
 export const POOL_MCAP_PRUNE_RATIO = 0.8;
+
+/**
+ * Coverage below which a pair-fetch answer is a TRANSPORT reading rather than
+ * a per-coin one — the fraction of requested tokens that must come back before
+ * a missing token may be counted as a pool coin swept with no reading (see
+ * poolSweepMisses).
+ *
+ * 0.5 is not a new number: it is the threshold the Jupiter fallback itself
+ * fires at (`pairsByToken.size < addresses.length * 0.5`, see the pair phase),
+ * so it names the same event from the other side — "the Dex lane answered for
+ * less than half of what was asked" is exactly where a missing token stops
+ * being evidence about that coin and becomes evidence about the transport.
+ * Measured on this pool: a refused Dex batch reads `pairs 0-96` against
+ * ~150-180 asked (docs/round-trips.md §4.36-4.38, docs/gecko-429.md), i.e.
+ * coverage far under half, while a healthy tick reads `pairs 155 pairsJup 120
+ * pairsMissing 0`. Below this floor NOTHING is marked, so a 429 window moves
+ * no coin's freshness mark.
+ */
+export const POOL_SWEEP_HEALTHY_COVERAGE = 0.5;
+
+/**
+ * The pool coins one sweep asked for and got NO reading back for (2026-10-08)
+ * — the input of the re-eval pool's freshness mark (db.DEAD_POOL_MISS_MAX).
+ *
+ * `answers` is the token→pair map the pair phase ended with (DexScreener plus
+ * the Jupiter fallback), `answered`/`requested` its coverage over the WHOLE
+ * batch (tracker head included — that is what the lane was asked for). The
+ * rule is deliberately narrow in three ways:
+ *
+ *  - POOL COINS ONLY. The feed's coins (fresh bonding-curve launches) have no
+ *    pair BY DESIGN for their first minutes, and marking one would hold it out
+ *    of the pool at the exact moment it graduates. The caller passes the
+ *    rotation slice, which excludes every feed coin (see scannedProfiles).
+ *  - HEALTHY BATCHES ONLY (see POOL_SWEEP_HEALTHY_COVERAGE). A refusal is a
+ *    fact about the transport, and the mark may never be advanced by one.
+ *  - IT REPORTS; IT NEVER WRITES. The scanner hands the list to the worker's
+ *    end-of-tick flush (worker.flushObservedLiquidity), so a coin that DID get
+ *    a reading in the same sweep is reset to 0 by that same flush and the two
+ *    halves cannot interleave inside a tick.
+ *
+ * Pure and exported so the rule is testable offline: the coverage guard is the
+ * part that must not drift.
+ */
+export function poolSweepMisses(
+  poolTokens: readonly string[],
+  answers: { has(token: string): boolean },
+  answered: number,
+  requested: number,
+): string[] {
+  if (poolTokens.length === 0 || requested <= 0) return [];
+  if (answered < requested * POOL_SWEEP_HEALTHY_COVERAGE) return [];
+  return poolTokens.filter((token) => !answers.has(token));
+}
 
 /**
  * `worker_state` row: the stamp the MAINTENANCE invocation leaves (see
@@ -2027,6 +2098,15 @@ export interface ScanSummary {
   /** Pool coins actually evaluated this tick (rotation slice of `pool`,
    * see RE_EVAL_PER_TICK_MAX). Undefined on pre-fix summaries. */
   poolSliced?: number;
+  /**
+   * Pool coins the sweep asked for and got NO reading back for (2026-10-08 —
+   * see poolSweepMisses / db.DEAD_POOL_MISS_MAX). This is the freshness
+   * mark's own input, and the reading that separates "the mark is working"
+   * from "the pair lane is failing": it can only move on POOL coins, and only
+   * on a batch whose coverage stayed above POOL_SWEEP_HEALTHY_COVERAGE, so a
+   * refused 429 tick reports 0 however many pairs it lost.
+   */
+  poolMisses?: number;
   /** Evaluations that passed the age gate (age ≥ min) this scan — proves
    * in-window coins are actually being evaluated, not silently skipped. */
   agedEval: number;
@@ -3090,6 +3170,21 @@ export class Scanner {
    * length self-normalizes via the modulo at use.
    */
   private poolSliceCursor = 0;
+  /**
+   * Pool coins the LAST sweep asked for and got no reading back for (see
+   * poolSweepMisses). CLEARED at the start of every scan and filled by its
+   * pair phase; drained by the worker's end-of-tick flush
+   * (takePoolSweepMisses), which turns them into the freshness mark
+   * (db.DEAD_POOL_MISS_MAX). Kept on the instance because the rule needs the
+   * pool slice and the pair answer — both of which exist only inside runScan —
+   * while the WRITE belongs to the tick's tail, where an un-awaited promise is
+   * held by the handler's waitUntil. Never append to it: a scan that returns
+   * before its pair phase (an empty feed AND pool, an early abort) must report
+   * NOTHING — the previous scan's list may still be here when its flush never
+   * ran (the isolate died without a waitUntil), and advancing those coins a
+   * second time would count one empty sweep as two.
+   */
+  private pendingPoolSweepMisses: string[] = [];
   /** Post-push tracker (null when disabled or no bot/db — see pushwatch.ts). */
   private readonly pushWatcher: import("./pushwatch").PushWatcher | null;
 
@@ -3920,6 +4015,19 @@ export class Scanner {
   }
 
   /**
+   * Take the pool coins the last sweep got no reading for (see
+   * poolSweepMisses), clearing the list. Called ONCE per tick by
+   * worker.flushObservedLiquidity — the take-once shape is what makes "the
+   * flush failed" cost one sweep of freshness instead of re-sending the same
+   * coins on the next tick's flush (which would double-count them).
+   */
+  takePoolSweepMisses(): string[] {
+    const out = this.pendingPoolSweepMisses;
+    this.pendingPoolSweepMisses = [];
+    return out;
+  }
+
+  /**
    * Pair lookup for the post-push tracker pass (see lastPairs): serve what
    * this tick already fetched, ask DexScreener for the rest, then fall back
    * to Jupiter exactly like the front pair phase does — the same rescue for
@@ -4463,6 +4571,7 @@ export class Scanner {
       pool: 0,
       agedEval: 0,
       staleReadings: 0,
+      poolMisses: 0,
       candidates: 0,
       pushed: 0,
       fails: {
@@ -4495,6 +4604,10 @@ export class Scanner {
       rejects: [],
       chainRejects: [],
     };
+    // Per-tick hand-off to the tick's tail: a scan that returns before its
+    // pair phase must report NO sweep misses, not the previous scan's (see
+    // pendingPoolSweepMisses).
+    this.pendingPoolSweepMisses = [];
     // LOW-WATER GATE (see SCAN_SUBREQ_FLOOR). The invocation's allowance is
     // shared with the tick's tail, and the scan is the only phase whose work is
     // optional — so the optional legs below ask this first. A dropped leg is
@@ -5714,6 +5827,21 @@ export class Scanner {
       diag.pairsMissing = scannedProfiles.filter(
         (p) => !pairsByToken.has(p.tokenAddress),
       ).length;
+      // The freshness mark's input (2026-10-08 — see poolSweepMisses). Two
+      // deliberate narrowings: the list is built from the ROTATION SLICE, not
+      // from scannedProfiles, because a feed coin's missing pair is its normal
+      // state (a bonding curve has no pair yet) and only the pool owns a
+      // freshness mark; and the coverage guard inside the helper drops the
+      // whole list on a refused batch, so a 429 tick advances nothing. The
+      // list is drained by the tick's own tail (worker.flushObservedLiquidity),
+      // which resets every coin that DID get a reading in the same flush.
+      this.pendingPoolSweepMisses = poolSweepMisses(
+        poolSlice.map((p) => p.tokenAddress),
+        pairsByToken,
+        pairsByToken.size,
+        addresses.length,
+      );
+      diag.poolMisses = this.pendingPoolSweepMisses.length;
       // The `dex` block is refreshed a SECOND time here (see the front refresh
       // above): the pair phase that just finished is the tick's last
       // DexScreener wire, and the pair lane's edge-cache counters

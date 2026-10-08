@@ -116,6 +116,7 @@ import {
 // Heal-path counters: module scope in the tracker, read here so /health can
 // answer "did the self-heal reuse the push-time baseline, and how often".
 import {
+  liquidityIsComparable,
   pushWatchHealStats,
   revivedBaseline,
   terminalRowIssues,
@@ -233,16 +234,65 @@ let dex: DexScreenerClient | null = null;
  *
  * Filled by the pair-fetch wrapper installed in init() and flushed after the
  * tick (see flushObservedLiquidity): it is the raw material for the pool's
- * dead-pool prune (db.ts DEAD_LIQUIDITY_USD). The pool used to pre-filter on
+ * dead-pool prune (db.ts DEAD_LIQUIDITY_USD) AND for the freshness mark that
+ * rides it (db.ts DEAD_POOL_MISS_MAX). The pool used to pre-filter on
  * `max_liquidity_observed`, a lifetime high-water, so a coin that had a pool
  * and LOST it stayed in the sweep forever — live 2026-09-19: 48 of 49 logged
  * rejects were liquidity failures (~72% of them liquidity 0/null) while a coin
  * like `wildebeest` read $0 against a $242K peak. Only readings the scan itself
  * produced go in here: no liquidity field (`null`) leaves the column as it was,
  * so a coin nobody has measured keeps the old behavior instead of being pruned
- * on a guess.
+ * on a guess — and only the leg those rules are CALIBRATED on may write it
+ * (observedLiquidityUsd, 2026-10-08: a Jupiter/Gecko reading is a different
+ * metric of the same pool, ~half or less, and would push a live coin under the
+ * floor).
  */
 let observedLiquidity = new Map<string, number>();
+
+/**
+ * The liquidity a fetched pair may put in `last_liquidity_usd`, or undefined
+ * when the pair carries nothing this column may be judged by (2026-10-08).
+ *
+ * WHY THE PROVENANCE GUARD. The column is the input of TWO
+ * DexScreener-calibrated rules — the re-eval pool's dead-pool floor
+ * (db.DEAD_LIQUIDITY_USD) and the freshness mark that rides on it
+ * (db.DEAD_POOL_MISS_MAX) — while the other two legs of this bot read the SAME
+ * pool as a DIFFERENT metric: Jupiter's per-token `liquidity` is 0.46-0.58x
+ * DexScreener's for the very same pool (measured 2026-09-20 over the tracker's
+ * rotation, 10 of 14 rows) and GeckoTerminal's reserve under-reports it too
+ * (it sums only the pools it indexes). Feeding either in can only leave the
+ * stored reading SHORT of the truth, and the pool's prune is one-way and
+ * permanent: a live coin whose recorded reading lands under $1K does not
+ * return to the sweep until a discovery feed re-registers it — a permanent
+ * missed push, the one cost worse than a one-tick delay. The mirror argument
+ * decides the freshness half: a reading that is not the same metric must not
+ * CLEAR a mark a DexScreener-calibrated rule set.
+ *
+ * Same rule as every sibling consumer, from the same source of truth
+ * (pushwatch.liquidityIsComparable): the scanner's high-water raise
+ * (updateTokenMaxMcaps) already omits a non-comparable leg for exactly this
+ * reason, and comparableLiquidity() is how the tracker's own liquidity rules
+ * read one. `feedSource` absent (fixtures, synthetic pairs, legacy rows) =
+ * DexScreener's, which is what keeps this a guard and not a behavior change
+ * for the DexScreener lane this wrapper is installed on.
+ *
+ * WHAT IT DOES NOT DECIDE: a non-comparable answer is NOT a sweep miss either
+ * (scanner.poolSweepMisses counts the pool coins the pair answer LEFT OUT, and
+ * a Jupiter answer means the pool was readable). Such a coin therefore neither
+ * advances nor clears its mark — the correct fail-safe direction, since no
+ * unjudgeable evidence may prune a coin, and the next DexScreener-served sweep
+ * of the same token records it and resets the mark normally.
+ */
+export function observedLiquidityUsd(pair: {
+  liquidity?: { usd: number | null } | null;
+  feedSource?: "dexscreener" | "jupiter" | "gecko";
+}): number | undefined {
+  if (!liquidityIsComparable(pair)) return undefined;
+  const liq = pair.liquidity?.usd;
+  // A finite reading including 0: a drained pool's $0 IS its identifying
+  // signal, and it is what the floor drops the coin on.
+  return typeof liq === "number" && Number.isFinite(liq) ? liq : undefined;
+}
 let helius: HeliusClient | null = null;
 let birdeye: BirdeyeClient | null = null;
 let gmgn: GmgnClient | null = null;
@@ -952,21 +1002,51 @@ async function recordDex429(at: number): Promise<void> {
  * BEFORE the write on purpose — a failed round trip costs one tick of freshness
  * on a signal that is recomputed on every sweep, and re-sending a stale batch
  * later would report liquidity from a tick that is already over.
+ *
+ * The same call owns the FRESHNESS MARK's half (2026-10-08): the pool coins
+ * the sweep asked for and got nothing back for, taken once from the scanner
+ * that ran the sweep (Scanner.takePoolSweepMisses — see poolSweepMisses and
+ * db.DEAD_POOL_MISS_MAX). They ride here because this is the only place both
+ * halves of the same fact exist: the readings that CLEAR the mark and the
+ * empty sweeps that ADVANCE it are produced by one sweep, so writing them
+ * together is what makes an overlap impossible. The advance runs first on
+ * purpose — if a coin were ever in both lists (the construction forbids it: a
+ * coin with a pair cannot be a miss), it must land on 0, alive. A prune that
+ * can never be undone may only fail toward serving a coin.
  */
-async function flushObservedLiquidity(): Promise<void> {
-  if (!db || observedLiquidity.size === 0) return;
+async function flushObservedLiquidity(source: Scanner | null): Promise<void> {
+  if (!db) return;
+  const missed = source?.takePoolSweepMisses() ?? [];
+  // Taken BEFORE the empty-map return below: a tick whose pair batch came back
+  // refused is exactly a tick with no readings and no misses (the scanner's
+  // coverage guard empties the list), and a tick whose pool coins got nothing
+  // is exactly a tick with misses and possibly no readings. Neither half may
+  // be skipped by the other's emptiness.
+  if (observedLiquidity.size === 0 && missed.length === 0) return;
+  if (missed.length > 0) {
+    try {
+      await db.noteSweptWithoutReading(missed);
+    } catch (err) {
+      console.warn(
+        "[worker] pool sweep-miss write failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
   const rows = [...observedLiquidity].map(([token, liquidityUsd]) => ({
     token,
     liquidityUsd,
   }));
   observedLiquidity = new Map();
-  try {
-    await db.recordObservedLiquidity(rows);
-  } catch (err) {
-    console.warn(
-      "[worker] observed-liquidity write failed:",
-      err instanceof Error ? err.message : err,
-    );
+  if (rows.length > 0) {
+    try {
+      await db.recordObservedLiquidity(rows);
+    } catch (err) {
+      console.warn(
+        "[worker] observed-liquidity write failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 }
 
@@ -3968,14 +4048,15 @@ async function ensureInitialized(env: Env): Promise<void> {
     // Record what each pair fetch ACTUALLY returned (see observedLiquidity):
     // the scanner keeps only in-memory state, so the worker — which owns the
     // end-of-tick write — has to see the map as it goes by. Cheap: one Map
-    // insert per coin per tick, no extra request.
+    // insert per coin per tick, no extra request. The reading is filtered
+    // through observedLiquidityUsd, so a leg the pool's USD floors are not
+    // calibrated on can never reach the column.
     const fetchPairs = dex.fetchPairsForTokens.bind(dex);
     dex.fetchPairsForTokens = async (addresses, deadline) => {
       const pairs = await fetchPairs(addresses, deadline);
       for (const [token, pair] of pairs) {
-        const liq = pair.liquidity?.usd;
-        if (typeof liq === "number" && Number.isFinite(liq))
-          observedLiquidity.set(token, liq);
+        const liq = observedLiquidityUsd(pair);
+        if (liq !== undefined) observedLiquidity.set(token, liq);
       }
       return pairs;
     };
@@ -4248,7 +4329,7 @@ async function ensureInitialized(env: Env): Promise<void> {
             const drained = drainDeferredWrites(subreqRemaining, {
               maxCalls: drainCallCeiling(deadPredecessorThisTick),
               shed: drainShedReason(deadPredecessorThisTick),
-            }).then(() => flushObservedLiquidity());
+            }).then(() => flushObservedLiquidity(scanner));
             // Keep the isolate alive for it when the handler handed us a
             // waitUntil (see tickWaitUntil): an un-awaited promise is
             // cancelled the instant the handler returns, which is exactly
@@ -8747,6 +8828,13 @@ const worker = {
         neverPushed: hist.neverPushed,
         buckets: hist.buckets,
         eligibleInWindow: hist.eligibleInWindow,
+        // The freshness mark's population (2026-10-08 — see
+        // db.DEAD_POOL_MISS_MAX): rows held out of the sweep for coming back
+        // empty too many times, and rows one empty sweep away. They are what
+        // makes a poolQueryCount that fell interpretable: it fell because
+        // these rows left, not because the floors moved.
+        deadMarked: hist.deadMarked,
+        deadPending: hist.deadPending,
         // The budget the query above actually ran with (see its `limit`):
         // echoing a literal here reported a pool the tick no longer reads.
         poolLimit: cfg?.reevalPoolSize ?? 1000,

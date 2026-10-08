@@ -1370,6 +1370,10 @@ const CENSUS_METHODS = [
   "resumeLaunchBackfill",
   "pruneOldTokenStats",
   "recordObservedLiquidity",
+  // The freshness mark's advance (src/db.ts, docs/pool-freshness-mark-2026-10-08.md):
+  // flushed from the SAME tail as the observed liquidity above, so a tick's
+  // outbound round trips are only complete if both are censused.
+  "noteSweptWithoutReading",
   "persistScanCompletion",
   "writeScheduledTick",
   "stampScheduledArrival",
