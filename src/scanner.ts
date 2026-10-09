@@ -1123,8 +1123,13 @@ export function poolKeyHash(text: string): string {
  * the satellite cache would serve it for up to its TTL after the deploy, which
  * is exactly the window an operator reads to judge the change. Bump this
  * whenever the pool SQL's shape changes, not only its bounds.
+ *
+ * 2026-10-09: the pool gained the no-evidence prune the same way (see
+ * Db.POOL_MCAP_EVIDENCE_GRACE_MS), so v3 retires every v2 snapshot — a v2
+ * entry holds exactly the rows (no mcap reading, past the grace) the new
+ * predicate drops.
  */
-export const POOL_QUERY_SHAPE_VERSION = "v2-2026-10-08-dead-mark";
+export const POOL_QUERY_SHAPE_VERSION = "v3-2026-10-09-mcap-evidence";
 
 /**
  * The STABLE half of a pool query, as a key fragment.
@@ -4871,6 +4876,14 @@ export class Scanner {
         // corpses starved live mid-cap coins out of the sweep (2026-09-10
         // audit). Same permanent-exclusion trade-off as the floor prune.
         maxQualifyMcap: poolMaxMcapUsd * 2,
+        // No-evidence prune (2026-10-09, DB-owned): a row with NO mcap
+        // reading at all is carried only inside Db.POOL_MCAP_EVIDENCE_GRACE_MS
+        // of its first sighting. Inside the grace NULL keeps the fail-open
+        // (nobody has measured it yet); past it, every served leg has already
+        // read non-positive and the row cannot qualify (see the constant's
+        // note for the live measurement — 55% of one sweep's rows). The
+        // cutoff derives from the query's own `now`, so nothing here passes
+        // it.
         // Liquidity floor prune: drop coins whose peak liquidity never
         // reached POOL_LIQUIDITY_PRUNE_RATIO (0.8 since 2026-09-28, up from
         // 0.6) × the widest chat's liquidity gate. Dead-liquidity

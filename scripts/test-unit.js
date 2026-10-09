@@ -4570,13 +4570,36 @@ async function main() {
       "the clause and the histogram's counter must read the SAME mark expression",
     );
     assert.ok(
-      (dbSrc.match(/\[DEAD_POOL_CLAUSE\]/g) || []).length === 2,
-      "both pool builders must carry the clause (the drift guard)",
+      (dbSrc.match(/\[DEAD_POOL_CLAUSE,POOL_MCAP_EVIDENCE_CLAUSE\]/g) || []).length === 2,
+      "both pool builders must carry the dead AND no-evidence clauses (the drift guard)",
     );
     assert.ok(
-      scannerSrc.includes('POOL_QUERY_SHAPE_VERSION="v2-2026-10-08-dead-mark"') &&
+      (dbSrc.match(/POOL_MCAP_EVIDENCE_CLAUSE/g) || []).length === 3,
+      "the no-evidence clause is defined once and carried by both builders",
+    );
+    assert.ok(
+      dbSrc.includes("[b.lo,b.hi,opts.sinceMs,mcapEvidenceSinceMs]") &&
+        dbSrc.includes("[lo,hi,opts.sinceMs,opts.mcapEvidenceSinceMs]"),
+      "both builders bind the cutoff where the clause's placeholder sits, before every floor's",
+    );
+    assert.ok(
+      scannerSrc.includes('POOL_QUERY_SHAPE_VERSION="v3-2026-10-09-mcap-evidence"') &&
         scannerSrc.includes("poolKeyHash(POOL_QUERY_SHAPE_VERSION+"),
       "the pool snapshot key must carry the SQL's own shape version, or a snapshot taken with the OLD predicate answers the new one",
+    );
+    // The offline instrument mirrors the clause and IMPORTS the grace — a
+    // restated number here would measure a wider pool than the tick reads.
+    const poolCostSrc = fs.readFileSync(
+      path.join(__dirname, "..", "scripts", "pool-read-cost.js"),
+      "utf8",
+    );
+    assert.ok(
+      poolCostSrc.includes("max_mcap_observed IS NOT NULL OR first_seen_at > ?"),
+      "pool-read-cost.js mirrors the no-evidence clause, not a paraphrase",
+    );
+    assert.ok(
+      poolCostSrc.includes("POOL_MCAP_EVIDENCE_GRACE_MS"),
+      "and imports the grace instead of restating it",
     );
     assert.ok(
       dbSrc.includes("sweeps_since_reading=sweeps_since_reading+1") &&
@@ -8860,7 +8883,11 @@ async function main() {
       const M = 60e3;
       const seed = async (token, firstSeenAt, ageMin, seen = false, atNow) => {
         await t.client.execute({
-          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)",
+          // A NON-NULL mcap history on every coin keeps this test about band
+          // geometry only: the no-evidence prune (2026-10-09) has its own
+          // test, and a NULL here would make this one measure the grace
+          // instead of the rotation.
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 120000)",
           // launch_ms = first_seen_at - age_min * 60s (same estimate the
           // production migration backfills into legacy rows).
           args: [token, firstSeenAt, ageMin, firstSeenAt - ageMin * 60e3],
@@ -9046,11 +9073,18 @@ async function main() {
       // huge max_mcap_observed would rank it FIRST under the signal
       // ordering, permanently occupying band LIMITs (the 2026-09-10
       // starvation audit), so the ceiling prune must drop it.
+      //
+      // The two NULL-history coins are FIRST SEEN inside the no-evidence
+      // grace (see POOL_MCAP_EVIDENCE_GRACE_MS) on purpose: this test pins
+      // the mcap floor's fail-open half, and past the grace a NULL row is
+      // dropped for its own reason — which the no-evidence test covers.
+      // Their launch stays where the band comments say it is (seed derives
+      // launch from first-seen minus the coin's age at first sight).
       const now = 50 * 300e3;
-      await seed("HOT", now - 6 * H, 0, null);
+      await seed("HOT", now - 2 * H, 240, null);
       await seed("FAR_HIGH", now - 25 * H, 0, 35000);
       await seed("FAR_LOW", now - 25 * H, 0, 3000);
-      await seed("FAR_NULL", now - 25 * H, 0, null);
+      await seed("FAR_NULL", now - 2 * H, 1380, null);
       await seed("FAR_CORPSE", now - 25 * H, 0, 5_000_000);
 
       const pool = await db.getReevalPool({
@@ -9087,6 +9121,86 @@ async function main() {
       assert.ok(
         tokens.indexOf("FAR_HIGH") < tokens.indexOf("FAR_NULL"),
         "signal ordering: known high-mcap coin before unknown (NULL)",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  // The no-evidence prune (2026-10-09). The pool carries NULL-mcap rows
+  // fail-open — an unmeasured coin must never be pruned on a guess — but a row
+  // whose every served reading came back non-positive can never answer the
+  // gates differently: measured live, 10,394 rows in the 30h window had no
+  // mcap reading at all (and no DexScreener liquidity reading either), and 531
+  // of one sweep's 966 returned rows were exactly that population. The clause
+  // keeps the fail-open window but bounds it: a row older than
+  // POOL_MCAP_EVIDENCE_GRACE_MS with still no mcap reading is dropped from
+  // every band — and a first positive reading returns it (the column is the
+  // evidence, not a one-way mark).
+  await test("pool: a no-evidence row is dropped after the grace, kept inside it, and a first reading returns it", async () => {
+    const { POOL_MCAP_EVIDENCE_GRACE_MS } = require("../dist/db.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      const H = 3600e3;
+      const M = 60e3;
+      const cutoff = now - POOL_MCAP_EVIDENCE_GRACE_MS;
+      // Every row in the hot zone (launch == the window entry), so the
+      // rotation cannot be what hides one of them — only the clause can.
+      const seed = async (token, firstSeenAt, maxMcap) => {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed) VALUES (?, ?, 0, ?, ?, ?)",
+          args: [token, firstSeenAt, 80, now - 80 * M, maxMcap],
+        });
+      };
+      await seed("OLD_EVID", cutoff - 1, null); // past the grace, no reading → out
+      await seed("EDGE_OLD", cutoff, null); // the boundary itself: not > → out
+      await seed("EDGE_LIVE", cutoff + 1, null); // one ms inside → kept
+      await seed("FRESH_EVID", now - H, null); // within the grace → kept
+      await seed("OLD_MCAP", cutoff - 1, 120_000); // old but measured → kept
+      const opts = {
+        sinceMs: now - 30 * H,
+        minLaunchMs: now - (1560 + 180) * M,
+        maxLaunchMs: now - (80 - 180) * M,
+        windowEntryLaunchMs: now - 80 * M,
+        limit: 1000,
+        nearSlots: 2,
+        farSlots: 12,
+        // Slot 0 for every call: the bands are fixed, so only the clause's
+        // own cutoff can move a row in or out.
+        rotationPeriodMs: 1e12,
+        minQualifyMcap: 30_000,
+        maxQualifyMcap: 500_000,
+        now,
+      };
+      const perBand = (await db.getReevalPool(opts)).map((r) => r.token).sort();
+      assert.deepEqual(
+        perBand,
+        ["EDGE_LIVE", "FRESH_EVID", "OLD_MCAP"],
+        "the pool carries no-evidence rows only inside the grace",
+      );
+      const batched = (await db.getReevalPoolBatched(opts)).map((r) => r.token).sort();
+      assert.deepEqual(batched, perBand, "both builders cut at the same instant");
+      // NEGATIVE CONTROL: the same rows, ONE clock earlier. The cutoff moves
+      // with `now` (bands are pinned by opts), so every row the grace hid is
+      // suddenly inside its own grace and reappears — nothing else changed.
+      const earlier = (await db.getReevalPoolBatched({ ...opts, now: now - 2 * H }))
+        .map((r) => r.token)
+        .sort();
+      assert.ok(
+        earlier.length === 5 && earlier.includes("OLD_EVID"),
+        `an earlier clock must re-admit the rows the grace hid (got ${JSON.stringify(earlier)})`,
+      );
+      // RECOVERY: one positive reading clears the exclusion — this is the same
+      // raise the tick's own updateTokenMaxMcaps writes from a served leg.
+      await db.updateTokenMaxMcaps([{ token: "OLD_EVID", mcapUsd: 150_000 }]);
+      const after = (await db.getReevalPoolBatched(opts)).map((r) => r.token).sort();
+      assert.deepEqual(
+        after,
+        ["EDGE_LIVE", "FRESH_EVID", "OLD_EVID", "OLD_MCAP"],
+        "a served reading brings the coin back into the rotation",
       );
     } finally {
       await t.cleanup();
@@ -9283,8 +9397,11 @@ async function main() {
       const now = 50 * 300e3;
       const seed = async (token, seenChats) => {
         await t.client.execute({
+          // first seen 2h ago (inside the no-evidence grace — this test is
+          // about the seen exclusion, not the evidence clause), launch 6h ago
+          // like before: seed's age-at-first-sight is what bridges the two.
           sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)",
-          args: [token, now - 6 * H, 0, now - 6 * H],
+          args: [token, now - 2 * H, 240, now - 6 * H],
         });
         for (const chat of seenChats) {
           await t.client.execute({

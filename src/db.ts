@@ -445,6 +445,66 @@ const DEAD_POOL_MARK =
 const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR NOT (${DEAD_POOL_MARK}))`;
 
 /**
+ * How long a row may sit in the pool with NO mcap evidence at all before the
+ * pool stops carrying it (2026-10-09).
+ *
+ * WHAT COUNTS AS EVIDENCE: a non-NULL `max_mcap_observed`. The scanner's
+ * raise loop records that column from every served pair leg — DexScreener,
+ * Jupiter, Gecko — but ONLY on a positive reading (`marketCap <= 0` records
+ * nothing). NULL therefore means "every time this coin was actually looked
+ * at, its mcap read non-positive": the coin has never been observed alive.
+ * Measured live 2026-10-09: 10,394 rows in the pool's 30h window (14% of
+ * 72,304) had no mcap reading — every one of them also had no DexScreener
+ * liquidity reading at all — and 531 of one sweep's 966 returned rows (55%)
+ * were that population: pairs the gates can only reject, each paying a
+ * pair-fetch slot and its rows-read.
+ *
+ * WHY THE POOL AND NOT A GATE: the mcap floor prune already drops coins whose
+ * KNOWN peak is hopeless; NULL is deliberately exempt (fail-open: an
+ * unmeasured coin is never pruned on a guess). That exemption is right while
+ * the coin could still be measured, and wrong forever after: a coin nobody has
+ * ever measured will never be measured into a push — no positive reading
+ * means no qualification — so every later sweep is paid for a row that CANNOT
+ * answer differently.
+ *
+ * WHY A WALL CLOCK AND NOT A SWEEP MARK (unlike DEAD_POOL_MISS_MAX): that
+ * mark counts MISSING readings and needs the healthy-batch guard so a dead
+ * transport cannot evict live coins. Here nothing is evicted for a missing
+ * reading — the eviction reads a column that only served, non-positive
+ * readings could ever have set, and the transport's health is already baked
+ * into whether those readings happened at all. The grace exists only so a coin
+ * the pair lane has not REACHED yet is not mistaken for one it has repeatedly
+ * judged: the worst rotation recurrence measured on this pool is 8 far-band
+ * recurrences (≈2.4h, docs/round-trips.md §4.48), and this bound is 2.5x that
+ * worst case.
+ *
+ * WHY SIX HOURS: 3h would sit barely above the measured worst-case coverage
+ * (1.25x — no room for a 429 window or a sweep's tail cut by the deadline) and
+ * 12h leaves half the population seated (5,552 of 10,394 in-window rows) for
+ * no extra signal; 6h cuts 8,124 of the 10,394 (78%) while every coin the
+ * pool was still plausibly going to measure keeps its seat.
+ *
+ * WHAT IT COSTS, AND WHY THAT IS THE ACCEPTED SIDE: a row evicted here is out
+ * of the sweep pool until a discovery feed finds the coin again — the feed's
+ * own evaluation still reads it every tick, and the first positive mcap any
+ * leg records clears the clause (it reads the column, not a one-way mark).
+ * That is the trade every other prune in this file already makes: the pool
+ * spends its rows on coins that can still qualify, and the grace is what keeps
+ * the trade off the fresh tail — a coin first seen inside the window is never
+ * judged on evidence nobody had time to collect.
+ */
+export const POOL_MCAP_EVIDENCE_GRACE_MS = 6 * 3600_000;
+
+/**
+ * The no-evidence pre-filter's SQL half. A BOUND argument — the cutoff moves
+ * with the tick's clock — and both builders MUST carry it with the cutoff
+ * bound right after `first_seen_at`, or the batched path would re-admit the
+ * rows the per-band path drops (the same drift DEAD_POOL_CLAUSE's note warns
+ * about).
+ */
+const POOL_MCAP_EVIDENCE_CLAUSE = `(max_mcap_observed IS NOT NULL OR first_seen_at > ?)`;
+
+/**
  * The market-cap floor's SQL half, as a LITERAL — and why it has to be one.
  *
  * 2026-10-07 (measured): a sweep billed ~18.5k rows to return 1.2k, because
@@ -1841,6 +1901,10 @@ export class Db {
     opts: Parameters<Db["getReevalPool"]>[0],
   ): Promise<TokenStats[]> {
     const now = opts.now ?? Date.now();
+    // Same cutoff the per-band builder derives (see getReevalPool): one clock,
+    // one instant, so the two paths cannot disagree about which rows' grace
+    // has run out — the drift guard test asserts the resulting sets match.
+    const mcapEvidenceSinceMs = now - POOL_MCAP_EVIDENCE_GRACE_MS;
     const center = opts.windowEntryLaunchMs;
     const spanLo = opts.minLaunchMs;
     const spanHi = opts.maxLaunchMs;
@@ -1908,8 +1972,8 @@ export class Db {
     if (bands.length === 0) return [];
     const seen = this.seenExclusion(opts.seenChatIds);
     const statements = bands.map((b) => {
-      const clauses: string[] = [DEAD_POOL_CLAUSE];
-      const args: Array<string | number> = [b.lo, b.hi, opts.sinceMs];
+      const clauses: string[] = [DEAD_POOL_CLAUSE, POOL_MCAP_EVIDENCE_CLAUSE];
+      const args: Array<string | number> = [b.lo, b.hi, opts.sinceMs, mcapEvidenceSinceMs];
       // Literal floor, no argument — see mcapFloorLiteral. Both builders must
       // carry the SAME shape or the drift guard pins them apart.
       if (opts.minQualifyMcap !== undefined) {
@@ -4431,6 +4495,10 @@ export class Db {
     now?: number;
   }): Promise<TokenStats[]> {
     const now = opts.now ?? Date.now();
+    // The no-evidence cutoff (see POOL_MCAP_EVIDENCE_GRACE_MS), derived from
+    // THIS call's clock so every band — and the batched builder — cuts at the
+    // same instant.
+    const mcapEvidenceSinceMs = now - POOL_MCAP_EVIDENCE_GRACE_MS;
     const center = opts.windowEntryLaunchMs;
     const spanLo = opts.minLaunchMs;
     const spanHi = opts.maxLaunchMs;
@@ -4443,6 +4511,7 @@ export class Db {
       out.push(
         ...(await this.queryReevalBand(hotLo, hotHi, center, {
           sinceMs: opts.sinceMs,
+          mcapEvidenceSinceMs,
           limit: hotLimit,
           minQualifyMcap: opts.minQualifyMcap,
           maxQualifyMcap: opts.maxQualifyMcap,
@@ -4483,6 +4552,7 @@ export class Db {
       out.push(
         ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
           sinceMs: opts.sinceMs,
+          mcapEvidenceSinceMs,
           limit: nearLimit,
           minQualifyMcap: opts.minQualifyMcap,
           maxQualifyMcap: opts.maxQualifyMcap,
@@ -4503,6 +4573,7 @@ export class Db {
       out.push(
         ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
           sinceMs: opts.sinceMs,
+          mcapEvidenceSinceMs,
           limit: farLimit,
           minQualifyMcap: opts.minQualifyMcap,
           maxQualifyMcap: opts.maxQualifyMcap,
@@ -4532,6 +4603,13 @@ export class Db {
     center: number,
     opts: {
       sinceMs: number;
+      /**
+       * The no-evidence cutoff (see POOL_MCAP_EVIDENCE_GRACE_MS): a row with
+       * no mcap reading is carried only while `first_seen_at >` this bound.
+       * Computed by the caller from its own clock, so every band of one call
+       * cuts at the same instant.
+       */
+      mcapEvidenceSinceMs: number;
       limit: number;
       minQualifyMcap?: number;
       maxQualifyMcap?: number;
@@ -4553,7 +4631,11 @@ export class Db {
     // already degraded — and it made every offline instrument that reads this
     // path measure a pool larger than the tick's (found while measuring the
     // band sizes behind POOL_BAND_ROTATE_BUCKETS).
-    const clauses: string[] = [DEAD_POOL_CLAUSE];
+    //
+    // The no-evidence clause rides both builders the same way: a row that has
+    // never recorded a positive mcap is carried only inside its grace (see
+    // POOL_MCAP_EVIDENCE_GRACE_MS) — the fail-open kept, its clock bounded.
+    const clauses: string[] = [DEAD_POOL_CLAUSE, POOL_MCAP_EVIDENCE_CLAUSE];
     // A LITERAL, not a bound argument — see mcapFloorLiteral: this is what lets
     // Db.ensurePoolBandIndex's partial index cover the band's range.
     if (opts.minQualifyMcap !== undefined)
@@ -4568,7 +4650,9 @@ export class Db {
       );
     const qualifyClause = clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : "";
     const seen = this.seenExclusion(opts.seenChatIds);
-    const args: Array<string | number> = [lo, hi, opts.sinceMs];
+    // The evidence cutoff binds first — the clause's placeholder sits right
+    // after `first_seen_at > ?`, before every floor's (order is binding order).
+    const args: Array<string | number> = [lo, hi, opts.sinceMs, opts.mcapEvidenceSinceMs];
     // No argument for minQualifyMcap: it rides the SQL as a literal (see
     // mcapFloorLiteral) so the partial index can cover this range.
     if (opts.maxQualifyMcap !== undefined) args.push(opts.maxQualifyMcap);

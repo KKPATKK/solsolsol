@@ -44,6 +44,7 @@ const {
   poolRotationSlot,
   mcapFloorLiteral,
   poolBandIndexName,
+  POOL_MCAP_EVIDENCE_GRACE_MS,
 } = require("../dist/db.js");
 const {
   RE_EVAL_WINDOW_MS,
@@ -103,6 +104,7 @@ function bandSql(orderSql) {
             WHERE launch_ms BETWEEN ? AND ?
               AND first_seen_at > ?
               AND ${DEAD_POOL_CLAUSE}
+              AND ${POOL_MCAP_EVIDENCE_CLAUSE}
               AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)
               AND (max_mcap_observed IS NULL OR max_mcap_observed <= ?)
               AND (max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)
@@ -120,11 +122,17 @@ const DEAD_LIQUIDITY_USD = 1_000;
 const DEAD_POOL_MISS_MAX = 3;
 const DEAD_POOL_MARK = `(last_liquidity_usd IS NOT NULL AND (last_liquidity_usd < ${DEAD_LIQUIDITY_USD} OR sweeps_since_reading >= ${DEAD_POOL_MISS_MAX}))`;
 const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR NOT (${DEAD_POOL_MARK}))`;
+// Mirrored from src/db.ts (2026-10-09): the no-evidence clause. A BOUND
+// argument, not literal text — its cutoff moves with the clock — so every
+// caller below binds it (see POOL_MCAP_EVIDENCE_GRACE_MS, imported, never
+// restated: this script and the tick must cut at the same instant).
+const POOL_MCAP_EVIDENCE_CLAUSE = `(max_mcap_observed IS NOT NULL OR first_seen_at > ?)`;
 
 const PRUNES = `AND (last_liquidity_usd IS NULL OR last_liquidity_usd >= ?)
           AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)
           AND (max_mcap_observed IS NULL OR max_mcap_observed <= ?)
-          AND (max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)`;
+          AND (max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)
+          AND (max_mcap_observed IS NOT NULL OR first_seen_at > ?)`;
 
 const fmt = (n) => Number(n).toLocaleString("en-US");
 const iso = (ms) => new Date(ms).toISOString().slice(11, 19);
@@ -201,6 +209,7 @@ async function main() {
   }
 
   const now = Date.now();
+  const evidenceCutoff = now - POOL_MCAP_EVIDENCE_GRACE_MS;
   const opts = poolArgs(db, now, chats);
   const minAge = Math.min(...chats.map((c) => c.minAgeMinutes));
   const maxAge = Math.max(...chats.map((c) => c.maxAgeMinutes));
@@ -217,6 +226,10 @@ async function main() {
     opts.minQualifyMcap,
     opts.maxQualifyMcap,
     opts.minQualifyLiquidity,
+    // PRUNES' last placeholder: the no-evidence cutoff, appended there for
+    // this script's report ladder only — the tick's own clause sits right
+    // after `first_seen_at > ?` and binds before the floors (see db.ts).
+    evidenceCutoff,
   ];
   const minQualifyMcap = opts.minQualifyMcap;
   const minQualifyLiquidity = opts.minQualifyLiquidity;
@@ -336,7 +349,7 @@ async function main() {
     // pruneArgs[0] is the dead-liquidity floor this statement no longer binds
     // (see DEAD_POOL_CLAUSE): the clause is literal text, so the arg list skips
     // it rather than shifting every floor behind it by one.
-    args: [hotLo, hotHi, spanLo, ...pruneArgs.slice(1), 0, hotLimit],
+    args: [hotLo, hotHi, spanLo, evidenceCutoff, ...pruneArgs.slice(1, -1), 0, hotLimit],
   });
   const details = plan.rows.map((r) => String(r.detail ?? r.DETAIL ?? JSON.stringify(r)));
   console.log("");
@@ -554,6 +567,7 @@ async function indexMode(floorArg) {
         AND first_seen_at > ${spanLo}
         AND (max_mcap_observed IS NULL OR max_mcap_observed >= ${floorText})
         AND ${DEAD_POOL_CLAUSE}
+        AND (max_mcap_observed IS NOT NULL OR first_seen_at > ${now - POOL_MCAP_EVIDENCE_GRACE_MS})
         ${order} LIMIT 518`;
   const show = async (tag, sql, args) => {
     const plan = await client.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args: args ?? [] });
