@@ -196,3 +196,50 @@ best-effort secret 全部綠）。部署後即刻抽嘅兩個公開讀數：
 `docs/pool-mcap-prune-2026-09-28.md` 早已點名呢個係真正槓桿（「86–89% 嘅池 row 冇 peak
 mcap，NULL 被保留」）。要修係另一條線（registration 時補
 `max_mcap_observed`，或對 NULL row 加寬限期後 prune），今次唔動。
+
+---
+
+## 十二、量度：候選純度提升（第二次讀，2026-10-09 00:32–00:39Z，部署後 ~47 分鐘）
+
+`39834c6` 部署（23:51Z）之後 ~47 分鐘 —— 即 **3-sweep 最短潛伏期已經過咗一倍有多**：
+`CLOCK_TICK_SECONDS="30"`（`/health.lastScanGapMs 23778` ＝ 每 ~24–30 秒一個 scan），
+90-coin slice 對 ~1,050-coin 池 ⇒ 同一隻幣約每 5–6 分鐘被掃一次 ⇒ 至今每隻池幣已經
+掃過 **~8 次**（就算只用 60s cron 都 ~4 次）。同一條唯讀探針（`scripts/tmp-purity-probe.js`，
+臨時，跑完即刪；`Db.init()` 係同 `pool-window-drift`／`pool-mcap-floor`／`cpu-profile`
+一樣嘅 idempotent DDL，冇任何 row 寫入）＋ 兩次 `/health` sample（00:32Z／00:39Z）＋
+`/debug/pool`（00:33Z／00:38Z，`cached:false`）。
+
+| 讀數 | §十一（00:20Z） | 今次（00:32–00:39Z） | 讀法 |
+|---|---|---|---|
+| `sweeps_since_reading` 分佈（全表） | 全部 77,479 row = 0 | **全部 77,520 row = 0** | 每隻池幣掃過 ~8 次，冇一次空 sweep |
+| `deadPending`（`0 < streak < 3`） | 0 | **0**（探針 `pending` 同 `/debug/pool` 都係 0） | 標記等候室一直空 |
+| dead predicate split（全表 ＝ `deadMarked`） | — | `floorDead 527` ＋ **`freshDead 0`** | `deadMarked 527` 全部係 $1K 地板；新半邊增量 **0** |
+| 標記可及人口（窗口 `last_liquidity_usd ≥ $1K`） | 1,335 | **1,344** | 窗口定義吻合（見下「量法」） |
+| 窗口 `max_mcap_observed IS NULL` | 9,842 | **9,854**（同 `mcapAndLiqNull` 完全一樣） | fail-open 人口冇縮 |
+| 窗口 mcap 已量度、低於地板（被 prune） | — | 57,265 | 對照 |
+| 窗口 mcap ≥ 地板（有證據） | — | 3,592 | 對照 |
+| **一線 sweep population**（`getReevalPool`，tick args） | — | **966 row**：`mcapNull` **531（55.0%）**、`mcapProvided` 435、`lastLiquidityNull` 867（89.8%） | 今次 sweep 過半數係冇 mcap 證據嘅 row |
+| `/health` 兩 tick | `poolMisses 0`、`pairsMissing 0` | `poolMisses 0`、`pairsMissing 0`、`staleReadings 0`（`pairs 190/194`、`pairsJup 165/147`） | pair lane 兩條腿仍然答齊池幣 |
+| per-tick rejects | `fails.mcap 150–169`、`other 0–17` | `fails.mcap 162 / 139`、`other 16 / 27`；兩次 sample 嘅 20 條 reject list 分別 **18/20**、**20/20** 條係「市值 —」（mcap 0） | 每 tick 百幾個估值名額花喺冇 mcap 嘅幣 |
+
+**結論**
+
+1. **freshness 半邊：今日純度提升仍然係 0 row —— 但今次唔可以再用「未夠鐘」解釋。**
+   47 分鐘 ≈ 8 個 rotation，遠超 `DEAD_POOL_MISS_MAX = 3` 嘅最短潛伏期；全表 77,520 row
+   `streak` 全部 0、`deadPending` 0、`poolMisses` 每次 sample 都 0 —— 即係標記嘅**輸入**
+   （連 Dex 同 Jupiter 都問唔到嘅幣）到今日**一次都未出現過**。§十一 嘅第一個解釋（「可能
+   只係未夠鐘」）今次過期，第二個解釋（輸入未發生）成立。呢半邊係保險，唔係音量槓桿。
+2. **真正嘅槓桿今次有一線尺寸**：實際 sweep 966 row 之中 **531 row（55%）
+   `max_mcap_observed IS NULL`**，而 **867 row（89.8%）連 `last_liquidity_usd` 都 NULL**
+   —— mcap floor（`max_mcap_observed IS NULL OR ≥ floor` fail-open）同 $1K 地板
+   （`last_liquidity_usd IS NULL` 直接過）**兩條 prune 都摸唔到佢哋**；窗口層面係
+   9,854 / 70,711（13.9%），另有 57,265 row 係已被 mcap floor prune 嘅已知低市值。
+   呢批 row 正正係每 tick `fails.mcap` 嘅主力（兩次 reject list：90–100% 係 mcap 0 嘅
+   「市值 —」）。要真正提升候選純度，槓桿喺 registration 補 `max_mcap_observed`，或對
+   NULL row 加寬限期後 prune（另一條線，未做 —— `docs/pool-mcap-prune-2026-09-28.md` 早已點名）。
+3. **量法（可重複）**：窗口 ＝ `launch_ms BETWEEN now-43h AND now-3h AND first_seen_at > now-42h`
+   （同 `/debug/pool` 嘅 `eligibleInWindow` 一致）；dead split 用同一條 `DEAD_POOL_MARK` 展開
+   （`floorDead` ＝ `last_liquidity_usd < 1000`；`freshDead` ＝ `last_liquidity_usd ≥ 1000 AND
+   sweeps_since_reading ≥ 3`）；一線 population 用 `Db.getReevalPool` 嘅 tick args
+   （同 `scripts/pool-window-drift.js` 同一招；探針 966 vs `/debug/pool` 963 —— 差別只係
+   `seenChatIds` 同取樣時刻）。
