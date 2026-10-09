@@ -166,3 +166,33 @@ best-effort secret 全部綠）。部署後即刻抽嘅兩個公開讀數：
 - **候選純度嘅提升仍然未量**：呢個 tick pool 1222／slice 90／candidates 0，同改動前冇
   baseline 對比，所以本文唔聲稱任何提升幅度；要量就要睇幾日 `deadMarked` 高出地板人口嘅部分
   同 `poolMisses` 嘅分佈。
+
+---
+
+## 十一、量度：候選純度提升（2026-10-09 00:20–00:22Z，部署後約 33 分鐘）
+
+唯讀探針（`scripts/tmp-purity-measure.js`，臨時，跑完已刪）＋連續三次 `/health` sample。
+
+| 讀數 | 值 | 讀法 |
+|---|---|---|
+| freshness 半邊剔走嘅 row（全表／池窗口） | **0 / 0** | 新半邊今日一隻都冇剔走 |
+| `sweeps_since_reading` 分佈 | **全部 77,479 row = 0** | deploy 至今冇任何池幣行過**一次**空 sweep |
+| 地板倖存、喺池窗口嘅 row（標記可及人口） | 1,335 | 標記只可能剔到呢批 |
+| `/health` 連續 3 tick | `poolMisses 0`；`pairs 162/183/200`、`pairsMissing 0`、`staleReadings 0` | pair lane（Dex ＋ Jupiter 腿）幾乎答齊所有池幣 |
+| 地板剔走（`last_liquidity_usd < $1K`） | 525 | 一直都有做，唔係新嘢 |
+| `max_mcap_observed IS NULL` 但被池收留（窗口） | **9,842**（其中 9,842 隻連 `max_liquidity_observed` 都 NULL） | 純度真正漏水處 |
+| 每 tick rejects | `fails.mcap 150–169`、`other 0–17`；reject list 主力係「市值 — < $60K」（mcap 0） | 唔係屍體主導，係「冇 mcap」主導 |
+
+**結論（老實講）：今日量到嘅純度提升 = 0 row。** 唔係 bug，係兩個事實：
+
+1. 標記嘅最小潛伏期係「同一隻幣連續 3 次空 sweep」（≈40 分鐘），而 deploy 至今只 ~33 分鐘；
+2. 更根本：標記嘅輸入（一隻幣連 Dex 同 Jupiter 都問唔到）今日**從未發生**——~35 分鐘 ≈
+   3,000 次幣-sweep，`poolMisses` 全 0。仲問得到嘅屍體係由 **$1K 地板**（525 row）剔走。
+
+所以呢半邊係**保險**（針對 pair 由任何 venue 都消失嘅情形），唔係音量槓桿。要顯著提升
+純度，量度指向另一邊：**mcap 地板嘅 fail-open NULL** ——窗口內 9,842 隻「冇任何 peak mcap、
+冇任何 peak liquidity」嘅 row 仍然入池，而每 tick reject 主力正正係佢哋（`fails.mcap`
+150–169 vs `fails.other` 0–17）；`src/scanner.ts` 嘅 `POOL_MCAP_PRUNE_RATIO` 註釋同
+`docs/pool-mcap-prune-2026-09-28.md` 早已點名呢個係真正槓桿（「86–89% 嘅池 row 冇 peak
+mcap，NULL 被保留」）。要修係另一條線（registration 時補
+`max_mcap_observed`，或對 NULL row 加寬限期後 prune），今次唔動。
