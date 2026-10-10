@@ -1060,6 +1060,105 @@ async function dexListCacheTest() {
     "blamed on the leg that wanted the slot",
   );
   await Promise.allSettled(queued);
+
+  // ---------- a caller's abort reaches the fetch, through the queue ---------
+  // (2026-10-10) The tracker's bounded() now HANDS ITS CAP DOWN: a read the
+  // pass has given up on aborts its own fetch (see PushWatcher.bounded), so the
+  // caller's signal must be respected at all three moments it can arrive —
+  // before the enqueue, while the attempt waits for its slot, and after the
+  // request is on the wire.
+  const abortUrls = [];
+  globalThis.fetch = async (url) => {
+    abortUrls.push(String(url));
+    return json([{ chainId: "solana", tokenAddress: "ABORT_T" }]);
+  };
+  const abortDex = new DexScreenerClient(
+    loadConfig({ DEX_REQUEST_INTERVAL_MS: "50" }),
+  );
+
+  // (a) Already aborted: the attempt is NEVER SENT, and it is counted as the
+  // never-sent drop a spent deadline produces (not as a refusal).
+  const abortDropsBefore = abortDex.getStats().budgetDrops;
+  const deadCtrl = new AbortController();
+  deadCtrl.abort(new Error("bounded cap"));
+  const deadPairs = await abortDex.fetchPairsForTokens(
+    ["ABORT_T"],
+    Date.now() + 2_000,
+    deadCtrl.signal,
+  );
+  assert.equal(deadPairs.size, 0, "an aborted call yields no pairs");
+  assert.equal(
+    abortUrls.length,
+    0,
+    "an attempt whose caller already gave up never reaches the wire",
+  );
+  assert.ok(
+    abortDex.getStats().budgetDrops > abortDropsBefore,
+    "and it is counted as a never-sent drop, not as a refusal",
+  );
+
+  // (b) Aborted while QUEUED: the wait is cut and nothing is dispatched.
+  await abortDex.fetchPairsForTokens(["WARM_ABORT"], Date.now() + 2_000);
+  const warmAbortCalls = abortUrls.length;
+  assert.ok(warmAbortCalls >= 1, "the warm-up owns the queue");
+  const queuedCtrl = new AbortController();
+  const queuedCall = abortDex.fetchPairsForTokens(
+    ["QUEUED_ABORT"],
+    Date.now() + 2_000,
+    queuedCtrl.signal,
+  );
+  setTimeout(() => queuedCtrl.abort(new Error("bounded cap")), 10);
+  const queuedPairs = await queuedCall;
+  assert.equal(queuedPairs.size, 0, "a call aborted in the queue yields no pairs");
+  assert.equal(
+    abortUrls.length,
+    warmAbortCalls,
+    "the queued attempt is dropped — no request is dispatched for a caller that has gone",
+  );
+
+  // (c) Aborted IN FLIGHT: the fetch's own signal fires with the caller's, and
+  // the call ends there — not at its budget, and with no retry behind it.
+  let flightAborts = 0;
+  globalThis.fetch = (_url, opts = {}) =>
+    new Promise((_resolve, reject) => {
+      const s = opts.signal;
+      if (!s) return; // no signal: hang forever, like the old bug
+      if (s.aborted) {
+        flightAborts += 1;
+        return reject(new Error("The operation was aborted"));
+      }
+      s.addEventListener(
+        "abort",
+        () => {
+          flightAborts += 1;
+          reject(new Error("The operation was aborted"));
+        },
+        { once: true },
+      );
+    });
+  const flightDex = new DexScreenerClient(
+    loadConfig({ DEX_REQUEST_INTERVAL_MS: "10" }),
+  );
+  const flightCtrl = new AbortController();
+  const flightAt = Date.now();
+  const flightCall = flightDex.fetchPairsForTokens(
+    ["HUNG_ABORT"],
+    Date.now() + 4_000,
+    flightCtrl.signal,
+  );
+  setTimeout(() => flightCtrl.abort(new Error("bounded cap")), 30);
+  const flightPairs = await flightCall;
+  const flightElapsed = Date.now() - flightAt;
+  assert.equal(flightPairs.size, 0, "an in-flight abort yields no pairs");
+  assert.ok(
+    flightElapsed < 1_000,
+    `the request dies with the caller's abort, not at its own budget (took ${flightElapsed}ms)`,
+  );
+  assert.equal(
+    flightAborts,
+    1,
+    "the fetch's own signal is what aborted — the caller's abort travelled through the queue",
+  );
 }
 
 // ---------- the durable snapshot the worker writes after the flush ----------

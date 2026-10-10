@@ -10881,6 +10881,122 @@ async function main() {
     );
   });
 
+  await test("PushWatcher: the pair hard cap ABORTS the lookup the pass gave up on", async () => {
+    // WHY (2026-10-10): the cap above stops the pass WAITING, but until it
+    // handed its signal down, the lookup kept running to its own 15s window and
+    // held the client's queue for a result nobody would read. bounded() now
+    // aborts on the cap and the read wires the signal into its fetch; this pins
+    // the abort at the pass's own boundary.
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const updated = [];
+    let handedSignal = null;
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      watchBot,
+      null,
+      loadConfig({}),
+      // The lookup never answers: only the cap ends the stage, and the signal
+      // it was handed is what a real client would wire into its fetch.
+      (_addrs, _deadline, signal) => {
+        handedSignal = signal;
+        return new Promise(() => {});
+      },
+      null,
+    );
+    pw.pairsHardCapMs = 60;
+    const out = await pw.runTick(Date.now() + 5_000);
+    assert.match(
+      String(out.note),
+      /^pairs-empty /,
+      `the cut is named like a refusal, not read as data (got ${out.note})`,
+    );
+    assert.ok(
+      handedSignal instanceof AbortSignal,
+      "the lookup is handed the cap's signal",
+    );
+    assert.equal(
+      handedSignal.aborted,
+      true,
+      "the cap that gave up on the lookup also cancels it — the request dies with the wait, not at its own timeout",
+    );
+  });
+
+  await test("PushWatcher: a lookup that answers before the cap is never aborted", async () => {
+    // The other side of the same contract: cancellation belongs to the cap
+    // alone. A read that answered while the pass was still waiting must not be
+    // aborted out from under the row it was about to judge.
+    const rows = [watchRow("AAA")];
+    const updated = [];
+    let handedSignal = null;
+    const pw = new PushWatcher(
+      watchDb(rows, updated),
+      watchBot,
+      null,
+      loadConfig({}),
+      (addrs, _deadline, signal) => {
+        handedSignal = signal;
+        return Promise.resolve(new Map(addrs.map((a) => [a, watchPair(a)])));
+      },
+      null,
+    );
+    pw.pairsHardCapMs = 5_000;
+    const out = await pw.runTick(Date.now() + 5_000);
+    assert.ok(
+      handedSignal instanceof AbortSignal,
+      "the lookup is handed the cap's signal",
+    );
+    assert.equal(
+      handedSignal.aborted,
+      false,
+      "an answer that made the cap moot must not cancel the request",
+    );
+    assert.equal(out.checked, 1, `the row is judged normally: ${out.note}`);
+    assert.match(String(out.note), /rows 1\/1/, `and the note says so: ${out.note}`);
+  });
+
+  await test("Scanner: the bounded cap's signal reaches the pair lookup through the constructor's deps", async () => {
+    // WHY an end-to-end here rather than only the PushWatcher test above: the
+    // Scanner builds the two lookup dependencies in its CONSTRUCTOR, and a
+    // wrapper arrow written with two parameters is assignable to the
+    // three-parameter dep type — the compiler cannot see a dropped signal.
+    // Live cost if dropped: bounded() aborts a signal nobody downstream ever
+    // received, and the fetch runs to its own timeout again.
+    const rows = [watchRow("AAA")];
+    const updated = [];
+    let forwarded = null;
+    const scanner = new Scanner(
+      watchDb(rows, updated),
+      watchBot,
+      {
+        fetchPairsForTokens: (_addresses, _deadline, signal) => {
+          forwarded = signal;
+          return new Promise(() => {}); // the live shape: never answers
+        },
+      },
+      loadConfig({}),
+      null,
+      null,
+      null,
+    );
+    assert.ok(scanner.pushWatcher, "the tracker is built with the default config");
+    scanner.pushWatcher.pairsHardCapMs = 60;
+    const out = await scanner.pushWatcher.runTick(Date.now() + 5_000);
+    assert.match(
+      String(out.note),
+      /^pairs-empty /,
+      `the cap still names the cut: ${out.note}`,
+    );
+    assert.ok(
+      forwarded instanceof AbortSignal,
+      "the lookup is handed the cap's signal end to end",
+    );
+    assert.equal(
+      forwarded.aborted,
+      true,
+      "and the cap's abort reaches it — the constructor wrapper did not drop the signal",
+    );
+  });
+
   await test("PushWatcher: one late pass covers all 30 tracked rows in a single batch trip", async () => {
     const rows = Array.from({ length: 30 }, (_, i) => watchRow(`POOL${i}`));
     const updated = [];

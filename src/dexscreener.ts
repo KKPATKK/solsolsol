@@ -726,6 +726,32 @@ export function passesChgGate(
 }
 
 /**
+ * One signal that aborts when EITHER input does — the CALLER's abort (a
+ * bounded read that has given up, see PushWatcher.bounded) or this attempt's
+ * own window (AbortSignal.timeout). Hand-rolled rather than AbortSignal.any:
+ * the Workers runtime and the offline unit tests (Node) must agree on ONE
+ * implementation, and the first cause — the one that names WHY the request
+ * died — is forwarded either way.
+ */
+function combineAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal,
+): AbortSignal {
+  if (a === undefined) return b;
+  const combined = new AbortController();
+  const forward = (from: AbortSignal): void => {
+    if (from.aborted) combined.abort(from.reason);
+    else
+      from.addEventListener("abort", () => combined.abort(from.reason), {
+        once: true,
+      });
+  };
+  forward(a);
+  forward(b);
+  return combined.signal;
+}
+
+/**
  * Spaces out request DISPATCHES so actual request starts stay ≥ interval
  * apart, globally across all concurrent callers. Calls chain on the previous
  * dispatch (not its completion), so one caller's in-flight response may
@@ -819,40 +845,72 @@ class Throttle {
    * in-queue check used to produce, but one queue-length earlier, so the bound
    * holds however deep the backlog is. Without a deadline (every ad-hoc call
    * and every test) the behaviour is exactly what it was.
+   *
+   * THE CALLER'S SIGNAL (2026-10-10) is the same rule one layer up: a bounded
+   * read that has given up hands its abort in, and the attempt is dropped
+   * exactly like a spent deadline — never dispatched, never a slot, never a
+   * subrequest. Its fetch is aborted by the CALLER's signal (see getJson's
+   * combined signal), so the queue does not hold a request nobody will read.
    */
-  async run<T>(fn: () => Promise<T>, deadline?: number): Promise<T | null> {
+  async run<T>(
+    fn: () => Promise<T>,
+    deadline?: number,
+    /**
+     * The caller's abort for a read that has given up (see
+     * PushWatcher.bounded). Optional, so every existing caller keeps its exact
+     * shape.
+     */
+    signal?: AbortSignal,
+  ): Promise<T | null> {
+    // Already given up before the enqueue: this attempt may not spend a slot,
+    // a gap of someone else's queue, or a subrequest.
+    if (signal?.aborted) return null;
     this.plannedAt = this.nextSlotAt();
-    // Set when the deadline wins the race below; the chain callback then SKIPS
-    // this item instead of dispatching a request nobody is waiting for.
+    // Set when the deadline OR the caller's abort wins the race below; the
+    // chain callback then SKIPS this item instead of dispatching a request
+    // nobody is waiting for.
     let cut = false;
     const dispatched = this.tail.then(async () => {
-      if (cut) return;
+      if (cut || signal?.aborted) return;
       const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
       if (wait > 0) await sleep(wait);
-      if (cut) return;
+      if (cut || signal?.aborted) return;
       this.lastCallAt = Date.now();
     });
     this.tail = dispatched;
-    if (deadline === undefined) {
+    if (deadline === undefined && signal === undefined) {
       await dispatched;
       return fn();
     }
-    const capMs = deadline - Date.now();
+    const capMs =
+      deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
     if (capMs <= 0) {
       cut = true;
       return null;
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const gotSlot = await Promise.race([
-      dispatched.then(() => true),
-      new Promise<false>((resolve) => {
+    let onAbort: (() => void) | undefined;
+    const lost = new Promise<false>((resolve) => {
+      if (Number.isFinite(capMs)) {
         timer = setTimeout(() => {
           cut = true;
           resolve(false);
         }, capMs);
-      }),
+      }
+      if (signal !== undefined) {
+        onAbort = () => {
+          cut = true;
+          resolve(false);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    });
+    const gotSlot = await Promise.race([
+      dispatched.then(() => true),
+      lost,
     ]).finally(() => {
       if (timer !== undefined) clearTimeout(timer);
+      if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
     });
     // A cut is NOT a dispatch: report it as the never-sent answer, never as an
     // attempt that "returned null".
@@ -1894,9 +1952,23 @@ export class DexScreenerClient {
      * refusal or a spent budget can never overwrite a caller's prior stamp.
      */
     pairContentAt?: { at: number | null },
+    /**
+     * The CALLER's abort — a bounded read that has given up (see
+     * Throttle.run's signal). An already-aborted call stops before the wire
+     * and is counted as the never-sent `budgetDrops` a spent deadline
+     * produces; one aborted mid-flight is not retried. Optional, so every
+     * existing caller keeps its exact shape.
+     */
+    callerSignal?: AbortSignal,
   ): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
+      // Nobody is waiting any more: this attempt was never sent, and it must
+      // not spend the caller's window retrying a read that has been abandoned.
+      if (callerSignal?.aborted) {
+        this.noteDrop(path);
+        return null;
+      }
       const remaining =
         deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
       if (remaining <= 0) return null; // budget exhausted — stop trying
@@ -1940,6 +2012,10 @@ export class DexScreenerClient {
           // from its `res === null` arm, so both never-sent shapes report
           // through ONE place instead of two.
           if (deadline !== undefined && Date.now() >= deadline) return null;
+          // The caller gave up while this attempt waited for its slot — the
+          // same never-sent answer, caught here for the abort that lands
+          // between the queue's race and this callback.
+          if (callerSignal?.aborted) return null;
           // A BOUNDED caller gets its deadline enforced on every attempt,
           // attempt 1 included. The old 1000ms floor was longer than the
           // 600ms window the profiles feed is handed, so the feed outlived
@@ -1952,7 +2028,11 @@ export class DexScreenerClient {
               : Math.max(1, Math.min(15_000, deadline - Date.now()));
           const init: CloudflareFetchInit = {
             headers: { Accept: "application/json" },
-            signal: AbortSignal.timeout(left),
+            // The caller's abort OR this attempt's own window, whichever comes
+            // first (see combineAbortSignals): a bounded read that has given
+            // up cancels the request itself instead of leaving it in flight
+            // until its budget runs out.
+            signal: combineAbortSignals(callerSignal, AbortSignal.timeout(left)),
           };
           if (edgeCacheTtlS !== undefined && edgeCacheTtlS > 0) {
             // See LIST_FEED_CACHE_TTL_S / PAIR_BATCH_CACHE_TTL_S. Non-2xx stays
@@ -1969,7 +2049,7 @@ export class DexScreenerClient {
             };
           }
           return fetch(`${BASE_URL}${path}`, init);
-        }, deadline);
+        }, deadline, callerSignal);
         // A throttled-away attempt (the window closed while it queued, or the
         // queue could not reach it in time — see Throttle.run) is a budget
         // answer, not a failure: the caller already owns its own fallback, and
@@ -2034,6 +2114,12 @@ export class DexScreenerClient {
         return await res.json();
       } catch (err) {
         lastError = err;
+        // A caller that has given up must not be retried: the request was
+        // aborted ON PURPOSE (see the combined fetch signal), and another
+        // attempt would go out for nobody. `null`, not a throw — this call
+        // reports "no answer" exactly like a refused one. No drop is counted
+        // here: this attempt DID spend the wire.
+        if (callerSignal?.aborted) return null;
         // A 429 is never retried by a BUDGETED caller (see below); an unbounded
         // caller keeps its 2s/4s spacing, since it has no window to protect.
         const rateLimited =
@@ -2302,6 +2388,13 @@ export class DexScreenerClient {
      * note in scanner.ts around SCAN_GATE_RESERVE_MS).
      */
     callerDeadlineMs?: number,
+    /**
+     * The caller's abort — a bounded read that has given up (see
+     * Throttle.run's signal). Every batch rides it: an aborted call stops
+     * dispatching and returns the pairs it already had. Optional, so every
+     * existing caller keeps its exact shape.
+     */
+    callerSignal?: AbortSignal,
   ): Promise<Map<string, PairInfo>> {
     const result = new Map<string, PairInfo>();
     /**
@@ -2357,11 +2450,23 @@ export class DexScreenerClient {
     );
     const batches: string[][] = [];
     for (let i = 0; i < misses.length; i += 30) batches.push(misses.slice(i, i + 30));
+    // The caller has already given up (a bounded read's cap — see
+    // Throttle.run's signal): the rotation is never sent, and the ledger gets
+    // the one reading that belongs there — a single never-sent drop, the shape
+    // a spent deadline produces at getJson's first-batch pre-check.
+    if (callerSignal?.aborted) {
+      this.noteDrop(`/latest/dex/tokens/${batches[0].join(",")}`);
+      return result;
+    }
     let nextBatch = 0;
     let saw429 = false;
 
     const worker = async (): Promise<void> => {
       while (nextBatch < batches.length && !saw429) {
+        // The caller gave up: nothing left to fetch FOR, so the rest of the
+        // rotation stops here — its tokens stay in the pool and are re-read
+        // next tick, the same as a spent budget.
+        if (callerSignal?.aborted) return;
         if (Date.now() > deadline) return; // keep the tick inside its budget
         // A batch the throttle cannot START inside this phase's window is not
         // a drop — it is not attempted AT ALL (2026-09-26).
@@ -2399,6 +2504,7 @@ export class DexScreenerClient {
             // of paying the shared egress (and its 429s) again.
             PAIR_BATCH_CACHE_TTL_S,
             contentAt,
+            callerSignal,
           )) as { pairs?: Array<Record<string, unknown>> } | null;
         } catch (err) {
           // A rate-limited batch means the remaining ones will 429 too — stop
@@ -2502,6 +2608,12 @@ export class DexScreenerClient {
      * budget only.
      */
     callerDeadlineMs?: number,
+    /**
+     * The caller's abort — a bounded read that has given up (see
+     * Throttle.run's signal). An aborted call is UNANSWERED (never "the pools
+     * are gone"): the caller's rows keep their snapshots. Optional.
+     */
+    callerSignal?: AbortSignal,
   ): Promise<{ pairs: Map<string, PairInfo>; answered: boolean }> {
     const pairs = new Map<string, PairInfo>();
     const uniq: string[] = [];
@@ -2522,12 +2634,22 @@ export class DexScreenerClient {
     );
     const batches: string[][] = [];
     for (let i = 0; i < uniq.length; i += 30) batches.push(uniq.slice(i, i + 30));
+    if (callerSignal?.aborted) {
+      // The pin call was abandoned, not attempted — one never-sent drop (see
+      // the token lane above), and UNANSWERED: every row keeps its snapshot.
+      this.noteDrop(`/latest/dex/pairs/solana/${batches[0].join(",")}`);
+      return { pairs, answered: false };
+    }
     let answered = true;
     for (const batch of batches) {
       // A batch the throttle cannot START inside the caller's window is not
       // attempted at all (the same rule the token lane documents): nothing was
       // asked, so the answer is incomplete — UNKNOWN, not "gone".
-      if (Date.now() > deadline || this.throttle.nextSlotAt() >= deadline) {
+      if (
+        callerSignal?.aborted ||
+        Date.now() > deadline ||
+        this.throttle.nextSlotAt() >= deadline
+      ) {
         answered = false;
         break;
       }
@@ -2541,6 +2663,7 @@ export class DexScreenerClient {
           // See PAIR_BATCH_CACHE_TTL_S / the note above.
           PAIR_BATCH_CACHE_TTL_S,
           contentAt,
+          callerSignal,
         );
       } catch {
         // A 429 has already armed the block and the spacing (see note429),

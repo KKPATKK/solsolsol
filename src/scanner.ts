@@ -3405,15 +3405,19 @@ export class Scanner {
           this.bot,
           this.birdeye,
           config,
-          (addresses: string[], deadlineMs?: number) =>
-            this.pairsForTracker(addresses, deadlineMs),
+          // The third parameter is the tracker's bounded() cap (see its
+          // signal): WITHOUT it here a two-argument arrow is still assignable
+          // to the dep type, so the compiler cannot catch the drop — and the
+          // cap's abort would reach a signal nobody downstream ever got.
+          (addresses: string[], deadlineMs?: number, signal?: AbortSignal) =>
+            this.pairsForTracker(addresses, deadlineMs, signal),
           // Trade service for the heal-resend card's buy/sell/mode buttons
           // (null = trading unconfigured → link + unwatch only).
           this.trade,
           // The pinned-pool lookup (see pushwatch's pool-pinning note): the
-          // rows' own pools, answered by address.
-          (addresses: string[], deadlineMs?: number) =>
-            this.poolPairsForTracker(addresses, deadlineMs),
+          // rows' own pools, answered by address — same signal, same rule.
+          (addresses: string[], deadlineMs?: number, signal?: AbortSignal) =>
+            this.poolPairsForTracker(addresses, deadlineMs, signal),
         )
       : null;
   }
@@ -4168,6 +4172,14 @@ export class Scanner {
   private async pairsForTracker(
     addresses: string[],
     deadlineMs?: number,
+    /**
+     * The tracker's bounded() cap (see PushWatcher.bounded): the DexScreener
+     * lookup rides it, and once it fires no FALLBACK leg is started either —
+     * a request opened for a result nobody will read is exactly what the
+     * signal exists to prevent. Optional, so every existing caller and test
+     * double keeps its shape.
+     */
+    signal?: AbortSignal,
   ): Promise<Map<string, PairInfo>> {
     const out = new Map<string, PairInfo>();
     const missing: string[] = [];
@@ -4176,16 +4188,25 @@ export class Scanner {
       if (hit) out.set(a, hit);
       else missing.push(a);
     }
-    if (missing.length === 0) return out;
+    if (missing.length === 0 || signal?.aborted) return out;
     try {
-      for (const [k, v] of await this.dex.fetchPairsForTokens(missing, deadlineMs)) {
+      for (const [k, v] of await this.dex.fetchPairsForTokens(
+        missing,
+        deadlineMs,
+        signal,
+      )) {
         out.set(k, v);
       }
     } catch {
       /* transient — the Jupiter fallback below may still answer */
     }
     const still = missing.filter((a) => !out.has(a));
-    if (still.length > 0 && this.jupiter && typeof deadlineMs === "number") {
+    if (
+      still.length > 0 &&
+      this.jupiter &&
+      typeof deadlineMs === "number" &&
+      !signal?.aborted
+    ) {
       const jup = await this.bestEffort(
         () => this.jupiter!.fetchTokenDataBatch(still),
         deadlineMs,
@@ -4219,7 +4240,8 @@ export class Scanner {
     if (
       geckoMissing.length > 0 &&
       this.gecko &&
-      typeof deadlineMs === "number"
+      typeof deadlineMs === "number" &&
+      !signal?.aborted
     ) {
       for (const mint of geckoMissing.slice(0, TRACKER_GECKO_LOOKUPS)) {
         const snap = await this.bestEffort(
@@ -4316,6 +4338,12 @@ export class Scanner {
   private async poolPairsForTracker(
     addresses: string[],
     deadlineMs?: number,
+    /**
+     * The tracker's bounded() cap (see pairsForTracker's signal): the
+     * by-address lookup rides it, so a pool lookup the pass has given up on is
+     * cancelled instead of held in the queue.
+     */
+    signal?: AbortSignal,
   ): Promise<{
     pairs: Map<string, PairInfo | null>;
     snapshots: number;
@@ -4355,7 +4383,11 @@ export class Scanner {
      */
     const absent: string[] = [];
     try {
-      const res = await this.dex.fetchPairsByAddresses(missing, deadlineMs);
+      const res = await this.dex.fetchPairsByAddresses(
+        missing,
+        deadlineMs,
+        signal,
+      );
       for (const a of missing) {
         const hit = res.pairs.get(a);
         if (hit) {

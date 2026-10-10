@@ -12,6 +12,31 @@ interface OhlcvItem {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * One signal that aborts when EITHER input does — the CALLER's abort (a
+ * bounded read that has given up, see PushWatcher.bounded) or this attempt's
+ * own window. Hand-rolled rather than AbortSignal.any so the offline tests
+ * (Node) and the Workers runtime share ONE implementation, and the first
+ * cause — the one that names WHY the request died — is forwarded either way.
+ */
+function combineAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal,
+): AbortSignal {
+  if (a === undefined) return b;
+  const combined = new AbortController();
+  const forward = (from: AbortSignal): void => {
+    if (from.aborted) combined.abort(from.reason);
+    else
+      from.addEventListener("abort", () => combined.abort(from.reason), {
+        once: true,
+      });
+  };
+  forward(a);
+  forward(b);
+  return combined.signal;
+}
+
 /** Spaces out HTTP requests so we stay well under Birdeye's rate limits. */
 class Throttle {
   private lastCallAt = 0;
@@ -201,9 +226,20 @@ export class BirdeyeClient {
   private async getJson(
     path: string,
     endpoint: BirdeyeEndpoint,
+    /**
+     * The CALLER's abort — a bounded read that has given up (see
+     * PushWatcher.bounded). An already-aborted call never charges a CU and
+     * never reaches the wire; one aborted mid-flight is not retried. Optional,
+     * so every existing caller keeps its exact shape.
+     */
+    signal?: AbortSignal,
   ): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
+      // Nobody is waiting any more: a probe the pass has given up on must not
+      // bill a CU (the free tier is the whole reason the probe is capped) nor
+      // spend the shared queue.
+      if (signal?.aborted) return null;
       // Charged PER ATTEMPT, before the fetch: a request that reaches Birdeye
       // is billed whether or not its payload lands, and a request aborted by
       // the timeout below may still have been processed. Charging the success
@@ -218,7 +254,10 @@ export class BirdeyeClient {
               "x-chain": "solana",
               Accept: "application/json",
             },
-            signal: AbortSignal.timeout(15_000),
+            // The caller's abort OR this attempt's own window, whichever
+            // comes first (see combineAbortSignals): a probe the pass has
+            // given up on is cancelled instead of holding the queue for 15s.
+            signal: combineAbortSignals(signal, AbortSignal.timeout(15_000)),
           }),
         );
         if (res.status === 429 || res.status >= 500) {
@@ -230,6 +269,9 @@ export class BirdeyeClient {
         return await res.json();
       } catch (err) {
         lastError = err;
+        // A caller that has given up must not be retried: the probe was
+        // aborted ON PURPOSE, and another attempt would go out for nobody.
+        if (signal?.aborted) return null;
         if (attempt < 3) await sleep(attempt * 2000);
       }
     }
@@ -423,13 +465,18 @@ export class BirdeyeClient {
    * Field names are parsed defensively (the docs don't publish a schema)
    * so a schema change degrades to nulls, never a scan failure.
    */
-  async getTokenOverview(address: string): Promise<{
+  async getTokenOverview(
+    address: string,
+    /** The tracker's bounded() cap (see getJson's signal). Optional. */
+    signal?: AbortSignal,
+  ): Promise<{
     holderCount: number | null;
     creator: string | null;
   }> {
     const data = (await this.getJson(
       `/defi/token_overview?address=${encodeURIComponent(address)}&ui_amount_mode=raw`,
       "tokenOverview",
+      signal,
     )) as { data?: Record<string, unknown> } | null;
     return parseTokenOverview(data?.data);
   }

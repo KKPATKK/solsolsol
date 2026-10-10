@@ -2870,6 +2870,12 @@ export class PushWatcher {
       addresses: string[],
       /** Optional epoch-ms cap for this call (see TRACKER_PAIRS_BUDGET_MS). */
       deadlineMs?: number,
+      /**
+       * The bounded() cap's signal (see bounded): a read the pass has given up
+       * on aborts its own fetch instead of running to its own timeout.
+       * Optional, so test doubles written before it keep their shape.
+       */
+      signal?: AbortSignal,
     ) => Promise<Map<string, import("./dexscreener").PairInfo>>,
     /**
      * Trade service (optional — null when BOT_WALLET_PRIVATE_KEY is unset).
@@ -2898,6 +2904,8 @@ export class PushWatcher {
       addresses: string[],
       /** Optional epoch-ms cap for this call (see TRACKER_PAIRS_BUDGET_MS). */
       deadlineMs?: number,
+      /** See pairsFor's signal — the same bounded() cap, same abort. */
+      signal?: AbortSignal,
     ) => Promise<{
       pairs: Map<string, import("./dexscreener").PairInfo | null>;
       /**
@@ -2944,10 +2952,24 @@ export class PushWatcher {
   }
 
   /**
-   * Bounds ONE network stage to `capMs`. The work is NOT cancelled — the
-   * caller stops waiting and a late settle is dropped, the same contract as
-   * the scanner's bestEffort(). Callers decide what a miss MEANS (the alert
-   * loop treats it as a failed send, the holder probe as a skip).
+   * Bounds ONE network stage to `capMs`. Callers decide what a miss MEANS (the
+   * alert loop treats it as a failed send, the holder probe as a skip).
+   *
+   * TWO FORMS, and the difference is what a cap can DO:
+   *
+   *  - A THUNK gets the cap's signal and is CANCELLED with the wait: when the
+   *    cap fires, `abort()` reaches the fetch of every read that wired the
+   *    signal through (the pair lookups and the holder probe do — see
+   *    Throttle.run and DexScreenerClient.getJson), so a stage the pass has
+   *    given up on stops holding the upstream queue instead of running to its
+   *    own 15s timeout for nobody.
+   *  - A PLAIN PROMISE keeps the old abandon-only contract — the caller stops
+   *    waiting, the request does not — and the SEND sites use it on purpose: a
+   *    cut card must keep flying (it may already be in the chat, and its late
+   *    settle is the audit proof the next pass dedupes on, see the send
+   *    sites), so cancellation is for READS only.
+   *
+   * A stage that settles before the cap is never aborted.
    *
    * Why this exists: the pass awaited its two network stages with nothing
    * bounding them. Every budget check happens BETWEEN stages, so a stage that
@@ -2957,17 +2979,25 @@ export class PushWatcher {
    * (SCAN_DB_TIMEOUT_MS); these two were the remaining unbounded awaits.
    */
   private async bounded<T>(
-    work: Promise<T>,
+    work: Promise<T> | ((signal: AbortSignal) => Promise<T>),
     capMs: number,
     fallback: T,
   ): Promise<T> {
     if (capMs <= 0) return fallback;
+    const aborter = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      const started = typeof work === "function" ? work(aborter.signal) : work;
       return await Promise.race([
-        work,
+        started,
         new Promise<T>((resolve) => {
-          timer = setTimeout(() => resolve(fallback), capMs);
+          timer = setTimeout(() => {
+            // The half that used to be missing: stop waiting AND stop the
+            // request — a read the pass has given up on may not keep a queue
+            // slot (or a connection) until its own timeout.
+            aborter.abort(new Error("bounded cap"));
+            resolve(fallback);
+          }, capMs);
         }),
       ]);
     } finally {
@@ -3642,14 +3672,16 @@ export class PushWatcher {
         // looking like "those coins have no pairs".
         if (healPast()) healCut = true;
         const missPairs = await this.bounded(
-          this.pairsFor(
-            missing.map((m) => m.token),
-            Date.now() +
-              Math.max(
-                0,
-                Math.min(TRACKER_PAIRS_BUDGET_MS, healDeadline - Date.now()),
-              ),
-          ),
+          (signal) =>
+            this.pairsFor(
+              missing.map((m) => m.token),
+              Date.now() +
+                Math.max(
+                  0,
+                  Math.min(TRACKER_PAIRS_BUDGET_MS, healDeadline - Date.now()),
+                ),
+              signal,
+            ),
           this.pairsHardCapMs,
           new Map<string, import("./dexscreener").PairInfo>(),
         );
@@ -3996,11 +4028,14 @@ export class PushWatcher {
     try {
       // BOUNDED (see TRACKER_PAIRS_HARD_CAP_MS): the deadline handed to the
       // client bounds its DISPATCH, not the queue wait inside it, so the pass
-      // still needs a hard wall of its own here. A cut answers an empty map,
-      // which the guard below reports as `pairs-empty` — the same shape a
-      // refusal takes, never fabricated data.
+      // still needs a hard wall of its own here. The thunk hands the cap's
+      // signal to the lookup, so the fetch dies with the cap too — the pass
+      // does not leave a request in the queue for a read it has given up on.
+      // A cut answers an empty map, which the guard below reports as
+      // `pairs-empty` — the same shape a refusal takes, never fabricated data.
       pairs = await this.bounded(
-        this.pairsFor(tokens, Date.now() + TRACKER_PAIRS_BUDGET_MS),
+        (signal) =>
+          this.pairsFor(tokens, Date.now() + TRACKER_PAIRS_BUDGET_MS, signal),
         this.pairsHardCapMs,
         new Map<string, import("./dexscreener").PairInfo>(),
       );
@@ -4014,7 +4049,12 @@ export class PushWatcher {
         try {
           const pinLookup = this.poolPairsFor;
           const answer = await this.bounded(
-            pinLookup(pinAddrs, Date.now() + TRACKER_PAIRS_BUDGET_MS),
+            (signal) =>
+              pinLookup(
+                pinAddrs,
+                Date.now() + TRACKER_PAIRS_BUDGET_MS,
+                signal,
+              ),
             this.pairsHardCapMs,
             {
               pairs: new Map<
@@ -4257,7 +4297,10 @@ export class PushWatcher {
           holderProbeUnsettled.add(r.token);
           holderProbePending.push(
             this.bounded(
-              birdeye.getTokenOverview(r.token),
+              // The thunk hands the cap's signal to the Birdeye probe: a probe
+              // the pass has abandoned is cancelled instead of occupying the
+              // shared Birdeye queue for its own 15s window.
+              (signal) => birdeye.getTokenOverview(r.token, signal),
               probeCapMs,
               null,
             )
