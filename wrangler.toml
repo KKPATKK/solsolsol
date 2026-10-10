@@ -680,7 +680,7 @@ SUPPLY_FLOW_BUDGET_MS = "1500"
 # are cached per mint, so a deferred coin is analyzed on the next sweep at
 # 0 extra RPC.
 FLURRY_BUDGET_MS = "1200"
-PUSH_WATCH_WINDOW_HOURS = "26"
+PUSH_WATCH_WINDOW_HOURS = "30"
 # Birdeye holder probe: how long ONE probe may take, ms. A probe is BILLED
 # whether or not its count lands, so this is the hit-rate dial, not a latency
 # knob: the endpoint measured 1_008–2_525ms from the Worker's own egress on

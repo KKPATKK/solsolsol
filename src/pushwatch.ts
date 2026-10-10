@@ -1059,7 +1059,7 @@ export const DRAIN_CONFIRM_MARK = "liq1";
  * window-expired row) and the next pass measures the pool again. At-least-once
  * by design: a pool that really is drained re-announces the ⚠️/💧 pair, which
  * is the honest outcome — the user gets to say "recheck it" without waiting
- * out the 26h window or re-pushing the coin.
+ * out the 30h window or re-pushing the coin.
  */
 export function resumeTrackingKeyboard(token: string): {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;

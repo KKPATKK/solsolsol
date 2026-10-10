@@ -959,9 +959,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxTracked: Number.isFinite(Number(env.PUSH_WATCH_MAX_TRACKED ?? 30))
         ? Math.max(1, Math.min(Math.floor(Number(env.PUSH_WATCH_MAX_TRACKED ?? 30)), 30))
         : 30,
-      windowHours: Number.isFinite(Number(env.PUSH_WATCH_WINDOW_HOURS ?? 24))
-        ? Math.max(1, Math.min(Math.floor(Number(env.PUSH_WATCH_WINDOW_HOURS ?? 24)), 72))
-        : 24,
+      windowHours: Number.isFinite(Number(env.PUSH_WATCH_WINDOW_HOURS ?? 30))
+        ? Math.max(1, Math.min(Math.floor(Number(env.PUSH_WATCH_WINDOW_HOURS ?? 30)), 72))
+        : 30,
       cooldownMin: Number.isFinite(Number(env.PUSH_WATCH_COOLDOWN_MIN ?? 30))
         ? Math.max(5, Math.min(Math.floor(Number(env.PUSH_WATCH_COOLDOWN_MIN ?? 30)), 240))
         : 30,
