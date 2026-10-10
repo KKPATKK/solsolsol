@@ -1001,6 +1001,65 @@ async function dexListCacheTest() {
     "...so no leg is blamed for it",
   );
   assert.equal(pairStats.cacheSize, 0, "the stub answered an empty pair list");
+
+  // ---------- the throttle WAIT itself is bounded by the caller's deadline ---
+  // THE BUG THIS PINS (2026-10-10). The queue spaces request STARTS by the
+  // CURRENT spacing, and the 429 controller raises that spacing for the items
+  // ALREADY QUEUED — while each item was ADMITTED on a plan computed with the
+  // spacing in force when it was enqueued. A request admitted against a 100ms
+  // gap can therefore be dispatched against the 1200ms ceiling, i.e. up to 12x
+  // further out than the plan its deadline check approved, and the caller's
+  // deadline used to be re-checked only once the queue RELEASED the item. Live
+  // cost: the tracker pass hung ~12s past its own pair budget
+  // (`cut:watchdog 13600ms db 58-1891ms`). The wait is now raced against the
+  // deadline, and losing that race is a NEVER-SENT attempt, reported as a drop
+  // and returned AT the deadline instead of at the back of the queue.
+  const waitUrls = [];
+  globalThis.fetch = async (url) => {
+    waitUrls.push(String(url));
+    return json([{ chainId: "solana", tokenAddress: "EDGE_W" }]);
+  };
+  dex = new DexScreenerClient(loadConfig({ DEX_REQUEST_INTERVAL_MS: "100" }));
+  const waitStart = Date.now();
+  // Five attempts admitted against the 100ms ladder (plans waitStart..+400)...
+  const queued = [];
+  for (let i = 0; i < 5; i++) queued.push(dex.fetchLatestSolanaProfiles());
+  // ...and a SIXTH, admitted by construction: this leg prices its OWN slot into
+  // its deadline (`max(now + BOOST_FEED_SELF_BUDGET_MS, slot + BOOST_FEED_ATTEMPT_MS)`),
+  // so handing it no window means its admission check passes whatever depth the
+  // queue is at — ONLY the wait can betray it.
+  const boundedBoost = dex.fetchBoostedTokens(20);
+  // The fleet row raises the spacing to the CEILING after those enqueues,
+  // exactly as a 429 storm does: every queued item is re-spaced, the plans are
+  // not — so the sixth attempt's real slot is ~6s away while it was admitted on
+  // a plan 500ms out.
+  dex.adoptDurableSpacing(JSON.stringify({ at: Date.now(), steps: 50 }));
+  const boostedWait = await boundedBoost;
+  const waitedMs = Date.now() - waitStart;
+  assert.deepEqual(boostedWait, [], "an attempt the queue cannot reach in time is never sent");
+  // BOTH ends matter, and the LOWER bound is the one that proves the mechanism:
+  // an instant return would mean the admission check caught it (the pre-existing
+  // path) rather than the WAIT being raced — the case this change exists for.
+  assert.ok(
+    waitedMs >= 400,
+    `the attempt was ADMITTED and then cut at its own deadline — an instant return would mean the admission check, not the wait, bounded it (waited ${waitedMs}ms)`,
+  );
+  assert.ok(
+    waitedMs < 2_500,
+    `and it never waits out the ~6s backlog behind it (waited ${waitedMs}ms)`,
+  );
+  assert.equal(
+    waitUrls.filter((u) => u.includes("token-boosts")).length,
+    0,
+    "the doomed request never reached the network: a cut spends no slot and no subrequest",
+  );
+  const waitStats = dex.getStats();
+  assert.ok(waitStats.budgetDrops >= 1, "and the never-sent attempt is counted as a drop");
+  assert.ok(
+    waitStats.dropsByLeg.boosts >= 1,
+    "blamed on the leg that wanted the slot",
+  );
+  await Promise.allSettled(queued);
 }
 
 // ---------- the durable snapshot the worker writes after the flush ----------

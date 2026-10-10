@@ -778,6 +778,15 @@ class Throttle {
    * plan, and a plan cannot start before the previous real dispatch because the
    * chain serializes them) and "now" for an idle one, where the next item has
    * no wait to pay: idle long enough and both terms are in the past.
+   *
+   * EXACT ONLY WHILE THE SPACING HOLDS (2026-10-10). Every term above reads
+   * `this.intervalMs` NOW, but `plannedAt` was accumulated gap-by-gap as items
+   * were ENQUEUED — so when a 429 raises the spacing (see AdaptiveSpacing) the
+   * items already queued are re-spaced, while the plans they were admitted on
+   * keep the old gaps. What this returns for a NEW enqueue can therefore
+   * understate the real dispatch by the whole ratio (250 -> 1_200ms is 4.8x),
+   * which is why an admission check may never be treated as a BOUND: `run`'s
+   * own deadline is what bounds the wait, below.
    */
   nextSlotAt(): number {
     return Math.max(
@@ -790,15 +799,65 @@ class Throttle {
     );
   }
 
-  run<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * Enqueue one attempt and return its result — or `null` when the caller's
+   * deadline passed while the item was still waiting for its slot.
+   *
+   * WHY THE DEADLINE LIVES HERE (2026-10-10): see nextSlotAt's caveat. The
+   * admission check a caller makes before enqueuing is a PLAN the mutable
+   * spacing can invalidate, and the caller's deadline used to be re-checked
+   * only once the queue had RELEASED the item — so an attempt admitted against
+   * a 250ms gap could be dispatched against a 1200ms one and the call sat in
+   * the queue for seconds longer than the window it had been handed. Live cost:
+   * the tracker pass hung ~12s past its own pair budget (`cut:watchdog 13600ms
+   * db 58-1891ms`, 2026-10-10) — the pass now fences that with a hard cap of
+   * its own, but THIS is the wait itself.
+   *
+   * With a deadline the WAIT is raced: losing that race means the attempt is
+   * NEVER DISPATCHED (`cut` below, so it spends neither a slot nor a
+   * subrequest) and the caller reads `null` — the same NEVER-SENT answer the
+   * in-queue check used to produce, but one queue-length earlier, so the bound
+   * holds however deep the backlog is. Without a deadline (every ad-hoc call
+   * and every test) the behaviour is exactly what it was.
+   */
+  async run<T>(fn: () => Promise<T>, deadline?: number): Promise<T | null> {
     this.plannedAt = this.nextSlotAt();
+    // Set when the deadline wins the race below; the chain callback then SKIPS
+    // this item instead of dispatching a request nobody is waiting for.
+    let cut = false;
     const dispatched = this.tail.then(async () => {
+      if (cut) return;
       const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
       if (wait > 0) await sleep(wait);
+      if (cut) return;
       this.lastCallAt = Date.now();
     });
     this.tail = dispatched;
-    return dispatched.then(() => fn());
+    if (deadline === undefined) {
+      await dispatched;
+      return fn();
+    }
+    const capMs = deadline - Date.now();
+    if (capMs <= 0) {
+      cut = true;
+      return null;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const gotSlot = await Promise.race([
+      dispatched.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => {
+          cut = true;
+          resolve(false);
+        }, capMs);
+      }),
+    ]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
+    // A cut is NOT a dispatch: report it as the never-sent answer, never as an
+    // attempt that "returned null".
+    if (!gotSlot || cut) return null;
+    return fn();
   }
 }
 
@@ -1859,6 +1918,10 @@ export class DexScreenerClient {
         return null;
       }
       try {
+        // The deadline rides the ENQUEUE as well as the attempt (see
+        // Throttle.run): the throttle WAIT is raced against it, so an attempt
+        // the queue cannot reach in time comes back `null` without ever being
+        // dispatched, however deep the backlog behind it is.
         const res = await this.throttle.run(async () => {
           // COUNT THE THROTTLE WAIT AGAINST THE CALLER'S DEADLINE (2026-09-25).
           // `remaining` above was computed BEFORE the queue, and the throttle
@@ -1870,13 +1933,13 @@ export class DexScreenerClient {
           // quietly filled the list (the fetch was aborted before it could
           // answer). The wait is now paid out of the same window: a spent
           // budget ends the attempt here instead of sending it.
-          if (deadline !== undefined && Date.now() >= deadline) {
-            // NEVER SENT (see budgetDrops): the queue held this attempt past
-            // the caller's window. Counting it apart from a 429 is the whole
-            // reason the field exists — the two have different fixes.
-            this.noteDrop(path);
-            return null;
-          }
+          //
+          // This is the BACKSTOP for the one slot Throttle.run's own race can
+          // lose by a hair (the queue releases the item as the deadline lands):
+          // the request is not sent either way, and the CALLER counts the drop
+          // from its `res === null` arm, so both never-sent shapes report
+          // through ONE place instead of two.
+          if (deadline !== undefined && Date.now() >= deadline) return null;
           // A BOUNDED caller gets its deadline enforced on every attempt,
           // attempt 1 included. The old 1000ms floor was longer than the
           // 600ms window the profiles feed is handed, so the feed outlived
@@ -1906,11 +1969,17 @@ export class DexScreenerClient {
             };
           }
           return fetch(`${BASE_URL}${path}`, init);
-        });
-        // A throttled-away attempt (the window closed while it queued) is a
-        // budget answer, not a failure: the caller already owns its own
-        // fallback, and retrying would only spend the caller's window.
-        if (res === null) return null;
+        }, deadline);
+        // A throttled-away attempt (the window closed while it queued, or the
+        // queue could not reach it in time — see Throttle.run) is a budget
+        // answer, not a failure: the caller already owns its own fallback, and
+        // retrying would only spend the caller's window. It is ALSO a DROP,
+        // the never-sent reading `budgetDrops` exists to carry — counted apart
+        // from a 429 because the two have different fixes.
+        if (res === null) {
+          this.noteDrop(path);
+          return null;
+        }
         // ONE place decides which LANE an outcome belongs to (the path — the
         // same dexFeedLeg mapping the drop counters use), so a pair HIT can
         // never move the list ratio that decides LIST_FEED_CACHE_TTL_S — and
