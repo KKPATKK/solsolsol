@@ -14,14 +14,76 @@ const JUP_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Wait `ms`, or resolve false as soon as `signal` aborts — the caller's abort
+ * must not spend a queue slot on a request nobody will read (the same rule
+ * DexScreenerClient.Throttle.run applies). On timeout the abort listener is
+ * removed; on abort the timer is cleared.
+ */
+function waitUnlessAborted(ms: number, signal: AbortSignal): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * One signal that aborts when EITHER input does — the CALLER's abort (a
+ * bounded read that has given up, see PushWatcher.bounded) or this attempt's
+ * own transport window (AbortSignal.timeout). Hand-rolled rather than
+ * AbortSignal.any, for the same reason the other clients hand-roll it: the
+ * Workers runtime and the offline unit tests (Node) must agree on ONE
+ * implementation, and the first cause — the one that names WHY the request
+ * died — is forwarded either way.
+ */
+function combineAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal,
+): AbortSignal {
+  if (a === undefined) return b;
+  const combined = new AbortController();
+  const forward = (from: AbortSignal): void => {
+    if (from.aborted) combined.abort(from.reason);
+    else
+      from.addEventListener("abort", () => combined.abort(from.reason), {
+        once: true,
+      });
+  };
+  forward(a);
+  forward(b);
+  return combined.signal;
+}
+
 /** Spaces out HTTP requests so we stay well under Jupiter's rate limit. */
 class Throttle {
   private lastCallAt = 0;
   constructor(private readonly intervalMs: number) {}
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * Enqueue one request START and return its result — or `null` when the
+   * caller's abort landed before the slot did (the never-sent answer the
+   * other clients' queues produce, see PushWatcher.bounded): a given-up
+   * attempt may not spend a slot the calls behind it would pay for. Without a
+   * signal the behaviour is exactly what it was.
+   */
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T | null> {
+    if (signal?.aborted) return null;
     const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
-    if (wait > 0) await sleep(wait);
+    if (wait > 0) {
+      if (signal === undefined) {
+        await sleep(wait);
+      } else if (!(await waitUnlessAborted(wait, signal))) {
+        return null;
+      }
+    }
+    if (signal?.aborted) return null;
     this.lastCallAt = Date.now();
     return fn();
   }
@@ -333,8 +395,13 @@ export class JupTokensClient {
 
   constructor(
     config: AppConfig,
-    /** Injectable fetch for tests (defaults to global fetch). */
-    private readonly fetcher?: (url: string) => Promise<Response>,
+    /**
+     * Injectable fetch for tests (defaults to global fetch). The second
+     * parameter is the caller's abort, when the read has one (see get) — an
+     * existing one-parameter stub still satisfies the type and simply never
+     * sees it.
+     */
+    private readonly fetcher?: (url: string, signal?: AbortSignal) => Promise<Response>,
   ) {
     this.throttle = new Throttle(config.jupiterRequestIntervalMs);
   }
@@ -343,18 +410,35 @@ export class JupTokensClient {
     return Date.now() < this.rateLimitedUntil;
   }
 
-  /** Shared GET: throttle-spaced, 429-aware; null on any failure. */
-  private async get(path: string): Promise<unknown> {
+  /**
+   * Shared GET: throttle-spaced, 429-aware; null on any failure.
+   *
+   * The optional `signal` is the CALLER's abort for a read that has given up
+   * (the tracker's bounded() cap — see Scanner.pairsForTracker): already
+   * aborted it never reaches the wire, one aborted while queued is never
+   * dispatched (see Throttle.run), and one aborted in flight is cancelled by
+   * the fetch itself (see combineAbortSignals). Optional, so every existing
+   * caller keeps its exact shape.
+   */
+  private async get(path: string, signal?: AbortSignal): Promise<unknown> {
     if (this.rateLimited()) return null;
     try {
       const doFetch =
         this.fetcher ??
-        ((u: string) =>
+        ((u: string, s?: AbortSignal) =>
           fetch(u, {
             headers: { Accept: "application/json" },
-            signal: AbortSignal.timeout(10_000),
+            // The caller's abort OR this attempt's own window, whichever
+            // comes first (see combineAbortSignals).
+            signal: combineAbortSignals(s, AbortSignal.timeout(10_000)),
           }));
-      const res = await this.throttle.run(() => doFetch(`${BASE_URL}${path}`));
+      const res = await this.throttle.run(
+        () => doFetch(`${BASE_URL}${path}`, signal),
+        signal,
+      );
+      // A cut is NOT a request: the caller gave up while this attempt waited
+      // for its slot, so there is no response — and no counter — to read.
+      if (res === null) return null;
       if (res.status === 429) {
         this.rateLimitedUntil = Date.now() + JUP_RATE_LIMIT_BACKOFF_MS;
         return null;
@@ -541,6 +625,15 @@ export class JupTokensClient {
      * nothing (the loop's own first check does it), exactly like the pair lane.
      */
     callerDeadlineMs?: number,
+    /**
+     * The CALLER's abort for a read that has given up (the tracker's
+     * bounded() cap — see Scanner.pairsForTracker): a leg the pass has
+     * abandoned stops opening chunks and cancels the one in flight, instead
+     * of running on for nobody. Same contract as the DexScreener client's
+     * fetchPairsForTokens. Optional, so every existing caller and test double
+     * keeps its shape.
+     */
+    signal?: AbortSignal,
     max = 500,
   ): Promise<Map<string, PairInfo>> {
     const out = new Map<string, PairInfo>();
@@ -562,14 +655,15 @@ export class JupTokensClient {
         // The serial loop's own rules, kept per lane: once the client is
         // paused by a 429 no NEW chunk may be dispatched (a lane already on
         // the wire cannot be recalled — which is exactly why the lane count
-        // stays small), and a deadline already gone stops the lane.
-        if (this.rateLimited() || Date.now() > deadline) return;
+        // stays small), a deadline already gone stops the lane, and the
+        // same holds once the CALLER has given up (see signal).
+        if (this.rateLimited() || Date.now() > deadline || signal?.aborted) return;
         // A chunk the lane cannot START inside the window is not attempted at
         // all — the same rule the serial loop applied (and the DexScreener
         // pair lane's batches): a request that cannot finish is pure latency,
         // and its tokens keep their pool slot for the next rotation.
         const remaining = deadline - Date.now();
-        if (remaining <= JUP_FALLBACK_MIN_ROOM_MS) return;
+        if (remaining <= JUP_FALLBACK_MIN_ROOM_MS || signal?.aborted) return;
         const chunk = list.slice(
           nextChunk * JUP_BATCH_SIZE,
           (nextChunk + 1) * JUP_BATCH_SIZE,
@@ -582,7 +676,7 @@ export class JupTokensClient {
         // gate/push phase behind it — past the scan's deadline. A chunk that
         // expires contributes nothing; the other lane's chunk is unaffected.
         const data = await Promise.race([
-          this.get(`/search?query=${chunk.join(",")}`),
+          this.get(`/search?query=${chunk.join(",")}`, signal),
           new Promise<null>((resolve) =>
             setTimeout(() => resolve(null), remaining),
           ),

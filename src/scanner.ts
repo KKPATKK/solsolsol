@@ -4208,7 +4208,11 @@ export class Scanner {
       !signal?.aborted
     ) {
       const jup = await this.bestEffort(
-        () => this.jupiter!.fetchTokenDataBatch(still),
+        // The caller's window AND its abort ride along: the leg's own 900ms
+        // no longer outlives the pass's deadline, and once the cap gives up
+        // the leg's fetch is cancelled instead of running on for nobody
+        // (see JupTokensClient.fetchTokenDataBatch).
+        () => this.jupiter!.fetchTokenDataBatch(still, deadlineMs, signal),
         deadlineMs,
         new Map<string, PairInfo>(),
       );
@@ -4245,7 +4249,10 @@ export class Scanner {
     ) {
       for (const mint of geckoMissing.slice(0, TRACKER_GECKO_LOOKUPS)) {
         const snap = await this.bestEffort(
-          () => this.gecko!.fetchTokenSnapshot(mint),
+          // The cap's signal rides along here too (see fetchTokenSnapshot):
+          // once a snapshot is out, a pass that gives up cancels it rather
+          // than leaving it in flight (2026-10-10).
+          () => this.gecko!.fetchTokenSnapshot(mint, signal),
           deadlineMs,
           null,
         );

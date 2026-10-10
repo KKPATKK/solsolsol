@@ -194,6 +194,53 @@ export interface NewPool {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Wait `ms`, or resolve false as soon as `signal` aborts — the caller's abort
+ * must not spend a queue slot on a request nobody will read (the same rule
+ * DexScreenerClient.Throttle.run applies). On timeout the abort listener is
+ * removed; on abort the timer is cleared.
+ */
+function waitUnlessAborted(ms: number, signal: AbortSignal): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * One signal that aborts when EITHER input does — the CALLER's abort (a
+ * bounded read that has given up, see PushWatcher.bounded) or this attempt's
+ * own transport window (AbortSignal.timeout, see requestInit). Hand-rolled
+ * rather than AbortSignal.any, for the same reason the other clients
+ * hand-roll it: the Workers runtime and the offline unit tests (Node) must
+ * agree on ONE implementation, and the first cause — the one that names WHY
+ * the request died — is forwarded either way.
+ */
+function combineAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal,
+): AbortSignal {
+  if (a === undefined) return b;
+  const combined = new AbortController();
+  const forward = (from: AbortSignal): void => {
+    if (from.aborted) combined.abort(from.reason);
+    else
+      from.addEventListener("abort", () => combined.abort(from.reason), {
+        once: true,
+      });
+  };
+  forward(a);
+  forward(b);
+  return combined.signal;
+}
+
+/**
  * Cloudflare-only fetch options — absent from the standard RequestInit (this
  * repo compiles without workers-types), which is why they are declared here and
  * cast in requestInit. Ignored by any other runtime (the bot's Node entry
@@ -333,9 +380,24 @@ class Throttle {
   private lastCallAt = 0;
   constructor(private readonly intervalMs: number) {}
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * Enqueue one request START and return its result — or `null` when the
+   * caller's abort landed before the slot did (the never-sent answer the
+   * other clients' queues produce, see PushWatcher.bounded): a given-up
+   * attempt may not spend a slot the calls behind it would pay for. Without a
+   * signal the behaviour is exactly what it was.
+   */
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T | null> {
+    if (signal?.aborted) return null;
     const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
-    if (wait > 0) await sleep(wait);
+    if (wait > 0) {
+      if (signal === undefined) {
+        await sleep(wait);
+      } else if (!(await waitUnlessAborted(wait, signal))) {
+        return null;
+      }
+    }
+    if (signal?.aborted) return null;
     this.lastCallAt = Date.now();
     return fn();
   }
@@ -620,14 +682,18 @@ export class GeckoTerminalClient {
    * cache, so a bad minute can never be served to the next tick as if it were a
    * fresh feed.
    */
-  private requestInit(ttlS: number): CloudflareFetchInit {
+  private requestInit(ttlS: number, signal?: AbortSignal): CloudflareFetchInit {
     const init: CloudflareFetchInit = {
       headers: {
         Accept: "application/json",
         "User-Agent": GECKO_USER_AGENT,
         ...(this.apiKey !== null ? { [this.apiKeyHeader]: this.apiKey } : {}),
       },
-      signal: AbortSignal.timeout(10_000),
+      // The caller's abort OR this attempt's own window, whichever comes
+      // first (see combineAbortSignals): a snapshot the tracker's bounded()
+      // cap has given up on is cancelled instead of holding its connection
+      // for 10s.
+      signal: combineAbortSignals(signal, AbortSignal.timeout(10_000)),
       cf: {
         cacheEverything: true,
         cacheTtl: ttlS,
@@ -672,19 +738,30 @@ export class GeckoTerminalClient {
    * than a rate limit, and without this the fallback would have spent a request
    * per tick for nothing.
    */
-  private async get(path: string): Promise<unknown> {
+  private async get(path: string, signal?: AbortSignal): Promise<unknown> {
+    // Nobody is waiting any more: a read the caller has given up on may not
+    // open a request — on either host (see attempt for the same rule once a
+    // request is already out).
+    if (signal?.aborted) return null;
     if (this.rateLimited()) {
       const now = Date.now();
       if (
         !geckoAltEligible(path, this.apiKey !== null) ||
-        now < this.altRateLimitedUntil
+        now < this.altRateLimitedUntil ||
+        signal?.aborted
       ) {
         return null;
       }
       this.altAttempts += 1;
-      return this.attempt(this.altBaseUrl, path, true, geckoCacheTtlS(path));
+      return this.attempt(this.altBaseUrl, path, true, geckoCacheTtlS(path), signal);
     }
-    const primary = await this.attempt(BASE_URL, path, false, geckoCacheTtlS(path));
+    const primary = await this.attempt(
+      BASE_URL,
+      path,
+      false,
+      geckoCacheTtlS(path),
+      signal,
+    );
     if (primary !== null) return primary;
     // A REFUSED PRIMARY FALLS THROUGH TO THE MIRROR IN THIS SAME CALL
     // (2026-10-04). WHY: the alternate used to be asked only by a LATER call
@@ -704,12 +781,13 @@ export class GeckoTerminalClient {
     if (
       !this.rateLimited() ||
       Date.now() < this.altRateLimitedUntil ||
-      !geckoAltEligible(path, this.apiKey !== null)
+      !geckoAltEligible(path, this.apiKey !== null) ||
+      signal?.aborted
     ) {
       return null;
     }
     this.altAttempts += 1;
-    return this.attempt(this.altBaseUrl, path, true, geckoCacheTtlS(path));
+    return this.attempt(this.altBaseUrl, path, true, geckoCacheTtlS(path), signal);
   }
 
   /**
@@ -744,11 +822,18 @@ export class GeckoTerminalClient {
     path: string,
     alt: boolean,
     ttlS: number,
+    /** The caller's abort (see get) — the same contract on both hosts. */
+    signal?: AbortSignal,
   ): Promise<unknown> {
     try {
-      const res = await this.throttle.run(() =>
-        fetch(`${baseUrl}${path}`, this.requestInit(ttlS)),
+      const res = await this.throttle.run(
+        () => fetch(`${baseUrl}${path}`, this.requestInit(ttlS, signal)),
+        signal,
       );
+      // NEVER DISPATCHED: the caller gave up while this attempt waited for
+      // its slot, so no request went out — and no counter may move for one
+      // (the same rule the DexScreener client's queue applies).
+      if (res === null) return null;
       this.requests += 1;
       this.lastStatus = res.status;
       const cacheStatus = res.headers.get("cf-cache-status");
@@ -831,10 +916,20 @@ export class GeckoTerminalClient {
    * One token's snapshot (see GeckoTokenSnapshot). Shares the client's
    * throttle and 429 backoff with the discovery feeds: after a 429 this
    * returns null for the whole backoff window, exactly like the feeds do.
+   *
+   * `signal` is the tracker's bounded() cap (see Scanner.pairsForTracker):
+   * handed to get, so an abandoned lookup never reaches the wire, never
+   * spends its queue slot, and has its in-flight fetch cancelled. Optional,
+   * so every existing caller and test double keeps its shape.
    */
-  async fetchTokenSnapshot(mint: string): Promise<GeckoTokenSnapshot | null> {
+  async fetchTokenSnapshot(
+    mint: string,
+    signal?: AbortSignal,
+  ): Promise<GeckoTokenSnapshot | null> {
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) return null;
-    return parseTokenSnapshot(await this.get(`/networks/solana/tokens/${mint}`));
+    return parseTokenSnapshot(
+      await this.get(`/networks/solana/tokens/${mint}`, signal),
+    );
   }
 
   /**

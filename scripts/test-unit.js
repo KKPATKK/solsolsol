@@ -7206,6 +7206,70 @@ async function main() {
     }
   });
 
+  await test("Scanner: the tracker's Jupiter and Gecko fallback legs are handed the bounded cap's signal", async () => {
+    // The DexScreener lookups got an end-to-end pin when the cap's abort was
+    // wired through the constructor's deps; these two legs are called
+    // DIRECTLY from pairsForTracker, so a dropped third argument is exactly
+    // as invisible to the compiler (a one-parameter stub accepts it and a
+    // two-parameter wrapper swallows it) — and exactly as expensive live:
+    // the cap aborts a signal neither leg ever received, and the fetches run
+    // to their own windows again (2026-10-10).
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchPairsForTokens = async () => new Map(); // the 429 shape: empty
+
+      // The Jupiter leg: the lookup never answers, so only the cap can end
+      // the read — and the signal it was handed is what a real client wires
+      // into its fetch.
+      let jupSignal = null;
+      const jupiter = {
+        fetchTokenDataBatch: (_mints, _deadline, signal) => {
+          jupSignal = signal;
+          return new Promise(() => {});
+        },
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, null, jupiter,
+      );
+      const cap = new AbortController();
+      const p = scanner.pairsForTracker(["AAA"], Date.now() + 300, cap.signal);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.ok(jupSignal instanceof AbortSignal, "the Jupiter leg is handed the cap's signal");
+      cap.abort(new Error("bounded cap"));
+      assert.equal(jupSignal.aborted, true, "and the abort reaches that signal");
+      await p;
+
+      // The Gecko leg, on its own scanner (Jupiter absent, so the same call
+      // reaches the third source).
+      let geckoSignal = null;
+      const gecko = {
+        fetchTokenSnapshot: (_mint, signal) => {
+          geckoSignal = signal;
+          return new Promise(() => {});
+        },
+      };
+      const scanner2 = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, gecko, null,
+      );
+      const cap2 = new AbortController();
+      const p2 = scanner2.pairsForTracker(["AAA"], Date.now() + 300, cap2.signal);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.ok(geckoSignal instanceof AbortSignal, "the Gecko leg is handed the cap's signal");
+      cap2.abort(new Error("bounded cap"));
+      assert.equal(geckoSignal.aborted, true, "and the abort reaches that signal");
+      await p2;
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   await test("Scanner: a hanging pool DB read is cut by POOL_FETCH_BUDGET_MS and the scan degrades to feed-only", async () => {
     // The libsql client can hang in internal retries (the same hang the
     // worker's flush-retry guard exists for). The pool read is raced against
@@ -10191,6 +10255,152 @@ async function main() {
     const again = await client.fetchTokenDataBatch(mints);
     assert.equal(again.size, 0);
     assert.equal(requests.length, 2, "a paused client makes zero requests, not a probe per lane");
+  });
+
+  await test("JupTokensClient: the caller's abort reaches the batch leg — never queued in, never left in flight", async () => {
+    // WHY (2026-10-10, the §22.8 remaining bullet): the tracker's bounded()
+    // cap aborts the pair lookup, but this leg's own fetch never carried the
+    // signal — a cut Jupiter call kept running to its own 10s transport
+    // window for a result nobody would read. The abort is now wired through
+    // fetchTokenDataBatch -> get -> Throttle.run -> fetch; both halves are
+    // pinned here.
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    // (1) Already aborted: zero requests, empty answer.
+    let calls = 0;
+    const pre = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async () => {
+        calls += 1;
+        return new Response(JSON.stringify([{ id: mint, mcap: 7 }]), { status: 200 });
+      },
+    );
+    const aborter = new AbortController();
+    aborter.abort(new Error("bounded cap"));
+    const none = await pre.fetchTokenDataBatch([mint], undefined, aborter.signal);
+    assert.equal(none.size, 0, "a read the pass gave up on contributes nothing");
+    assert.equal(calls, 0, "and it never reaches the wire");
+
+    // (2) Aborted mid-flight: the fetch's OWN signal fires and the call dies
+    // with the abort, not at its 10s window.
+    const ac = new AbortController();
+    let handed = null;
+    const inflight = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      (_url, signal) => {
+        handed = signal;
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        });
+      },
+    );
+    const p = inflight.fetchTokenDataBatch([mint], undefined, ac.signal);
+    await new Promise((r) => setTimeout(r, 10));
+    const t0 = Date.now();
+    ac.abort(new Error("bounded cap"));
+    const got = await p;
+    const waited = Date.now() - t0;
+    assert.equal(got.size, 0, "a cancelled leg answers empty");
+    assert.ok(waited < 100, `the abort ended it, not a timeout (waited ${waited}ms)`);
+    assert.ok(handed instanceof AbortSignal, "the leg's fetch is handed a signal");
+    assert.equal(handed.aborted, true, "and the caller's abort reaches that signal");
+
+    // (2b) Aborted while QUEUED for a throttle slot: nothing is dispatched.
+    const dispatched = [];
+    const spacedFetcher = async (url) => {
+      dispatched.push(String(url));
+      return new Response(JSON.stringify([{ id: mint, mcap: 7 }]), { status: 200 });
+    };
+    const warm = new JupTokensClient({ jupiterRequestIntervalMs: 200 }, spacedFetcher);
+    // The first call takes the slot (its wait is 0); the second's wait is one
+    // full spacing, and the abort lands inside it.
+    assert.equal((await warm.fetchTokenDataBatch([mint])).size, 1);
+    assert.equal(dispatched.length, 1, "the first call dispatches");
+    const ac3 = new AbortController();
+    const queued = warm.fetchTokenDataBatch([mint], undefined, ac3.signal);
+    await new Promise((r) => setTimeout(r, 20));
+    ac3.abort(new Error("bounded cap"));
+    const t1 = Date.now();
+    assert.equal((await queued).size, 0);
+    assert.equal(dispatched.length, 1, "the queued attempt is NEVER dispatched");
+    assert.ok(Date.now() - t1 < 100, "and the wait ends with the abort, not the full spacing");
+
+    // (3) The other side of the contract: a read that ANSWERED while the
+    // caller still waited must not be aborted out from under its result.
+    const ac2 = new AbortController();
+    const timely = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async () => new Response(JSON.stringify([{ id: mint, mcap: 7 }]), { status: 200 }),
+    );
+    const ok = await timely.fetchTokenDataBatch([mint], undefined, ac2.signal);
+    assert.equal(ok.size, 1, "a timely answer lands");
+    assert.equal(ac2.signal.aborted, false, "and nobody aborted it");
+  });
+
+  await test("GeckoTerminalClient: the caller's abort reaches the snapshot leg", async () => {
+    // The same rule on the third pair source (see Scanner.pairsForTracker):
+    // the tracker's bounded() cap aborts a Gecko snapshot already on the
+    // wire, instead of leaving it to run to its own 10s transport window.
+    // (The tracker's OTHER protection — not STARTING the leg after the cap —
+    // is the pre-existing `!signal?.aborted` gate; this is the half that was
+    // missing once a request is out.)
+    const mint = "5xYbGqsdE9Znz9PKKPnDk8TDrYx8fXxxwN7kQTbpump";
+    const origFetch = global.fetch;
+    const calls = [];
+    const okBody = JSON.stringify({
+      data: { attributes: { price_usd: "0.001", fdv_usd: 133810 } },
+    });
+    try {
+      // (1) Already aborted: zero requests.
+      const client = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 0 });
+      global.fetch = async (url) => {
+        calls.push(String(url));
+        return new Response(okBody, { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      const aborter = new AbortController();
+      aborter.abort(new Error("bounded cap"));
+      assert.equal(await client.fetchTokenSnapshot(mint, aborter.signal), null);
+      assert.equal(calls.length, 0, "an aborted snapshot never reaches the wire");
+
+      // (2) Aborted mid-flight: the fetch's own signal fires.
+      const ac = new AbortController();
+      let handed = null;
+      global.fetch = (_url, init) =>
+        new Promise((_resolve, reject) => {
+          handed = init.signal;
+          init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        });
+      const p = client.fetchTokenSnapshot(mint, ac.signal);
+      await new Promise((r) => setTimeout(r, 10));
+      const t0 = Date.now();
+      ac.abort(new Error("bounded cap"));
+      assert.equal(await p, null, "a cancelled snapshot answers null");
+      const waited = Date.now() - t0;
+      assert.ok(waited < 100, `the abort ended it, not a timeout (waited ${waited}ms)`);
+      assert.ok(handed instanceof AbortSignal, "the fetch is handed a signal");
+      assert.equal(handed.aborted, true, "and the caller's abort reaches that signal");
+
+      // (3) Aborted while QUEUED for a throttle slot: nothing is dispatched.
+      const spaced = new GeckoTerminalClient({ geckoterminalRequestIntervalMs: 200 });
+      const dispatched = [];
+      global.fetch = async (url) => {
+        dispatched.push(String(url));
+        return new Response(okBody, { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      // The first call takes the slot (its wait is 0); the second's wait is
+      // one full spacing, and the abort lands inside it.
+      await spaced.fetchNewPools(1);
+      assert.equal(dispatched.length, 1, "the first call dispatches");
+      const ac2 = new AbortController();
+      const queued = spaced.fetchTokenSnapshot(mint, ac2.signal);
+      await new Promise((r) => setTimeout(r, 20));
+      ac2.abort(new Error("bounded cap"));
+      const t1 = Date.now();
+      assert.equal(await queued, null);
+      assert.equal(dispatched.length, 1, "the queued attempt is NEVER dispatched");
+      assert.ok(Date.now() - t1 < 100, "and the wait ends with the abort, not the full spacing");
+    } finally {
+      global.fetch = origFetch;
+    }
   });
 
   await test("fetchOrganicScore: parses score/label/traders; genuine 0 ≠ absent", async () => {
