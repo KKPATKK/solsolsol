@@ -1032,3 +1032,64 @@ consumed, not carried*，前提係「下一個 check 嘅寫入會用自己嘅 ma
 **線上驗收**：`curl …/debug/push-audit?rows=200`（掃「同 token 同 sig、30 分鐘內重複」）應該大幅收縮；
 `curl …/debug/push-watch` 嘅 `upStages` 應該見得到 `p:` mark 存活；`/health` 嘅 pass note 應該見到正常
 `dup-skip`（而唔係跟住多送一張卡）。同類修法嘅 context 見 §十五（fail-open 重送）同 §十九（冇 mark 都查 proof）。
+
+---
+
+## 二十二、第五修：pair lookup 嘅 hard cap ＋ throttle 佇列等待自己受 deadline 管（2026-10-10，`aea7a1e` ＋ `d1b5e84`）
+
+### 22.1 讀數
+
+| 讀數 | 值 |
+|---|---|
+| pass durable row（`push_watch_pass`） | `cut:watchdog 13600ms db 58-1891ms`、`phase:"cut"`，連續幾個 pass（12:0x–12:2xZ） |
+| 同一 tick 嘅掃描前端 | `cut in the pairs stage (13790ms in)`、`ok:false` |
+| 上游狀態 | DexScreener 429 風暴未停（`lastHour 38-50`，共用 egress IP） |
+
+`13600 = TRACKER_TICK_BUDGET_MS (5_000) + TRACKER_PASS_OVERRUN_MS (8_600)`，即 watchdog 開喺**自己設計嘅界**——佢冇提早，係 pass 真係跑咗 13.6s。`db` 58–1891ms 係第二個線索：13.6s 入面只有 <2s 喺 DB，**~12s 喺一個非 DB await**，而同一輪嘅掃描前端都係死喺 pairs stage。
+
+### 22.2 根因
+
+`TRACKER_PAIRS_BUDGET_MS` 係**交俾 client 嘅 deadline**（佢停 dispatch 喺呢個時刻），唔關個 call 幾時 **return** 事。Pair lookup 經 DexScreener client 嘅共用 dispatch queue，而 queue 嘅 admission（`Throttle.nextSlotAt`）係一條「enqueue 一刻、按當時 spacing 砌嘅 PLAN」：
+
+* 429 controller 會將 spacing 由 250 → 1200ms（4.8×）畀**已經入咗隊**嘅 request；`adoptDurableSpacing` 甚至直接跳到 fleet 嘅 step count。
+* 所以一個 lookup 可以喺隊入面坐到過咗自己個 deadline 幾秒，而 tracker pass 係**直接 await** 佢（全 pass 唯一冇 `bounded()` 嘅 await；self-heal、head batch、pin lookup 三處都係），watchdog 就變成唯一嘅界。
+
+### 22.3 修法一（backstop，`aea7a1e`）
+
+* 新 `TRACKER_PAIRS_HARD_CAP_MS = TRACKER_PAIRS_BUDGET_MS + 1_000 = 2_200ms`（一個 pair budget ＋ 1s 畀「遲到但真實」嘅答案，同 `TRACKER_ROW_SPAN_HOLD_MS` 同一個「＋slack」算法）；instance field `pairsHardCapMs`，等測試可以釘一個細 cap 而唔使等真界。
+* 三個 lookup 全部入 `bounded()`：self-heal、head batch、pin lookup。
+* 一個 cut **同一個 refusal 同形狀**：空 map ⇒ note 講 `pairs-empty` ⇒ 冇任何 row 被判、冇嘢被刪；下個 pass 重讀同一批 missing token。
+* 三個 cap 加埋仍然細過 watchdog 自己嘅 8_600ms overrun —— 呢點係「watchdog 返去做 backstop」嘅算術。
+
+### 22.4 修法二（治本，`d1b5e84`）
+
+`Throttle.run(fn, deadline?)`：**將「等 slot」同 deadline 對賽**（`Promise.race`）。
+
+* 輸咗 ⇒ `cut = true`，chain callback 見到 `cut` 就跳過 ⇒ 條 attempt **永不 dispatch**：唔佔 slot、唔發 subrequest；caller 讀到 `null`（同舊 in-queue 檢查同一個「never-sent」答案，但早咗一整個 queue-length ⇒ backlog 幾深都好，個界都 hold）。
+* 冇 deadline 嘅 call（所有 ad-hoc／test）行為**一模一樣**。
+* 原本 in-queue 嘅 deadline 檢查留做 backstop：處理「queue 啱啱喺 deadline 到時放行」嗰一線。
+* 兩種 never-sent 形狀**統一喺 `getJson` 嘅 `res === null` 一處**計 drop（`budgetDrops` / `dropsByLeg`，同 429 分開——兩者有唔同嘅修法）。
+
+### 22.5 測試
+
+* `test-unit.js`：新測試 —— pair lookup 永不 return ⇒ 被 hard cap 切、pass 即刻 return、note 係 `pairs-empty`。**512 passed / 0 failed**。
+* `test-deferred-priority.js`：第六個 attempt 由自己條腿定價**入到隊**（唔會即刻被 admission 擋），跟住 fleet 升到 1200ms 天花板 re-space 成條 queue ⇒ 佢喺**自己 deadline（~1s）被切**、計為 drop、**冇 request 出網**。斷言**兩邊都釘**：上界（唔會等 ~6s backlog）＋下界（`waited >= 400ms`）——初版淨係得個上界，結果連「即時被 admission drop」都 pass（`waited 1ms`），加咗下界先暴露同修正。
+* 全量 `npm run test:unit`：9 個 suite 全 pass（512 ＋ 7 ＋ 5 ＋ 11 ＋ 4 ＋ 14 ＋ 9），**562 passed / 0 failed**；`typecheck`、`build` clean。
+
+### 22.6 落線驗收
+
+| 改動 | run | 結果 |
+|---|---|---|
+| `aea7a1e` | 38052622041 | success（typecheck ＋ test:unit ＋ `wrangler deploy`） |
+| `d1b5e84` | 38053829954 | success |
+
+* **backstop 之後**：~5 分鐘 16 個 pass，**0 次 `cut:watchdog`**，`trackerMs` 最大 **1537ms**（改動前約 10 分鐘 9 次 cut）；期間風暴仍然活躍。
+* **治本之後**：掃描前端嘅 **pairs leg**（tracker cap 管唔到，所以係 throttle 修復嘅獨立證據）由 `cut in the pairs stage (13790ms in)` → `poolLegMs.pairs 1327–1729ms`、`pairs-jup 620–756ms`、`ok:true`。
+* **2026-10-10 13:10:53–13:12:26Z**（deploy 後 ~75 分鐘）再抽 5 個 pass：全部 `phase:"done"`、**`cut0`**、`trackerMs 263–1026ms`、`rows 29/29 pairs 29/29 pins 29/29`；最新 scan heartbeat `poolLegMs.pairs 2000`、`pairsJup 192`、冇 cut。
+
+### 22.7 界線（老實講）
+
+* **新嘅 cut 路徑未喺 production 觀察到開火**（抽樣 tick `budgetDrops 0`）：前端窗口大、tracker 又常食 `lastPairs`，未必需要切。該路徑由 unit test 嘅**雙向斷言**覆蓋，唔係 live。
+* **冇 controlled A/B**：因果主要靠「前端 pairs leg 復原」——呢點 tracker cap 解釋唔到（cap 只喺 tracker 度）。
+* **`bounded()` 唔 cancel 底層 request**：佢只保證 pass 一定 return；被切嘅 lookup 個 promise 仲會自己行落去（結果冇人讀）。真正取消要將 fetch abort 由 queue 傳出去，係另一個 change。
+* **`nextSlotAt` 嘅 admission pre-check 保留**（free drop）：佢同新嘅 race 係兩道閘；前者省一個 slot，後者係 backlog 幾深都 hold 嘅真正界。
