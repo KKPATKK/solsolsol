@@ -1091,5 +1091,17 @@ consumed, not carried*，前提係「下一個 check 嘅寫入會用自己嘅 ma
 
 * **新嘅 cut 路徑未喺 production 觀察到開火**（抽樣 tick `budgetDrops 0`）：前端窗口大、tracker 又常食 `lastPairs`，未必需要切。該路徑由 unit test 嘅**雙向斷言**覆蓋，唔係 live。
 * **冇 controlled A/B**：因果主要靠「前端 pairs leg 復原」——呢點 tracker cap 解釋唔到（cap 只喺 tracker 度）。
-* **`bounded()` 唔 cancel 底層 request**：佢只保證 pass 一定 return；被切嘅 lookup 個 promise 仲會自己行落去（結果冇人讀）。真正取消要將 fetch abort 由 queue 傳出去，係另一個 change。
+* **`bounded()` 唔 cancel 底層 request**：佢只保證 pass 一定 return；被切嘅 lookup 個 promise 仲會自己行落去（結果冇人讀）。真正取消要將 fetch abort 由 queue 傳出去，係另一個 change。**2026-10-10 已收：見 §22.8。**
 * **`nextSlotAt` 嘅 admission pre-check 保留**（free drop）：佢同新嘅 race 係兩道閘；前者省一個 slot，後者係 backlog 幾深都 hold 嘅真正界。
+
+### 22.8 後續：`bounded()` 而家真係取消底層 request（2026-10-10，`dd4f317`）
+
+§22.7 嗰個「被切嘅 lookup 會自己行落去」已經收：
+
+* `bounded()` 自己揸一個 `AbortController`，cap 一到就 `abort()`，並且收 **thunk 形式** `(signal) => Promise<T>`；四個 read 站點全部改傳 thunk（self-heal／head batch／pin 三個 pair lookup ＋ holder probe）。Sends 照舊傳 promise——cut 卡要繼續飛，佢遲到嘅 settle 就係下個 pass 用嚟去重嘅 audit proof。
+* 信號沿住成條鏈傳到 fetch：`src/scanner.ts` 兩個 tracker lookup 加 `signal?` 並轉發落 dex（**constructor 兩個 wrapper 必須帶第三個參數**——兩參數 arrow 一樣 assignable，compiler 睇唔到 drop；negative control：拿走咗 ⇒ 新測試即刻紅、還原後 **515 passed / 0 failed**）；`fetchPairsForTokens`／`fetchPairsByAddresses` → `getJson`；`Throttle.run(fn, deadline?, signal?)` 喺 enqueue 前已 abort 就唔 dispatch、等 slot 期間 abort 就即刻 cut（同 deadline race 同一條路）；fetch 用 `combineAbortSignals(callerSignal, AbortSignal.timeout(left))`，abort 後唔 retry；batch／pin 兩條 lane 嘅前置檢查各計**一個** never-sent drop。
+* Holder probe 一樣：`BirdeyeClient.getJson(path, endpoint, signal?)` abort 後唔 charge CU、唔出網；`getTokenOverview(address, signal?)`。
+* 測試：`test-unit` **515 pass / 0 fail**（cap 會 abort、準時回答唔會被 abort、constructor 端到端轉發）；`test-deferred-priority` 三個新情境——已 abort 唔出網＋一個 drop、排隊中 abort 唔出網、in-flight abort ~30ms 收工（fetch 自己嘅 signal 開火，唔等自己 4s budget）。
+* 落線：run **38057960039 success**；deploy 後抽 8 個 pass 全部 `phase:"done"`、0 `pairs-empty`／`cut`、`trackerMs 175–4108ms`；驗證窗口 fleet spacing 仲喺 1200ms 天花板（429 殘留）下依然正常。
+
+仍留（老實講）：新嘅 abort 路徑喺 production 未觀察到開火（cap 未觸發）；Jupiter／GeckoTerminal 兩個 client 自身嘅 fetch 未接 signal（abort 後只係唔會再開新 request）。
