@@ -1104,4 +1104,17 @@ consumed, not carried*，前提係「下一個 check 嘅寫入會用自己嘅 ma
 * 測試：`test-unit` **515 pass / 0 fail**（cap 會 abort、準時回答唔會被 abort、constructor 端到端轉發）；`test-deferred-priority` 三個新情境——已 abort 唔出網＋一個 drop、排隊中 abort 唔出網、in-flight abort ~30ms 收工（fetch 自己嘅 signal 開火，唔等自己 4s budget）。
 * 落線：run **38057960039 success**；deploy 後抽 8 個 pass 全部 `phase:"done"`、0 `pairs-empty`／`cut`、`trackerMs 175–4108ms`；驗證窗口 fleet spacing 仲喺 1200ms 天花板（429 殘留）下依然正常。
 
-仍留（老實講）：新嘅 abort 路徑喺 production 未觀察到開火（cap 未觸發）；Jupiter／GeckoTerminal 兩個 client 自身嘅 fetch 未接 signal（abort 後只係唔會再開新 request）。
+仍留（老實講）：新嘅 abort 路徑喺 production 未觀察到開火（cap 未觸發）；Jupiter／GeckoTerminal 兩個 client 自身嘅 fetch 未接 signal（abort 後只係唔會再開新 request）。**2026-10-10 已收：見 §22.9。**
+
+### 22.9 後續：Jupiter／GeckoTerminal 兩條 fallback leg 而家接 signal（2026-10-10，`0388c12`）
+
+§22.8 嗰條「兩個 client 自身嘅 fetch 未接 signal」已經收：
+
+* `src/jupfeeds.ts`（`JupTokensClient`）：`get(path, signal?)` 已 abort 永遠唔出網；in-flight fetch 用 `combineAbortSignals(signal, AbortSignal.timeout(10_000))` 真取消。`Throttle.run(fn, signal?)` 等 slot 途中 abort ⇒ **唔 dispatch、唔佔 slot**（「未發出」同「發出咗但返 null」係兩件事，呢度係前者）；injected fetcher 放寬成 `(url, signal?)`，舊 one-param stub 一樣 assignable。`fetchTokenDataBatch(mints, callerDeadlineMs?, signal?, max?)`：lane 開 chunk 前查 abort，chunk fetch 帶 signal；tracker call 順帶加埋 `deadlineMs`，leg 自己嗰 900ms 唔再 outlive pass 嘅 deadline（同 2026-10-01 前端嗰課一樣）。
+* `src/geckoterminal.ts`（`GeckoTerminalClient`）：`fetchTokenSnapshot(mint, signal?)` → `get` → `attempt`（primary ＋ mirror 兩條 host 都收）→ `requestInit(ttlS, signal?)` 合併 caller abort ＋ 10s transport cap；「未發出」唔會動任何 counter。
+* `src/scanner.ts` `pairsForTracker`：兩個 call site 而家傳 `fetchTokenDataBatch(still, deadlineMs, signal)` 同 `fetchTokenSnapshot(mint, signal)`。
+* 測試：`test-unit` 三個新情境——兩個 client 各自（1）已 abort 唔出網、（2）in-flight abort 由 fetch 自己嘅 signal 開火、~10ms 收工（唔等自己 budget）、（3）排隊等 slot 期間 abort ⇒ 一個 request 都唔開；另加「準時回答唔會被 abort」嘅另一邊。Scanner 端到端：兩個 stub 各自捕捉 cap 嘅 signal（negative control：兩個 call site 抽走 signal ⇒ **517 pass / 1 fail**，還原後 `diff` byte-identical）。
+* 全套：`test-unit` **518 pass / 0 fail**，其餘八個 suite 全綠，typecheck／build clean。
+* 落線：run **38061800043 success**（1m37s；typecheck → unit tests → `wrangler deploy` → 3 個 secret）；`/health` 200；deploy 後抽 3 個 tick 全部 `ok:true phase:"done"`（ms 3941／2469／3355）；最新 summary `pairs 189 / pairsJup 189 / pairsMissing 0`、`poolLegMs.pairs-jup 391ms`、tracker `yield:peer-pass`（正常 peer 讓路，唔係 cut）——正常路徑中性，冇回歸。
+
+仍留（老實講）：新嘅 abort 路徑喺 production 未觀察到開火（cap 未觸發）——中性讀數只證明「冇回歸」，唔等於「睇過取消」；前端（front phase）嗰個 Jupiter call 冇 signal——嗰度冇 `bounded()` caller，由 `frontDeadline` 管。
