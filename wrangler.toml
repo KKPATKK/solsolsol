@@ -363,7 +363,7 @@ RE_EVAL_POOL_SIZE = "1200"
 # repeatedly seen below half the market-cap gate are dropped from the pool
 # (pre-qualification filter), so the sweep budget concentrates on realistic
 # candidates. Slots = sweep ÷ the pool cache TTL below (capped at 12 near
-# and 48 far by src/config.ts; 3/1.5 = 2 and 18/1.5 = 12 slots here).
+# and 48 far by src/config.ts; 3/1.5 = 2 and 12/1.5 = 8 slots here).
 #
 # SIZING THE BANDS (2026-09-15 audit, measured against /debug/pool): a band's
 # per-visit LIMIT is a hard cap and bands are read in signal order (max mcap
@@ -389,8 +389,20 @@ RE_EVAL_POOL_SIZE = "1200"
 # POOL_BAND_ROTATE_BUCKETS / poolBandOrder), so the overflow is served over
 # successive sweeps instead of never, and the slot counts below are a cadence
 # choice again rather than a starvation lever.
+#
+# 2026-10-09 — FAR SWEEP 18 → 12 MIN, measured: the no-evidence prune cut the
+# far band's candidate set (1,107 → 127 in one slot; every one of the 127
+# evidence-bearing rows still returned — nothing actionable was clipped), so
+# the band now underfills its 222-row limit in most slots. The binding delay
+# for a far coin is no longer the LIMIT — it is how often its sub-window
+# appears in the returned pool at all (every 18 min), because the per-tick
+# slice reaches only part of the pool before the slot rotates. 8 far slots
+# (12-min recurrence) give every far coin 1.5x the appearances; each
+# sub-window widens ~1.5x (~190-680 candidate rows with the clause — still
+# under the pre-clause per-sweep total). Slots must stay a multiple of the
+# pool cache TTL (12 / 1.5 = 8).
 REEVAL_NEAR_SWEEP_MIN = "3"
-REEVAL_FAR_SWEEP_MIN = "18"
+REEVAL_FAR_SWEEP_MIN = "12"
 # Re-eval pool query cache TTL + rotation period, in seconds. The pool query
 # is the scan's dominant Turso rows-read consumer; it re-runs once per TTL
 # per isolate, and each expiry advances the rotation slot (slots = sweep ÷

@@ -102,5 +102,7 @@ signal ordering 將 NULL 排最後，cut 走嘅 old NULL 本來就排喺 LIMIT �
 - 寬限期係 db.ts 常數（唔係 config）：一個 per-tick 調嘅 knob 會令 snapshot
   key 同界線靜靜漂走。
 - `pool-read-cost.js` report 每次 ~150k rows quota；今次兩個 before/after 探針
-  （`scripts/tmp-band-evidence.js`）同 window 人口探針（`tmp-evidence-size.js`）
-  用完即刪。
+  （`scripts/tmp-band-evidence.js`）同 window 人口探針（`tmp-evidence-size.js`）用完即刪。
+- 已做（同日晚）：slice 兩道 lane（evidence / filler）＋ far sweep 12min，見
+  `docs/pool-lane-split-2026-10-09.md` —— 唔再收緊呢條 clause，只係把 freed budget
+  用返喺覆蓋率。

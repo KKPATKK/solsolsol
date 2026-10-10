@@ -29,7 +29,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, slicePoolTwoLanes, RE_EVAL_FAST_LANE_SHARE, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -8119,6 +8119,133 @@ async function main() {
     const r3 = slicePoolRotation(items, 10_007, 5);
     assert.deepEqual(r3.slice, [7, 8, 9]);
     assert.equal(r3.nextCursor, 0);
+  });
+
+  // ---------- the two-lane pool rotation (evidence vs filler) --------------
+  //
+  // The slice window is a per-tick SPLIT between the rows with mcap evidence
+  // (the only rows the sweep can act on) and the no-evidence in-grace fillers,
+  // each lane with its own cursor: the fast lane cycles in
+  // ~ceil(fast / (window x RE_EVAL_FAST_LANE_SHARE)) ticks while the filler
+  // lane stays fully covered, just slower. A budget, not extra work.
+  await test("slicePoolTwoLanes: fast lane takes its share, filler rides the rest", () => {
+    const fast = Array.from({ length: 409 }, (_, i) => `e${i}`);
+    const filler = Array.from({ length: 800 }, (_, i) => `n${i}`);
+    const share = Math.round(90 * RE_EVAL_FAST_LANE_SHARE);
+    const r = slicePoolTwoLanes(fast, filler, { fast: 0, slow: 0 }, 90);
+    assert.equal(r.slice.length, 90, "the window is fully spent");
+    assert.deepEqual(
+      r.slice.slice(0, share),
+      fast.slice(0, share),
+      "fast lane first, at its share",
+    );
+    assert.deepEqual(
+      r.slice.slice(share),
+      filler.slice(0, 90 - share),
+      "filler takes the remainder",
+    );
+    assert.equal(r.cursors.fast, share);
+    assert.equal(r.cursors.slow, 90 - share);
+  });
+
+  await test("slicePoolTwoLanes: each lane covers itself once per lane-sweep, no row starved", () => {
+    // The measured shape (2026-10-09): 305 evidenced rows + 836 fillers in a
+    // ~1.1K pool. The old single cursor took ceil(1141/90)=13 ticks per pass;
+    // the split puts every evidenced row through in 6 ticks (the measured
+    // win) while the filler lane still admits all 836 within its 24-tick run.
+    const fast = Array.from({ length: 305 }, (_, i) => `e${i}`);
+    const filler = Array.from({ length: 836 }, (_, i) => `n${i}`);
+    const fastSeen = new Set();
+    const fillerSeen = new Set();
+    let cursors = { fast: 0, slow: 0 };
+    for (let tick = 1; tick <= 24; tick++) {
+      const r = slicePoolTwoLanes(fast, filler, cursors, 90);
+      cursors = r.cursors;
+      for (const item of r.slice) (item[0] === "e" ? fastSeen : fillerSeen).add(item);
+      if (tick === 6) {
+        assert.equal(fastSeen.size, fast.length, "every evidenced row within 6 ticks");
+      }
+    }
+    assert.equal(
+      fillerSeen.size,
+      filler.length,
+      "every filler row still covered in its own cycle",
+    );
+  });
+
+  await test("slicePoolTwoLanes: a lane taken whole resets only its own cursor", () => {
+    const fast = ["e1", "e2"];
+    const filler = Array.from({ length: 300 }, (_, i) => `n${i}`);
+    const r = slicePoolTwoLanes(fast, filler, { fast: 7, slow: 100 }, 90);
+    assert.equal(r.slice.length, 90);
+    assert.deepEqual(r.slice.slice(0, 2), ["e1", "e2"], "small fast lane is taken whole");
+    assert.equal(r.cursors.fast, 0, "and only its cursor resets");
+    assert.equal(r.cursors.slow, 188, "the filler cursor advances by what the fast lane left");
+  });
+
+  await test("slicePoolTwoLanes: empty fast lane hands the whole window to the filler", () => {
+    const filler = Array.from({ length: 300 }, (_, i) => `n${i}`);
+    const r = slicePoolTwoLanes([], filler, { fast: 0, slow: 0 }, 90);
+    assert.equal(r.slice.length, 90);
+    assert.deepEqual(r.slice, filler.slice(0, 90));
+    assert.equal(r.cursors.fast, 0);
+    assert.equal(r.cursors.slow, 90);
+  });
+
+  await test("slicePoolTwoLanes: owed coins keep head priority inside their lane", () => {
+    // slicePoolRotation's make-up priority must survive the lane split: a
+    // deferred coin is placed ahead of its lane's rotating window.
+    const ledger = new DeferredPushLedger();
+    ledger.defer("LANE_OWED", 1);
+    try {
+      const r = slicePoolTwoLanes(
+        [],
+        [
+          { tokenAddress: "ordinary-1" },
+          { tokenAddress: "LANE_OWED" },
+          { tokenAddress: "ordinary-2" },
+        ],
+        { fast: 0, slow: 0 },
+        2,
+      );
+      assert.deepEqual(
+        r.slice.map((i) => i.tokenAddress),
+        ["LANE_OWED", "ordinary-1"],
+      );
+    } finally {
+      ledger.recover("LANE_OWED");
+    }
+  });
+
+  await test("scanner: the pool slice splits evidence and filler lanes", () => {
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const src = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+    );
+    assert.ok(
+      src.includes("exportconstRE_EVAL_FAST_LANE_SHARE=0.6;"),
+      "the fast-lane share is exported and pinned",
+    );
+    assert.ok(
+      src.includes(
+        "slicePoolTwoLanes(fastOnly,fillerOnly,this.poolSliceCursors,RE_EVAL_PER_TICK_MAX",
+      ),
+      "the call site splits the tick window across the two lanes",
+    );
+    assert.ok(
+      src.includes("maxMcapObserved!==null&&s.maxMcapObserved!==undefined"),
+      "the fast lane is keyed on mcap evidence, not on a second guess",
+    );
+    assert.ok(
+      src.includes(
+        "diag.poolSliceLanes={fast:fastOnly.length,filler:fillerOnly.length}",
+      ),
+      "the split is published on the tick summary for acceptance reads",
+    );
   });
 
   await test("cardSendDeadline: a healthy send keeps the internal deadline, a late one is refused", () => {

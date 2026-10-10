@@ -1443,7 +1443,26 @@ export const RE_EVAL_AGE_MARGIN_MIN = 180;
  * limits and RE_EVAL_POOL_SIZE are the levers denominated in that gap — move
  * one of them with a measurement like this one, not this slice again.
  */
-const RE_EVAL_PER_TICK_MAX = 90;
+export const RE_EVAL_PER_TICK_MAX = 90;
+
+/**
+ * Share of the per-tick rotation window given to the pool's FAST lane — the
+ * rows the sweep can still act on (see slicePoolTwoLanes).
+ *
+ * WHY LANES (2026-10-09, measured): the slice is 90 rows against a returned
+ * pool of ~1,100-1,200, so the whole pool takes ~13 ticks (~6.5 min at the
+ * 30s clock) — and ~2/3 of those turns went to no-evidence rows whose every
+ * served reading was non-positive (hot 401 + near 326 + far 154 null fillers
+ * in one slot), while every EVIDENCE-bearing row is already returned by the
+ * bands (measured: hot 46/46, near 191/191, far 68/68 — zero clipped). A coin
+ * with a positive mcap on record is the only kind the sweep can act on; the
+ * fillers are inside the 6h grace and can also turn out alive, which is why
+ * they keep a lane rather than being dropped. 0.6 = the evidenced cohort is
+ * re-checked every ~5-7 ticks (~2.5-3.5 min) while the filler lane's cycle
+ * stretches to ~20-25 ticks (~10-12 min) — the fillers' own catch path is the
+ * discovery feeds plus the grace, not the pool slice.
+ */
+export const RE_EVAL_FAST_LANE_SHARE = 0.6;
 
 /**
  * The liquidity floor the re-eval pool prunes on, as a fraction of the widest
@@ -1818,6 +1837,54 @@ export function slicePoolRotation<T>(
   return { slice: ordered.slice(start), nextCursor: 0 };
 }
 
+/**
+ * Two-lane variant of slicePoolRotation (exported for offline unit tests).
+ *
+ * The pool is split by evidence: the FAST lane holds rows with
+ * `maxMcapObserved` set — the only rows that have ever been read alive — and
+ * the FILLER lane holds no-evidence rows, which are kept in the pool (inside
+ * Db.POOL_MCAP_EVIDENCE_GRACE_MS) but are unlikely to answer. Each lane keeps
+ * its OWN cursor, so the fast lane cycles in ~⌈fast / (window × share)⌉ ticks
+ * while the filler lane — still fully covered, never cut — cycles slower.
+ *
+ * The budget is a per-tick SPLIT of the SAME window, not extra work: the fast
+ * lane takes RE_EVAL_FAST_LANE_SHARE of it, the filler gets the rest, and any
+ * part a lane cannot use (it is smaller than its share, or its tail window is
+ * short) flows to the lane that still has rows instead of being wasted. A
+ * lane taken whole resets its own cursor (see slicePoolRotation); the cursors
+ * are independent, so one lane's sweep boundary never advances the other.
+ */
+export function slicePoolTwoLanes<T>(
+  fast: T[],
+  filler: T[],
+  cursors: { fast: number; slow: number },
+  maxPerTick: number,
+): { slice: T[]; cursors: { fast: number; slow: number } } {
+  const window = Math.max(0, Math.floor(maxPerTick));
+  if (window === 0) return { slice: [], cursors };
+  let fastTake = Math.min(fast.length, Math.round(window * RE_EVAL_FAST_LANE_SHARE));
+  let slowTake = Math.min(filler.length, window - fastTake);
+  // The window is a budget, not a quota: hand anything a lane could not use to
+  // the lane that still has rows (fast first — its rows are the actionable
+  // ones), so a small or drained lane never leaves evaluation slots idle.
+  let leftover = window - fastTake - slowTake;
+  if (leftover > 0) fastTake += Math.min(leftover, fast.length - fastTake);
+  leftover = window - fastTake - slowTake;
+  if (leftover > 0) slowTake += Math.min(leftover, filler.length - slowTake);
+  const fastSlice =
+    fastTake > 0
+      ? slicePoolRotation(fast, cursors.fast, fastTake)
+      : { slice: [] as T[], nextCursor: cursors.fast };
+  const fillerSlice =
+    slowTake > 0
+      ? slicePoolRotation(filler, cursors.slow, slowTake)
+      : { slice: [] as T[], nextCursor: cursors.slow };
+  return {
+    slice: [...fastSlice.slice, ...fillerSlice.slice],
+    cursors: { fast: fastSlice.nextCursor, slow: fillerSlice.nextCursor },
+  };
+}
+
 /** One qualifying coin, prepared for a specific chat. */
 export interface QualifyingCoin {
   chatId: string;
@@ -2103,6 +2170,13 @@ export interface ScanSummary {
   /** Pool coins actually evaluated this tick (rotation slice of `pool`,
    * see RE_EVAL_PER_TICK_MAX). Undefined on pre-fix summaries. */
   poolSliced?: number;
+  /**
+   * Lane populations the tick's slice split saw (see slicePoolTwoLanes):
+   * `fast` = returned pool rows with mcap evidence, `filler` = the returned
+   * no-evidence (in-grace) rows. Read WITH `poolSliced`: the slice stays 90,
+   * the split only decides which rows spend it.
+   */
+  poolSliceLanes?: { fast: number; filler: number };
   /**
    * Pool coins the sweep asked for and got NO reading back for (2026-10-08 —
    * see poolSweepMisses / db.DEAD_POOL_MISS_MAX). This is the freshness
@@ -3169,12 +3243,14 @@ export class Scanner {
    */
   private profileFeedStampedAt: number | null = null;
   /**
-   * Start offset of the current tick's pool rotation slice (see
-   * RE_EVAL_PER_TICK_MAX). Advances by the slice length each tick and wraps,
-   * so the whole pool is covered in ⌈pool / slice⌉ ticks. Cursor > pool
-   * length self-normalizes via the modulo at use.
+   * Start offsets of the two per-tick pool rotation windows (see
+   * RE_EVAL_PER_TICK_MAX / slicePoolTwoLanes): `fast` walks the evidence-
+   * bearing rows, `slow` the no-evidence (in-grace) fillers. Each advances by
+   * its lane's slice length every tick and wraps, so every row of a lane is
+   * covered once per lane sweep. Cursors > lane length self-normalize via the
+   * modulo at use.
    */
-  private poolSliceCursor = 0;
+  private poolSliceCursors = { fast: 0, slow: 0 };
   /**
    * Pool coins the LAST sweep asked for and got no reading back for (see
    * poolSweepMisses). CLEARED at the start of every scan and filled by its
@@ -5709,14 +5785,33 @@ export class Scanner {
       // a smaller pool is taken whole (cursor clamps). Stable order across
       // ticks (the pool query sorts by band then mcap) keeps the window
       // sweep deterministic.
+      //
+      // TWO LANES (2026-10-09, see slicePoolTwoLanes): the SAME window is
+      // split between the rows with mcap evidence (the only rows the sweep
+      // can act on — every evidenced row is already returned by the bands)
+      // and the no-evidence in-grace fillers, which keep a slower lane rather
+      // than being dropped. The window size itself is unchanged (90).
       const feedOnly = poolProfiles.slice(0, feedProfiles.length);
       const poolOnly = poolProfiles.slice(feedProfiles.length);
-      const { slice: poolSlice, nextCursor } = slicePoolRotation(
-        poolOnly,
-        this.poolSliceCursor,
+      const evidencedTokens = new Set(
+        recentStats
+          .filter(
+            (s) => s.maxMcapObserved !== null && s.maxMcapObserved !== undefined,
+          )
+          .map((s) => s.token),
+      );
+      const fastOnly = poolOnly.filter((p) => evidencedTokens.has(p.tokenAddress));
+      const fillerOnly = poolOnly.filter(
+        (p) => !evidencedTokens.has(p.tokenAddress),
+      );
+      const { slice: poolSlice, cursors: nextPoolSliceCursors } = slicePoolTwoLanes(
+        fastOnly,
+        fillerOnly,
+        this.poolSliceCursors,
         RE_EVAL_PER_TICK_MAX,
       );
-      this.poolSliceCursor = nextCursor;
+      this.poolSliceCursors = nextPoolSliceCursors;
+      diag.poolSliceLanes = { fast: fastOnly.length, filler: fillerOnly.length };
       diag.poolSliced = poolSlice.length;
       const evalStart = Date.now();
       const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
