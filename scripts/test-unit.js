@@ -20,7 +20,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, TRACKER_PAIRS_HARD_CAP_MS, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
 const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS, CARRIED_ATTEMPT_SIGS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
@@ -10830,6 +10830,54 @@ async function main() {
       typeof deadlines[0],
       "number",
       "the batch gets a caller deadline so it cannot overrun the pass",
+    );
+  });
+
+  await test("PushWatcher: a pair lookup that never returns is cut at the hard cap, so the pass cannot overrun the watchdog", async () => {
+    // WHY (2026-10-10): TRACKER_PAIRS_BUDGET_MS bounds the batch's DISPATCH, not
+    // its RETURN — the lookups wait in the DexScreener client's shared throttle
+    // queue, whose admission plan is computed from the spacing at ENQUEUE while
+    // the 429 controller can widen that spacing for the requests already queued
+    // (250 -> 1200ms). The pass awaited the lookup DIRECTLY, so that wait became
+    // its one un-raced await: live readings were `cut:watchdog 13600ms db
+    // 58-1891ms` pass after pass — ~12s of a 13.6s pass spent OUTSIDE the
+    // database. The hard cap is what ends it now, in the same shape a refusal
+    // takes (an empty answer, never data).
+    const rows = [watchRow("AAA"), watchRow("BBB")];
+    const updated = [];
+    const db = watchDb(rows, updated);
+    const pw = new PushWatcher(
+      db,
+      watchBot,
+      null,
+      loadConfig({}),
+      // The live shape: the lookup is dispatched and never settles (the queue
+      // never reaches it). Nothing inside the client can end the pass.
+      () => new Promise(() => {}),
+      null,
+    );
+    // Pin the wall without waiting out the real bound (the field exists for
+    // exactly this, the same reason Scanner.trackerPassOverrunMs does).
+    pw.pairsHardCapMs = 60;
+    const t0 = Date.now();
+    const out = await pw.runTick(Date.now() + 5_000);
+    const waited = Date.now() - t0;
+    assert.ok(
+      waited < 1_000,
+      `a stalled pair lookup must not hold the pass (waited ${waited}ms)`,
+    );
+    assert.match(
+      String(out.note),
+      /^pairs-empty /,
+      `the cut is named like a refusal, not read as data (got ${out.note})`,
+    );
+    assert.equal(out.checked, 0, "no row is judged off a request that never answered");
+    assert.equal(updated.length, 0, "and nothing is written for those rows");
+    // The default sits above the pair budget and far inside the watchdog's
+    // overrun — that sum is what makes the watchdog a backstop, not the bound.
+    assert.ok(
+      TRACKER_PAIRS_HARD_CAP_MS > 1_200 && TRACKER_PAIRS_HARD_CAP_MS < 8_600,
+      `the hard cap belongs above the pair budget and below the watchdog overrun (got ${TRACKER_PAIRS_HARD_CAP_MS})`,
     );
   });
 

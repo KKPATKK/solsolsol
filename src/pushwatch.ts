@@ -429,6 +429,35 @@ const HOLDER_PROBE_STAMP_KEY = "holder_probe_at";
  */
 const TRACKER_PAIRS_BUDGET_MS = 1_200;
 /**
+ * OUTER wall on ONE pair lookup — the bound TRACKER_PAIRS_BUDGET_MS does NOT
+give, and the reason the watchdog used to be the only thing that ended a pass.
+ *
+ * TRACKER_PAIRS_BUDGET_MS is the deadline the batch is HANDED (the client
+ * stops dispatching past it); it says nothing about when the call RETURNS. The
+ * lookups go through the client's shared dispatch queue, and that queue's
+ * admission check (`Throttle.nextSlotAt`, src/dexscreener.ts) is a PLAN built
+ * from the spacing in force when a request is ENQUEUED — while the 429
+ * controller can widen the spacing for the requests already queued (250 ->
+ * 1_200ms). A lookup can therefore sit in the queue for seconds past the
+ * deadline it was handed with nothing bounding the wait, and the pass awaited
+ * the lookup DIRECTLY (no bounded(), unlike every send and probe, and unlike
+ * the Jupiter/Gecko legs, which bestEffort races). That made this the pass's
+ * one un-raced await: live 2026-10-10, pass after pass read
+ * `cut:watchdog 13600ms db 58-1891ms` — ~12s of a 13.6s pass spent OUTSIDE the
+ * database, in the pair stage, while the same tick's own front was cut `in the
+ * pairs stage (13790ms in)`.
+ *
+ * The wall is one pair budget plus 1s of slack for a late-but-real answer (the
+ * same "+slack" arithmetic TRACKER_ROW_SPAN_HOLD_MS uses), so a healthy lookup
+ * — which returns inside its deadline — never notices it. THREE lookups at
+ * this cap (the self-heal's, the head batch, the pin lookup) still sum well
+ * inside the watchdog's own 8_600ms overrun, which is what makes the watchdog
+ * a backstop again instead of the only bound. A cut is answered the SAME way
+ * a refusal is (an empty map: no row judged off a request that never answered
+ * — see the `pairs-empty` guard in runTick), never as data.
+ */
+export const TRACKER_PAIRS_HARD_CAP_MS = TRACKER_PAIRS_BUDGET_MS + 1_000;
+/**
  * Rows the pair batch covers: THE WHOLE ROTATION, not a slice of it.
  *
  * 30 is the tracking pool's own ceiling (cfg.maxTracked, itself hard-capped at
@@ -2686,6 +2715,13 @@ export class PushWatcher {
    */
   private passStage = "none";
   private subreqProbe: (() => number) | null = null;
+  /**
+   * Wall-clock wall on ONE pair lookup (see TRACKER_PAIRS_HARD_CAP_MS). An
+   * instance field for the same reason Scanner.trackerPassOverrunMs is one — a
+   * unit test can pin the cut without waiting out the real bound — and it is
+   * read per call, so a test can shorten the bound on a live watcher.
+   */
+  pairsHardCapMs = TRACKER_PAIRS_HARD_CAP_MS;
 
   /**
    * What a THROWN pass can say about itself: the stage it was in, and how
@@ -3605,13 +3641,17 @@ export class PushWatcher {
         // is what makes a starved heal visible in the note instead of it
         // looking like "those coins have no pairs".
         if (healPast()) healCut = true;
-        const missPairs = await this.pairsFor(
-          missing.map((m) => m.token),
-          Date.now() +
-            Math.max(
-              0,
-              Math.min(TRACKER_PAIRS_BUDGET_MS, healDeadline - Date.now()),
-            ),
+        const missPairs = await this.bounded(
+          this.pairsFor(
+            missing.map((m) => m.token),
+            Date.now() +
+              Math.max(
+                0,
+                Math.min(TRACKER_PAIRS_BUDGET_MS, healDeadline - Date.now()),
+              ),
+          ),
+          this.pairsHardCapMs,
+          new Map<string, import("./dexscreener").PairInfo>(),
         );
         for (const m of missing) {
           const pair = missPairs.get(m.token);
@@ -3954,9 +3994,15 @@ export class PushWatcher {
     /** Age (ms) of the OLDEST snapshot served this pass (0 = none). */
     let pinOldestMs = 0;
     try {
-      pairs = await this.pairsFor(
-        tokens,
-        Date.now() + TRACKER_PAIRS_BUDGET_MS,
+      // BOUNDED (see TRACKER_PAIRS_HARD_CAP_MS): the deadline handed to the
+      // client bounds its DISPATCH, not the queue wait inside it, so the pass
+      // still needs a hard wall of its own here. A cut answers an empty map,
+      // which the guard below reports as `pairs-empty` — the same shape a
+      // refusal takes, never fabricated data.
+      pairs = await this.bounded(
+        this.pairsFor(tokens, Date.now() + TRACKER_PAIRS_BUDGET_MS),
+        this.pairsHardCapMs,
+        new Map<string, import("./dexscreener").PairInfo>(),
       );
       // The pin lookup rides the pair STAGE and takes its own window, the
       // same rule the token batch gets (a deadline measured from its own
@@ -3966,9 +4012,18 @@ export class PushWatcher {
       // the loop reads as "not evidence", never as "gone".
       if (pinAddrs.length > 0 && typeof this.poolPairsFor === "function") {
         try {
-          const answer = await this.poolPairsFor(
-            pinAddrs,
-            Date.now() + TRACKER_PAIRS_BUDGET_MS,
+          const pinLookup = this.poolPairsFor;
+          const answer = await this.bounded(
+            pinLookup(pinAddrs, Date.now() + TRACKER_PAIRS_BUDGET_MS),
+            this.pairsHardCapMs,
+            {
+              pairs: new Map<
+                string,
+                import("./dexscreener").PairInfo | null
+              >(),
+              snapshots: 0,
+              snapshotOldestMs: 0,
+            },
           );
           pinPairs = answer.pairs;
           pinSnapshots = answer.snapshots;
