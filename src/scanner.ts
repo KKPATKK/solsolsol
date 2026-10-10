@@ -1848,12 +1848,49 @@ export function slicePoolRotation<T>(
  * while the filler lane — still fully covered, never cut — cycles slower.
  *
  * The budget is a per-tick SPLIT of the SAME window, not extra work: the fast
- * lane takes RE_EVAL_FAST_LANE_SHARE of it, the filler gets the rest, and any
- * part a lane cannot use (it is smaller than its share, or its tail window is
- * short) flows to the lane that still has rows instead of being wasted. A
- * lane taken whole resets its own cursor (see slicePoolRotation); the cursors
- * are independent, so one lane's sweep boundary never advances the other.
+ * lane takes RE_EVAL_FAST_LANE_SHARE of it, the filler gets the rest. Whatever
+ * a lane cannot use this tick — it is smaller than its share, or (the
+ * inherited tail rule, see slicePoolRotation) its window reached the end of
+ * the lane — is offered to the lane that still has rows, which is re-sliced
+ * from its OWN cursor with a bigger take: the longer run extends the first, so
+ * no row is served twice and neither lane wraps back. The only case left that
+ * leaves the window short is BOTH lanes reaching their end in the same tick,
+ * which is a genuinely exhausted rotation, not idle slots.
+ *
+ * A lane taken whole resets its own cursor; each lane's tail tick serves the
+ * remainder and resets. The cursors are independent, so one lane's sweep
+ * boundary never advances the other — but a lane that absorbs the other's
+ * unused slots does advance further on that tick, which is the point: the
+ * recovered budget buys more evaluations instead of going idle. Measured at
+ * the live lane sizes (2026-10-10, fast 392 / filler 775 over a 90-row
+ * window): short ticks 14 in 88 (15.9%) before this pass and 0 in 200 with it
+ * — the both-lanes-at-their-end case is still possible and has its own test,
+ * but at these lane sizes the two lanes never reached their end together.
  */
+
+/**
+ * One lane's slice for this tick, plus the ROOM it has left: how many more rows
+ * it could serve from the same cursor without wrapping past the lane's end
+ * (0 when the lane is taken whole or its window reached the end — the tail
+ * rule in slicePoolRotation, which this deliberately does not change).
+ */
+function planLane<T>(
+  items: T[],
+  cursor: number,
+  take: number,
+): { slice: T[]; nextCursor: number; room: number } {
+  if (take <= 0 || items.length === 0) {
+    return { slice: [], nextCursor: cursor, room: 0 };
+  }
+  const { slice, nextCursor } = slicePoolRotation(items, cursor, take);
+  const start = cursor % items.length;
+  const room =
+    items.length <= take || start + take >= items.length
+      ? 0
+      : items.length - start - take;
+  return { slice, nextCursor, room };
+}
+
 export function slicePoolTwoLanes<T>(
   fast: T[],
   filler: T[],
@@ -1864,24 +1901,31 @@ export function slicePoolTwoLanes<T>(
   if (window === 0) return { slice: [], cursors };
   let fastTake = Math.min(fast.length, Math.round(window * RE_EVAL_FAST_LANE_SHARE));
   let slowTake = Math.min(filler.length, window - fastTake);
-  // The window is a budget, not a quota: hand anything a lane could not use to
-  // the lane that still has rows (fast first — its rows are the actionable
-  // ones), so a small or drained lane never leaves evaluation slots idle.
-  let leftover = window - fastTake - slowTake;
-  if (leftover > 0) fastTake += Math.min(leftover, fast.length - fastTake);
-  leftover = window - fastTake - slowTake;
-  if (leftover > 0) slowTake += Math.min(leftover, filler.length - slowTake);
-  const fastSlice =
-    fastTake > 0
-      ? slicePoolRotation(fast, cursors.fast, fastTake)
-      : { slice: [] as T[], nextCursor: cursors.fast };
-  const fillerSlice =
-    slowTake > 0
-      ? slicePoolRotation(filler, cursors.slow, slowTake)
-      : { slice: [] as T[], nextCursor: cursors.slow };
+  let fastPlan = planLane(fast, cursors.fast, fastTake);
+  let slowPlan = planLane(filler, cursors.slow, slowTake);
+  // The window is a budget, not a quota. A lane that could not use its share —
+  // it is smaller than the share, or its window reached the end of the lane
+  // (slicePoolRotation serves the tail and resets) — hands the rest to the lane
+  // that still has rows. Fast lane first: its rows are the actionable ones. The
+  // re-slice uses the SAME cursor with a bigger take, so the longer run extends
+  // the first one; the grown lane advances by exactly what it served, and
+  // neither lane wraps back.
+  let idle = window - fastPlan.slice.length - slowPlan.slice.length;
+  if (idle > 0 && fastPlan.room > 0) {
+    const served = fastPlan.slice.length;
+    fastTake += Math.min(idle, fastPlan.room);
+    fastPlan = planLane(fast, cursors.fast, fastTake);
+    idle -= fastPlan.slice.length - served;
+  }
+  if (idle > 0 && slowPlan.room > 0) {
+    const served = slowPlan.slice.length;
+    slowTake += Math.min(idle, slowPlan.room);
+    slowPlan = planLane(filler, cursors.slow, slowTake);
+    idle -= slowPlan.slice.length - served;
+  }
   return {
-    slice: [...fastSlice.slice, ...fillerSlice.slice],
-    cursors: { fast: fastSlice.nextCursor, slow: fillerSlice.nextCursor },
+    slice: [...fastPlan.slice, ...slowPlan.slice],
+    cursors: { fast: fastPlan.nextCursor, slow: slowPlan.nextCursor },
   };
 }
 
@@ -2173,8 +2217,10 @@ export interface ScanSummary {
   /**
    * Lane populations the tick's slice split saw (see slicePoolTwoLanes):
    * `fast` = returned pool rows with mcap evidence, `filler` = the returned
-   * no-evidence (in-grace) rows. Read WITH `poolSliced`: the slice stays 90,
-   * the split only decides which rows spend it.
+   * no-evidence (in-grace) rows. Read WITH `poolSliced`: the window is 90 and
+   * the split only decides which rows spend it — a short `poolSliced` means
+   * both lanes' windows reached the end of their lanes on the same tick (see
+   * slicePoolTwoLanes), not that a lane went idle with rows left over.
    */
   poolSliceLanes?: { fast: number; filler: number };
   /**

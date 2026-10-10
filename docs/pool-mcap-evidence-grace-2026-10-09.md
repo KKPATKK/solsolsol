@@ -105,4 +105,4 @@ signal ordering 將 NULL 排最後，cut 走嘅 old NULL 本來就排喺 LIMIT �
   （`scripts/tmp-band-evidence.js`）同 window 人口探針（`tmp-evidence-size.js`）用完即刪。
 - 已做（同日晚）：slice 兩道 lane（evidence / filler）＋ far sweep 12min，見
   `docs/pool-lane-split-2026-10-09.md` —— 唔再收緊呢條 clause，只係把 freed budget
-  用返喺覆蓋率。
+  用返喺覆蓋率；2026-10-10 再補尾段閒置額度過戶（同文件 §六）。

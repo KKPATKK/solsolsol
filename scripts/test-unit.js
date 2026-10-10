@@ -8217,6 +8217,61 @@ async function main() {
     }
   });
 
+  await test("slicePoolTwoLanes: a lane at its end hands the rest to the other lane", () => {
+    // The inherited tail rule serves the remainder and resets the cursor, so
+    // the rows that lane could not spend are idle — unless the OTHER lane can
+    // take them, which it can here: fast (100 rows) sits at 78, so its 54-row
+    // window is a 22-row tail, and the filler covers the remaining 68.
+    const fast = Array.from({ length: 100 }, (_, i) => `e${i}`);
+    const filler = Array.from({ length: 500 }, (_, i) => `n${i}`);
+    const r = slicePoolTwoLanes(fast, filler, { fast: 78, slow: 0 }, 90);
+    assert.equal(r.slice.length, 90, "the window is spent, not left idle");
+    assert.deepEqual(r.slice, [...fast.slice(78), ...filler.slice(0, 68)]);
+    assert.equal(r.cursors.fast, 0, "the short lane still resets — no wrap-back");
+    assert.equal(r.cursors.slow, 68, "the other lane advances by what it served");
+  });
+
+  await test("slicePoolTwoLanes: both lanes at their end leaves a genuinely short window", () => {
+    // Nothing to hand over: this is an exhausted rotation, not idle slots.
+    const fast = Array.from({ length: 100 }, (_, i) => `e${i}`);
+    const filler = Array.from({ length: 50 }, (_, i) => `n${i}`);
+    const r = slicePoolTwoLanes(fast, filler, { fast: 90, slow: 40 }, 90);
+    assert.equal(r.slice.length, 20, "fast tail 10 + filler tail 10");
+    assert.deepEqual(r.slice, [...fast.slice(90), ...filler.slice(40)]);
+    assert.equal(r.cursors.fast, 0);
+    assert.equal(r.cursors.slow, 0);
+  });
+
+  await test("slicePoolTwoLanes: recovery never serves a row twice in a lane sweep", () => {
+    // Recovery re-slices the other lane from its own cursor with a bigger take,
+    // so a grown run must stay a prefix-extension: every row of a lane is
+    // served exactly once per sweep, whatever the other lane's boundary does.
+    const fast = Array.from({ length: 108 }, (_, i) => `e${i}`);
+    const filler = Array.from({ length: 500 }, (_, i) => `n${i}`);
+    let cursors = { fast: 0, slow: 0 };
+    const seen = { fast: new Set(), slow: new Set() };
+    const closed = { fast: 0, slow: 0 };
+    for (let tick = 0; tick < 60; tick++) {
+      const before = { ...cursors };
+      const r = slicePoolTwoLanes(fast, filler, cursors, 90);
+      cursors = r.cursors;
+      for (const item of r.slice) {
+        const lane = item[0] === "e" ? "fast" : "slow";
+        assert.equal(seen[lane].has(item), false, `${item} served twice in one sweep`);
+        seen[lane].add(item);
+      }
+      for (const lane of ["fast", "slow"]) {
+        if (cursors[lane] < before[lane]) {
+          const items = lane === "fast" ? fast : filler;
+          assert.equal(seen[lane].size, items.length, `${lane} sweep missed rows`);
+          seen[lane].clear();
+          closed[lane] += 1;
+        }
+      }
+    }
+    assert.ok(closed.fast >= 5 && closed.slow >= 3, "both lanes completed sweeps");
+  });
+
   await test("scanner: the pool slice splits evidence and filler lanes", () => {
     const strip = (text) =>
       text
