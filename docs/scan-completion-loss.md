@@ -432,10 +432,18 @@ if (recentClaim && !delivered.has(m.token)) { ... 送補發 ... }
 - `bestEffort(null)` 同「真係被拒」之間嗰個混同順手修好：rejection 而家會帶住 Telegram 原本嘅 error
   出去（`/debug/chats` 嘅描述唔再一律係「exceeded its deadline」），而 `cardSendTimeout` 呢個 tag 同
   佢喺 retry 閘門嘅例外一齊冇再需要（cut 已經唔會 throw 出去）。
+- **第三處：紀錄寫入係 fail-open（同一日補）**。留住 claim 之所以安全，全靠嗰條 durable 紀錄話俾 settle 知
+  「呢個 claim 係我嘅」；而 `seen_tokens` 冇 prune、冇 expiry（全 `src` 只有 `unclaimTokenPush` 同
+  `removeChat` 兩個 DELETE），所以「claim 在 ＋ 無紀錄」= 該 chat 永久 withheld = **真係漏推**。
+  所以：ring 寫唔到 → 即刻 `unclaimTokenPush`（最多遲兩分鐘多一張，方向跟 never-miss），而背景鏈
+  **唔會再放第二次 claim**（否則可能刪到之後重推所拎嘅新 claim → 第三張卡）。兩邊寫入都失敗就
+  `console.error` 點名該 mint —— 呢個係唯一殘留嘅 fail-closed 點，要靠人手 unclaim，而
+  `cardSendAbandoned` 同 ring 對唔上就係唯一訊號。
 
 測試：純規則仍然喺 `scripts/test-unit.js`（`cardSendDisposition`、`settleUnconfirmedCardSends`、ring 讀寫），
 **接線**喺新檔 `scripts/test-unconfirmed-cards.js`（真 tick：一個候選幣 + 一個永遠唔答嘅 send →
-claim 保留、ring 一條紀錄、`push_audit` **冇** entry；另加一個 400 拒絕 → claim 放返）。
+claim 保留、ring 一條紀錄、`push_audit` **冇** entry；一個 400 拒絕 → claim 放返；同一個 cut 但
+**ring 寫唔到** → claim 即刻放返、下一個 tick 真係推得出去）。
 
 ---
 

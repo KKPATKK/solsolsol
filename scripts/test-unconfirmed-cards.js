@@ -74,6 +74,51 @@ function tmpDb() {
   };
 }
 
+/**
+ * Gate settings that let a fixture coin qualify (every gate zero, so only the
+ * chain runs) — the shape the chain-floor cases in
+ * scripts/test-deferred-priority.js use.
+ */
+const ZERO_GATES = {
+  minLiquidityUsd: 0,
+  minVolume24hUsd: 0,
+  minMarketCapUsd: 0,
+  maxMarketCapUsd: 10_000_000,
+  minAgeMinutes: 0,
+  maxAgeMinutes: 100_000,
+  min5mVolUsd: 0,
+  min1hVolUsd: 0,
+  min5mChgPct: 0,
+  min1hChgPct: 0,
+  enabled: true,
+};
+
+/** A pair that passes every gate, for whatever mint the tick is handed. */
+function cutPair(mint) {
+  return {
+    chainId: "solana",
+    url: `https://dexscreener.com/solana/${mint}P`,
+    pairAddress: `${mint}P`,
+    baseToken: { address: mint, name: "Cut Coin", symbol: "CUT" },
+    priceUsd: "0.001",
+    marketCap: 100_000,
+    volume: { h24: 500_000, h1: 60_000, m5: 9_000 },
+    priceChange: { m5: 40, h1: 60 },
+    txns: { m5Buys: 80, m5Sells: 60, h1Buys: 900, h1Sells: 700 },
+    liquidity: { usd: 20_000 },
+    pairCreatedAt: Date.now() - 60 * 60_000,
+  };
+}
+
+/** The discovery feed: the one coin the tick is about to push. */
+function stubCutFeed(mint) {
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify([{ chainId: "solana", tokenAddress: mint, symbol: "CUT" }]), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+}
+
 async function main() {
   // ---------- the worker's tick tail settles the record ----------
   // The record a cut send wrote is resolved HERE, out of the proofs the tail
@@ -290,44 +335,14 @@ async function main() {
     // milliseconds instead of the 8s send tail.
     const cfg = loadConfig({});
     const realNow = Date.now;
-    const zeros = {
-      minLiquidityUsd: 0,
-      minVolume24hUsd: 0,
-      minMarketCapUsd: 0,
-      maxMarketCapUsd: 10_000_000,
-      minAgeMinutes: 0,
-      maxAgeMinutes: 100_000,
-      min5mVolUsd: 0,
-      min1hVolUsd: 0,
-      min5mChgPct: 0,
-      min1hChgPct: 0,
-      enabled: true,
-    };
-    const pairFor = (mint) => ({
-      chainId: "solana",
-      url: `https://dexscreener.com/solana/${mint}P`,
-      pairAddress: `${mint}P`,
-      baseToken: { address: mint, name: "Cut Coin", symbol: "CUT" },
-      priceUsd: "0.001",
-      marketCap: 100_000,
-      volume: { h24: 500_000, h1: 60_000, m5: 9_000 },
-      priceChange: { m5: 40, h1: 60 },
-      txns: { m5Buys: 80, m5Sells: 60, h1Buys: 900, h1Sells: 700 },
-      liquidity: { usd: 20_000 },
-      pairCreatedAt: Date.now() - 60 * 60_000,
-    });
     const runTick = async (chatId, mint, sendMessage) => {
       const t = tmpDb();
       const db = new Db(t.p, undefined, t.client);
       await db.init();
-      await db.saveChatSettings({ chatId, ...zeros });
+      await db.saveChatSettings({ chatId, ...ZERO_GATES });
       const dex = new DexScreenerClient(cfg);
-      dex.fetchPairsForTokens = async () => new Map([[mint, pairFor(mint)]]);
-      globalThis.fetch = async () =>
-        new Response(JSON.stringify([{ chainId: "solana", tokenAddress: mint, symbol: "CUT" }]), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+      dex.fetchPairsForTokens = async () => new Map([[mint, cutPair(mint)]]);
+      stubCutFeed(mint);
       const scanner = new Scanner(db, { api: { sendMessage } }, dex, cfg, null, null, null);
       await scanner.runOnce();
       return { db, scanner, cleanup: t.cleanup };
@@ -388,6 +403,92 @@ async function main() {
       );
     } finally {
       await rejected.cleanup();
+    }
+  });
+
+  await test("scanner: a cut send whose record cannot be written gives the claim back, and the next tick pushes it", async () => {
+    // THE FAIL-OPEN HALF (2026-10-11). Holding the claim is only safe while a
+    // durable record says the settle owns it: seen_tokens has no prune and no
+    // expiry, so a claim with NO record can never be released and the coin would
+    // be withheld from that chat FOREVER — a lost card, the one outcome the
+    // never-miss rule forbids. So a record that cannot be written gives the
+    // claim back instead (at most one duplicate, minutes late).
+    const cfg = loadConfig({});
+    const realNow = Date.now;
+    let skew = 0;
+    Date.now = () => realNow() + skew;
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({ chatId: "chat-cut", ...ZERO_GATES });
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchPairsForTokens = async () => new Map([["CUTMINT", cutPair("CUTMINT")]]);
+      stubCutFeed("CUTMINT");
+      // The record's write fails the way a tick that has run out of room fails
+      // it: exactly ONE write cannot land, and it is the ring's.
+      const realSetWorkerState = db.setWorkerState.bind(db);
+      let ringWrites = 0;
+      db.setWorkerState = async (key, value) => {
+        if (key === UNCONFIRMED_CARD_STATE_KEY) {
+          ringWrites += 1;
+          throw new Error("Too many subrequests");
+        }
+        return realSetWorkerState(key, value);
+      };
+      const hanging = new Scanner(
+        db,
+        {
+          api: {
+            sendMessage: async () => {
+              skew = 60_000;
+              return new Promise(() => {});
+            },
+          },
+        },
+        dex,
+        cfg,
+        null,
+        null,
+        null,
+      );
+      await hanging.runOnce();
+      assert.equal(ringWrites, 1, "the record write was attempted");
+      assert.equal(hanging.lastSummary.cardSendAbandoned, 1, "the abandoned send is still counted");
+      assert.equal(
+        await db.isTokenSeen("chat-cut", "CUTMINT"),
+        false,
+        "the claim is GIVEN BACK — a claim with no record has nothing that could ever release it",
+      );
+      assert.deepEqual(
+        parseUnconfirmedCardSends(await db.getWorkerState(UNCONFIRMED_CARD_STATE_KEY)),
+        [],
+        "and nothing is recorded as unconfirmed",
+      );
+      // The point of giving it back: the coin is NOT withheld. The very next
+      // tick (clock back to normal, writes healthy) pushes it.
+      skew = 0;
+      db.setWorkerState = realSetWorkerState;
+      const next = new Scanner(
+        db,
+        { api: { sendMessage: async () => ({ message_id: 4_243 }) } },
+        dex,
+        cfg,
+        null,
+        null,
+        null,
+      );
+      await next.runOnce();
+      assert.equal(next.lastSummary.pushed, 1, "the released coin is pushed by the next tick");
+      assert.equal(await db.isTokenSeen("chat-cut", "CUTMINT"), true, "and that push holds its own claim");
+      const audit = await db.getWorkerState("push_audit");
+      assert.ok(
+        typeof audit === "string" && audit.includes("CUTMINT"),
+        "with the delivery audit written — the proof the deferral guard and the heal gate read",
+      );
+    } finally {
+      Date.now = realNow;
+      await t.cleanup();
     }
   });
 

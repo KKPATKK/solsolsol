@@ -7011,12 +7011,30 @@ export class Scanner {
               diag.cardSendAbandoned = (diag.cardSendAbandoned ?? 0) + 1;
               this.cardSendAbandonedTotal += 1;
               diag.cardSendAbandonedTotal = this.cardSendAbandonedTotal;
-              await this.recordUnconfirmedCardSend(c).catch(() => {
-                /* best-effort: the CLAIM was already kept by this branch, so a
-                   record that cannot land only means the settle finds nothing
-                   to release — the coin stays withheld, which is the
-                   never-miss direction. */
-              });
+              // The record is what LATER RELEASES the claim, so it is not
+              // best-effort any more (2026-10-11, fail-open): a claim with no
+              // record has nothing that can ever settle it — seen_tokens has no
+              // prune and no expiry, so the coin would be withheld from that
+              // chat FOREVER, i.e. a lost card, the one outcome the never-miss
+              // rule forbids. If the write does not land, give the claim back
+              // right here and accept at most one duplicate, minutes late.
+              const recorded = await this.recordUnconfirmedCardSend(c).then(
+                () => true,
+                () => false,
+              );
+              if (!recorded) {
+                try {
+                  await this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress);
+                } catch {
+                  // Both writes failing is the DB in trouble, and this isolate
+                  // can do no more: name the coin, because a claim left behind
+                  // WITH no record is otherwise invisible (no ring row, and
+                  // `seen_tokens` is only a gate).
+                  console.error(
+                    `[scanner] abandoned card for ${symbol ?? c.chatId} could not be recorded AND its claim could not be released — it stays withheld; unclaim ${c.profile.tokenAddress} for this chat by hand`,
+                  );
+                }
+              }
               // Settle in the background: the tick is over either way. A late
               // success AUDITS the card (the settle below then keeps the claim
               // and NOTHING is ever re-pushed); a late rejection RELEASES the
@@ -7029,10 +7047,18 @@ export class Scanner {
                   if (r.status === "sent") {
                     // The card DID arrive, so the follow-ups it is owed start
                     // here (the same enrollment the foreground path runs — one
-                    // call site, see enrollTracking).
+                    // call site, see enrollTracking), and the audit is the proof
+                    // the deferral guard and the heal gate both read.
                     await auditDelivery(Number(r.message.message_id ?? 0));
                     await this.enrollTracking(c);
-                  } else {
+                  } else if (recorded) {
+                    // Only while THIS claim is still ours: with a record, the
+                    // claim is held and a late rejection releases it. Without
+                    // one the claim was already given back above, and a second
+                    // release could delete a claim a later re-push has since
+                    // taken — which would put a SECOND card in flight off one
+                    // abandoned send (the ordering rule the worker's settle
+                    // documents for its own release).
                     try {
                       await this.db.unclaimTokenPush(
                         c.chatId,
@@ -7042,12 +7068,14 @@ export class Scanner {
                       /* best-effort — the settle releases it after the grace */
                     }
                   }
-                  await this.clearUnconfirmedCardSend(
-                    c.chatId,
-                    c.profile.tokenAddress,
-                  ).catch(() => {
-                    /* best-effort — the worker's settle drops it on proof */
-                  });
+                  if (recorded) {
+                    await this.clearUnconfirmedCardSend(
+                      c.chatId,
+                      c.profile.tokenAddress,
+                    ).catch(() => {
+                      /* best-effort — the worker's settle drops it on proof */
+                    });
+                  }
                 })
                 .catch(() => {
                   /* the worker's settle resolves whatever this isolate cannot */
