@@ -20,7 +20,7 @@ const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS } = require("../dist/dexscreener.js");
-const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, TRACKER_PAIRS_HARD_CAP_MS, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse } = require("../dist/pushwatch.js");
+const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, TRACKER_PAIRS_HARD_CAP_MS, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse, trackerLaneStatus, TRACKER_LANE_STALE_MS, runningPassStamp } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
 const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS, CARRIED_ATTEMPT_SIGS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
@@ -18676,6 +18676,138 @@ async function main() {
     );
   });
 
+  // ---------- /health's tracker LANE field (2026-10-11) ----------
+  //
+  // The lane reading has to come from the DURABLE pass row, never from
+  // trackerPassPulse(): the pulse is module memory, so an isolate that has not
+  // run a pass answered `pushWatchLive: null` (live 2026-10-11: two /health
+  // polls a minute apart, both null, while the pass was serving 21 rows —
+  // `ok:21/1 rows 21/21 pairs 21/21 pins 21/21 miss 0 lost 0`). These tests pin
+  // the row-only reader and the alarms it must keep apart.
+  await test("tracker lane: the durable row answers on a cold isolate, counters included", () => {
+    const now = 1_800_000_000_000;
+    const lane = trackerLaneStatus(
+      JSON.stringify({
+        at: now - 12_000,
+        note: "ok:21/1 rows 21/21 pairs 21/21 pins 21/21 miss 0 lost 0 trips 7 db 135ms",
+        trackerMs: 166,
+        phase: "done",
+        via: "cron-pass",
+        relay: "inner",
+        stage: "done",
+        checked: 21,
+        alerted: 1,
+        claimLost: 0,
+      }),
+      now,
+    );
+    assert.equal(lane.present, true);
+    assert.equal(lane.stale, false, "12s is inside the window");
+    assert.equal(lane.running, false);
+    assert.equal(lane.stuck, false);
+    assert.equal(lane.cut, false);
+    assert.equal(lane.phase, "done");
+    assert.equal(lane.ageMs, 12_000);
+    assert.equal(lane.ageSec, 12);
+    assert.equal(lane.staleAfterMs, TRACKER_LANE_STALE_MS);
+    assert.equal(lane.stage, "done");
+    assert.equal(lane.checked, 21, "the counters the pulse used to carry alone");
+    assert.equal(lane.alerted, 1);
+    assert.equal(lane.claimLost, 0);
+    assert.equal(lane.trackerMs, 166);
+    assert.equal(lane.via, "cron-pass");
+    assert.equal(lane.relay, "inner");
+    assert.match(String(lane.note), /^ok:21\/1 rows 21\/21/);
+  });
+
+  await test("tracker lane: stale, stuck, cut and skip are four different readings", () => {
+    const now = 1_800_000_000_000;
+    const row = (extra) => JSON.stringify({ at: now - 10_000, note: "x", phase: "done", ...extra });
+    const flags = (lane) => ({ stale: lane.stale, running: lane.running, stuck: lane.stuck, cut: lane.cut });
+    // (a) A fresh completed pass: no alarm at all.
+    assert.deepEqual(flags(trackerLaneStatus(row({}), now)), {
+      stale: false,
+      running: false,
+      stuck: false,
+      cut: false,
+    });
+    // (b) A pass IN FLIGHT and inside the window: running, and neither stuck
+    // nor stale — an in-flight pass is the healthy shape for a few hundred ms.
+    assert.deepEqual(flags(trackerLaneStatus(row({ phase: "running" }), now)), {
+      stale: false,
+      running: true,
+      stuck: false,
+      cut: false,
+    });
+    // (c) The SAME row past the window: the killed-mid-flight shape — the pass
+    // never got to write its note, so `stale` cannot wait for a phase change.
+    assert.deepEqual(
+      flags(trackerLaneStatus(row({ phase: "running", at: now - TRACKER_LANE_STALE_MS - 1 }), now)),
+      { stale: true, running: true, stuck: true, cut: false },
+    );
+    // (d) A pass the WATCHDOG abandoned: it ran and did not finish its
+    // rotation. Not stale (the lane was served seconds ago) but cut, which is
+    // the reading that says cards may have been dropped.
+    assert.deepEqual(flags(trackerLaneStatus(row({ phase: "cut" }), now)), {
+      stale: false,
+      running: false,
+      stuck: false,
+      cut: true,
+    });
+    // (e) A tick that ran NO pass. The row is fresh, and that is exactly why it
+    // must not count as coverage (passRowAgeMs's own rule): a run of skipped
+    // ticks would otherwise hold the lane "fresh" while no row was checked.
+    const skipped = trackerLaneStatus(row({ phase: "skip", note: "skip:no-budget" }), now);
+    assert.deepEqual([skipped.present, skipped.stale, skipped.ageSec], [true, true, 10]);
+    // (f) The window itself: inclusive — a row exactly at the bound is still
+    // inside it, one millisecond past is not.
+    assert.equal(trackerLaneStatus(row({ at: now - TRACKER_LANE_STALE_MS }), now).stale, false);
+    assert.equal(trackerLaneStatus(row({ at: now - TRACKER_LANE_STALE_MS - 1 }), now).stale, true);
+    // (g) A stamp from the FUTURE reads 0, never a negative age: `at` comes
+    // from another invocation's clock (the same rule passRowAgeMs applies).
+    const future = trackerLaneStatus(row({ at: now + 5_000 }), now);
+    assert.deepEqual([future.ageMs, future.ageSec, future.stale], [0, 0, false]);
+  });
+
+  await test("tracker lane: no row, an unparsable row and a stamp-less row all read as NO coverage", () => {
+    const now = 1_800_000_000_000;
+    for (const raw of [
+      null,
+      undefined,
+      "",
+      "not json",
+      "{}",
+      "[]",
+      JSON.stringify({ note: "x" }),
+      JSON.stringify({ at: 0, phase: "done" }),
+    ]) {
+      const lane = trackerLaneStatus(raw, now);
+      assert.equal(lane.present, false, `${JSON.stringify(raw)} must not read as a served lane`);
+      assert.equal(lane.stale, true);
+      assert.equal(lane.at, null);
+      assert.equal(lane.ageMs, null);
+      assert.equal(lane.phase, null);
+      assert.equal(lane.checked, null);
+    }
+    // An ABSENT row and an UNPARSABLE one are the SAME reading on purpose: the
+    // shape that must never happen is a fresh-looking lane behind a broken
+    // write, and the shape that must always exist is an answer.
+    assert.deepEqual(trackerLaneStatus("not json", now), trackerLaneStatus(null, now));
+  });
+
+  await test("tracker lane: the running stamp carries the same shape as the pass's final row", () => {
+    const now = 1_800_000_000_000;
+    const lane = trackerLaneStatus(runningPassStamp(now), now + 1_000);
+    assert.equal(lane.present, true);
+    assert.equal(lane.phase, "running");
+    assert.equal(lane.stage, "entry", "the stage the pass names before its first read");
+    // The counters exist at ZERO rather than being absent, so a reader never
+    // has to tell `0` from `undefined` on the one row a stuck pass sits at.
+    assert.deepEqual([lane.checked, lane.alerted, lane.claimLost], [0, 0, 0]);
+    assert.equal(lane.running, true);
+    assert.equal(lane.stuck, false);
+  });
+
   await test("out-of-window patch: the tracker's pulse survives a refused note write (docs/patches/tracker-pass-pulse.apply.js)", async () => {
     const strip = (text) =>
       text
@@ -18712,6 +18844,106 @@ async function main() {
       0,
       `partial paste of docs/patches/tracker-pass-pulse.apply.js — missing: ${missing.join(", ")}`,
     );
+  });
+
+  await test("tracker lane: /health serves it from the durable row, never from the pulse", () => {
+    // The field's whole job is isolate independence, and no live reading can
+    // tell a row-derived field from a memory-derived one that happens to be
+    // warm — so the wiring is asserted on the source, the way this repo pins
+    // every other cross-file contract.
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const read = (p) => strip(fs.readFileSync(path.join(__dirname, "..", p), "utf8"));
+    const workerSrc = read("src/worker.ts");
+    const pushwatchSrc = read("src/pushwatch.ts");
+    // The reader itself must be PURE: a pulse read inside it would rebuild the
+    // exact blind spot the field exists to remove, because the pulse is null on
+    // every isolate that has not run a pass. Comments are stripped above, so
+    // this is a check on the code, not on the prose that explains it.
+    const laneAt = pushwatchSrc.indexOf("exportfunctiontrackerLaneStatus(");
+    assert.ok(laneAt > 0, "the lane reader must exist");
+    const laneBody = pushwatchSrc.slice(laneAt, pushwatchSrc.indexOf("export", laneAt + 10));
+    assert.ok(!laneBody.includes("trackerPassPulse"), "the lane reader must not consult the pulse");
+    assert.ok(!laneBody.includes("passPulse"), "nor the module's pulse state");
+    const applied = {
+      "pushwatch (the window is named once)":
+        pushwatchSrc.includes("exportconstTRACKER_LANE_STALE_MS="),
+      "worker (the lane is built from the row the front already read)":
+        workerSrc.includes("pushWatchLane=trackerLaneStatus(rawPass,Date.now());"),
+      "worker (and it is served beside the raw row)":
+        workerSrc.includes("pushWatchPass,pushWatchLane,now:newDate().toISOString(),"),
+      "worker (the pulse keeps its own field, for the isolate that ran the pass)":
+        workerSrc.includes("view.pushWatchLive=trackerPassPulse();view.pushWatchFail=trackerPassFailure;"),
+      "scanner (a pass result's counters ride the durable row)":
+        read("src/scanner.ts").includes('stage:typeofpw.stage==="string"?pw.stage:null,'),
+    };
+    const missing = Object.entries(applied).filter(([, v]) => !v).map(([k]) => k);
+    // A half-wired lane field is the worst of both readings: the field exists,
+    // so an operator stops looking at `pushWatchLive`, while it never answers
+    // anything the row could not — or, worse, answers from warm state again.
+    assert.equal(missing.length, 0, `half-wired lane field: ${missing.join(", ")}`);
+  });
+
+  await test("tracker lane: a real pass writes its counters into the row the lane reads", async () => {
+    // The whole point of the field (see trackerLaneStatus): the numbers have to
+    // survive the pass's own invocation, because the isolate answering /health
+    // is usually a DIFFERENT one. So this asserts the ROW, not the pulse.
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const writes = [];
+    const db = {
+      setWorkerState: async (key, value) => {
+        writes.push({ key, value });
+      },
+    };
+    const scanner = new Scanner(
+      db, { api: { sendMessage: async () => ({}) } }, null, cfg, null, null, null,
+    );
+    scanner.pushWatcher = {
+      headTokens: () => [],
+      onPush: async () => {},
+      runTick: async () => ({
+        checked: 21, alerted: 1, trips: 7,
+        note: "rows 21/21 pairs 21/21 pins 21/21 miss 0 lost 2 trips 7",
+        undeliveredTotal: 0, recoveredUndelivered: 0,
+        stage: "rows", claimLost: 2,
+      }),
+    };
+    scanner.lastSummary = {};
+    await scanner.runTrackerPass(Date.now() + 2_500, undefined, undefined, {
+      via: "cron-pass",
+      relay: "inner",
+    });
+    assert.equal(writes.length, 1, "one row write per pass");
+    assert.equal(writes[0].key, "push_watch_pass");
+    const row = JSON.parse(writes[0].value);
+    assert.deepEqual(
+      [row.stage, row.checked, row.alerted, row.claimLost],
+      ["rows", 21, 1, 2],
+      "the counters are ON the row — the pulse cannot lend them to another isolate",
+    );
+    // And the lane reading carries them, computed from that row alone.
+    const lane = trackerLaneStatus(writes[0].value, Date.now());
+    assert.equal(lane.present, true);
+    assert.equal(lane.stale, false);
+    assert.equal(lane.stage, "rows");
+    assert.equal(lane.checked, 21);
+    assert.equal(lane.alerted, 1);
+    assert.equal(lane.claimLost, 2, "a lost claim is visible from any isolate");
+    assert.equal(lane.via, "cron-pass");
+    assert.equal(lane.relay, "inner");
+    // A caller with no pass result (the skip path) invents NO counters: the row
+    // keeps the shape it had before the lane existed, and it still reads as the
+    // lane having been served by nobody.
+    writes.length = 0;
+    await scanner.noteTrackerSkipped("no-budget");
+    const skipped = JSON.parse(writes[0].value);
+    assert.equal(skipped.phase, "skip");
+    assert.ok(!("checked" in skipped), "no pass result, no invented counters");
+    assert.equal(trackerLaneStatus(writes[0].value, Date.now()).stale, true, "a skip is not coverage");
   });
 
   await test("out-of-window patch: a thrown pass describes itself (docs/patches/tracker-pass-err-diag.apply.js)", () => {
@@ -22600,6 +22832,24 @@ async function main() {
       assert.equal(r.status, 200, `${p} is a real route and must still answer`);
       assert.ok(!r.body.includes(UNKNOWN), `${p} must not be answered by the 404 rule`);
     }
+
+    // (d) The tracker LANE field answers even on a worker that has never run a
+    // pass and has no database: the reading is derived from the durable row, so
+    // "there is no row" IS the answer (`present:false`, `stale:true`) — unlike
+    // `summary.pushWatchLive`, which reads null on every isolate that did not
+    // itself run a pass (live 2026-10-11, two polls a minute apart, both null,
+    // while the pass was serving 21 rows).
+    const health = JSON.parse((await get("/health")).body);
+    assert.equal(
+      health.pushWatchLane.present,
+      false,
+      "no row must be reported as no row, not as a missing field",
+    );
+    assert.equal(
+      health.pushWatchLane.stale,
+      true,
+      "an unserved lane is an alarm, and it is readable from any isolate",
+    );
   });
 
   await test("fetch routing: the webhook call is POST-only, and sits after the /debug routes", () => {

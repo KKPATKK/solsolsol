@@ -852,3 +852,69 @@ supply，所以 `mcapAt5m = mcap / (1 + m5/100)`。當**上次檢查距今 > 5 �
 * 落線睇：`/health.pushWatchPass.note` 唔應該因呢刀而變；下次出現 `pairs-empty`／
   `deferred:subreq-budget`／tick 死亡之後嘅 🚀 卡，尾段應該帶 `距上次檢查 N 分鐘`，
   而 `N` 對得上嗰個盲窗。
+
+---
+
+## 第十五補：`/health.pushWatchLane` —— lane 嘅狀態唔可以住喺 warm isolate（2026-10-11）
+
+### 1. 背景：一個「睇落冇事」嘅 null
+
+2026-10-11 18:12Z 同 18:14Z 兩次 `/health` 讀數 **兩個都係 `summary.pushWatchLive: null`**，
+但同一時間跟進 lane 明明正常：`pushWatchPass` 讀 `ok:21/0`／`ok:21/1 rows 21/21 pairs 21/21
+pins 21/21 miss 0 lost 0`，`/debug/push-audit` 連續有 🚀 卡。原因係 `pushWatchLive` 嘅本體係
+`trackerPassPulse()` —— **module memory**（見 `src/pushwatch.ts` 嘅 `TrackerPassPulse`）——
+只有「自己跑過一個 pass」嗰個 isolate 答得出；`/health` 由邊個 isolate 應答係撞彩，所以嗰個
+專門答「跟進 lane 生唔生」嘅欄位，偏偏喺人哋問嗰下 **缺席**。（`pushWatchPass` 呢個 row 本身
+係持久嘅，佢答得到「有跑過」，但答唔到 age／staleness，亦冇 pass 嘅 stage 同 counter。）
+
+### 2. 做咗嘅：三個改動，一個新欄位
+
+* **`src/pushwatch.ts`**
+  * `trackerLaneStatus(raw, now, staleAfterMs = TRACKER_LANE_STALE_MS)`：**純函數**，只讀 durable
+    row，唔碰 pulse。回 `{ present, at, ageMs, ageSec, staleAfterMs, stale, running, stuck, cut,
+    phase, stage, checked, alerted, claimLost, trackerMs, note, via, relay }`。
+  * `TRACKER_LANE_STALE_MS = 150_000` ＝ **兩個 pass cron 週期（60s ×2）＋ 30s jitter**，同
+    `MAINTENANCE_PASS_FALLBACK_FRESH_MS` 嘅算術一樣。比 tick 自己嘅 stand-down 窗
+    （`TRACKER_PASS_FALLBACK_FRESH_MS` 120s）寬一格，所以「過窗」＝兩個 owner 都冇服務過佢。
+  * 三個 alarm **刻意分開**，因為修法唔同：`stale`（冇 pass 服務過條 lane）／`stuck`（row 係
+    `running` 而且已過窗 —— 死喺半路嘅形狀）／`cut`（watchdog 放棄咗，跑過但未完 rotation）。
+    `phase:"skip"` 一律當「**冇** coverage」（同 `passRowAgeMs` 同一條規矩），否則一串 skip 會
+    令條 lane 永遠「fresh」而冇檢查過任何 row。冇 row／parse 唔到／`at` 唔可用 一律
+    `present:false, stale:true` —— **唔會有 null 呢個答案**。
+  * `runningPassStamp()` 加 `stage:"entry"`＋三個 0 counter；`runTick` 嘅 result 加
+    `stage`／`claimLost`（optional，唔改任何既有 return path 嘅形狀）。
+  * 未來時間戳讀 0，唔會負數（`at` 係另一個 invocation 嘅鐘，同 `passRowAgeMs` 一致）。
+* **`src/scanner.ts`**：`persistPassNote(..., counters?)` 把 pass result 嘅 `stage`／`checked`／
+  `alerted`／`claimLost` 寫入**同一個 row**（零額外 round trip）。只有手上有 pass result 嘅
+  caller（`done` 路徑）先寫；`skip`／`cut`／`err` 嘅 row **逐字不變**。註解講明：唔可以順手讀
+  pulse，因為目標就係唔靠 module memory。
+* **`src/worker.ts`**：`const pushWatchLane = trackerLaneStatus(rawPass, Date.now());`，`rawPass`
+  係 `/health` 條 front batch **已經讀過**嘅同一行（`readHealthFront`），所以新欄位 0 round trip；
+  回應加 `pushWatchLane`（就喺 `pushWatchPass` 隔籬）。`summary.pushWatchLive` **保留**唔動：
+  佢答嘅係另一個問題（「**呢個** isolate 跑過 pass 未、worker 自己抓到咩失敗」）。
+
+### 3. 驗證
+
+* `test-unit.js` 加 6 條（unit 518 → **524 passed, 0 failed**，`npm run test:unit` EXIT=0）：
+  durable row → lane 讀數（連 counter）；四種 alarm 分辨（fresh／running／stuck／cut／skip／窗嘅
+  邊界各一）；冇 row／爛 row／冇 `at` 一律 `present:false`；running stamp 形狀；**source 接線**
+  斷言（lane reader 內文唔准出現 `trackerPassPulse`／`passPulse`、worker 由 `rawPass` 建、回應有
+  個欄位、scanner 有 counter 上 row）；真 pass（stub `runTick`）之後 row 真係帶 counter 而 lane
+  讀得到，同埋 `skip` 路徑**唔會**無中生有 counter。
+* `/health` 喺「冇 DB、未跑過 pass」嘅 worker 上一樣要有個欄位，而且係 `present:false,
+  stale:true`（fetch routing 測試加一段）。
+* **突變檢查（證明測試有牙）**：`dist/pushwatch.js` 把 stale 規則改成 `stale:false` → 4 條 alarm
+  檢查紅 2 條；`dist/scanner.js` 把 counter 由 done 路徑拆走 → `row.checked=undefined`、
+  `lane.checked/claimLost/stage` 全部 null。之後 `npm run build` 還原（`grep -r MUTATION dist/` ＝ 0）。
+
+### 4. 界線（唔好讀大）
+
+* `stale` 係一條**判斷線**（150s），唔係量出嚟嘅 cadence：佢答「有冇人服務過呢條 lane」，唔答
+  「服務得好唔好」——後者要睇 note／`/debug/push-watch`。
+* 新 row 嘅 counter 只在 `done` 路徑寫：一個 `cut`／`err` pass 嘅 row 冇 counter（嗰時 note
+  已經係證據，`phase` 亦講明咗）。呢個係故意，唔係漏。
+* `pushWatchLive` 嘅 null 盲點**仍然存在**（佢係 module state 嘅本質）；分別係由 2026-10-11 起
+  佢唔再係**唯一**一條讀法，operator 要睇 lane 生死睇 `pushWatchLane`。
+* 落線睇：deploy 之後隨便一個 isolate 打 `/health`，`pushWatchLane.present` 應該一律 `true`、
+  `ageSec` 十位數以內、`stale:false`、`phase:"done"`，而 `checked/alerted/claimLost/stage` 同
+  `pushWatchPass.note` 嘅 `rows X/Y`、`ok:X/Y`、`lost N` 對得上。

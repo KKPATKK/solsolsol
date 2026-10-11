@@ -3992,12 +3992,22 @@ export class Scanner {
         );
         this.lastSummary.trackerMs = Date.now() - startedAt;
       }
+      // The counters ride the SAME row (see the counters parameter): they are
+      // the reading /health's lane field publishes from ANY isolate, and this
+      // function is the last place they are still in hand — the pulse that
+      // holds them is this isolate's memory and nothing else.
       await this.persistPassNote(
         note,
         startedAt,
         "done",
         options?.via,
         options?.relay,
+        {
+          stage: typeof pw.stage === "string" ? pw.stage : null,
+          checked: pw.checked,
+          alerted: pw.alerted,
+          claimLost: typeof pw.claimLost === "number" ? pw.claimLost : null,
+        },
       );
       return note;
     } catch (err) {
@@ -4102,7 +4112,10 @@ export class Scanner {
 
   /**
    * The tracker pass's coverage line, in ONE worker_state row — the durable
-   * copy the in-memory carries above cannot give. The in-memory path only
+   * copy the in-memory carries above cannot give. Since 2026-10-11 the row
+   * ALSO carries the pass's counters (`stage`, `checked`, `alerted`,
+   * `claimLost`), which is what makes /health's `pushWatchLane` readable from
+   * any isolate (see trackerLaneStatus in src/pushwatch.ts). The in-memory path only
    * reaches /health when the next tick's flush happens to run on THIS isolate,
    * and on 2026-09-21 that was the exception, not the rule: four consecutive
    * /health polls showed no note at all while the pass was demonstrably
@@ -4133,6 +4146,20 @@ export class Scanner {
      * worker.ts's relay block). Same caller-says-it rule as `via`.
      */
     relay?: PassRelayTag,
+    /**
+     * The pass's own counters, from the pass's RESULT — never from the pulse:
+     * `trackerLaneStatus` reads this row from any isolate, so these have to be
+     * on the row itself (the pulse is module memory, the exact blind spot the
+     * lane field exists to remove). Omitted by every caller that has no pass
+     * result in hand (the skip, cut and err paths), which leaves their rows
+     * byte-for-byte as they were.
+     */
+    counters?: {
+      stage: string | null;
+      checked: number | null;
+      alerted: number | null;
+      claimLost: number | null;
+    },
   ): Promise<void> {
     // AWAITED, not raced. The race this replaces resolved at its bound while the
     // write was still in flight, and an abandoned promise is CANCELLED the
@@ -4158,6 +4185,20 @@ export class Scanner {
           // Same rule for the relay reading: a caller that cannot say leaves
           // no field, and a reader that does not care never sees one.
           ...(relay ? { relay } : {}),
+          // ...and the same rule once more for the pass's counters: the lane
+          // reading carries `stage`/`checked`/`alerted`/`claimLost` from this
+          // row (see trackerLaneStatus), and only a caller holding a pass
+          // result writes them. A null stage stays a PRESENT field (the pass
+          // ran and named none) — the reader tells that from a row that never
+          // carried the field at all.
+          ...(counters
+            ? {
+                stage: counters.stage,
+                checked: counters.checked,
+                alerted: counters.alerted,
+                claimLost: counters.claimLost,
+              }
+            : {}),
         }),
       );
     } catch {

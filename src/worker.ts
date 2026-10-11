@@ -130,6 +130,7 @@ import {
   revivedBaseline,
   terminalRowIssues,
   trackerPassPulse,
+  trackerLaneStatus,
   terminalRowRepair,
 } from "./pushwatch";
 import { JupTokensClient } from "./jupfeeds";
@@ -6836,6 +6837,17 @@ const worker = {
       // Db.readHealthFront): this row used to be a round trip of its own,
       // for a request the front already pays for.
       let pushWatchPass: unknown = null;
+      // THE TRACKER LANE, read from the row above rather than from this
+      // isolate's pulse. `summary.pushWatchLive` is the pulse (module memory,
+      // see tickprobe's onTickEnd): it answers null on every isolate that has
+      // not run a pass, which is most of them — live 2026-10-11 two /health
+      // polls a minute apart both read `pushWatchLive: null` while the pass was
+      // serving 21 rows (`ok:21/1 rows 21/21 pairs 21/21 pins 21/21 miss 0
+      // lost 0`). This field answers the same question with NO warm state, so
+      // whichever isolate the request lands on reports the same lane — and it
+      // costs no round trip: the row it reads already rides the front's ONE
+      // batch below (see readHealthFront).
+      let pushWatchLane: ReturnType<typeof trackerLaneStatus> | null = null;
       // Cross-isolate cron diagnostics: the scheduled handler persists a
       // running total + last event time to Turso, so any isolate serving
       // /health can prove whether the Cron Trigger is actually delivering.
@@ -6972,6 +6984,11 @@ const worker = {
         }
         const rawPass = tickState?.get("push_watch_pass") ?? null;
         pushWatchPass = rawPass ? JSON.parse(rawPass) : null;
+        // The interpreted half of the same row: age, staleness and the three
+        // "a pass is/was not finishing" alarms (see TrackerLaneStatus). An
+        // absent or unparsable row is its own reading (`present:false`,
+        // `stale:true`) — never a silent null.
+        pushWatchLane = trackerLaneStatus(rawPass, Date.now());
         // The count, not the listing: /health only ever used the length of
         // listEnabledChats, so its row mapping was decoded for nothing — the
         // front's second statement answers it with COUNT(*).
@@ -7169,6 +7186,7 @@ const worker = {
         tickProgress,
         summary: scanner?.lastSummary ?? null,
         pushWatchPass,
+        pushWatchLane,
         now: new Date().toISOString(),
       });
     }

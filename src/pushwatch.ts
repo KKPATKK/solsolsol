@@ -562,6 +562,154 @@ function notePassPulse(fields: Partial<TrackerPassPulse>): void {
   if (passPulse === null) return;
   passPulse = { ...passPulse, ...fields };
 }
+
+/**
+ * How old the durable pass row may be before /health calls the LANE stale:
+ * TWO of the pass's own cron periods (60 s each) plus the 30 s jitter budget
+ * every gate in this repo reserves — the same arithmetic
+ * scanner.MAINTENANCE_PASS_FALLBACK_FRESH_MS states for its own "two periods
+ * plus jitter".
+ *
+ * WHY two periods and not one: the pass's row is written by TWO owners (the
+ * pass's own cron delivery, and the scan tick's fallback), and the tick's
+ * stand-down window (worker.TRACKER_PASS_FALLBACK_FRESH_MS, 120 s) already
+ * treats a row younger than that as "someone owns this minute". A row older
+ * than BOTH windows is the reading no jitter, slow tick or single missed
+ * delivery explains — it is the shape of a lane nobody is serving.
+ */
+export const TRACKER_LANE_STALE_MS = 150_000;
+
+/**
+ * The tracker lane's status, DERIVED FROM THE DURABLE PASS ROW.
+ *
+ * WHY THIS EXISTS (live 2026-10-11): the lane's own reading used to live only
+ * in `trackerPassPulse()` — MODULE MEMORY, so an isolate that has not run a
+ * pass answers `pushWatchLive: null`. Two /health polls a minute apart both
+ * read null that day while the pass was demonstrably serving 21 rows (its
+ * durable row read `ok:21/1 rows 21/21 pairs 21/21 pins 21/21 miss 0 lost 0`),
+ * i.e. the field whose whole job was to say "the tracker is alive" was absent
+ * on exactly the request an operator uses to ask. This reader takes the ROW
+ * instead of the pulse: same numbers (the pass writes its counters into the
+ * row — see persistPassNote), no warm state, so ANY isolate answers.
+ *
+ * THE THREE ALARMS, kept apart on purpose — they have different fixes:
+ *  - `stale`  : no pass served the lane inside staleAfterMs. Nobody is running
+ *               the pass at all (dead trigger AND a dead fallback).
+ *  - `stuck`  : a pass is IN FLIGHT (phase "running") and already older than
+ *               that window — the killed-mid-flight shape, whose note is the
+ *               run that never got to write one (the row reads `running`).
+ *  - `cut`    : the pass returned by being ABANDONED (the watchdog, see
+ *               racePassWatchdog): it ran and did not finish its rotation.
+ * A `skip` row counts as NO coverage (see passRowAgeMs for the same rule): it
+ * is written by a tick that ran no pass, so treating it as evidence would let
+ * a run of skipped ticks hold the lane "fresh" while no row was ever checked.
+ */
+export interface TrackerLaneStatus {
+  /** A durable row with a usable `at` is behind this reading. */
+  present: boolean;
+  /** The row's own stamp (epoch ms), or null when there is no usable row. */
+  at: number | null;
+  ageMs: number | null;
+  ageSec: number | null;
+  /** The window `stale`/`stuck` are judged against (see TRACKER_LANE_STALE_MS). */
+  staleAfterMs: number;
+  stale: boolean;
+  /** phase "running": a pass is in flight as far as the row knows. */
+  running: boolean;
+  stuck: boolean;
+  cut: boolean;
+  /** "done" | "running" | "cut" | "skip" | null (a row without one). */
+  phase: string | null;
+  /** The stage the pass last named (see passDiag), once the row carries one. */
+  stage: string | null;
+  /** Rows this pass evaluated (the note's `rows X/Y`), when the row carries it. */
+  checked: number | null;
+  /** Rows whose transition produced a card (the note's `ok:X/Y`). */
+  alerted: number | null;
+  /** Rows the claim batch lost — a DB refusing writes, not an idle rotation. */
+  claimLost: number | null;
+  trackerMs: number | null;
+  note: string | null;
+  /** "cron-pass" (the pass's own delivery) or "tick" (the fallback). */
+  via: string | null;
+  /** Which region the pass ran in ("inner" = the placed path). */
+  relay: string | null;
+}
+
+/**
+ * Read the lane out of the durable pass row. Pure: no DB, no module state, so
+ * it answers identically on a cold isolate — and the same call serves /health
+ * and any test (see the interface for what each field means).
+ */
+export function trackerLaneStatus(
+  raw: string | null | undefined,
+  now: number,
+  staleAfterMs: number = TRACKER_LANE_STALE_MS,
+): TrackerLaneStatus {
+  const absent: TrackerLaneStatus = {
+    present: false,
+    at: null,
+    ageMs: null,
+    ageSec: null,
+    staleAfterMs,
+    stale: true,
+    running: false,
+    stuck: false,
+    cut: false,
+    phase: null,
+    stage: null,
+    checked: null,
+    alerted: null,
+    claimLost: null,
+    trackerMs: null,
+    note: null,
+    via: null,
+    relay: null,
+  };
+  if (!raw) return absent;
+  let row: unknown;
+  try {
+    row = JSON.parse(raw);
+  } catch {
+    // An unparsable row is NO row, never a healthy one: the one shape this
+    // reader must not produce is a fresh-looking lane behind a broken write.
+    return absent;
+  }
+  if (row === null || typeof row !== "object") return absent;
+  const rec = row as Record<string, unknown>;
+  const at = Number(rec.at);
+  if (!Number.isFinite(at) || at <= 0) return absent;
+  const asNumber = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) ? v : null;
+  const asText = (v: unknown): string | null =>
+    typeof v === "string" && v.length > 0 ? v : null;
+  const phase = asText(rec.phase);
+  // A stamp from the FUTURE reads 0, never negative — `at` comes from another
+  // invocation's clock (the same rule passRowAgeMs applies to this row).
+  const ageMs = Math.max(0, now - at);
+  const running = phase === "running";
+  const stuck = running && ageMs > staleAfterMs;
+  return {
+    present: true,
+    at,
+    ageMs,
+    ageSec: Math.round(ageMs / 1000),
+    staleAfterMs,
+    stale: stuck || phase === "skip" || (!running && ageMs > staleAfterMs),
+    running,
+    stuck,
+    cut: phase === "cut",
+    phase,
+    stage: asText(rec.stage),
+    checked: asNumber(rec.checked),
+    alerted: asNumber(rec.alerted),
+    claimLost: asNumber(rec.claimLost),
+    trackerMs: asNumber(rec.trackerMs),
+    note: asText(rec.note),
+    via: asText(rec.via),
+    relay: asText(rec.relay),
+  };
+}
 /**
  * Age past which a row the tracker has NEVER evaluated is treated as a
  * BACKFILL instead of a live follow-up: its push is older than the alert
@@ -1316,9 +1464,28 @@ export const STRONG_BUY_REVIVES = 2;
  */
 export const TRACKER_PASS_STATE_KEY = "push_watch_pass";
 
-/** The `phase:"running"` stamp: a pass in flight, before its first stage. */
+/**
+ * The `phase:"running"` stamp: a pass in flight, before its first stage.
+ *
+ * The counters ride it at their zero values ON PURPOSE (see
+ * persistPassNote): the lane reader (trackerLaneStatus) reads this row from
+ * ANY isolate, so a pass in flight has to present the SAME shape as the pass
+ * that will overwrite it — otherwise `checked` would be an undefined field for
+ * exactly the window a stuck pass sits in, i.e. the one moment the reading is
+ * being used. `stage:"entry"` is the stage the pass names before its first
+ * read (see runTick / passDiag).
+ */
 export function runningPassStamp(now = Date.now()): string {
-  return JSON.stringify({ at: now, note: "running", trackerMs: 0, phase: "running" });
+  return JSON.stringify({
+    at: now,
+    note: "running",
+    trackerMs: 0,
+    phase: "running",
+    stage: "entry",
+    checked: 0,
+    alerted: 0,
+    claimLost: 0,
+  });
 }
 
 /**
@@ -3167,6 +3334,18 @@ export class PushWatcher {
      * same shape as undeliveredTotal.
      */
     terminalAbandonedTotal?: number;
+    /**
+     * The stage this pass ended in (see passDiag). Optional: a pass that
+     * deferred before its first stage never named one, and the durable row
+     * simply omits the field rather than inventing a stage.
+     */
+    stage?: string;
+    /**
+     * Rows the claim batch did NOT win this pass — a cross-isolate race OR a
+     * batch that failed outright (see the pulse's own field). Published in the
+     * durable row so /health can report it from any isolate.
+     */
+    claimLost?: number;
   }> {
     // The tick's waitUntil hand-off, when the caller has one (see holdForTick).
     this.keepAliveForTick = keepAlive ?? null;
@@ -5193,6 +5372,12 @@ export class PushWatcher {
       undeliveredTotal: this.undeliveredTotal,
       recoveredUndelivered: this.recoveredUndeliveredTotal,
       pendingUndelivered: this.pendingUndelivered.size,
+      // The two fields the durable row needs for /health's lane reading (see
+      // persistPassNote + trackerLaneStatus): the stage it ended in and the
+      // claim batch's losses. Both are read HERE, where they are still known —
+      // the pulse in module memory is not readable from another isolate.
+      stage: this.passStage ?? "done",
+      claimLost,
     };
   }
 
