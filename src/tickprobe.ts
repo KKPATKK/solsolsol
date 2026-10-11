@@ -820,6 +820,66 @@ export function deliveryDuplicatesView(): DeliveryDuplicatesView {
   return { ...duplicates, tokens: [...duplicates.tokens] };
 }
 
+/**
+ * The ABANDONED-card ledger as the heartbeat sees it (see
+ * deferrallog.UNCONFIRMED_CARD_STATE_KEY and the worker's settle).
+ *
+ * WHY IT EXISTS (2026-10-11, fix 2 of the tripled ALON card): the only number
+ * the heartbeat carried for duplicate cards was `deliveryDuplicates`, which
+ * counts pairs of *audited* `initial` cards — and the duplicate path it misses
+ * is precisely the one where the extra sends have NO audit row (ALON: msgIds
+ * 11467/11468 unrecorded, the single recorded one 11469). So the failure was
+ * invisible in /health and known only from the chat. This view closes that:
+ * `pending` says how many cut sends are currently withheld, and
+ * `releasedTotal` counts the releases — each one is a coin that was re-pushed
+ * without proof of delivery, i.e. a possible duplicate, which is exactly the
+ * number a fix has to move.
+ */
+export interface UnconfirmedCardsView {
+  /** Cut sends whose delivery is still unproven (the durable ring's size). */
+  pending: number;
+  /**
+   * Releases since this isolate booted — each one re-pushes a coin whose card
+   * may already be in the chat. Isolate-local (the ring is not): the durable
+   * state is `pending`, and this is the rate.
+   */
+  releasedTotal: number;
+  /** Epoch of the most recent release (0 = none since boot). */
+  releasedAt: number;
+  /** Up to three tokens from the last settle, for the log/health line. */
+  tokens: string[];
+}
+
+let unconfirmedCards: UnconfirmedCardsView = {
+  pending: 0,
+  releasedTotal: 0,
+  releasedAt: 0,
+  tokens: [],
+};
+
+/**
+ * Record the last tail's view of the abandoned-card ring. `pending` is always
+ * overwritten (the ring is authoritative); `releasedNow` accumulates, because
+ * a rate that reset every tick could never be read.
+ */
+export function noteUnconfirmedCards(
+  update: { pending: number; releasedNow: number; tokens?: readonly string[] },
+  now = Date.now(),
+): void {
+  const releasedNow = Math.max(0, update.releasedNow);
+  unconfirmedCards = {
+    pending: Math.max(0, update.pending),
+    releasedTotal: unconfirmedCards.releasedTotal + releasedNow,
+    releasedAt: releasedNow > 0 ? now : unconfirmedCards.releasedAt,
+    tokens: (update.tokens ?? []).filter((t) => t.length > 0).slice(0, 3),
+  };
+}
+
+/** Abandoned-card ledger as of the last completed tail. */
+export function unconfirmedCardsView(): UnconfirmedCardsView {
+  return { ...unconfirmedCards, tokens: [...unconfirmedCards.tokens] };
+}
+
 /** Per-method DB timing since this isolate booted (see the header). */
 export function dbStepView(): Record<string, DbStepView> {
   const out: Record<string, DbStepView> = {};
@@ -1531,6 +1591,12 @@ export function installTickProbe(
         // feed state is a cumulative view of the client, not a tick-scoped
         // stamp, so it belongs to every tick.
         summary.gecko = geckoFeedStats();
+        // The abandoned-card ledger (see UnconfirmedCardsView): a CUT send's
+        // unknown delivery, and how many were released without proof. Published
+        // with the same every-tick discipline as `gecko` below — a
+        // candidate-less tick is exactly when a withheld card is hardest to
+        // notice, and the phase guard would swallow it there.
+        summary.unconfirmedCards = unconfirmedCardsView();
         // GMGN rides along for the same reason (see gmgn.GmgnFeedStats): its
         // edge 429s a Worker's egress IP, and whether the client is currently
         // paused (and for how long) is the difference between "GMGN is

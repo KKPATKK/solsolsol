@@ -3,6 +3,12 @@ import { tradeKeyboard } from "./bot";
 import type { BirdeyeClient } from "./birdeye";
 import type { AppConfig } from "./config";
 import {
+  UNCONFIRMED_CARD_STATE_KEY,
+  addUnconfirmedCardSend,
+  cardSendDisposition,
+  removeUnconfirmedCardSend,
+} from "./deferrallog";
+import {
   DEX_BOOSTS_AT_KEY,
   DEX_PROFILES_LAST_KEY,
   GECKO_DISCOVERY_AT_KEY,
@@ -318,6 +324,12 @@ const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
  * SAME card again. Measured live 2026-09-20 10:48-11:08 HKT: GROYPER and
  * PONDER each arrived 4-5 times, on ticks whose phases were exactly this
  * shape — `wallets@2800 flurry@3300 render@3300 send@3542`.
+ *
+ * 2026-10-11: a cut send is no longer that generator. The send is three-state
+ * (see the THREE-STATE SEND note in the send path): a cut KEEPS the claim and
+ * records the unknown delivery durably, and the worker's tick-tail settle
+ * releases it only after UNCONFIRMED_CARD_GRACE_MS with no proof anywhere. This
+ * number (1500) is still what buys the send its slice.
  *
  * At 1500 the chain ends at 2700ms, so the send slice becomes
  * `chain 2700 + 242 overhead` → send start ~2942 against a 4200 deadline,
@@ -2304,6 +2316,20 @@ export interface ScanSummary {
    */
   cardSendDeferredTotal?: number;
   /**
+   * Initial-card sends this tick whose DELIVERY IS UNKNOWN — the send ran past
+   * its slice, so the card may or may not be in the chat (the three-state send
+   * in the push path). Counted apart from `cardSendDeferred` (nothing was sent
+   * at all there) and from the heartbeat's `cardSend.cut` (which counts the
+   * phase shape): this number counts the RECORDS written, which is what the
+   * worker's tick-tail settle resolves and what can become a duplicate.
+   */
+  cardSendAbandoned?: number;
+  /**
+   * Cross-tick cumulative of `cardSendAbandoned` (isolate-local, the same
+   * shape as the deferred pair above).
+   */
+  cardSendAbandonedTotal?: number;
+  /**
    * Deferred cards the re-eval pool has since pushed: when this rises, "a
    * deferred coin really is pushed back on a later tick" is proven live
    * rather than only argued from the code path.
@@ -3063,6 +3089,8 @@ export class Scanner {
   private readonly deferredPushes = new DeferredPushLedger();
   /** Cumulative initial-card deferrals this isolate has refused. */
   private cardSendDeferredTotal = 0;
+  /** Cumulative abandoned (unknown-delivery) card sends this isolate recorded. */
+  private cardSendAbandonedTotal = 0;
   /** Cumulative tracker cards this isolate failed to deliver (from PushWatcher). */
   private pushWatchUndeliveredTotal = 0;
   /**
@@ -4791,6 +4819,8 @@ export class Scanner {
       // proof that a deferred coin really is pushed back later).
       cardSendDeferred: 0,
       cardSendDeferredTotal: this.cardSendDeferredTotal,
+      cardSendAbandoned: 0,
+      cardSendAbandonedTotal: this.cardSendAbandonedTotal,
       deferRecovered: this.deferredPushes.recovered,
       deferPending: this.deferredPushes.pendingCount,
       deferPruned: this.deferredPushes.pruned,
@@ -6891,55 +6921,144 @@ export class Scanner {
             return;
           }
           try {
-            // Bounded by the card-send tail (see CARD_SEND_TAIL_MS): a
-            // null here means the send missed its slice, and the
-            // caller's failure path releases the claim so the coin is
-            // retried.
+            // THREE-STATE SEND (2026-10-11 — the landed half of "Patch 2／4"
+            // in docs/scan-completion-loss.md § "(A) cut → unclaim → re-eval
+            // 重推"). The two-state version read EVERY non-delivery as a
+            // failure: `bestEffort` returns `null` both when Telegram REJECTED
+            // the card and when the tick merely stopped WAITING for a request
+            // that is still in flight — and the second case then released the
+            // claim, so the next tick pushed the same coin again while the
+            // first card was already on its way. Live 2026-10-11: ALON arrived
+            // three times, the two extra cards with no audit row at all
+            // (msgIds 11467/11468 in the gap before the recorded 11469).
+            //
+            // The promise is started ONCE, here, so the background chain below
+            // watches the very request the race gave up on. `settled` never
+            // rejects: a rejection is a FACT ("Telegram said no") while the
+            // timeout is the ABSENCE of one, and not conflating the two is the
+            // whole fix.
             this.markPhase(diag, "send:telegram", startedAt);
-            const sent = await this.bestEffort(
-              () =>
-                this.bot.api.sendMessage(c.chatId, message, {
-                  reply_markup: {
-                    inline_keyboard: tradeKeyboard(
-                      tokenAddress,
-                      this.trade ? this.trade.buySizeLabel : "",
-                      tradeMode,
-                      { modeSwitch: Boolean(this.trade), unwatch: true },
-                    ),
-                  },
-                }),
-              sendDeadline,
-              null,
-            );
-            if (sent === null) {
-              const cut = new Error(
-                `initial-card send exceeded its deadline (card may not have been delivered)`,
-              ) as Error & { cardSendTimeout?: boolean };
-              // Tagged so the delivery retry below does NOT sleep 1200ms and
-              // re-send inside a tick that has already run out of room.
-              cut.cardSendTimeout = true;
-              throw cut;
-            }
-            // Delivery audit: Telegram returned a message_id, so the card
-            // left us and was accepted. Recording it lets a later "never
-            // got the first card" report be answered with hard evidence.
-            try {
-              await this.db.recordPushDelivery({
-                chatId: c.chatId,
-                token: c.profile.tokenAddress,
-                symbol: c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
-                messageId: Number(
-                  (sent as { message_id?: unknown }).message_id ?? 0,
+            const inFlight = this.bot.api.sendMessage(c.chatId, message, {
+              reply_markup: {
+                inline_keyboard: tradeKeyboard(
+                  tokenAddress,
+                  this.trade ? this.trade.buySizeLabel : "",
+                  tradeMode,
+                  { modeSwitch: Boolean(this.trade), unwatch: true },
                 ),
-                mcapAtPush: c.pair.marketCap,
-                kind: "initial",
+              },
+            });
+            const settled = inFlight.then(
+              (m) => ({ status: "sent" as const, message: m }),
+              (err: unknown) => ({ status: "failed" as const, error: err }),
+            );
+            let cutTimer: ReturnType<typeof setTimeout> | null = null;
+            const abandoned = new Promise<{ status: "abandoned" }>((resolve) => {
+              cutTimer = setTimeout(
+                () => resolve({ status: "abandoned" }),
+                Math.max(0, sendDeadline - Date.now()),
+              );
+            });
+            const raced = await Promise.race([settled, abandoned]);
+            // Cleared either way: a pending timer would hold this isolate's
+            // request open past the tick that no longer waits for it.
+            if (cutTimer !== null) clearTimeout(cutTimer);
+            // The never-miss rule as ONE tested function (deferrallog):
+            //   sent      → audit it (hard proof of delivery)
+            //   failed    → release the claim, surface the failure (the catch
+            //               below — a rejected card was NOT delivered)
+            //   abandoned → KEEP the claim, record the unknown delivery
+            //               durably, watch the request to a conclusion
+            const plan = cardSendDisposition(raced.status);
+            if (plan.throwFailure) {
+              // The ORIGINAL error rides out, so /debug/chats keeps Telegram's
+              // own code + description and the transient retry below still
+              // recognises a 429/5xx.
+              throw raced.status === "failed" && raced.error instanceof Error
+                ? raced.error
+                : new Error(
+                    `initial-card send failed (Telegram did not accept it — the card was NOT delivered)`,
+                  );
+            }
+            const symbol = c.profile.symbol ?? c.pair.baseToken.symbol ?? null;
+            // Delivery audit: Telegram returned a message_id, so the card left
+            // us and was accepted. Recording it lets a later "never got the
+            // first card" report be answered with hard evidence.
+            const auditDelivery = async (messageId: number): Promise<void> => {
+              try {
+                await this.db.recordPushDelivery({
+                  chatId: c.chatId,
+                  token: c.profile.tokenAddress,
+                  symbol,
+                  messageId,
+                  mcapAtPush: c.pair.marketCap,
+                  kind: "initial",
+                });
+              } catch {
+                /* audit is best-effort */
+              }
+            };
+            if (plan.audit && raced.status === "sent") {
+              await auditDelivery(Number(raced.message.message_id ?? 0));
+            }
+            if (plan.recordUnconfirmed) {
+              // ABANDONED. The request is still in flight, so the card may
+              // already be in the chat: KEEP the claim — it is the only thing
+              // stopping the re-eval pool from sending a second card — and
+              // record the send durably, so the worker's tick-tail settle can
+              // release it if nothing ever proves delivery. The audit ring gets
+              // NOTHING here: an entry means Telegram ACCEPTED a card.
+              diag.cardSendAbandoned = (diag.cardSendAbandoned ?? 0) + 1;
+              this.cardSendAbandonedTotal += 1;
+              diag.cardSendAbandonedTotal = this.cardSendAbandonedTotal;
+              await this.recordUnconfirmedCardSend(c).catch(() => {
+                /* best-effort: the CLAIM was already kept by this branch, so a
+                   record that cannot land only means the settle finds nothing
+                   to release — the coin stays withheld, which is the
+                   never-miss direction. */
               });
-            } catch {
-              /* audit is best-effort */
+              // Settle in the background: the tick is over either way. A late
+              // success AUDITS the card (the settle below then keeps the claim
+              // and NOTHING is ever re-pushed); a late rejection RELEASES the
+              // claim (the never-miss half, and Telegram's answer is proof the
+              // card was not delivered); an isolate that dies before either is
+              // exactly what the durable record is for — the worker's tick-tail
+              // settle releases it after UNCONFIRMED_CARD_GRACE_MS.
+              void settled
+                .then(async (r) => {
+                  if (r.status === "sent") {
+                    // The card DID arrive, so the follow-ups it is owed start
+                    // here (the same enrollment the foreground path runs — one
+                    // call site, see enrollTracking).
+                    await auditDelivery(Number(r.message.message_id ?? 0));
+                    await this.enrollTracking(c);
+                  } else {
+                    try {
+                      await this.db.unclaimTokenPush(
+                        c.chatId,
+                        c.profile.tokenAddress,
+                      );
+                    } catch {
+                      /* best-effort — the settle releases it after the grace */
+                    }
+                  }
+                  await this.clearUnconfirmedCardSend(
+                    c.chatId,
+                    c.profile.tokenAddress,
+                  ).catch(() => {
+                    /* best-effort — the worker's settle drops it on proof */
+                  });
+                })
+                .catch(() => {
+                  /* the worker's settle resolves whatever this isolate cannot */
+                });
+              return;
             }
           } catch (err) {
-            // Release the claim: the caller's failure handling + the
-            // chat-aware re-eval pool will retry on a later scan.
+            // A REJECTED send is a FACT (Telegram answered with an error), so
+            // the claim goes back: the caller's failure handling + the
+            // chat-aware re-eval pool retry on a later scan. An ABANDONED send
+            // never reaches this catch — it keeps the claim and returns above.
             try {
               await this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress);
             } catch {
@@ -6956,22 +7075,8 @@ export class Scanner {
           pushed++;
           // Start post-push tracking (🚀/⚠️/💀 follow-ups). Best-effort and
           // deduped by the table's PK — never affects the push itself.
-          try {
-            this.markPhase(diag, "send:track", startedAt);
-            await this.pushWatcher?.onPush(
-              c.chatId,
-              c.profile.tokenAddress,
-              c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
-              c.pair.marketCap,
-              c.pair.liquidity.usd,
-              // The PIN (see pushwatch's pool-pinning note): the pool this
-              // card is based on. pinnablePoolAddress refuses a Jupiter/Gecko
-              // pair (their pairAddress is the mint, not a pool).
-              pinnablePoolAddress(c.pair),
-            );
-          } catch {
-            /* tracking is optional */
-          }
+          this.markPhase(diag, "send:track", startedAt);
+          await this.enrollTracking(c);
           // Auto trading mode: buy immediately after the push. The mode is
           // read live (a /setmode flip applies right away); executeBuy also
           // re-checks the mode gate internally. Dedupe is guaranteed twice
@@ -7014,11 +7119,13 @@ export class Scanner {
             console.error(
               `[scanner] failed to push ${symbol} to ${c.chatId}: ${info.line}`,
             );
-            // A send cut by the deadline is NOT retried inside this tick:
-            // there is no room left by definition, and the 1200ms sleep would
-            // only push the completion flush past the race window. The claim
-            // was released, so the next tick's re-eval pool re-pushes it.
-            if (info.transient && !(err as { cardSendTimeout?: boolean }).cardSendTimeout) {
+            // A REJECTED card is retried once inside this tick (the retry
+            // re-enters sendTo, so it is bounded by the same claim/send
+            // deadlines and can itself only defer). An ABANDONED send never
+            // reaches this catch at all: it keeps its claim and settles in the
+            // background (see the three-state send in sendTo), so there is no
+            // cut error left to suppress here.
+            if (info.transient) {
               await sleep(1200);
               try {
                 if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
@@ -7473,6 +7580,90 @@ export class Scanner {
    * the chain runs, which is how every gate here became countable but
    * nameless.
    */
+  /**
+   * Record a card send whose DELIVERY IS UNKNOWN — the durable half of the
+   * three-state send (see the cut branch in the push path and
+   * deferrallog.UNCONFIRMED_CARD_STATE_KEY).
+   *
+   * WHY DURABLE: the isolate that started the send is exactly what may not
+   * survive to settle it — an abandoned send means the tick ran out of room,
+   * which is one step from the wall-clock kill — and a record kept in this
+   * isolate's memory would let a recycle re-push a coin whose card is already
+   * in the chat.
+   *
+   * Read through a seam rather than a Db method (the tracker's own ring write
+   * does the same): offline test doubles implement only the readers they need,
+   * and a double without the ring degrades to "no record", never a crash.
+   */
+  private async recordUnconfirmedCardSend(coin: QualifyingCoin): Promise<void> {
+    const read = (this.db as Partial<Pick<Db, "getWorkerState">>).getWorkerState;
+    const write = (this.db as Partial<Pick<Db, "setWorkerState">>).setWorkerState;
+    if (typeof read !== "function" || typeof write !== "function") return;
+    const raw = await read.call(this.db, UNCONFIRMED_CARD_STATE_KEY);
+    await write.call(
+      this.db,
+      UNCONFIRMED_CARD_STATE_KEY,
+      addUnconfirmedCardSend(raw, {
+        chatId: coin.chatId,
+        token: coin.profile.tokenAddress,
+        at: Date.now(),
+        symbol: coin.profile.symbol ?? coin.pair.baseToken.symbol ?? null,
+      }),
+    );
+  }
+
+  /**
+   * Enroll a coin whose card Telegram ACCEPTED into the tracking pool — the
+   * 🚀/⚠️/💀 follow-ups the push promises.
+   *
+   * ONE call site by construction (the pool's own writer is unique, and the
+   * enrollment invariant test counts on this): the tracker may only ever be
+   * seeded from a DELIVERED card, so both callers are post-send — the normal
+   * path (behind `pushed++`) and the background chain that watches an abandoned
+   * send to its conclusion. Best-effort: tracking is optional and never affects
+   * the push.
+   */
+  private async enrollTracking(c: QualifyingCoin): Promise<void> {
+    try {
+      await this.pushWatcher?.onPush(
+        c.chatId,
+        c.profile.tokenAddress,
+        c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
+        c.pair.marketCap,
+        c.pair.liquidity.usd,
+        // The PIN (see pushwatch's pool-pinning note): the pool this card is
+        // based on. pinnablePoolAddress refuses a Jupiter/Gecko pair (their
+        // pairAddress is the mint, not a pool).
+        pinnablePoolAddress(c.pair),
+      );
+    } catch {
+      /* tracking is optional */
+    }
+  }
+
+  /**
+   * Drop one coin's abandoned-card record — the background chain's own settle:
+   * the send that was abandoned has ANSWERED (delivered, audited, and settled
+   * by the record's own removal; or rejected, with the claim released right
+   * there), so the worker's tick-tail settle must not decide it again. Same
+   * seam discipline as the write above (the tracker's
+   * clearAbandonedTerminalCard is the other instance of this pair).
+   */
+  private async clearUnconfirmedCardSend(
+    chatId: string,
+    token: string,
+  ): Promise<void> {
+    const read = (this.db as Partial<Pick<Db, "getWorkerState">>).getWorkerState;
+    const write = (this.db as Partial<Pick<Db, "setWorkerState">>).setWorkerState;
+    if (typeof read !== "function" || typeof write !== "function") return;
+    const raw = await read.call(this.db, UNCONFIRMED_CARD_STATE_KEY);
+    await write.call(
+      this.db,
+      UNCONFIRMED_CARD_STATE_KEY,
+      removeUnconfirmedCardSend(raw, chatId, token),
+    );
+  }
+
   private addReject(
     diag: ScanSummary,
     coin: QualifyingCoin,

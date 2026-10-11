@@ -77,6 +77,7 @@ import {
   DEFERRED_MAX_CALLS_PER_DRAIN,
   DEFERRED_DEAD_PREDECESSOR_MAX_CALLS,
   noteDuplicateCards,
+  noteUnconfirmedCards,
   noteTrackerPassSpend,
   WRITE_DRAIN_ERROR_KEY,
   drainErrorIsStale,
@@ -84,16 +85,24 @@ import {
 } from "./tickprobe";
 import {
   PUSH_DEFERRAL_STATE_KEY,
+  addUnconfirmedCardSend,
+  UNCONFIRMED_CARD_GRACE_MS,
+  UNCONFIRMED_CARD_STATE_KEY,
   heldBackCandidates,
   loadPushDeferralSnapshot,
   nextPushDeferralSnapshot,
+  deliveredCardTokens,
   deliveredDeferredTokens,
   deliveredFollowupTokens,
   duplicateInitialTokens,
+  parseUnconfirmedCardSends,
   parsePushDeferralSnapshot,
   pushDeferralAlreadyApplied,
   pushDeferralDelta,
+  serializeUnconfirmedCardSends,
+  settleUnconfirmedCardSends,
   type PushDeferralSnapshot,
+  type UnconfirmedCardSend,
 } from "./deferrallog";
 import {
   PUSH_LEDGER_STATE_KEY,
@@ -692,6 +701,10 @@ const TAIL_STATE_KEYS = [
   SKIP_CAPTURE_STATE_KEY,
   BIRDEYE_CU_STATE_KEY,
   BIRDEYE_CU_BY_STATE_KEY,
+  // The abandoned-card ring rides the same read: the settle below needs it
+  // every tick, and its proofs are already in this readout (see
+  // cardProofTokens) — so settling a cut send costs no round trip of its own.
+  UNCONFIRMED_CARD_STATE_KEY,
 ] as const;
 
 /**
@@ -1122,6 +1135,30 @@ function dropDeliveredPendings(tail: TailReadout, pending: readonly string[]): s
 }
 
 /**
+ * Every token the tail's own proofs say a card was DELIVERED for — the audit
+ * ring (`push_audit`), the durable push ledger and the `push_watch` rows
+ * (written right after a successful push). The same three sources
+ * dropDeliveredPendings folds, in the same readout, so this costs a parse and
+ * never a round trip.
+ *
+ * Used by the abandoned-card settle: any of the three means the coin's card
+ * reached the chat, so an unconfirmed record for it must NOT release the claim
+ * (releasing it would re-push a card the operator already has).
+ */
+function cardProofTokens(tail: TailReadout): Set<string> {
+  const tokens = new Set<string>();
+  const audit = parsePushAuditState(tail.states.get(PUSH_AUDIT_STATE_KEY) ?? null);
+  for (const token of deliveredCardTokens(audit)) tokens.add(token);
+  for (const token of ledgerDeliveredTokens(
+    parsePushLedger(tail.states.get(PUSH_LEDGER_STATE_KEY) ?? null),
+  )) {
+    tokens.add(token);
+  }
+  for (const row of tail.pushWatch ?? []) tokens.add(row.token);
+  return tokens;
+}
+
+/**
  * Bring the durable deferral counters (src/deferrallog.ts) in step with this
  * tick's summary, and refresh the copy the heartbeat publishes.
  *
@@ -1243,6 +1280,51 @@ export async function syncPushDeferralCounters(
     );
     writes.push({ key: PUSH_DEFERRAL_STATE_KEY, value: JSON.stringify(shrunk) });
   }
+  // ABANDONED-INITIAL-CARD SETTLE (2026-10-11). A cut initial send now KEEPS
+  // its `seen_tokens` claim and records itself in unconfirmed_card_sends (see
+  // Scanner.recordUnconfirmedCardSend); this is the only thing that resolves
+  // those records, and it rides the tail's SAME read and (when anything
+  // settles) its SAME batch:
+  //   * PROVEN (any of the three sources in cardProofTokens names the coin) →
+  //     the card is in the chat: drop the record, keep the claim.
+  //   * SILENT past UNCONFIRMED_CARD_GRACE_MS → the isolate died between the
+  //     send and the audit, so the card may never have arrived: RELEASE the
+  //     claim and let a later scan re-push it.
+  // The release is the deliberate fail-open direction (a missing card is a lost
+  // trade, a duplicate is noise) and it is bounded to one per record: the
+  // record is dropped in the same batch that precedes the release, so the same
+  // coin cannot be released twice for the same abandoned send.
+  const abandonedRecords = parseUnconfirmedCardSends(
+    tail.states.get(UNCONFIRMED_CARD_STATE_KEY) ?? null,
+  );
+  let abandonedRelease: UnconfirmedCardSend[] = [];
+  if (abandonedRecords.length > 0) {
+    const settled = settleUnconfirmedCardSends(
+      abandonedRecords,
+      now,
+      UNCONFIRMED_CARD_GRACE_MS,
+      cardProofTokens(tail),
+    );
+    abandonedRelease = settled.release;
+    if (settled.confirmed.length > 0 || settled.release.length > 0) {
+      writes.push({
+        key: UNCONFIRMED_CARD_STATE_KEY,
+        value: serializeUnconfirmedCardSends(settled.kept),
+      });
+    }
+    noteUnconfirmedCards(
+      {
+        pending: settled.kept.length,
+        releasedNow: settled.release.length,
+        tokens: [...settled.confirmed, ...settled.release].map((r) => r.token),
+      },
+      now,
+    );
+  } else {
+    // Publish the settled-to-zero state: the record count is what says whether
+    // any cut send is still withheld, and a stale reading would outlive it.
+    noteUnconfirmedCards({ pending: 0, releasedNow: 0, tokens: [] }, now);
+  }
   // The three throttled telemetry merges ride the SAME read and land in the
   // SAME batch: they used to be a second read plus a second write, each with
   // its own 900ms bound.
@@ -1332,6 +1414,38 @@ export async function syncPushDeferralCounters(
   if (ledgerDue) pushLedgerSyncedAt = settledAt;
   if (skipDue) skipCaptureSyncedAt = settledAt;
   if (birdeyeDue) birdeyeCuSyncedAt = settledAt;
+  // The releases wait for the batch: persisting the SHRUNK ring first is what
+  // makes the release at-most-once (a crash after the claim was dropped but
+  // before the record was would release the same claim again — and if the coin
+  // had been re-pushed and re-claimed in between, that second release would
+  // delete a NEW claim and put a third card in flight).
+  if (landed && abandonedRelease.length > 0) {
+    let released = 0;
+    for (const record of abandonedRelease) {
+      try {
+        await database.unclaimTokenPush(record.chatId, record.token);
+        released += 1;
+      } catch {
+        // Put the record BACK: the claim is still held and the coin still has
+        // no proven card, so forgetting it now would be the one outcome that
+        // hurts — a coin pushed-with-no-card and no longer re-pushable.
+        try {
+          const back = addUnconfirmedCardSend(
+            await database.getWorkerState(UNCONFIRMED_CARD_STATE_KEY),
+            record,
+          );
+          await database.setWorkerState(UNCONFIRMED_CARD_STATE_KEY, back);
+        } catch {
+          /* best-effort: the next tail attempts the same release again */
+        }
+      }
+    }
+    if (released > 0) {
+      console.log(
+        `[worker] released ${released} abandoned card claim(s) with no proof of delivery — a later scan re-pushes them (possible duplicate, never a lost card)`,
+      );
+    }
+  }
   if (landed) {
     // Telemetry side effects only AFTER the batch lands, in the order the
     // standalone syncs applied them: a landed write is the only thing that

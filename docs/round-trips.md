@@ -1151,12 +1151,16 @@ enabled chats，四個 round trip 收成一個讀；佢哋嘅 bookkeeping 收成
 
 - `Db.readPostScanTelemetry(stateKeys, limit)`：key set 由 caller 決定（worker 嘅
   `TAIL_STATE_KEYS` = `push_deferral` / `push_ledger` / `push_audit` /
-  `skip_capture` / `birdeye_cu_v1`），SQL 用 `IN (?, …)` —— 同上面
+  `skip_capture` / `birdeye_cu_v1` / `unconfirmed_card_sends`），SQL 用 `IN (?, …)` —— 同上面
   `getWorkerStates(keys)` 一模一樣。兩個 listing（`push_watch` 60 行、enabled
   chats）照舊，ORDER BY … LIMIT 不變。
 - `syncPushDeferralCounters(summary)` 變成整個 tail：**一個讀**（全部 row 一次）
   → duplicate guard（純函數，唔再 await 自己嘅讀）→ shrink、三個 telemetry
   merge、delta **一個 batch 寫**（`setWorkerStatesMany`）。
+  2026-10-11：三態 send 嘅 abandoned 紀錄（`unconfirmed_card_sends`）加咗入呢個
+  key set —— 佢嘅 proof 三個來源（`push_audit` / push ledger / `push_watch`）本身
+  就係 tail 已讀嘅嘢，所以 settle 係**零額外讀**（收縮跟同一個 batch；只有真要
+  release 先多一個 `unclaimTokenPush`）。
 - `syncPostScanTelemetry` / `runPostScanTelemetry` 退役。讀已經喺 tail 開頭
   發生，所以 throttle 判斷搬入 tail，merge 本身變成 pure planner
   `planPostScanTelemetry`（read 入；writes ＋ landed 之後才套嘅 side effect 出）。

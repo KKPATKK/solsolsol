@@ -50,6 +50,12 @@ for (let i = RISING_STAGES.length - 1; i >= 0; i--) { if (chg >= stage && !fired
 但 cut（唔再等）同 failed（Telegram 真拒絕）係兩件事，
 而 cut 之後**冇任何交付證據被留低**——audit 唔寫，所以下一次只能盲送。
 
+> **2026-10-11**：同一個「cut ≠ failed」嘅規則亦已經套用到 **initial 卡**（唔止 tracker 卡）：
+> `scanner.ts` 嘅 send 變成三態，cut 之後保留 `seen_tokens` claim ＋ 寫 durable 嘅
+> `unconfirmed_card_sends`，worker 嘅 tick 尾喺 120s 內證唔到交付才放手——live 症狀係同一張
+> ALON 卡收三次（msgIds 11467/11468 完全冇 audit entry）。詳見
+> `docs/scan-completion-loss.md` § (A)，測試喺 `scripts/test-unconfirmed-cards.js`。
+
 ## 三、修法
 
 | 位置 | 改動 |

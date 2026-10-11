@@ -348,7 +348,11 @@ async function main() {
   // reported live on 2026-09-20. A card's Telegram send only duplicates when it
   // is CUT: Telegram accepts the card, the awaited race expires first, `sendTo`
   // throws `cardSendTimeout`, its catch releases the claim, and the next tick
-  // sees the coin as unseen and pushes the same card again. What decides that
+  // sees the coin as unseen and pushes the same card again. (The send is
+  // THREE-STATE since 2026-10-11 — a cut keeps its claim and the worker's tail
+  // settle resolves it, see scripts/test-unconfirmed-cards.js — so what is left
+  // here is the room arithmetic that decides how often the send is cut at all.)
+  // What decides that
   // is the slice the send gets, and the tick's shape makes it exactly
   // `CANDIDATE_PUSH_RESERVE_MS - overhead`: the chain ends at
   // `SCAN_TICK_DEADLINE_MS - reserve`, the send starts `overhead` later
@@ -2934,15 +2938,19 @@ async function main() {
 
   // ---------- hand-paste drift guard (out-of-window patches) ----------
   //
-  // Three of the four fixes in docs/scan-completion-loss.md § "可直接貼上嘅窗口外
-  // patch" sit past the file-sync window, so a human copies them in by hand.
-  // The dangerous state is a PARTIAL paste: the three-state send without the
-  // worker-side reconcile leaves an abandoned card's claim held forever (a coin
-  // whose card truly failed is then never pushed again — the one thing the
-  // operator forbids), and the race clamp on its own changes nothing while
-  // still costing scans. So: either the behavioural patches are all in the
-  // source, or none are. Anything in between fails HERE, with a message that
-  // names what is missing, instead of silently shipping a half-applied fix.
+  // docs/scan-completion-loss.md § "可直接貼上嘅窗口外 patch" listed fixes a human
+  // had to copy in by hand. The dangerous state was a PARTIAL paste: the
+  // three-state send without the worker-side settle leaves an abandoned card's
+  // claim held forever (a coin whose card truly failed is then never pushed
+  // again — the one thing the operator forbids).
+  //
+  // 2026-10-11: that pair has LANDED (§ (A)) — the send half in src/scanner.ts,
+  // the settle half in the tick tail — so the markers below describe the landed
+  // shapes and this guard protects the same invariant in its installed form:
+  // whenever the send half is in the source, the settle half must be too.
+  // Anything in between fails HERE, with a message that names what is missing,
+  // instead of silently shipping a half-applied fix that withholds a coin
+  // forever.
 
   await test("out-of-window patches: pasted all together, or not at all", () => {
     const strip = (text) =>
@@ -2956,12 +2964,28 @@ async function main() {
     const pushwatchSrc = read("src/pushwatch.ts");
 
     const applied = {
-      "patch 1 (race floor clamp)": workerSrc.includes("constscanRaceMs=Math.max(0,Math.min("),
+      // 2026-10-11: the pair has LANDED (the send half in scanner.ts, the
+      // settle half in the tick tail), so these markers describe the landed
+      // shapes instead of the doc's literal paste list:
+      //   * patch 1 (the race floor clamp) is deliberately NOT a marker any
+      //     more — the clamp is scanRaceWindowMs() now, i.e. it landed in the
+      //     refactor that added the shed reason, and a half-applied scan
+      //     envelope is a different guard (the scanRaceMs cases) that has
+      //     nothing to do with this pair;
+      //   * the reconcile moved INTO the tail — it rides the tail's own read
+      //     (see docs/round-trips.md) — so it is pinned by the settle call, the
+      //     ring key the tail reads, the release it performs after the batch
+      //     lands, and the imports that make the rule reachable.
       "patch 2 (three-state send)": scannerSrc.includes("cardSendDisposition(raced.status)"),
-      "patch 3 (reconcile function)": workerSrc.includes(
-        "asyncfunctionreconcileUnconfirmedCardSends",
+      "patch 3 (the tail settles the ring)": workerSrc.includes(
+        "settleUnconfirmedCardSends(",
       ),
-      "patch 3 (reconcile called)": workerSrc.includes("awaitreconcileUnconfirmedCardSends("),
+      "patch 3 (the ring rides the tail read)": workerSrc.includes(
+        "UNCONFIRMED_CARD_STATE_KEY",
+      ),
+      "patch 3 (release only after the batch lands)": workerSrc.includes(
+        "unclaimTokenPush(record.chatId,record.token)",
+      ),
       "patch 3 (reconcile imports)":
         workerSrc.includes("parseUnconfirmedCardSends") &&
         workerSrc.includes("UNCONFIRMED_CARD_GRACE_MS"),

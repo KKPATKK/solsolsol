@@ -263,6 +263,9 @@ alert 一齊放寬）。改為新增獨立常數：
 
 > **2026-09-20：以下三項已經整理成逐字可貼（verbatim verified）嘅 patch，見文末
 > 「可直接貼上嘅窗口外 patch」——三態 send 嘅規則／讀側已經落地並有單元測試，剩返嘅只係搬線。**
+>
+> **2026-10-11：三態 send 已經搬完線（scanner 保留 claim + 寫 durable 紀錄，worker tick 尾 reconcile，
+> /health 有讀數），見 § (A)。user 端嘅現象（同一個幣連收 3 張）就係呢條線。**
 
 - race 信封嘅 floor clamp（窗口外，patch 已寫喺上面 —— 係正確性修正，唔係今次減失 flush 嘅主刀）。
 - flush 仍然會失手：今次改嘅係「吊死嘅寫入而家喺 reserve 內失敗，令重試有機會落地」，唔係令 Turso
@@ -408,7 +411,35 @@ if (recentClaim && !delivered.has(m.token)) { ... 送補發 ... }
 
 **為何用 seam 讀**：heal 測試用嘅 Db double 只實作 `getInitialPushAuditTokens`，所以新 reader 用 `typeof` 檢查（缺就退回舊集合）——純規則本身有單元測試釘死。
 
-### (A) cut → unclaim → re-eval 重推 —— 機制確認，修法在窗口外
+### (A) cut → unclaim → re-eval 重推 —— **已修（2026-10-11）**
+
+**2026-10-11 落地（唔再係「窗口外」）**：live 再中一次 —— user 收到同一張 ALON 卡三次，
+`push_audit` 只有 1 條 `initial`（id 11469 / 14:59:40Z），而同一個 chat 嘅 id **11466 → 11469 中間 2 個 id
+完全冇 audit**（你講嘅 22:53 HKT = 14:53Z 正好係缺口起點），`seen_tokens` 只剩最後嗰次 claim ——正是下面
+「機制」第 3 步：cut → unclaim → 下一 tick 重推。所以今次連同 patch 一齊貼咗：
+
+| 檔案 | 改動 |
+|---|---|
+| `src/scanner.ts` | `sendTo` 嘅 send 改成三態（start 一次 promise → `settled` / `abandoned` race → `cardSendDisposition`）：`sent` 照寫 audit，`failed` 照 `unclaimTokenPush` + throw（Telegram 嘅 code／description 原樣帶出），**`abandoned` 保留 claim + 寫 `unconfirmed_card_sends`**，再喺背景跟到有答案（成功 → 補 audit，順便起 tracking；失敗 → 放 claim）|
+| `src/worker.ts` | tick 尾 `syncPushDeferralCounters` 收尾：proof（`push_audit` / push ledger / `push_watch`）→ 丟紀錄、保留 claim；過 `UNCONFIRMED_CARD_GRACE_MS`（120s）仍然冇 proof → 真正 `unclaimTokenPush`（最壞 = 遲兩分鐘多一張，唔會漏）；收縮嘅 ring **先寫入同一個 batch**，成功落地才放手（釋放 at-most-once）|
+| `src/tickprobe.ts` | `UnconfirmedCardsView`（`pending` = ring 大細、`releasedTotal` = 無 proof 放手次數）＋ scanner 嘅 `cardSendAbandoned`／`cardSendAbandonedTotal`，兩個都掛上心跳 |
+
+同下面 patch 草稿有兩處分別（都係後來的 round-trip 紀律，行為一樣）：
+
+- reconcile **唔會自己讀 ring**：`unconfirmed_card_sends` 加咗入 `TAIL_STATE_KEYS`，而 proof 三個來源本身
+  就喺同一個 readout（duplicate guard 已經讀）→ 一次 settle = 「1 讀 + 1 寫 + 每個 release 一個 unclaim」，
+  唔係草稿嗰種「每次多兩次讀」。
+- `bestEffort(null)` 同「真係被拒」之間嗰個混同順手修好：rejection 而家會帶住 Telegram 原本嘅 error
+  出去（`/debug/chats` 嘅描述唔再一律係「exceeded its deadline」），而 `cardSendTimeout` 呢個 tag 同
+  佢喺 retry 閘門嘅例外一齊冇再需要（cut 已經唔會 throw 出去）。
+
+測試：純規則仍然喺 `scripts/test-unit.js`（`cardSendDisposition`、`settleUnconfirmedCardSends`、ring 讀寫），
+**接線**喺新檔 `scripts/test-unconfirmed-cards.js`（真 tick：一個候選幣 + 一個永遠唔答嘅 send →
+claim 保留、ring 一條紀錄、`push_audit` **冇** entry；另加一個 400 拒絕 → claim 放返）。
+
+---
+
+**原本嘅診斷（保留）**：
 
 **機制（代碼路徑，`scanner.ts` sendTo，行 ~3020，窗口外）**
 
@@ -500,9 +531,13 @@ if (raced.status === "abandoned") {
   基線：`cut` 應該幾乎每次卡被送都 +1（每次 `send@>3500ms` 嘅 tick），`sent` 只喺快 slice 出現。
 - **(B) 已修嘅驗收**：同一 token 喺 audit ring 唔應該再出現**多過一條** `resend`（改前可以 4–5 條）；
   用戶唔應該再收到「📤 補發推送」。呢個係 deploy 後最快見到嘅成效（下一次有 cut 或漏 row 嘅幣就會觸發）。
-- **(A) 未修**：`cardSend.cut` 應該維持（上游生成器仍在）；`deliveryDuplicates.count` 唔會反映 (A)（見限制）。
-  (A) 嘅驗收要等窗口外嘅三態 send 落地：**同一 token 喺 `/debug/push-audit` 只應有 1 條 `initial`**、
-  `seen_tokens` 唔應該再因為 timeout 而被刪。
+- **(A) 已修（2026-10-11）**：`cardSend.cut` 會照樣出現（上游生成器仍在，只係唔再 unclaim）。新讀數：
+  `/health` → `heartbeat.summary.cardSendAbandoned`（此 isolate 記低嘅「未知交付」）同
+  `heartbeat.unconfirmedCards = { pending, releasedTotal, releasedAt, tokens }`（ring 現況 + 無 proof 嘅放手）。
+  驗收：**同一 token 喺 `/debug/push-audit` 只應有 1 條 `initial`**；cut 之後 `seen_tokens` 唔應該再被刪
+  （`/debug/token?mint=` 應該仍然讀到「已推」）；`unconfirmedCards.pending` 應該幾乎長期 0
+  （背景 settle / 下一 tick 就收掉）；`releasedTotal` 每 +1 就係**一次無 proof 嘅放手 = 一個潛在重複**，
+  所以呢個數應該極少升 —— 升就係 Telegram 真係冇答而 isolate 又死咗（即上面「最壞情況」）。
 - 反面驗收（防漏推）：模擬一個 request reject 嘅 send → 仍然要 `unclaimTokenPush` + 下 tick 補推；
   只有 `abandoned` 才保留 claim，而且 2 個 tick 內證唔到 delivery 就必須放返出去。
   heal gate 嘅反面驗收：**ring 完全冇 entry 嘅 token 必須照樣補發**（單元測試 `deliveredCardTokens` 覆蓋）。
@@ -682,7 +717,7 @@ race 反過來變成無上限。
 
 ---
 
-## Patch 2／4：三態 send（`src/scanner.ts`，`sendTo` 內 ~3086–3140 行）
+## Patch 2／4：三態 send（`src/scanner.ts`，`sendTo` 內 ~3086–3140 行）—— ✅ 已落地（2026-10-11，見 § (A)）
 
 ### 2a. 檔案頂 import（窗口內，可即刻做）
 
