@@ -1945,6 +1945,26 @@ export interface QualifyingCoin {
  */
 export interface RejectionEntry {
   symbol: string;
+  /**
+   * The coin's Solana mint — `pair.baseToken.address`, or the address the coin
+   * was looked up by when a pair carries none.
+   *
+   * WHY (2026-10-11). The rest of this entry is what an operator READS, but a
+   * symbol is not an identity: pump.fun hands the same ticker to many mints,
+   * and a live sample showed the log's `INTENTS` entries belonging to 08:38 /
+   * 09:14 / 09:44 launches while the pushed INTENTS launched at 07:22 — all 16
+   * same-symbol candidates in a 100-entry sample failed a ±3-minute
+   * launch-time check. Without the mint a rejected coin could not be joined to
+   * its own token_stats row (`/debug/token?mint=`), so "the feed read this coin
+   * as dead" could not be told apart from "the reading was missing". With it,
+   * `/health.summary.rejects` joins to `/debug/token` directly.
+   *
+   * DATA ONLY: no gate reads this field, so no filter behaviour changes. It
+   * costs ~55 bytes per entry (a mint is 32–44 base58 chars) — ~1.1KB on the
+   * 20-slot eval ring and ~0.3KB on the five-slot chain ring, which is the
+   * byte accounting REJECT_LOG_MAX's 50 → 20 trim was made against.
+   */
+  token: string;
   ageMin: number;
   mcapUsd: number;
   vol5Usd: number;
@@ -2451,6 +2471,13 @@ export interface ScanSummary {
  * BYTES are the one thing still buyable there, and 20 entries keep the
  * dominant reasons visible (the feed's sub-$10K dust + the pool's gate
  * failures) at ~2KB.
+ *
+ * 2026-10-11: every entry now also carries the coin's mint (see
+ * RejectionEntry.token, ~55B), so the ring is ~3.1KB rather than ~2KB. Kept at
+ * 20 on purpose: the mint is what makes an entry ACTABLE (joinable to
+ * /debug/token), so buying those bytes back by trimming the count would trade
+ * the reading away for its size — and 20 is still the reason-population the
+ * cap was chosen for.
  */
 const REJECT_LOG_MAX = 20;
 
@@ -2469,9 +2496,10 @@ const REJECT_LOG_MAX = 20;
  * (`fails.sus`) and never named, in every sampled tick. The two phases now
  * have a ring each, so the chain's five slots survive whatever the eval does.
  *
- * SIZE: five entries serialize to ~0.5KB (the reasons differ in length — the
- * flurry line is the long one) on a completion batch that is already ~2KB of
- * rejects and 12.4KB in total, so this is the cheapest reading in the batch.
+ * SIZE: five entries serialize to ~0.8KB (the reasons differ in length — the
+ * flurry line is the long one — plus each entry's mint since 2026-10-11) on a
+ * completion batch that is already ~3KB of rejects and ~13.5KB in total, so
+ * this is the cheapest reading in the batch.
  */
 export const CHAIN_REJECT_LOG_MAX = 5;
 
@@ -7455,6 +7483,8 @@ export class Scanner {
     const ageMs = Date.now() - pair.pairCreatedAt;
     diag.chainRejects.push({
       symbol: pair.baseToken.symbol || coin.profile.symbol || "?",
+      // Same join key as the eval ring (see RejectionEntry.token).
+      token: pair.baseToken.address || coin.profile.tokenAddress,
       ageMin: Math.round(ageMs / 60_000),
       mcapUsd: Math.round(pair.marketCap),
       vol5Usd: Math.round(pair.volume.m5),
@@ -7947,6 +7977,10 @@ export class Scanner {
           return;
         rejects.push({
           symbol: pair.baseToken.symbol || profile.symbol || "?",
+          // The join key (see RejectionEntry.token): the pair's own base mint,
+          // falling back to the address this coin was looked up by — never an
+          // empty string, which would be an unjoinable entry.
+          token: pair.baseToken.address || profile.tokenAddress,
           ageMin: Math.round(ageMs / 60_000),
           mcapUsd: Math.round(pair.marketCap),
           vol5Usd: Math.round(pair.volume.m5),

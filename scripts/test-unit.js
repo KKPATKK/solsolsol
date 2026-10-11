@@ -5440,6 +5440,30 @@ async function main() {
     assert.equal(diag.chainRejects[0].symbol, "AAA");
     assert.equal(diag.chainRejects[0].mcapUsd, 12_345);
     assert.equal(diag.chainRejects[0].ageMin, 2, "1.5 minutes rounds to 2");
+    // The JOIN KEY (2026-10-11): a symbol is not an identity — pump.fun reuses
+    // tickers, so the log's `INTENTS` entries were three other launches — which
+    // is why each entry carries the coin's mint and the ring can be read
+    // against /debug/token?mint=. This fixture's pair carries no
+    // baseToken.address, so the address the coin was looked up by is the
+    // honest fallback (never an empty, unjoinable string).
+    assert.equal(diag.chainRejects[0].token, "T", "the mint rides the entry");
+    const addressed = {
+      profile: { symbol: "BBB", tokenAddress: "T2" },
+      pair: {
+        baseToken: { address: "MINT_BBB", symbol: "BBB" },
+        pairCreatedAt: Date.now() - 60_000,
+        marketCap: 1,
+        volume: { m5: 0 },
+        priceChange: { m5: 0 },
+      },
+    };
+    const diag2 = { rejects: [], chainRejects: [] };
+    scanner.addReject(diag2, addressed, "r");
+    assert.equal(
+      diag2.chainRejects[0].token,
+      "MINT_BBB",
+      "the PAIR's own base mint wins when it is known — the lookup address is only a fallback",
+    );
     // The ring only exists if the tick's summary carries it.
     const scannerSrc = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
     assert.ok(scannerSrc.includes("chainRejects: [],"), "the summary must initialise the ring");
@@ -6099,6 +6123,19 @@ async function main() {
       assert.equal(owed.length, 1, "the owed coin's rejection is in the log");
       assert.equal(owed[0].symbol, "OWED", "the entry names the debt");
       assert.match(owed[0].reason, /市值/, "and the gate refusing it");
+      // Every entry of the EVAL ring is joinable to its own token_stats row
+      // (2026-10-11): the ring is the only place a scan's judgment about a coin
+      // survives, and without the mint a reader could not ask the coin's row
+      // whether it was dead or merely unread.
+      assert.ok(
+        rejects.every((r) => typeof r.token === "string" && r.token.length > 0),
+        "every logged rejection carries its mint, so the ring joins to /debug/token",
+      );
+      assert.equal(
+        owed[0].token,
+        "OWEDCOIN",
+        "and the debt's entry names the mint the make-up lane looked it up by",
+      );
       // The reserve is what bought that slot — the log is not simply bigger.
       assert.ok(
         !rejects.some((r) => r.symbol === `FEED${FEED - 1}`),

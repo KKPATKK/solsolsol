@@ -4121,3 +4121,44 @@ curl -s .../debug/push-watch | jq '.mutedSigs'
 - **舊 row（deploy 前已追蹤）由 0 起**：所以上線後第一對復活就可能出卡 —— 呢個係想要嘅行為（之前嘅復活冇計落 memory，無法回溯）。
 - **改嘅係一張新卡 + 一個新 column**：現有 🟢/🚀/💀 規則、threshold、cooldown 全部零改動；round trips：每 tick 每 row 唔多唔少（同一個 UPDATE 多一格），silent 批次一樣係一 trip。
 - **文案講「第二次」**：count 由 0 起、出完即歸 0，所以 fire 嘅一刻一定是 1→2；`>= 2` 係 defensive（例如手改 DB 嘅 row）。
+
+---
+
+## 4.62 Reject log 每個 entry 帶埋 mint —— `/health.summary.rejects` 可以直接 join `/debug/token`（2026-10-11）
+
+### 一、需求（operator 原話）
+
+「RejectionEntry 加一個 token（mint）欄並喺 src/scanner.ts 嘅 reject() push 埋 pair.baseToken.address — 一行資料改動、唔影響任何閘行為，之後 /health.summary.rejects 就可以直接 join /debug/token（同埋徹底解決撞名）」
+
+### 二、為何要（實測，唔係理論）
+
+- `/debug/token` 係 `?mint=` 查 `token_stats`，而 `token_stats` **唔存 symbol** → reject log 只有 symbol 嘅年代，**冇任何官方 symbol→mint 查法**，一條 reject 追唔到自己嘅 row。
+- 撞名確實會發生（pump.fun 容許同一 ticker 多個 mint）：已推送 **INTENTS** 實際 launch 07:22，但 log 裏面嘅 `INTENTS` 係 08:38 / 09:14 / 09:44 / 11:52；100 條 reject 樣本有 **16 條撞名**，用 launch-time 檢定（±3 分鐘）**16/16 全部唔通過**（Δ −688 至 +261 分鐘）。
+- 後果：分唔清「feed 讀到呢隻幣係死」同「根本冇讀數」—— 呢個分野正係純零 stub（mcap 0＋vol5 0＋chg 0）最需要嘅證人。
+
+### 三、做法（一行資料 × 兩個 writer）
+
+- `RejectionEntry.token: string`（**required**）：兩個 writer 都一定有 mint，冇得填嘅 entry 唔應該存在。
+- EVAL ring（`matchCoins` 內嘅 `reject()`）同 PUSH ring（`addReject()`）都係 `token: pair.baseToken.address || profile.tokenAddress` —— pair 自帶嘅 base mint 優先，冇嘅時候退回 lookup 地址，**永遠唔會係空字串**（空字串 = unjoinable，等於冇加）。
+- **純資料**：冇任何閘讀呢個欄，filter 行為零改動（ER 只係 log；REJECT_LOG_MAX / CHAIN_REJECT_LOG_MAX 嘅 cap 同 budget 邏輯一樣）。
+
+### 四、測試（main suite **518 passed, 0 failed**；其餘 8 個 suite 全綠）
+
+- chain ring 測試（`addReject()` writer）：entry 帶 `token`；fixture 冇 `baseToken.address` → 用 lookup 地址（`"T"`）；再一個有 address 嘅 coin → 用 pair 自己嘅 mint（`MINT_BBB`），釘實「pair mint 優先、lookup 只係 fallback」。
+- owed-coin reject-log budget 測試（行真 `runOnce()` → `matchCoins` → `reject()` writer）：`rejects.every(r => typeof r.token === "string" && r.token.length > 0)`，而 owed entry 嘅 `token` = make-up lane lookup 嘅 mint（`OWEDCOIN`）。
+
+### 五、驗收（deploy 後）
+
+```bash
+curl -s .../health | jq '.summary.rejects[0]'            # 見到 token
+curl -s ".../debug/token?mint=$(curl -s .../health | jq -r '.summary.rejects[0].token')" | jq '{ok, stats}'
+```
+
+第二條由 `ok:true, stats:null`（唔知係死定冇數據）變成一個真正嘅 token_stats row：**死幣 vs 冇讀數，同一條 lane 直接分得開**。
+
+### 六、界線（老實講）
+
+- **字節代價**：每條 +~55B（mint 32–44 base58 字）→ EVAL ring 20 條由 ~2KB 變 ~3.1KB、chain ring ~0.5KB 變 ~0.8KB，completion batch ~12.4KB 變 ~13.5KB。**刻意唔減條數**：mint 就係令 entry 可行動嘅嘢，用條數換返字節等於用讀數換體積（兩個 cap 嘅註解已記低）。
+- **呢個改動只係「之後可以 join」，唔等於已經 join 完**：live 驗收要等 deploy 之後嘅第一個 heartbeat。
+- **只覆蓋會落到 log 嘅 reject**（EVAL 20 + chain 5，budget 決定邊條入選），唔係全量 reject。
+- **撞名唔會因此消失**：mint 只係令撞名唔再阻礙判讀；同一個 symbol 多個 mint 係 pump.fun 嘅事實。
