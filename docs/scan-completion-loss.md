@@ -535,7 +535,8 @@ if (raced.status === "abandoned") {
   `/health` → `heartbeat.summary.cardSendAbandoned`（此 isolate 記低嘅「未知交付」）同
   `heartbeat.unconfirmedCards = { pending, releasedTotal, releasedAt, tokens }`（ring 現況 + 無 proof 嘅放手）。
   驗收：**同一 token 喺 `/debug/push-audit` 只應有 1 條 `initial`**；cut 之後 `seen_tokens` 唔應該再被刪
-  （`/debug/token?mint=` 應該仍然讀到「已推」）；`unconfirmedCards.pending` 應該幾乎長期 0
+  （per-mint 嘅讀法係 `/debug/flow?mint=…` 回 `pushed: true` + `pushedAt` —— 佢本身有 cooldown
+  同 Helius 成本，唔應該當成 poll 用）；`unconfirmedCards.pending` 應該幾乎長期 0
   （背景 settle / 下一 tick 就收掉）；`releasedTotal` 每 +1 就係**一次無 proof 嘅放手 = 一個潛在重複**，
   所以呢個數應該極少升 —— 升就係 Telegram 真係冇答而 isolate 又死咗（即上面「最壞情況」）。
 - 反面驗收（防漏推）：模擬一個 request reject 嘅 send → 仍然要 `unclaimTokenPush` + 下 tick 補推；
