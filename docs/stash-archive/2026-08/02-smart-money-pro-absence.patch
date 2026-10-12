@@ -1,0 +1,318 @@
+diff --git a/scripts/test-unit.js b/scripts/test-unit.js
+index 2e669d0..eaa0c56 100644
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -19,6 +19,7 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
+ const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
+ const { passesChgGate } = require("../dist/dexscreener.js");
+ const { evaluateWatch } = require("../dist/pushwatch.js");
++const { proAbsenceAlert } = require("../dist/pushwatch.js");
+ const { mcapRatioBlockReason } = require("../dist/scanner.js");
+ const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
+ const { parseTokenOverview } = require("../dist/birdeye.js");
+@@ -1939,6 +1940,51 @@ async function main() {
+     assert.equal(parseFilterArgs(["40000", "300000", "180", "1680", "6000", "30", "40", "10000", "-5"]).ok, false);
+   });
+ 
++  // ---------- smart-money absence alert (DOTE/BAOJIN shape) ----------
++
++  await test("proAbsenceAlert: pumped-but-zero-pros fires, everything else stays silent", () => {
++    // DOTE/BAOJIN shape: ran +40% since push, still zero smart_traders.
++    assert.match(proAbsenceAlert(0, 40, 30), /聰明錢缺席/);
++    // Below the gain threshold, absence is normal (coin never ran).
++    assert.equal(proAbsenceAlert(0, 10, 30), null);
++    // Smart money arrived — healthy, no alert (the CONK case after god candle).
++    assert.equal(proAbsenceAlert(2, 120, 30), null);
++    // Unknown trader data — cannot judge, never alert.
++    assert.equal(proAbsenceAlert(null, 999, 30), null);
++    // Boundary: exactly at the gain threshold fires.
++    assert.match(proAbsenceAlert(0, 30, 30), /聰明錢缺席/);
++  });
++
++  await test("push_watch pros_checked_at round-trips and listPushWatch exposes it", async () => {
++    const t = tmpDb();
++    try {
++      const db = new Db(t.p, undefined, t.client);
++      await db.init();
++      await db.upsertPushWatch({
++        token: "T-PRO", chatId: "chat-a", symbol: "PRO",
++        pushedAt: Date.now(), mcapAtPush: 100, liquidityUsd: 50,
++      });
++      let rows = await db.listPushWatch(10);
++      assert.equal(rows[0].prosCheckedAt, null);
++      const at = Date.now();
++      await db.setPushWatchProsChecked("T-PRO", at);
++      rows = await db.listPushWatch(10);
++      assert.equal(rows[0].prosCheckedAt, at);
++    } finally {
++      await t.cleanup();
++    }
++  });
++
++  await test("loadConfig: pushWatch pro knobs parse and clamp", () => {
++    const d = loadConfig({});
++    assert.equal(d.pushWatch.proCheckDelayMin, 45);
++    assert.equal(d.pushWatch.proGainAlertPct, 30);
++    const off = loadConfig({ PUSH_WATCH_PRO_CHECK_MIN: "0" });
++    assert.equal(off.pushWatch.proCheckDelayMin, 0);
++    const tuned = loadConfig({ PUSH_WATCH_PRO_CHECK_MIN: "90", PUSH_WATCH_PRO_GAIN_PCT: "50" });
++    assert.equal(tuned.pushWatch.proCheckDelayMin, 90);
++    assert.equal(tuned.pushWatch.proGainAlertPct, 50);
++  });
+   // ---------- mcap/liquidity ratio gate (Nudaeng lesson) ----------
+ 
+   await test("mcapRatioBlockReason: real push-history calibration", () => {
+diff --git a/src/config.ts b/src/config.ts
+index 951843c..604c416 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -342,6 +342,13 @@ export interface AppConfig {
+     cooldownMin: number;
+     holdersRefreshMin: number;
+     maxHolderChecksPerTick: number;
++    /** Delay after push before the ONE-TIME smart-money recheck (0 = off).
++     * At push time even golden dogs show 0 pro traders (smart money arrives
++     * late), so the signal is only evaluated once the coin has had time. */
++    proCheckDelayMin: number;
++    /** Gain vs push baseline (%) required for the absence alert to fire —
++     * "pumped but zero smart money" is the DOTE/BAOJIN shape. */
++    proGainAlertPct: number;
+   };
+   /** Minimum spacing between DexScreener HTTP requests (rate limiting). */
+   dexRequestIntervalMs: number;
+@@ -524,6 +531,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+       maxHolderChecksPerTick: Number.isFinite(Number(env.PUSH_WATCH_MAX_HOLDER_CHECKS ?? 4))
+         ? Math.max(0, Math.min(Math.floor(Number(env.PUSH_WATCH_MAX_HOLDER_CHECKS ?? 4)), 10))
+         : 4,
++      proCheckDelayMin: Number.isFinite(Number(env.PUSH_WATCH_PRO_CHECK_MIN ?? 45))
++        ? Math.max(0, Math.min(Math.floor(Number(env.PUSH_WATCH_PRO_CHECK_MIN ?? 45)), 720))
++        : 45,
++      proGainAlertPct: Number.isFinite(Number(env.PUSH_WATCH_PRO_GAIN_PCT ?? 30))
++        ? Math.max(5, Math.min(Math.floor(Number(env.PUSH_WATCH_PRO_GAIN_PCT ?? 30)), 500))
++        : 30,
+     },
+     dexRequestIntervalMs:
+       Number.isFinite(rawDexInterval) && rawDexInterval >= 0 ? rawDexInterval : 350,
+diff --git a/src/db.ts b/src/db.ts
+index 9597380..1b25cd9 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -346,7 +346,8 @@ export class Db {
+           followups_sent INTEGER NOT NULL DEFAULT 0,
+           last_state TEXT,
+           last_vol_5m REAL,
+-          dead_trough_mcap REAL
++          dead_trough_mcap REAL,
++          pros_checked_at INTEGER
+         );`,
+         `CREATE INDEX IF NOT EXISTS idx_push_watch_pushed ON push_watch(pushed_at);`,
+         // Pushed-coin top-holder snapshots (wallet analysis, feature C): one
+@@ -578,6 +579,9 @@ export class Db {
+     // push_watch.dead_trough_mcap — the dead-state low anchoring the
+     // trough × 1.5 resurrection trigger. Idempotent.
+     await this.addColumnIfMissing("push_watch", "dead_trough_mcap", "REAL");
++    // push_watch.pros_checked_at — one-time delayed smart-money recheck
++    // (聰明錢缺席 alert): null = not yet checked. Idempotent.
++    await this.addColumnIfMissing("push_watch", "pros_checked_at", "INTEGER");
+     // Telemetry counters: /health used to run COUNT(*) over token_stats
+     // (~400K rows) and seen_tokens (~50K rows) on every ping — at the 1-min
+     // uptime-monitor cadence that alone is ~600M rows/day (alerted
+@@ -1636,6 +1640,7 @@ export class Db {
+     holdersAtPush: number | null;
+     holdersLast: number | null;
+     holdersCheckedAt: number | null;
++    prosCheckedAt: number | null;
+     lastChecked: number;
+     lastAlertAt: number;
+     followupsSent: number;
+@@ -1678,6 +1683,10 @@ export class Db {
+           r.holders_checked_at === null || r.holders_checked_at === undefined
+             ? null
+             : Number(r.holders_checked_at),
++        prosCheckedAt:
++          r.pros_checked_at === null || r.pros_checked_at === undefined
++            ? null
++            : Number(r.pros_checked_at),
+         lastChecked: Number(r.last_checked ?? 0),
+         lastAlertAt: Number(r.last_alert_at ?? 0),
+         followupsSent: Number(r.followups_sent ?? 0),
+@@ -1735,6 +1744,15 @@ export class Db {
+     });
+   }
+ 
++  /** Mark the one-time delayed smart-money recheck as done (regardless of
++   * outcome — a null Birdeye result is not worth burning quota to retry). */
++  async setPushWatchProsChecked(token: string, at: number): Promise<void> {
++    await this.get().execute({
++      sql: "UPDATE push_watch SET pros_checked_at = ? WHERE token = ?",
++      args: [at, token],
++    });
++  }
++
+   async deletePushWatch(token: string): Promise<void> {
+     await this.get().execute({
+       sql: "DELETE FROM push_watch WHERE token = ?",
+diff --git a/src/pushwatch.ts b/src/pushwatch.ts
+index d313ca6..ecc3c8f 100644
+--- a/src/pushwatch.ts
++++ b/src/pushwatch.ts
+@@ -318,6 +318,28 @@ export function evaluateWatch(
+  * All network/db work is best-effort — a tracker failure must never affect
+  * the scan or a push.
+  */
++/**
++ * Smart-money absence alert (the DOTE/BAOJIN shape): a pushed coin that has
++ * PUMPED ≥ gainAlertPct since push but still shows ZERO Birdeye smart_trader
++ * wallets among its top traders. Push-time gating is impossible — even CONK
++ * showed 0 pros at push (smart money arrives late) — so the signal is only
++ * evaluated once, after proCheckDelayMin, on coins that have actually run.
++ * Returns the alert text, or null when the coin is fine / data unknown.
++ */
++export function proAbsenceAlert(
++  proTraders: number | null,
++  gainPct: number,
++  gainAlertPct: number,
++): string | null {
++  if (proTraders === null) return null; // no trader data — cannot judge
++  if (proTraders > 0) return null; // smart money present — healthy
++  if (!(gainPct >= gainAlertPct)) return null; // hasn't run — absence is normal
++  return (
++    `🧠 聰明錢缺席：推送後已漲 +${gainPct.toFixed(0)}%，` +
++    `但 24h 內仍無任何 smart_trader 進場（DOTE/BAOJIN 型形態——漲幅無聰明錢背書）`
++  );
++}
++
+ export class PushWatcher {
+   constructor(
+     private readonly db: Db,
+@@ -495,6 +517,63 @@ export class PushWatcher {
+       }
+     }
+ 
++    // One-time delayed smart-money recheck (聰明錢缺席): after
++    // proCheckDelayMin, ask Birdeye whether any smart_trader has arrived.
++    // Only coins that have PUMPED can be judged — absence without a run is
++    // normal. One shot per coin (pros_checked_at), oldest push first, and
++    // the same per-tick cap as holder probes keeps Birdeye usage bounded.
++    if (this.birdeye && cfg.proCheckDelayMin > 0 && cfg.maxHolderChecksPerTick > 0) {
++      const duePros = activeRows
++        .filter(
++          (r) =>
++            r.prosCheckedAt === null &&
++            pairs.has(r.token) &&
++            now - r.pushedAt >= cfg.proCheckDelayMin * 60_000,
++        )
++        .sort((a, b) => a.pushedAt - b.pushedAt)
++        .slice(0, cfg.maxHolderChecksPerTick);
++      for (const r of duePros) {
++        const pair = pairs.get(r.token)!;
++        try {
++          const info = await this.birdeye.getTraderInfo(
++            r.token,
++            pair.marketCap,
++            pair.priceUsd,
++          );
++          const gainPct =
++            r.mcapAtPush > 0 ? (pair.marketCap / r.mcapAtPush - 1) * 100 : 0;
++          const alert = proAbsenceAlert(
++            info.proTraders,
++            gainPct,
++            cfg.proGainAlertPct,
++          );
++          if (alert) {
++            try {
++              await this.bot.api.sendMessage(
++                r.chatId,
++                `${alert}\n🪙 ${r.symbol ?? r.token.slice(0, 6)}｜市值 ${fmtUsd(pair.marketCap)}`,
++              );
++              alerted += 1;
++            } catch (err) {
++              console.error(
++                "[push-watch] pro-absence alert send failed:",
++                err instanceof Error ? err.message : err,
++              );
++            }
++          }
++        } catch (err) {
++          console.error(
++            "[push-watch] pro-trader recheck failed:",
++            err instanceof Error ? err.message : err,
++          );
++        } finally {
++          // One shot regardless of outcome — a null Birdeye result is not
++          // worth burning quota to retry.
++          await this.db.setPushWatchProsChecked(r.token, now);
++        }
++      }
++    }
++
+     return { checked, alerted };
+   }
+ }
+diff --git a/src/render.ts b/src/render.ts
+index 4c78ddb..98dd9d4 100644
+--- a/src/render.ts
++++ b/src/render.ts
+@@ -24,6 +24,7 @@ export function renderMessage(
+   arkham: ArkhamTokenHolders | null,
+   crime: CrimeCheckResult,
+   wallet: WalletAnalysisResult | null,
++  proTraders: number | null = null,
+ ): string {
+   const { pair, profile } = coin;
+   const name = pair.baseToken.name || profile.name || "Unknown";
+@@ -49,6 +50,14 @@ export function renderMessage(
+     sniperPct === null
+       ? "🎯 Sniper 買入: —（未檢測）"
+       : `🎯 Sniper 買入: ${sniperPct.toFixed(1)}%（佔供應）`;
++  // Smart-money count (Birdeye smart_trader tags, bundler/dev excluded) —
++  // the same signal Axiom shows as "Pro Traders". At push time this is 0 or
++  // unknown for nearly every coin (pros arrive late), so it is display-only:
++  // the actionable check is the tracker's delayed recheck (聰明錢缺席 alert).
++  const proLine =
++    proTraders === null
++      ? "🧠 聰明錢: —（未檢測）"
++      : `🧠 聰明錢: ${proTraders}（24h smart_trader）`;
+   const holdersLine =
+     holderCount === null
+       ? "👥 Holders: —（未检测）"
+@@ -122,6 +131,7 @@ export function renderMessage(
+     top10Line,
+     flowLine,
+     sniperLine,
++    proLine,
+     holdersLine,
+     creatorLine,
+     gmgnLine,
+diff --git a/src/scanner.ts b/src/scanner.ts
+index e7c083a..5f7e2c9 100644
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -1117,6 +1117,7 @@ export class Scanner {
+           arkham,
+           crime,
+           wallet,
++          trader.proTraders,
+         );
+         const sendTo = async (c: QualifyingCoin): Promise<void> => {
+           await this.bot.api.sendMessage(c.chatId, message, {
+diff --git a/wrangler.toml b/wrangler.toml
+index 742b243..c2e5cca 100644
+--- a/wrangler.toml
++++ b/wrangler.toml
+@@ -84,6 +84,15 @@ PUSH_WATCH_WINDOW_HOURS = "24"
+ PUSH_WATCH_COOLDOWN_MIN = "30"
+ PUSH_WATCH_HOLDERS_REFRESH_MIN = "30"
+ PUSH_WATCH_MAX_HOLDER_CHECKS = "4"
++# Smart-money absence recheck (聰明錢缺席): ONE delayed Birdeye top-traders
++# probe per pushed coin, proCheckDelayMin after the push (0 = disabled).
++# Fires an alert only when the coin has PUMPED ≥ proGainAlertPct since push
++# yet still shows ZERO smart_trader wallets — the DOTE/BAOJIN shape (rallied
++# on coordinated wallets with no smart money backing). Push-time gating is
++# impossible: even CONK showed 0 pros at push, so this is deliberately a
++# post-push signal. Shares maxHolderChecksPerTick's per-tick cap.
++PUSH_WATCH_PRO_CHECK_MIN = "45"
++PUSH_WATCH_PRO_GAIN_PCT = "30"
+ # Market-cap/liquidity ratio sanity gate: rejects candidates whose market cap
+ # exceeds their pooled liquidity by more than MCAP_LIQ_RATIO_MAX times. A
+ # price running on a sliver of depth is trivially wickable and nearly

@@ -1,0 +1,340 @@
+diff --git a/scripts/test-unit.js b/scripts/test-unit.js
+index c853744..632400e 100644
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -20,6 +20,7 @@ const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
+ const { passesChgGate } = require("../dist/dexscreener.js");
+ const { evaluateWatch, recapVerdict, recapMessage } = require("../dist/pushwatch.js");
+ const { mcapRatioBlockReason, newWalletBlockReason, top10MinBlockReason } = require("../dist/scanner.js");
++const { poolFeeBlockReason, PoolFeesClient } = require("../dist/poolfees.js");
+ const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
+ const { parseTokenOverview } = require("../dist/birdeye.js");
+ const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
+@@ -2864,6 +2865,63 @@ async function main() {
+     assert.equal(top10MinBlockReason(null, 10, 90), null);
+   });
+ 
++  await test("poolFeeBlockReason: wash/stale shapes blocked, real activity passes", () => {
++    // Calibration: JEFFERY at push measured ~0.65% (day $2,062 on $318K)
++    // — comfortably above the 0.05% default line.
++    assert.equal(poolFeeBlockReason(2062, 318000, 0.0005), null);
++    // The wash/stale shape: big mcap, near-zero accrued fees.
++    assert.match(poolFeeBlockReason(3, 200000, 0.0005), /費用趨零/);
++    assert.match(poolFeeBlockReason(0, 150000, 0.0005), /\$0/);
++    // Boundary: exactly at the line passes (strict <), like the band gates.
++    assert.equal(poolFeeBlockReason(25, 50000, 0.0005), null); // exactly 0.05%
++    assert.ok(poolFeeBlockReason(24, 50000, 0.0005));
++    // Missing data (non-Raydium pool / API failure) never judges.
++    assert.equal(poolFeeBlockReason(null, 300000, 0.0005), null);
++    assert.equal(poolFeeBlockReason(NaN, 300000, 0.0005), null);
++    // Zero/negative mcap cannot form a ratio.
++    assert.equal(poolFeeBlockReason(100, 0, 0.0005), null);
++    // Disabled.
++    assert.equal(poolFeeBlockReason(0, 300000, 0), null);
++  });
++
++  await test("PoolFeesClient parses Raydium volumeFee; non-Raydium pools degrade to null", async () => {
++    const cfg = { rugcheckRequestIntervalMs: 0 };
++    const client = new PoolFeesClient(cfg);
++    const originalFetch = globalThis.fetch;
++    try {
++      // Raydium CLMM pool (the JEFFERY main-pool response shape).
++      globalThis.fetch = async () => ({
++        ok: true,
++        json: async () => ({
++          success: true,
++          data: [{ type: "Concentrated", day: { volumeFee: 2062.19 }, week: { volumeFee: 9561.89 } }],
++        }),
++      });
++      const info = await client.fetchPoolFees("PAIRADDR");
++      assert.equal(info.dayUsd.toFixed(2), "2062.19");
++      assert.equal(info.weekUsd.toFixed(2), "9561.89");
++
++      // Non-Raydium pool: success:false / empty data → null (never judges).
++      globalThis.fetch = async () => ({
++        ok: true,
++        json: async () => ({ id: "x", success: false, msg: "query ids value error" }),
++      });
++      assert.equal(await client.fetchPoolFees("METEORAPOOL"), null);
++
++      // HTTP failure → best-effort null.
++      globalThis.fetch = async () => ({ ok: false, status: 503 });
++      assert.equal(await client.fetchPoolFees("ANY"), null);
++
++      // Empty address short-circuits without a fetch.
++      let called = false;
++      globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({}) }; };
++      assert.equal(await client.fetchPoolFees(""), null);
++      assert.equal(called, false);
++    } finally {
++      globalThis.fetch = originalFetch;
++    }
++  });
++
+   // ---------- summary ----------
+ 
+   console.log("\n===== UNIT TESTS =====");
+diff --git a/src/config.ts b/src/config.ts
+index 0e61f0f..5906454 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -417,6 +417,12 @@ export interface AppConfig {
+    * runs on a sliver of liquidity — trivially wickable, nearly un-exitable.
+    * 0 = disabled. See MCAP_LIQ_RATIO_MAX in wrangler.toml. */
+   mcapLiqRatioMax: number;
++  /**
++   * Minimum accumulated-LP-fee/market-cap ratio (POOL_FEE_MCAP_RATIO_MIN).
++   * Pool fees are the hardest proof of real trading activity; a market cap
++   * running on near-zero daily fees is the wash-trading/stale-chart shape.
++   * Missing Raydium data never judges. 0 = disabled. */
++  poolFeeMcapRatioMin: number;
+   /** Crime-wallet blocklist (community list — see CrimeWalletClient). */
+   crimeWallets: CrimeWalletsConfig;
+   /** Pushed-coin wallet analysis (creator profile + holder ages + clustering). */
+@@ -620,6 +626,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+       const v = Number(env.MCAP_LIQ_RATIO_MAX ?? 10);
+       return Number.isFinite(v) && v > 0 ? v : 0;
+     })(),
++    poolFeeMcapRatioMin: (() => {
++      // 0 disables; garbage/negative falls back to disabled rather than NaN.
++      const v = Number(env.POOL_FEE_MCAP_RATIO_MIN ?? 0.0005);
++      return Number.isFinite(v) && v > 0 ? v : 0;
++    })(),
+     crimeWallets: {
+       enabled: (env.CRIME_WALLETS_ENABLED ?? "true") !== "false",
+       url: env.CRIME_WALLETS_URL || DEFAULT_CRIME_WALLETS_URL,
+diff --git a/src/index.ts b/src/index.ts
+index 9ac84b3..864cd99 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -11,6 +11,7 @@ import { JupiterClient, TradeService } from "./jupiter";
+ import { PumpFunClient } from "./pumpfun";
+ import { ArkhamClient } from "./arkham";
+ import { CrimeWalletClient } from "./crimewallets";
++import { PoolFeesClient } from "./poolfees";
+ import { WalletAnalyzer } from "./walletanalysis";
+ 
+ const config = loadConfig();
+@@ -158,6 +159,8 @@ async function main(): Promise<void> {
+         // clustering for pushed coins (null when disabled). Mirrors the
+         // worker.ts wiring (see there).
+         config.walletAnalysis.enabled ? new WalletAnalyzer(config, db, helius) : null,
++        // Accumulated LP fees (Raydium) — fee/mcap quality gate + card line.
++        new PoolFeesClient(config),
+       );
+ 
+       const runScan = async (initial: boolean) => {
+diff --git a/src/render.ts b/src/render.ts
+index 6736ef0..2b61567 100644
+--- a/src/render.ts
++++ b/src/render.ts
+@@ -30,6 +30,8 @@ export function renderMessage(
+     label: string | null;
+     tradersH1: number | null;
+   } | null,
++  /** Raydium accumulated LP fees (null = not a Raydium pool / lookup failed). */
++  poolFeeInfo: { dayUsd: number; weekUsd: number } | null,
+ ): string {
+   const { pair, profile } = coin;
+   const name = pair.baseToken.name || profile.name || "Unknown";
+@@ -133,6 +135,12 @@ export function renderMessage(
+             ? ""
+             : ` | 1h 交易者 ${organic.tradersH1.toLocaleString("en-US")}`
+         }`;
++  // Accumulated LP fees: the hardest proof of real trading volume. Hidden
++  // when the pool is not Raydium (no data) — same stance as the GMGN line.
++  const feeLine =
++    poolFeeInfo === null
++      ? null
++      : `💸 LP 費用: 24h ${fmtUsd(poolFeeInfo.dayUsd)} | 7d ${fmtUsd(poolFeeInfo.weekUsd)}`;
+   const lines = [
+     `🪙 ${name} (${symbol})`,
+     `💵 价格: ${fmtUsd(price)}`,
+@@ -152,6 +160,7 @@ export function renderMessage(
+     ...(holderAnalysisLine ? [holderAnalysisLine] : []),
+     ...(clusterLine ? [clusterLine] : []),
+     `📈 24h 量: ${fmtUsd(pair.volume.h24)}`,
++    ...(feeLine ? [feeLine] : []),
+     `💧 流动性: ${fmtUsd(liquidityUsd)}`,
+     `⏱️ 上线: ${fmtAge(ageMs)}`,
+     `🔑 合约: ${tokenAddress}`,
+diff --git a/src/scanner.ts b/src/scanner.ts
+index 31dccac..f1aec24 100644
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -16,6 +16,7 @@ import type { ArkhamClient, ArkhamTokenHolders } from "./arkham";
+ import type { CrimeWalletClient } from "./crimewallets";
+ import type { JupTokensClient } from "./jupfeeds";
+ import { renderMessage } from "./render";
++import { PoolFeesClient, poolFeeBlockReason, type PoolFeeInfo } from "./poolfees";
+ import { WalletAnalyzer } from "./walletanalysis";
+ import { PushWatcher } from "./pushwatch";
+ 
+@@ -369,6 +370,13 @@ export class Scanner {
+      * truncates the card enrichment, never the push.
+      */
+     private readonly walletAnalyzer: WalletAnalyzer | null = null,
++    /**
++     * Raydium pool-fee client (null = disabled): accumulated LP fees are
++     * the hardest proof of real trading volume; the fee/mcap ratio gates
++     * wash-traded/stale charts and the figures join the card. Best-effort —
++     * a failed lookup degrades to “no verdict + no card line”.
++     */
++    private readonly poolFees: PoolFeesClient | null = null,
+   ) {
+     this.pushWatcher = config.pushWatch.enabled
+       ? new PushWatcher(
+@@ -1183,6 +1191,27 @@ export class Scanner {
+           );
+           continue;
+         }
++        // Accumulated-LP-fee quality gate: a market cap running on
++        // near-zero pool fees is the wash-trading/stale-chart shape. One
++        // Raydium lookup per candidate that cleared every other gate (a
++        // handful per tick — no hot-path budget impact); missing data
++        // never judges.
++        const poolFeeInfo: PoolFeeInfo | null = this.poolFees
++          ? await this.poolFees.fetchPoolFees(coin.pair.pairAddress)
++          : null;
++        const feeReason = poolFeeBlockReason(
++          poolFeeInfo?.dayUsd ?? null,
++          coin.pair.marketCap,
++          this.config.poolFeeMcapRatioMin,
++        );
++        if (feeReason) {
++          diag.fails.other++;
++          this.addReject(diag, coin, feeReason);
++          console.log(
++            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (pool fees near zero)`,
++          );
++          continue;
++        }
+         // Live trade-mode read (once per token): /setmode flips apply to the
+         // very next card. Buy button renders in manual mode; sell buttons in
+         // any non-off mode (in auto the coin was already bought — exits are
+@@ -1204,6 +1233,7 @@ export class Scanner {
+           crime,
+           wallet,
+           organic,
++          poolFeeInfo,
+         );
+         const sendTo = async (c: QualifyingCoin): Promise<void> => {
+           // Atomic claim BEFORE sending: overlapping isolates can both pass
+diff --git a/src/worker.ts b/src/worker.ts
+index 5e1a56e..4e76049 100644
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -6,6 +6,7 @@ import { Db } from "./db";
+ import { DexScreenerClient } from "./dexscreener";
+ import { HeliusClient, type SupplyFlowResult } from "./helius";
+ import { RugcheckClient } from "./rugcheck";
++import { PoolFeesClient } from "./poolfees";
+ import { Scanner } from "./scanner";
+ import { JupiterClient, TradeService } from "./jupiter";
+ import { PumpFunClient } from "./pumpfun";
+@@ -352,6 +353,8 @@ async function ensureInitialized(env: Env): Promise<void> {
+           // Wallet analysis — creator profile + holder ages + cross-coin
+           // clustering for pushed coins (null when disabled).
+           walletAnalyzer ?? undefined,
++          // Accumulated LP fees (Raydium) — fee/mcap quality gate + card line.
++          new PoolFeesClient(config),
+         );
+         scannerReady = true;
+       }
+@@ -1081,6 +1084,76 @@ export default {
+       }
+     }
+ 
++    // Axiom token-info probe — calls the authenticated read-token-info
++    // endpoint with the stored access token and returns the raw token
++    // metrics (creator fee, volumes, holder data). Used to verify Axiom's
++    // fee figures against our own pool-fee estimates. On an auth failure
++    // it retries once through the client's refresh flow.
++    if (url.pathname === "/debug/axiom-token-info") {
++      const mint = (url.searchParams.get("mint") ?? "").trim();
++      if (!mint) {
++        return Response.json({ ok: false, error: "missing ?mint=<address>" });
++      }
++      const fetchInfo = async (
++        accessToken: string,
++      ): Promise<{ status: number; body: string }> => {
++        const res = await fetch(
++          `https://api6.axiom.trade/read-token-info?address=${encodeURIComponent(mint)}`,
++          {
++            headers: {
++              Accept: "application/json",
++              Origin: "https://axiom.trade",
++              Referer: "https://axiom.trade/",
++              Cookie: `auth-access-token=${accessToken}`,
++            },
++            signal: AbortSignal.timeout(12_000),
++          },
++        );
++        return { status: res.status, body: await res.text() };
++      };
++      let accessToken = await db?.getWorkerState("axiom_access_token");
++      if (!accessToken) {
++        return Response.json({
++          ok: false,
++          error: "not logged in — run /debug/axiom-login first",
++        });
++      }
++      try {
++        let out = await fetchInfo(accessToken);
++        if (out.status !== 200 && axiom) {
++          // Access tokens are short-lived JWTs — refresh once and retry.
++          const refreshToken = await db?.getWorkerState("axiom_refresh_token");
++          if (refreshToken) {
++            try {
++              const fresh = await axiom.refreshAccessToken(refreshToken);
++              if (fresh.accessToken) {
++                accessToken = fresh.accessToken;
++                await db?.setWorkerState("axiom_access_token", fresh.accessToken);
++                if (fresh.refreshToken) {
++                  await db?.setWorkerState("axiom_refresh_token", fresh.refreshToken);
++                }
++                out = await fetchInfo(fresh.accessToken);
++              }
++            } catch {
++              // fall through with the original response
++            }
++          }
++        }
++        let parsed: unknown = null;
++        try {
++          parsed = JSON.parse(out.body);
++        } catch {
++          parsed = out.body.slice(0, 300);
++        }
++        return Response.json({ ok: out.status === 200, status: out.status, data: parsed });
++      } catch (err) {
++        return Response.json({
++          ok: false,
++          error: err instanceof Error ? err.message : String(err),
++        });
++      }
++    }
++
+     // GeckoTerminal trending probe — ground truth for the momentum feed:
+     // reports the raw HTTP status + parse count so a persistent geoTrend: 0
+     // is diagnosable as rate-limited (429), changed shape, or empty feed.
+diff --git a/wrangler.toml b/wrangler.toml
+index 4781fa4..f235cbe 100644
+--- a/wrangler.toml
++++ b/wrangler.toml
+@@ -109,6 +109,15 @@ TOP10_PCT_MAX = "90"
+ # then rugged to $2K LP). Default 10 splits the clusters with headroom on
+ # both sides. 0 = disabled.
+ MCAP_LIQ_RATIO_MAX = "10"
++# Accumulated-LP-fee quality gate: rejects candidates whose pool's 24h
++# accrued LP fees (Raydium API, USD) are below POOL_FEE_MCAP_RATIO_MIN of
++# their market cap. Fees are the hardest signal of REAL trading volume — a
++# chart with a big mcap but near-zero fees is stale or wash-traded (the
++# LARRY shape). Calibration: JEFFERY at push measured ~0.65% (day $2,062
++# on $318K); the default 0.0005 = 0.05% asks for roughly $8K+ of daily
++# volume at typical 0.25% fee tiers on a $40K coin. Only Raydium pools
++# resolve — missing data never judges. 0 = disabled.
++POOL_FEE_MCAP_RATIO_MIN = "0.0005"
+ # GeckoTerminal new-pools discovery (free, no key): newest Solana pools
+ # across every DEX incl. pump.fun graduates. Pages × 20 pools per scan
+ # (page size fixed at 20; each page ≈ 1 min of launches). Measured 2026-08-14:

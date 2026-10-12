@@ -1,0 +1,97 @@
+diff --git a/src/poolfees.ts b/src/poolfees.ts
+new file mode 100644
+index 0000000..4e329e0
+--- /dev/null
++++ b/src/poolfees.ts
+@@ -0,0 +1,91 @@
++import type { AppConfig } from "./config";
++
++/**
++ * Accumulated LP-fee enrichment + quality gate (Raydium pools).
++ *
++ * Every swap pays an LP fee that accrues in the pool, so a pool's
++ * accumulated fees are the hardest signal of REAL trading activity:
++ * high fees = genuine volume; "market cap with near-zero fees" = a stale
++ * or wash-traded chart (the LARRY shape: one 5-minute spike, no follow-
++ * through). Raydium's public API v3 exposes the exact figures per pool —
++ * day/week `volumeFee` in USD — for both AMM and CLMM pools.
++ *
++ * Coverage note: only Raydium pools resolve here. Meteora/pump.fun pools
++ * return no data and the gate treats missing data as "never judges"
++ * (same stance as every other enrichment gate).
++ */
++
++const BASE_URL = "https://api-v3.raydium.io";
++const TIMEOUT_MS = 8_000;
++
++export interface PoolFeeInfo {
++  /** Fees accrued in the last 24h, USD. */
++  dayUsd: number;
++  /** Fees accrued in the last 7d, USD (context for young vs old pools). */
++  weekUsd: number;
++}
++
++const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
++
++export class PoolFeesClient {
++  private lastCallAt = 0;
++  constructor(private readonly config: AppConfig) {}
++
++  /**
++   * Accumulated LP fees for one pool address (the DexScreener pairAddress).
++   * Returns null when the pool is not a Raydium pool or the API fails —
++   * callers must treat null as "no verdict", never as "zero fees".
++   */
++  async fetchPoolFees(pairAddress: string): Promise<PoolFeeInfo | null> {
++    if (!pairAddress) return null;
++    const wait = Math.max(
++      0,
++      this.lastCallAt + this.config.rugcheckRequestIntervalMs - Date.now(),
++    );
++    if (wait > 0) await sleep(wait);
++    this.lastCallAt = Date.now();
++    try {
++      const res = await fetch(
++        `${BASE_URL}/pools/info/ids?ids=${encodeURIComponent(pairAddress)}`,
++        { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(TIMEOUT_MS) },
++      );
++      if (!res.ok) return null;
++      const json = (await res.json()) as {
++        success?: boolean;
++        data?: Array<{ day?: { volumeFee?: number }; week?: { volumeFee?: number } }>;
++      };
++      const pool = Array.isArray(json.data) ? json.data[0] : undefined;
++      const dayUsd = Number(pool?.day?.volumeFee);
++      if (!Number.isFinite(dayUsd)) return null; // non-Raydium / unknown pool
++      const weekRaw = Number(pool?.week?.volumeFee);
++      return { dayUsd, weekUsd: Number.isFinite(weekRaw) ? weekRaw : dayUsd };
++    } catch {
++      return null; // best-effort enrichment — degrade to "no verdict"
++    }
++  }
++}
++
++/**
++ * Pure gate: reject candidates whose accumulated LP fees are negligible
++ * relative to their market cap — the wash-trading/stale-chart shape
++ * ("market cap high but fees near zero"). Missing data (null) NEVER
++ * judges; ratioMin <= 0 disables the gate; exactly at the line passes
++ * (strict <), mirroring the other band gates.
++ */
++export function poolFeeBlockReason(
++  dayFeeUsd: number | null,
++  mcapUsd: number,
++  ratioMin: number,
++): string | null {
++  if (ratioMin <= 0) return null;
++  if (dayFeeUsd === null || !Number.isFinite(dayFeeUsd)) return null;
++  if (!(mcapUsd > 0)) return null;
++  const ratio = dayFeeUsd / mcapUsd;
++  if (ratio >= ratioMin) return null;
++  const pct = (ratio * 100).toFixed(3);
++  const minPct = (ratioMin * 100).toFixed(3);
++  return (
++    `LP 費用比過低：24h 費用 $${Math.round(dayFeeUsd).toLocaleString("en-US")}` +
++    ` 僅佔市值 ${pct}% < ${minPct}%（市值高但費用趨零：疑似刷量/僵盤）`
++  );
++}

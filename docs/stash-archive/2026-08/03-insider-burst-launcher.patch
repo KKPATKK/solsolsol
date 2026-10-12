@@ -1,0 +1,544 @@
+diff --git a/scripts/test-unit.js b/scripts/test-unit.js
+index a04ffee..e7179a0 100644
+--- a/scripts/test-unit.js
++++ b/scripts/test-unit.js
+@@ -19,6 +19,8 @@ const { parseNewPools, GeckoTerminalClient } = require("../dist/geckoterminal.js
+ const { parseJupTokens, JupTokensClient } = require("../dist/jupfeeds.js");
+ const { passesChgGate } = require("../dist/dexscreener.js");
+ const { evaluateWatch } = require("../dist/pushwatch.js");
++const { insiderBlockReason, burstLaunchBlockReason } = require("../dist/rugcheck.js");
++const { jupAuditBlockReason } = require("../dist/jupfeeds.js");
+ const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
+ const { parseTokenOverview } = require("../dist/birdeye.js");
+ const { parseAxiomTrending, AxiomClient } = require("../dist/axiom.js");
+@@ -667,6 +669,72 @@ async function main() {
+     assert.equal(passesChgGate(-41.2, -10, 20, 40), false);
+   });
+ 
++  await test("jupAuditBlockReason: top-holders substitute + serial launcher", () => {
++    // Null audit never blocks.
++    assert.equal(jupAuditBlockReason(null, 75, 50), null);
++    // Below both thresholds → pass.
++    assert.equal(
++      jupAuditBlockReason({ topHoldersPercentage: 16.4, devBalancePercentage: 6.9, devMints: 7 }, 75, 50),
++      null,
++    );
++    // Top-holder concentration at threshold → block.
++    assert.match(
++      jupAuditBlockReason({ topHoldersPercentage: 80, devBalancePercentage: null, devMints: null }, 75, 50),
++      /Top持倉/,
++    );
++    // Serial launcher (CONK's dev: 1346 mints) → blocked even with low concentration.
++    assert.match(
++      jupAuditBlockReason({ topHoldersPercentage: 18.7, devBalancePercentage: 2, devMints: 1346 }, 75, 50),
++      /連環發行商/,
++    );
++    // Both over → combined reason; serial-mint knob off (0) disables it.
++    const both = jupAuditBlockReason({ topHoldersPercentage: 90, devBalancePercentage: null, devMints: 1346 }, 75, 0);
++    assert.match(both, /Top持倉/);
++    assert.doesNotMatch(both, /連環發行商/);
++  });
++
++  await test("insiderBlockReason: bundler/top10 thresholds, nulls never block", () => {
++    // Below both thresholds → pass.
++    assert.equal(insiderBlockReason(5, 60, 20, 75), null);
++    // Exactly at threshold → block (≥ semantics).
++    assert.match(insiderBlockReason(20, 60, 20, 75), /捆綁錢包/);
++    assert.match(insiderBlockReason(5, 75, 20, 75), /Top10/);
++    // Both over → one combined reason.
++    const both = insiderBlockReason(30, 80, 20, 75);
++    assert.match(both, /捆綁錢包/);
++    assert.match(both, /Top10/);
++    // Missing report data never blocks.
++    assert.equal(insiderBlockReason(null, null, 20, 75), null);
++    // Threshold 0 disables the check entirely.
++    assert.equal(insiderBlockReason(99, 99, 0, 0), null);
++  });
++
++  await test("burstLaunchBlockReason: token-farm burst detection", () => {
++    // DOTE at push time: dev had launched 2 other tokens minutes earlier
++    // (ages in hours as seen by the gate when the candidate is evaluated).
++    const doteAges = [0.1, 0.15];
++    assert.match(
++      burstLaunchBlockReason(doteAges, 24, 1),
++      /連環發射場/,
++    );
++    // Same launches outside the window → pass.
++    assert.equal(burstLaunchBlockReason([30, 40], 24, 1), null);
++    // Only one sibling in window → ≤ max tolerated → pass.
++    assert.equal(burstLaunchBlockReason([0.5, 40], 24, 1), null);
++    // Exactly at max tolerated → pass (> semantics).
++    assert.equal(burstLaunchBlockReason([2], 24, 1), null);
++    // CONK/organic pattern: no other tokens ever.
++    assert.equal(burstLaunchBlockReason([], 24, 1), null);
++    // Unknown report data never blocks.
++    assert.equal(burstLaunchBlockReason(null, 24, 1), null);
++    // Disabled gate (maxTokens=0) never blocks.
++    assert.equal(burstLaunchBlockReason([0.1, 0.2, 0.3], 24, 0), null);
++    // Window disabled (windowHours=0) never blocks.
++    assert.equal(burstLaunchBlockReason([0.1, 0.2], 0, 1), null);
++    // Negative/garbage ages are ignored.
++    assert.equal(burstLaunchBlockReason([-5, NaN], 24, 1), null);
++  });
++
+   await test("evaluateWatch: rising stages fire once each; cooldown suppresses", () => {
+     const row = (over = {}) => ({
+       token: "T", chatId: "c", symbol: "GOAT", pushedAt: 0,
+diff --git a/src/config.ts b/src/config.ts
+index 2a624ba..1571136 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -360,6 +360,30 @@ export interface AppConfig {
+    * is configured.
+    */
+   gmgnBlockWashTrading: boolean;
++  /**
++   * RugCheck insider-concentration push gates (percent of supply).
++   * A candidate is rejected when the report's bundler share or top-10
++   * holder share reaches these values; 0 disables the respective check.
++   * Null (report not ready) never blocks.
++   */
++  rugcheckBlockBundlerPct: number;
++  rugcheckBlockTop10Pct: number;
++  /**
++   * Burst-launcher gate (RUGCHECK_BURST_WINDOW_HOURS / RUGCHECK_BURST_MAX_TOKENS):
++   * block when the creator launched MORE than rugcheckBurstMaxTokens other
++   * tokens within rugcheckBurstWindowHours of now. Catches pump.fun "token
++   * farm" launches (several mints minutes apart from one dev wallet) while
++   * sparing organic devs. 0 disables.
++   */
++  rugcheckBurstWindowHours: number;
++  rugcheckBurstMaxTokens: number;
++  /**
++   * When the RugCheck report has no data, fall back to the Jupiter audit
++   * (top-holder concentration + serial-launcher dev detection).
++   */
++  rugcheckJupFallback: boolean;
++  /** Serial-launcher threshold: dev's historical mint count ≥ this blocks. */
++  jupBlockSerialMints: number;
+   /**
+    * Axiom Trade trending feed size per scan (AXIOM_TRENDING_LIMIT, default
+    * 20, 0 = discovery feed disabled). Axiom's trending rows carry
+@@ -532,6 +556,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+       ? Math.max(0, Number(env.GMGN_REQUEST_INTERVAL_MS ?? 600))
+       : 600,
+     gmgnBlockWashTrading: (env.GMGN_BLOCK_WASH_TRADING ?? "true") !== "false",
++    rugcheckBlockBundlerPct: Number(env.RUGCHECK_BLOCK_BUNDLER_PCT ?? "20"),
++    rugcheckBlockTop10Pct: Number(env.RUGCHECK_BLOCK_TOP10_PCT ?? "75"),
++    rugcheckBurstWindowHours: Number(env.RUGCHECK_BURST_WINDOW_HOURS ?? "24"),
++    rugcheckBurstMaxTokens: Number(env.RUGCHECK_BURST_MAX_TOKENS ?? "1"),
++    rugcheckJupFallback: (env.RUGCHECK_JUP_FALLBACK ?? "true") !== "false",
++    jupBlockSerialMints: Number(env.JUP_BLOCK_SERIAL_MINTS ?? "50"),
+     axiomEmail: env.AXIOM_EMAIL || undefined,
+     axiomPassword: env.AXIOM_PASSWORD || undefined,
+     axiomTrendingLimit: Number.isFinite(Number(env.AXIOM_TRENDING_LIMIT ?? 20))
+diff --git a/src/jupfeeds.ts b/src/jupfeeds.ts
+index 962d5ea..1ffc289 100644
+--- a/src/jupfeeds.ts
++++ b/src/jupfeeds.ts
+@@ -49,6 +49,50 @@ interface JupStats {
+   sellVolume?: unknown;
+ }
+ 
++/** Jupiter `audit` block — holder/dev concentration signals (no bundler%). */
++export interface JupAudit {
++  topHoldersPercentage: number | null;
++  devBalancePercentage: number | null;
++  devMints: number | null;
++}
++
++function auditNum(v: unknown): number | null {
++  if (v === undefined || v === null) return null;
++  const n = Number(v);
++  return Number.isFinite(n) ? n : null;
++}
++
++/**
++ * Pure fallback gate used ONLY when the RugCheck report has no data:
++ * blocks on top-holder concentration (Jupiter's topHoldersPercentage as
++ * the top10 substitute) and on serial-launcher devs whose mint count
++ * reaches the threshold (a dev with hundreds of launches is a factory).
++ * Null audit never blocks.
++ */
++export function jupAuditBlockReason(
++  audit: JupAudit | null,
++  maxTop10Pct: number,
++  maxDevMints: number,
++): string | null {
++  if (!audit) return null;
++  const parts: string[] = [];
++  if (
++    maxTop10Pct > 0 &&
++    audit.topHoldersPercentage !== null &&
++    audit.topHoldersPercentage >= maxTop10Pct
++  )
++    parts.push(
++      `Top持倉 ${audit.topHoldersPercentage.toFixed(1)}% ≥ ${maxTop10Pct}%`,
++    );
++  if (
++    maxDevMints > 0 &&
++    audit.devMints !== null &&
++    audit.devMints >= maxDevMints
++  )
++    parts.push(`連環發行商（歷史 ${audit.devMints} 個幣）`);
++  return parts.length > 0 ? parts.join("；") : null;
++}
++
+ /** Valid base58 Solana mint (32–44 chars, no 0/O/I/l). */
+ const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+ 
+@@ -151,6 +195,8 @@ export class JupTokensClient {
+   private readonly throttle: Throttle;
+   /** Timestamp until which all calls are skipped (after a 429). */
+   private rateLimitedUntil = 0;
++  /** Audit blocks by mint (see fetchAudit); cleared when oversized. */
++  private readonly auditCache = new Map<string, JupAudit | null>();
+ 
+   constructor(
+     config: AppConfig,
+@@ -228,4 +274,37 @@ export class JupTokensClient {
+     }
+     return out;
+   }
++
++  /**
++   * Audit block for ONE mint (the insider-gate fallback when RugCheck has
++   * no data). Cached in-memory — a candidate re-checked on later ticks
++   * costs no extra call.
++   */
++  async fetchAudit(mint: string): Promise<JupAudit | null> {
++    if (!MINT_RE.test(mint)) return null;
++    const cached = this.auditCache.get(mint);
++    if (cached !== undefined) return cached;
++    let audit: JupAudit | null = null;
++    try {
++      const data = (await this.get(`/search?query=${mint}`)) as Array<
++        Record<string, unknown>
++      > | null;
++      const entry = Array.isArray(data)
++        ? data.find((t) => t && (t as { id?: unknown }).id === mint)
++        : undefined;
++      if (entry) {
++        const a = entry.audit as Record<string, unknown> | undefined;
++        audit = {
++          topHoldersPercentage: auditNum(a?.topHoldersPercentage),
++          devBalancePercentage: auditNum(a?.devBalancePercentage),
++          devMints: auditNum(a?.devMints),
++        };
++      }
++    } catch {
++      audit = null;
++    }
++    if (this.auditCache.size > 2_000) this.auditCache.clear();
++    this.auditCache.set(mint, audit);
++    return audit;
++  }
+ }
+diff --git a/src/rugcheck.ts b/src/rugcheck.ts
+index 9b67fcd..b61df95 100644
+--- a/src/rugcheck.ts
++++ b/src/rugcheck.ts
+@@ -17,6 +17,65 @@ class Throttle {
+   }
+ }
+ 
++/**
++ * Pure insider-concentration gate (exported for offline unit tests).
++ * Returns a reject reason when the RugCheck report shows bundled-wallet
++ * buying or top-10 concentration above the configured thresholds, null
++ * when the coin passes or the report has no data yet (nulls never block —
++ * same stance as the card: 未檢測 ≠ 有罪).
++ */
++export function insiderBlockReason(
++  bundlerPct: number | null,
++  top10Pct: number | null,
++  maxBundlerPct: number,
++  maxTop10Pct: number,
++): string | null {
++  const parts: string[] = [];
++  if (
++    maxBundlerPct > 0 &&
++    bundlerPct !== null &&
++    bundlerPct >= maxBundlerPct
++  )
++    parts.push(`捆綁錢包買入 ${bundlerPct.toFixed(1)}% ≥ ${maxBundlerPct}%`);
++  if (maxTop10Pct > 0 && top10Pct !== null && top10Pct >= maxTop10Pct)
++    parts.push(`Top10 持倉 ${top10Pct.toFixed(1)}% ≥ ${maxTop10Pct}%`);
++  return parts.length > 0 ? parts.join("；") : null;
++}
++
++/**
++ * Pure burst-launcher gate (exported for offline unit tests).
++ *
++ * Catches the "token farm" launch pattern: the same dev wallet mints several
++ * tokens around the same time (e.g. DOTE: dev launched 2 other pump.fun
++ * tokens within 10 minutes of the pushed one). Organic devs essentially
++ * never do this; serial-launcher farms always do.
++ *
++ * @param otherTokenAgeHours ages (hours ago) of the creator's OTHER known
++ *   token launches, or null when unknown (never blocks on unknown).
++ * @param windowHours how far back a launch counts as "recent".
++ * @param maxOtherTokens maximum tolerated recent launches (block when the
++ *   count EXCEEDS this, i.e. >= maxOtherTokens + 1). 0 disables the gate.
++ */
++export function burstLaunchBlockReason(
++  otherTokenAgeHours: number[] | null,
++  windowHours: number,
++  maxOtherTokens: number,
++): string | null {
++  if (
++    maxOtherTokens <= 0 ||
++    windowHours <= 0 ||
++    !Array.isArray(otherTokenAgeHours)
++  )
++    return null;
++  const recent = otherTokenAgeHours.filter(
++    (h) => Number.isFinite(h) && h >= 0 && h <= windowHours,
++  ).length;
++  if (recent > maxOtherTokens) {
++    return `連環發射場：dev 於 ${windowHours}h 內另發射了 ${recent} 枚幣（> ${maxOtherTokens}）`;
++  }
++  return null;
++}
++
+ export interface RugcheckReport {
+   /** Share of total supply held by insider/bundler networks, in percent. */
+   bundlerPct: number | null;
+@@ -27,6 +86,12 @@ export interface RugcheckReport {
+   top10HolderPct: number | null;
+   /** Deployer/creator wallet of the token (report root `creator`). */
+   creator: string | null;
++  /**
++   * Ages in hours of the creator's OTHER token launches (report root
++   * `creatorTokens[].createdAt`), newest first. Null when the report has no
++   * creator-token list.
++   */
++  otherTokenAgeHours: number[] | null;
+ }
+ 
+ interface InsiderNetwork {
+@@ -39,6 +104,10 @@ interface TopHolder {
+   pct?: number;
+ }
+ 
++interface CreatorToken {
++  createdAt?: string;
++}
++
+ /**
+  * RugCheck token report (public API, no key required).
+  *
+@@ -96,6 +165,7 @@ export class RugcheckClient {
+       token?: { supply?: number };
+       insiderNetworks?: InsiderNetwork[];
+       topHolders?: TopHolder[];
++      creatorTokens?: CreatorToken[];
+     } | null;
+ 
+     // Bundler/insider share of supply.
+@@ -136,6 +206,20 @@ export class RugcheckClient {
+         ? creatorRaw.trim()
+         : null;
+ 
+-    return { bundlerPct, top10HolderPct, creator };
++    // Ages of the creator's other token launches — feeds the burst-launcher
++    // gate (several mints in a short window = token farm).
++    const creatorTokens = data?.creatorTokens;
++    let otherTokenAgeHours: number[] | null = null;
++    if (Array.isArray(creatorTokens)) {
++      const now = Date.now();
++      const ages: number[] = [];
++      for (const t of creatorTokens) {
++        const ms = t?.createdAt ? Date.parse(t.createdAt) : NaN;
++        if (Number.isFinite(ms)) ages.push((now - ms) / 3_600_000);
++      }
++      otherTokenAgeHours = ages;
++    }
++
++    return { bundlerPct, top10HolderPct, creator, otherTokenAgeHours };
+   }
+ }
+diff --git a/src/scanner.ts b/src/scanner.ts
+index ed40e14..206646c 100644
+--- a/src/scanner.ts
++++ b/src/scanner.ts
+@@ -7,6 +7,8 @@ import { DexScreenerClient, passesChgGate, type PairInfo, type TokenProfile } fr
+ import { fmtUsd } from "./format";
+ import type { HeliusClient, SupplyFlowResult } from "./helius";
+ import type { RugcheckClient } from "./rugcheck";
++import { insiderBlockReason, burstLaunchBlockReason } from "./rugcheck";
++import { jupAuditBlockReason } from "./jupfeeds";
+ import type { TradeService } from "./jupiter";
+ import type { PumpFunClient } from "./pumpfun";
+ import type { GeckoTerminalClient } from "./geckoterminal";
+@@ -218,6 +220,8 @@ export class Scanner {
+   private readonly rugcheckFetchedAt = new Map<string, number>();
+   /** Creator wallet learned from RugCheck reports (static per token). */
+   private readonly rugcheckCreator = new Map<string, string>();
++  /** Ages (hours) of the creator's other launches, for the burst gate. */
++  private readonly rugcheckBurstAges = new Map<string, number[]>();
+   /**
+    * When Helius/Birdeye last returned empty/failed for a token, so we can
+    * skip re-querying it for a while (in-memory negative cache).
+@@ -984,10 +988,70 @@ export class Scanner {
+           );
+           continue;
+         }
+-        // Bundler + top-10 holder share is resolved for the message card but
+-        // no longer filters — those filters were removed, so coins push even
+-        // when the RugCheck report is not ready yet (the card shows 未检测).
++        // Bundler + top-10 holder share: resolved per candidate and now
++        // ALSO gates the push — bundled/insider-heavy distributions (the
++        // "all related wallets" pattern seen on Axiom) are exactly what
++        // these two numbers capture. Null (report not ready) never blocks.
+         const rugcheck = await this.resolveRugcheckData(coin);
++        const insiderReason = insiderBlockReason(
++          rugcheck.bundlerPct,
++          rugcheck.top10Pct,
++          this.config.rugcheckBlockBundlerPct,
++          this.config.rugcheckBlockTop10Pct,
++        );
++        if (insiderReason) {
++          diag.fails.other++;
++          this.addReject(diag, coin, `内部人集中：${insiderReason}`);
++          console.log(
++            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (insider concentration)`,
++          );
++          continue;
++        }
++        // Burst-launcher gate: the dev wallet minted several OTHER tokens
++        // within a short window (the pump.fun "token farm" pattern — e.g.
++        // a dev launching 3 tokens within 10 minutes). Independent of the
++        // concentration checks; unknown ages never block.
++        const burstReason = burstLaunchBlockReason(
++          rugcheck.otherTokenAgeHours,
++          this.config.rugcheckBurstWindowHours,
++          this.config.rugcheckBurstMaxTokens,
++        );
++        if (burstReason) {
++          diag.fails.other++;
++          this.addReject(diag, coin, `發射場：${burstReason}`);
++          console.log(
++            `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (burst launcher)`,
++          );
++          continue;
++        }
++        // Second line: RugCheck had NO data → fall back to the Jupiter
++        // audit (top-holder concentration + serial-launcher dev count).
++        if (
++          !insiderReason &&
++          rugcheck.bundlerPct === null &&
++          rugcheck.top10Pct === null &&
++          this.config.rugcheckJupFallback &&
++          this.jupiter
++        ) {
++          try {
++            const audit = await this.jupiter.fetchAudit(coin.stats.token);
++            const jupReason = jupAuditBlockReason(
++              audit,
++              this.config.rugcheckBlockTop10Pct,
++              this.config.jupBlockSerialMints,
++            );
++            if (jupReason) {
++              diag.fails.other++;
++              this.addReject(diag, coin, `内部人集中(Jupiter)：${jupReason}`);
++              console.log(
++                `[scanner] blocked ${coin.profile.symbol ?? coin.pair.baseToken.symbol} (jup audit fallback)`,
++              );
++              continue;
++            }
++          } catch {
++            /* best-effort — never block the scan */
++          }
++        }
+         // Crime-wallet check: the coin's creator (RugCheck) and top holder
+         // owner wallets are matched against the community blocklist. A hit
+         // is a warning (flagged on the card) unless CRIME_WALLETS_BLOCK
+@@ -1315,11 +1379,12 @@ export class Scanner {
+    * removed; Birdeye is also deliberately NOT consulted (its OHLCV endpoint
+    * was the main free-tier budget burner).
+    */
+-  /** Bundler + top-10 holder share + creator: cached → single RugCheck fetch → unknown. */
++  /** Bundler + top-10 holder share + creator + dev-launch ages: cached → single RugCheck fetch → unknown. */
+   private async resolveRugcheckData(coin: QualifyingCoin): Promise<{
+     bundlerPct: number | null;
+     top10Pct: number | null;
+     creator: string | null;
++    otherTokenAgeHours: number[] | null;
+   }> {
+     const { stats } = coin;
+     // Use the cache only while it is fresh. RugCheck keeps refining reports
+@@ -1336,6 +1401,8 @@ export class Scanner {
+         bundlerPct: stats.rugcheckBundlerPct,
+         top10Pct: stats.rugcheckTop10Pct,
+         creator: knownCreator,
++        otherTokenAgeHours:
++          this.rugcheckBurstAges.get(stats.token) ?? null,
+       };
+     }
+     if (this.rugcheck) {
+@@ -1346,6 +1413,8 @@ export class Scanner {
+         );
+         this.rugcheckFetchedAt.set(stats.token, Date.now());
+         if (report.creator) this.rugcheckCreator.set(stats.token, report.creator);
++        if (report.otherTokenAgeHours)
++          this.rugcheckBurstAges.set(stats.token, report.otherTokenAgeHours);
+         await this.db.updateTokenRugcheckData(
+           stats.token,
+           report.bundlerPct,
+@@ -1357,6 +1426,7 @@ export class Scanner {
+           bundlerPct: report.bundlerPct,
+           top10Pct: report.top10HolderPct,
+           creator: report.creator ?? knownCreator,
++          otherTokenAgeHours: report.otherTokenAgeHours,
+         };
+       } catch (err) {
+         console.error(
+@@ -1372,9 +1442,15 @@ export class Scanner {
+         bundlerPct: stats.rugcheckBundlerPct,
+         top10Pct: stats.rugcheckTop10Pct,
+         creator: knownCreator,
++        otherTokenAgeHours: this.rugcheckBurstAges.get(stats.token) ?? null,
+       };
+     }
+-    return { bundlerPct: null, top10Pct: null, creator: knownCreator };
++    return {
++      bundlerPct: null,
++      top10Pct: null,
++      creator: knownCreator,
++      otherTokenAgeHours: this.rugcheckBurstAges.get(stats.token) ?? null,
++    };
+   }
+ 
+   /**
+diff --git a/wrangler.toml b/wrangler.toml
+index a3dc6e4..8212990 100644
+--- a/wrangler.toml
++++ b/wrangler.toml
+@@ -171,6 +171,26 @@ WALLET_ANALYSIS_NEW_AGE_HOURS = "24"
+ WALLET_ANALYSIS_CLUSTER_MIN_COINS = "2"
+ WALLET_ANALYSIS_CLUSTER_WINDOW_DAYS = "14"
+ RUGCHECK_REQUEST_INTERVAL_MS = "800"
++# Insider-concentration push gates (percent of supply, from the RugCheck
++# report fetched per candidate). A coin whose bundler-wallet share or
++# top-10 holder share reaches these values is rejected before push —
++# blocks the "all top holders are related wallets" pattern. 0 = check off;
++# a missing report never blocks.
++RUGCHECK_BLOCK_BUNDLER_PCT = "20"
++RUGCHECK_BLOCK_TOP10_PCT = "75"
++# Burst-launcher (token-farm) gate: block a candidate when its dev wallet
++# launched MORE than RUGCHECK_BURST_MAX_TOKENS other tokens within the last
++# RUGCHECK_BURST_WINDOW_HOURS. Catches pump.fun farms that mint several
++# tokens minutes apart from one wallet (e.g. 3 launches in 10 minutes);
++# organic devs with 0-1 recent launches pass. 0 = off.
++RUGCHECK_BURST_WINDOW_HOURS = "24"
++RUGCHECK_BURST_MAX_TOKENS = "1"
++# When RugCheck has no data for a candidate, fall back to the Jupiter
++# audit: topHoldersPercentage is checked against RUGCHECK_BLOCK_TOP10_PCT,
++# and serial-launcher devs (historical mint count >= JUP_BLOCK_SERIAL_MINTS,
++# 0 = off) are blocked too.
++RUGCHECK_JUP_FALLBACK = "true"
++JUP_BLOCK_SERIAL_MINTS = "50"
+ HELIUS_REQUEST_INTERVAL_MS = "300"
+ # Periodic Birdeye new_listing backfill (safety net for discovery gaps):
+ # every BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back
