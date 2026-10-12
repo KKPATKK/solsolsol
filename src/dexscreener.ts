@@ -333,6 +333,51 @@ export const BOOST_FEED_SELF_BUDGET_MS = 480;
 export const BOOST_FEED_ATTEMPT_MS = 480;
 
 /**
+ * The boosts lane's OWN 429 pause, and the ladder it climbs (2026-10-12).
+ *
+ * WHY THE LANE NEEDS ONE (live 2026-10-12): the boosts cadence gate
+ * (Db.DEX_BOOSTS_AT_KEY, DEXSCREENER_BOOSTS_INTERVAL_SECONDS = 300) is stamped
+ * at DISPATCH, so ONE refusal from the shared egress IP's bucket — the origin
+ * answers 429 with Cloudflare's `error code: 1015` body whenever the edge
+ * cache is cold — burned the whole five-minute window for a request that was
+ * never even served. Every other lane already had a reaction: the batch lane
+ * has its 90s cache-only block and the adaptive spacing, and the profiles list
+ * has its reuse/make-up lanes. The boosts list is the one leg whose answer is
+ * a bare [] with no fallback, so the scanner re-arms its gate to this pause's
+ * end (see Scanner.rearmBoostsDiscovery).
+ *
+ * WHY 60s, AND WHY IT STILL DECAYS. A refused list answers in ~350ms and a
+ * budgeted caller never retries inside the call, so the retry's whole cost is
+ * one request. The base is sized to cost one TICK of discovery instead of
+ * five; the doubling ladder is what keeps a genuine wall from becoming a
+ * request a minute forever (60 → 120 → 240 → … up to the ceiling) — the same
+ * shape GECKO_KEYED_429_BACKOFF_MS uses, for the same reason. A served 2xx
+ * (an edge-cache HIT included: the endpoint did serve) resets the streak.
+ *
+ * NO JITTER, deliberately (unlike the gecko ladder): that jitter spreads a
+ * FLEET of callers re-probing one host, while this pause only decides what
+ * ONE durable gate row is re-armed to — a spread number would just make the
+ * retry aim harder to predict.
+ */
+export const BOOSTS_429_BACKOFF_MS = 60_000;
+/** Ceiling the doubling stops at (1 h) — mirrored from GECKO_BACKOFF_MAX_MS. */
+export const BOOSTS_BACKOFF_MAX_MS = 60 * 60_000;
+
+/**
+ * How long the boosts lane pauses after `consecutive429` refusals (pure —
+ * unit-tested). The first refusal is the base; every further one in the same
+ * streak doubles it, capped at the ceiling. Floored at 1 so a zero/negative
+ * streak can only ever read as the first refusal, never as a shorter window.
+ */
+export function boostsBackoffMs(consecutive429: number): number {
+  const step = Math.max(1, Math.floor(consecutive429));
+  const doubled = BOOSTS_429_BACKOFF_MS * 2 ** Math.min(step - 1, 8);
+  return Math.round(
+    Math.min(BOOSTS_BACKOFF_MAX_MS, Math.max(BOOSTS_429_BACKOFF_MS, doubled)),
+  );
+}
+
+/**
  * Edge-cache TTL for the two LIST feeds (`/token-profiles/latest/v1`,
  * `/token-boosts/latest/v1`) — the requests that go through `cf` below.
  *
@@ -1543,6 +1588,20 @@ export class DexScreenerClient {
    * the batch lane's reaction, the ring is every lane's record.
    */
   private last429RecordedAt = 0;
+  /**
+   * Until this epoch the BOOSTS lane was refused (see BOOSTS_429_BACKOFF_MS).
+   * Its own pause, separate from the batch block: a LIST refusal must never
+   * gate the pair lane (see note429), and 90s of batch silence is not what a
+   * boosts retry should aim at. Read by Scanner.rearmBoostsDiscovery through
+   * boostsPauseEndsAt, which is a DECISION — deliberately not routed through
+   * getStats() alone (the same pauseEndsAt/stats split the gecko client keeps).
+   */
+  private boostsBlockedUntil = 0;
+  /**
+   * Consecutive boosts refusals — the ladder's input (see boostsBackoffMs).
+   * Reset by a served response, HIT included: the endpoint did serve.
+   */
+  private boostsConsecutive429 = 0;
   /** 429 responses seen by this isolate (incl. retry attempts). */
   private http429Total = 0;
   /** Epoch of the most recent 429 response, or null if never. */
@@ -1752,6 +1811,19 @@ export class DexScreenerClient {
     dropsByLeg: Record<DexFeedLeg, number>;
     /** The leg of the most recent drop, or null while none dropped. */
     lastDropLeg: DexFeedLeg | null;
+    /**
+     * The BOOSTS lane's own 429 pause, ms remaining (0 = open). The reading
+     * the scanner's re-arm is aimed through: `> 0` is why a due boosts tick
+     * gets a retry a minute later instead of a full five-minute window (see
+     * BOOSTS_429_BACKOFF_MS / Scanner.rearmBoostsDiscovery). Separate from
+     * `blockedForMs` on purpose — that one is the PAIR lane's 90s block, and
+     * neither a list refusal may arm it nor it a boosts pause (the 2026-10-01
+     * lane split, kept in both directions).
+     */
+    boostsBlockedForMs: number;
+    /** Consecutive boosts refusals — the ladder's input (0 after a serve, or
+     * when no boosts fetch has been refused in this isolate). */
+    boostsConsecutive429: number;
   } {
     return {
       intervalMs: this.spacing.currentMs,
@@ -1775,6 +1847,8 @@ export class DexScreenerClient {
       lastDroppedAt: this.lastDroppedAt,
       dropsByLeg: { ...this.dropsByLeg },
       lastDropLeg: this.lastDropLeg,
+      boostsBlockedForMs: Math.max(0, this.boostsBlockedUntil - Date.now()),
+      boostsConsecutive429: this.boostsConsecutive429,
     };
   }
 
@@ -1918,6 +1992,39 @@ export class DexScreenerClient {
     } catch {
       // telemetry only — never fail a request over a counter write
     }
+  }
+
+  /**
+   * Epoch the BOOSTS lane's own 429 pause ends at, or 0 when it is not
+   * paused.
+   *
+   * A DECISION, not telemetry (the same split the gecko client keeps between
+   * pauseEndsAt and stats()): Scanner.rearmBoostsDiscovery reads this to
+   * re-arm the durable gate to the moment the lane can answer again, so a
+   * refusal costs one tick instead of the whole cadence window. Both answer
+   * from the same `boostsBlockedUntil`, so they can never disagree about
+   * whether the lane is paused.
+   */
+  boostsPauseEndsAt(now = Date.now()): number {
+    return now < this.boostsBlockedUntil ? this.boostsBlockedUntil : 0;
+  }
+
+  /**
+   * Arm the boosts lane's pause (see BOOSTS_429_BACKOFF_MS). Called from
+   * getJson's 429 branch for this LANE alone — deliberately not from note429,
+   * which every lane shares: a profiles refusal must not pause boosts, and a
+   * boosts refusal must not move the batch lane's block or the spacing (the
+   * mirror image of the 2026-10-01 coupling the LIST/BATCH split removed).
+   */
+  private noteBoostsRefused(): void {
+    this.boostsConsecutive429 += 1;
+    const window = boostsBackoffMs(this.boostsConsecutive429);
+    this.boostsBlockedUntil = Date.now() + window;
+    console.warn(
+      `[dex] boosts 429 #${this.boostsConsecutive429} — pausing the lane ${Math.round(
+        window / 1000,
+      )}s (its gate will be re-armed to the end of it)`,
+    );
   }
 
   /**
@@ -2066,7 +2173,8 @@ export class DexScreenerClient {
         // the 429 handler below charges the refusal to that same lane (see
         // note429), which is why the answer is computed before the
         // edge-cache branch rather than inside it.
-        const pairLane = dexFeedLeg(path) === "pairs";
+        const lane = dexFeedLeg(path);
+        const pairLane = lane === "pairs";
         if (edgeCacheTtlS !== undefined) {
           if (res.ok) {
             // ONE place counts a list outcome and one place decides what a hit
@@ -2091,7 +2199,14 @@ export class DexScreenerClient {
             else noteListCacheRefused(res.status);
           }
         }
-        if (res.status === 429) this.note429(pairLane);
+        if (res.status === 429) {
+          this.note429(pairLane);
+          // The boosts lane arms its OWN pause here (see noteBoostsRefused):
+          // the scanner re-arms the durable gate to it, so one refusal costs a
+          // tick instead of the whole five-minute window. Deliberately outside
+          // note429, which every lane shares.
+          if (lane === "boosts") this.noteBoostsRefused();
+        }
         if (res.status === 429 || res.status >= 500) {
           throw new Error(`DexScreener HTTP ${res.status}`);
         }
@@ -2104,6 +2219,17 @@ export class DexScreenerClient {
         // SERVED the body, none of them changes when the body was generated.
         if (pairContentAt) {
           pairContentAt.at = DexScreenerClient.responseContentAt(res, Date.now());
+        }
+        // A served boosts response — an edge-cache HIT included, because the
+        // endpoint DID serve — ends the refusal streak (see
+        // BOOSTS_429_BACKOFF_MS) and reopens the lane for the next refusal's
+        // base window.
+        if (lane === "boosts" && this.boostsConsecutive429 > 0) {
+          console.log(
+            `[dex] boosts feed recovered after ${this.boostsConsecutive429} consecutive 429(s)`,
+          );
+          this.boostsConsecutive429 = 0;
+          this.boostsBlockedUntil = 0;
         }
         // A 2xx is the ONLY reading that relaxes the spacing (see
         // AdaptiveSpacing): a 404 for a delisted token is "not refused", not

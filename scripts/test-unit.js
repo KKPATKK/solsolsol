@@ -19,7 +19,7 @@ const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dis
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS } = require("../dist/jupfeeds.js");
-const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS } = require("../dist/dexscreener.js");
+const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS, BOOSTS_429_BACKOFF_MS, BOOSTS_BACKOFF_MAX_MS, boostsBackoffMs } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, TRACKER_PAIRS_HARD_CAP_MS, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse, trackerLaneStatus, TRACKER_LANE_STALE_MS, runningPassStamp } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
 const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS, CARRIED_ATTEMPT_SIGS } = require("../dist/pushwatch.js");
@@ -3626,6 +3626,52 @@ async function main() {
     assert.equal(geckoDiscoveryRetryStamp(now + 1_000, Number.NaN, I), null);
   });
 
+  await test("boostsDiscoveryRetryStamp: a refusal is charged the lane's pause, never more than the interval", () => {
+    const { boostsDiscoveryDue, boostsDiscoveryRetryStamp } = require("../dist/scanner.js");
+    const now = Date.UTC(2026, 9, 12, 6, 0, 0);
+    const MIN = 60_000;
+    const I = 5 * MIN; // DEXSCREENER_BOOSTS_INTERVAL_SECONDS = 300
+    // The whole gain: the lane's 60s pause ends in a minute, so the retry lands
+    // on the next tick instead of five minutes later.
+    const refused = boostsDiscoveryRetryStamp(now + 60_000, now, I);
+    assert.equal(refused, now + 60_000 - I, "the stamp is expressed against the interval");
+    assert.equal(
+      boostsDiscoveryDue(refused, now + 59_000, I),
+      false,
+      "not due before the pause is over — the retry must not land inside it",
+    );
+    assert.equal(
+      boostsDiscoveryDue(refused, now + 60_000, I),
+      true,
+      "due exactly at the pause end, which is the tick that can actually answer",
+    );
+    // THE CLAMP: a pause at or past the interval re-arms the ordinary gate, so
+    // the widened ladder (60 → 120 → 240 → …) decays back to the five-minute
+    // cadence instead of a request a minute forever.
+    assert.equal(boostsDiscoveryRetryStamp(now + 3_600_000, now, I), now);
+    assert.equal(boostsDiscoveryDue(now, now + I - 1, I), false);
+    assert.equal(boostsDiscoveryDue(now, now + I, I), true);
+    // Not paused, or a reading it cannot trust -> the dispatch stamp stands.
+    // (An empty 200 list and a budget drop arm no pause, so they keep the
+    // interval; the client's own pause is what tells a refusal apart.)
+    assert.equal(boostsDiscoveryRetryStamp(0, now, I), null, "not paused");
+    assert.equal(boostsDiscoveryRetryStamp(now, now, I), null, "the pause is already over");
+    assert.equal(boostsDiscoveryRetryStamp(now + 1_000, now, 0), null, "no gate configured");
+    assert.equal(boostsDiscoveryRetryStamp(Number.NaN, now, I), null);
+    assert.equal(boostsDiscoveryRetryStamp(now + 1_000, Number.NaN, I), null);
+  });
+
+  await test("boostsBackoffMs: the first refusal is the 60s base, the ladder doubles to the 1h ceiling", () => {
+    assert.equal(BOOSTS_429_BACKOFF_MS, 60_000, "the base is one minute — a tick, not a window");
+    assert.equal(boostsBackoffMs(1), 60_000, "first refusal: the base");
+    assert.equal(boostsBackoffMs(2), 120_000);
+    assert.equal(boostsBackoffMs(3), 240_000);
+    assert.equal(boostsBackoffMs(0), 60_000, "a zero streak still reads as the first refusal");
+    assert.equal(boostsBackoffMs(1.9), 60_000, "floor, never a shorter window");
+    assert.equal(boostsBackoffMs(99), BOOSTS_BACKOFF_MAX_MS, "capped at the ceiling");
+    assert.equal(BOOSTS_BACKOFF_MAX_MS, 60 * 60_000);
+  });
+
   await test("B1 wiring: the refusal re-arms the gate, and only the keyed base moves", () => {
     const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
     const flat = (p) => read(p).replace(/\s+/g, "");
@@ -4873,6 +4919,92 @@ async function main() {
         1,
         "the ring's gap debounces the RECORD, never the reaction",
       );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("DexScreenerClient: a BOOSTS 429 arms the lane's own short pause, and only a serve clears it", async () => {
+    // 2026-10-12: the boosts cadence gate is stamped at DISPATCH, so one
+    // refusal from the shared egress bucket (live shape: HTTP 429, body
+    // `error code: 1015`) used to burn the whole five-minute window. The
+    // client now keeps the lane's own pause and the scanner re-arms the
+    // durable gate to it (see boostsPauseEndsAt /
+    // Scanner.rearmBoostsDiscovery) — so the pause must belong to THIS lane
+    // alone: a profiles refusal must not pause boosts, and a boosts refusal
+    // must not move the pair block or the dispatch spacing.
+    const origFetch = globalThis.fetch;
+    let mode = "boosts429";
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("/token-boosts/")) {
+        if (mode === "boosts429")
+          return new Response("error code: 1015", {
+            status: 429,
+            headers: { "cf-cache-status": "BYPASS" },
+          });
+        return new Response(JSON.stringify([{ chainId: "solana", tokenAddress: "SOLB" }]), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "cf-cache-status": "HIT" },
+        });
+      }
+      if (u.includes("/token-profiles/")) {
+        if (mode === "profiles429") return new Response("rate limited", { status: 429 });
+        return new Response(JSON.stringify([{ chainId: "solana", tokenAddress: "SOLP" }]), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "cf-cache-status": "MISS" },
+        });
+      }
+      return new Response(JSON.stringify({ pairs: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    try {
+      const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" });
+      const dex = new DexScreenerClient(cfg);
+      assert.equal(dex.boostsPauseEndsAt(Date.now()), 0, "starts unpaused");
+
+      // (a) A refusal arms exactly the lane's own pause, at the 60s base.
+      assert.deepEqual(await dex.fetchBoostedTokens(30), [], "a refused boosts fetch is []");
+      const first = dex.getStats();
+      assert.ok(
+        first.boostsBlockedForMs > 0 && first.boostsBlockedForMs <= 60_000 + 100,
+        `the first refusal pauses at the 60s base (got ${first.boostsBlockedForMs}ms)`,
+      );
+      assert.equal(first.boostsConsecutive429, 1);
+      assert.ok(dex.boostsPauseEndsAt(Date.now()) > 0, "and it is readable as a decision");
+      assert.equal(first.blockedForMs, 0, "the pair lane's block must stay out of it");
+      assert.equal(first.spacingSteps, 0, "and so must the dispatch spacing");
+
+      // (b) The ladder doubles per consecutive refusal.
+      await dex.fetchBoostedTokens(30);
+      const second = dex.getStats();
+      assert.equal(second.boostsConsecutive429, 2);
+      assert.ok(
+        second.boostsBlockedForMs > 100_000,
+        `the second refusal pauses at 120s (got ${second.boostsBlockedForMs}ms)`,
+      );
+
+      // (c) A sibling lane's refusal must not touch it: the profiles list is
+      // refused about once a tick and has no boosts pause of its own.
+      mode = "profiles429";
+      await dex.fetchLatestSolanaProfiles();
+      assert.equal(
+        dex.getStats().boostsConsecutive429,
+        2,
+        "a profiles 429 is not a boosts 429",
+      );
+      assert.ok(dex.boostsPauseEndsAt(Date.now()) > 0, "and the boosts pause is still its own");
+
+      // (d) A SERVED boosts response — cache HIT included — clears the streak,
+      // so the next refusal starts from the base again.
+      mode = "ok";
+      const rows = await dex.fetchBoostedTokens(30);
+      assert.equal(rows.length, 1, "the served list is handed back");
+      const served = dex.getStats();
+      assert.equal(served.boostsConsecutive429, 0, "a serve ends the streak");
+      assert.equal(dex.boostsPauseEndsAt(Date.now()), 0, "and the lane is open again");
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -17639,6 +17771,43 @@ async function main() {
     assert.ok(
       toml.includes('DEXSCREENER_BOOSTS_INTERVAL_SECONDS = "300"'),
       "wrangler.toml must run the boosts gate at the measured 5-minute cadence, not leave it implicit",
+    );
+    // The boosts refusal retry (2026-10-12): the dispatch stamp alone charged
+    // one 429/1015 the whole five-minute window. Pin the same things the gecko
+    // re-arm pins — only an EMPTY result re-arms, it aims at the client's OWN
+    // boosts pause, the stamp rides the front's single write — plus the
+    // client-side lane isolation the retry depends on.
+    const dexSrc = read("src/dexscreener.ts");
+    assert.ok(
+      scannerSrc.includes("awaitthis.rearmBoostsDiscovery(Date.now())"),
+      "the boosts closure must re-arm after a refused/empty fetch, or one 1015 still burns the interval",
+    );
+    assert.ok(
+      scannerSrc.includes("if(p.length===0){") &&
+        scannerSrc.includes("this.dex.boostsPauseEndsAt(now)"),
+      "and only an empty tick re-arms, aimed at the boosts lane's OWN pause",
+    );
+    assert.ok(
+      scannerSrc.includes(
+        "boostsDiscoveryRetryStamp(pauseEnd,now,this.config.dexscreenerBoostsIntervalMs,)",
+      ),
+      "the retry stamp is computed against the configured interval, like gecko's",
+    );
+    assert.ok(
+      scannerSrc.includes("awaitthis.stampFront(DEX_BOOSTS_AT_KEY,String(stamp))"),
+      "the retry rides the scan front's single write, like the dispatch stamp it replaces",
+    );
+    assert.ok(
+      dexSrc.includes('if(lane==="boosts")this.noteBoostsRefused();'),
+      "a boosts 429 must arm the lane's own pause in the client",
+    );
+    assert.ok(
+      dexSrc.includes("boostsPauseEndsAt(now=Date.now()):number{"),
+      "and the client must expose that pause as a decision the scanner reads",
+    );
+    assert.ok(
+      dexSrc.includes("BOOSTS_429_BACKOFF_MS*2**Math.min(step-1,8)"),
+      "the ladder doubles per consecutive refusal (else a wall becomes a request a minute)",
     );
     assert.ok(
       scannerSrc.includes("if(diag.geo>0)return;") &&

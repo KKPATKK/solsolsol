@@ -354,6 +354,13 @@ export interface AppConfig {
    * `boostsDue true` is the other reading: a fetch that was allowed and came
    * back refused or empty. Comparing `/debug/dex429` before and after a change
    * to this value is the measurement that says whether it bought anything.
+   *
+   * A REFUSAL IS NOT CHARGED THE WHOLE WINDOW (2026-10-12): a 429 re-arms the
+   * gate to the boosts lane's own short pause (Scanner.rearmBoostsDiscovery +
+   * BOOSTS_429_BACKOFF_MS in src/dexscreener.ts), so the tick that was
+   * refused is followed by a retry a minute later — `summary.boostsRetryAt`
+   * names that retry when it happens. An empty 200 list leaves the full
+   * cadence in place.
    */
   dexscreenerBoostsIntervalMs: number;
   /**

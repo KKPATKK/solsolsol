@@ -335,6 +335,11 @@ DEXSCREENER_BOOSTS_LIMIT = "30"
 # `summary.boostsDue false` and makes NO request (`dropsByLeg.boosts` flat — a
 # gated tick is not a dropped one). `boosts 0` with `boostsDue true` is the
 # other reading: a fetch that was allowed and came back refused or empty.
+# A REFUSAL IS NOT CHARGED THE WHOLE WINDOW (2026-10-12): a 429 re-arms this
+# gate to the boosts lane's own short pause (Scanner.rearmBoostsDiscovery +
+# BOOSTS_429_BACKOFF_MS in src/dexscreener.ts), so the refused tick is followed
+# by a retry a minute later — `summary.boostsRetryAt` names it when it happens
+# — instead of an empty five-minute window.
 # Compare `/debug/dex429` (`lastHour`, `total`) before and after changing this
 # value — that is the reading that says whether the gate bought anything.
 # The gate is DURABLE (worker_state `dex_boosts_at`), because isolates churn

@@ -1015,6 +1015,13 @@ export const GECKO_DISCOVERY_AT_KEY = "gecko_discovery_at";
  * per-isolate stamp would reset long before the window elapsed and the gate
  * would never hold. The row rides SCAN_FRONT_GATE_KEYS' existing IN-list, so
  * the question costs zero extra round trips.
+ *
+ * A REFUSED ATTEMPT DOES NOT HOLD FOR THE WINDOW (2026-10-12): the dispatch
+ * stamp above is the SCHEDULE, and a refusal re-arms this row to the boosts
+ * lane's own pause end (see Scanner.rearmBoostsDiscovery +
+ * BOOSTS_429_BACKOFF_MS in src/dexscreener.ts), so one 429/1015 costs a tick
+ * instead of five minutes. A delivered or genuinely empty fetch leaves the
+ * stamp alone.
  */
 export const DEX_BOOSTS_AT_KEY = "dex_boosts_at";
 

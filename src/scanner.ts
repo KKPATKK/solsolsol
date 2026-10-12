@@ -1765,6 +1765,53 @@ export function boostsDiscoveryDue(
 }
 
 /**
+ * The durable stamp a REFUSED boosts fetch should leave, so the lane is due
+ * again when its own pause is over instead of a full interval later (pure —
+ * unit-tested; null = leave the dispatch stamp alone). The boosts mirror of
+ * geckoDiscoveryRetryStamp below — the same min() arithmetic, its own name and
+ * its own reasons, so a future change to either leg's retry cannot silently
+ * move the other's (the rule boostsDiscoveryDue already states for the gates).
+ * Its sibling (geckoDiscoveryRetryStamp) sits just below it.
+ *
+ * WHY IT EXISTS (live 2026-10-12). The boosts gate is stamped at DISPATCH,
+ * which is right for a success and too expensive for a refusal: the leg's
+ * origin answers are refused with `error code: 1015` whenever the edge cache
+ * has nothing fresh, and ONE such tick then read `boosts 0` with no request
+ * allowed for five more minutes — four more ticks of a lane that had nothing
+ * wrong with it. The client's own pause is 60s on the first refusal and
+ * doubles per consecutive one (see BOOSTS_429_BACKOFF_MS), so aiming the gate
+ * at the pause's end turns a refusal into a one-tick loss and leaves a genuine
+ * wall back at the old cadence by the fourth refusal — 60 → 120 → 240 → 480s
+ * is already past this lane's 300s interval, so the min() clamps it and the
+ * widening never turns into a request a minute forever.
+ *
+ * THE MIN() IS THE SAFETY ARGUMENT, not a detail: the retry is aimed at the
+ * pause end but never past `now + interval`, so this can only ever make the
+ * leg due EARLIER than the cadence already allowed — a pause the ladder has
+ * widened past the interval returns the ordinary gate unchanged.
+ *
+ * Aimed AT the pause end and not a margin past it for the reason the gecko
+ * version documents: ticks arrive one minute apart, so a stamp a hair early
+ * only costs that same minute — a paused lane answers without spending a
+ * request, so an early retry is never a request paid for nothing.
+ *
+ * A failure that armed no pause at all — an empty 200 list, a 4xx/5xx, a
+ * budget drop that was never sent — returns null and leaves the full interval
+ * in place.
+ */
+export function boostsDiscoveryRetryStamp(
+  pauseEndMs: number,
+  nowMs: number,
+  intervalMs: number,
+): number | null {
+  if (!Number.isFinite(pauseEndMs) || !Number.isFinite(nowMs)) return null;
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return null;
+  if (pauseEndMs <= nowMs) return null;
+  const retryAt = Math.min(pauseEndMs, nowMs + intervalMs);
+  return Math.round(retryAt - intervalMs);
+}
+
+/**
  * The durable stamp a REFUSED fetch should leave, so the leg is due again when
  * the host's own pause is over instead of a full interval later (pure —
  * unit-tested; null = leave the dispatch stamp alone).
@@ -2032,6 +2079,15 @@ export interface ScanSummary {
    * `boosts 0` + `boostsDue true` is a fetch that came back empty or refused.
    */
   boostsDue?: boolean;
+  /**
+   * Epoch the durable gate was re-armed to after this tick's boosts fetch came
+   * back REFUSED, so the lane is due again the moment its own 60s pause
+   * expires (see boostsDiscoveryRetryStamp / BOOSTS_429_BACKOFF_MS in
+   * src/dexscreener.ts). Absent on a tick that was held back, succeeded, or
+   * failed without arming a pause — so `boostsRetryAt` is the reading that
+   * says one 429/1015 cost the lane its pause instead of its whole interval.
+   */
+  boostsRetryAt?: number;
   /** pump.fun discovery feed size this scan (0 when blocked/unconfigured). */
   pump: number;
   /**
@@ -3209,6 +3265,32 @@ export class Scanner {
     if (stamp === null) return null;
     await this.stampFront(GECKO_DISCOVERY_AT_KEY, String(stamp));
     return Math.min(pauseEnd, now + this.config.geckoterminalDiscoveryIntervalMs);
+  }
+
+  /**
+   * Re-arm the durable gate after a REFUSED boosts fetch (see
+   * boostsDiscoveryRetryStamp). Rides the front's ONE write, exactly like the
+   * dispatch stamp it replaces, so the retry costs no round trip of its own.
+   * Returns the epoch it aimed at, or null when it left the dispatch stamp
+   * alone.
+   *
+   * A no-op whenever the lane is not paused — a success, an empty 200 list, a
+   * hard refusal — which is what keeps every non-429 path on the cadence it
+   * already had. Best-effort by construction: the dispatch stamp is already
+   * queued, so anything that goes wrong here degrades to the old
+   * full-interval behaviour.
+   */
+  private async rearmBoostsDiscovery(now: number): Promise<number | null> {
+    if (!this.dex) return null;
+    const pauseEnd = this.dex.boostsPauseEndsAt(now);
+    const stamp = boostsDiscoveryRetryStamp(
+      pauseEnd,
+      now,
+      this.config.dexscreenerBoostsIntervalMs,
+    );
+    if (stamp === null) return null;
+    await this.stampFront(DEX_BOOSTS_AT_KEY, String(stamp));
+    return Math.min(pauseEnd, now + this.config.dexscreenerBoostsIntervalMs);
   }
 
   /**
@@ -5550,6 +5632,10 @@ export class Scanner {
               // attempt that DOES reach it may still have been billed (the
               // adaptive spacing exists precisely because 429s are routine on
               // this host), so the stamp is spent at dispatch, not on success.
+              // A REFUSAL IS NOT CHARGED THE WHOLE WINDOW (2026-10-12): the
+              // result handler below re-arms this row to the boosts lane's own
+              // pause end when the fetch came back empty with a pause armed,
+              // so one 429/1015 costs a tick instead of five minutes.
               await this.stampFront(DEX_BOOSTS_AT_KEY, String(Date.now()));
               return this.dex!.fetchBoostedTokens(
                 this.config.dexscreenerBoostsLimit,
@@ -5559,9 +5645,20 @@ export class Scanner {
             [],
             boostsDeadline,
           )
-            .then((p) => {
+            .then(async (p) => {
               boostProfiles = p;
               diag.boosts = p.length;
+              // A REFUSAL MUST NOT BURN THE WHOLE WINDOW (see
+              // boostsDiscoveryRetryStamp): the dispatch stamp above is right
+              // for a delivery and for a lane with nothing to say, while the
+              // client's own 60s pause is what decides whether this was a
+              // refusal — re-arming to its end turns one 1015 into a one-tick
+              // loss instead of five minutes of it. Mirrors the gecko block
+              // above; a delivered window stops here and keeps the interval.
+              if (p.length === 0) {
+                const boostsRetryAt = await this.rearmBoostsDiscovery(Date.now());
+                if (boostsRetryAt !== null) diag.boostsRetryAt = boostsRetryAt;
+              }
             })
             .catch((err: unknown) => {
               console.error(
