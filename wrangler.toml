@@ -466,6 +466,24 @@ PUMPFUN_FALLBACK_LIMIT = "0"
 # ignored), Orca's pools carry no creation field. One request when reached.
 # See src/meteora.ts.
 METEORA_FALLBACK_LIMIT = "20"
+# Raydium LaunchLab newest launches per scan (code default 0 = off, cap 100).
+# THE FOURTH LAUNCH FEED (2026-10-13). Raydium's POOL list cannot answer
+# "newest pools" (no creation-time sortField — `createTime`/`createdAt` 500,
+# `poolSortField` silently ignored, `openTime` not usable creation data; all
+# re-measured live 2026-10-13), but its LaunchLab MINT list does:
+# `GET launch-mint-v1.raydium.io/get/list?sort=new` serves a 100-row page
+# STRICTLY DESCENDING by `createAt` (ms) — newest ~2 minutes old, page tail
+# ~86 minutes old, ≈ 70 launches/hour across Raydium's own launchpad and its
+# tenant frontends (StonkFun, letsbonk.fun, Growpad, …). That is a launch
+# source INDEPENDENT of pump.fun v3, Meteora and gecko new_pools, and it is
+# keyless: ONE request per tick while this is > 0, so its cost is a single
+# subrequest (the page covers ~1.4h, so a 30s tick can never miss a row), and
+# its net-new registrations are typically 0-2/tick after cross-feed dedupe.
+# 0 = off; junk fails closed. Best-effort: a refusal/bad body degrades to an
+# empty feed (the client pauses 60s on a 429/5xx), never a broken tick.
+# READ /debug/raydium-launch after deploy — the Worker-egress reachability of
+# this host was measured from a clean host only before this change.
+RAYDIUM_LAUNCH_LIMIT = "20"
 # Minimum spacing between GeckoTerminal new-pools FETCHES, in seconds (code
 # default 300 = one fetch per 5 min; 0 = no gate, one per tick). This is the
 # cadence the KEYED leg is spent at: the demo plan is 10K calls/month, one call

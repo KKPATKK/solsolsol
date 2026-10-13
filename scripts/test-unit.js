@@ -17,6 +17,7 @@ const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("..
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
+const { parseRaydiumLaunches, RaydiumLaunchClient, RAYDIUM_LAUNCH_BASE_URL, RAYDIUM_LAUNCH_MAX_LIMIT, RAYDIUM_LAUNCH_BACKOFF_MS } = require("../dist/raydiumlaunch.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS, BOOSTS_429_BACKOFF_MS, BOOSTS_BACKOFF_MAX_MS, boostsBackoffMs } = require("../dist/dexscreener.js");
@@ -17338,6 +17339,148 @@ async function main() {
     }
   });
 
+  // ---------- Raydium LaunchLab (src/raydiumlaunch.ts) ----------
+  //
+  // The FOURTH launch feed. Raydium's POOL list cannot answer "newest pools"
+  // (re-measured live 2026-10-13: `sortField=createTime/createdAt` → HTTP 500
+  // `query sortField check error`, `poolSortField` silently ignored, `openTime`
+  // not usable creation data), but its LaunchLab mint list can:
+  // `GET launch-mint-v1.raydium.io/get/list?sort=new` answers a 100-row page
+  // STRICTLY DESCENDING by `createAt` (ms), newest ~2 minutes old and the page
+  // tail ~86 minutes old (≈ 70 launches/hour). These tests pin the parser's
+  // rules, the client's refusal handling (one request per tick, a 60s pause
+  // after 429/5xx, no retry ladder) and the config knob's fail-closed parse.
+
+  await test("Raydium LaunchLab: parseRaydiumLaunches keeps valid mints newest-first and drops junk", () => {
+    const now = Date.now();
+    const rows = [
+      // Out of order on purpose: the parser sorts descending by createAt.
+      { mint: mint("OLDERIC1"), createAt: now - 600_000, name: "Old", symbol: "OLD" },
+      {
+        mint: mint("NEWERIC1"),
+        createAt: now - 2_000,
+        name: "New",
+        symbol: "NEW",
+        // mintB is an OBJECT on live rows (WSOL/BONK/PUMP sides) — the parser
+        // must read `.address`, not assume a string.
+        mintB: { address: WSOL_MINT, symbol: "WSOL" },
+      },
+      // Duplicate mint → deduped.
+      { mint: mint("NEWERIC1"), createAt: now - 1_000 },
+      // The quote side as its own base: no identifiable launch token.
+      { mint: WSOL_MINT, createAt: now - 3_000, mintB: { address: WSOL_MINT } },
+      // No creation time / zero: the re-eval pool is keyed on birth time.
+      { mint: mint("NOTIME11") },
+      { mint: mint("ZEROTIME"), createAt: 0 },
+      // Not a Solana base58 mint.
+      { mint: "short", createAt: now - 5_000 },
+      { mint: 123, createAt: now - 5_000 },
+      // Non-object rows.
+      null,
+      7,
+      "x",
+    ];
+    const out = parseRaydiumLaunches({ id: "x", success: true, data: { rows, nextPageId: "p" } });
+    assert.equal(out.length, 2, `exactly two usable rows (got ${out.length})`);
+    assert.equal(out[0].tokenAddress, mint("NEWERIC1"), "newest first, whatever order the page arrived in");
+    assert.equal(out[0].name, "New");
+    assert.equal(out[0].symbol, "NEW");
+    assert.equal(out[0].openTimestamp, now - 2_000, "createAt is milliseconds, passed through as-is");
+    assert.equal(out[1].tokenAddress, mint("OLDERIC1"));
+    // Shape failures are an empty feed, never a crash.
+    assert.deepEqual(parseRaydiumLaunches(null), []);
+    assert.deepEqual(parseRaydiumLaunches({ data: "nope" }), []);
+    assert.deepEqual(parseRaydiumLaunches({ data: { rows: "nope" } }), []);
+    assert.deepEqual(parseRaydiumLaunches({ data: { rows: [null, 7, "x"] } }), []);
+    // The limit is the API page ceiling, and it slices the NEWEST rows.
+    const many = Array.from({ length: 120 }, (_, i) => ({
+      mint: mint("M" + String(i).padStart(4, "0")),
+      createAt: now - i * 1_000,
+    }));
+    assert.equal(parseRaydiumLaunches({ data: { rows: many } }, 5).length, 5);
+    assert.equal(parseRaydiumLaunches({ data: { rows: many } }, 500).length, RAYDIUM_LAUNCH_MAX_LIMIT);
+  });
+
+  await test("RaydiumLaunchClient: asks the LaunchLab host for the newest list and pauses after a refusal", async () => {
+    const cfg = loadConfig({});
+    const client = new RaydiumLaunchClient(cfg);
+    const origFetch = globalThis.fetch;
+    const calls = [];
+    try {
+      globalThis.fetch = async (url, init) => {
+        calls.push({ url: String(url), headers: (init && init.headers) || {} });
+        return new Response(
+          JSON.stringify({
+            id: "x",
+            success: true,
+            data: {
+              rows: [
+                { mint: mint("LABCOIN1"), createAt: Date.now() - 30_000, symbol: "LAB" },
+              ],
+              nextPageId: "p",
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+      const got = await client.fetchNewLaunches(5);
+      assert.equal(got.length, 1);
+      assert.equal(got[0].tokenAddress, mint("LABCOIN1"));
+      assert.ok(
+        calls[0].url.startsWith(`${RAYDIUM_LAUNCH_BASE_URL}/get/list?`),
+        `the feed must come from the LaunchLab host (got ${calls[0].url})`,
+      );
+      assert.ok(
+        calls[0].url.includes("sort=new"),
+        "the ONLY thing that makes this source a launch feed is the newest-first sort",
+      );
+      assert.ok(
+        String(calls[0].headers["User-Agent"] || "").startsWith("solana-meme-bot/"),
+        "an anonymous shared-egress request is the shape that gets blocked",
+      );
+      const h = client.health();
+      assert.equal(h.ok, 1);
+      assert.equal(h.http429, 0);
+      assert.equal(h.lastError, null);
+      // A refusal is an empty feed and exactly ONE request — and the 60s pause
+      // it arms means the NEXT tick does not even ask.
+      let fetches = 0;
+      globalThis.fetch = async () => {
+        fetches += 1;
+        return new Response("nope", { status: 429 });
+      };
+      assert.deepEqual(await client.fetchNewLaunches(5), []);
+      assert.equal(fetches, 1, "a refusal must not be retried inside the tick");
+      const h2 = client.health();
+      assert.equal(h2.http429, 1);
+      assert.equal(h2.consecutive429, 1);
+      assert.equal(h2.lastStatus, 429);
+      assert.ok(
+        h2.backoffUntil - Date.now() > 0 && h2.backoffUntil - Date.now() <= RAYDIUM_LAUNCH_BACKOFF_MS,
+        "a refusal must arm the pause",
+      );
+      assert.deepEqual(await client.fetchNewLaunches(5), []);
+      assert.equal(fetches, 1, "the pause must swallow the next tick's request too");
+      // A 200 that does not parse (challenge page / shape change) is an empty
+      // feed as well — never a crash, never a bogus row.
+      const fresh = new RaydiumLaunchClient(cfg);
+      globalThis.fetch = async () => new Response("<html>challenge</html>", { status: 200 });
+      assert.deepEqual(await fresh.fetchNewLaunches(5), []);
+      assert.equal(fresh.health().lastError, "non-JSON body");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("loadConfig: RAYDIUM_LAUNCH_LIMIT is off by default, clamped and fail-closed", () => {
+    assert.equal(loadConfig({}).raydiumLaunchLimit, 0, "the fourth launch feed ships OFF unless the var says otherwise");
+    assert.equal(loadConfig({ RAYDIUM_LAUNCH_LIMIT: "0" }).raydiumLaunchLimit, 0);
+    assert.equal(loadConfig({ RAYDIUM_LAUNCH_LIMIT: "20" }).raydiumLaunchLimit, 20);
+    assert.equal(loadConfig({ RAYDIUM_LAUNCH_LIMIT: "9000" }).raydiumLaunchLimit, 100, "clamped to the API page");
+    assert.equal(loadConfig({ RAYDIUM_LAUNCH_LIMIT: "-5" }).raydiumLaunchLimit, 0, "below zero is OFF too");
+    assert.equal(loadConfig({ RAYDIUM_LAUNCH_LIMIT: "nope" }).raydiumLaunchLimit, 0, "junk fails closed");
+  });
+
   const chainScanner = async (cfgEnv, opts) => {
     const { Scanner } = require("../dist/scanner.js");
     const db = new Db(opts.t.p, undefined, opts.t.client);
@@ -17359,7 +17502,7 @@ async function main() {
     const dex = new DexScreenerClient(cfg);
     dex.fetchLatestSolanaProfiles = async () => [];
     dex.fetchPairsForTokens = async () => new Map();
-    const calls = { gecko: 0, pump: 0, meteora: 0 };
+    const calls = { gecko: 0, pump: 0, meteora: 0, raydium: 0 };
     const gecko = {
       fetchNewPools: async () => {
         calls.gecko += 1;
@@ -17384,9 +17527,17 @@ async function main() {
         return opts.meteoraPools();
       },
     };
+    const raydium = {
+      fetchNewLaunches: async (limit) => {
+        calls.raydium += 1;
+        opts.raydiumLimitSeen = limit;
+        return opts.raydiumCoins ? opts.raydiumCoins() : [];
+      },
+      health: () => ({}),
+    };
     // (db, bot, dex, cfg, birdeye, rugcheck, helius, trade, pumpfun, gecko,
     //  jupiter, gmgn, axiom, arkham, crimeWallets, walletAnalyzer, flurry,
-    //  meteora)
+    //  meteora, raydiumLaunch)
     const scanner = new Scanner(
       db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
       null, null, null, null,
@@ -17397,6 +17548,7 @@ async function main() {
       null, null,
       null,
       meteora,
+      raydium,
     );
     return { scanner, calls };
   };
@@ -17460,6 +17612,114 @@ async function main() {
       globalThis.fetch = origFetch;
       await t.cleanup();
     }
+  });
+
+  await test("Scanner: the LaunchLab leg is a fourth ALWAYS-ON launch feed, not a fallback layer", async () => {
+    // pump.fun's lesson applied to a new source: a launch feed's value is the
+    // earliest sighting, so the LaunchLab leg runs on every tick it is enabled
+    // — including a tick where gecko, pump.fun AND Meteora all answered. It is
+    // not gated by any of them; the cross-feed dedupe happens later.
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const opts = {
+        t,
+        geckoPools: () => [{ tokenAddress: mint("GECkxCxN"), createdAtMs: Date.now() - 60_000 }],
+        pumpCoins: () => [{ tokenAddress: mint("PUMPCxxN1") }],
+        meteoraPools: () => [],
+        raydiumCoins: () => [{ tokenAddress: mint("LABCOIN1"), openTimestamp: Date.now() - 30_000, symbol: "LAB" }],
+      };
+      const { scanner, calls } = await chainScanner(
+        { METEORA_FALLBACK_LIMIT: "20", RAYDIUM_LAUNCH_LIMIT: "20" },
+        opts,
+      );
+      await scanner.runOnce();
+      assert.equal(calls.raydium, 1, "an always-on launch feed is not gated by the other feeds' verdicts");
+      assert.equal(opts.raydiumLimitSeen, 20, "the configured limit is what the fetch is sized by");
+      assert.equal(scanner.lastSummary.raydium, 1);
+      assert.ok(scanner.lastSummary.pool >= 1, "the LaunchLab coin must reach the eval list");
+      assert.equal(scanner.lastSummary.geo, 1, "gecko delivered on the same tick");
+      assert.equal(scanner.lastSummary.pump, 1, "pump.fun delivered on the same tick");
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: RAYDIUM_LAUNCH_LIMIT=0 keeps the LaunchLab leg off entirely", async () => {
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const { scanner, calls } = await chainScanner(
+        { METEORA_FALLBACK_LIMIT: "20", RAYDIUM_LAUNCH_LIMIT: "0" },
+        {
+          t,
+          geckoPools: () => [],
+          pumpCoins: () => [],
+          meteoraPools: () => [],
+          raydiumCoins: () => [{ tokenAddress: mint("LABCOIN1"), openTimestamp: Date.now() - 30_000 }],
+        },
+      );
+      await scanner.runOnce();
+      assert.equal(calls.raydium, 0, "a disabled feed must cost zero requests — the client is not even called");
+      assert.equal(scanner.lastSummary.raydium, 0);
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Raydium LaunchLab wiring: client, config, feed leg, attribution and probe land together (source pin)", () => {
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const scannerSrc = read("src/scanner.ts").replace(/\s+/g, "");
+    const workerSrc = read("src/worker.ts").replace(/\s+/g, "");
+    const configSrc = read("src/config.ts").replace(/\s+/g, "");
+    const wranglerSrc = read("wrangler.toml").replace(/\s+/g, "");
+    const scannerWanted = {
+      "feed leg": "this.raydiumLaunch!.fetchNewLaunches(this.config.raydiumLaunchLimit,)",
+      "summary counter": "diag.raydium=p.length",
+      "subreq floor leg name": 'dropOptionalLeg("raydium")',
+      "discovery attribution":
+        '...raydiumLaunchProfiles.map((p)=>[p.tokenAddress,"raydium"]asconst)',
+    };
+    const missing = [];
+    for (const [name, v] of Object.entries(scannerWanted)) {
+      if (!scannerSrc.includes(v)) missing.push(name);
+    }
+    assert.equal(missing.length, 0, `scanner wiring missing: ${missing.join(", ")}`);
+    // Every feedProfiles filter AFTER the LaunchLab entry must exclude its
+    // mints, or a coin two feeds carry is evaluated twice. One occurrence per
+    // later feed: gecko, geoTrend, boosts, gmgn, axiom, jup, jupTrend, meteora.
+    assert.equal(
+      scannerSrc.split("!raydiumMints.has(p.tokenAddress)").length - 1,
+      8,
+      "every later feed's dedupe filter must exclude raydiumMints",
+    );
+    const configWanted = {
+      "config field": "raydiumLaunchLimit:number;",
+      "config parse": "raydiumLaunchLimit:Number.isFinite(Number(env.RAYDIUM_LAUNCH_LIMIT??0))",
+    };
+    for (const [name, v] of Object.entries(configWanted)) {
+      if (!configSrc.includes(v)) missing.push(name);
+    }
+    const workerWanted = {
+      "client construction":
+        "config.raydiumLaunchLimit>0?newRaydiumLaunchClient(config):null",
+      "probe endpoint": 'url.pathname==="/debug/raydium-launch"',
+      "probe uses the real client": "newRaydiumLaunchClient(cfg)",
+    };
+    for (const [name, v] of Object.entries(workerWanted)) {
+      if (!workerSrc.includes(v)) missing.push(name);
+    }
+    assert.equal(missing.length, 0, `client/config/probe wiring missing: ${missing.join(", ")}`);
+    assert.ok(
+      wranglerSrc.includes('RAYDIUM_LAUNCH_LIMIT="20"'),
+      "the deployed knob must enable the feed (or explicitly document 0)",
+    );
   });
 
   await test("Scanner: gecko's cadence skips the fetch and Meteora covers the tick", async () => {

@@ -436,6 +436,29 @@ export interface AppConfig {
    */
   meteoraFallbackLimit: number;
   /**
+   * Raydium LaunchLab newest-launch count per scan (RAYDIUM_LAUNCH_LIMIT,
+   * default 0 = off, capped at 100).
+   *
+   * A FOURTH INDEPENDENT LAUNCH FEED (2026-10-13). Raydium's pool list cannot
+   * answer "newest pools" (its `sortField` enum has no creation-time member,
+   * `poolSortField` is silently ignored and pool `openTime` is not usable
+   * creation data — re-measured live 2026-10-13), but its LaunchLab mint API
+   * does: `GET launch-mint-v1.raydium.io/get/list?sort=new` returns a 100-row
+   * page STRICTLY DESCENDING by `createAt` (ms), newest ~2 minutes old and the
+   * page's tail ~86 minutes old. That page is the newest launches of Raydium's
+   * own launchpad plus its tenant frontends (StonkFun, letsbonk.fun, Growpad,
+   * …). Like pump.fun's v3 feed, the leg is ALWAYS ON while this is > 0: one
+   * keyless request per tick, because a launch feed's whole value is the
+   * earliest possible sighting of a coin that may age into the qualifying
+   * window. The other launch sources (pump.fun v3, Meteora, gecko new_pools)
+   * are unaffected — this is an additional provider, not a fallback layer.
+   * The 30s clock cannot outrun the page: 100 rows cover ~1.4 hours, so a tick
+   * slice of ~20 is always the freshest cohort. Best-effort: any refusal /
+   * bad body / blocked egress degrades to an empty feed and the scan
+   * continues (see src/raydiumlaunch.ts; /debug/raydium-launch reports why).
+   */
+  raydiumLaunchLimit: number;
+  /**
    * How many newest GeckoTerminal Solana pools to register per scan
    * (GECKOTERMINAL_POOL_PAGES, default 1, max 5 — each page ~20 pools). Free
    * discovery feed (no key) covering every Solana DEX incl. pump.fun
@@ -926,6 +949,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       : 0,
     meteoraFallbackLimit: Number.isFinite(Number(env.METEORA_FALLBACK_LIMIT ?? 0))
       ? Math.max(0, Math.min(Math.floor(Number(env.METEORA_FALLBACK_LIMIT ?? 0)), 300))
+      : 0,
+    // Fail-closed on junk (an unparseable knob must not silently enable a
+    // per-tick request); an explicit 0 is OFF, 100 is the API's page ceiling.
+    raydiumLaunchLimit: Number.isFinite(Number(env.RAYDIUM_LAUNCH_LIMIT ?? 0))
+      ? Math.max(0, Math.min(Math.floor(Number(env.RAYDIUM_LAUNCH_LIMIT ?? 0)), 100))
       : 0,
     geckoterminalPoolPages:
       Number.isFinite(rawGeoPages) && rawGeoPages > 0

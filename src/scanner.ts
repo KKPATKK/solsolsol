@@ -42,6 +42,7 @@ import type { TradeService } from "./jupiter";
 import { pumpfunDiscoveryLimit, type PumpFunClient } from "./pumpfun";
 import type { GeckoTerminalClient } from "./geckoterminal";
 import type { MeteoraClient } from "./meteora";
+import type { RaydiumLaunchClient } from "./raydiumlaunch";
 import type { GmgnClient, GmgnTokenInfo } from "./gmgn";
 import type { AxiomClient, AxiomTokenInfo, AxiomTrendingToken } from "./axiom";
 import { parseAxiomTokenInfo } from "./axiom";
@@ -2108,6 +2109,15 @@ export interface ScanSummary {
    */
   meteora: number;
   /**
+   * Raydium LaunchLab feed size this scan (RAYDIUM_LAUNCH_LIMIT, 0 when
+   * disabled or when the fetch degraded to an empty feed). The FOURTH launch
+   * source and an always-on one like pump.fun: one keyless request per tick,
+   * newest-first by `createAt`. A 0 here is normal (a quiet window) and not
+   * proof of a block — `/debug/raydium-launch` carries the refusal
+   * diagnostics (status, 429s, pause). See src/raydiumlaunch.ts.
+   */
+  raydium: number;
+  /**
    * GeckoTerminal new-pools feed size this scan (0 when blocked, held back by
    * the cadence, or unconfigured). Read together with `geoDue`: `geo 0` with
    * `geoDue false` is the cadence doing its job, `geo 0` with `geoDue true` is
@@ -2238,7 +2248,7 @@ export interface ScanSummary {
   /**
    * The OPTIONAL legs this tick dropped to protect the tick's tail, by name
    * (`meteora`, `geoTrend`, `boosts`, `gmgn`, `axiom`, `jupTrend`,
-   * `backfill`, `crime-refresh`), plus `chain` when the CANDIDATE CHAIN
+   * `raydium`, `backfill`, `crime-refresh`), plus `chain` when the CANDIDATE CHAIN
    * itself stood down (see CHAIN_SUBREQ_FLOOR). Present only alongside
    * `subreqFloor`.
    */
@@ -3536,6 +3546,15 @@ export class Scanner {
      * pump.fun. Best-effort: failures degrade to the feeds ahead of it.
      */
     private readonly meteora: MeteoraClient | null = null,
+    /**
+     * Raydium LaunchLab newest-launch discovery (null = disabled) — the
+     * FOURTH keyless launch feed and an always-on one like pump.fun: one
+     * request per tick while RAYDIUM_LAUNCH_LIMIT > 0. LaunchLab is Raydium's
+     * own launchpad plus its tenant frontends (StonkFun, letsbonk.fun, …).
+     * Best-effort: failures degrade to an empty feed (see
+     * src/raydiumlaunch.ts), never a broken tick.
+     */
+    private readonly raydiumLaunch: RaydiumLaunchClient | null = null,
   ) {
     this.pushWatcher = config.pushWatch.enabled
       ? new PushWatcher(
@@ -4902,6 +4921,7 @@ export class Scanner {
       boosts: 0,
       pump: 0,
       meteora: 0,
+      raydium: 0,
       geo: 0,
       geoTrend: 0,
       jup: 0,
@@ -5515,6 +5535,39 @@ export class Scanner {
         // pump job any more (Meteora waits on the GECKO job — see below).
         feedJobs.push(pumpPromise);
       }
+      // Raydium LaunchLab — the FOURTH launch feed (see src/raydiumlaunch.ts),
+      // and an ALWAYS-ON one like pump.fun: the LaunchLab mint API's
+      // `sort=new` page is strictly newest-first by `createAt` (100 rows ≈
+      // 1.4h of launches ≈ 70/hour across Raydium's own launchpad and its
+      // tenant frontends), so one keyless request per tick can never miss a
+      // row, and the tick's slice is always the freshest cohort. It neither
+      // gates nor is gated by gecko/pump/Meteora — it is an independent
+      // provider, not another fallback layer. Sized by RAYDIUM_LAUNCH_LIMIT
+      // (0 = off); best-effort — a refusal/bad body degrades to [] and the
+      // scan continues on the other three launch feeds.
+      let raydiumLaunchProfiles: TokenProfile[] = [];
+      if (this.raydiumLaunch && this.config.raydiumLaunchLimit > 0 && !dropOptionalLeg("raydium")) {
+        feedJobs.push(
+          this.fetchFeedCapped(
+            () =>
+              this.raydiumLaunch!.fetchNewLaunches(
+                this.config.raydiumLaunchLimit,
+              ),
+            [],
+            feedDeadline,
+          )
+            .then((p) => {
+              raydiumLaunchProfiles = p;
+              diag.raydium = p.length;
+            })
+            .catch((err: unknown) => {
+              console.error(
+                "[scanner] raydium launchlab discovery failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }),
+        );
+      }
       // Meteora DAMM v2 — GECKO'S COVER (see src/meteora.ts). It is an
       // independent provider precisely for the ticks gecko's 5-minute cadence
       // holds back, and for a due tick whose fetch came back empty or refused:
@@ -5850,6 +5903,9 @@ export class Scanner {
       // entry wins — it carries richer profile data.
       const dexMints = new Set(profiles.map((p) => p.tokenAddress));
       const pumpMints = new Set(pumpProfiles.map((p) => p.tokenAddress));
+      const raydiumMints = new Set(
+        raydiumLaunchProfiles.map((p) => p.tokenAddress),
+      );
       const geckoMints = new Set(geckoProfiles.map((p) => p.tokenAddress));
       const meteoraMints = new Set(meteoraProfiles.map((p) => p.tokenAddress));
       const geoTrendMints = new Set(geoTrendProfiles.map((p) => p.tokenAddress));
@@ -5866,6 +5922,7 @@ export class Scanner {
       const discoveredVia = new Map<string, string>([
         ...profiles.map((p) => [p.tokenAddress, "dex"] as const),
         ...pumpProfiles.map((p) => [p.tokenAddress, "pump"] as const),
+        ...raydiumLaunchProfiles.map((p) => [p.tokenAddress, "raydium"] as const),
         ...geckoProfiles.map((p) => [p.tokenAddress, "gecko"] as const),
         ...geoTrendProfiles.map((p) => [p.tokenAddress, "geoTrend"] as const),
         ...boostProfiles.map((p) => [p.tokenAddress, "boosts"] as const),
@@ -5880,20 +5937,28 @@ export class Scanner {
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),
-        ...geckoProfiles.filter(
+        ...raydiumLaunchProfiles.filter(
           (p) =>
             !dexMints.has(p.tokenAddress) && !pumpMints.has(p.tokenAddress),
+        ),
+        ...geckoProfiles.filter(
+          (p) =>
+            !dexMints.has(p.tokenAddress) &&
+            !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress),
         ),
         ...geoTrendProfiles.filter(
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress),
         ),
         ...boostProfiles.filter(
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress),
         ),
@@ -5901,6 +5966,7 @@ export class Scanner {
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
             !boostMints.has(p.tokenAddress),
@@ -5909,6 +5975,7 @@ export class Scanner {
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
             !gmgnMints.has(p.tokenAddress),
@@ -5917,6 +5984,7 @@ export class Scanner {
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
             !boostMints.has(p.tokenAddress) &&
@@ -5927,6 +5995,7 @@ export class Scanner {
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
             !boostMints.has(p.tokenAddress) &&
@@ -5938,6 +6007,7 @@ export class Scanner {
           (p) =>
             !dexMints.has(p.tokenAddress) &&
             !pumpMints.has(p.tokenAddress) &&
+            !raydiumMints.has(p.tokenAddress) &&
             !geckoMints.has(p.tokenAddress) &&
             !geoTrendMints.has(p.tokenAddress) &&
             !boostMints.has(p.tokenAddress) &&

@@ -114,6 +114,7 @@ import {
 import { JupiterClient, TradeService } from "./jupiter";
 import { PumpFunClient } from "./pumpfun";
 import { MeteoraClient } from "./meteora";
+import { RaydiumLaunchClient } from "./raydiumlaunch";
 import {
   GeckoTerminalClient,
   GECKO_ALT_BASE_URL,
@@ -4349,6 +4350,13 @@ async function ensureInitialized(env: Env): Promise<void> {
           // back, and on a due tick whose fetch came back empty or refused
           // (best-effort; see src/meteora.ts).
           new MeteoraClient(config),
+          // Raydium LaunchLab newest-launch feed — the FOURTH launch source,
+          // always-on like pump.fun (one keyless request per tick; null when
+          // RAYDIUM_LAUNCH_LIMIT is 0). Best-effort: a refusal/bad body
+          // degrades to an empty feed (see src/raydiumlaunch.ts).
+          config.raydiumLaunchLimit > 0
+            ? new RaydiumLaunchClient(config)
+            : null,
         );
         // Capture every early-return reason the scanner records: it sets
         // lastSkip back to null in runOnce's finally within the same tick, so
@@ -7510,6 +7518,43 @@ const worker = {
         rawBytes: text.length,
         count: Array.isArray(items) ? items.length : 0,
         bodyPreview: text.slice(0, 200),
+      });
+    }
+
+    // Raydium LaunchLab probe — calls the REAL client from the Worker's own
+    // egress, so a quiet `raydium 0` can be told apart from a blocked host or
+    // a parser mismatch without guessing (the contract /debug/gmgn and
+    // /debug/gecko-trending follow). Read it after a deploy: reachability of
+    // `launch-mint-v1.raydium.io` from Worker egress was measured from a
+    // clean host only before this feed shipped, and `health` carries WHY an
+    // empty answer happened — a refusal (`lastStatus` 429/5xx), the 60s pause
+    // it armed (`backoffUntil`), a non-JSON body (`lastError`), or an OK page
+    // whose rows simply were all duplicates/old (`ok` > 0 with `count` 0 is
+    // then a quiet feed, not a broken one). `?limit=N` sizes the batch
+    // (default 5, capped at the API page of 100).
+    if (url.pathname === "/debug/raydium-launch") {
+      if (!cfg) return Response.json({ ok: false, error: "not initialized" });
+      const limitRaw = Number(url.searchParams.get("limit") ?? 5);
+      const limit = Number.isFinite(limitRaw)
+        ? Math.min(Math.max(Math.trunc(limitRaw), 1), 100)
+        : 5;
+      const client = new RaydiumLaunchClient(cfg);
+      const t0 = Date.now();
+      const coins = await client.fetchNewLaunches(limit);
+      const newest =
+        coins.length > 0
+          ? Math.max(...coins.map((c) => c.openTimestamp ?? 0))
+          : 0;
+      return Response.json({
+        ok: coins.length > 0,
+        ms: Date.now() - t0,
+        count: coins.length,
+        // The newest launch's age, in seconds — the freshness proof a launch
+        // feed lives or dies on (the same reading /debug/pool-source prints).
+        newestAgeS:
+          newest > 0 ? Math.round((Date.now() - newest) / 1000) : null,
+        health: client.health(),
+        coins: coins.slice(0, 5),
       });
     }
 
