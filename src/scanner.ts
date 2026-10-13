@@ -5918,22 +5918,34 @@ export class Scanner {
       );
       // Per-mint discovery attribution (see TokenStats.discoveredVia): the
       // merge order below is the priority order — the feed that survives a
-      // dedupe filter is the one that found the coin first.
-      const discoveredVia = new Map<string, string>([
-        ...profiles.map((p) => [p.tokenAddress, "dex"] as const),
-        ...pumpProfiles.map((p) => [p.tokenAddress, "pump"] as const),
-        ...raydiumLaunchProfiles.map((p) => [p.tokenAddress, "raydium"] as const),
-        ...geckoProfiles.map((p) => [p.tokenAddress, "gecko"] as const),
-        ...geoTrendProfiles.map((p) => [p.tokenAddress, "geoTrend"] as const),
-        ...boostProfiles.map((p) => [p.tokenAddress, "boosts"] as const),
-        ...gmgnProfiles.map((p) => [p.tokenAddress, "gmgn"] as const),
-        ...axiomProfiles.map((p) => [p.tokenAddress, "axiom"] as const),
-        ...jupProfiles.map((p) => [p.tokenAddress, "jup"] as const),
-        ...jupTrendProfiles.map((p) => [p.tokenAddress, "jupTrend"] as const),
-        // Last-resort feed → last place in the attribution order: a mint both
-        // Meteora and an earlier feed carry is credited to the earlier one.
-        ...meteoraProfiles.map((p) => [p.tokenAddress, "meteora"] as const),
-      ]);
+      // dedupe filter is the one the mint is credited to.
+      //
+      // The list is fed in REVERSE, and that is load-bearing: `new Map(entries)`
+      // keeps the LAST duplicate key, so the priority order written here (dex
+      // first … meteora last) would otherwise name the LOWEST-priority leg that
+      // carried the mint. That is what shipped from 0e59b51 (2026-08-22) until
+      // 2026-10-13: measured then, of the 1,505 pump.fun launches registered in
+      // the previous hour 1,373 were labelled `jup` against the pump leg's 132,
+      // although pump.fun's own newest-20 page carries every launch of that hour
+      // (scripts/raydium-attribution.js prints that `label-share` reading, and
+      // scripts/test-unit.js pins the reverse so it cannot silently flip back).
+      const discoveredVia = new Map<string, string>(
+        [
+          ...profiles.map((p) => [p.tokenAddress, "dex"] as const),
+          ...pumpProfiles.map((p) => [p.tokenAddress, "pump"] as const),
+          ...raydiumLaunchProfiles.map((p) => [p.tokenAddress, "raydium"] as const),
+          ...geckoProfiles.map((p) => [p.tokenAddress, "gecko"] as const),
+          ...geoTrendProfiles.map((p) => [p.tokenAddress, "geoTrend"] as const),
+          ...boostProfiles.map((p) => [p.tokenAddress, "boosts"] as const),
+          ...gmgnProfiles.map((p) => [p.tokenAddress, "gmgn"] as const),
+          ...axiomProfiles.map((p) => [p.tokenAddress, "axiom"] as const),
+          ...jupProfiles.map((p) => [p.tokenAddress, "jup"] as const),
+          ...jupTrendProfiles.map((p) => [p.tokenAddress, "jupTrend"] as const),
+          // Last-resort feed → last place in the priority order: a mint both
+          // Meteora and an earlier feed carry is credited to the earlier one.
+          ...meteoraProfiles.map((p) => [p.tokenAddress, "meteora"] as const),
+        ].reverse(),
+      );
       const feedProfiles: TokenProfile[] = [
         ...profiles,
         ...pumpProfiles.filter((p) => !dexMints.has(p.tokenAddress)),

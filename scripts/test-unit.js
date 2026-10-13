@@ -17722,6 +17722,170 @@ async function main() {
     );
   });
 
+  // The cross-feed attribution priority — pinned HERE, because nothing else can
+  // catch it. `discoveredVia` decides what token_stats.discovered_via records
+  // and /debug/feed-stats aggregates, and the map it is built from has one trap:
+  // `new Map(entries)` keeps the LAST duplicate key, so the order the list is
+  // WRITTEN in (dex → pump → raydium → … → meteora, the same order feedProfiles
+  // filters in) only names the right feed if the list is fed in REVERSE. Handed
+  // over as written it credited a mint several legs carried to the
+  // LOWEST-priority one, live from 0e59b51 (2026-08-22) until 2026-10-13 —
+  // measured then: of the 1,505 pump.fun launches registered in the previous
+  // hour, 1,373 were labelled `jup` and 132 `pump`, although pump.fun's own
+  // newest-20 page carries every launch of that hour (scripts/
+  // raydium-attribution.js prints that `label-share` reading). The raydium
+  // wire-up test above passes either way — it only checks the entries' text —
+  // which is exactly why the orientation needs its own assertion.
+  await test("discovery attribution: the priority list is reversed into the map, so the first-listed feed owns a shared mint", () => {
+    const src = fs
+      .readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8")
+      .replace(/\s+/g, "");
+    const start = src.indexOf("constdiscoveredVia=");
+    assert.ok(start > 0, "the attribution map must exist");
+    const end = src.indexOf("constfeedProfiles", start);
+    assert.ok(end > start, "the feedProfiles union must be the statement after it");
+    const block = src.slice(start, end);
+    // (a) Every leg is named, and the list stays written highest-priority-first
+    // — the order a reader checks against the dedupe filters below it.
+    for (const feed of [
+      "dex",
+      "pump",
+      "raydium",
+      "gecko",
+      "geoTrend",
+      "boosts",
+      "gmgn",
+      "axiom",
+      "jup",
+      "jupTrend",
+      "meteora",
+    ]) {
+      assert.ok(block.includes(`"${feed}"`), `the map must name ${feed}`);
+    }
+    assert.ok(
+      block.indexOf('"dex"') < block.indexOf('"meteora"'),
+      "the list must stay written in priority order (dex first, meteora last)",
+    );
+    // (b) …and it is reversed INTO the map. Without this the LAST entry wins
+    // every shared mint, which is the inversion this test exists for.
+    assert.ok(
+      block.includes("].reverse(),)"),
+      `the discoveredVia list must be reversed into the map: …${block.slice(-70)}`,
+    );
+    // (c) The mechanic the pin exists for, asserted rather than described: a
+    // future reader reversing (b) away must see this fail first.
+    assert.equal(
+      new Map([["m", "dex"], ["m", "meteora"]]).get("m"),
+      "meteora",
+      "new Map keeps the LAST duplicate key — which is why (b) is required",
+    );
+  });
+
+  // …and the same contract DRIVEN, because the pin above reads source text: it
+  // cannot see a refactor that builds the map some other way, and what the user
+  // reads is the column (token_stats.discovered_via → /debug/feed-stats). Two
+  // legs carry ONE mint in a single tick through the real scan path, so the
+  // assertion is about the merge, not about the entries' spelling: the shared
+  // mint must be registered once, credited to the higher-priority feed, while
+  // each leg's own coin keeps its own label (which is what makes the shared one
+  // meaningful — a raydium fake that never delivered would pass vacuously).
+  await test("discovery attribution (driven): a mint two feeds carry is registered once, credited to the higher-priority feed", async () => {
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    try {
+      // Only the two legs under test are wired; gecko/Jupiter/Meteora are null
+      // so their fetches cannot contribute, and the DexScreener profiles feed
+      // is an empty list (offline, no network).
+      globalThis.fetch = async () =>
+        new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      const cfg = loadConfig({
+        PUMPFUN_PROFILE_LIMIT: "20",
+        RAYDIUM_LAUNCH_LIMIT: "20",
+        BIRDEYE_BACKFILL_ENABLED: "false",
+      });
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // One wide-open chat: the registration loop runs before any gate, but a
+      // chatless DB would leave the pool query without a window.
+      await db.saveChatSettings({
+        ...DEFAULT_SETTINGS,
+        chatId: "attr-chat",
+        enabled: true,
+        minAgeMinutes: 0,
+        maxAgeMinutes: 100_000,
+        minMarketCapUsd: 0,
+        maxMarketCapUsd: 10_000_000,
+        minLiquidityUsd: 0,
+        min5mVolUsd: 0,
+        min5mChgPct: 0,
+        min1hChgPct: 0,
+      });
+      // Realistic base58 mints: the tick passes them on untouched, but a fake
+      // that could not be a mint would make the failure message unreadable.
+      const SHARED = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+      const PUMP_ONLY = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+      const RAY_ONLY = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr";
+      const born = Date.now() - 5 * 60_000;
+      const profile = (tokenAddress, symbol) => ({
+        chainId: "solana",
+        tokenAddress,
+        symbol,
+        openTimestamp: born,
+      });
+      const pumpfun = {
+        fetchNewestCoins: async () => [profile(SHARED, "SHR"), profile(PUMP_ONLY, "PMP")],
+      };
+      const raydium = {
+        fetchNewLaunches: async () => [profile(SHARED, "SHR"), profile(RAY_ONLY, "RAY")],
+      };
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchPairsForTokens = async () => new Map();
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        // birdeye, rugcheck, helius, trade, pumpfun, gecko, jupiter, gmgn,
+        // axiom, arkham, crimeWallets, walletAnalyzer, flurry, meteora,
+        // raydiumLaunch (positional — see the constructor's parameter list).
+        null, null, null, null, pumpfun,
+        null, null, null, null, null, null, null, null, null, raydium,
+      );
+      const batches = [];
+      const realRecord = db.recordTokenStatsMany.bind(db);
+      db.recordTokenStatsMany = async (stats) => {
+        batches.push(stats);
+        return realRecord(stats);
+      };
+      await scanner.runOnce();
+
+      // Both legs delivered, and the summary can say so.
+      assert.equal(scanner.lastSummary.pump, 2, "the pump leg's two coins arrived");
+      assert.equal(scanner.lastSummary.raydium, 2, "the raydium leg's two coins arrived");
+      assert.equal(batches.length, 1, "a tick registers its new coins in ONE batch");
+      const byMint = (mint) =>
+        batches[0].filter((s) => s.token === mint).map((s) => s.discoveredVia);
+      assert.deepEqual(
+        byMint(SHARED),
+        ["pump"],
+        "one mint two legs carry is registered once, credited to the higher-priority leg",
+      );
+      assert.deepEqual(byMint(PUMP_ONLY), ["pump"], "the pump leg's own coin stays pump");
+      assert.deepEqual(byMint(RAY_ONLY), ["raydium"], "and the raydium leg's own coin is raydium");
+      // The column afterwards is the same answer /debug/feed-stats reads.
+      assert.equal((await db.getTokenStats(SHARED)).discoveredVia, "pump");
+      assert.equal((await db.getTokenStats(RAY_ONLY)).discoveredVia, "raydium");
+      const rows = await t.client.execute(
+        "SELECT COUNT(*) AS n FROM token_stats WHERE token = ?",
+        [SHARED],
+      );
+      assert.equal(Number(rows.rows[0].n), 1, "and one mint is one row");
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
   await test("Scanner: gecko's cadence skips the fetch and Meteora covers the tick", async () => {
     // The quota gate, end to end: tick 1 spends a gecko attempt and stamps the
     // durable row; tick 2 is inside the window, so gecko costs nothing at all —
