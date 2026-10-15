@@ -145,7 +145,7 @@ batch 本身就係一個 request（順序執行，兩邊 store 都係：D1 嘅 t
 
 ## 6. 限制（唔可以當過）
 
-- **呢兩個修正喺寫呢份文件時未 deploy**：§1 係改之前嘅實測（before），「after」係**待驗**——驗收讀數見 §2 嘅三點。
+- **兩個修正已 deploy：after 讀數見 §8**（§1 係改之前嘅實測）。
   呢個 repo 既有嘅做法（`wrangler.toml` PLACEMENT block）就係「量 → 改 → 再量 → 保留或 revert」，今次照跟。
 - `wrangler d1 info` 嘅 `running_in_region` 係 group 標籤（WNAM），同 `served_by_colo`（DFW）唔同層次：呢份文件用後者。
 - **placement 係 hint**：官方講明「Cloudflare automatically adjusts placement to account for network maintenance or changes」——
@@ -157,8 +157,52 @@ batch 本身就係一個 request（順序執行，兩邊 store 都係：D1 嘅 t
 
 ## 7. 落地清單
 
-1. Push（或 `workflow_dispatch`）`deploy.yml` → deploy job 綠（`wrangler deploy` 接受 `gcp:us-south1`）。
+1. Push（或 `workflow_dispatch`）`deploy.yml` → deploy job 綠（`wrangler deploy` 接受 `gcp:us-south1`）。**✅ 見 §8。**
 2. 5 分鐘後讀三個位：`/health.heartbeat.colo`（唔再 NRT）、`/debug/db-latency`（`select1 p50` 應大幅下降）、
-   `/health.heartbeat.summary.dbTickSteps`（各項加總塌）、同三個 relay marker 仍然 `inner`。
-3. 15 分鐘後確認 tick 冇斷（`lastScanMs`、`scan_history` 間距、tracker pass 嘅 `trackerMs`／`db Nms`）。
+   `/health.heartbeat.summary.dbTickSteps`（各項加總塌）、同三個 relay marker 仍然 `inner`。**✅ 見 §8。**
+3. 15 分鐘後確認 tick 冇斷（`lastScanMs`、`scan_history` 間距、tracker pass 嘅 `trackerMs`／`db Nms`）。**✅ 見 §8。**
 4. 如果 (2) 冇改善：改 fallback region（§2），重複 (2)。如果連 fallback 都冇用，就係「唔係距離」——到時要量 per-statement 讀數。
+
+## 8. 部署後實測（2026-10-15 23:25:22Z deploy，commit b6cc59a）
+
+**Run 38823281353 三個 job 全綠**：`migrate` 23:23:30→23:23:49（marker 令佢 no-op）、
+`deploy` 23:23:51→23:25:29（unit tests 過 → 注入 D1 binding → `Uploaded solana-meme-bot (3.48s)`、
+`Deployed … triggers (1.38s)`；**API 收咗 `gcp:us-south1`**，冇 region 錯誤）、`catchup` 23:25:32→23:26:01。
+
+### 8.1 D1 距離（`/debug/db-latency`，同一條 route、`?samples=5`）
+| op | 改之前 | 23:29:05Z | 23:35:52Z |
+|---|---|---|---|
+| `select1` p50 | 143ms | **14ms** | **20ms** |
+| `readRow` | 156ms | 15ms | 20ms |
+| `writeUpsert` | 169ms | 40ms | 47ms |
+| `claimShapeTwoTrip` | 347ms | 82ms | 91ms |
+| `claimShapeOneTrip` | 146ms | 15ms | 19ms |
+
+`changes` 嘅自我校正兩次都係 `verdict: verified`（即寫入路徑同一 batch 內嘅 `changes()` 語意完好）。
+即係距離塌咗大約**十倍**：143ms → 14–20ms。
+
+### 8.2 tick 側（`/health`）
+| 讀數 | 改之前 | 改之後（三個樣本） |
+|---|---|---|
+| `heartbeat.colo` | NRT | **DFW**（`relay inner`，一次 `via clock`、一次 `via cron`） |
+| `lastScanMs` | 3,599–4,058ms | **2,292 / 3,235ms** |
+| `dbTickSteps` 每 tick 加總 | ~5,000ms（同一窗口 5 個 tick 合共 ~25.0s） | **189 / 270 / 218ms** |
+| `getWorkerStates` 每次 call | 202ms | **29ms**（17 calls/497ms） |
+| `claimScanLock` | 186ms | 49ms |
+| `writeScanFront` | 174ms | 22–90ms |
+| `getReevalPool` | 401ms | 31ms |
+| `getTokenStatsMany` | 152ms | 14ms |
+| `isTokenSeen` | 143ms | 14ms |
+| tracker pass `trackerMs` | 763ms | **202ms**（`trips 4`、`db 0ms`） |
+
+### 8.3 寫入路徑冇壞（最要緊嗰句）
+- `scan_history` 最新一行 `23:35:24Z`，讀嘅時候係 **10 秒前**（tick 嘅完成 flush 準時落）。
+- `seen_tokens` 1,223、`token_stats` 56,316 行（同一時間 /health 嘅 cached counter 56,672——`pruneOldTokenStats` 同 hourly 嘅 `reconcileTelemetryCounts` 之間嘅正常漂移，唔係 lost write）。
+- `writeCensus` 見到 `update token_stats`、`insert scan_history`、`update push_watch`、`insert worker_state`——六個改成「一次請求」嘅 writer 有數落。
+- `writeDrainError null`、`deadTickStreak 0`、`initError null`、`dbReady true`、`scannerReady true`。
+
+### 8.4 呢批讀數嘅限制
+- **樣本細**：每個 method 1–3 次 call（isolate 換代之後 counter 重新計）；`readScanFront`／`writeScanFront` 都有 129ms／179ms 嘅樣本，
+  因為 **D1 每個 database 單線程**（同一個 tick 內多個請求會排隊），所以睇**每 tick 加總**，唔好睇單次 call 嘅 min/max。
+- **placement 係 hint**：Cloudflare 官方講明會因網絡維護自動調整；如果日後再見到 cross-region 讀數，先睇 `served_by_colo`（`wrangler d1 execute … --remote … "SELECT 1"`），再決定要唔要換 §2 嘅 fallback。
+- 呢次 deploy 只改 placement 同 writer 嘅請求形狀，**冇改 state machine**：單飛鎖、`seen_tokens`、tracker CAS 全部照舊，亦冇任何 marker／migration 變動（`migrate`／`catchup` 靠 marker no-op）。
