@@ -604,6 +604,113 @@ export interface TokenStats {
 }
 
 /**
+ * Rows WRITTEN as the server reports them, per statement shape — the write-side
+ * twin of the tick probe's call census (see dbTickStepView in src/tickprobe.ts).
+ *
+ * WHY IT EXISTS (2026-10-15): a trim that removes CALLS can leave the billed
+ * quantity flat, because the free plan bills ROWS: the 2026-10-14 trim
+ * (docs/turso-write-trim-2026-10-14.md) took the pool lane out of the tick's
+ * recorded-liquidity write and the A/B read 263 -> 246 rows/tick against a
+ * table census that showed only ~30 rows/tick of NET growth — i.e. ~200 rows
+ * per tick of in-place UPDATE churn nobody had ever attributed. The call
+ * census cannot see it (it counts calls, and a batch of 200 UPDATEs is ONE
+ * call); `rowsAffected` can. This meter rides the hard-wall Proxy that already
+ * intercepts every execute()/batch() (see wrapClientWithHardWall), so it
+ * counts every statement the process issues, from any call site, with no
+ * per-method instrumentation to drift.
+ *
+ * Turso counts a row as written even when an UPDATE rewrites a row with the
+ * SAME values (SQLite marks the page dirty either way), so `rowsAffected` is
+ * the honest lower bound of what the plan bills — a statement that matches no
+ * row costs a round trip but 0 rows, and is deliberately not counted here.
+ */
+const WRITE_CENSUS_MAX_KEYS = 200;
+/** Per statement shape: rows the server accepted, and how many statements. */
+const writeCensus = new Map<string, { rows: number; stmts: number }>();
+/** Rows whose shape overflowed the key cap, so the total stays exact. */
+const writeCensusOverflow = { rows: 0, stmts: 0 };
+let writeCensusRows = 0;
+const writeCensusSince = Date.now();
+
+/**
+ * The census key for one statement: its write verb and target table
+ * ("update token_stats", "insert seen_tokens", "delete push_recaps").
+ *
+ * Exported for the unit test: the attribution is only as good as this parser,
+ * and a key that reads `other` for a statement that clearly writes a table
+ * would hide the very row this census exists to find. Anything without a
+ * write verb (SELECT, PRAGMA) answers "other" and is dropped by the caller
+ * anyway — a read reports rowsAffected 0.
+ */
+export function writeCensusKey(sql: string): string {
+  const verb = /^\s*(insert(?:\s+or\s+\w+)?|replace|update(?:\s+or\s+\w+)?|delete)\b/i.exec(sql);
+  if (!verb) return "other";
+  const raw = verb[1]!.toLowerCase();
+  const kind =
+    raw.startsWith("insert") || raw.startsWith("replace")
+      ? "insert"
+      : raw.startsWith("update")
+        ? "update"
+        : "delete";
+  const table =
+    kind === "update"
+      ? /\bupdate(?:\s+or\s+\w+)?\s+([a-z_][a-z0-9_]*)/i.exec(sql)
+      : kind === "insert"
+        ? /\binto\s+([a-z_][a-z0-9_]*)/i.exec(sql)
+        : /\bfrom\s+([a-z_][a-z0-9_]*)/i.exec(sql);
+  return table ? `${kind} ${table[1]!.toLowerCase()}` : kind;
+}
+
+/** Rows one libsql result reports as affected (a batch answers per statement). */
+function rowsAffectedOf(result: unknown): number {
+  if (Array.isArray(result)) return result.reduce((n, r) => n + rowsAffectedOf(r), 0);
+  const ra = (result as { rowsAffected?: unknown } | null)?.rowsAffected;
+  if (typeof ra === "number") return ra;
+  if (typeof ra === "bigint") return Number(ra);
+  return 0;
+}
+
+/** The SQL text of a statement, for either the string or the {sql} shape. */
+function statementSql(stmt: unknown): string {
+  if (typeof stmt === "string") return stmt;
+  const sql = (stmt as { sql?: unknown } | null)?.sql;
+  return typeof sql === "string" ? sql : "";
+}
+
+function noteWriteCensus(sql: unknown, result: unknown): void {
+  const rows = rowsAffectedOf(result);
+  if (rows <= 0) return;
+  writeCensusRows += rows;
+  const key = writeCensusKey(statementSql(sql));
+  const seen = writeCensus.get(key);
+  if (seen) {
+    seen.rows += rows;
+    seen.stmts += 1;
+    return;
+  }
+  if (writeCensus.size >= WRITE_CENSUS_MAX_KEYS) {
+    writeCensusOverflow.rows += rows;
+    writeCensusOverflow.stmts += 1;
+    return;
+  }
+  writeCensus.set(key, { rows, stmts: 1 });
+}
+
+/** The write census of THIS isolate, heaviest shape first (see /health). */
+export function writeCensusView(limit = 24): {
+  rows: number;
+  sinceMs: number;
+  keys: Array<{ key: string; rows: number; stmts: number }>;
+} {
+  const keys = [...writeCensus.entries()]
+    .map(([key, v]) => ({ key, rows: v.rows, stmts: v.stmts }))
+    .sort((a, b) => b.rows - a.rows)
+    .slice(0, limit);
+  if (writeCensusOverflow.rows > 0) keys.push({ key: "(overflow)", ...writeCensusOverflow });
+  return { rows: writeCensusRows, sinceMs: Date.now() - writeCensusSince, keys };
+}
+
+/**
  * Thin wrapper around the Turso (libSQL) client.
  *
 /**
@@ -664,6 +771,24 @@ export function wrapClientWithHardWall<T extends object>(
         if (onCost) {
           raced.finally(() => onCost(Date.now() - t0)).catch(() => {});
         }
+        // The write census rides the same race (see noteWriteCensus): the
+        // result is where `rowsAffected` lives, and a late-settling promise
+        // after the wall has no reader for it anyway.
+        raced
+          .then((result) => {
+            if (prop === "execute") {
+              noteWriteCensus(args[0], result);
+              return;
+            }
+            const stmts = Array.isArray(args[0]) ? args[0] : [];
+            const results = Array.isArray(result) ? result : [result];
+            for (let i = 0; i < results.length; i++) {
+              noteWriteCensus(stmts[i], results[i]);
+            }
+          })
+          .catch(() => {
+            // A failed statement wrote nothing to count.
+          });
         return raced;
       };
     },

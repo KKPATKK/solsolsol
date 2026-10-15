@@ -23636,6 +23636,69 @@ async function main() {
     );
   });
 
+  await test("db write census: rows are attributed to the statement's verb + table", async () => {
+    const {
+      writeCensusKey,
+      writeCensusView,
+      wrapClientWithHardWall,
+    } = require("../dist/db.js");
+    // The parser: one key per write shape. A miss here would put real rows
+    // under `other`, i.e. hide the very writer the census exists to name.
+    assert.equal(
+      writeCensusKey("UPDATE token_stats SET last_liquidity_usd = ? WHERE token = ?"),
+      "update token_stats",
+    );
+    assert.equal(
+      writeCensusKey("\n  INSERT OR IGNORE INTO seen_tokens (chat_id, token) VALUES (?, ?)"),
+      "insert seen_tokens",
+    );
+    assert.equal(
+      writeCensusKey(
+        "INSERT INTO worker_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ),
+      "insert worker_state",
+      "an upsert is an insert of its target table, not a second write shape",
+    );
+    assert.equal(
+      writeCensusKey("DELETE FROM token_stats WHERE token IN (SELECT token FROM token_stats LIMIT 5000)"),
+      "delete token_stats",
+    );
+    assert.equal(writeCensusKey("REPLACE INTO worker_state (key, value) VALUES (?, ?)"), "insert worker_state");
+    assert.equal(writeCensusKey("UPDATE OR REPLACE push_watch SET token = ?"), "update push_watch");
+    assert.equal(writeCensusKey("SELECT * FROM push_watch"), "other", "a read has no write shape");
+    assert.equal(writeCensusKey("PRAGMA journal_mode"), "other");
+    // The meter: rows come off the server's own rowsAffected, for both the
+    // single-statement and the batched shape — one batch is ONE CALL, so the
+    // call census can never see the rows inside it.
+    const before = writeCensusView(200);
+    const client = wrapClientWithHardWall({
+      execute: async () => ({ rowsAffected: 3 }),
+      batch: async () => [{ rowsAffected: 1 }, { rowsAffected: 2 }],
+    });
+    await client.execute({
+      sql: "UPDATE token_stats SET min_mcap_observed = ? WHERE token = ?",
+      args: [1, "t"],
+    });
+    await client.batch([
+      { sql: "DELETE FROM token_stats WHERE token = ?", args: ["a"] },
+      { sql: "INSERT INTO seen_tokens (chat_id, token) VALUES (?, ?)", args: ["c", "t"] },
+    ]);
+    const after = writeCensusView(200);
+    assert.equal(after.rows - before.rows, 6, "3 + (1 + 2) rows landed in the census");
+    const keyRows = (keys, key) =>
+      keys.filter((k) => k.key === key).reduce((n, k) => n + k.rows, 0);
+    assert.equal(keyRows(after.keys, "update token_stats") - keyRows(before.keys, "update token_stats"), 3);
+    assert.equal(keyRows(after.keys, "delete token_stats") - keyRows(before.keys, "delete token_stats"), 1);
+    assert.equal(keyRows(after.keys, "insert seen_tokens") - keyRows(before.keys, "insert seen_tokens"), 2);
+    // …and /health publishes it, or the attribution is unreadable in production.
+    assert.ok(
+      fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8").includes(
+        "writeCensus: writeCensusView()",
+      ),
+      "/health must publish the write census",
+    );
+  });
+
   console.log("\n===== UNIT TESTS =====");
   for (const line of results) console.log(line);
   console.log(`\n  ${passed} passed, ${failed} failed`);

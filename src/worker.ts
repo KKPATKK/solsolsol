@@ -20,6 +20,7 @@ import {
   parseTelemetryCounter,
   parseTradeModeOverride,
   telemetryCounterUsable,
+  writeCensusView,
   type ScanTrigger,
   type ScanTriggerCounts,
   type ScheduledTickEntry,
@@ -7222,6 +7223,16 @@ const worker = {
           writeDrainError === null || !(Number(writeDrainError.at) > 0)
             ? null
             : drainErrorIsStale(writeDrainError, Date.now()),
+        // WHAT this isolate's statements billed in ROWS, per statement shape,
+        // since it booted (see writeCensusView in src/db.ts). The free plan
+        // bills rows_written, NOT calls: the drained-call trims of 2026-10-14
+        // moved calls and left the bill flat, because ~200 rows/tick of
+        // in-place UPDATE churn had never been attributed to a statement. This
+        // is that attribution, read straight off the server's rowsAffected.
+        // Per ISOLATE and cumulative: two polls in a row on the SAME isolate
+        // (watch `heartbeat.owner`) give the rate, and keys[0] names the
+        // loudest writer without a tick-level window.
+        writeCensus: writeCensusView(),
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         // Cross-isolate single-flight: how often this isolate skipped a
