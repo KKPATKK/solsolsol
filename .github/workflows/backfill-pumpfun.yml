@@ -1,79 +1,81 @@
-name: Backfill pump.fun coins
+name: "Backfill the re-eval pool (was: pump.fun coins)"
 
-# Runs the one-time backfill (seed token_stats with pump.fun coins created in
-# the last ~42h) from a GitHub Actions runner. pump.fun blocks datacenter IPs
-# (530 from the sandbox and the Cloudflare Worker), but GitHub-hosted runners
-# egress from different ranges — this job tests reachability first and only
-# runs the backfill when the feed responds.
+# WHY THE FILE IS STILL CALLED backfill-pumpfun.yml. This is the same operator
+# lever it always was — the one-shot that seeds token_stats with recently
+# created coins, so launches that happened before discovery was watching can
+# still age into the re-eval pool and be pushed — but its SOURCE is retired
+# (2026-10-15). The path stays because docs/d1-migration-2026-10-15.md, the
+# deploy workflow's notes and the run history all link to it by path; the name
+# above says what it now does.
 #
-# WHERE IT WRITES (2026-10-15): D1, not Turso. The cutover made Turso a
-# read-only archive (docs/d1-migration-2026-10-15.md), so rows written there
-# would never reach the Worker's pool — the script now names the D1 database
-# itself (resolve it below) and writes through the Cloudflare API. The Turso
-# secrets are no longer needed by this job.
+# WHAT CHANGED, AND WHY A GREEN RUN IS NO LONGER ENOUGH. The old job scraped
+# pump.fun's launch API from the runner and gated on its reachability. Measured
+# 2026-10-15, that feed refuses every egress this bot has: the sandbox and the
+# GitHub-hosted runner both get a Cloudflare challenge page from
+# `frontend-api.pump.fun` (HTTP 403, "Just a moment…"), `frontend-api-v2`
+# answers `access_denied / rule_id 0.18`, and the legacy host is dead outright
+# (530 / error 1016 — see src/pumpfun.ts). So the gate SKIPPED the backfill
+# while the job still reported success (run 38725742725's log reads "pump.fun
+# returns 403 from GitHub Actions runner — backfill cannot run here"): a job
+# that seeds nothing looked exactly like a job that seeded everything.
 #
-# Trigger: manual (Actions tab → Run workflow), or automatically when the
-# backfill script changes. Needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID
-# as GitHub Actions secrets (the token needs D1:Edit).
+# THE SOURCE NOW. Birdeye's `new_listing` feed with meme_platform_enabled=true
+# (pump.fun launches included), reached the way production already reaches it —
+# the deployed Worker calls it and writes the rows through its own D1 binding
+# (src/worker.ts `/debug/backfill`; scanner.runPeriodicBackfill is the same call
+# on an interval inside the tick). This job is the manual lever on that route:
+# the difference between "seeded now" and "seeded when the interval next fires".
+#
+# NO CREDENTIALS. The route is unauthenticated and the write happens inside the
+# Worker, so this workflow holds NO secret at all: nothing to rotate, nothing to
+# leak, and no CLOUDFLARE_API_TOKEN with D1:Edit for a backfill that no longer
+# writes from the runner. `scripts/backfill-pool.mjs` is what makes the run
+# honest — it exits non-zero when the route refuses and reads the route's own
+# sample mint back through `/debug/token`, so a run that seeded nothing cannot
+# pass (see its header). It also reads the Worker's hostname from wrangler.toml
+# rather than repeating it here.
+#
+# TRIGGER: manual only. The route WRITES production D1 (idempotently), so the
+# `push:` trigger the old file carried — on the script's own path — would seed
+# the pool as a side effect of a commit. Dispatch it from the Actions tab, or
+# with `gh workflow run backfill-pumpfun.yml`.
+#
+# It needs no D1 credentials and no database id for exactly that reason, which
+# is why scripts/test-d1-migrate.js asserts the absence of BOTH here (the
+# Axiom refresher, which still writes D1 from the runner, keeps resolving the
+# database by name).
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'scripts/backfill-pumpfun.mjs'
+    inputs:
+      worker_url:
+        description: "Worker base URL — leave empty to use wrangler.toml's CRON_RELAY_URL"
+        required: false
+        default: ""
+      timeout_ms:
+        description: "How long to wait for the route (it walks a 42h window in 6h chunks)"
+        required: false
+        default: "120000"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Node is pinned like every other workflow here, but nothing is installed
+      # and nothing is built: the script is standalone (global fetch + node:fs)
+      # and the write happens inside the Worker, not in this runner — which is
+      # also why this job needs no `npm ci`, no `npm run build` and no cache.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
-      # The script chunks its INSERTs with the shared helper from src/d1.ts
-      # (chunkForParamLimit) and talks to D1 through scripts/d1-rest.js.
-      - name: Build
-        run: npm run build
-
-      # The database's uuid, looked up (or created) by name — never committed.
-      - name: Resolve the D1 database
-        id: d1
+      - name: Seed the pool through the deployed Worker
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          D1_DATABASE_NAME: solana-meme-bot
-        run: node scripts/d1-copy.js ensure
-
-      - name: Test pump.fun reachability from runner
-        run: |
-          code=$(curl -s -o /tmp/pf.json -w "%{http_code}" --max-time 15 \
-            "https://frontend-api.pump.fun/coins?limit=2&sort=created&order=DESC")
-          echo "HTTP $code"
-          if [ "$code" = "200" ]; then
-            echo "::notice::pump.fun reachable from GitHub Actions runner — backfill can run here"
-            echo "REACHABLE=1" >> "$GITHUB_ENV"
-          else
-            echo "::warning::pump.fun returns $code from GitHub Actions runner (datacenter block) — backfill cannot run here; see docs for alternatives"
-          fi
-
-      - name: Run backfill
-        if: env.REACHABLE == '1'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          D1_DATABASE_ID: ${{ steps.d1.outputs.database_id }}
-        run: |
-          if [ -z "$D1_DATABASE_ID" ]; then
-            echo "::warning::the D1 database could not be resolved (is CLOUDFLARE_API_TOKEN set, with D1:Edit?) — refusing to write the Turso archive instead; re-run once the secret is in place"
-            exit 0
-          fi
-          node scripts/backfill-pumpfun.mjs --since-hours 42
+          WORKER_URL: ${{ inputs.worker_url }}
+          TIMEOUT_MS: ${{ inputs.timeout_ms }}
+        run: node scripts/backfill-pool.mjs

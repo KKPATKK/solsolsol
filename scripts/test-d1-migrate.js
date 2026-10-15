@@ -823,30 +823,138 @@ async function main() {
       );
     }
 
-    // The two operator jobs WRITE, so they must not hold them at all, and must
-    // name the D1 database explicitly (resolved by name on every run).
-    for (const name of ["backfill-pumpfun.yml", "axiom-refresh.yml"]) {
-      const yml = readWorkflow(name);
-      assert.equal(/secrets\.TURSO_AUTH_TOKEN/.test(yml), false, `${name} still reads archive credentials`);
-      assert.equal(/secrets\.TURSO_DATABASE_URL/.test(yml), false, `${name} still reads archive credentials`);
-      assert.match(yml, /scripts\/d1-copy\.js ensure/, `${name} must resolve the D1 database`);
-      assert.match(yml, /D1_DATABASE_ID: \$\{\{ steps\.d1\.outputs\.database_id \}\}/);
-    }
+    // The Axiom refresher is the operator job left that WRITES D1 FROM THE
+    // RUNNER, so it must not hold archive credentials at all, and must name the
+    // D1 database explicitly (resolved by name on every run). The pool backfill
+    // used to be the second name in this loop; since 2026-10-15 it writes
+    // through the deployed Worker's own binding instead, so it holds no
+    // credential and resolves no database — pinned by its own test below.
+    const axiomYml = readWorkflow("axiom-refresh.yml");
+    assert.equal(/secrets\.TURSO_AUTH_TOKEN/.test(axiomYml), false, "axiom-refresh.yml still reads archive credentials");
+    assert.equal(/secrets\.TURSO_DATABASE_URL/.test(axiomYml), false, "axiom-refresh.yml still reads archive credentials");
+    assert.match(axiomYml, /scripts\/d1-copy\.js ensure/, "axiom-refresh.yml must resolve the D1 database");
+    assert.match(axiomYml, /D1_DATABASE_ID: \$\{\{ steps\.d1\.outputs\.database_id \}\}/);
 
-    // The three hand-run tools that CAN write a store carry the same explicit
+    // The four hand-run tools that CAN write a store carry the same explicit
     // opt-in, so "the archive is read-only" is a property of the scripts and not
     // only of the workflows: backfill (token_stats rows), the Axiom refresher
-    // (the rotated pair — a rotation in the wrong store kills the session), and
-    // pool-read-cost's `index` mode (a partial index the Worker mints on D1).
+    // (the rotated pair — a rotation in the wrong store kills the session),
+    // pool-read-cost's `index` mode (a partial index the Worker mints on D1),
+    // and test-filters.js — which is `npm test`, called by hand far more often
+    // than any of them, and which upserts token_stats then runs the REAL
+    // Scanner.runOnce before deleting its own seen_tokens rows.
     const optIns = [
       ["scripts/backfill-pumpfun.mjs", /--allow-archive-write/],
       ["scripts/axiom-refresh-action.py", /ARCHIVE_WRITE_OK/],
       ["scripts/pool-read-cost.js", /ALLOW_ARCHIVE_WRITE/],
+      ["scripts/test-filters.js", /--allow-archive-write/],
     ];
     for (const [file, optIn] of optIns) {
       const src = fs.readFileSync(path.join(__dirname, "..", file), "utf8");
       assert.match(src, optIn, `${file} must gate its archive writes behind an opt-in`);
     }
+
+    // The opt-in must be a CONJUNCTION with the credentials: a guard that only
+    // mentioned the flag would still connect whenever TURSO_* happened to be in
+    // the environment (which is exactly how `npm test` reached the archive in
+    // this workspace). Only the phases' `if (db)` checks may then follow.
+    const filters = fs.readFileSync(path.join(__dirname, "..", "scripts", "test-filters.js"), "utf8");
+    assert.match(
+      filters,
+      /const USE_ARCHIVE = Boolean\(URL && TOKEN\) && ARCHIVE_WRITE_OK;/,
+      "test-filters.js must make the archive available only when opt-in AND credentials are both present",
+    );
+    assert.match(
+      filters,
+      /if \(USE_ARCHIVE\) \{/,
+      "test-filters.js phase 1 must gate the real settings read on USE_ARCHIVE",
+    );
+  });
+
+  await test("the pool backfill asks the deployed Worker, and can write no store itself", () => {
+    // WHY THIS PINS A WORKFLOW. The one-shot backfill used to scrape pump.fun's
+    // launch feed from the runner and gate on its reachability. That feed
+    // refuses every egress this bot has (403 / Cloudflare challenge, measured
+    // 2026-10-15: sandbox, Worker AND the GitHub-hosted runner), so the gate
+    // skipped the backfill while the job still reported SUCCESS — the failure
+    // this change removes. It now asks the deployed Worker's `/debug/backfill`
+    // route, whose D1 binding does the write in production.
+    const yml = readWorkflow("backfill-pumpfun.yml");
+    assert.match(yml, /node scripts\/backfill-pool\.mjs/, "the workflow must run the pool-backfill script");
+    assert.equal(
+      /backfill-pumpfun\.mjs/.test(yml),
+      false,
+      "the pump.fun script's feed is refused from every egress we have — the workflow must not invoke it",
+    );
+    // It fetches no feed itself: the probe (curl) was the gate that turned a
+    // blocked feed into a green run, and the Worker is what reaches Birdeye.
+    // Comments are stripped first, so the header may discuss the old probe
+    // without the assertion either failing on prose or passing on it — the old
+    // file's curl sat on a `run: |` continuation line, which a match on the
+    // `run:` line alone would have missed.
+    const codeOnly = yml
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+    assert.equal(
+      /\bcurl\b/.test(codeOnly),
+      false,
+      "the workflow must not fetch a feed itself — the Worker's route is the only call",
+    );
+    // NO credential at all, which is stronger than the archive-credential rule
+    // it replaces: the route is unauthenticated and the write is the Worker's,
+    // so there is nothing here to rotate, leak — or resolve a database with.
+    assert.equal(/secrets\./.test(yml), false, "the backfill workflow must hold no secret at all");
+    assert.equal(
+      /D1_DATABASE_ID|database_id/.test(yml),
+      false,
+      "it writes through the Worker's binding, so it resolves no database id",
+    );
+    // Manual only: dispatching is what spends Birdeye CU, so a `push:` trigger
+    // (the old file had one, on the script's path) would seed production as a
+    // side effect of a commit. Asserted on the `on:` BLOCK, not on its first
+    // line: the old file's `workflow_dispatch:` was first there too, with
+    // `push:` right behind it.
+    const onAt = yml.indexOf("\non:");
+    const jobsAt = yml.indexOf("\njobs:");
+    assert.ok(onAt > 0 && jobsAt > onAt, "the workflow must keep an on: block above its jobs");
+    const onBlock = yml.slice(onAt, jobsAt);
+    assert.match(onBlock, /^  workflow_dispatch:/m, "dispatch is the trigger to keep");
+    assert.equal(
+      /^\s{2}(push|schedule|pull_request|workflow_run|release):/m.test(onBlock),
+      false,
+      "the trigger must be dispatch-ONLY — the route writes production",
+    );
+
+    // The URL the run asks is wrangler.toml's CRON_RELAY_URL, resolved AT RUN
+    // TIME — a hostname copied into a script or workflow is how a job ends up
+    // asking a Worker that no longer exists. Asserted as BEHAVIOR (the script's
+    // own --check-url, which sends nothing) rather than by grepping its source.
+    const scriptPath = path.join(__dirname, "..", "scripts", "backfill-pool.mjs");
+    const script = fs.readFileSync(scriptPath, "utf8");
+    const tomlUrl = fs
+      .readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8")
+      .match(/^\s*CRON_RELAY_URL\s*=\s*"([^"]+)"/m)?.[1];
+    assert.ok(tomlUrl, "wrangler.toml must carry CRON_RELAY_URL (the Worker's own URL)");
+    const { spawnSync } = require("node:child_process");
+    const checked = spawnSync(process.execPath, [scriptPath, "--check-url"], { encoding: "utf8" });
+    assert.equal(checked.status, 0, `--check-url must resolve a URL, got: ${checked.stderr}`);
+    assert.equal(
+      checked.stdout.trim(),
+      tomlUrl,
+      "the script must ask the Worker wrangler.toml declares — never a copy of the hostname",
+    );
+    assert.equal(
+      /workers\.dev/.test(script),
+      false,
+      "the hostname must not be duplicated in the script",
+    );
+    // The honesty the old workflow lacked: a refusal exits non-zero, and the
+    // seed is confirmed by reading the row back through the pool's own read
+    // path — `ok:true` from the writer alone is not evidence the row landed.
+    assert.match(script, /process\.exit\(1\)/, "a refused or unlanded run must exit non-zero");
+    assert.match(script, /TOKEN_PATH/, "the script must read the seeded row back");
+    assert.match(script, /\/debug\/backfill/, "the script must name the route it drives");
   });
 
   console.log("===== D1 MIGRATION TESTS =====");

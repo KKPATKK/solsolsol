@@ -2,8 +2,14 @@
  * Complete filter-chain test for the Solana meme coin scanner.
  *
  * Usage (secrets supplied at runtime, never stored in this file):
+ *   BIRDEYE_API_KEY=... node scripts/test-filters.js
+ *
+ * This file is `npm test`, and it is a WRITER — which is why it carries the
+ * archive guard described at ARCHIVE_WRITE_OK below. By default the database
+ * phases are skipped entirely; running them against the frozen Turso archive
+ * takes a deliberate --allow-archive-write:
  *   TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... BIRDEYE_API_KEY=... \
- *     node scripts/test-filters.js
+ *     node scripts/test-filters.js --allow-archive-write
  *
  * Phases:
  *   1. Config sanity: DEFAULT_SETTINGS + /help text contain the 6 filters
@@ -26,6 +32,38 @@ const { Scanner } = require("../dist/scanner.js");
 const URL = process.env.TURSO_DATABASE_URL;
 const TOKEN = process.env.TURSO_AUTH_TOKEN;
 const BKEY = process.env.BIRDEYE_API_KEY;
+
+/**
+ * ARCHIVE GUARD (added 2026-10-15, after the D1 cutover).
+ *
+ * Turso is the FROZEN read-only archive: rows written there are never read by
+ * the Worker again (docs/d1-migration-2026-10-15.md §5). This script is not a
+ * reader — phase 2 upserts rugcheck/trader/min-mcap readings into token_stats,
+ * phase 3 runs the REAL `Scanner.runOnce` (seen_tokens claims, scan_history,
+ * pool state) and then deletes the seen_tokens rows it created. Because this
+ * file is `npm test`, a routine local run used to mutate the frozen archive
+ * with no guard at all.
+ *
+ * So the archive is opt-in, with the same switch as the other hand-run writers
+ * (scripts/backfill-pumpfun.mjs, scripts/pool-read-cost.js, and
+ * scripts/axiom-refresh-action.py): `--allow-archive-write`, or
+ * ALLOW_ARCHIVE_WRITE=1. Without it the DB phases take their existing
+ * "no database" path — phase 1's config checks and phase 2's live-feed
+ * diagnosis still run, and nothing touches Turso.
+ */
+const ARCHIVE_WRITE_OK =
+  process.argv.includes("--allow-archive-write") ||
+  /^(1|true|yes)$/i.test(process.env.ALLOW_ARCHIVE_WRITE || "");
+const USE_ARCHIVE = Boolean(URL && TOKEN) && ARCHIVE_WRITE_OK;
+
+/** Why the database phases are not running, phrased for whoever just ran it. */
+function archiveSkipReason() {
+  if (!URL || !TOKEN) return "⚠️  TURSO 未配置，跳过";
+  return (
+    "🚫 Turso 憑證已設定，但 Turso 係唯讀 archive（2026-10-15 切去 D1）——" +
+    " 呢個腳本會寫入，所以要明加 --allow-archive-write（或 ALLOW_ARCHIVE_WRITE=1）才讀寫 archive。跳過資料庫階段。"
+  );
+}
 
 // The bounds come from the scanner itself, so the diagnosis runs what the tick
 // runs. These were hand-copied until 2026-09-28: this copy happened to stay
@@ -76,8 +114,8 @@ async function phase1() {
     console.log(`  ${ok ? "✅" : "❌"} /help 文案不再包含 "${t}"（已移除该 filter）`);
   }
 
-  // Real chat settings from the database.
-  if (URL && TOKEN) {
+  // Real chat settings from the database (archive only with an explicit opt-in).
+  if (USE_ARCHIVE) {
     const db = new Db(URL, TOKEN);
     await db.init();
     const chats = await db.listEnabledChats();
@@ -89,7 +127,7 @@ async function phase1() {
     }
     return db;
   }
-  console.log("  ⚠️  TURSO 未配置，跳过真实设置读取");
+  console.log(`  ${archiveSkipReason()}`);
   return null;
 }
 
@@ -262,8 +300,11 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
 
 async function phase3(db, cfg, dex, birdeye, rugcheck) {
   console.log("\n===== PHASE 3: 真实 Scanner.runOnce 端到端（mock bot，不实际发送） =====\n");
-  if (!db) {
-    console.log("  ⚠️  TURSO 未配置，跳过");
+  // `db` is only ever non-null under USE_ARCHIVE (phase 1 returns it there),
+  // but the guard is restated here so every DB touchpoint in this file is
+  // gated by the opt-in rather than by inference.
+  if (!db || !USE_ARCHIVE) {
+    console.log(`  ${archiveSkipReason()}`);
     return;
   }
   const testStart = Date.now();
@@ -312,10 +353,15 @@ async function main() {
   await phase3(db, cfg, dex, birdeye, rugcheck);
 
   console.log("\n===== 测试完成 =====");
-  if (URL && TOKEN && BKEY) {
-    console.log("  数据源: DexScreener ✅ / Turso ✅ / Birdeye ✅ / RugCheck ✅");
+  const turso = USE_ARCHIVE
+    ? "Turso archive ✅ (--allow-archive-write)"
+    : URL && TOKEN
+      ? "Turso 🚫 唯讀 archive（未開 --allow-archive-write）"
+      : "Turso ⚠️未配";
+  if (USE_ARCHIVE && BKEY) {
+    console.log(`  数据源: DexScreener ✅ / ${turso} / Birdeye ✅ / RugCheck ✅`);
   } else {
-    console.log("  数据源: " + (URL ? "Turso ✅" : "Turso ⚠️未配") + " / " + (BKEY ? "Birdeye ✅" : "Birdeye ⚠️未配"));
+    console.log(`  数据源: ${turso} / ${BKEY ? "Birdeye ✅" : "Birdeye ⚠️未配"}`);
   }
   process.exit(0);
 }
