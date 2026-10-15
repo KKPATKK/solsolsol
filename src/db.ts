@@ -630,7 +630,22 @@ const writeCensus = new Map<string, { rows: number; stmts: number }>();
 /** Rows whose shape overflowed the key cap, so the total stays exact. */
 const writeCensusOverflow = { rows: 0, stmts: 0 };
 let writeCensusRows = 0;
-const writeCensusSince = Date.now();
+/**
+ * Epoch of the first row counted (0 = none yet). LAZY ON PURPOSE: module scope
+ * is evaluated during the runtime's PRE-INIT, where `Date.now()` answers 0, so
+ * a stamp taken at evaluation time reads as 1970 and makes `sinceMs` answer
+ * `Date.now()` itself — measured live 2026-10-15 on the freshly deployed
+ * isolate (`rows 0, sinceMs 1792034987235`, i.e. the whole epoch). The first
+ * counted row (or the first view) happens inside a real request, where the
+ * clock is live.
+ */
+let writeCensusSince = 0;
+
+/** Stamp the census baseline on first use, wherever the clock is real. */
+function writeCensusClock(): number {
+  if (writeCensusSince === 0) writeCensusSince = Date.now();
+  return writeCensusSince;
+}
 
 /**
  * The census key for one statement: its write verb and target table
@@ -680,6 +695,7 @@ function statementSql(stmt: unknown): string {
 function noteWriteCensus(sql: unknown, result: unknown): void {
   const rows = rowsAffectedOf(result);
   if (rows <= 0) return;
+  writeCensusClock();
   writeCensusRows += rows;
   const key = writeCensusKey(statementSql(sql));
   const seen = writeCensus.get(key);
@@ -707,7 +723,7 @@ export function writeCensusView(limit = 24): {
     .sort((a, b) => b.rows - a.rows)
     .slice(0, limit);
   if (writeCensusOverflow.rows > 0) keys.push({ key: "(overflow)", ...writeCensusOverflow });
-  return { rows: writeCensusRows, sinceMs: Date.now() - writeCensusSince, keys };
+  return { rows: writeCensusRows, sinceMs: Date.now() - writeCensusClock(), keys };
 }
 
 /**

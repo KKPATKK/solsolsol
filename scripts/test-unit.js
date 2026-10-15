@@ -23697,6 +23697,21 @@ async function main() {
       ),
       "/health must publish the write census",
     );
+    assert.ok(
+      fs.readFileSync(path.join(__dirname, "..", "src", "tickprobe.ts"), "utf8").includes(
+        "summary.writeCensus = writeCensusView()",
+      ),
+      "the census must ride the tick summary, so the durable heartbeat carries it",
+    );
+    // The baseline stamp must stay LAZY: module scope runs during pre-init,
+    // where Date.now() answers 0, so an eager stamp makes sinceMs answer the
+    // epoch itself (measured live 2026-10-15 on a freshly deployed isolate).
+    const dbSrc = fs.readFileSync(path.join(__dirname, "..", "src", "db.ts"), "utf8");
+    assert.ok(
+      !/const writeCensusSince = Date\.now\(\)/.test(dbSrc) &&
+        dbSrc.includes("function writeCensusClock()"),
+      "the census baseline is stamped on first use, never at module scope",
+    );
   });
 
   console.log("\n===== UNIT TESTS =====");

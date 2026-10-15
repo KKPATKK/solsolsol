@@ -1,3 +1,4 @@
+import { writeCensusView } from "./db";
 import { geckoFeedStats } from "./geckoterminal";
 import { gmgnFeedStats } from "./gmgn";
 // The subrequest window is stamped here, because this wrapper is the only
@@ -1606,6 +1607,15 @@ export function installTickProbe(
         // subrequest host split says how much went to Turso; this says which
         // calls it was, which is what a batching decision needs.
         summary.dbTickSteps = dbTickStepView();
+        // …and the write side of the same question (src/db.ts, writeCensusView):
+        // rows the SERVER reported written, per statement shape, for THIS
+        // isolate. On the summary rather than only on /health because the free
+        // plan bills rows_written, not calls, and this reading has to survive
+        // the request landing on an isolate that never ticks: the summary rides
+        // the completion heartbeat, so any isolate can serve it, and two
+        // heartbeats from the same isolate give the per-tick rate (a changed
+        // isolate resets `sinceMs`, which is how a reader tells them apart).
+        summary.writeCensus = writeCensusView();
         if (marker !== null && captured.length > 0) {
           summary.phases = captured;
           // Published here rather than by the worker's onTickEnd hook: this
