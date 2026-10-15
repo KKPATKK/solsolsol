@@ -64,7 +64,15 @@ const {
   chunkForParamLimit,
   createD1Transport,
 } = require("../dist/d1.js");
-const { CloudflareApiError, createD1Rest, createRestBinding } = require("./d1-rest.js");
+const {
+  CloudflareApiError,
+  MAX_VALUE_BYTES,
+  boundBytes,
+  createD1Rest,
+  createRestBinding,
+  normalizeStatement,
+  planRequests,
+} = require("./d1-rest.js");
 
 /** worker_state key stamped by a completed `seed` pass (see the header). */
 const SEED_MARKER_KEY = "d1_seed_v1";
@@ -322,10 +330,19 @@ async function copyTable({ client, transport, table, mode, dryRun, pageRows, onP
   let changes = 0;
   let pending = [];
   let maxParams = 0;
+  let requests = 0;
 
   const flush = async () => {
     if (pending.length === 0) return;
     if (dryRun) {
+      // A dry run exists to catch what the real run would fail on, so it must
+      // still PLAN the requests. Skipping the plan is how a statement of ~200
+      // bytes of SQL carrying 335 KB of worker_state params passed a 37.9s dry
+      // run and then stopped the first real seed in CI (2026-10-15).
+      // Normalized exactly the way createRestBinding/`api.batch` normalizes
+      // them, so the dry run weighs the same statements the real run sends
+      // (the copy builds `{sql, args}`; the wire wants `{sql, params}`).
+      requests += planRequests(pending.map(normalizeStatement)).length;
       pending = [];
       return;
     }
@@ -339,6 +356,18 @@ async function copyTable({ client, transport, table, mode, dryRun, pageRows, onP
     if (page.length === 0) break;
     afterRowid = page[page.length - 1].rowid;
     rows += page.length;
+    // A row past D1's documented 2 MB string/row ceiling cannot be carried by
+    // ANY chunking, so it is refused here, by rowid, instead of being sent to
+    // be rejected by the API in the middle of a 117k-row copy.
+    for (const row of page) {
+      const bytes = boundBytes(row.values);
+      if (bytes > MAX_VALUE_BYTES) {
+        throw new Error(
+          `${table.name} rowid ${row.rowid} is ${bytes} bytes, over D1's ${MAX_VALUE_BYTES}-byte row/value limit` +
+            ` — no chunk size can carry it, that value has to shrink first`,
+        );
+      }
+    }
     for (const chunk of chunkForParamLimit(page.map((r) => r.values), argsPerRow, D1_MAX_BOUND_PARAMS)) {
       const statement = insertStatement(table, chunk, mode);
       maxParams = Math.max(maxParams, statement.args.length);
@@ -352,7 +381,7 @@ async function copyTable({ client, transport, table, mode, dryRun, pageRows, onP
     if (page.length < pageRows) break;
   }
   await flush();
-  return { table: table.name, rows, statements, changes, maxParams, rowsPerStatement };
+  return { table: table.name, rows, statements, changes, maxParams, rowsPerStatement, requests };
 }
 
 /** Every table, in name order. `only` narrows to a `--tables=` list. */
@@ -371,7 +400,9 @@ async function copyAll({ client, transport, tables, mode, dryRun, pageRows, log 
     log(
       `${table.name}: ${result.rows} rows → ${result.statements} statements ` +
         `(${result.rowsPerStatement}/statement, max ${result.maxParams} params)` +
-        (dryRun ? " [dry run]" : `, ${result.changes} rows affected`),
+        (dryRun
+          ? ` [dry run: ${result.requests} requests planned, every statement inside D1's limits]`
+          : `, ${result.changes} rows affected`),
     );
     out.push(result);
   }

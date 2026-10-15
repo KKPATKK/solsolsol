@@ -41,6 +41,19 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 
 `cap` 保留原本嘅行數上限，所以 **Turso 嘅 round-trip profile 完全不變**（切得太細會喺 Turso 白加 subrequest）。
 
+**第二條規則（2026-10-15 第一次真 seed 撞到）**：D1 嘅 statement 上限係 **SQL 文字 100 KB**
+（workerd 直接套 sqlite 嘅 `SQLITE_LIMIT_SQL_LENGTH`；SQLite 對「大 value」嘅建議本身就係綁做 parameter，
+見 cloudflare/workerd#3049），**唔包** bound parameter；單一 value／row 上限係 **2 MB**。
+當日 `scripts/d1-rest.js` 嘅 `planRequests` 把 SQL ＋ params 一齊量，所以 `worker_state`
+（67 行、合共 ~323 KB 嘅 JSON blob ring，最大一行 `push_audit` 33 KB）連一行都寫唔出：
+`statement is 335048 bytes, over D1's 100000-byte limit`——而 D1 其實收得落（處理器只收到 2 MB）。
+修法：**per-statement 只量 SQL 文字**（`sqlTextBytes`）；**per-request 先量 SQL＋params**
+（`MAX_REQUEST_BYTES` 1 MB 係自訂嘅運輸界線，唔係 D1 規則），另加 D1 文件明寫嘅 **2 MB／value·row**
+檢查（copy 會指名 rowid，因為呢個冇任何 chunking 救得到）。`--dry-run` 亦改成**照 plan requests**
+（乾跑唔 plan 就係 37.9s 乾跑都睇唔到呢條死因嘅原因；順帶第一次跑就快捉到一個 `{sql,args}`／`{sql,params}`
+未 normalize 嘅錯），`scripts/test-d1-migrate.js` 加咗一條 150 KB 嘅 `worker_state` row—用舊規則會紅
+（mutation 實測：`statement is 189037 bytes`）。
+
 ## 3. 已經落地嘅檔案
 **Worker／state machine**
 - `src/d1.ts`：`createD1Transport`、`normalizeD1Result`、`chunkForParamLimit`、`D1_MAX_BOUND_PARAMS`，同一個唔靠 `@cloudflare/workers-types` 嘅 binding 型別。

@@ -36,6 +36,9 @@ const { Db } = require("../dist/db.js");
 const { D1_MAX_BOUND_PARAMS, createD1Transport } = require("../dist/d1.js");
 const {
   CloudflareApiError,
+  MAX_REQUEST_BYTES,
+  MAX_VALUE_BYTES,
+  boundBytes,
   createD1Rest,
   createRestBinding,
   planRequests,
@@ -95,6 +98,7 @@ class FakeD1Api {
     this.databases = new Map(); // uuid -> { name, client }
     this.requests = [];
     this.maxParams = 0;
+    this.maxParamBytes = 0;
     this.worst = null;
     this.statements = 0;
     this.fetch = (url, init) => this.handle(String(url), init);
@@ -160,6 +164,18 @@ class FakeD1Api {
     this.statements++;
     if (params > this.maxParams) this.worst = stmt;
     this.maxParams = Math.max(this.maxParams, params);
+    // The values are weighed, not judged: D1's 100 KB rule is the SQL TEXT (see
+    // planRequests), so a fat value is legal here — it only has to stay inside
+    // the documented 2 MB string/row ceiling.
+    this.maxParamBytes = Math.max(this.maxParamBytes, boundBytes(stmt.params ?? []));
+    for (const param of stmt.params ?? []) {
+      if (typeof param === "string" && Buffer.byteLength(param) > MAX_VALUE_BYTES) {
+        return this.reply(400, {
+          success: false,
+          errors: [{ code: 7500, message: `value over ${MAX_VALUE_BYTES} bytes` }],
+        });
+      }
+    }
     if (params > D1_MAX_BOUND_PARAMS) {
       return this.reply(400, {
         success: false,
@@ -225,6 +241,42 @@ async function main() {
     assert.throws(
       () => planRequests([{ sql: `SELECT '${"x".repeat(100_001)}'`, params: [] }]),
       /over D1's 100000-byte limit/,
+    );
+  });
+
+  await test("planRequests: the 100 KB rule counts the SQL text, not the bound values", () => {
+    // The shape that stopped the first real seed (2026-10-15): an INSERT whose
+    // SQL is ~50 bytes and whose params are 335 KB (worker_state's rows). D1's
+    // limit is sqlite's SQLITE_LIMIT_SQL_LENGTH — the query TEXT — and SQLite's
+    // own guidance for a value that size is to BIND it, so counting the values
+    // towards the statement refused a statement D1 accepts.
+    const fat = [
+      { sql: "INSERT INTO worker_state (key, value) VALUES (?, ?)", params: ["push_audit", "x".repeat(335_048)] },
+    ];
+    const plans = planRequests(fat);
+    assert.equal(plans.length, 1, "one statement is one request");
+    assert.equal(plans[0].length, 1);
+    // The request bound still counts the values, so a group of them is split
+    // before the body outgrows MAX_REQUEST_BYTES.
+    const many = Array.from({ length: 4 }, () => ({
+      sql: "INSERT INTO worker_state (key, value) VALUES (?, ?)",
+      params: ["k", "x".repeat(300_000)],
+    }));
+    const grouped = planRequests(many);
+    assert.equal(grouped.length, 2, "1.2 MB of values does not fit one request");
+    assert.equal(
+      grouped.every((r) => r.reduce((n, s) => n + statementBytes(s), 0) <= MAX_REQUEST_BYTES),
+      true,
+    );
+  });
+
+  await test("planRequests: a value over D1's 2 MB row ceiling is refused by name", () => {
+    assert.throws(
+      () =>
+        planRequests([
+          { sql: "INSERT INTO worker_state (key, value) VALUES (?, ?)", params: ["k", "x".repeat(MAX_VALUE_BYTES + 1)] },
+        ]),
+      /over D1's 2000000-byte row\/value limit/,
     );
   });
 
@@ -376,6 +428,20 @@ async function main() {
     "INSERT OR REPLACE INTO worker_state (key, value) VALUES ('telemetry_seen_tokens_count', '2'), ('push_audit', '[{\"kind\":\"push\"}]')",
   );
 
+  // The shape the first real seed died on (2026-10-15): a fat but perfectly
+  // legal value. worker_state carries JSON blob rings (the live archive's
+  // push_audit is 33 KB, the crime list bigger), and this one row is over D1's
+  // 100 KB SQL-text rule the moment that rule is made to count the bound values
+  // with the text — while D1 itself accepts 2 MB of value per row.
+  const fatRing = `[${Array.from(
+    { length: 5_000 },
+    (_, i) => `{"m":"mint-${i}","at":1700${String(i % 1000).padStart(4, "0")}}`,
+  ).join(",")}]`;
+  await archive.client.execute({
+    sql: "INSERT OR REPLACE INTO worker_state (key, value) VALUES ('crime_wallets_ring_v1', ?)",
+    args: [fatRing],
+  });
+
   const tables = await introspect();
 
   await test("seed: every archive row lands, values and NULLs included (upsert)", async () => {
@@ -410,6 +476,19 @@ async function main() {
     // worker_state: init's own bootstrap rows plus the archive's, not instead of them.
     const state = await d1Client.execute("SELECT value FROM worker_state WHERE key = 'telemetry_seen_tokens_count'");
     assert.equal(String(state.rows[0].value), "2");
+    // The fat value landed byte-identical — and it really went through the fake
+    // API's checks, so this cannot pass by the copy having skipped the row.
+    const ring = await d1Client.execute("SELECT value FROM worker_state WHERE key = 'crime_wallets_ring_v1'");
+    assert.equal(
+      String(ring.rows[0]?.value) === fatRing,
+      true,
+      "a five-figure value must ride as a bound parameter, byte for byte",
+    );
+    assert.equal(
+      api.maxParamBytes >= 150_000,
+      true,
+      `the fat statement was never sent (max params seen: ${api.maxParamBytes} bytes)`,
+    );
 
     // The strongest statement available at seed time: every row the copy READ
     // was written (rowsAffected == rows, so no statement silently did nothing),

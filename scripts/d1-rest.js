@@ -43,11 +43,30 @@ const API_BASE = "https://api.cloudflare.com/client/v4";
 /** Statements per `/query` request. Undocumented limit → kept deliberately low. */
 const STATEMENTS_PER_REQUEST = 50;
 
-/** Bytes of SQL + parameters per request. Undocumented limit → kept low. */
+/**
+ * Bytes of SQL + parameters per REQUEST. Undocumented → deliberately low: this
+ * is a self-imposed transport bound, and it is the only place the bound VALUES
+ * are counted (see MAX_STATEMENT_BYTES for the rule D1 itself enforces).
+ */
 const MAX_REQUEST_BYTES = 1_000_000;
 
-/** D1's documented per-statement SQL length cap. */
+/**
+ * D1's documented per-statement length: "Maximum SQL statement length: 100,000
+ * bytes". It is the SQL TEXT that is capped — workerd applies sqlite's own
+ * SQLITE_LIMIT_SQL_LENGTH, and SQLite's guidance for a value that big is to
+ * bind it as a PARAMETER rather than inline it (cloudflare/workerd#3049 says
+ * exactly that). Counting the bound values towards it therefore refuses
+ * statements D1 accepts: measured 2026-10-15, the first real seed stopped on an
+ * INSERT of ~200 bytes of SQL whose params were 335 KB (worker_state's rows).
+ */
 const MAX_STATEMENT_BYTES = 100_000;
+
+/**
+ * D1's documented ceiling on one string, BLOB or row: 2,000,000 bytes. A row
+ * past this cannot be carried by ANY chunking, so it is refused by name rather
+ * than sent to be rejected.
+ */
+const MAX_VALUE_BYTES = 2_000_000;
 
 /** HTTP statuses worth retrying: rate limits and Cloudflare's own hiccups. */
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
@@ -71,17 +90,32 @@ function normalizeStatement(stmt) {
 
 /** How many bytes of the request one statement will cost (SQL + parameters). */
 function statementBytes(stmt) {
-  return (
-    Buffer.byteLength(stmt.sql) +
-    (stmt.params.length === 0 ? 0 : Buffer.byteLength(JSON.stringify(stmt.params)))
-  );
+  return Buffer.byteLength(stmt.sql) + boundBytes(stmt.params);
+}
+
+/** The SQL TEXT of a statement — the thing D1's 100 KB limit is about. */
+function sqlTextBytes(stmt) {
+  return Buffer.byteLength(stmt.sql);
+}
+
+/**
+ * The bytes one statement's PARAMETERS cost on the wire — the weight of a fat
+ * value (a worker_state JSON blob, say), and the reason a request is split by
+ * size as well as by statement count.
+ */
+function boundBytes(params) {
+  return params.length === 0 ? 0 : Buffer.byteLength(JSON.stringify(params));
 }
 
 /**
  * Splits statements into requests: at most `perRequest` statements and
- * `maxBytes` each. A single statement that is too big is a hard error rather
- * than a silent oversize request — the fix is a smaller chunk upstream (see
- * chunkForParamLimit), never a retry.
+ * `maxBytes` each. A statement that breaks a documented D1 rule is a hard error
+ * rather than a silent oversize request — the fix is a smaller chunk upstream
+ * (see chunkForParamLimit), never a retry.
+ *
+ * TWO DIFFERENT MEASURES, on purpose: the per-statement rule is the SQL TEXT
+ * (MAX_STATEMENT_BYTES, what D1 enforces), while the per-request bound counts
+ * the values too (MAX_REQUEST_BYTES, our own transport bound).
  */
 function planRequests(statements, perRequest = STATEMENTS_PER_REQUEST, maxBytes = MAX_REQUEST_BYTES) {
   const requests = [];
@@ -89,10 +123,19 @@ function planRequests(statements, perRequest = STATEMENTS_PER_REQUEST, maxBytes 
   let bytes = 0;
   for (const stmt of statements) {
     const size = statementBytes(stmt);
-    if (size > MAX_STATEMENT_BYTES) {
+    const sqlBytes = sqlTextBytes(stmt);
+    if (sqlBytes > MAX_STATEMENT_BYTES) {
       throw new Error(
-        `statement is ${size} bytes, over D1's ${MAX_STATEMENT_BYTES}-byte limit: ${stmt.sql.slice(0, 200)}…`,
+        `statement SQL is ${sqlBytes} bytes, over D1's ${MAX_STATEMENT_BYTES}-byte limit: ${stmt.sql.slice(0, 200)}…`,
       );
+    }
+    for (const param of stmt.params) {
+      const valueBytes = typeof param === "string" ? Buffer.byteLength(param) : 0;
+      if (valueBytes > MAX_VALUE_BYTES) {
+        throw new Error(
+          `a bound value is ${valueBytes} bytes, over D1's ${MAX_VALUE_BYTES}-byte row/value limit: ${stmt.sql.slice(0, 120)}…`,
+        );
+      }
     }
     if (current.length > 0 && (current.length >= perRequest || bytes + size > maxBytes)) {
       requests.push(current);
@@ -346,10 +389,13 @@ module.exports = {
   CloudflareApiError,
   MAX_REQUEST_BYTES,
   MAX_STATEMENT_BYTES,
+  MAX_VALUE_BYTES,
   STATEMENTS_PER_REQUEST,
+  boundBytes,
   createD1Rest,
   createRestBinding,
   planRequests,
   normalizeStatement,
+  sqlTextBytes,
   statementBytes,
 };
