@@ -4,7 +4,13 @@
 // connect there. `@libsql/client/web` ships CJS + ESM variants, so the same
 // import works in Node and on Workers. https:// URLs additionally force the
 // pure-HTTP transport everywhere.
-import { createClient, type Client } from "@libsql/client/web";
+import { createClient, type Client, type InStatement, type Row, type TransactionMode } from "@libsql/client/web";
+import {
+  D1_MAX_BOUND_PARAMS,
+  chunkForParamLimit,
+  createD1Transport,
+  type D1DatabaseLike,
+} from "./d1";
 import {
   DB_LATENCY_PROBE_COUNT_KEY,
   DB_LATENCY_PROBE_KEY,
@@ -14,6 +20,59 @@ import {
   type DbLatencyOp,
   type DbLatencyRaw,
 } from "./dblatency";
+
+/**
+ * THE TRANSPORT SEAM (2026-10-15). `Db` drives the database through exactly two
+ * calls and reads exactly two fields off their answers. Naming them is what
+ * lets the SAME state machine run on Turso (libsql over HTTP) or Cloudflare D1
+ * (a Workers binding) without a second implementation of the lock, the batched
+ * claims, the deferred drain or the write census — see src/d1.ts for the D1
+ * side, paramLimit() for the one difference that reaches the SQL (D1 rejects
+ * statements with more than 100 bound parameters).
+ */
+export interface SqlStatement {
+  sql: string;
+  args?: readonly unknown[];
+}
+
+/** One statement's answer, in the shape every call site in this file reads. */
+export interface SqlResult {
+  rows: Row[];
+  rowsAffected: number;
+}
+
+export interface SqlTransport {
+  execute(stmt: SqlStatement | string): Promise<SqlResult>;
+  /**
+   * Batched statements, either built ({sql, args}) or bare SQL text — libsql
+   * accepts both (`batch(ddl)` sends a list of DDL strings) and the D1 adapter
+   * narrows each one the same way it narrows `execute`.
+   */
+  batch(stmts: Array<SqlStatement | string>, mode?: TransactionMode): Promise<SqlResult[]>;
+  close?(): void;
+}
+
+/**
+ * libsql's own client, behind the seam. The cast is the whole translation:
+ * libsql's `ResultSet` already answers `rows`/`rowsAffected` (the fields the
+ * D1 adapter has to build, see normalizeD1Result in src/d1.ts), and its
+ * `InStatement` is a superset of SqlStatement.
+ */
+function asSqlTransport(client: Client): SqlTransport {
+  return {
+    execute: (stmt) => client.execute(stmt as InStatement),
+    batch: (stmts, mode) => client.batch(stmts as InStatement[], mode),
+    close: () => client.close(),
+  };
+}
+
+/**
+ * SQLite's default SQLITE_MAX_VARIABLE_NUMBER (>= 3.32), i.e. how many bindings
+ * a libsql statement may carry. The largest statement this file builds binds
+ * 600 (recordObservedLiquidity), so the ceiling only ever matters as the split
+ * point between "the whole tick's batch" and "one chunk".
+ */
+const LIB_SQL_MAX_BOUND_PARAMS = 32_766;
 
 /**
  * The `worker_state` key holding the pushed-token counter — the cached
@@ -1329,7 +1388,12 @@ export const MIGRATION_FLAG_KEYS = [
 export const TELEMETRY_SEED_MARKER_KEY = "telemetry_counts_seeded_v1";
 
 /** The `batch` reply shape (see Db.init's boot read). */
-type BatchRows = Awaited<ReturnType<Client["batch"]>>;
+/**
+ * The answer to one `batch()` call: an array of per-statement results. Typed
+ * off the seam rather than off libsql's `Client` (2026-10-15), because the D1
+ * transport answers the same shape from a binding — see SqlTransport.
+ */
+type BatchRows = Awaited<ReturnType<SqlTransport["batch"]>>;
 
 /**
  * A `worker_state.push_audit` ring as read from its row: an array of
@@ -1398,26 +1462,57 @@ export class Db {
    * spans.
    */
   private static readonly PUSH_AUDIT_MAX = 200;
-  private client: Client | null = null;
+  private client: SqlTransport | null = null;
   private readonly url: string;
   private readonly authToken?: string;
   /** Pre-built client (unit tests: local `file:` libsql, no network). */
   private readonly injectedClient?: Client;
   /**
+   * The Cloudflare D1 binding, when this deployment stores its state there
+   * (2026-10-15). Present → EVERY statement goes over the binding and the URL
+   * / authToken are unused: the two stores are never mixed, because the state
+   * machine read-after-writes its own rows in the same tick (the single-flight
+   * scan lock, the seen_tokens claim that gates the next push, the tracker's
+   * per-row CAS). See src/d1.ts.
+   */
+  private readonly d1?: D1DatabaseLike;
+  /**
    * Tick-scoped client, created on the first enterScanMode() and reused for
    * the isolate's lifetime. See SCAN_DB_TIMEOUT_MS: same connection settings,
    * 5x shorter leash, so a scan round trip cannot outlive the tick.
    */
-  private scanClient: Client | null = null;
+  private scanClient: SqlTransport | null = null;
   /** True while a scan is running (see enterScanMode). */
   private scanMode = false;
   /** Ms spent inside tick-scoped round trips since the last enterScanMode(). */
   private scanDbMs = 0;
 
-  constructor(url: string, authToken?: string, injectedClient?: Client) {
+  constructor(
+    url: string,
+    authToken?: string,
+    injectedClient?: Client,
+    d1?: D1DatabaseLike,
+  ) {
     this.url = url;
     this.authToken = authToken;
     this.injectedClient = injectedClient;
+    this.d1 = d1;
+  }
+
+  /**
+   * How many bound parameters ONE statement may carry on this transport.
+   *
+   * WHY IT IS A PROPERTY OF THE STORE AND NOT A CONSTANT (2026-10-15): D1
+   * rejects any statement with more than 100 bound parameters, while libsql
+   * accepts thousands. Three writers here size their chunks by ROW COUNT
+   * (recordObservedLiquidity at 120 rows = 600 parameters, noteSweptWithoutReading
+   * at 120 = 120, updateTokenMaxMcaps with no chunk at all = 7 per entry), so a
+   * fixed row count is either illegal on D1 or needlessly chatty on Turso. Each
+   * of them now asks this for its ceiling and keeps its old row count as the
+   * cap on the libsql side, so the Turso round-trip profile is unchanged.
+   */
+  private paramLimit(): number {
+    return this.d1 ? D1_MAX_BOUND_PARAMS : LIB_SQL_MAX_BOUND_PARAMS;
   }
 
   /**
@@ -2176,19 +2271,29 @@ export class Db {
     return out;
   }
 
-  /** Creates the libsql client once (lazy; no network until first call). */
-  private connect(): Client {
+  /** Creates the transport once (lazy; no network until first call). */
+  private connect(): SqlTransport {
     if (this.client) return this.client;
+    if (this.d1) {
+      // D1: the binding call IS the transport, so there is nothing to bound
+      // with a fetch signal — the hard wall still guards the call (1.2x
+      // DB_REQUEST_TIMEOUT_MS), and the wall's own `onCost` hook keeps the
+      // tick's `dbMs` reading working on this store too.
+      this.client = wrapClientWithHardWall(createD1Transport(this.d1));
+      return this.client;
+    }
     if (this.injectedClient) {
       // Test clients go through the same hard wall: a mock (or a real
       // client) that never settles must reject near the wall instead of
       // hanging the caller — that behavior is exactly what the unit tests
       // assert. Healthy local file clients settle in single-digit ms and
       // never notice the wall.
-      this.client = wrapClientWithHardWall(this.injectedClient);
+      this.client = asSqlTransport(wrapClientWithHardWall(this.injectedClient));
       return this.client;
     }
-    this.client = wrapClientWithHardWall(this.createRawClient(DB_REQUEST_TIMEOUT_MS));
+    this.client = asSqlTransport(
+      wrapClientWithHardWall(this.createRawClient(DB_REQUEST_TIMEOUT_MS)),
+    );
     return this.client;
   }
 
@@ -2222,17 +2327,25 @@ export class Db {
    * no request state, and re-creating it per tick would re-allocate the
    * transport on the hot path).
    */
-  private ensureScanClient(): Client {
+  private ensureScanClient(): SqlTransport {
     if (this.scanClient) return this.scanClient;
+    if (this.d1) {
+      // One D1 transport for both modes: there is no HTTP request to abort at
+      // SCAN_DB_TIMEOUT_MS (the binding call is the RPC), so a second client
+      // would only re-wrap the same binding. The wall still applies through
+      // connect(), and the scan-mode cost counter is served by the same
+      // onCost hook the libsql path installs below.
+      return (this.scanClient = this.connect());
+    }
     const raw = this.injectedClient ?? this.createRawClient(SCAN_DB_TIMEOUT_MS);
-    const wrapped = wrapClientWithHardWall(raw, SCAN_DB_TIMEOUT_MS, (ms) => {
+    const wrapped = asSqlTransport(wrapClientWithHardWall(raw, SCAN_DB_TIMEOUT_MS, (ms) => {
       // Reachable only in scan mode (see get()), so this counter is the
       // tick's own un-raced Turso cost. A call that started inside a scan and
       // settles after exitScanMode() adds its ms to the NEXT tick's count
       // (the tick had already given up on it); that bias is a few ms wide and
       // only ever overstates, never hides, the cost.
       this.scanDbMs += ms;
-    });
+    }));
     return (this.scanClient = wrapped);
   }
 
@@ -2900,12 +3013,20 @@ export class Db {
    */
   async recordObservedLiquidity(
     rows: Array<{ token: string; liquidityUsd: number }>,
+    /**
+     * Rows per statement, capped by the transport's own ceiling: FIVE bindings
+     * a row — the SET's CASE pair, the IN list, and the WHERE's second copy of
+     * that same CASE — so D1's 100 allows 20 rows, while the 120 this always
+     * used (600 bindings) stays the libsql shape (see paramLimit). Chunking is a
+     * ROUND-TRIP cost on Turso, so the cap only bites where the store demands
+     * it. The count is 5, not 3: the crossing test re-binds the CASE, which is
+     * the same 120-row statement binding 600 parameters rather than 360.
+     */
     chunk = 120,
   ): Promise<number> {
     if (rows.length === 0) return 0;
     let updated = 0;
-    for (let i = 0; i < rows.length; i += chunk) {
-      const slice = rows.slice(i, i + chunk);
+    for (const slice of chunkForParamLimit(rows, 5, this.paramLimit(), chunk)) {
       const cases = slice.map(() => "WHEN ? THEN ?").join(" ");
       const args: Array<string | number> = [];
       // The CASE is bound TWICE (the SET's value and the WHERE's own crossing
@@ -2948,8 +3069,9 @@ export class Db {
   async noteSweptWithoutReading(tokens: string[], chunk = 120): Promise<number> {
     if (tokens.length === 0) return 0;
     let updated = 0;
-    for (let i = 0; i < tokens.length; i += chunk) {
-      const slice = tokens.slice(i, i + chunk);
+    // One binding a token, so the cap is the transport's ceiling itself: D1's
+    // 100 against the 120 this always used (see paramLimit).
+    for (const slice of chunkForParamLimit(tokens, 1, this.paramLimit(), chunk)) {
       const res = await this.get().execute({
         sql: `UPDATE token_stats SET sweeps_since_reading = sweeps_since_reading + 1
               WHERE token IN (${slice.map(() => "?").join(",")})`,
@@ -3235,7 +3357,7 @@ export class Db {
     return false;
   }
 
-  private get(): Client {
+  private get(): SqlTransport {
     if (!this.client) {
       throw new Error("Database is not initialized");
     }
@@ -4927,23 +5049,27 @@ export class Db {
     pushedAt: number,
   ): Promise<void> {
     if (rows.length === 0) return;
-    const placeholders = rows.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(",");
-    const args: Array<string | number> = [];
-    for (const r of rows) {
-      args.push(
-        r.token,
-        r.owner,
-        r.rank,
-        Number.isFinite(r.uiAmount) ? r.uiAmount : 0,
-        r.isCreator ? 1 : 0,
-        r.crimeHit ? 1 : 0,
-        pushedAt,
-      );
+    // 7 bindings a row, so D1's 100-parameter ceiling allows 14 rows per
+    // statement (a push records ≤ 9 holder rows, so one statement either way).
+    for (const slice of chunkForParamLimit(rows, 7, this.paramLimit())) {
+      const placeholders = slice.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(",");
+      const args: Array<string | number> = [];
+      for (const r of slice) {
+        args.push(
+          r.token,
+          r.owner,
+          r.rank,
+          Number.isFinite(r.uiAmount) ? r.uiAmount : 0,
+          r.isCreator ? 1 : 0,
+          r.crimeHit ? 1 : 0,
+          pushedAt,
+        );
+      }
+      await this.get().execute({
+        sql: `INSERT OR IGNORE INTO pushed_holders (token, owner, rank, ui_amount, is_creator, crime_hit, pushed_at) VALUES ${placeholders}`,
+        args,
+      });
     }
-    await this.get().execute({
-      sql: `INSERT OR IGNORE INTO pushed_holders (token, owner, rank, ui_amount, is_creator, crime_hit, pushed_at) VALUES ${placeholders}`,
-      args,
-    });
   }
 
   /**
@@ -4983,29 +5109,34 @@ export class Db {
   ): Promise<void> {
     if (rows.length === 0) return;
     const now = Date.now();
-    const placeholders = rows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",");
-    const args: Array<string | number | null> = [];
-    for (const row of rows) {
-      args.push(
-        row.token,
-        row.chatId,
-        row.symbol,
-        row.pushedAt,
-        row.mcapAtPush,
-        row.mcapAtPush,
-        row.liquidityUsd,
-        now,
-        row.poolAddress ?? null,
-      );
+    // 9 bindings a row: D1's ceiling allows 11 rows per statement. A tick
+    // enrolls the pushes it just sent (0-2 rows), so this is one statement
+    // there; the split exists so a large backfill cannot be rejected outright.
+    for (const slice of chunkForParamLimit(rows, 9, this.paramLimit())) {
+      const placeholders = slice.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",");
+      const args: Array<string | number | null> = [];
+      for (const row of slice) {
+        args.push(
+          row.token,
+          row.chatId,
+          row.symbol,
+          row.pushedAt,
+          row.mcapAtPush,
+          row.mcapAtPush,
+          row.liquidityUsd,
+          now,
+          row.poolAddress ?? null,
+        );
+      }
+      await this.get().execute({
+        sql: `INSERT INTO push_watch
+                (token, chat_id, symbol, pushed_at, mcap_at_push, peak_mcap,
+                 last_liquidity, last_checked, pool_address)
+              VALUES ${placeholders}
+              ON CONFLICT(token) DO NOTHING`,
+        args,
+      });
     }
-    await this.get().execute({
-      sql: `INSERT INTO push_watch
-              (token, chat_id, symbol, pushed_at, mcap_at_push, peak_mcap,
-               last_liquidity, last_checked, pool_address)
-            VALUES ${placeholders}
-            ON CONFLICT(token) DO NOTHING`,
-      args,
-    });
   }
 
   /**
@@ -5783,6 +5914,21 @@ export class Db {
     entries: Array<{ token: string; mcapUsd: number; liquidityUsd?: number }>,
   ): Promise<void> {
     if (entries.length === 0) return;
+    // 7 bindings per entry — the mcap CASE (3), the liquidity CASE (3) and the
+    // IN list (1) — so this statement is the one whose SIZE the transport's
+    // ceiling decides: D1's 100 allows 14 entries per statement, libsql's
+    // 32,766 keeps the whole tick's raise list in ONE statement exactly as it
+    // always was (see paramLimit). A tick's raise list is ~20 entries in steady
+    // state, so the D1 split is 2 statements where libsql sends 1.
+    for (const slice of chunkForParamLimit(entries, 7, this.paramLimit())) {
+      await this.writeTokenMaxMcapsChunk(slice);
+    }
+  }
+
+  /** One chunk of updateTokenMaxMcaps — see that method's caller for the split. */
+  private async writeTokenMaxMcapsChunk(
+    entries: Array<{ token: string; mcapUsd: number; liquidityUsd?: number }>,
+  ): Promise<void> {
     const mcapCases = entries
       .map(
         () =>
@@ -5950,34 +6096,40 @@ export class Db {
    */
   async recordTokenStatsMany(statsList: TokenStats[]): Promise<void> {
     if (statsList.length === 0) return;
-    const placeholders = statsList
-      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)")
-      .join(",");
-    const args: Array<string | number | null> = [];
-    for (const s of statsList) {
-      args.push(
-        s.token,
-        s.firstSeenAt,
-        s.firstM5Vol,
-        s.firstSeenAgeMin,
-        s.launchMs,
-        s.birdeye1mVol,
-        s.rugcheckBundlerPct,
-        s.rugcheckTop10Pct,
-        s.birdeyeProTraders,
-        s.birdeyeSniperPct,
-        s.minMcapObserved,
-        s.discoveredVia ?? null,
-      );
+    // 12 bindings a row (the 14 columns less the two NULL literals), so D1's
+    // 100-parameter ceiling allows 8 rows per statement — a real constraint,
+    // because a dense launch market registers 20-40 coins in one tick. libsql's
+    // ceiling keeps the whole registration batch in ONE statement as before
+    // (see paramLimit).
+    let inserted = 0;
+    for (const slice of chunkForParamLimit(statsList, 12, this.paramLimit())) {
+      const placeholders = slice
+        .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)")
+        .join(",");
+      const args: Array<string | number | null> = [];
+      for (const s of slice) {
+        args.push(
+          s.token,
+          s.firstSeenAt,
+          s.firstM5Vol,
+          s.firstSeenAgeMin,
+          s.launchMs,
+          s.birdeye1mVol,
+          s.rugcheckBundlerPct,
+          s.rugcheckTop10Pct,
+          s.birdeyeProTraders,
+          s.birdeyeSniperPct,
+          s.minMcapObserved,
+          s.discoveredVia ?? null,
+        );
+      }
+      const res = await this.get().execute({
+        sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at, discovered_via) VALUES ${placeholders}`,
+        args,
+      });
+      inserted += Number(res.rowsAffected ?? 0);
     }
-    const res = await this.get().execute({
-      sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at, discovered_via) VALUES ${placeholders}`,
-      args,
-    });
-    await this.bumpTelemetryCounter(
-      "telemetry_token_stats_count",
-      Number(res.rowsAffected ?? 0),
-    );
+    await this.bumpTelemetryCounter("telemetry_token_stats_count", inserted);
   }
 
   /**

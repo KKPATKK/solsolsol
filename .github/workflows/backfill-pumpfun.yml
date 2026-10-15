@@ -6,9 +6,15 @@ name: Backfill pump.fun coins
 # egress from different ranges — this job tests reachability first and only
 # runs the backfill when the feed responds.
 #
+# WHERE IT WRITES (2026-10-15): D1, not Turso. The cutover made Turso a
+# read-only archive (docs/d1-migration-2026-10-15.md), so rows written there
+# would never reach the Worker's pool — the script now names the D1 database
+# itself (resolve it below) and writes through the Cloudflare API. The Turso
+# secrets are no longer needed by this job.
+#
 # Trigger: manual (Actions tab → Run workflow), or automatically when the
-# backfill script changes. Needs TURSO_DATABASE_URL + TURSO_AUTH_TOKEN as
-# GitHub Actions secrets (same values as the Cloudflare Worker secrets).
+# backfill script changes. Needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID
+# as GitHub Actions secrets (the token needs D1:Edit).
 
 on:
   workflow_dispatch:
@@ -33,6 +39,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The script chunks its INSERTs with the shared helper from src/d1.ts
+      # (chunkForParamLimit) and talks to D1 through scripts/d1-rest.js.
+      - name: Build
+        run: npm run build
+
+      # The database's uuid, looked up (or created) by name — never committed.
+      - name: Resolve the D1 database
+        id: d1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_NAME: solana-meme-bot
+        run: node scripts/d1-copy.js ensure
+
       - name: Test pump.fun reachability from runner
         run: |
           code=$(curl -s -o /tmp/pf.json -w "%{http_code}" --max-time 15 \
@@ -48,11 +68,12 @@ jobs:
       - name: Run backfill
         if: env.REACHABLE == '1'
         env:
-          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ steps.d1.outputs.database_id }}
         run: |
-          if [ -z "$TURSO_DATABASE_URL" ] || [ -z "$TURSO_AUTH_TOKEN" ]; then
-            echo "::warning::TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are not set as GitHub Actions secrets — add them (same values as the Worker secrets) and re-run this workflow"
+          if [ -z "$D1_DATABASE_ID" ]; then
+            echo "::warning::the D1 database could not be resolved (is CLOUDFLARE_API_TOKEN set, with D1:Edit?) — refusing to write the Turso archive instead; re-run once the secret is in place"
             exit 0
           fi
           node scripts/backfill-pumpfun.mjs --since-hours 42

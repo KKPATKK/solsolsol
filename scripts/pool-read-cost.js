@@ -68,6 +68,20 @@ const POOL_NEAR_LIMIT_SHARE = 0.7;
 const MEASURED_ROWS_PER_HOUR =
   Number(process.argv[2]) > 0 ? Number(process.argv[2]) : 1_000_000;
 
+/**
+ * THIS INSTRUMENT IS READ-ONLY against the archive, with ONE exception: the
+ * `index` mode creates the partial pool-band index it is about to measure.
+ *
+ * That exception matters since the 2026-10-15 cutover (docs/d1-migration-2026-10-15.md):
+ * Turso is frozen and the Worker creates its own `idx_pool_band_*` on D1
+ * (Db.ensurePoolBandIndex), so an index minted here costs rows written in the
+ * archive and is never used by production. Creating it therefore takes an
+ * explicit opt-in — the reads this script is for do not.
+ */
+const ALLOW_ARCHIVE_WRITE =
+  process.argv.includes("--allow-archive-write") ||
+  /^(1|true|yes)$/i.test(process.env.ALLOW_ARCHIVE_WRITE || "");
+
 /** wrangler.toml's [vars] — the deployed knobs, which beat the code defaults. */
 function wranglerVars() {
   const text = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
@@ -542,6 +556,13 @@ async function indexMode(floorArg) {
   const literal = mcapFloorLiteral(floor);
   console.log(`floor                ${literal} (${chats.length} enabled chats x POOL_MCAP_PRUNE_RATIO)`);
   console.log(`index                ${name}`);
+  if (!ALLOW_ARCHIVE_WRITE) {
+    throw new Error(
+      "refusing to CREATE INDEX in the Turso ARCHIVE (read-only since the 2026-10-15 cutover; the Worker mints its own " +
+        "idx_pool_band_* on D1 — see Db.ensurePoolBandIndex). Re-run with --allow-archive-write (or ALLOW_ARCHIVE_WRITE=1) " +
+        "for a deliberate one-off; every other mode of this script only reads, so they need nothing.",
+    );
+  }
   await client.execute({
     sql: `CREATE INDEX IF NOT EXISTS ${name} ON token_stats(launch_ms)
           WHERE (max_mcap_observed IS NULL OR max_mcap_observed >= ${literal})`,

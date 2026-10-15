@@ -25,8 +25,16 @@
 # the first success, with the HTTP status that says which remedy applies.
 #
 # Secrets required (repo → Settings → Secrets and variables → Actions):
-#   TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io
-#   TURSO_AUTH_TOKEN     Turso auth token
+#   CLOUDFLARE_API_TOKEN   needs D1:Edit
+#   CLOUDFLARE_ACCOUNT_ID
+#
+# WHICH STORE (2026-10-15): D1 — the Worker's store since the Turso→D1 cutover
+# (docs/d1-migration-2026-10-15.md). The script reads AND writes worker_state
+# there (the rotated pair, the CAS lock, the status row) and REFUSES to run
+# against the Turso archive, because Axiom rotates on every call: rotating the
+# pair in a store the Worker never reads would kill the very session this job
+# keeps alive. The database id is resolved below (`d1-copy.js ensure`), never
+# committed — same pattern as backfill-pumpfun.yml.
 #
 # STATUS 2026-09-19: DISABLED along with AXIOM_ENABLED=0 — the schedule below
 # is commented out and nothing here runs on its own. Everything in this file is
@@ -77,10 +85,29 @@ jobs:
       - name: Install curl_cffi
         run: pip install --quiet "curl_cffi>=0.7"
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The database's uuid, looked up (or created) by name — never committed.
+      - name: Resolve the D1 database
+        id: d1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_NAME: solana-meme-bot
+        run: npm run build && node scripts/d1-copy.js ensure
+
       - name: Refresh Axiom tokens
         env:
-          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ steps.d1.outputs.database_id }}
           FORCE_REFRESH: ${{ inputs.force && '1' || '0' }}
         run: python scripts/axiom-refresh-action.py
 

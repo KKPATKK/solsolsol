@@ -28,6 +28,10 @@ import {
 // Subclass with the last-good pool fallback: the method it wraps lives past
 // the file-sync window in src/db.ts, so the production path is adjusted here.
 import { PoolFallbackDb, poolFallbackStats } from "./poolfallback";
+// The store seam: D1 (a Workers binding) or Turso (libsql over HTTP). See
+// src/d1.ts for why the same state machine can run on either — and why the two
+// are never mixed inside one tick.
+import type { D1DatabaseLike } from "./d1";
 // Early-return capture: the scanner nulls its own lastSkip in the same tick it
 // records a reason, so the reason is captured instead (see src/skipcapture.ts).
 import {
@@ -198,10 +202,24 @@ globalThis.fetch = ((
  */
 
 interface Env {
-  [key: string]: string | undefined;
+  /**
+   * Every var/secret (strings) plus the D1 binding below. The index signature
+   * has to admit the binding (2026-10-15): `DB` is an object, not a string, and
+   * a `string`-only signature rejects it at the interface itself.
+   */
+  [key: string]: string | D1DatabaseLike | undefined;
   TELEGRAM_BOT_TOKEN?: string;
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
+  /**
+   * The Cloudflare D1 binding, when this deployment stores its state there
+   * (2026-10-15). Added to wrangler.toml by the deploy workflow, so its
+   * PRESENCE is the store switch: with it, every read and write goes to D1
+   * (the Workers Paid plan includes 50M rows written a month, against the
+   * ~19M/month this bot needs); without it, the Turso URL/token above are used
+   * exactly as before. See src/d1.ts and Db's transport seam.
+   */
+  DB?: D1DatabaseLike;
   BIRDEYE_API_KEY?: string;
   HELIUS_API_KEY?: string;
   SCAN_INTERVAL_SECONDS?: string;
@@ -2918,13 +2936,29 @@ export function shouldStampArrival(
  * look dead from /health, which is exactly what this counter is for) and an
  * unreadable worker_state. Returns what it cost, for summary.preTick.steps.bump.
  */
+/**
+ * A Db for a one-shot bookkeeping write on a path that runs BEFORE (or
+ * without) init: the standalone cron counter and the arrival stamp. It has to
+ * follow the SAME store as the live instance — a stamp written to the Turso
+ * archive while the bot ticks on D1 is a write nothing will ever read, and it
+ * would resurrect exactly the Turso rows-written overage this migration is
+ * removing. Returns null when neither store is configured.
+ */
+function standaloneDb(env: Env): Db | null {
+  if (env.DB) {
+    return new Db(env.TURSO_DATABASE_URL ?? "", env.TURSO_AUTH_TOKEN, undefined, env.DB);
+  }
+  if (env.TURSO_DATABASE_URL && env.TURSO_AUTH_TOKEN) {
+    return new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
+  }
+  return null;
+}
+
 async function bumpScheduledTickLegacy(env: Env): Promise<number> {
   const at = Date.now();
   try {
-    if (env.TURSO_DATABASE_URL && env.TURSO_AUTH_TOKEN) {
-      const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
-      await probe.bumpScheduledTick();
-    }
+    const probe = standaloneDb(env);
+    if (probe) await probe.bumpScheduledTick();
   } catch (err) {
     console.error("[worker] standalone cron counter failed:", err);
   }
@@ -4088,7 +4122,11 @@ async function ensureInitialized(env: Env): Promise<void> {
   }
   if (initPromise) return initPromise;
   const boot = (async () => {
-    const config = loadConfig(env);
+    // The cast is the binding: loadConfig reads string vars/secrets, and `DB`
+    // (the D1 binding, see Env) is the one non-string member of this object.
+    // Narrowing here keeps config.ts typed for Node, where process.env really is
+    // all strings.
+    const config = loadConfig(env as unknown as NodeJS.ProcessEnv);
     cfg = config;
     lastTradeFp = fp;
     tursoConfigured = Boolean(config.tursoUrl);
@@ -4105,9 +4143,17 @@ async function ensureInitialized(env: Env): Promise<void> {
       config.axiomEnabled && config.axiomEmail && config.axiomPassword,
     );
     tradeConfigured = Boolean(config.trade.walletSecret);
-    jupiterKeyed = Boolean(config.trade.jupiterApiKey);      if (config.tursoUrl) {
+    jupiterKeyed = Boolean(config.trade.jupiterApiKey);      // The D1 binding, when present, is the store: same Db, same state
+      // machine, one transport instead of libsql's HTTP client (see src/d1.ts).
+      const d1 = env.DB;
+      if (config.tursoUrl || d1) {
         try {
-          db = new PoolFallbackDb(config.tursoUrl, config.tursoAuthToken);
+          db = new PoolFallbackDb(
+            config.tursoUrl ?? "",
+            config.tursoAuthToken,
+            undefined,
+            d1,
+          );
           await db.init();
           dbReady = true;
           console.log("[worker] Turso ready");
@@ -8957,7 +9003,7 @@ const worker = {
     // market; if eligibleInWindow < poolLimit, the pool covers everything
     // and zero pushes just means nothing qualifies.
     if (url.pathname === "/debug/pool") {
-      if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
+      if (!env.DB && (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN)) {
         return Response.json({ ok: false, error: "TURSO not configured" });
       }
       // Durable TTL cache FIRST, before the probe Db is even constructed: a
@@ -8971,7 +9017,12 @@ const worker = {
           cacheAgeMs: cached.ageMs,
         });
       }
-      const probe = new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN);
+      const probe = new Db(
+        env.TURSO_DATABASE_URL ?? "",
+        env.TURSO_AUTH_TOKEN,
+        undefined,
+        env.DB,
+      );
       // Db.get() requires the client to be connected (init does this; the
       // lazy connect() used by other probe methods doesn't set it).
       await probe.init();
@@ -9274,11 +9325,7 @@ const worker = {
         const stamp =
           db !== null
             ? db.stampScheduledArrival(cronAt)
-            : env.TURSO_DATABASE_URL && env.TURSO_AUTH_TOKEN
-              ? new Db(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN).stampScheduledArrival(
-                  cronAt,
-                )
-              : null;
+            : standaloneDb(env)?.stampScheduledArrival(cronAt) ?? null;
         if (stamp) {
           await recoveryAwait(stamp, PRE_INIT_ARRIVAL_BOUND_MS, "cron arrival stamp");
         }

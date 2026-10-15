@@ -12,7 +12,7 @@ the Worker never calls refresh itself — THIS script is the only refresher.
 invalidate each other.)
 
 Flow:
-  1. Read auth-access-token / auth-refresh-token from Turso worker_state.
+  1. Read auth-access-token / auth-refresh-token from worker_state.
   2. Decode the access JWT's exp claim. If >REFRESH_MARGIN seconds remain,
      exit 0 without refreshing (fewer rotations = fewer failure windows).
   3. Claim the cross-platform refresh lock (CAS on worker_state).
@@ -23,12 +23,23 @@ Flow:
      worker_state.axiom_refresh_status so a dead refresher is visible
      without reading run logs — see record_status().
 
-Secrets expected (GitHub repo → Settings → Secrets → Actions):
-  TURSO_DATABASE_URL   e.g. libsql://your-db.turso.io
-  TURSO_AUTH_TOKEN     Turso auth token
+WHICH STORE (2026-10-15): D1, the same store the Worker reads since the
+Turso→D1 cutover (docs/d1-migration-2026-10-15.md), through the Cloudflare
+REST API. Turso is a READ-ONLY archive now, and for THIS script reading it is
+as wrong as writing it: Axiom rotates the refresh token on every call, so
+rotating the pair in a store the Worker never reads would kill the session it
+exists to keep alive. Without D1 credentials the script therefore REFUSES to
+run (ALLOW_ARCHIVE_WRITE=1 overrides, for a deliberate one-off while Axiom
+still points at Turso).
 
-Tokens themselves are NEVER stored in CI Secrets — Turso worker_state is
-the single source of truth, same keys the Worker reads.
+Secrets expected (GitHub repo → Settings → Secrets → Actions):
+  CLOUDFLARE_API_TOKEN   needs D1:Edit
+  CLOUDFLARE_ACCOUNT_ID
+  (D1_DATABASE_ID comes from the workflow's `d1-copy.js ensure` step)
+  TURSO_DATABASE_URL / TURSO_AUTH_TOKEN   only for ALLOW_ARCHIVE_WRITE=1
+
+Tokens themselves are NEVER stored in CI Secrets — worker_state is the
+single source of truth, same keys the Worker reads.
 """
 
 import base64
@@ -46,6 +57,17 @@ TURSO_URL = (os.environ.get("TURSO_DATABASE_URL") or "").strip().replace(
     "libsql://", "https://", 1
 )
 TURSO_TOKEN = (os.environ.get("TURSO_AUTH_TOKEN") or "").strip()
+
+# The Worker's store since 2026-10-15 (see the module docstring).
+D1_DATABASE_ID = (os.environ.get("D1_DATABASE_ID") or "").strip()
+CF_ACCOUNT_ID = (os.environ.get("CLOUDFLARE_ACCOUNT_ID") or "").strip()
+CF_API_TOKEN = (os.environ.get("CLOUDFLARE_API_TOKEN") or "").strip()
+# Escape hatch for the archive, and ONLY for the archive: see db_execute.
+ARCHIVE_WRITE_OK = (os.environ.get("ALLOW_ARCHIVE_WRITE") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 HOSTS = ["api9.axiom.trade", "api3.axiom.trade", "api6.axiom.trade", "api10.axiom.trade"]
 REFRESH_PATH = "/refresh-access-token"
@@ -98,7 +120,53 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-def turso_pipeline(sql: str, args: list | None = None):
+def d1_params(args: list | None) -> list:
+    """Turso's Hrana cells ({"type": "text", "value": …}) as plain D1 params.
+
+    Everything this script binds is text already (the SQL relies on CASTs —
+    see try_claim_lock), so the value is taken verbatim: binding a number
+    where a CASTed TEXT is expected is how the v2/pipeline rejected the
+    integer cell type, and D1 is just as strict.
+    """
+    out = []
+    for arg in args or []:
+        out.append(arg.get("value") if isinstance(arg, dict) else arg)
+    return out
+
+
+def d1_pipeline(sql: str, args: list | None = None):
+    """One statement via Cloudflare's D1 REST API; the shape of turso's.
+
+    Returns {"rows": [[cell, …], …], "affected_row_count": n} — the call
+    sites below read positionally, and D1's objects arrive in SELECT order.
+    """
+    res = creq.post(
+        f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
+        f"/d1/database/{D1_DATABASE_ID}/query",
+        headers={
+            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"sql": sql, "params": d1_params(args)},
+        timeout=20,
+    )
+    if res.status_code >= 300:
+        raise RuntimeError(
+            f"D1 HTTP {res.status_code}: {res.text[:300]!r} for sql={sql[:80]!r}"
+        )
+    payload = res.json()
+    if not payload.get("success"):
+        raise RuntimeError(f"D1 refused the statement: {json.dumps(payload.get('errors'))[:300]}")
+    result = payload["result"][0]
+    if result.get("success") is False:
+        raise RuntimeError(f"D1 error: {json.dumps(result)[:300]}")
+    return {
+        "rows": [[row.get(col) for col in row] for row in result.get("results") or []],
+        "affected_row_count": int((result.get("meta") or {}).get("changes") or 0),
+    }
+
+
+def archive_pipeline(sql: str, args: list | None = None):
     """One statement via Turso's v2/pipeline HTTP API; returns the result."""
     body = {
         "requests": [
@@ -126,15 +194,37 @@ def turso_pipeline(sql: str, args: list | None = None):
     return result["response"]["result"]
 
 
-def turso_query(sql: str, args: list | None = None):
+def pipeline(sql: str, args: list | None = None):
+    """One statement against this run's store — D1 when it is configured."""
+    if D1_DATABASE_ID:
+        return d1_pipeline(sql, args)
+    return archive_pipeline(sql, args)
+
+
+def db_query(sql: str, args: list | None = None):
     """One SELECT; rows come back as [[cell_value, ...], ...]."""
-    rows = turso_pipeline(sql, args)["rows"]
-    return [[cell.get("value") for cell in row] for row in rows]
+    inner = pipeline(sql, args)
+    if D1_DATABASE_ID:
+        return inner["rows"]
+    return [[cell.get("value") for cell in row] for row in inner["rows"]]
 
 
-def turso_execute(sql: str, args: list | None = None) -> int:
-    """One mutating statement; returns affected-row count for CAS checks."""
-    inner = turso_pipeline(sql, args)
+def db_execute(sql: str, args: list | None = None) -> int:
+    """One mutating statement; returns affected-row count for CAS checks.
+
+    Writes to the ARCHIVE are refused, always, unless ALLOW_ARCHIVE_WRITE=1:
+    the 2026-10-15 cutover made Turso read-only for the Worker, so a row
+    written there (the rotated token pair, the lock, the status row) is a
+    write nothing will ever read — and for this script that is worse than
+    doing nothing, because the rotation itself is irreversible.
+    """
+    if not D1_DATABASE_ID and not ARCHIVE_WRITE_OK:
+        raise RuntimeError(
+            "refusing to write the Turso ARCHIVE — set D1_DATABASE_ID (with "
+            "CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN) to write D1, or "
+            "ALLOW_ARCHIVE_WRITE=1 for a deliberate one-off"
+        )
+    inner = pipeline(sql, args)
     # Turso's v2/pipeline result spells it affected_row_count (docs-verified
     # 2026-08-26). The old rowsAffected/rows_affected guesses match NOTHING,
     # so every claim read as "0 rows" and skipped itself while having just
@@ -229,7 +319,7 @@ def record_status(
     except Exception:
         pass
     try:
-        turso_execute(
+        db_execute(
             "INSERT INTO worker_state (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [
@@ -256,7 +346,7 @@ def try_claim_lock(now_s: int) -> bool:
     args are exactly what the rest of this script has always used.
     """
     cutoff = str(now_s - LOCK_TTL_SECONDS)
-    n = turso_execute(
+    n = db_execute(
         "UPDATE worker_state SET value = ? WHERE key = ? "
         "AND CAST(value AS INTEGER) <= CAST(? AS INTEGER)",
         [
@@ -267,14 +357,14 @@ def try_claim_lock(now_s: int) -> bool:
     )
     if n > 0:
         return True
-    rows = turso_query(
+    rows = db_query(
         "SELECT value FROM worker_state WHERE key = ?",
         [{"type": "text", "value": LOCK_KEY}],
     )
     if rows:
         return False  # row exists with a fresh timestamp — someone else owns it
     try:
-        turso_execute(
+        db_execute(
             "INSERT INTO worker_state (key, value) VALUES (?, ?)",
             [
                 {"type": "text", "value": LOCK_KEY},
@@ -289,7 +379,7 @@ def try_claim_lock(now_s: int) -> bool:
 def release_lock() -> None:
     """Free the lock immediately so the next slot isn't blocked by the TTL."""
     try:
-        turso_execute(
+        db_execute(
             "UPDATE worker_state SET value = '0' WHERE key = ?",
             [{"type": "text", "value": LOCK_KEY}],
         )
@@ -298,12 +388,12 @@ def release_lock() -> None:
 
 
 def get_worker_state(key: str) -> str | None:
-    rows = turso_query("SELECT value FROM worker_state WHERE key = ?", [{"type": "text", "value": key}])
+    rows = db_query("SELECT value FROM worker_state WHERE key = ?", [{"type": "text", "value": key}])
     return rows[0][0] if rows else None
 
 
 def set_worker_state(key: str, value: str) -> None:
-    turso_query(
+    db_execute(
         "UPDATE worker_state SET value = ? WHERE key = ?",
         [{"type": "text", "value": value}, {"type": "text", "value": key}],
     )
@@ -362,7 +452,20 @@ def refresh(refresh_token: str):
 
 
 def run() -> None:
-    if not TURSO_URL or not TURSO_TOKEN:
+    # WHICH STORE this run drives — see the module docstring. The archive is
+    # never the default: the Worker reads D1, and a rotation written anywhere
+    # else is a dead session (Axiom rotates on every call).
+    if D1_DATABASE_ID:
+        if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+            die("D1_DATABASE_ID is set but CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN are missing")
+    elif not ARCHIVE_WRITE_OK:
+        die(
+            "refusing to run against the Turso ARCHIVE (read-only since the 2026-10-15 "
+            "cutover — the Worker reads D1, so a rotation here would kill the session). "
+            "Set D1_DATABASE_ID (+ CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN), or "
+            "ALLOW_ARCHIVE_WRITE=1 for a deliberate one-off"
+        )
+    elif not TURSO_URL or not TURSO_TOKEN:
         die("TURSO_DATABASE_URL / TURSO_AUTH_TOKEN secrets missing")
 
     access = get_worker_state("axiom_access_token")

@@ -1,12 +1,102 @@
+# This workflow is ALSO the Turso → D1 cutover (2026-10-15). See
+# docs/d1-migration-2026-10-15.md for the whole plan; the short version:
+#
+#   migrate  creates the D1 database if the account has none, applies the
+#            schema by running the Worker's OWN `Db.init()` against it, and
+#            copies every row out of the Turso archive (once — a marker in
+#            worker_state makes every later run a no-op).
+#   deploy   injects the `[[d1_databases]]` binding into the runner's own
+#            wrangler.toml and deploys. BINDING PRESENCE IS THE STORE SWITCH
+#            (see src/worker.ts), so this deploy is the cutover and everything
+#            above it must succeed first: a failed copy never reaches prod.
+#   catchup  runs AFTER the deploy and fills the rows written during the
+#            copy→deploy window (insert-if-missing only: from the deploy onward
+#            D1 holds the newer truth, and overwriting it would roll live state
+#            backward).
+#
+# Rollback BEFORE the deploy step: nothing to undo, the Worker is still on
+# Turso. Rollback AFTER it: revert this file and redeploy — writes made to D1
+# since the cutover are lost, which is why it has to be immediate.
 name: Deploy Worker to Cloudflare
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      catchup:
+        description: "Force the Turso→D1 catch-up (fills rows D1 lacks; never overwrites)"
+        type: boolean
+        default: false
+
+# One run at a time. The migration reads the entire archive and writes D1, and
+# two overlapping runs could interleave a seed with a catch-up — or two binds
+# with two deploys.
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+# The database the binding points at. It is created/LOOKED UP by name on every
+# run, so no database id is ever committed (see scripts/d1-bind.js).
+env:
+  D1_DATABASE_NAME: solana-meme-bot
 
 jobs:
+  # Make the D1 database exist and hold the archive's rows BEFORE anything can
+  # switch production onto it.
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      database_id: ${{ steps.database.outputs.database_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The migration scripts require the built Worker: the schema is applied by
+      # running the real Db.init() from dist/db.js through dist/d1.js's
+      # transport, and the copy's chunk rule is chunkForParamLimit.
+      - name: Build
+        run: npm run build
+
+      - name: Ensure the D1 database exists
+        id: database
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/d1-copy.js ensure
+
+      - name: Apply the schema (the Worker's own init) to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ steps.database.outputs.database_id }}
+        run: node scripts/d1-copy.js schema
+
+      # Reads the Turso archive (the only place the state exists today) and
+      # writes D1. Idempotent, and a no-op once worker_state.d1_seed_v1 is set —
+      # which is what keeps a later deploy from overwriting live D1 state with a
+      # frozen archive.
+      - name: Seed D1 from the Turso archive
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ steps.database.outputs.database_id }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: node scripts/d1-copy.js seed
+
   deploy:
+    needs: migrate
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -30,6 +120,14 @@ jobs:
       # batched token_stats methods and the /filter argument parser.
       - name: Unit tests
         run: npm run test:unit
+
+      # The cutover itself. The binding is written into THIS runner's checkout
+      # (never committed), and its presence in the deployed Worker is what makes
+      # every read and write go to D1 instead of Turso.
+      - name: Inject the D1 binding
+        env:
+          D1_DATABASE_ID: ${{ needs.migrate.outputs.database_id }}
+        run: node scripts/d1-bind.js --database-id "$D1_DATABASE_ID" --name "$D1_DATABASE_NAME"
 
       # Deploy first: with Cloudflare's versioning model, `wrangler secret put`
       # refuses to bind a secret when the latest Worker version is an
@@ -115,4 +213,42 @@ jobs:
             echo "::warning::COINGECKO_API_KEY not set as a GitHub Actions secret — skipping (the gecko discovery leg stays at geo 0)"
           fi
 
+  # AFTER the deploy, so Turso has already stopped taking writes and this pass
+  # sees the whole cutover window. It may only INSERT rows D1 lacks (see the
+  # header): everything D1 wrote since the switch is newer than anything the
+  # archive can still hold. Runs on every deploy — once worker_state.d1_cutover_v1
+  # is stamped it is just the count report, which is also the check that D1 is
+  # really the store (it fails if a table the bot fills came up empty).
+  catchup:
+    needs: [migrate, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Fill anything the cutover window left behind
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ needs.migrate.outputs.database_id }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          # The manual "fill the gaps now" button (workflow_dispatch). The
+          # script reads it instead of the shell building a flag out of an
+          # expression, which is also what keeps the push path free of one.
+          FORCE_CATCHUP: ${{ inputs.catchup }}
+        run: node scripts/d1-copy.js catchup
 

@@ -18408,10 +18408,9 @@ async function main() {
       'readDebugScanCache<Record<string,unknown>>("pool")',
       poolAt,
     );
-    const probeAt = src.indexOf(
-      "constprobe=newDb(env.TURSO_DATABASE_URL,env.TURSO_AUTH_TOKEN);",
-      poolAt,
-    );
+    // 2026-10-15: the probe's constructor now also carries the D1 binding (see
+    // Env.DB), so the pin matches the build itself and not its argument list.
+    const probeAt = src.indexOf("constprobe=newDb(env.TURSO_DATABASE_URL", poolAt);
     assert.ok(
       poolCacheAt > poolAt && probeAt > poolCacheAt,
       "/debug/pool must answer from the cache before building the probe",
@@ -19285,7 +19284,12 @@ async function main() {
       "worker (stamp BEFORE init)":
         handlerStart >= 0 && stampCall >= handlerStart && scheduledInit > stampCall,
       "worker (every return moves the flag)": flagSets >= 3,
-      "worker (the cold-isolate fallback)": workerSrc.includes("newDb(env.TURSO_DATABASE_URL,env.TURSO_AUTH_TOKEN).stampScheduledArrival("),
+      // 2026-10-15: the fallback now builds its Db through standaloneDb(env),
+      // which answers the SAME cold-isolate need while following the active
+      // store (D1 when the binding is present, Turso otherwise) — a stamp
+      // written to the inactive store is the one failure this pin must not
+      // allow, so it asserts the call site, not the constructor arguments.
+      "worker (the cold-isolate fallback)": workerSrc.includes("standaloneDb(env)?.stampScheduledArrival("),
       "health (the pair is published)": workerSrc.includes("scheduledArrivalUnaccounted:"),
     };
     const done = Object.entries(applied).filter(([, v]) => v);
