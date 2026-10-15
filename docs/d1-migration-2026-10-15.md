@@ -70,6 +70,13 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 唔需要額外權限）：答 `active` ＝ 憑證有效、係權限問題；答唔到 ＝ 要換憑證。呢個 hint 由
 `scripts/test-d1-migrate.js` 釘住（401 嘅真實形狀：D1 route 401/10000 ＋ verify 400）。
 
+**點加 `D1:Edit`（2026-10-15，dashboard 位置記低，下次唔使搵）**：Cloudflare 右上角頭像 →
+**My Profile → API Tokens**（account-owned token 就係 **Manage Account → Account API Tokens**）→
+該行 `...` → **Edit** → Permissions 區 **+ Add more** → 三個下拉揀 `Account` ／ `D1` ／ `Edit`
+（**只 Read 唔夠**：Cloudflare release note 講明 HTTP API 寫 D1 要 `D1:Edit`）→ 順手確認
+**Account Resources** 包住 `CLOUDFLARE_ACCOUNT_ID` 嗰個 account → **Continue to summary** → **Save**。
+權限**即時生效**，token 值唔變、GitHub secret 唔使換，所以只需要重跑一次 workflow。
+
 1. **migrate**（`timeout-minutes: 45`）：`ensure` → `schema` → `seed`。`ensure` 用 `wrangler` name 搵 DB（`solana-meme-bot`），冇就 create，uuid 交去下一個 job（`outputs.database_id`）。
 2. **deploy**：照舊 typecheck＋全套測試，然後 `scripts/d1-bind.js` 注入 binding，再 `wrangler deploy`。**binding 出現就係切換**：D1 未 seeded 就 deploy 唔到（job 依賴 migrate），所以 prod 永遠唔會指住一個空 DB。
 3. **catchup**：deploy 之後跑，把 copy→deploy 呢段窗口寫入嘅行補落 D1（**只插入、唔覆蓋**）。
