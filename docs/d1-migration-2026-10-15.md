@@ -60,6 +60,16 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 ## 4. 切換：`deploy.yml` 三個 job（`migrate` → `deploy` → `catchup`）
 **憑證**：CI **已經有** Turso 憑證（`backfill-pumpfun.yml`、`axiom-refresh.yml` 一直用 `secrets.TURSO_DATABASE_URL`／`TURSO_AUTH_TOKEN`），所以唔需要新 secret；CF 側就係本身用緊嘅 `CLOUDFLARE_API_TOKEN`（要有 **D1:Edit**）＋ `CLOUDFLARE_ACCOUNT_ID`。
 
+**實測（2026-10-15 08:39Z，第一次 push 去 main）**：`migrate` 喺第一步 `ensure` 就死，
+`GET /accounts/<acct>/d1/database → HTTP 401 (10000 Authentication error)`。**同一個** secret
+喺 04:12Z 嘅 deploy run 仲係成功（`wrangler deploy` ＋ 三個 `wrangler secret put` 全綠），
+即係「wrangler 過得」唔等於「D1 過得」：Cloudflare 嘅 "Edit Cloudflare Workers" 模板**冇** D1 權限，
+而 D1 REST 要 **Account > D1 > Edit**。`401 / 10000` 呢個碼本身分唔開「憑證唔 valid」同
+「憑證冇 D1 權限」（cloudflare/workers-sdk#9320 就係呢個形狀：deploy 成功、D1 call 被拒），
+所以 `scripts/d1-copy.js` 喺 401/403 嘅失敗路徑會再問一次 `/user/tokens/verify`（唔需要 account、
+唔需要額外權限）：答 `active` ＝ 憑證有效、係權限問題；答唔到 ＝ 要換憑證。呢個 hint 由
+`scripts/test-d1-migrate.js` 釘住（401 嘅真實形狀：D1 route 401/10000 ＋ verify 400）。
+
 1. **migrate**（`timeout-minutes: 45`）：`ensure` → `schema` → `seed`。`ensure` 用 `wrangler` name 搵 DB（`solana-meme-bot`），冇就 create，uuid 交去下一個 job（`outputs.database_id`）。
 2. **deploy**：照舊 typecheck＋全套測試，然後 `scripts/d1-bind.js` 注入 binding，再 `wrangler deploy`。**binding 出現就係切換**：D1 未 seeded 就 deploy 唔到（job 依賴 migrate），所以 prod 永遠唔會指住一個空 DB。
 3. **catchup**：deploy 之後跑，把 copy→deploy 呢段窗口寫入嘅行補落 D1（**只插入、唔覆蓋**）。
@@ -104,7 +114,7 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 - **回滾**：`deploy` step **之前**抽走（或者唔 commit 呢個 workflow）＝零資料損失，Worker 照舊 Turso。**之後**回滾＝由 revert workflow 再 deploy，但會失去 D1 窗口內嘅寫入（重複推卡風險），所以只可以即刻做。
 
 ## 7. 落地 checklist
-1. Merge（或者手動 `workflow_dispatch`）`deploy.yml` → 睇 migrate job：`created/found D1 database solana-meme-bot (uuid …)`、`schema_tables=9`、`copied=true`、行數表全部 `+0` 或以上。
+1. Merge（或者手動 `workflow_dispatch`）`deploy.yml` → 睇 migrate job：`created/found D1 database solana-meme-bot (uuid …)`、`schema_tables=9`、`copied=true`、行數表全部 `+0` 或以上。（`ensure` 死喺 `HTTP 401` 就係上面 §4 嘅憑證問題，唔係搬數問題——worker 仲喺 Turso，冇嘢寫過。）
 2. 睇 deploy job log：`injected [[d1_databases]] …` 之後 `wrangler deploy` 成功。**呢一刻就係切換。**
 3. 睇 catchup job：`d1_cutover_v1` stamp、行數表（archive 同 d1 會唔同，正常）。
 4. 15 分鐘後睇 `/health`：`dbOk`、`dbTickSteps`、`writeCensus`、tick `ms`；用 `/debug/pool` 對照 pool 行數（同 archive 唔會一樣，D1 係 live）。

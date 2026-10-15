@@ -64,7 +64,7 @@ const {
   chunkForParamLimit,
   createD1Transport,
 } = require("../dist/d1.js");
-const { createD1Rest, createRestBinding } = require("./d1-rest.js");
+const { CloudflareApiError, createD1Rest, createRestBinding } = require("./d1-rest.js");
 
 /** worker_state key stamped by a completed `seed` pass (see the header). */
 const SEED_MARKER_KEY = "d1_seed_v1";
@@ -223,6 +223,67 @@ async function readPage(client, table, columns, afterRowid, limit) {
     rowid: Number(row.__rowid),
     values: columns.map((c) => portableValue(row[c.name], table.name, c.name)),
   }));
+}
+
+/**
+ * WHY A 401 IS NOT AN ANSWER. Cloudflare refuses a D1 call with `401 / 10000
+ * Authentication error` in two very different situations: the credential is
+ * revoked or expired, or the credential is perfectly good and simply has no D1
+ * access — the "Edit Cloudflare Workers" template deploys this Worker on every
+ * push and carries no D1 permission (cloudflare/workers-sdk#9320 is that exact
+ * shape). Both arrive here as the same status, so when one does, ask
+ * `/user/tokens/verify` (needs no account, no extra permission) and say which
+ * one it was. This runs on the FAILURE path only: a healthy run makes no extra
+ * call, and a run whose credentials are refused never gets far enough to have
+ * written anything, which is why the hint can promise a re-run is safe.
+ *
+ * Returns "" whenever it has nothing certain to add — an unrelated error, a
+ * missing credential, or a probe that itself failed gets no invented cause.
+ */
+async function authHint(
+  err,
+  {
+    accountId = process.env.CLOUDFLARE_ACCOUNT_ID,
+    apiToken = process.env.CLOUDFLARE_API_TOKEN,
+    fetchImpl = undefined,
+  } = {},
+) {
+  if (!(err instanceof CloudflareApiError)) return "";
+  if (err.status !== 401 && err.status !== 403) return "";
+  if (!apiToken) return "";
+  try {
+    const { status, expiresOn } = await createD1Rest({
+      accountId,
+      apiToken,
+      ...(fetchImpl ? { fetchImpl } : {}),
+    }).verifyToken();
+    if (status === "active") {
+      return (
+        `\n  the token itself answers /user/tokens/verify as "active" — it IS a valid Cloudflare credential` +
+        `, so this is a PERMISSION/scope refusal, not a bad token. D1 needs Account > D1 > Edit on the` +
+        ` account CLOUDFLARE_ACCOUNT_ID names (a token built from Cloudflare's "Edit Cloudflare Workers"` +
+        ` template deploys this Worker on every push and still has no D1 access).` +
+        `\n  Nothing was written to D1 by this run; add the permission and re-run, the copy is idempotent.`
+      );
+    }
+    return (
+      `\n  the token itself answers /user/tokens/verify as "${status}"${expiresOn ? ` (expires_on ${expiresOn})` : ""}` +
+      ` — the CLOUDFLARE_API_TOKEN secret needs reissuing. Nothing was written to D1 by this run;` +
+      ` the copy is idempotent, so re-running after the new secret is set is safe.`
+    );
+  } catch (probeErr) {
+    // Measured 2026-10-15 against the real API: a token Cloudflare does not
+    // accept answers the D1 route 401/10000 and /user/tokens/verify 400. What is
+    // NOT claimed here is WHICH of those it is — verify needs no account and no
+    // permission, but it also cannot see every kind of token (an account-owned
+    // one, for instance), so all it proves is that the credential is what needs
+    // fixing rather than the call.
+    return (
+      `\n  the D1 API refused this credential AND /user/tokens/verify refused it too (HTTP ${probeErr?.status ?? "?"})` +
+      ` — verify needs no account and no permission, so the credential itself is what has to change, not the call.` +
+      ` Reissue CLOUDFLARE_API_TOKEN (Account > D1 > Edit) and re-run; nothing was written and the copy is idempotent.`
+    );
+  }
 }
 
 /**
@@ -573,6 +634,7 @@ module.exports = {
   SEED_MARKER_KEY,
   STATEMENTS_PER_FLUSH,
   archiveCounts,
+  authHint,
   assertEverythingLanded,
   copyAll,
   copyTable,
@@ -584,8 +646,11 @@ module.exports = {
 };
 
 if (require.main === module) {
-  main().catch((err) => {
-    console.error(`d1-copy failed: ${err instanceof Error ? err.message : err}`);
+  main().catch(async (err) => {
+    // The hint is decided HERE rather than per subcommand so every path that can
+    // meet the ambiguous 401 (ensure, schema, seed, catchup) says the same thing.
+    const hint = await authHint(err);
+    console.error(`d1-copy failed: ${err instanceof Error ? err.message : err}${hint}`);
     if (err instanceof Error && err.stack) console.error(err.stack.split("\n").slice(1, 4).join("\n"));
     process.exit(1);
   });

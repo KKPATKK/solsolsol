@@ -258,12 +258,33 @@ function createD1Rest({
     return out;
   }
 
+  /**
+   * The token's own status — the one endpoint that answers a question about the
+   * CREDENTIAL rather than about a resource. It needs no account in the path and
+   * no permission beyond being a valid token, which is exactly why it is the
+   * only way to tell the two 401s apart: Cloudflare refuses a revoked token and
+   * a live token with no D1 access with the SAME status and code (401 / 10000 —
+   * cf. cloudflare/workers-sdk#9320, where `wrangler deploy` succeeds and a D1
+   * call is refused). See authHint in scripts/d1-copy.js.
+   */
+  async function verifyToken() {
+    const payload = await call("GET", "/user/tokens/verify");
+    const result = payload?.result ?? {};
+    return {
+      id: result.id ?? null,
+      status: String(result.status ?? "unknown"),
+      expiresOn: result.expires_on ?? null,
+      notBefore: result.not_before ?? null,
+    };
+  }
+
   return {
     listDatabases,
     createDatabase,
     ensureDatabase,
     query,
     batch,
+    verifyToken,
     /** Raw call, for the one-off probes CI logs (account checks). */
     call,
   };

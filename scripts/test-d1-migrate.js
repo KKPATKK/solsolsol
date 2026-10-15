@@ -35,6 +35,7 @@ const { createClient } = require("@libsql/client");
 const { Db } = require("../dist/db.js");
 const { D1_MAX_BOUND_PARAMS, createD1Transport } = require("../dist/d1.js");
 const {
+  CloudflareApiError,
   createD1Rest,
   createRestBinding,
   planRequests,
@@ -43,6 +44,7 @@ const {
 const {
   archiveCounts,
   assertEverythingLanded,
+  authHint,
   insertStatement,
   introspect,
   copyAll,
@@ -557,6 +559,79 @@ async function main() {
     archive.client.close();
     for (const [, db] of api.databases) db.client.close();
     for (const [, db] of other.databases) db.client.close();
+  });
+
+  // ---- the ambiguous 401 --------------------------------------------------
+  await test("a refused D1 call names its cause instead of printing the status twice", async () => {
+    // Cloudflare answers the SAME 401/10000 for a revoked token and for a live
+    // token with no D1 permission (workers-sdk#9320: wrangler deploys the
+    // Worker, the D1 call is refused), so the message has to ask
+    // /user/tokens/verify before it can say which one it was. These are the
+    // three answers it must keep apart, plus the errors it must not touch.
+    const reply = (status, payload) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: () => null },
+      text: async () => JSON.stringify(payload),
+    });
+    const refuse = () =>
+      reply(401, { success: false, errors: [{ code: 10000, message: "Authentication error" }] });
+    const fetchWith = (verifyResponse) => async (url) =>
+      new URL(url).pathname.replace(/^\/client\/v4/, "") === "/user/tokens/verify"
+        ? verifyResponse
+        : refuse();
+    const refusedCall = new CloudflareApiError(
+      "GET /accounts/acct/d1/database → HTTP 401 (10000 Authentication error)",
+      401,
+      [{ code: 10000, message: "Authentication error" }],
+    );
+    const probe = (verifyResponse) => ({
+      accountId: "acct",
+      apiToken: "test-token",
+      fetchImpl: fetchWith(verifyResponse),
+    });
+
+    const active = await authHint(
+      refusedCall,
+      probe(reply(200, { success: true, result: { id: "tok", status: "active" } })),
+    );
+    assert.match(active, /PERMISSION\/scope refusal/);
+    assert.match(active, /D1 > Edit/);
+    assert.match(active, /idempotent/);
+
+    const expired = await authHint(
+      refusedCall,
+      probe(
+        reply(200, {
+          success: true,
+          result: { id: "tok", status: "expired", expires_on: "2026-10-01T00:00:00Z" },
+        }),
+      ),
+    );
+    assert.match(expired, /"expired"/);
+    assert.match(expired, /2026-10-01T00:00:00Z/);
+    assert.doesNotMatch(expired, /PERMISSION/);
+
+    // The real shape measured 2026-10-15: a token Cloudflare refuses answers the
+    // D1 route 401/10000 and /user/tokens/verify 400. The message names the
+    // credential as the thing to change and stops there — verify cannot see
+    // every kind of token, so it does not get to call the token invalid.
+    const unverifiable = await authHint(
+      refusedCall,
+      probe(reply(400, { success: false, errors: [{ code: 10000, message: "Authentication error" }] })),
+    );
+    assert.match(unverifiable, /HTTP 400/);
+    assert.match(unverifiable, /credential itself is what has to change/);
+    assert.doesNotMatch(unverifiable, /revoked|expired or mistyped/);
+
+    // A refusal that is not an auth one (the parameter ceiling answers 400) and
+    // a plain JS error get no invented cause…
+    const ceiling = new CloudflareApiError("statement too big", 400, []);
+    assert.equal(await authHint(ceiling, probe(reply(200, { success: true, result: {} }))), "");
+    assert.equal(await authHint(new Error("boom"), {}), "");
+    // …and with nothing to probe with, the hint stays SILENT rather than asking
+    // as an empty token, which would answer 401 and blame the secret for it.
+    assert.equal(await authHint(refusedCall, { accountId: "acct", apiToken: "" }), "");
   });
 
   // ---- the CI wiring that runs all of the above ----------------------------
