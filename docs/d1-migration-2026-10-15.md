@@ -152,7 +152,7 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 - **Worker 喺真 D1 嘅成本**（`/health.heartbeat.summary.dbTickSteps`，placed 路徑 NRT）：`getReevalPool 242ms`、`writeScanFront 144–153ms`、`getTokenStatsMany 123–131ms`、`readScanFront 110–116ms`、`isTokenSeen 109–110ms`（每個＝一次 batched call）；tick `ms` 3.6–4.8s，**比 Turso 同期嘅 1.73s 慢約 2.3×**（仍遠低於 60 秒 cadence）；三次抽樣 `writeDrainError` 都係 `null`、`initError` 一直 `null`、`dbReady true`、tracker lane 正常（`checked 20`）。
 - **未量**：D1 每 tick 嘅 statement 總數同 50-subrequest 預算嘅關係（`dbTickSteps` 係 per-method，唔係 per-statement）。
 
-## 9. 切換後兩個修正（2026-10-15，跟 §5 嘅 store 問題同一類）
+## 9. 切換後三個修正（2026-10-15，跟 §5 嘅 store 問題同一類）
 
 ### 9.1 `/debug/backfill` 嘅 cooldown 改為 durable
 呢條 route 每次行 42h Birdeye `new_listing`、花 30–80 CU，所以有 5 分鐘冷卻——但冷卻原本係**module scope 變數**（`let backfillDebugLastRunAt`），而 module scope 喺呢個 Worker 唔等於「一部機」：fleet 由接到 request 嘅 isolate 各自答，新 isolate 讀到自己嘅 `0`，所以「40 秒前跑過」喺另一個 isolate 完全睇唔到，冷卻只擋得住**撞返同一個 isolate** 嘅第二次 call。
@@ -167,3 +167,13 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 呢條 route 原本 `dbRegion: dbRegionFromUrl(env.TURSO_DATABASE_URL)` 係無條件嘅，切換之後就變成報緊一個**呢次 probe 根本冇碰過**嘅 database（`TURSO_DATABASE_URL` 仍然留喺 Worker 做 archive／Node 路徑）。
 
 改法：由 binding 自己報 store——`dbStore: env.DB ? "d1" : "turso"`——而 `dbRegion` 只有喺 **Turso 就係當前 store** 時才由 URL 解析（D1 唔係 `null` 就係假嘅 region，所以寧願 `null` 加一個真嘅 store label）。留意 D1 binding 唔會報邊個 region 服務嗰個 query，所以喺 D1 上面 `colo` 係唯一嘅距離訊號（而 §2 嘅 CAVEAT 亦適用：`colo` 係入口而唔係執行地）。同一條測試（`scripts/test-unit.js`）同時釘住 store label 同「URL 只喺 Turso 模式下解析」。
+
+### 9.3 `/debug/flow` 嘅 per-mint cooldown 亦改為 durable（同 9.1 同一類）
+`FLOW_DEBUG_COOLDOWN_MS`（30s）原本靠 module scope 嘅 `Map<mint, ms>`——同 9.1 一樣係「每個 isolate 一份」，所以只擋得住撞返同一個 isolate 嘅重複分析，而每次 gTFA 分析係 **150–300 Helius credits**；而該 Map 在單一 isolate 內亦會隨住任何人問過嘅 mint 無上限增長。
+
+改法：stamps 落**一行** `worker_state.debug_flow_at`（JSON `{mint: epochMs}`），經 `getWorkerState`／`setWorkerState` 讀寫。**故意唔用一 row per mint**（backfill 就係一行一次）：呢條 route 冇認證，一 row per mint 即係任何人打任意合法地址都可以種一條永久 row。所以每次寫入一定先 `pruneFlowDebugStamps`，只保留**仍然擋得住人**嘅 stamp（過期同「未來」嘅丟掉），另加 `FLOW_DEBUG_MAX_ENTRIES`（64，最舊先走）上限——row 大小係「最近 30 秒問過幾個唔同 mint」嘅函數，唔係「歷來問過幾多」。
+- 規則同樣抽成純函數（`src/worker.ts` 匯出）：`parseFlowDebugStamps`（冇 row／垃圾／JSON 陣列／單一壞 entry → 當冇，絕不 throw，唔會因為一個壞 key 令整行讀唔到）、`flowDebugWaitMs`（同 `backfillCooldownRemainingMs` 同規則：冇 stamp／過期／**未來** → 0）、`pruneFlowDebugStamps`。
+- stamp 記**嘗試**、寫喺 `analyzeMintFlow` **之前**（同舊 Map 一樣），所以分析 throw／timeout 都照樣吃掉 30 秒窗；429 形狀（`cooldown — re-analysis is credit-expensive` + `retryAfterSec`）不變，`docs/scan-completion-loss.md` 那句「有 cooldown 同 Helius 成本、唔應該當 poll 用」依然成立（而且現在真係跨 isolate 生效）。
+- 讀唔到 row = 當冇 stamp（放行）；寫失敗只 log，唔 fail（route 本身係手動診斷）。
+- 成本：被 429 擋住嘅路徑多一次 keyed row 讀（就係全部成本），放行嗰條多一次 row 寫；**tick 完全唔經呢條路**。
+- `scripts/test-unit.js` 加四條測試：parse（垃圾／陣列／壞 entry）、`flowDebugWaitMs`（缺／邊界／未來／其他 mint）、`pruneFlowDebugStamps`（過期＋未來＋cap 係「最新優先」）、同 route wiring（唔准再出現 `flowDebugLastRunAt` 呢個 Map、必須經共享行、stamp 先於 Helius 花費）。

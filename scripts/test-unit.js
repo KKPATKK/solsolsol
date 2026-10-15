@@ -26,7 +26,7 @@ const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = requi
 const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS, CARRIED_ATTEMPT_SIGS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
-const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX, backfillCooldownRemainingMs, BACKFILL_DEBUG_COOLDOWN_MS } = require("../dist/worker.js");
+const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX, backfillCooldownRemainingMs, BACKFILL_DEBUG_COOLDOWN_MS, parseFlowDebugStamps, flowDebugWaitMs, pruneFlowDebugStamps, FLOW_DEBUG_COOLDOWN_MS, FLOW_DEBUG_MAX_ENTRIES } = require("../dist/worker.js");
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
@@ -23817,6 +23817,120 @@ async function main() {
     assert.ok(worker.includes("await target.getWorkerState(BACKFILL_DEBUG_LAST_RUN_KEY)"));
     assert.ok(
       worker.includes("await target.setWorkerState(BACKFILL_DEBUG_LAST_RUN_KEY, String(atMs))"),
+    );
+  });
+
+  // ---------- the /debug/flow cooldown: the same durable shape, per mint ----------
+  //
+  // The gate protects ~150–300 Helius credits per re-analysis. It used to be a
+  // module-scope `Map<mint, ms>` — a copy per isolate, so it throttled only the
+  // isolate that had just run the mint, and on that isolate it also grew with
+  // every mint anyone ever probed. The stamps are one shared worker_state row
+  // now, and they are PRUNED to the ones that can still refuse something, so the
+  // durable shape is bounded by construction rather than by good behaviour.
+
+  await test("parseFlowDebugStamps: a missing, junk or non-object row is no stamps at all", () => {
+    assert.equal(FLOW_DEBUG_COOLDOWN_MS, 30_000, "one gTFA re-analysis is 150–300 Helius credits");
+    assert.deepEqual(parseFlowDebugStamps(null), {});
+    assert.deepEqual(parseFlowDebugStamps(undefined), {});
+    assert.deepEqual(parseFlowDebugStamps(""), {});
+    assert.deepEqual(parseFlowDebugStamps("not json"), {}, "junk is not a throw");
+    assert.deepEqual(parseFlowDebugStamps("[1,2]"), {}, "a JSON array is not a mint map");
+    assert.deepEqual(parseFlowDebugStamps("null"), {});
+    assert.deepEqual(parseFlowDebugStamps('"1700000000000"'), {});
+    // A single unusable entry must not make the whole row unreadable: the others
+    // still throttle their mints.
+    assert.deepEqual(
+      parseFlowDebugStamps(
+        '{"Ma": 1700000000000, "Mb": "abc", "Mc": 0, "Md": -1, "Me": null}',
+      ),
+      { Ma: 1700000000000 },
+    );
+    assert.deepEqual(
+      parseFlowDebugStamps('{"Ma":"1700000000000"}'),
+      { Ma: 1700000000000 },
+      "a numeric string is a usable stamp",
+    );
+  });
+
+  await test("flowDebugWaitMs: only a stamp inside the window blocks, and the remainder counts down", () => {
+    const t0 = 1_700_000_000_000;
+    const cd = FLOW_DEBUG_COOLDOWN_MS;
+    assert.equal(flowDebugWaitMs({}, "MINT", t0), 0, "an unseen mint may run");
+    assert.equal(flowDebugWaitMs({ OTHER: t0 }, "MINT", t0), 0, "another mint's stamp is not this one's");
+    assert.equal(flowDebugWaitMs({ MINT: t0 }, "MINT", t0), cd, "a run that just started");
+    assert.equal(flowDebugWaitMs({ MINT: t0 - 10_000 }, "MINT", t0), cd - 10_000, "10s in");
+    assert.equal(
+      flowDebugWaitMs({ MINT: t0 - cd }, "MINT", t0),
+      0,
+      "the boundary itself has elapsed — never a negative remainder",
+    );
+    assert.equal(flowDebugWaitMs({ MINT: t0 - cd - 1 }, "MINT", t0), 0);
+    assert.equal(flowDebugWaitMs({ MINT: t0 + 60_000 }, "MINT", t0), 0, "a future stamp is clock skew, not a block");
+    assert.equal(flowDebugWaitMs({ MINT: Number.NaN }, "MINT", t0), 0);
+  });
+
+  await test("pruneFlowDebugStamps: the durable row stays bounded, and keeps only stamps that can still refuse", () => {
+    const t0 = 1_700_000_000_000;
+    const cd = FLOW_DEBUG_COOLDOWN_MS;
+    assert.deepEqual(pruneFlowDebugStamps({}, t0), {});
+    assert.deepEqual(
+      pruneFlowDebugStamps({ A: t0 - cd, B: t0 - cd - 1, C: t0 - 1 }, t0),
+      { C: t0 - 1 },
+      "expired stamps are dropped — the row is not a directory of every mint ever probed",
+    );
+    assert.deepEqual(pruneFlowDebugStamps({ A: t0 + 5_000 }, t0), {}, "a future stamp is dropped, not carried");
+    assert.deepEqual(pruneFlowDebugStamps({ A: "x", B: t0 }, t0), { B: t0 }, "junk entries are dropped");
+    assert.deepEqual(pruneFlowDebugStamps({ A: t0 - cd + 1 }, t0), { A: t0 - cd + 1 }, "one ms inside the window stays");
+
+    // The cap: past FLOW_DEBUG_MAX_ENTRIES the NEWEST win, so a burst of probes
+    // cannot evict the stamps of the mints an operator is actually iterating on.
+    const many = {};
+    for (let i = 0; i < FLOW_DEBUG_MAX_ENTRIES + 10; i++) many["M" + i] = t0 - 100 - i;
+    const kept = pruneFlowDebugStamps(many, t0);
+    assert.equal(Object.keys(kept).length, FLOW_DEBUG_MAX_ENTRIES, "the row is capped");
+    assert.equal(kept.M0, t0 - 100, "the newest entry survives the cap");
+    assert.equal(kept["M" + (FLOW_DEBUG_MAX_ENTRIES - 1)], t0 - 100 - (FLOW_DEBUG_MAX_ENTRIES - 1));
+    assert.equal(kept["M" + FLOW_DEBUG_MAX_ENTRIES], undefined, "the oldest are the ones dropped");
+  });
+
+  await test("the /debug/flow cooldown reads and writes the durable row, and stamps the ATTEMPT", () => {
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const worker = read("src/worker.ts");
+    const start = worker.indexOf('url.pathname === "/debug/flow"');
+    assert.ok(start > 0, "the route is registered");
+    const route = worker.slice(start, start + 1500);
+
+    assert.ok(
+      !/flowDebugLastRunAt/.test(worker),
+      "a module-scope Map<mint, ms> cannot gate the endpoint — it is a copy per isolate",
+    );
+    assert.ok(
+      route.includes("const stamps = await readFlowDebugStamps();") &&
+        route.includes("const waitMs = flowDebugWaitMs(stamps, mint, nowMs);"),
+      "the gate reads the durable stamps and applies the rule the tests above pin",
+    );
+    assert.ok(
+      route.includes("await stampFlowDebugRun(stamps, mint, nowMs);"),
+      "a run writes the stamp back",
+    );
+    assert.ok(
+      route.includes('error: "cooldown — re-analysis is credit-expensive"') &&
+        route.includes("retryAfterSec: Math.ceil(waitMs / 1000)"),
+      "the refusal keeps its 429 shape",
+    );
+    // Ordering: the stamp lands BEFORE the credit spend, so an analysis that
+    // throws or times out still holds the mint's window (the Map did too).
+    const stampAt = route.indexOf("await stampFlowDebugRun(stamps, mint, nowMs);");
+    const analyzeAt = route.indexOf("const res = await analyzeMintFlow(mint);");
+    assert.ok(stampAt > 0 && analyzeAt > stampAt, "the attempt is stamped before the Helius spend");
+
+    // One shared, PRUNED row — the wiring has to match the rule the tests pin.
+    assert.ok(worker.includes('const FLOW_DEBUG_LAST_RUN_KEY = "debug_flow_at"'));
+    assert.ok(worker.includes("await target.getWorkerState(FLOW_DEBUG_LAST_RUN_KEY)"));
+    assert.ok(
+      worker.includes("JSON.stringify(pruneFlowDebugStamps({ ...stamps, [mint]: nowMs }, nowMs))"),
+      "the write prunes, so the durable row is bounded by design",
     );
   });
 

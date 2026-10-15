@@ -333,10 +333,28 @@ let walletAnalyzer: WalletAnalyzer | null = null;
 let flurryAnalyzer: FlurryAnalyzer | null = null;
 let trade: TradeService | null = null;
 let cfg: AppConfig | null = null;
-/** Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
- * expensive (~150–300 Helius credits), so throttle manual triggers. */
-const FLOW_DEBUG_COOLDOWN_MS = 30_000;
-const flowDebugLastRunAt = new Map<string, number>();
+/**
+ * Cooldown for the /debug/flow endpoint: re-analysis of the same mint is
+ * expensive (~150–300 Helius credits), so throttle manual triggers.
+ *
+ * DURABLE, NOT PER-ISOLATE (2026-10-15), for the reason the backfill gate below
+ * spells out: a module-scope `Map<mint, ms>` is a copy per isolate, so the
+ * throttle only refused a second call that happened to land on the isolate
+ * which served the first — the Helius spend the 30s window exists to bound was
+ * not bounded. The stamps live in ONE shared `worker_state` row now.
+ *
+ * WHY A MAP IN ONE ROW, and not one row per mint (the shape the backfill stamp
+ * uses): this route is unauthenticated, so a row per mint lets any caller mint a
+ * permanent row per arbitrary address it types. The row instead carries only the
+ * stamps that can still refuse something — `pruneFlowDebugStamps` drops anything
+ * older than the cooldown — so it is a handful of recently-probed mints, and one
+ * write per call instead of one row per address.
+ */
+export const FLOW_DEBUG_COOLDOWN_MS = 30_000;
+/** worker_state key: JSON `{ mint: epochMs }` of recent /debug/flow runs. */
+const FLOW_DEBUG_LAST_RUN_KEY = "debug_flow_at";
+/** Ceiling on that row's entries — even a burst must not grow it without bound. */
+export const FLOW_DEBUG_MAX_ENTRIES = 64;
 /** Cooldown for the /debug/tick endpoint (manual scan trigger). */
 const TICK_DEBUG_COOLDOWN_MS = 25_000;
 let tickDebugLastRunAt = 0;
@@ -492,6 +510,112 @@ async function stampBackfillRun(atMs: number): Promise<void> {
   } catch (err) {
     console.error(
       "[worker] backfill cooldown stamp failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/**
+ * The durable flow-cooldown row, parsed. A missing row, junk, a JSON array and
+ * any entry that is not a usable epoch ms all answer `{}` — never a throw. This
+ * is a throttle: an unreadable throttle must not fail the route it guards, and
+ * the route is manual, so the cost of forgetting a stamp is one extra analysis
+ * rather than a wrong answer anywhere.
+ */
+export function parseFlowDebugStamps(
+  raw: string | null | undefined,
+): Record<string, number> {
+  if (!raw) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return {};
+  }
+  const out: Record<string, number> = {};
+  for (const [mint, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const at = Number(value);
+    if (Number.isFinite(at) && at > 0) out[mint] = at;
+  }
+  return out;
+}
+
+/**
+ * Milliseconds of cooldown left for `mint`, 0 when it may run — the same rule
+ * `backfillCooldownRemainingMs` applies, per mint: no stamp (or an expired one)
+ * means nothing to wait for, and a stamp from the FUTURE is clock skew between
+ * isolates rather than a run that has not happened, so it must not hold the
+ * lever shut until the clock catches up.
+ */
+export function flowDebugWaitMs(
+  stamps: Record<string, number>,
+  mint: string,
+  nowMs: number,
+): number {
+  const at = stamps[mint];
+  if (!Number.isFinite(at) || at <= 0) return 0;
+  const since = nowMs - at;
+  if (since < 0) return 0;
+  return Math.max(0, FLOW_DEBUG_COOLDOWN_MS - since);
+}
+
+/**
+ * Drops what can no longer refuse anything — stamps older than the cooldown, and
+ * stamps from the future — then keeps the newest FLOW_DEBUG_MAX_ENTRIES of the
+ * rest. This is what makes the durable row bounded (see FLOW_DEBUG_LAST_RUN_KEY)
+ * AND self-cleaning: because only sub-cooldown stamps survive, the row's size is
+ * a function of how many DISTINCT mints were probed in the last 30s, not of how
+ * many were probed ever.
+ */
+export function pruneFlowDebugStamps(
+  stamps: Record<string, number>,
+  nowMs: number,
+): Record<string, number> {
+  const fresh = Object.entries(stamps).filter(
+    ([, at]) =>
+      Number.isFinite(at) && at <= nowMs && nowMs - at < FLOW_DEBUG_COOLDOWN_MS,
+  );
+  fresh.sort((a, b) => b[1] - a[1]);
+  return Object.fromEntries(fresh.slice(0, FLOW_DEBUG_MAX_ENTRIES));
+}
+
+/** The durable stamps, or `{}` when the row is missing or unreadable (above). */
+async function readFlowDebugStamps(): Promise<Record<string, number>> {
+  const target = db;
+  if (!target) return {};
+  try {
+    return parseFlowDebugStamps(
+      await target.getWorkerState(FLOW_DEBUG_LAST_RUN_KEY),
+    );
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Stamp a run's START into the durable row, from the map the route already read
+ * — so the allowed path costs one row read and one row write, and never a second
+ * read to find out what to write over. Pruned on the way out (see above).
+ * Best-effort, like the backfill stamp: a failed write is logged, not fatal.
+ */
+async function stampFlowDebugRun(
+  stamps: Record<string, number>,
+  mint: string,
+  nowMs: number,
+): Promise<void> {
+  const target = db;
+  if (!target) return;
+  try {
+    await target.setWorkerState(
+      FLOW_DEBUG_LAST_RUN_KEY,
+      JSON.stringify(pruneFlowDebugStamps({ ...stamps, [mint]: nowMs }, nowMs)),
+    );
+  } catch (err) {
+    console.error(
+      "[worker] flow cooldown stamp failed:",
       err instanceof Error ? err.message : err,
     );
   }
@@ -8846,19 +8970,24 @@ const worker = {
       if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
         return Response.json({ ok: false, error: "invalid mint" }, { status: 400 });
       }
-      const last = flowDebugLastRunAt.get(mint) ?? 0;
-      const wait = FLOW_DEBUG_COOLDOWN_MS - (Date.now() - last);
-      if (wait > 0) {
+      // The per-mint gate is the DURABLE row (`FLOW_DEBUG_LAST_RUN_KEY`), so it
+      // holds across isolates; the one read answers both the verdict and the map
+      // the stamp is written back from. `nowMs` is taken once, so the stamp can
+      // never refuse the call that is writing it.
+      const nowMs = Date.now();
+      const stamps = await readFlowDebugStamps();
+      const waitMs = flowDebugWaitMs(stamps, mint, nowMs);
+      if (waitMs > 0) {
         return Response.json(
           {
             ok: false,
             error: "cooldown — re-analysis is credit-expensive",
-            retryAfterSec: Math.ceil(wait / 1000),
+            retryAfterSec: Math.ceil(waitMs / 1000),
           },
           { status: 429 },
         );
       }
-      flowDebugLastRunAt.set(mint, Date.now());
+      await stampFlowDebugRun(stamps, mint, nowMs);
       const res = await analyzeMintFlow(mint);
       return Response.json({ mint, ...res });
     }
