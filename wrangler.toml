@@ -160,8 +160,9 @@ crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 # on /debug/db-latency. The tracker pass is where the second relay pays for
 # itself: its durable note read `db 738ms` per pass at ORD, all of it round
 # trips. WHAT TO READ AFTER A DEPLOY, one marker per delivery:
-# /health.heartbeat.relay for the scan tick (with heartbeat.colo — NRT expected
-# for a relayed tick; ORD is the cron region the probe measured);
+# /health.heartbeat.relay for the scan tick (with heartbeat.colo — NRT was
+# expected for a relayed tick UNDER THE TURSO POINTER, DFW after the
+# 2026-10-15 D1 re-point below; ORD is the cron region the probe measured);
 # /health.pushWatchPass.relay for the tracker pass (whose `db Nms` is the
 # number the relay shortens); and the tick summary's diag.maintRelay for the
 # maintenance legs. In every one, "inner" = the placed invocation ran it,
@@ -174,9 +175,54 @@ crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
 # runs on this placed path through the same relay. No location hint is set on
 # the object on purpose: the clock's own data center cannot matter, because it
 # runs no tick; the region reading that does matter is the heartbeat's `colo`,
-# which stays NRT because the relayed invocation is what runs the scan.
+# which reads the PLACED colo (NRT under the Turso pointer, DFW now) because
+# the relayed invocation is what runs the scan.
+#
+# RE-POINTED 2026-10-15 (the day of the D1 cutover): the database moved out of
+# Tokyo, so the region the fetch path was pointed at stopped being the
+# database's neighbour — measured before this change, the placed path paid a
+# cross-Pacific round trip on EVERY statement:
+#   - `npx wrangler d1 info solana-meme-bot`: `running_in_region WNAM`;
+#   - `npx wrangler d1 execute … --remote --command "SELECT 1"`: the answer
+#     carries Cloudflare's own routing — `meta.served_by_primary true`,
+#     `meta.served_by_region WNAM`, `meta.served_by_colo DFW`, and
+#     `meta.duration 0.2165` ms of actual SQL. So the data is served from
+#     DALLAS and the query costs nothing; the distance was everything.
+#   - /debug/db-latency (placed path): select1 p50 143ms, readRow 156ms,
+#     writeUpsert 169ms, claimShapeTwoTrip 347ms — against the 8-9ms this same
+#     route measured beside Turso-Tokyo on 2026-10-02.
+#   - /health.heartbeat.summary.dbTickSteps over five ticks: getWorkerStates
+#     37 calls / 7,486ms, recordTokenStatsMany 3 / 2,875ms, updateTokenMaxMcaps
+#     5 / 1,954ms, findUntrackedPushesAndLedger 3 / 1,472ms, writeScanFront
+#     7 / 1,217ms, readPostScanTelemetry 4 / 1,001ms — every one of those is a
+#     single round trip, i.e. ~140-200ms of Pacific per statement.
+#
+# WHAT THE NEW POINTER IS. `gcp:us-south1` is GCP's Dallas/Texas region, i.e.
+# the closest advertised cloud region to the DFW colo that serves the D1
+# primary — Cloudflare places a Worker in the colo with the lowest latency to
+# the named region, so this is the deterministic way to ask for "next to the
+# database" (the same reasoning that produced the NRT pointer, re-derived from
+# the store that actually holds the state).
+# Sources for the two facts this pointer rests on:
+#   developers.cloudflare.com/workers/configuration/placement — "Cloudflare
+#   maps your specified cloud region to the data center with the lowest latency
+#   to that region", identifiers are `{provider}:{region}` (AWS/GCP/Azure);
+#   cloud.google.com/about/locations — GCP `us-south1` IS Dallas, Texas (its
+#   zones are literally dfw-zone1-*).
+# ALTERNATIVES, in order, if GCP's Dallas is not accepted or does not land at
+# DFW: `azure:southcentralus` (San Antonio, the other Texas region) and then
+# `aws:us-east-2` (Ohio — central US at ~20ms, still a 7x cut from NRT). All
+# three are reverted the same way: change this one string.
+# WHAT TO READ AFTER THE DEPLOY, exactly as in 2026-10-02: `dbTickSteps` sums
+# should collapse (and /debug/db-latency's select1 p50 with them), the
+# heartbeat's `colo` should answer DFW or a neighbouring US colo rather than
+# NRT, and every relay marker must still read "inner" — the pointer decides
+# WHERE the work runs, never WHETHER it runs. The Turso archive is no longer
+# read by this Worker at all (see docs/d1-migration-2026-10-15.md §5), so no
+# other consumer depends on this path being in Tokyo; the maintenance legs'
+# upstreams (Birdeye, crime list) and the Telegram API are global.
 [placement]
-region = "aws:ap-northeast-1"
+region = "gcp:us-south1"
 
 # ---------------------------------------------------------------------------
 # THE SUB-MINUTE CLOCK (2026-10-02): a Durable Object whose alarm drives the

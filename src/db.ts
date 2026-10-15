@@ -1516,6 +1516,44 @@ export class Db {
   }
 
   /**
+   * Runs the statements a chunked writer split by `paramLimit()` as ONE round
+   * trip (2026-10-15).
+   *
+   * WHY. The 100-bound-parameter rule is a limit on how big ONE statement may
+   * be, never on how many statements one request may carry: a batch is a single
+   * request that runs its statements in order. Splitting for the ceiling while
+   * still awaiting each chunk separately therefore turned the ceiling into a
+   * ROUND-TRIP multiplier — measured live on D1 (`/health.heartbeat.summary.
+   * dbTickSteps`, 2026-10-15 22:5xZ): `recordTokenStatsMany` 3 calls / 2,875ms
+   * and `updateTokenMaxMcaps` 5 calls / 1,954ms, against a D1 whose own SQL for
+   * the same session answered `meta.duration 0.2165` ms. The statements were
+   * never the cost; the number of requests was, at ~140ms of Pacific each (the
+   * pre-re-point placement, see wrangler.toml).
+   *
+   * WHAT IT DOES NOT CHANGE. The statement list is built exactly as the loop
+   * built it — same order, same bindings, the same chunks — so the libsql shape
+   * (one statement of up to 2,400 parameters where D1 allows 100) is unchanged,
+   * and libsql now answers N chunks in the single request it always sent for
+   * the single statement. Every statement's own `rowsAffected` is still
+   * reported (a batch answers one result per statement), so the write census
+   * (`noteWriteCensus`) attributes the same rows to the same tables.
+   *
+   * WHAT IT DOES CHANGE, on purpose: a batch is all-or-nothing on both stores
+   * (see SqlTransport.batch), so a chunk that fails now takes its siblings with
+   * it instead of leaving a half-applied split. At the sizes these writers see
+   * (a tick's 20-40 registrations, ≤ 9 holder rows, the sweep's own cap) the
+   * window [one request instead of five] is the whole point, and every caller
+   * is either idempotent or retried by the deferred drain.
+   */
+  private async runChunked(stmts: SqlStatement[]): Promise<number> {
+    if (stmts.length === 0) return 0;
+    const results = await this.get().batch(stmts);
+    let rows = 0;
+    for (const res of results) rows += Number(res.rowsAffected ?? 0);
+    return rows;
+  }
+
+  /**
    * Many keys, ONE round trip. Every getWorkerState call is a subrequest, and
    * the invocation's budget counts Turso's HTTP requests too (Workers Free: 50
    * subrequests per invocation) — so the tick-front reads (scan_heartbeat plus
@@ -3025,7 +3063,7 @@ export class Db {
     chunk = 120,
   ): Promise<number> {
     if (rows.length === 0) return 0;
-    let updated = 0;
+    const stmts: SqlStatement[] = [];
     for (const slice of chunkForParamLimit(rows, 5, this.paramLimit(), chunk)) {
       const cases = slice.map(() => "WHEN ? THEN ?").join(" ");
       const args: Array<string | number> = [];
@@ -3035,7 +3073,7 @@ export class Db {
       for (const r of slice) args.push(r.token, r.liquidityUsd);
       for (const r of slice) args.push(r.token);
       for (const r of slice) args.push(r.token, r.liquidityUsd);
-      const res = await this.get().execute({
+      stmts.push({
         sql: `UPDATE token_stats SET last_liquidity_usd = CASE token ${cases} END,
               sweeps_since_reading = 0
               WHERE token IN (${slice.map(() => "?").join(",")})
@@ -3045,9 +3083,10 @@ export class Db {
                          IS NOT ((CASE token ${cases} END) < ${DEAD_LIQUIDITY_USD})))`,
         args,
       });
-      updated += Number(res.rowsAffected ?? 0);
     }
-    return updated;
+    // One request for the whole flush, however many chunks the store's ceiling
+    // forced (see runChunked).
+    return this.runChunked(stmts);
   }
 
   /**
@@ -3068,18 +3107,18 @@ export class Db {
    */
   async noteSweptWithoutReading(tokens: string[], chunk = 120): Promise<number> {
     if (tokens.length === 0) return 0;
-    let updated = 0;
     // One binding a token, so the cap is the transport's ceiling itself: D1's
-    // 100 against the 120 this always used (see paramLimit).
+    // 100 against the 120 this always used (see paramLimit) — and the chunks
+    // ride ONE request (see runChunked).
+    const stmts: SqlStatement[] = [];
     for (const slice of chunkForParamLimit(tokens, 1, this.paramLimit(), chunk)) {
-      const res = await this.get().execute({
+      stmts.push({
         sql: `UPDATE token_stats SET sweeps_since_reading = sweeps_since_reading + 1
               WHERE token IN (${slice.map(() => "?").join(",")})`,
         args: [...slice],
       });
-      updated += Number(res.rowsAffected ?? 0);
     }
-    return updated;
+    return this.runChunked(stmts);
   }
 
   /**
@@ -5051,6 +5090,7 @@ export class Db {
     if (rows.length === 0) return;
     // 7 bindings a row, so D1's 100-parameter ceiling allows 14 rows per
     // statement (a push records ≤ 9 holder rows, so one statement either way).
+    const stmts: SqlStatement[] = [];
     for (const slice of chunkForParamLimit(rows, 7, this.paramLimit())) {
       const placeholders = slice.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(",");
       const args: Array<string | number> = [];
@@ -5065,11 +5105,12 @@ export class Db {
           pushedAt,
         );
       }
-      await this.get().execute({
+      stmts.push({
         sql: `INSERT OR IGNORE INTO pushed_holders (token, owner, rank, ui_amount, is_creator, crime_hit, pushed_at) VALUES ${placeholders}`,
         args,
       });
     }
+    await this.runChunked(stmts);
   }
 
   /**
@@ -5111,7 +5152,9 @@ export class Db {
     const now = Date.now();
     // 9 bindings a row: D1's ceiling allows 11 rows per statement. A tick
     // enrolls the pushes it just sent (0-2 rows), so this is one statement
-    // there; the split exists so a large backfill cannot be rejected outright.
+    // there; the split exists so a large backfill cannot be rejected outright —
+    // and the chunks ride ONE request (see runChunked).
+    const stmts: SqlStatement[] = [];
     for (const slice of chunkForParamLimit(rows, 9, this.paramLimit())) {
       const placeholders = slice.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",");
       const args: Array<string | number | null> = [];
@@ -5128,7 +5171,7 @@ export class Db {
           row.poolAddress ?? null,
         );
       }
-      await this.get().execute({
+      stmts.push({
         sql: `INSERT INTO push_watch
                 (token, chat_id, symbol, pushed_at, mcap_at_push, peak_mcap,
                  last_liquidity, last_checked, pool_address)
@@ -5137,6 +5180,7 @@ export class Db {
         args,
       });
     }
+    await this.runChunked(stmts);
   }
 
   /**
@@ -5919,16 +5963,25 @@ export class Db {
     // ceiling decides: D1's 100 allows 14 entries per statement, libsql's
     // 32,766 keeps the whole tick's raise list in ONE statement exactly as it
     // always was (see paramLimit). A tick's raise list is ~20 entries in steady
-    // state, so the D1 split is 2 statements where libsql sends 1.
+    // state, so D1 splits that call into 2 statements — both inside the ONE
+    // request the libsql path also sends now (see runChunked; before it, each
+    // chunk awaited its own round trip, measured at 390ms a call on the
+    // pre-re-point placement).
+    const stmts: SqlStatement[] = [];
     for (const slice of chunkForParamLimit(entries, 7, this.paramLimit())) {
-      await this.writeTokenMaxMcapsChunk(slice);
+      stmts.push(this.tokenMaxMcapsStatement(slice));
     }
+    await this.runChunked(stmts);
   }
 
-  /** One chunk of updateTokenMaxMcaps — see that method's caller for the split. */
-  private async writeTokenMaxMcapsChunk(
+  /**
+   * One chunk of updateTokenMaxMcaps — see that method's caller for the split.
+   * Returns the statement instead of running it, so the caller can put every
+   * chunk of one raise list in ONE request (see runChunked).
+   */
+  private tokenMaxMcapsStatement(
     entries: Array<{ token: string; mcapUsd: number; liquidityUsd?: number }>,
-  ): Promise<void> {
+  ): SqlStatement {
     const mcapCases = entries
       .map(
         () =>
@@ -5974,7 +6027,7 @@ export class Db {
     // which is the backlog `writeDrain.pending` showed for days (2026-09-24:
     // pending 47, and the named cause once the drain record was made
     // durable: updateTokenMaxMcaps, pending 11).
-    await this.get().execute({
+    return {
       sql: `UPDATE token_stats SET
               max_mcap_observed = CASE ${mcapCases} ELSE max_mcap_observed END${
                 liqCases
@@ -5984,7 +6037,7 @@ export class Db {
               }
             WHERE token IN (${tokens.map(() => "?").join(",")})`,
       args: [...mcapArgs, ...liqArgs, ...tokens],
-    });
+    };
   }
 
   /**
@@ -6091,8 +6144,10 @@ export class Db {
 
   /**
    * Record stats for several first-seen tokens in ONE multi-row insert.
-   * Same rationale as getTokenStatsMany: batch to keep the tick's Turso
-   * round trips low when the database is slow.
+   * Same rationale as getTokenStatsMany: keep the tick's round trips low when
+   * the database is slow — and since 2026-10-15 that means one REQUEST for the
+   * whole registration, however many statements the store's parameter ceiling
+   * splits it into (see runChunked).
    */
   async recordTokenStatsMany(statsList: TokenStats[]): Promise<void> {
     if (statsList.length === 0) return;
@@ -6102,6 +6157,7 @@ export class Db {
     // ceiling keeps the whole registration batch in ONE statement as before
     // (see paramLimit).
     let inserted = 0;
+    const stmts: SqlStatement[] = [];
     for (const slice of chunkForParamLimit(statsList, 12, this.paramLimit())) {
       const placeholders = slice
         .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)")
@@ -6123,12 +6179,14 @@ export class Db {
           s.discoveredVia ?? null,
         );
       }
-      const res = await this.get().execute({
+      stmts.push({
         sql: `INSERT OR IGNORE INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, birdeye_1m_vol, rugcheck_bundler_pct, rugcheck_top10_pct, birdeye_pro_traders, birdeye_sniper_pct, min_mcap_observed, max_mcap_observed, supply_flow, supply_flow_at, discovered_via) VALUES ${placeholders}`,
         args,
       });
-      inserted += Number(res.rowsAffected ?? 0);
     }
+    // Every chunk of one registration pass in ONE request (see runChunked):
+    // D1's ceiling splits the rows, never the round trip.
+    inserted += await this.runChunked(stmts);
     await this.bumpTelemetryCounter("telemetry_token_stats_count", inserted);
   }
 

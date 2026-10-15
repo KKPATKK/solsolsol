@@ -22834,13 +22834,21 @@ async function main() {
   // feed). The block's own comment carries the measured before/after; this
   // test only stops the lever from being deleted or silently swapped while it
   // is still the live shape.
-  await test("placement experiment: the fetch path is pinned near the db region", () => {
-    const lines = fs
-      .readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8")
-      .split("\n");
+  //
+  // RE-DERIVED 2026-10-15 (the D1 cutover moved the store out of Tokyo): the
+  // pointer must name the region of the database THIS Worker reads and writes,
+  // which is now D1. The evidence the pointer rests on is in the block itself
+  // (Cloudflare's own answer for a `SELECT 1`: `served_by_colo DFW`,
+  // `served_by_primary true`, `meta.duration 0.2165` ms) — so this test pins
+  // both the pointer AND that its justification is still written down, because
+  // the previous pointer was CORRECT for the store that no longer serves the
+  // state, and a revert to it would silently restore ~140ms Pacific round
+  // trips on every statement of every tick.
+  await test("placement pointer: the fetch path is pinned near the D1 primary, not the Turso region", () => {
+    const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
     const placement = {};
     let inPlacement = false;
-    for (const line of lines) {
+    for (const line of toml.split("\n")) {
       if (/^\s*\[/.test(line)) {
         inPlacement = /^\s*\[placement\]/.test(line);
         continue;
@@ -22849,15 +22857,38 @@ async function main() {
       const m = /^\s*([a-z_]+)\s*=\s*"([^"]*)"\s*$/.exec(line);
       if (m) placement[m[1]] = m[2];
     }
+    // GCP's us-south1 IS Dallas, Texas, and Cloudflare places a Worker in the
+    // colo with the lowest latency to the named region — i.e. DFW, where the D1
+    // primary is served from. The other two are the block's written fallbacks
+    // (San Antonio and Ohio) for the case where the first is not accepted.
     assert.equal(
       placement.region,
-      "aws:ap-northeast-1",
-      "the fetch path must run near the Turso region the probe measures against",
+      "gcp:us-south1",
+      "the fetch path must run near the D1 primary (served_by_colo DFW)",
     );
     assert.equal(
       placement.mode,
       undefined,
       "an explicit region hint, not smart: the two are mutually exclusive",
+    );
+    // The justification has to survive in the block: the measurement that chose
+    // DFW, the fallbacks, and what to read after a deploy to confirm it worked.
+    assert.ok(toml.includes("served_by_colo"), "the pointer must quote Cloudflare's own colo answer");
+    assert.ok(toml.includes("DFW"), "…which is DFW for this database");
+    assert.ok(toml.includes("meta.duration 0.2165"), "…and the 0.2ms of SQL behind it");
+    for (const alt of ["azure:southcentralus", "aws:us-east-2"]) {
+      assert.ok(toml.includes(alt), `the block must name its fallback ${alt}`);
+    }
+    assert.ok(
+      toml.includes("dbTickSteps") && toml.includes("/debug/db-latency"),
+      "the block must say how to confirm the re-point from /health and /debug/db-latency",
+    );
+    // The Turso-era pointer is DEAD for this store, and its own block above
+    // records what it bought (8-9ms beside Turso-Tokyo). Coming back needs a
+    // new measurement, not a copy-paste.
+    assert.ok(
+      !toml.includes('region = "aws:ap-northeast-1"'),
+      "the Turso-Tokyo pointer must not come back without a fresh measurement",
     );
   });
 

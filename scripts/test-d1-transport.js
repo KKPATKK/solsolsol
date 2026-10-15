@@ -23,6 +23,16 @@
  *      chunking fix that also re-chunked Turso would quietly buy extra round
  *      trips, i.e. extra subrequests, on every tick).
  *
+ *      THE CEILING SPLITS STATEMENTS, NEVER REQUESTS. Each of those writers is
+ *      pinned to EXACTLY ONE request per call on both stores (fake.roundTrips):
+ *      a batch runs its statements in one round trip, so a writer that awaited
+ *      each chunk separately would turn a parameter limit into a round-trip
+ *      multiplier. That is not hypothetical — measured live on D1 on
+ *      2026-10-15 (`/health.heartbeat.summary.dbTickSteps`), recordTokenStatsMany
+ *      cost 2,875ms across 3 calls and updateTokenMaxMcaps 1,954ms across 5,
+ *      against a store whose own SQL answered `meta.duration 0.2165` ms: the
+ *      requests were the cost, not the statements.
+ *
  * The fake binding is deliberate: D1 does not exist outside Workers, and a mock
  * that only records calls would not prove the SQL still runs. Every statement
  * here is executed by @libsql/client against a temp file, with D1's own
@@ -81,6 +91,16 @@ class FakeD1 {
     this.maxArgs = 0;
     /** The heaviest statement seen, so a ceiling failure names its own SQL. */
     this.worst = null;
+    /**
+     * Round trips, counted the way the store bills them: an `all()`/`run()` is
+     * one request, a `batch()` is one request however many statements it
+     * carries. Reset before a writer call to pin that call's shape.
+     */
+    this.roundTrips = { singles: 0, batches: 0, batchStatements: 0 };
+  }
+
+  reset() {
+    this.roundTrips = { singles: 0, batches: 0, batchStatements: 0 };
   }
 
   prepare(sql) {
@@ -89,8 +109,14 @@ class FakeD1 {
       _sql: sql,
       _args: args,
       bind: (...more) => build(more),
-      all: () => self.exec(sql, args),
-      run: () => self.exec(sql, args),
+      all: () => {
+        self.roundTrips.singles += 1;
+        return self.exec(sql, args);
+      },
+      run: () => {
+        self.roundTrips.singles += 1;
+        return self.exec(sql, args);
+      },
     });
     return build([]);
   }
@@ -112,6 +138,8 @@ class FakeD1 {
   }
 
   async batch(stmts) {
+    this.roundTrips.batches += 1;
+    this.roundTrips.batchStatements += stmts.length;
     const out = [];
     for (const s of stmts) out.push(await this.exec(s._sql, s._args));
     return out;
@@ -240,43 +268,105 @@ async function main() {
   });
 
   // ---- the whole Db on a D1 binding ---------------------------------------
-  await test("Db on D1: init + the row-count-sized writers stay under 100 bindings", async () => {
+  await test("Db on D1: every row-count-sized writer is ONE request under 100 bindings", async () => {
     const { client } = tmpClient();
     const fake = new FakeD1(client);
     const db = new Db("", undefined, undefined, fake);
     await db.init();
 
-    // Registration: 200 coins, 12 bindings a row on one statement before this
-    // change — the shape that D1 would have rejected outright (40 registrations
-    // already bind 480).
-    await db.recordTokenStatsMany(bigStatsList(200));
+    /**
+     * One writer call, and the shape it cost: exactly ONE batch request, no
+     * single-statement request at all, carrying `statements` statements. The
+     * split is the CEILING's business — the round trip must not multiply with
+     * it (see runChunked in src/db.ts).
+     */
+    const oneRequest = async (label, run, statements, extraSingles = 0) => {
+      fake.reset();
+      await run();
+      assert.deepEqual(
+        fake.roundTrips,
+        { singles: extraSingles, batches: 1, batchStatements: statements },
+        `${label} must be ONE request carrying ${statements} statement(s)` +
+          ` (plus ${extraSingles} bookkeeping request(s) of its own)`,
+      );
+      assert.equal(
+        fake.maxArgs <= D1_MAX_BOUND_PARAMS,
+        true,
+        `${label} bound ${fake.maxArgs} parameters — D1 rejects anything over ${D1_MAX_BOUND_PARAMS}` +
+          (fake.worst ? `\n      SQL: ${fake.worst.sql.slice(0, 300)}` : ""),
+      );
+    };
 
-    // The observed-liquidity batch: its 120-row form binds 600 parameters.
-    await db.recordObservedLiquidity(liquidityRows(200));
-
-    // The max-mcap raise: 7 bindings an entry, and this one had no chunk at all.
-    await db.updateTokenMaxMcaps(mcapEntries(60));
-
-    // The freshness mark: 1 binding a token, 120 at its old chunk size.
-    await db.noteSweptWithoutReading(Array.from({ length: 150 }, (_, i) => `tok${i}`));
-
-    // The post-push enrollment: 9 bindings a row.
-    await db.upsertPushWatchMany(
-      Array.from({ length: 30 }, (_, i) => ({
-        token: `push${i}`,
-        chatId: "1",
-        symbol: "T",
-        pushedAt: 1_700_000_000_000 + i,
-        mcapAtPush: 70_000,
-        liquidityUsd: 20_000,
-      })),
+    // Registration: 200 coins, 12 bindings a row — the shape D1 rejects
+    // outright (40 registrations already bind 480), so 25 statements of 8 rows.
+    //
+    // The ONE extra single-statement request is telemetry_token_stats_count,
+    // and it is correct that it stays separate: its delta is the rows INSERT OR
+    // IGNORE actually admitted, which only the server can answer (`changes()`),
+    // so it must FOLLOW the statements it counts rather than be computed before
+    // them — see CLAIM_COUNTER_UPSERT_SQL's own note on this. It is one request
+    // per registration pass, not one per chunk.
+    await oneRequest(
+      "recordTokenStatsMany(200 rows)",
+      () => db.recordTokenStatsMany(bigStatsList(200)),
+      25,
+      1,
     );
 
-    assert.equal(
-      fake.maxArgs <= D1_MAX_BOUND_PARAMS,
-      true,
-      `a statement bound ${fake.maxArgs} parameters — D1 rejects anything over ${D1_MAX_BOUND_PARAMS}` +
-        (fake.worst ? `\n      SQL: ${fake.worst.sql.slice(0, 300)}` : ""),
+    // The observed-liquidity batch: 5 bindings a row, 20 rows a statement.
+    await oneRequest(
+      "recordObservedLiquidity(200 rows)",
+      () => db.recordObservedLiquidity(liquidityRows(200)),
+      10,
+    );
+
+    // The max-mcap raise: 7 bindings an entry, 14 entries a statement.
+    await oneRequest(
+      "updateTokenMaxMcaps(60 entries)",
+      () => db.updateTokenMaxMcaps(mcapEntries(60)),
+      5,
+    );
+
+    // The freshness mark: 1 binding a token, 100 tokens a statement.
+    await oneRequest(
+      "noteSweptWithoutReading(150 tokens)",
+      () => db.noteSweptWithoutReading(Array.from({ length: 150 }, (_, i) => `tok${i}`)),
+      2,
+    );
+
+    // The post-push enrollment: 9 bindings a row, 11 rows a statement.
+    await oneRequest(
+      "upsertPushWatchMany(30 rows)",
+      () =>
+        db.upsertPushWatchMany(
+          Array.from({ length: 30 }, (_, i) => ({
+            token: `push${i}`,
+            chatId: "1",
+            symbol: "T",
+            pushedAt: 1_700_000_000_000 + i,
+            mcapAtPush: 70_000,
+            liquidityUsd: 20_000,
+          })),
+        ),
+      3,
+    );
+
+    // The holder snapshot: 7 bindings a row, 14 rows a statement.
+    await oneRequest(
+      "recordPushedHolders(40 rows)",
+      () =>
+        db.recordPushedHolders(
+          Array.from({ length: 40 }, (_, i) => ({
+            token: `hold${i}`,
+            owner: `own${i}`,
+            rank: i + 1,
+            uiAmount: 1000 + i,
+            isCreator: i === 0,
+            crimeHit: false,
+          })),
+          1_700_000_000_000,
+        ),
+      3,
     );
 
     // The rows really landed (the statements ran; they were not merely split).
@@ -285,6 +375,8 @@ async function main() {
     assert.equal(stats.get("tok0").maxMcapObserved, 80_000);
     const watch = await client.execute("SELECT COUNT(*) AS n FROM push_watch");
     assert.equal(Number(watch.rows[0].n), 30);
+    const holders = await client.execute("SELECT COUNT(*) AS n FROM pushed_holders");
+    assert.equal(Number(holders.rows[0].n), 40);
 
     // …and the write census sees them, which is the proof that `rowsAffected`
     // was translated from `meta.changes` and not from `meta.rows_written`.
@@ -297,34 +389,48 @@ async function main() {
     client.close();
   });
 
-  await test("Db on libsql: the same calls keep their original batch shape", async () => {
+  await test("Db on libsql: the same calls keep their original statement shape, in ONE request", async () => {
     const { client } = tmpClient();
     /** Every statement the Db sent, so each writer can be counted on its own. */
     let sent = [];
+    /** Requests, the way the transport bills them: one per batch() call. */
+    let batches = 0;
     const counting = {
       execute: (stmt) => {
         sent.push({ sql: String(stmt.sql), args: (stmt.args ?? []).length });
         return client.execute(stmt);
       },
-      batch: (stmts, mode) => client.batch(stmts, mode),
+      batch: (stmts, mode) => {
+        batches += 1;
+        for (const s of stmts) {
+          sent.push({ sql: String(s.sql ?? s), args: (s.args ?? []).length });
+        }
+        return client.batch(stmts, mode);
+      },
     };
     const db = new Db("file:injected", undefined, counting);
     await db.init();
 
-    /** The statements one writer issued, and the largest bind count among them. */
+    /** How one writer call looked: its statements, its heaviest bind, its requests. */
     const measure = (marker) => {
       const mine = sent.filter((s) => s.sql.includes(marker));
-      return { statements: mine.length, maxArgs: Math.max(0, ...mine.map((s) => s.args)) };
+      return {
+        statements: mine.length,
+        maxArgs: Math.max(0, ...mine.map((s) => s.args)),
+        requests: batches,
+      };
     };
 
     // Registration: 200 rows × 12 bindings = ONE 2,400-parameter statement on
-    // libsql (D1 splits the same call into 25).
+    // libsql (D1 splits the same call into 25 statements), and ONE request on
+    // both stores.
     sent = [];
+    batches = 0;
     await db.recordTokenStatsMany(bigStatsList(200));
     assert.deepEqual(
       measure("INSERT OR IGNORE INTO token_stats"),
-      { statements: 1, maxArgs: 2400 },
-      "registration must stay ONE 2,400-parameter statement on libsql",
+      { statements: 1, maxArgs: 2400, requests: 1 },
+      "registration must stay ONE 2,400-parameter statement in ONE request",
     );
 
     // The observed-liquidity batch: 120 rows × 5 bindings (SET pair + IN + the
@@ -332,20 +438,22 @@ async function main() {
     // this is ten statements (20 rows each) — a chunking fix that also applied
     // to libsql would add eight round trips to every tick's tail.
     sent = [];
+    batches = 0;
     await db.recordObservedLiquidity(liquidityRows(200));
     assert.deepEqual(
       measure("last_liquidity_usd ="),
-      { statements: 2, maxArgs: 600 },
-      "liquidity must stay TWO 600-parameter statements on libsql",
+      { statements: 2, maxArgs: 600, requests: 1 },
+      "liquidity must stay TWO 600-parameter statements in ONE request on libsql",
     );
 
     // The max-mcap raise: 60 entries × 7 bindings = 420, one statement.
     sent = [];
+    batches = 0;
     await db.updateTokenMaxMcaps(mcapEntries(60));
     assert.deepEqual(
       measure("max_mcap_observed ="),
-      { statements: 1, maxArgs: 420 },
-      "max-mcap must stay ONE 420-parameter statement on libsql",
+      { statements: 1, maxArgs: 420, requests: 1 },
+      "max-mcap must stay ONE 420-parameter statement in ONE request on libsql",
     );
 
     client.close();

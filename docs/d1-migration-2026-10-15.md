@@ -151,6 +151,7 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 - **Turso 唯讀**：archive 最新一行 `scan_history.at = 09:31:23Z`（切換前最後一個 tick）；usage API 嘅 09:35–09:40Z 桶 **`rows_written=0`、`rows_read=0`**（對照同日 09:25–09:30 桶：2,213／263,825）。
 - **Worker 喺真 D1 嘅成本**（`/health.heartbeat.summary.dbTickSteps`，placed 路徑 NRT）：`getReevalPool 242ms`、`writeScanFront 144–153ms`、`getTokenStatsMany 123–131ms`、`readScanFront 110–116ms`、`isTokenSeen 109–110ms`（每個＝一次 batched call）；tick `ms` 3.6–4.8s，**比 Turso 同期嘅 1.73s 慢約 2.3×**（仍遠低於 60 秒 cadence）；三次抽樣 `writeDrainError` 都係 `null`、`initError` 一直 `null`、`dbReady true`、tracker lane 正常（`checked 20`）。
 - **未量**：D1 每 tick 嘅 statement 總數同 50-subrequest 預算嘅關係（`dbTickSteps` 係 per-method，唔係 per-statement）。
+- **切換之後嘅效率跟進（placement 指住咗東京、同 chunk 實作把 100-param 上限變成 round-trip 乘數）另開一份：`docs/d1-efficiency-2026-10-15.md`。**
 
 ## 9. 切換後三個修正（2026-10-15，跟 §5 嘅 store 問題同一類）
 
