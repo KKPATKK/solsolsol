@@ -26,7 +26,7 @@ const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = requi
 const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS, CARRIED_ATTEMPT_SIGS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
-const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX } = require("../dist/worker.js");
+const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, SCAN_TICK_BUDGET_MS, cronGateLoad, scanSubreqLeft, TRACKER_PASS_SUBREQ_RESERVE, FRONT_INIT_BOUND_MS, frontSplitNote, preStartSplitNote, TICK_PROGRESS_FRONT_MAX, TICK_PROGRESS_ERR_MAX, backfillCooldownRemainingMs, BACKFILL_DEBUG_COOLDOWN_MS } = require("../dist/worker.js");
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
@@ -22790,7 +22790,19 @@ async function main() {
     assert.ok(!probeCode.includes("seen_tokens"), "a diagnostic must not be able to claim a coin");
     const worker = read("src/worker.ts");
     assert.ok(worker.includes('url.pathname === "/debug/db-latency"'), "the route is registered");
-    assert.ok(worker.includes("dbRegionFromUrl(env.TURSO_DATABASE_URL)"), "the report carries the db region");
+    // WHICH store the probe measured must come from the BINDING, not from a URL
+    // that may describe a different database: since the 2026-10-15 cutover the
+    // tick (and this probe) runs on env.DB while TURSO_DATABASE_URL stays in the
+    // Worker for the archive/Node path, so an unconditional parse named a region
+    // the probe had not touched.
+    assert.ok(
+      worker.includes('dbStore: env.DB ? "d1" : "turso"'),
+      "the report names the store it actually measured",
+    );
+    assert.ok(
+      worker.includes("dbRegion: env.DB ? null : dbRegionFromUrl(env.TURSO_DATABASE_URL)"),
+      "a region is read out of the Turso URL only while Turso is the store in use",
+    );
     assert.ok(worker.includes("await db.measureLatency(requested)"), "…and the measurement comes from the Db");
     assert.ok(worker.includes("verdict: changesVerdict("), "the report carries the changes() verdict");
     assert.ok(
@@ -23715,6 +23727,96 @@ async function main() {
       !/const writeCensusSince = Date\.now\(\)/.test(dbSrc) &&
         dbSrc.includes("function writeCensusClock()"),
       "the census baseline is stamped on first use, never at module scope",
+    );
+  });
+
+  // ---------- the /debug/backfill cooldown has to be durable ----------
+  //
+  // The endpoint walks 42h of Birdeye `new_listing` and spends 30–80 CU a run,
+  // so it is gated at 5 minutes. The gate used to be a MODULE-SCOPE timestamp,
+  // which does not bound it: the fleet answers each request from whichever
+  // isolate Cloudflare routes to, and a fresh isolate reads its own `0` — so a
+  // second call 40s later, routed elsewhere, walked the whole window again. The
+  // stamp is one worker_state row now, shared by every isolate (the same
+  // argument DEBUG_SCAN_CACHE_* makes for the two scan endpoints).
+
+  await test("backfillCooldownRemainingMs: absent, junk and future stamps never block; elapsed ones do", () => {
+    const t0 = 1_700_000_000_000;
+    // The rule is tested against the constant the route uses, so tuning the
+    // cooldown never rewrites the rule — and the CU cost it gates is pinned
+    // here, in one place, instead of in five assertions.
+    const cd = BACKFILL_DEBUG_COOLDOWN_MS;
+    assert.equal(cd, 5 * 60_000, "a 42h Birdeye walk (30–80 CU) is gated at five minutes");
+    // No row at all = the endpoint has never run: an absent gate must never be
+    // a block, or the first call after a fresh deploy would be refused.
+    assert.equal(backfillCooldownRemainingMs(null, t0), 0, "missing row");
+    assert.equal(backfillCooldownRemainingMs(undefined, t0), 0);
+    assert.equal(backfillCooldownRemainingMs("", t0), 0);
+    assert.equal(backfillCooldownRemainingMs("abc", t0), 0, "an unparseable stamp is not a block");
+    assert.equal(backfillCooldownRemainingMs("0", t0), 0);
+    assert.equal(backfillCooldownRemainingMs(Number.NaN.toString(), t0), 0);
+
+    assert.equal(backfillCooldownRemainingMs(String(t0), t0), cd, "a run that just started");
+    assert.equal(backfillCooldownRemainingMs(String(t0 - 60_000), t0), cd - 60_000, "one minute in");
+    assert.equal(
+      backfillCooldownRemainingMs(String(t0 - cd), t0),
+      0,
+      "the boundary itself has elapsed — never a negative remainder",
+    );
+    assert.equal(backfillCooldownRemainingMs(String(t0 - cd - 1), t0), 0);
+    assert.equal(backfillCooldownRemainingMs(String(t0 - 86_400_000), t0), 0, "a day ago");
+    // A stamp from the FUTURE is clock skew between the isolate that wrote it and
+    // the one reading it — not a run that has yet to happen. Waiting for it would
+    // hold the lever shut until the clock caught up, i.e. longer than any cooldown.
+    assert.equal(
+      backfillCooldownRemainingMs(String(t0 + 60_000), t0),
+      0,
+      "a future stamp must not lock the lever",
+    );
+  });
+
+  await test("the /debug/backfill cooldown reads and writes the durable stamp, and stamps the ATTEMPT", () => {
+    const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+    const worker = read("src/worker.ts");
+    const start = worker.indexOf('url.pathname === "/debug/backfill"');
+    assert.ok(start > 0, "the route is registered");
+    const route = worker.slice(start, start + 2500);
+
+    assert.ok(
+      !/let\s+backfillDebugLastRunAt/.test(worker),
+      "a module-scope stamp cannot gate the endpoint — it is a copy per isolate",
+    );
+    assert.ok(
+      route.includes("const waitMs = await backfillCooldownRemaining(nowMs);"),
+      "the gate reads the durable stamp once, and the same instant is stamped",
+    );
+    assert.ok(route.includes("await stampBackfillRun(nowMs);"), "a run writes the stamp back");
+    assert.ok(
+      route.includes('error: "cooldown — backfill is CU-bounded, wait a bit"') &&
+        route.includes("retryAfterSec: Math.ceil(waitMs / 1000)"),
+      "the refusal keeps its 429 shape — backfill-pool.mjs reports that one as benign",
+    );
+    // Ordering: the stamp lands BEFORE the readiness check, so a 503 (Birdeye
+    // key or db missing) still consumes the cooldown, as the module-scope code
+    // did. Without it a misconfigured Worker answers line rate: every caller
+    // sees an error, and the CU-bounded route would have run each time.
+    const stampAt = route.indexOf("await stampBackfillRun(nowMs)");
+    const readyAt = route.indexOf("if (!birdeye || !db)");
+    assert.ok(
+      stampAt > 0 && readyAt > stampAt,
+      "the attempt is stamped before the run can be refused for being unready",
+    );
+
+    // One shared row, read and written by the same helpers the rule above is
+    // tested on — an isolate memo would pass every assertion except these.
+    assert.ok(worker.includes('const BACKFILL_DEBUG_LAST_RUN_KEY = "debug_backfill_at"'));
+    assert.ok(
+      worker.includes("return backfillCooldownRemainingMs("),
+      "the route's gate applies the rule the unit test pins",
+    );
+    assert.ok(worker.includes("await target.getWorkerState(BACKFILL_DEBUG_LAST_RUN_KEY)"));
+    assert.ok(
+      worker.includes("await target.setWorkerState(BACKFILL_DEBUG_LAST_RUN_KEY, String(atMs))"),
     );
   });
 

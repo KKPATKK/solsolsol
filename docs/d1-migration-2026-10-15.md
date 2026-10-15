@@ -116,14 +116,16 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 |---|---|---|
 | Worker（624k rows／日） | **冇** | `env.DB` 一出現，所有讀寫行 D1；`standaloneDb(env)` 亦跟同一個 store |
 | `scripts/d1-copy.js` | **只讀** | 由構造決定：只出 `SELECT`／聚合 |
-| `scripts/backfill-pumpfun.mjs`（CI，手動） | 寫 **D1** | 默認經 Cloudflare API 寫 `D1_DATABASE_ID`；冇 id 就 **throw**（要寫 archive 必須明寫 `--allow-archive-write`） |
+| `.github/workflows/backfill-pumpfun.yml`（手動） | 寫 **D1**，但**唔係自己寫** | 已經轉為跑 `scripts/backfill-pool.mjs` → 打 Worker 嘅 `/debug/backfill`，由 Worker 自己嘅 binding 寫。所以呢個 job **唔持任何 secret**、唔解析任何 database id（2026-10-15 之前佢拿 `CLOUDFLARE_API_TOKEN`）；舊版會喺 pump.fun 403 時靜靜地 skip 成個 run 但報 success，所以 `backfill-pool.mjs` 會 exit non-zero，並用 `/debug/token` 讀返 route 自己報嘅 sample mint（route 講 ok 但行讀唔返＝fail） |
+| `scripts/backfill-pumpfun.mjs`（本機，residential egress） | 寫 **D1**（要明寫例外才寫 archive） | 同一個舊 levers 嘅**住宅網絡**版本（pump.fun 擋 datacenter IP）：pump.fun launch feed → `token_stats`。默認經 Cloudflare API 寫 `D1_DATABASE_ID`，冇 id 就 **throw**；要寫 archive 必須明寫 **`--allow-archive-write`** 加 `TURSO_DATABASE_URL`／`TURSO_AUTH_TOKEN` |
 | `scripts/axiom-refresh-action.py`（CI，**停用中**） | 寫 **D1** | 已改：有 `D1_DATABASE_ID` 就經 Cloudflare API 讀寫 `worker_state`；冇就 **die**（要寫 archive 必須 `ALLOW_ARCHIVE_WRITE=1`）。理由唔只係一致性：Axiom 每次 call 都換 refresh token，喺 Worker 唔讀嘅 store 度輪換＝直接整死條 session |
 | `scripts/pool-read-cost.js`（本機診斷，`index` 模式） | **refuse** | 其餘模式全部只讀；只有 `index` 模式會 `CREATE INDEX`（寫 archive）——要寫必須明加 `--allow-archive-write`（或 `ALLOW_ARCHIVE_WRITE=1`），因為 Worker 自己會在 D1 開 `idx_pool_band_*`（`Db.ensurePoolBandIndex`） |
+| `scripts/test-filters.js`（＝**`npm test`**，本機最常跑） | **refuse**（默認跳過 DB 階段） | 呢個唔係讀者：phase 2 會 upsert `token_stats`（rugcheck／trader／min-mcap），phase 3 跑真 `Scanner.runOnce`（`seen_tokens` 認領、`scan_history`）再 `DELETE` 自己寫嘅 `seen_tokens`。所以冇 `--allow-archive-write`（或 `ALLOW_ARCHIVE_WRITE=1`）就完全唔碰 Turso，只跑 phase 1 config 檢查同 phase 2 feed 診斷；`USE_ARCHIVE = Boolean(URL && TOKEN) && ARCHIVE_WRITE_OK` 係 AND，唔係 OR——憑證出現喺環境（本 workspace 就係）唔等於可以寫 |
 | Node 入口（`npm start`，本機 dev／離線測試） | 仲係 Turso | 係本地 harness（測試用 injected `file:` client），唔係生產路徑 |
 
 驗證方法：Turso usage API 嘅 rows_written 應該跌到接近 0（唯一例外：有人明寫 `--allow-archive-write`）。
 
-`scripts/test-d1-migrate.js` 會把上面呢張表釘死（包含三個手動工具各自嘅 opt-in 護欄）：`deploy.yml` 三個 job 嘅順序／每個 step 有冇收到 `D1_DATABASE_ID`（順便釘住一個真實踩過嘅 bug：第一版 `schema`／`seed` 兩個 step 冇收到 id）、binding 一定要喺 `wrangler deploy` **之前**注入、repo 度唔准出現寫死嘅 `database_id`、而且除咗只讀嘅 copy 之外冇任何 job 拿得住 Turso 憑證。
+`scripts/test-d1-migrate.js` 會把上面呢張表釘死（包含三個仍然自己寫 store 嘅工具各自嘅 opt-in 護欄：`backfill-pumpfun.mjs`、`axiom-refresh-action.py`、`pool-read-cost.js` 嘅 `index` 模式、同 `test-filters.js`（`npm test`）——後者另外釘住 `USE_ARCHIVE` 一定要係 flag **AND** 憑證；而 pool backfill 嘅 workflow 由**自己嘅一條測試**釘住：只可以跑 `backfill-pool.mjs`、唔准提 `backfill-pumpfun.mjs`、唔准出現 `secrets.` 任何一個）：`deploy.yml` 三個 job 嘅順序／每個 step 有冇收到 `D1_DATABASE_ID`（順便釘住一個真實踩過嘅 bug：第一版 `schema`／`seed` 兩個 step 冇收到 id）、binding 一定要喺 `wrangler deploy` **之前**注入、repo 度唔准出現寫死嘅 `database_id`、而且除咗只讀嘅 copy 之外冇任何 job 拿得住 Turso 憑證。
 
 ## 6. 風險同限制（唔可以當過）
 - **D1 每個 DB 單線程**，文件上限係 30 秒／batch、100 個 bound parameter／query、100KB／statement（**只計 SQL 文字**，見 §2）、200 萬 bytes／value·row、1,200 request／5 分鐘／token。本 bot 每 tick 約 250 個 statement（已大量 batch），遷移亦只係 ~338 個 request；**Worker runtime 喺真 D1 嘅數字見 §8**：每 tick 嘅 batched call 110–242ms、tick `ms` 3.6–4.8s，比 Turso 同期嘅 1.73s 慢約 2.3×（仍然遠低於 60 秒 cadence）。
@@ -149,3 +151,19 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 - **Turso 唯讀**：archive 最新一行 `scan_history.at = 09:31:23Z`（切換前最後一個 tick）；usage API 嘅 09:35–09:40Z 桶 **`rows_written=0`、`rows_read=0`**（對照同日 09:25–09:30 桶：2,213／263,825）。
 - **Worker 喺真 D1 嘅成本**（`/health.heartbeat.summary.dbTickSteps`，placed 路徑 NRT）：`getReevalPool 242ms`、`writeScanFront 144–153ms`、`getTokenStatsMany 123–131ms`、`readScanFront 110–116ms`、`isTokenSeen 109–110ms`（每個＝一次 batched call）；tick `ms` 3.6–4.8s，**比 Turso 同期嘅 1.73s 慢約 2.3×**（仍遠低於 60 秒 cadence）；三次抽樣 `writeDrainError` 都係 `null`、`initError` 一直 `null`、`dbReady true`、tracker lane 正常（`checked 20`）。
 - **未量**：D1 每 tick 嘅 statement 總數同 50-subrequest 預算嘅關係（`dbTickSteps` 係 per-method，唔係 per-statement）。
+
+## 9. 切換後兩個修正（2026-10-15，跟 §5 嘅 store 問題同一類）
+
+### 9.1 `/debug/backfill` 嘅 cooldown 改為 durable
+呢條 route 每次行 42h Birdeye `new_listing`、花 30–80 CU，所以有 5 分鐘冷卻——但冷卻原本係**module scope 變數**（`let backfillDebugLastRunAt`），而 module scope 喺呢個 Worker 唔等於「一部機」：fleet 由接到 request 嘅 isolate 各自答，新 isolate 讀到自己嘅 `0`，所以「40 秒前跑過」喺另一個 isolate 完全睇唔到，冷卻只擋得住**撞返同一個 isolate** 嘅第二次 call。
+
+改法：stamp 落 **`worker_state.debug_backfill_at`**（全部 isolate 共用一行），即係同 `DEBUG_SCAN_CACHE_*` 同一個理由。兩個細節：
+- **stamp 記「嘗試」而唔係「成功」**，而且寫喺 42h 行之前——行到一半死咗都已經花咗 CU。
+- stamp 喺**就緒檢查之前**寫，同舊 code 一樣：所以 `birdeye`／`db` 未配置嘅 503 一樣會吃掉冷卻（否則一個配置錯嘅 Worker 可以被人以行頻打）。
+- 規則抽成**純函數** `backfillCooldownRemainingMs(stamp, nowMs)`（`src/worker.ts` 匯出）：冇行／讀唔到／非正數 → 0（未跑過，唔應該堵），**未來**嘅 stamp（isolate 之間時鐘偏移）→ 0（唔可以等到時鐘追返），過期 → 0。`worker_state` 讀失敗一律當 0（放行）——佢係閘，讀唔到唔應該令手動 lever 變成永久 429。
+- `scripts/test-unit.js` 釘住上面全部 case，另加 route wiring（唔准再出現 module-scope `let backfillDebugLastRunAt`、一定要 `getWorkerState`／`setWorkerState` 同一個 key、429 形狀不變——`backfill-pool.mjs` 靠呢個形狀分辨「良性」）。
+
+### 9.2 `/debug/db-latency` 唔再由 Turso URL 報「當前 store」
+呢條 route 原本 `dbRegion: dbRegionFromUrl(env.TURSO_DATABASE_URL)` 係無條件嘅，切換之後就變成報緊一個**呢次 probe 根本冇碰過**嘅 database（`TURSO_DATABASE_URL` 仍然留喺 Worker 做 archive／Node 路徑）。
+
+改法：由 binding 自己報 store——`dbStore: env.DB ? "d1" : "turso"`——而 `dbRegion` 只有喺 **Turso 就係當前 store** 時才由 URL 解析（D1 唔係 `null` 就係假嘅 region，所以寧願 `null` 加一個真嘅 store label）。留意 D1 binding 唔會報邊個 region 服務嗰個 query，所以喺 D1 上面 `colo` 係唯一嘅距離訊號（而 §2 嘅 CAVEAT 亦適用：`colo` 係入口而唔係執行地）。同一條測試（`scripts/test-unit.js`）同時釘住 store label 同「URL 只喺 Turso 模式下解析」。

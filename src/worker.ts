@@ -352,9 +352,23 @@ let dbLatencyLastRunAt = 0;
  * Cooldown for the /debug/backfill endpoint (one-shot Birdeye backfill).
  * It costs real CU (30–80 per request) and does a full 42h window walk, so
  * keep it manual and rare.
+ *
+ * DURABLE, NOT PER-ISOLATE. This began as a module-scope timestamp — the shape
+ * the two gates above still have — and that shape cannot bound the endpoint: the
+ * fleet answers each request from whichever isolate Cloudflare routes to, so
+ * two calls land on two isolates with two copies of the variable, each with its
+ * own `0` and its own idea of "recently". The gate then only refuses a second
+ * call that happens to land on the same isolate, i.e. a cooldown the caller
+ * cannot rely on. The stamp is ONE `worker_state` row now, read and written by
+ * every isolate — the same reason the debug scan cache below is durable instead
+ * of an isolate memo.
+ *
+ * The stamp records the ATTEMPT, not the success: it is written before the 42h
+ * walk (see the route), because a walk that dies mid-way has still spent its CU.
  */
-const BACKFILL_DEBUG_COOLDOWN_MS = 5 * 60_000;
-let backfillDebugLastRunAt = 0;
+export const BACKFILL_DEBUG_COOLDOWN_MS = 5 * 60_000;
+/** worker_state key: epoch ms at which the last /debug/backfill run started. */
+const BACKFILL_DEBUG_LAST_RUN_KEY = "debug_backfill_at";
 /**
  * Durable TTL cache for the two /debug endpoints whose read is a FULL-TABLE
  * SCAN of `token_stats`, and which were completely ungated until now:
@@ -420,6 +434,69 @@ async function writeDebugScanCache<T>(name: string, body: T): Promise<void> {
     /* best-effort: a failed seed only means the next poll recomputes */
   }
 }
+
+/**
+ * How much of the backfill cooldown is left, given the durable stamp's raw
+ * value. Pure, so the rule is unit-testable without a database — and kept
+ * separate from the read below precisely so the test can exercise it:
+ *
+ *   - no row, unparseable, or non-positive → 0. Nothing ran, so there is
+ *     nothing to wait for; an absent gate must never be a block.
+ *   - a stamp in the FUTURE (skew between the isolate that wrote it and the one
+ *     reading it) → 0. Otherwise this would hold the lever shut until the clock
+ *     caught up, which is longer than any cooldown.
+ *   - otherwise the remainder, floored at 0 at the boundary itself.
+ */
+export function backfillCooldownRemainingMs(
+  stamp: string | null | undefined,
+  nowMs: number,
+): number {
+  const at = Number(stamp ?? "");
+  if (!Number.isFinite(at) || at <= 0) return 0;
+  const since = nowMs - at;
+  if (since < 0) return 0;
+  return Math.max(0, BACKFILL_DEBUG_COOLDOWN_MS - since);
+}
+
+/**
+ * The backfill cooldown as the route asks it: the pure rule above applied to
+ * the durable row. A read failure answers 0 (allowed) rather than blocking —
+ * the row is the gate, and a database that cannot be read must not turn a
+ * manual operator lever into a permanent 429. Whatever is wrong with the store
+ * is reported by the route's own readiness check instead.
+ */
+async function backfillCooldownRemaining(nowMs: number): Promise<number> {
+  const target = db;
+  if (!target) return 0;
+  try {
+    return backfillCooldownRemainingMs(
+      await target.getWorkerState(BACKFILL_DEBUG_LAST_RUN_KEY),
+      nowMs,
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Best-effort durable stamp of a run's start (see the route). A failed write is
+ * logged but not fatal: the run it describes is about to happen anyway, and
+ * refusing to run because the GATE could not be recorded would trade a real
+ * capability for bookkeeping.
+ */
+async function stampBackfillRun(atMs: number): Promise<void> {
+  const target = db;
+  if (!target) return;
+  try {
+    await target.setWorkerState(BACKFILL_DEBUG_LAST_RUN_KEY, String(atMs));
+  } catch (err) {
+    console.error(
+      "[worker] backfill cooldown stamp failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
 /** Minimum gap between fallback scans triggered from the fetch path. */
 // How often the HTTP-triggered fallback may LOOK. Cron (1/min) is the primary
 // driver, and since 2026-09-27 the fallback is a RESCUE rather than a cadence
@@ -8454,8 +8531,11 @@ const worker = {
       // `claimShapeSavingMs` is the difference between them, and `rawMs`
       // keeps every sample so a slow FIRST sample (connection setup on a cold
       // isolate) stays visible instead of being averaged into the median.
-      // `colo` (where the request ENTERED Cloudflare) next to `dbRegion`
-      // (parsed from the connection URL) is the distance question itself.
+      // `colo` (where the request ENTERED Cloudflare) is half the distance
+      // question — and on D1 it is the only half this response can name: the
+      // binding does not report which region served the query, so `dbStore`
+      // says WHICH STORE was measured and `dbRegion` is filled in only while
+      // the Turso URL is the store in use (see the response below).
       // CAVEAT, measured 2026-10-02 with the [placement] block live: `colo`
       // reports the ENTRY data center, NOT where the code ran — the placed
       // fetch path still reads `colo: LAX` while its round trips collapsed to
@@ -8493,7 +8573,14 @@ const worker = {
           at: new Date().toISOString(),
           colo:
             (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? null,
-          dbRegion: dbRegionFromUrl(env.TURSO_DATABASE_URL),
+          // WHICH STORE the probe just measured, taken from the binding itself.
+          // It is not cosmetic: since the 2026-10-15 cutover the tick (and this
+          // probe) runs on `env.DB`, while TURSO_DATABASE_URL stays in the
+          // Worker for the archive/Node path — so parsing that URL
+          // unconditionally reported a region the probe had not touched. The
+          // URL is consulted only when it IS the store in use.
+          dbStore: env.DB ? "d1" : "turso",
+          dbRegion: env.DB ? null : dbRegionFromUrl(env.TURSO_DATABASE_URL),
           samples: measured.samples,
           ops,
           claimShapeSavingMs: claimShapeSavingMs(ops),
@@ -8784,20 +8871,23 @@ const worker = {
     // — is the backfill's discovery source. Cooldown-bounded (CU cost);
     // INSERT OR IGNORE makes it idempotent, safe to re-run after tweaks.
     if (url.pathname === "/debug/backfill") {
-      const sinceLast = Date.now() - backfillDebugLastRunAt;
-      if (sinceLast < BACKFILL_DEBUG_COOLDOWN_MS) {
+      // The gate is the DURABLE stamp (`BACKFILL_DEBUG_LAST_RUN_KEY`), so it
+      // holds across isolates. Note the `nowMs` is taken once: the same value
+      // decides whether to refuse AND is what gets stamped, so a run can never
+      // be refused by the write of the call that is currently running.
+      const nowMs = Date.now();
+      const waitMs = await backfillCooldownRemaining(nowMs);
+      if (waitMs > 0) {
         return Response.json(
           {
             ok: false,
             error: "cooldown — backfill is CU-bounded, wait a bit",
-            retryAfterSec: Math.ceil(
-              (BACKFILL_DEBUG_COOLDOWN_MS - sinceLast) / 1000,
-            ),
+            retryAfterSec: Math.ceil(waitMs / 1000),
           },
           { status: 429 },
         );
       }
-      backfillDebugLastRunAt = Date.now();
+      await stampBackfillRun(nowMs);
       if (!birdeye || !db) {
         return Response.json(
           {
