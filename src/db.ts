@@ -2725,6 +2725,37 @@ export class Db {
    * the reset here rather than in a second statement is what makes the mark
    * impossible to leave stuck on a coin the pair lane is demonstrably still
    * serving (see DEAD_POOL_MISS_MAX).
+   *
+   * EDGE-TRIGGERED SINCE 2026-10-14 — THE WRITE BUDGET IS THE CONSTRAINT.
+   * This batch used to re-write EVERY coin the pair lane answered, every tick:
+   * live on 2026-10-14 that is ~204 rows/tick (`/health` `pairs 204`) against a
+   * tick's own total of ~233-267 — ~85% of every row this bot writes
+   * (~540k/day) — on a free plan whose ENTIRE allowance is 10M rows written a
+   * month (333k/day). The statement now admits a row only when the write can
+   * still change a VERDICT, which makes it equivalent to the mirror it replaces
+   * at every reader that exists:
+   *   • `sweeps_since_reading > 0` — the coin's freshness mark needs its reset,
+   *     the half of this statement DEAD_POOL_MISS_MAX is built on;
+   *   • `last_liquidity_usd IS NULL` — the row has never been measured, so this
+   *     is its FIRST reading: DEAD_POOL_MARK's fail-open branch, and what the
+   *     census counts;
+   *   • a CROSSING of DEAD_LIQUIDITY_USD, either direction — the stored value is
+   *     compared against that floor and nothing else, so a row that stays on the
+   *     same side of it reads identically whether the number stored is this
+   *     tick's or the one from when it last crossed.
+   * WHAT CHANGES, and why it is only the diagnostics: the column stops being a
+   * mirror of the last reading and becomes the last reading that MATTERED. A
+   * coin quietly alive carries the value it had when it last crossed the floor
+   * instead of its current number, and a corpse already recorded under the floor
+   * keeps that number however often the sweep re-reads it. `deadMarked`
+   * (DEAD_POOL_MARK, counted over the same state) and every verdict the pool
+   * query makes are unchanged; `deadPending` and the "has a reading" census now
+   * count crossings instead of readings. Nothing on the push path reads this
+   * column — the gates judge `max_liquidity_observed`, the lifetime high-water
+   * updateTokenMaxMcaps still maintains raise-only.
+   *
+   * The returned count is therefore the rows this RULE admitted, not the batch
+   * size (the caller ignores it; the unit tests read it).
    */
   async recordObservedLiquidity(
     rows: Array<{ token: string; liquidityUsd: number }>,
@@ -2736,12 +2767,20 @@ export class Db {
       const slice = rows.slice(i, i + chunk);
       const cases = slice.map(() => "WHEN ? THEN ?").join(" ");
       const args: Array<string | number> = [];
+      // The CASE is bound TWICE (the SET's value and the WHERE's own crossing
+      // test re-derives it), in statement order: its pairs, the IN list, then
+      // its pairs again.
       for (const r of slice) args.push(r.token, r.liquidityUsd);
       for (const r of slice) args.push(r.token);
+      for (const r of slice) args.push(r.token, r.liquidityUsd);
       const res = await this.get().execute({
         sql: `UPDATE token_stats SET last_liquidity_usd = CASE token ${cases} END,
               sweeps_since_reading = 0
-              WHERE token IN (${slice.map(() => "?").join(",")})`,
+              WHERE token IN (${slice.map(() => "?").join(",")})
+                AND (sweeps_since_reading > 0
+                     OR last_liquidity_usd IS NULL
+                     OR ((last_liquidity_usd < ${DEAD_LIQUIDITY_USD})
+                         IS NOT ((CASE token ${cases} END) < ${DEAD_LIQUIDITY_USD})))`,
         args,
       });
       updated += Number(res.rowsAffected ?? 0);

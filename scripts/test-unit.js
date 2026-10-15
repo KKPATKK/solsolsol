@@ -41,7 +41,7 @@ const { parseArkhamHolders, isSmartMoneyType } = require("../dist/arkham.js");
 const { parseCrimeWalletList, CrimeWalletClient } = require("../dist/crimewallets.js");
 const { WalletAnalyzer } = require("../dist/walletanalysis.js");
 const { deriveBondingCurvePda, slotActivityFromTransaction, detectBundle, clusterByFunding, linkedWalletCount, scoreRisk, findFundedBy, FlurryAnalyzer } = require("../dist/flurry.js");
-const { tradeFingerprint, deadTickBackfillInfo, TICK_PROGRESS_KEY, tickProgressRecord, parseTickProgress, tickProgressNote, tickPhaseLadder, healthAgeMs } = require("../dist/worker.js");
+const { tradeFingerprint, deadTickBackfillInfo, TICK_PROGRESS_KEY, tickProgressRecord, parseTickProgress, tickProgressNote, tickPhaseLadder, TICK_PHASE_STAMP_MIN_MS, tickPhaseStampDue, healthAgeMs } = require("../dist/worker.js");
 const { PUSH_DEFERRAL_RING_MAX, loadPushDeferralSnapshot, parsePushDeferralSnapshot, nextPushDeferralSnapshot, pushDeferralAlreadyApplied, pushDeferralDelta, heldBackCandidates, deliveredDeferredTokens, deliveredCardTokens, deliveredFollowupTokens, deliveredFollowupProofs, cardProofKey, duplicateInitialTokens, cardSendDisposition, parseUnconfirmedCardSends, addUnconfirmedCardSend, removeUnconfirmedCardSend, settleUnconfirmedCardSends, serializeUnconfirmedCardSends, UNCONFIRMED_CARD_MAX, UNCONFIRMED_CARD_GRACE_MS, UNCONFIRMED_TERMINAL_STATE_KEY } = require("../dist/deferrallog.js");
 const { PoolFallbackDb, poolFallbackStats, resetPoolFallbackStats } = require("../dist/poolfallback.js");
 
@@ -4506,6 +4506,119 @@ async function main() {
     const hist = await db.getPoolHistogram(now, ["chat-1"]);
     assert.equal(hist.deadPending, 1, "one row is one empty sweep into the mark");
     assert.equal(hist.deadMarked, 1, "one row is held out of the sweep");
+    await t.cleanup();
+  });
+
+  // The write itself is EDGE-TRIGGERED (2026-10-14). Re-writing every reading
+  // the pair lane answered costs ~204 rows/tick — ~85% of every row this bot
+  // writes, ~540k/day against a free plan's whole 10M/month — so the statement
+  // now admits a row only when the write can still change a verdict. This pins
+  // BOTH halves of that claim: what is SKIPPED, and that the pool's own
+  // verdicts are unchanged across the sequence (a skip must not cost a prune,
+  // and a crossing must not lose one).
+  await test("pool: a routine reading is not written — only a crossing, a first reading or a mark to clear", async () => {
+    const t = tmpDb();
+    const db = new Db("file:injected", undefined, t.client);
+    await db.init();
+    const now = Date.now();
+    const seed = async (token, ageMin, lastLiq, streak) => {
+      const launch = now - ageMin * 60_000;
+      await t.client.execute({
+        sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed, last_liquidity_usd, sweeps_since_reading)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [token, launch, 10_000, ageMin, launch, 120_000, 250_000, lastLiq, streak],
+      });
+    };
+    const stored = async (token) =>
+      (
+        await t.client.execute({
+          sql: "SELECT last_liquidity_usd, sweeps_since_reading FROM token_stats WHERE token = ?",
+          args: [token],
+        })
+      ).rows[0];
+    await seed("ALIVE2", 100, 25_000, 0);
+    await seed("CORPSE", 102, 400, 0);
+    await seed("UNSEEN", 104, null, 0);
+    await seed("MOVED", 106, 25_000, 2);
+
+    // (a) Same side of the floor and the mark is already 0: nothing left that
+    // the write could change, so the row is SKIPPED.
+    assert.equal(
+      await db.recordObservedLiquidity([{ token: "ALIVE2", liquidityUsd: 24_000 }]),
+      0,
+      "a live pool's routine reading is not written",
+    );
+    assert.equal(
+      Number((await stored("ALIVE2")).last_liquidity_usd),
+      25_000,
+      "and the column keeps the reading that last mattered",
+    );
+
+    // (b) The crossing under the floor IS the verdict the floor makes: written.
+    assert.equal(
+      await db.recordObservedLiquidity([{ token: "ALIVE2", liquidityUsd: 900 }]),
+      1,
+      "the crossing below the floor is written",
+    );
+    // (c) Still under it: same side again, SKIPPED — and it keeps the reading
+    // that killed it, which is the number the floor judged.
+    assert.equal(
+      await db.recordObservedLiquidity([{ token: "ALIVE2", liquidityUsd: 800 }]),
+      0,
+      "a repeat below the floor is not re-written",
+    );
+    assert.equal(Number((await stored("ALIVE2")).last_liquidity_usd), 900, "the corpse keeps 900, not 800");
+
+    // (d) A corpse already stored under the floor is SKIPPED however often the
+    // sweep re-reads it — the case that used to spend a row every tick.
+    assert.equal(
+      await db.recordObservedLiquidity([{ token: "CORPSE", liquidityUsd: 200 }]),
+      0,
+      "a pool already recorded dead is not re-written every tick",
+    );
+
+    // (e) A row nobody has measured: the FIRST reading is always written (it is
+    // DEAD_POOL_MARK's fail-open branch, and what the population census counts).
+    assert.equal(
+      await db.recordObservedLiquidity([{ token: "UNSEEN", liquidityUsd: 12_000 }]),
+      1,
+      "a first reading is always written",
+    );
+    assert.equal(Number((await stored("UNSEEN")).last_liquidity_usd), 12_000, "the first reading lands");
+
+    // (f) The freshness mark's reset rides the same statement: a reading for a
+    // coin whose mark moved is written even when the VALUE decided nothing —
+    // that write IS the proof the pool asked and was answered.
+    assert.equal(
+      await db.recordObservedLiquidity([{ token: "MOVED", liquidityUsd: 24_000 }]),
+      1,
+      "a moved freshness mark is cleared by the reading",
+    );
+    assert.equal(Number((await stored("MOVED")).sweeps_since_reading), 0, "and the mark really is back to 0");
+
+    // The verdict half: one pool read must hold exactly what the liquidity
+    // floor says — not more (a skip is not a prune) and not less (a crossing
+    // is), with the never-measured row still failing open.
+    const opts = {
+      sinceMs: now - 30 * 3600_000,
+      minLaunchMs: now - (1560 + 180) * 60_000,
+      maxLaunchMs: now - (80 - 180) * 60_000,
+      windowEntryLaunchMs: now - 80 * 60_000,
+      limit: 1000,
+      nearSlots: 2,
+      farSlots: 12,
+      rotationPeriodMs: 1e12,
+      minQualifyMcap: 30_000,
+      maxQualifyMcap: 500_000,
+      minQualifyLiquidity: 5_000,
+      seenChatIds: ["chat-1"],
+      now,
+    };
+    const tokens = (await db.getReevalPoolBatched(opts)).map((r) => r.token);
+    assert.ok(!tokens.includes("ALIVE2"), "the coin that crossed under the floor is pruned");
+    assert.ok(!tokens.includes("CORPSE"), "a corpse stays pruned however often it is re-read");
+    assert.ok(tokens.includes("UNSEEN"), "a measured, live pool stays in the sweep");
+    assert.ok(tokens.includes("MOVED"), "the cleared mark puts the coin back in the sweep");
     await t.cleanup();
   });
 
@@ -19782,6 +19895,53 @@ async function main() {
     // and landed. A stalled queue would leave the row naming a phase the tick
     // had long left — which is the failure this test exists to catch.
     assert.equal(attempts, 2);
+  });
+
+  // The ladder's RISK GATE (2026-10-14). The three middle phase stamps cost
+  // ~3.8 rows/tick (~10k rows/day — ~2% of the free plan's whole 10M/month)
+  // and they are insurance against a death, which only a late tick has. This
+  // pins the bound against the measured shapes AND that it gates the PHASE
+  // STAMPS alone: the admission stamp rides the claim batch and the pre-flush
+  // record must still land on every tick.
+  await test("tickPhaseStampDue: the phase ladder is risk-gated, and the pre-flush record is not", () => {
+    // The healthy tick shapes (measured 2026-10-14 over 7 days / 18,475 ticks:
+    // the mode is 3-5s and 96.7% of ticks finish under the 5s bound).
+    assert.equal(tickPhaseStampDue(0, 2_900), false, "a 2.9s tick buys no phase row");
+    assert.equal(tickPhaseStampDue(0, 4_396), false, "nor does the 4.4s feed-window tick");
+    assert.equal(
+      tickPhaseStampDue(0, TICK_PHASE_STAMP_MIN_MS),
+      true,
+      "the bound itself is due (>=, not >)",
+    );
+    // The shapes that DO die: the race cut at 15.5s (tick budget 20,000ms,
+    // flush reserve 4,500ms) and Cloudflare's kill after the flush starts.
+    assert.equal(tickPhaseStampDue(0, 15_500), true, "the measured cut stamps its phase");
+    assert.equal(tickPhaseStampDue(0, 20_000), true);
+    // A clock that stepped backwards cannot place a stamp, so it is not due.
+    assert.equal(tickPhaseStampDue(5_000, 4_000), false);
+    assert.equal(tickPhaseStampDue(0, Number.NaN), false);
+    assert.ok(
+      TICK_PHASE_STAMP_MIN_MS >= 4_000 && TICK_PHASE_STAMP_MIN_MS <= 8_000,
+      "the bound sits above the healthy mode and far below the 15.5s cut",
+    );
+    // Wiring: EXACTLY one call site, so the gate can only be the phase hook —
+    // the admission stamp (which rides the claim) and the pre-flush record (the
+    // tick's one guaranteed durable note) are untouched by it.
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const workerSrc = strip(fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8"));
+    assert.equal(
+      (workerSrc.match(/tickPhaseStampDue\(/g) || []).length,
+      2,
+      "the definition plus exactly ONE call site — no other writer consults the bound",
+    );
+    assert.ok(
+      workerSrc.includes("if(!tickPhaseStampDue(startedAt,Date.now()))return;"),
+      "and the hook returns instead of stamping",
+    );
   });
 
   await test("healthAgeMs: a frozen reading reports its age, and a missing row is not the epoch", () => {

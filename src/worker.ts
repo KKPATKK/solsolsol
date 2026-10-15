@@ -3139,6 +3139,13 @@ export interface TickProgressRecord {
    * THE FLUSH STAGES, stamped once the scan is over: `postscan` (flush in
    * front of it), `postscan-late` (same point, but too late to wait for the
    * stamp), `flush-hung`, `flush-failed`, `flush-retry-failed`.
+   *
+   * THE LADDER IS RISK-GATED (2026-10-14, see TICK_PHASE_STAMP_MIN_MS): the
+   * three MIDDLE stamps (`front`/`pair`/`gate`) are only queued once the tick
+   * has spent that long, because a tick that dies is by definition a slow one.
+   * A healthy tick therefore writes NO phase stamp — its row is the ADMISSION
+   * stamp (which rides the claim batch, zero extra rows) and then the pre-flush
+   * record, and the two are one write each.
    */
   stage: string;
   /** When this stamp was written (epoch ms). */
@@ -3179,6 +3186,52 @@ export interface TickProgressRecord {
  * message was extended to provide.
  */
 export const TICK_PROGRESS_ERR_MAX = 320;
+/**
+ * How long a tick must have spent before its MIDDLE phase stamps are worth a
+ * row (2026-10-14 — see tickPhaseStampDue).
+ *
+ * WHY A GATE AT ALL. The ladder writes ~3.8 rows a tick (measured
+ * 2026-10-14: `dbSteps` `setWorkerState:tick_progress` 65 calls over 17
+ * ticks), i.e. ~10k rows/day = ~320k/month of a free plan whose whole write
+ * allowance is 10M/month. The admission stamp (which rides the claim, 0 extra
+ * rows) and the pre-flush record (1 row, the one the successor's note reads)
+ * are the two that earn their keep on EVERY tick; the three in between are
+ * insurance against a death, and only a late tick dies.
+ *
+ * WHY 5,000. Measured over the 7 days to 2026-10-14 (scan_history, 18,475
+ * ticks): 6,244 ticks finished under 3s and 11,624 under 5s — 96.7% of ticks
+ * never reach this bound — while every recorded death sits far past it: the
+ * 318 failures of that window are the race cut at `ms 15500` (tick budget
+ * 20,000ms, flush reserve 4,500ms), and Cloudflare's own kill lands after the
+ * flush starts at ~15.5s. `prog` notes in the backfilled rows of the same
+ * window: ZERO, i.e. the ladder produced no reading at all in a week.
+ *
+ * WHY THE GATE STILL CATCHES THE SHAPES IT WAS BUILT FOR (2026-09-24: a death
+ * could only be attributed to "before the flush", which is where the whole
+ * tick lives): the laggard shapes are slow BY CONSTRUCTION, so the boundary
+ * that closes the slow phase is itself past the bound — a tick whose FEEDS take
+ * 8s queues `front` at 8s, one that hangs in the pool read queues `pair` late,
+ * and the cut/kill shapes above queue `gate` and then the pre-flush record. The
+ * one shape the gate drops is a tick killed inside its first five seconds,
+ * which has no recorded precedent and whose admission stamp already names the
+ * stretch it reached (`scan`).
+ */
+export const TICK_PHASE_STAMP_MIN_MS = 5_000;
+
+/**
+ * Whether a phase stamp is worth queuing at this point of the tick (see
+ * TICK_PHASE_STAMP_MIN_MS). Pure, so the bound can be pinned offline instead
+ * of only in production. `now < startedAt` (a clock that stepped backwards)
+ * reads as NOT due: a stamp the tick cannot place is not evidence.
+ */
+export function tickPhaseStampDue(
+  startedAt: number,
+  now: number,
+  minMs: number = TICK_PHASE_STAMP_MIN_MS,
+): boolean {
+  const spent = Number(now) - Number(startedAt);
+  return Number.isFinite(spent) && spent >= Number(minMs);
+}
 /**
  * How much of the front split the record keeps. Sized for the longest line the
  * two formatters can produce (the whole front, every step named 0-99999), so a
@@ -5127,7 +5180,11 @@ async function runScan(
       // itself no longer queues here (2026-09-26): it rides the claim batch
       // above, so the ladder's own writes start with the scan's first phase
       // (or with the postscan record on a tick whose scan never stamped).
-      const notePhase = (phase: string) =>
+      const notePhase = (phase: string) => {
+        // RISK-GATED (see TICK_PHASE_STAMP_MIN_MS): a tick that has spent less
+        // than the bound is not one of the shapes that dies, and its phase
+        // stamp is a row bought for nothing — 96.7% of ticks never reach it.
+        if (!tickPhaseStampDue(startedAt, Date.now())) return;
         void ladder.stamp({
           at: startedAt,
           stage: phase,
@@ -5139,6 +5196,7 @@ async function runScan(
           cut: false,
           err: null,
         });
+      };
       if (scanner) scanner.onTickPhase = notePhase;
       // Wired only for the duration of the scan: the hook is unwired after
       // the race, so the tail (the tracker pass) cannot stamp a phase the
