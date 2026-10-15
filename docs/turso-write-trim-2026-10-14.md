@@ -143,3 +143,100 @@ cut／kill 全部 stamp `gate` 再 stamp pre-flush record。唯一失掉嘅形�
 每 run 嘅 state 寫入：`push_watch_pass` 1.42／run（pass 嘅 `running`＋`done` 兩張 row）同
 `writeScanFront` 1.33／run（無改動，二者都唔可以壓成一次寫入——前者嘅 `running` 係
 「pass 係唔係卡住」嘅見證，寫在 pass 完結之前才有意義，同 ladder 嘅死亡見證同一個道理）。
+
+---
+
+## 7. 2026-10-15 覆核：L1／L2 上線後嘅真實讀數，同一個**先修正咗嘅歸因**
+
+### 7.1 交付同驗收
+
+`1236dae` 2026-10-15T01:19:30Z 經 deploy workflow 上線（run 38665020206）。
+
+**L2（phase ladder 風險閘）＝ 兌現**。`node scripts/verify-tick-progress-writes.js --expect-live`：
+verdict `LIVE`；5 隻健康 tick（ms 1886／3702／2466／…）**全部寫 0 行** `tick_progress`
+（deploy 前 3.9 行／run）；500 tick 嘅 ms 直方圖 140／352／8／0／0（1.6% 過 5 秒閘）、`ok=0` 0、
+`prog` note 0。pre-flush record 照舊每 tick 一條（`dbSteps.setWorkerState:tick_progress`
+41 calls／41 completion），同設計一致。
+
+**L1（pool lane 邊緣觸發）＝ 兌現，但係「唔寫」而唔係「少寫」**。
+
+- `dbSteps` 裏面**完全冇出現** `recordObservedLiquidity`：31.4 分鐘、41 個 completion 之內
+  **0 call、0 row**（呢個 isolate 連 call 都冇——掃嘅幣冇一個有可寫嘅變化）。
+- 同一窗口 `update token_stats` = **847 行／45 stmts**，即 ~21 行／completion，全部係
+  `updateTokenMaxMcaps`（本 tick 嘅真新高，~20 隻）加 ~2 行 liquidity；`pairs 200 / pairsJup 200 /
+  poolMisses 0` 同 deploy 前一樣 ⇒ pool lane 照**讀**，只係唔再**寫**。
+- `/debug/pool`：`total 60366 / neverPushed 59160 / eligibleInWindow 53637 / deadMarked 174 /
+  deadPending 27 / poolQueryCount 979`——mark（`mark_pos 622`、`skippable_if_same_side 1481`）
+  仍然有人維護，池嘅判決面冇缺。
+
+### 7.2 但係第 4 節嗰個目標冇兌現，而原因係歸因本身錯
+
+usage API（5 分鐘桶）03:20–04:05 讀到 **142／300 行／tick 之間，平均 ~220**（≈ 630k／日），
+即係第 4 節要求嘅 110–160k／日**冇達到**。
+
+根因唔係 L1 冇做嘢，而係 **第 1 節嗰張表嘅 204 行／tick 從來冇量過**：佢係由
+「`pairs` 讀數 = 204 行寫入」推論出嚟嘅假設（call census 只數 call，數唔到 batch 裏面嘅行，
+而 `Db` 方法收埋咗 `rowsAffected`）。L1 精確咁切走咗一條**冇被 bill 嘅** 204 行寫入，所以賬單只係
+跌咗 17 行／tick（263 → 246，即 6%）。
+
+### 7.3 補上嘅儀器：write census（rows，而唔係 calls）
+
+`src/db.ts` `wrapClientWithHardWall` 呢個 proxy 已經 intercept 咗**所有** `execute()`／`batch()`，
+所以喺該處讀 statement 結果嘅 `rowsAffected`，按「動詞 + 表名」累加（`update token_stats`、
+`delete push_watch` …），並經 `/health.writeCensus` 同 **`heartbeat.summary.writeCensus`**（tick 嘅
+summary → durable heartbeat，任何 isolate 都讀得到；`sinceMs` 反過嚟講出係邊隻 isolate 嘅累積值）
+公佈。`/health.writeCensus` 单独睇唔可靠 ——活着嘅 isolate 往往唔係跑 tick 嗰隻（實測：同一個
+請求嘅 `this isolate` 只有 2 行／分鐘，而 summary 嗰隻 164 行／分鐘）。
+
+上線：`269f1eb`（03:28Z）＋ `bdd015c`（03:34Z，修 pre-init：module 求值時 `Date.now()` 係 0，
+baseline 變成「由 1970 起」，改為 lazy 蓋章；順便騎上 tick summary）。
+
+### 7.4 校正：一個邏輯行究竟 bill 幾多行
+
+同一個 DB，實測（5 分鐘桶，寫入前後對比；全部用 `calib_probe_*` 臨時 key，之後一次 DELETE 清走）：
+
+| 動作 | 邏輯行 | billed rows_written | 倍數 |
+|---|---|---|---|
+| 1000 個單行 UPSERT（250／batch）| 1,000 | +~2,100（1,536→2,084 基線區間外）| **×2.1** |
+| 5000 個單行 UPSERT（250／batch）| 5,000 | +9,600（基線 ~2,000 → 11,963）| **×1.9** |
+| 一個 6,000 行 DELETE（單 statement）| 6,000 | +5,648（基線 ~2,000 → 7,648）| **×0.94** |
+
+⇒ **INSERT／UPDATE 每個邏輯行大約 bill 2 行**（一 row ＋ 一條 index entry，Turso 文件只講
+「insert／update 一行 = 一次寫」），**DELETE ≈ 1 行**。所以上面嘅 census 數字（UPDATE／INSERT）
+要 ×2 先同 usage API 對得上；呢個 2 倍就係 10-14 所有「calls vs rows」推論全部失手嘅另一半原因。
+
+### 7.5 實測歸因（ticking isolate，1,886,718ms ＝ 31.4 分鐘、41 個 completion、共 4,142 邏輯行）
+
+| statement shape | 邏輯行（/31.4min）| billed（×2／×1）| 佔賬單 | 每 tick billed |
+|---|---|---|---|---|
+| `update push_watch`（tracker claim CAS）| 1,005／1,005 stmts | 2,010 | **28%** | ~49 |
+| `update token_stats`（max-mcap 新高 ＋ liquidity）| 847／45 | 1,694 | **24%** | ~41 |
+| `insert worker_state`（heartbeat／admission／front／counters／ring）| 598／598 | 1,196 | 17% | ~29 |
+| `insert token_stats`（登記）| 594／41 | 1,188 | 17% | ~29 |
+| `delete token_stats`（10 分鐘一次 prune，2 run）| 973／2 | 973 | 14% | ~24 |
+| `delete/update worker_state`＋`insert scan_history`＋`delete push_watch` | 125／125 | 125 | 2% | ~3 |
+| **合計** | 4,142 | **7,186** | | **~175** |
+
+（~175 加其他 isolate 嘅份 ≈ 觀測到嘅 ~220 行／tick ✓）
+
+### 7.6 重新排過嘅槓桿（按 billed 由大至小）
+
+1. **`claimPushWatchChecksMany` 每行 CAS（28%）**：pass ~2 次／分鐘、每次 claim ~21 行，每行係一個
+   CAS UPDATE（防重複卡）。減法只有三條路：pass cadence 30s→60s（−28% ≈ −170k／日，代價係跟進卡遲
+   最多 30s）、claim 行數攤薄（總數一樣，冇用）、或者拆走 per-row CAS（要單飛鎖先安全，歷史上
+   double ⚠️ 事故就係佢擋住嘅）。**要產品決定。**
+2. **`updateTokenMaxMcaps` 新高 UPDATE（24%）**：已經 raise-only，但本 tick 有真新高嘅每一隻幣
+   （~20）就 bill 2 行。加一個容差（例如新 mcap 要高過存住嘅 0.5%／$250 才寫）可以砍走大部分；
+   代價係 high-water mark 會低估少少（排序／prune 用），屬**語意改動**。
+3. **`insert worker_state`（17%）**：tick 嘅耐久 stamps（heartbeat、admission、pre-flush record、
+   front 嘅 gate stamps、scan_trigger 計數、ring）。要減就要合併成更少 row（front 已經合併成一個
+   request，但冇合併成一個 row），係剩下最大嘅結構性裁剪。
+4. **登記 `insert token_stats`（17%）**：14.5 行／completion。要減就要喺註冊前過濾（產品）。
+5. **prune `delete token_stats`（14%）**：穩態 = 登記數（每個「從未 push 嘅幣」= 登記 2 行 ＋ 刪除 1 行）。
+   縮 retention 只係提早刪，總量不變；**唔係槓桿**。
+6. **緊急掣（無代碼改動）**：`CLOCK_TICK_SECONDS "30" → "60"` ⇒ 全部 per-tick 讀寫減半
+   （~630k → ~315k／日），代價係掃描節奏減半——仍然夠唔到 160k／日。
+
+**一句總結**：10-14 打中嘅唔係賬單；真正嘅大頭係 tracker 每行 CAS ＋ max-mcap 新高 UPDATE ＋
+tick 嘅 state stamps ＋ 登記 INSERT ＋ prune DELETE，各佔 14–28%。下一步每一條都要產品決定
+（cadence／容差／stamps 合併／註冊過濾），凌駕所有嘅仍然係 `CLOCK_TICK_SECONDS`。
