@@ -126,7 +126,7 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 `scripts/test-d1-migrate.js` 會把上面呢張表釘死（包含三個手動工具各自嘅 opt-in 護欄）：`deploy.yml` 三個 job 嘅順序／每個 step 有冇收到 `D1_DATABASE_ID`（順便釘住一個真實踩過嘅 bug：第一版 `schema`／`seed` 兩個 step 冇收到 id）、binding 一定要喺 `wrangler deploy` **之前**注入、repo 度唔准出現寫死嘅 `database_id`、而且除咗只讀嘅 copy 之外冇任何 job 拿得住 Turso 憑證。
 
 ## 6. 風險同限制（唔可以當過）
-- **D1 每個 DB 單線程**，文件上限係 30 秒／batch、100 個 bound parameter／query、100KB／statement、1,200 request／5 分鐘／token。本 bot 每 tick 約 250 個 statement（已大量 batch），遷移亦只係 ~338 個 request，但**Worker runtime 未喺真 D1 上量過**；上線後睇 `dbTickSteps`／`writeCensus` 同 tick `ms`。
+- **D1 每個 DB 單線程**，文件上限係 30 秒／batch、100 個 bound parameter／query、100KB／statement（**只計 SQL 文字**，見 §2）、200 萬 bytes／value·row、1,200 request／5 分鐘／token。本 bot 每 tick 約 250 個 statement（已大量 batch），遷移亦只係 ~338 個 request；**Worker runtime 喺真 D1 嘅數字見 §8**：每 tick 嘅 batched call 110–242ms、tick `ms` 3.6–4.8s，比 Turso 同期嘅 1.73s 慢約 2.3×（仍然遠低於 60 秒 cadence）。
 - D1 binding call 亦算 Workers subrequest（服務類），所以唔會「省 subrequest」——只係換 quota。
 - `SELECT name FROM pragma_table_info(?)`（`addColumnIfMissing` 嘅 batched probe）同 `PRAGMA` 支援係 D1 側要真跑一次先知嘅嘢：`migrate` job 嘅 `schema` step 就係喺真 D1 上跑 `Db.init()`，佢失敗就唔會 deploy（即係 prod 唔會踩到）。
 - 搬數期間 archive 仍在寫入，所以 catchup 一定要喺 deploy 之後跑（見 §4 窗口語意）。
@@ -139,3 +139,13 @@ libsql 冇呢個限制（SQLite 預設 32,766），所以本 repo 有幾個「�
 3. 睇 catchup job：`d1_cutover_v1` stamp、行數表（archive 同 d1 會唔同，正常）。
 4. 15 分鐘後睇 `/health`：`dbOk`、`dbTickSteps`、`writeCensus`、tick `ms`；用 `/debug/pool` 對照 pool 行數（同 archive 唔會一樣，D1 係 live）。
 5. Turso usage API：rows_written 應該跌到 ~0。
+
+## 8. 切換實測（2026-10-15，run 38713155760：migrate 1m52s → deploy 1m33s → catchup 2m15s，全綠）
+
+- **`ensure`／`schema`**：`found D1 database solana-meme-bot (uuid e8b4be30-…)`；`schema` **喺真 D1 上跑真 `Db.init()` 成功**，`schema_tables=10`（9 張 bot table ＋ D1 自己嘅內部表）、`schema_ddl_fingerprint=b9f7c39c` ⇒ §6 嗰句「`PRAGMA`／`pragma_table_info(?)` 要真跑一次先知」有答案：冇問題。
+- **`seed`**：9 張表 **115,402 行**抄完（token_stats 56,907／scan_history 56,837／seen_tokens 1,212／pushed_holders 346…），每張表 `rows affected == rows read`，`stamped d1_seed_v1 = 09:30:05Z`。第一次跑死喺 `worker_state`（335KB params）——即 §2 第二條規則，修好後同一條 statement 一行 planRequests 就過。
+- **`deploy`（＝切換）**：`injected [[d1_databases]] binding="DB" database_id="e8b4be30-…"` → `Uploaded solana-meme-bot (3.94s)` → `Deployed … triggers (0.93s)`；**09:31:35Z 就係切換時刻**。
+- **`catchup`**：115,432 行讀、16,694 statements、**只有 12 行 affected**（窗口內 archive 新過 D1 嘅行），`stamped d1_cutover_v1 = 09:33:57Z`；行數表見到方向反轉（token_stats archive 56,932 vs d1 57,665 **+733**；scan_history **+3**）＝D1 係活嘅一邊，archive 已經落後。
+- **Turso 唯讀**：archive 最新一行 `scan_history.at = 09:31:23Z`（切換前最後一個 tick）；usage API 嘅 09:35–09:40Z 桶 **`rows_written=0`、`rows_read=0`**（對照同日 09:25–09:30 桶：2,213／263,825）。
+- **Worker 喺真 D1 嘅成本**（`/health.heartbeat.summary.dbTickSteps`，placed 路徑 NRT）：`getReevalPool 242ms`、`writeScanFront 144–153ms`、`getTokenStatsMany 123–131ms`、`readScanFront 110–116ms`、`isTokenSeen 109–110ms`（每個＝一次 batched call）；tick `ms` 3.6–4.8s，**比 Turso 同期嘅 1.73s 慢約 2.3×**（仍遠低於 60 秒 cadence）；三次抽樣 `writeDrainError` 都係 `null`、`initError` 一直 `null`、`dbReady true`、tracker lane 正常（`checked 20`）。
+- **未量**：D1 每 tick 嘅 statement 總數同 50-subrequest 預算嘅關係（`dbTickSteps` 係 per-method，唔係 per-statement）。
