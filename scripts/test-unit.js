@@ -5430,6 +5430,7 @@ async function main() {
     const {
       parseDexSpacingStamp,
       dexSpacingDecaySteps,
+      dexFleetPairBlockUntil,
       DEX_ADAPTIVE_FLEET_DECAY_MS,
       DEX_SPACING_STATE_KEY,
     } = require("../dist/dexscreener.js");
@@ -5449,13 +5450,46 @@ async function main() {
     assert.equal(parseDexSpacingStamp('{"at":"1000","steps":1}'), null, "strings do not count");
     assert.deepEqual(
       parseDexSpacingStamp('{"at":1000.7,"steps":2.9}'),
-      { at: 1000, steps: 2 },
+      { at: 1000, steps: 2, pairRefusedAt: 0 },
       "readings are floored, never rounded up into an extra raise",
     );
     assert.deepEqual(
       parseDexSpacingStamp('{"at":1000,"steps":0}'),
-      { at: 1000, steps: 0 },
+      { at: 1000, steps: 0, pairRefusedAt: 0 },
       "a RECOVERY row is a real reading, not an absent one",
+    );
+    // THE REFUSAL FIELD IS OPTIONAL AND GRADED (2026-10-16): the row existed
+    // before it, and it is the carrier of the pair lane's 90s block across
+    // isolates (see dexFleetPairBlockUntil). A row without it must stay a
+    // usable row, and a garbage value must read as "no refusal on the row"
+    // rather than erase a real spacing reading beside it.
+    assert.deepEqual(
+      parseDexSpacingStamp('{"at":1000,"steps":1}'),
+      { at: 1000, steps: 1, pairRefusedAt: 0 },
+      "a row written before the refusal field existed is still a usable row",
+    );
+    assert.equal(
+      parseDexSpacingStamp('{"at":1000,"steps":1,"pairRefusedAt":2500}').pairRefusedAt,
+      2500,
+      "the refusal travels with the raise",
+    );
+    for (const junk of ['"soon"', "-5", "0", "null", "true", '{"at":1}']) {
+      assert.equal(
+        parseDexSpacingStamp(`{"at":1000,"steps":1,"pairRefusedAt":${junk}}`).pairRefusedAt,
+        0,
+        `an unreadable refusal (${junk}) reads as none, and never costs the row`,
+      );
+    }
+
+    // The block derived from the row is the LANE'S OWN rule (refusedAt + the
+    // 90s block), not a second number — pinned against the local block a
+    // refused client reports rather than against a literal, so the two can
+    // never drift apart.
+    assert.equal(dexFleetPairBlockUntil(null), 0, "no row = nothing blocked");
+    assert.equal(
+      dexFleetPairBlockUntil({ at: 1000, steps: 1, pairRefusedAt: 0 }),
+      0,
+      "a row with no refusal blocks nothing",
     );
 
     assert.equal(dexSpacingDecaySteps(null, 5_000), 0, "no row = no fleet raise");
@@ -5580,13 +5614,174 @@ async function main() {
       // A refusal AFTER the row decayed is recorded against the NEW episode:
       // `at` is what a later isolate measures its decay from, so re-writing the
       // count with the old timestamp would decay it twice.
+      //
+      // The row adopted here is the LEGACY shape (no `pairRefusedAt`) — the one
+      // every row written before 2026-10-16 has, and the one a fleet that has
+      // never refused the batch lane still writes. That is deliberate: the row
+      // above carries a refusal, and a row that carries one makes the lane
+      // cache-only (see the block test below), so this leg would never reach the
+      // wire. A legacy row must therefore leave the lane OPEN — the pin that a
+      // missing field never invents a block.
       const d = new DexScreenerClient(cfg, {});
-      d.adoptDurableSpacing(JSON.stringify(row), quietAt);
+      d.adoptDurableSpacing(JSON.stringify({ at: row.at, steps: row.steps }), quietAt);
       await d.fetchPairsForTokens(addrs);
       const again = d.durableSpacingWrite(quietAt + 1);
       assert.ok(again !== null, "a fresh refusal is a fresh write");
       assert.equal(again.at, quietAt + 1);
       assert.ok(again.steps >= 1);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("DexScreenerClient: the batch lane's 90s block crosses the isolate boundary too", async () => {
+    // WHY (measured live 2026-10-16 00:25-00:27Z): four of five ticks paid a
+    // dispatch slot for the SAME refusal — the pair lane's leg read 1,202-1,693ms
+    // of a 3,125-3,816ms tick to bring back 0-26 pairs of ~200 while the Jupiter
+    // fallback answered the rest in 418-635ms — because every one of those ticks
+    // ran on an isolate whose OWN block had expired. Meanwhile the row those
+    // isolates already read (dex_spacing, same front read, no extra round trip)
+    // carried the raise but not the refusal, so the block was re-earned per
+    // isolate. This is that pair of isolates, with the block riding the row.
+    const {
+      DexScreenerClient,
+      dexFleetPairBlockUntil,
+      DEX_ADAPTIVE_RECOVER_SUCCESSES,
+    } = require("../dist/dexscreener.js");
+    const origFetch = globalThis.fetch;
+    const addrs = Array.from({ length: 30 }, (_, i) => `MINT${i}`.padEnd(44, "x"));
+    const cfg = loadConfig({
+      DEX_REQUEST_INTERVAL_MS: "0",
+      REEVAL_POOL_CACHE_SECONDS: "90",
+    });
+    // A BUDGETED caller (a deadline, as the tick always passes) ends its own
+    // retry loop on a 429, so every call below costs exactly one request.
+    const withinTick = () => Date.now() + 60_000;
+    let calls = 0;
+    try {
+      globalThis.fetch = async () => {
+        calls++;
+        return new Response("rate limited", { status: 429 });
+      };
+      // Isolate A: the batch lane is refused, so the block arms HERE and the row
+      // learns WHEN. The block is the lane's own 90s rule, unchanged.
+      const a = new DexScreenerClient(cfg, {});
+      a.adoptDurableSpacing(null);
+      await a.fetchPairsForTokens(addrs, withinTick());
+      const localBlock = a.getStats().blockedForMs;
+      assert.ok(localBlock > 0, "the refusal arms this isolate's own block");
+      const refusedAt = Date.now();
+      assert.ok(
+        Math.abs(dexFleetPairBlockUntil({ at: refusedAt, steps: 1, pairRefusedAt: refusedAt }) - refusedAt - localBlock) < 1_000,
+        "the row's block is the SAME rule as the local one, not a second backoff",
+      );
+      const row = a.durableSpacingWrite(refusedAt);
+      assert.ok(row !== null, "a refusal is worth a write");
+      assert.ok(row.pairRefusedAt > 0, "and the row carries when it happened");
+      assert.equal(a.durableSpacingWrite(refusedAt + 1), null, "written once, not every tick");
+
+      // Isolate B: a fresh client 10s later. Without the row it would spend a
+      // slot re-earning the same refusal; with it the lane is cache-only — NO
+      // request may go out at all.
+      const before = calls;
+      const b = new DexScreenerClient(cfg, {});
+      const adopted = b.adoptDurableSpacing(JSON.stringify(row), refusedAt + 10_000);
+      assert.ok(
+        adopted.pairBlockedForMs > 0,
+        "the block crossed the isolate boundary — the whole point",
+      );
+      const bStats = b.getStats();
+      assert.ok(
+        bStats.pairFleetRefusedAgeMs !== null && bStats.pairFleetRefusedAgeMs < 5_000,
+        `the fleet's refusal is published as an age (got ${bStats.pairFleetRefusedAgeMs})`,
+      );
+      assert.ok(bStats.blockedForMs > 0, "the block in force is readable beside it");
+      const blockedPairs = await b.fetchPairsForTokens(addrs, withinTick());
+      assert.equal(blockedPairs.size, 0, "a blocked lane answers cache-only");
+      assert.equal(calls, before, "and the wire is not touched — no slot, no request, no 429");
+      assert.equal(
+        bStats.pairCacheHits + bStats.pairCacheMisses + bStats.pairCacheRefused,
+        0,
+        "nothing was asked, so there is no pair outcome to report",
+      );
+      assert.equal(b.durableSpacingWrite(refusedAt + 10_001), null, "an adopted row is not re-written");
+
+      // …and the fleet-wide block still buys the RECOVERY attempt the local rule
+      // had: once it is spent, the lane is asked again.
+      // …and once it is SPENT the lane is asked again — the fleet block buys the
+      // same recovery attempt the local rule had, never a permanent silence.
+      // (A row that refuses 200s ago: its block ended 110s ago.)
+      const c = new DexScreenerClient(cfg, {});
+      c.adoptDurableSpacing(
+        JSON.stringify({ at: refusedAt - 200_000, steps: row.steps, pairRefusedAt: refusedAt - 200_000 }),
+        Date.now(),
+      );
+      assert.equal(c.getStats().blockedForMs, 0, "a spent refusal leaves no block");
+      const cBefore = calls;
+      await c.fetchPairsForTokens(addrs, withinTick());
+      assert.ok(calls > cBefore, "a spent block re-opens the wire");
+
+      // RAISE-ONLY, like the spacing itself: a row whose block is long spent
+      // must never shorten a fresher LOCAL one (the refusal this isolate earned
+      // AFTER that row was written is the newer evidence).
+      const staleRow = { at: 1_000_000, steps: 0, pairRefusedAt: 1_000_000 };
+      const d = new DexScreenerClient(cfg, {});
+      await d.fetchPairsForTokens(addrs, withinTick());
+      const dOwn = d.getStats().blockedForMs;
+      assert.ok(dOwn > 0, "this isolate was refused on its own account");
+      d.adoptDurableSpacing(JSON.stringify(staleRow), Date.now());
+      assert.ok(
+        Math.abs(d.getStats().blockedForMs - dOwn) < 50,
+        "a stale row never shortens a fresher local block",
+      );
+      // …and the write carries the LATER of the two refusals: this isolate's own
+      // (newer than the row's) must not be replaced by the row's older one, or
+      // the fleet would inherit an already-spent block and re-earn the refusal.
+      const back = d.durableSpacingWrite(Date.now());
+      assert.ok(back !== null, "a refusal newer than the row is a write");
+      assert.ok(
+        back.pairRefusedAt > staleRow.pairRefusedAt,
+        "the newer refusal travels",
+      );
+
+      // A write that happens for ANOTHER reason (the spacing walking back after a
+      // healthy streak) must not drop the row's refusal from the payload — that
+      // is how a later isolate would re-earn a block the fleet had already paid
+      // for.
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ pairs: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      // (a base spacing here: a client configured at 0 can never inherit a
+      // raise by design, so the walk-back below needs a real base to walk from)
+      const cfgBase = loadConfig({
+        DEX_REQUEST_INTERVAL_MS: "250",
+        REEVAL_POOL_CACHE_SECONDS: "90",
+      });
+      // The row here carries a WIDE count beside an OLD refusal: the spacing
+      // window is a memory of the burst, while the block is one 90s episode, so
+      // a spent refusal beside a live raise is the ordinary shape of a recovering
+      // fleet — and it must leave the lane open (or the walk-back below could
+      // never reach the wire).
+      const spentRefusal = refusedAt - 200_000;
+      const e = new DexScreenerClient(cfgBase, {});
+      e.adoptDurableSpacing(
+        JSON.stringify({ at: refusedAt, steps: 3, pairRefusedAt: spentRefusal }),
+        refusedAt + 1,
+      );
+      assert.ok(e.getStats().spacingSteps >= 3, "the row's raise was inherited");
+      for (let i = 0; i < DEX_ADAPTIVE_RECOVER_SUCCESSES; i++) {
+        await e.fetchPairsForTokens(addrs, withinTick());
+      }
+      const walked = e.durableSpacingWrite(refusedAt + 2);
+      assert.ok(walked !== null, "a walked-back count is a write");
+      assert.ok(walked.steps < 3, "the streak gave a step back");
+      assert.equal(
+        walked.pairRefusedAt,
+        spentRefusal,
+        "and the row's refusal rides along instead of being erased",
+      );
     } finally {
       globalThis.fetch = origFetch;
     }

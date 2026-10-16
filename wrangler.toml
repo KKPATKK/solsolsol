@@ -677,10 +677,14 @@ DEX_REQUEST_INTERVAL_MS = "250"
 #                                      DEX_ADAPTIVE_MAX_MS (1200), one step back
 #                                      per 6 consecutive 2xx. Reacts within the
 #                                      refused request, dies with the isolate.
-#   worker_state "dex_spacing"         the FLEET row. {at, steps}; the next
-#                                      tick adopts it, decaying one step per
-#                                      DEX_ADAPTIVE_FLEET_DECAY_MS (60s = one
-#                                      tick) of quiet. Raise-only on adoption.
+#   worker_state "dex_spacing"         the FLEET row. {at, steps, pairRefusedAt};
+#                                      the next tick adopts it, decaying one
+#                                      step per DEX_ADAPTIVE_FLEET_DECAY_MS
+#                                      (60s = one tick) of quiet. Raise-only on
+#                                      adoption — and "pairRefusedAt" is where
+#                                      the PAIR lane's 90s cache-only block
+#                                      (PAIR_BATCH_BACKOFF_MS) also crosses the
+#                                      boundary: see the block below.
 #
 # WHY THE ROW EXISTS (measured 2026-09-29T00:57Z): the per-isolate layer alone
 # lost its raise at the moment it mattered — the refused isolate read
@@ -696,6 +700,27 @@ DEX_REQUEST_INTERVAL_MS = "250"
 # spacingFleetSteps / spacingFleetAgeMs (the row, after decay).
 # spacingFleetSteps > 0 is the proof that a raise outlived an isolate, which is
 # the only thing this change can claim.
+#
+# THE BATCH LANE'S BLOCK TRAVELS ON THE SAME ROW (2026-10-16, fighter of the
+# tick's biggest single piece). Measured live 00:25-00:27Z: four of five ticks
+# read `poolLegMs.pairs 1,202-1,693ms` inside a 3,125-3,816ms tick while
+# bringing back 0-26 pairs of ~200 — the batch lane was 429'd by the shared
+# egress IP on essentially every attempt, its 90s cache-only block was armed
+# per isolate, and isolates churn every ~30s, so each fresh isolate spent ~1.2s
+# of dispatch spacing (~the raised intervalMs) re-earning a refusal the fleet
+# already knew. The Jupiter fallback answered the rest in 418-635ms (one tick
+# that inherited a live block read `poolLegMs.pairs 0` beside the same pairs
+# total). So the row now carries `pairRefusedAt` — the last refusal the BATCH
+# lane itself earned, never a LIST lane's (that coupling was removed 2026-10-01
+# on purpose: a list refusal is this egress IP's normal state and must not gate
+# the pair lane) — and adoption raises this isolate's block to
+# `pairRefusedAt + PAIR_BATCH_BACKOFF_MS`, raise-only, exactly like `steps`.
+# Result per episode: one doomed probe per 90s fleet-wide instead of one per
+# tick-owning isolate. Write-back carries the LATER of the two refusals, and
+# the block still buys the recovery attempt the local rule had. Read
+# `heartbeat.dex.pairFleetRefusedAgeMs` (null = the row carries none) beside
+# `blockedForMs`: a block with a non-null age on an isolate that has never been
+# refused itself is a block that crossed the boundary.
 #
 # SIZING THE DECAY (measured 2026-09-29T01:24-01:26Z): the first cut of the
 # window was 15s, sized against the in-isolate walk-back (6 consecutive 2xx =

@@ -1048,6 +1048,20 @@ export interface DexSpacingStamp {
   /** Raises in force at `at`. 0 is a REAL reading (the fleet recovered) — 
    * see parseDexSpacingStamp. */
   steps: number;
+  /**
+   * Epoch ms of the last BATCH-lane refusal any isolate recorded (see
+   * note429), or 0 when the row carries none. Written whenever the batch lane
+   * is refused, and read back as the fleet's cache-only block
+   * (dexFleetPairBlockUntil): the pair lane's 90s reaction stops being a fact
+   * per isolate and becomes the host-wide fact its trigger already is.
+   *
+   * DELIBERATELY NOT the any-lane 429 ring (`dex_429_at`): a LIST refusal is
+   * the normal state of this egress IP (see DEX_429_RECORD_MIN_GAP_MS) and
+   * must never gate the pair lane — the coupling the 2026-10-01 lane split
+   * removed, and the reason the pair lane was asked at all. Only a refusal the
+   * BATCH lane itself earned may travel here.
+   */
+  pairRefusedAt: number;
 }
 
 /**
@@ -1072,10 +1086,36 @@ export function parseDexSpacingStamp(
     const steps =
       typeof row.steps === "number" && Number.isFinite(row.steps) ? row.steps : null;
     if (at === null || steps === null || at <= 0 || steps < 0) return null;
-    return { at: Math.floor(at), steps: Math.floor(steps) };
+    // The refusal is OPTIONAL and graded, never required: a row written before
+    // this field existed (and every healthy tick that never wrote one) must
+    // stay a usable row, and an unreadable value must read as "no refusal on
+    // the row" rather than erase a real spacing reading. 0 is the absence, not
+    // a time — same rule as `at`.
+    const pairRefusedRaw = row.pairRefusedAt;
+    const pairRefusedAt =
+      typeof pairRefusedRaw === "number" && Number.isFinite(pairRefusedRaw) && pairRefusedRaw > 0
+        ? Math.floor(pairRefusedRaw)
+        : 0;
+    return { at: Math.floor(at), steps: Math.floor(steps), pairRefusedAt };
   } catch {
     return null;
   }
+}
+
+/**
+ * When the FLEET's last batch-lane refusal stops costing this isolate a
+ * request, or 0 when the row carries no refusal (see
+ * DexSpacingStamp.pairRefusedAt).
+ *
+ * EXACTLY the local rule (`refusedAt + PAIR_BATCH_BACKOFF_MS`) applied to the
+ * row's timestamp instead of this isolate's own, so the two can never disagree
+ * about how long a refusal is worth blocking for. A future timestamp (clock
+ * skew between isolates) yields a block further out — the safe direction, the
+ * same reading dexSpacingDecaySteps gives a future `at`.
+ */
+export function dexFleetPairBlockUntil(stamp: DexSpacingStamp | null): number {
+  const at = stamp?.pairRefusedAt ?? 0;
+  return at > 0 ? at + PAIR_BATCH_BACKOFF_MS : 0;
 }
 
 /**
@@ -1394,7 +1434,19 @@ const PAIR_CACHE_MAX = 4_000;
  * dispatched at all, so the edge cache is not a second way around a refusal.
  */
 export const PAIR_BATCH_CACHE_TTL_S = 120;
-/** After a batched-endpoint 429, skip all batch calls for this long. */
+/**
+ * After a batched-endpoint 429, skip all batch calls for this long.
+ *
+ * THE LANE'S OWN REACTION, one refusal's worth. It is armed per isolate (see
+ * note429) AND carried across isolates on the durable spacing row (see
+ * DexSpacingStamp.pairRefusedAt / dexFleetPairBlockUntil): measured live
+ * 2026-10-16 00:25–00:27Z, four of five ticks paid a slot for the SAME refusal
+ * — each on an isolate whose own block had expired — and the pair lane's leg
+ * read 1,202–1,693ms of a 3,125–3,816ms tick to bring back 0–26 pairs of ~200
+ * while Jupiter answered the rest in 418–635ms. The refusal is a fact about the
+ * shared egress IP, so the block travels with the fleet's memory of it instead
+ * of being re-earned by every isolate that runs a tick.
+ */
 const PAIR_BATCH_BACKOFF_MS = 90_000;
 /**
  * Minimum gap between two durable 429 records (see note429).
@@ -1583,6 +1635,26 @@ export class DexScreenerClient {
   /** Until this epoch the endpoint 429'd — serve pair cache only. */
   private batchBlockedUntil = 0;
   /**
+   * Epoch of this isolate's last BATCH-lane refusal (see note429), or 0. It is
+   * the value the durable row carries (see durableSpacingWrite) so the block
+   * below is not re-earned by every isolate that runs a tick.
+   */
+  private pairRefusedAt = 0;
+  /**
+   * The FLEET's last batch-lane refusal as the durable row last read it, or 0.
+   * Kept so a write can carry the LATER of the two refusals: this isolate's
+   * own refusal arriving after the row's must not erase the row's, and the
+   * row's must not be re-stamped as this isolate's.
+   */
+  private fleetPairRefusedAt = 0;
+  /**
+   * The refusal the row is BELIEVED to hold — the value adopted from it,
+   * updated on every write. `durableSpacingWrite` compares it against the two
+   * live readings (the spacing's steps and the refusal above), which is what
+   * keeps a healthy tick from spending a write to say "nothing changed".
+   */
+  private persistedPairRefusedAt = 0;
+  /**
    * When a refusal was last written to the fleet ring (see note429 and
    * DEX_429_RECORD_MIN_GAP_MS). Deliberately NOT the batch block: the block is
    * the batch lane's reaction, the ring is every lane's record.
@@ -1691,6 +1763,14 @@ export class DexScreenerClient {
     raised: boolean;
     /** The spacing this isolate is running after adoption (ms). */
     intervalMs: number;
+    /**
+     * ms left of the block the ROW's refusal carries, after this adoption —
+     * 0 when the row carried none, or one already spent. Published so a tick
+     * that skipped the pair wire can say whether the skip was the fleet's
+     * block or its own (see getStats, and the live shape this was written for:
+     * four of five ticks paying a slot for the same refusal).
+     */
+    pairBlockedForMs: number;
   } {
     const stamp = parseDexSpacingStamp(raw);
     const steps = dexSpacingDecaySteps(stamp, now);
@@ -1702,11 +1782,24 @@ export class DexScreenerClient {
     this.persistedSteps = steps;
     const raised = this.spacing.adoptSteps(steps);
     if (raised) this.throttle.setIntervalMs(this.spacing.currentMs);
+    // THE FLEET'S BLOCK, adopted RAISE-ONLY exactly like the spacing above —
+    // and for the same reason: a refusal that landed in this isolate before
+    // the front row came back is fresher evidence, and a row whose block is
+    // already spent must never shorten it. It is the pair lane's reaction to a
+    // refusal (PAIR_BATCH_BACKOFF_MS), not a second, longer backoff: the row
+    // only says WHEN the refusal happened.
+    this.fleetPairRefusedAt = stamp?.pairRefusedAt ?? 0;
+    this.persistedPairRefusedAt = this.fleetPairRefusedAt;
+    const fleetBlockUntil = dexFleetPairBlockUntil(stamp);
+    if (fleetBlockUntil > this.batchBlockedUntil) {
+      this.batchBlockedUntil = fleetBlockUntil;
+    }
     return {
       steps,
       ageMs: this.fleetAgeMs,
       raised,
       intervalMs: this.spacing.currentMs,
+      pairBlockedForMs: Math.max(0, this.batchBlockedUntil - now),
     };
   }
 
@@ -1727,13 +1820,17 @@ export class DexScreenerClient {
    */
   durableSpacingWrite(now: number = Date.now()): DexSpacingStamp | null {
     const steps = this.spacing.growthSteps;
-    if (this.persistedSteps !== null) {
-      if (steps === this.persistedSteps) return null;
-    } else if (steps <= 0) {
-      return null;
-    }
+    // The LATER of the two refusals travels (see fleetPairRefusedAt): the row
+    // is the fleet's memory of the last batch refusal, so this isolate's own —
+    // possibly older — refusal must never erase one the fleet already knows.
+    const pairRefusedAt = Math.max(this.pairRefusedAt, this.fleetPairRefusedAt);
+    const stepsMoved =
+      this.persistedSteps !== null ? steps !== this.persistedSteps : steps > 0;
+    const refusalMoved = pairRefusedAt !== this.persistedPairRefusedAt;
+    if (!stepsMoved && !refusalMoved) return null;
     this.persistedSteps = steps;
-    return { at: now, steps };
+    this.persistedPairRefusedAt = pairRefusedAt;
+    return { at: now, steps, pairRefusedAt };
   }
 
   /**
@@ -1761,6 +1858,15 @@ export class DexScreenerClient {
     spacingFleetSteps: number;
     /** Age of that row when it was read, or null when there was none. */
     spacingFleetAgeMs: number | null;
+    /**
+     * Age (ms) of the FLEET's last BATCH-lane refusal as the row last read it
+     * was, or null when the row carried none. Read WITH `blockedForMs`: that
+     * field is what remains of the block in force, while this one says whether
+     * the fleet put it there — `blockedForMs > 0` and this non-null on an
+     * isolate that has never been refused itself is a block that crossed the
+     * boundary (the whole point, see adoptDurableSpacing).
+     */
+    pairFleetRefusedAgeMs: number | null;
     http429: number;
     last429At: number | null;
     blockedForMs: number;
@@ -1831,6 +1937,8 @@ export class DexScreenerClient {
       spacingSteps: this.spacing.growthSteps,
       spacingFleetSteps: this.fleetSteps,
       spacingFleetAgeMs: this.fleetAgeMs,
+      pairFleetRefusedAgeMs:
+        this.fleetPairRefusedAt > 0 ? Math.max(0, Date.now() - this.fleetPairRefusedAt) : null,
       http429: this.http429Total,
       last429At: this.last429At,
       blockedForMs: Math.max(0, this.batchBlockedUntil - Date.now()),
@@ -1982,6 +2090,7 @@ export class DexScreenerClient {
     this.last429At = now;
     if (batchLane) {
       this.batchBlockedUntil = now + PAIR_BATCH_BACKOFF_MS;
+      this.pairRefusedAt = now;
       this.spacing.noteRefused();
       this.throttle.setIntervalMs(this.spacing.currentMs);
     }
