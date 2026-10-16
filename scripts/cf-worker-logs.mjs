@@ -21,22 +21,23 @@
  * neither needs the dashboard and neither needs hardware.
  *
  * WHAT IT ASKS: Cloudflare's Workers Observability query API
- * (`POST /accounts/{id}/workers/observability/telemetry/query`) twice —
+ * (`POST /accounts/{id}/workers/observability/telemetry/query`) —
  *   view: "invocations"     one row per invocation, so the expensive tick can
  *                           be named (eventType, trigger, outcome, wall time).
+ *                           PAGED (see below).
  *   view: "calculations"    count/min/median/max/p90/p99 OF `$workers.cpuTimeMs`
  *                           over the whole window. This half is what makes the
  *                           answer more than a page: the invocation view is
- *                           limit-capped, a percentile is not.
- * and then the SAME window from GraphQL (see § "like for like" below), because
- * the two sources disagreed by ~2.2x and that has to be attributed, not
- * averaged away.
+ *                           limit-capped per page, a percentile is not capped at
+ *                           all.
+ * and then the SAME window from GraphQL, because the two sources disagreed by
+ * ~2.2x and that has to be attributed rather than averaged away.
  *
  * Reads CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID from the environment,
- * WORKER / MINUTES / LIMIT / SHOW as optional knobs. Exits non-zero only when
- * it could not ask Cloudflare at all — an empty result is a reading too (it is
- * what "not enabled yet" and "no invocations" look like), so it is printed
- * rather than treated as a failure.
+ * WORKER / MINUTES / LIMIT / MAX_PAGES / SHOW as optional knobs. Exits non-zero
+ * only when it could not ask Cloudflare at all — an empty result is a reading
+ * too (it is what "not enabled yet" and "no invocations" look like), so it is
+ * printed rather than treated as a failure.
  */
 
 import { appendFileSync } from "node:fs";
@@ -45,13 +46,16 @@ const TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
 const ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
 const WORKER = process.env.WORKER || "solana-meme-bot";
 const MINUTES = Number(process.env.MINUTES || "60");
-const LIMIT = Number(process.env.LIMIT || "4000");
+const LIMIT = Number(process.env.LIMIT || "2000");
+const MAX_PAGES = Number(process.env.MAX_PAGES || "20");
 const SHOW = Number(process.env.SHOW || "15");
 
 /** The Workers Logs dataset name (the one the dashboard's query builder uses). */
 const DATASET = "cloudflare-workers";
 /** This script's own ad-hoc query id; parameters travel inline with the call. */
 const QUERY_ID = "solana-meme-bot-per-invocation-cpu";
+/** Cloudflare's own ceiling on one page of this view — a bigger `limit` is a hard error. */
+const API_PAGE_MAX = 2000;
 
 if (!TOKEN || !ACCOUNT) {
   console.error(
@@ -63,6 +67,16 @@ if (!TOKEN || !ACCOUNT) {
 
 if (!(MINUTES > 0) || MINUTES > 24 * 60) {
   console.error(`MINUTES must be 1..1440 (got ${process.env.MINUTES})`);
+  process.exit(2);
+}
+
+if (!(LIMIT >= 1) || LIMIT > API_PAGE_MAX) {
+  console.error(
+    `LIMIT must be 1..${API_PAGE_MAX} (got ${process.env.LIMIT}). This is the ` +
+      `PAGE size, not a window cap: asking for 4000 was rejected by Cloudflare ` +
+      `itself as "too_big, maximum 2000". The window is covered by paging ` +
+      `(MAX_PAGES=${MAX_PAGES}) instead.`,
+  );
   process.exit(2);
 }
 
@@ -142,9 +156,9 @@ function pct(sorted, p) {
 /**
  * The median as a reader means it (average of the two middle values for an even
  * count), which is NOT the nearest-rank `pct(xs, 50)` once the sample is small:
- * with ~12 invocations a minute and a heavy tail, the two differ by a whole
- * order statistic, and the answer to "why do the two readings disagree?" turns
- * on exactly that distinction.
+ * with ~12 invocations a minute and a heavy tail the two differ by a whole order
+ * statistic, and the answer to "why do the two readings disagree?" turns on
+ * exactly that distinction.
  */
 function median(xs) {
   if (xs.length === 0) return null;
@@ -173,31 +187,103 @@ say(`window: ${stamp(from)} → ${stamp(to)} (${MINUTES} min)`);
 say(`dataset: ${DATASET} · filter: $metadata.service = ${WORKER}`);
 say("");
 
-/* ---------------------------------------------------------------- the page */
+/* -------------------------------------------------------------- the pages */
 
-const page = await query({
-  queryId: QUERY_ID,
-  timeframe: { from, to },
-  view: "invocations",
-  limit: LIMIT,
-  parameters: baseParameters,
-});
+/**
+ * PAGED, not capped. One page of this view holds at most 2000 events (the API
+ * answers a larger `limit` with ZodError `too_big, maximum 2000`), and an
+ * invocation contributes its own record PLUS its log lines, so a 60-minute
+ * window is several pages. Stopping after one page would silently turn the
+ * reading into "the newest 2000 events" — the exact truncation that makes a
+ * per-minute comparison lie by omission. The cursor for this view is the
+ * `$metadata.id` of the LAST event on the page; a short page means the window
+ * is exhausted.
+ */
+const collected = new Map();
+let pages = 0;
+let cursor = "";
+let exhausted = false;
+let pageStats = null;
+let firstRequestId = "";
 
-if (!page.json?.success) {
-  console.error(`observability query failed (HTTP ${page.status}):`);
-  console.error(JSON.stringify(page.json?.errors ?? page.json, null, 2).slice(0, 2000));
-  if (page.status === 403 || page.status === 401) {
-    console.error(
-      "\nA 403 here is the TOKEN, not the Worker: reading Workers Logs needs " +
-        "the account token to carry Workers Observability Read (Metadata " +
-        "Read-Only) alongside the deploy permissions it already has.",
-    );
+for (;;) {
+  const body = {
+    queryId: QUERY_ID,
+    timeframe: { from, to },
+    view: "invocations",
+    limit: LIMIT,
+    parameters: baseParameters,
+  };
+  if (cursor) {
+    body.offset = cursor;
+    body.offsetDirection = "next";
   }
-  process.exit(2);
+
+  const res = await query(body);
+
+  if (!res.json?.success) {
+    console.error(`observability query failed (HTTP ${res.status}, page ${pages + 1}):`);
+    console.error(JSON.stringify(res.json?.errors ?? res.json, null, 2).slice(0, 2000));
+    if (res.status === 403 || res.status === 401) {
+      console.error(
+        "\nA 403 here is the TOKEN, not the Worker: reading Workers Logs needs " +
+          "the account token to carry Workers Observability Read (Metadata " +
+          "Read-Only) alongside the deploy permissions it already has.",
+      );
+    }
+    process.exit(2);
+  }
+
+  const result = res.json.result ?? {};
+  if (!pageStats) pageStats = result.statistics ?? {};
+  const pageGroups = result.invocations ?? {};
+  const entries = Object.entries(pageGroups);
+  let eventsOnPage = 0;
+  let lastEventId = "";
+
+  for (const [requestId, events] of entries) {
+    const list = Array.isArray(events) ? events : [events];
+    eventsOnPage += list.length;
+    if (!firstRequestId) firstRequestId = requestId;
+    if (!collected.has(requestId)) collected.set(requestId, list);
+    const last = list[list.length - 1];
+    if (last?.$metadata?.id) lastEventId = String(last.$metadata.id);
+  }
+
+  pages++;
+
+  if (entries.length === 0) {
+    exhausted = true;
+    break;
+  }
+  // A page that came back short of the requested limit is the last one.
+  if (eventsOnPage < LIMIT) {
+    exhausted = true;
+    break;
+  }
+  if (!lastEventId) {
+    // Full page but no cursor to follow: stop, and say so below rather than
+    // pretending the window was covered.
+    break;
+  }
+  if (pages >= MAX_PAGES) break;
+  cursor = lastEventId;
 }
 
-const groups = page.json.result?.invocations ?? {};
-const stats = page.json.result?.statistics ?? {};
+const rowEntries = [...collected.entries()];
+
+say(
+  `invocation groups collected: ${rowEntries.length}` +
+    ` · pages: ${pages}${exhausted ? " (window exhausted)" : " — STOPPED BEFORE THE END (raise MAX_PAGES)"}`,
+);
+say(
+  `query statistics: rows_read ${pageStats?.rows_read ?? "?"} · bytes_read ${pageStats?.bytes_read ?? "?"}` +
+    ` · abr_level ${pageStats?.abr_level ?? 1}` +
+    (pageStats?.abr_level && pageStats.abr_level > 1
+      ? "  <- ABR sampling is on: counts below are estimates"
+      : ""),
+);
+say("");
 
 /**
  * Each key is a request id; each value is every event Workers Logs stored for
@@ -208,8 +294,7 @@ const stats = page.json.result?.statistics ?? {};
  */
 const rows = [];
 let groupsWithoutTiming = 0;
-for (const [requestId, events] of Object.entries(groups)) {
-  const list = Array.isArray(events) ? events : [events];
+for (const [requestId, list] of rowEntries) {
   const timed = list.find((e) => num(e?.$workers?.cpuTimeMs) !== null);
   if (!timed) {
     groupsWithoutTiming++;
@@ -232,16 +317,8 @@ for (const [requestId, events] of Object.entries(groups)) {
 rows.sort((a, b) => b.cpuTimeMs - a.cpuTimeMs);
 
 say(
-  `invocation groups returned: ${Object.keys(groups).length}` +
-    ` · carrying $workers.cpuTimeMs: ${rows.length}` +
+  `carrying $workers.cpuTimeMs: ${rows.length}` +
     (groupsWithoutTiming ? ` · groups with no timing record: ${groupsWithoutTiming}` : ""),
-);
-say(
-  `query statistics: rows_read ${stats.rows_read ?? "?"} · bytes_read ${stats.bytes_read ?? "?"}` +
-    ` · abr_level ${stats.abr_level ?? 1}` +
-    (stats.abr_level && stats.abr_level > 1
-      ? "  <- ABR sampling is on: counts below are estimates"
-      : ""),
 );
 say("");
 
@@ -260,8 +337,8 @@ if (rows.length > 0) {
   }
   say("");
   say(
-    `this page: n=${rows.length} · mean ${ms(mean(cpu))}ms · ` +
-      `p50 ${pct(cpu, 50)}ms (nearest-rank) · p90 ${pct(cpu, 90)}ms · max ${cpu[cpu.length - 1]}ms`,
+    `this window: n=${rows.length} · mean ${ms(mean(cpu))}ms · ` +
+      `median ${ms(median(cpu))}ms · p90 ${pct(cpu, 90)}ms · max ${cpu[cpu.length - 1]}ms`,
   );
 
   // Per-invocation CPU is only interesting BY EVENT TYPE: the cron tick is the
@@ -277,7 +354,7 @@ if (rows.length > 0) {
     byType.set(k, acc);
   }
   say("");
-  say("### by event type (this page)");
+  say("### by event type (this window)");
   say("");
   say("| eventType | n | mean cpuMs | max cpuMs |");
   say("|---|---|---|---|");
@@ -292,9 +369,6 @@ if (rows.length > 0) {
       "may simply predate it. Widen MINUTES to include the deploy, or confirm " +
       "that [observability] enabled = true reached the live Worker.",
   );
-  const sample = JSON.stringify(page.json.result ?? {}).slice(0, 600);
-  say("");
-  say("raw result (truncated): " + sample);
 }
 
 /* --------------------------------------------------------- the percentiles */
@@ -319,7 +393,7 @@ const agg = await query({
 });
 
 say("");
-say("## whole window (percentiles are NOT limit-capped)");
+say("## whole window (the calculations view is not page-capped)");
 say("");
 
 if (!agg.json?.success) {
@@ -374,17 +448,16 @@ if (!agg.json?.success) {
  *
  * Comparing a per-minute median SERIES with a per-invocation MEAN of a
  * heavy-tailed distribution mixes two differences at once (minute-bucket vs
- * invocation, and median vs mean). This half prints both per minute, so the
- * like-for-like pairs — median vs median, and minute vs minute — are separable.
+ * invocation, and median vs mean). This half prints both per minute so the
+ * like-for-like pairs are separable.
  *
  * Field names are NOT guessed: scripts/cf-invocations.mjs introspects this
  * schema, and its own run log (2026-10-16T04:23Z) reads `datetime_geq` /
  * `datetime_leq`, dimension `datetime`, status dimension present, quantiles
  * field `quantiles` holding cpuTimeP50/cpuTimeP99, `max.cpuTime` present. A
  * rename therefore shows up as the GraphQL error printed below, not as a
- * silent zero. NOTE THE UNIT: cpuTime here is MICROSECONDS (the Free plan's
- * 10ms CPU limit is 10,000 in this field), while Workers Logs reports
- * milliseconds.
+ * silent zero. UNIT: cpuTime here is MICROSECONDS (the Free plan's 10ms CPU
+ * limit reads as 10,000 in this field), while Workers Logs reports milliseconds.
  */
 const GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const GRAPHQL_QUERY = `
@@ -401,9 +474,6 @@ query ($accountTag: String!, $filter: WorkersInvocationsAdaptiveGroupsFilter!) {
   }
 }`;
 
-const graphqlFrom = new Date(from).toISOString();
-const graphqlTo = new Date(to).toISOString();
-
 const gqlRes = await fetch(GRAPHQL_ENDPOINT, {
   method: "POST",
   headers: {
@@ -414,13 +484,17 @@ const gqlRes = await fetch(GRAPHQL_ENDPOINT, {
     query: GRAPHQL_QUERY,
     variables: {
       accountTag: ACCOUNT,
-      filter: { datetime_geq: graphqlFrom, datetime_leq: graphqlTo, scriptName: WORKER },
+      filter: {
+        datetime_geq: new Date(from).toISOString(),
+        datetime_leq: new Date(to).toISOString(),
+        scriptName: WORKER,
+      },
     },
   }),
 });
 
 const gqlText = await gqlRes.text();
-let gql;
+let gql = null;
 try {
   gql = JSON.parse(gqlText);
 } catch {
@@ -438,17 +512,15 @@ if (!gql) {
 } else if (gql.errors?.length) {
   gqlNote = `GraphQL errors: ${JSON.stringify(gql.errors).slice(0, 600)}`;
 } else {
-  const gqlGroups =
-    gql?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive ?? [];
+  const gqlGroups = gql?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive ?? [];
   for (const g of gqlGroups) {
     const dims = g?.dimensions ?? {};
     const minute = String(dims.datetime ?? "").slice(0, 16);
     if (!minute) continue;
     const row = gqlByMinute.get(minute) ?? { requests: 0, p50: 0, p99: 0, cpuMax: 0, wallMax: 0 };
     row.requests += Number(g?.sum?.requests ?? 0);
-    // One row per (minute, status): with a single-status Worker this is the one
-    // bucket, and if a status ever splits it the MAX is kept rather than a sum,
-    // because a percentile does not add.
+    // One row per (minute, status). A percentile does not add, so a minute that
+    // splits by status keeps the MAX of the P50s rather than their sum.
     row.p50 = Math.max(row.p50, Number(g?.quantiles?.cpuTimeP50 ?? 0));
     row.p99 = Math.max(row.p99, Number(g?.quantiles?.cpuTimeP99 ?? 0));
     row.cpuMax = Math.max(row.cpuMax, Number(g?.max?.cpuTime ?? 0));
@@ -456,7 +528,8 @@ if (!gql) {
     gqlByMinute.set(minute, row);
   }
   if (gqlByMinute.size === 0) {
-    gqlNote = "GraphQL returned no rows for this window (retention, or a token without Analytics read).";
+    gqlNote =
+      "GraphQL returned no rows for this window (retention, or a token without Analytics read).";
   }
 }
 
@@ -481,7 +554,17 @@ if (gqlNote) {
   }
 
   const bothMinutes = [...gqlByMinute.keys()].filter((m) => logByMinute.has(m)).sort();
+  const logOnly = [...logByMinute.keys()].filter((m) => !gqlByMinute.has(m));
+  const gqlOnly = [...gqlByMinute.keys()].filter((m) => !logByMinute.has(m));
 
+  say(
+    `minutes in both sources: ${bothMinutes.length}` +
+      (logOnly.length ? ` · Logs-only: ${logOnly.length}` : "") +
+      (gqlOnly.length ? ` · GraphQL-only: ${gqlOnly.length}` : "") +
+      " (Logs-only minutes are the pre-deploy minutes the switch could not store, " +
+      "or minutes whose events fell off the page).",
+  );
+  say("");
   say("| minute (UTC) | gql requests | gql cpuP50 ms | gql cpuP99 ms | gql cpuMax ms | logs n | logs median ms | logs mean ms | logs max ms |");
   say("|---|---|---|---|---|---|---|---|---|");
   for (const m of bothMinutes) {
@@ -500,29 +583,30 @@ if (gqlNote) {
   say("");
   say("| statistic | value |");
   say("|---|---|");
-  say(`| GraphQL minutes (buckets in the window) | ${gqlByMinute.size} |`);
+  say(`| GraphQL minute buckets in the window | ${gqlByMinute.size} |`);
   say(`| GraphQL requests summed over those minutes | ${gqlRequests} |`);
-  say(`| GraphQL cpuP50 **median across minutes** | ${ms(median(gqlP50s))} ms |`);
-  say(`| GraphQL cpuP50 **mean across minutes** | ${ms(mean(gqlP50s))} ms |`);
-  say(`| GraphQL cpuP50 of all minutes (all buckets pooled) | ${ms(median([...gqlByMinute.values()].flatMap((r) => r.p50 / 1000)))} ms |`);
+  say(`| GraphQL cpuP50 — **median across minutes** | ${ms(median(gqlP50s))} ms |`);
+  say(`| GraphQL cpuP50 — **mean across minutes** | ${ms(mean(gqlP50s))} ms |`);
   say(`| Logs per-invocation **median** | ${ms(median(logCpu))} ms |`);
   say(`| Logs per-invocation **mean** | ${ms(mean(logCpu))} ms |`);
   say("");
   say(
-    `LIKE FOR LIKE: per-minute median vs per-invocation median is ` +
+    `LIKE FOR LIKE — per-minute median vs per-invocation median: ` +
       `${ms(median(gqlP50s))} ms vs ${ms(median(logCpu))} ms ` +
-      `(${ms(median(logCpu) / (median(gqlP50s) || 1))}x), and per-invocation mean vs ` +
-      `per-invocation median is ${ms(mean(logCpu))} ms vs ${ms(median(logCpu))} ms ` +
-      `(the heavy tail, ${ms(mean(logCpu) / (median(logCpu) || 1))}x). ` +
-      `Multiplying those two ratios is what a "monthly ms" figure built from a ` +
-      `per-minute P50 series and a per-invocation mean are actually differ by.`,
+      `(${ms((median(logCpu) ?? 0) / (median(gqlP50s) || 1))}x); ` +
+      `per-invocation mean vs per-invocation median (the heavy tail): ` +
+      `${ms(mean(logCpu))} ms vs ${ms(median(logCpu))} ms ` +
+      `(${ms((mean(logCpu) ?? 0) / (median(logCpu) || 1))}x). ` +
+      `Those two are different questions: the first is whether the datasets agree, ` +
+      `the second is why a monthly figure built from a median-like series and a ` +
+      `mean land 2x apart.`,
   );
 }
 
 say("");
 say(
-  `the invocations view is capped at LIMIT=${LIMIT} events, so naming the ` +
-    `most expensive invocation in the window is only exact when the page held ` +
-    `the whole window; the calculations view above is the uncapped statement ` +
-    `about it.`,
+  `the invocation view is paged at LIMIT=${LIMIT} events/page ` +
+    `(${pages} page(s), ${exhausted ? "all pages" : "NOT all pages"}), so a ` +
+    `per-minute join is complete only when the window was exhausted; the ` +
+    `calculations view above is uncapped either way.`,
 );
