@@ -8509,6 +8509,82 @@ async function main() {
     }
   });
 
+  await test("DexScreenerClient: an idle queue still defers an episodic pass the ROTATION makes long", async () => {
+    // The projection half of the budget, pinned (see PAIR_INLINE_WAIT_BUDGET_MS).
+    // Measured live 2026-10-16 06:00–06:06Z, right after the episode rule's first
+    // deploy: the scan's pair phase runs ~30s after the previous one, so the queue
+    // is IDLE and a FIRST-SLOT check read "cheap" on 5 of 6 episode ticks — each
+    // of which then spent 1,384–2,000ms of its 1,813–4,932ms envelope on the raised
+    // INTER-BATCH spacing (4–7 batches at 400–1,200ms) to bring back 0–72 pairs.
+    //
+    // The arithmetic that makes this test unambiguous: on a FRESH lane the queue
+    // cannot be more than one interval (400ms here, steps 1) out, and the check is
+    // strictly `>` the 400ms budget — so a deferral can ONLY have come from the
+    // pass's own pacing (4 batches x 400ms / 3 = 533ms), which is the production
+    // shape. A single batch (400/3 = 133ms) is not enough on its own, which is why
+    // the reading is the larger of the two halves and not their sum.
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const origFetch = globalThis.fetch;
+    const addrs = (prefix, n) =>
+      Array.from({ length: n }, (_, i) => `${prefix}${i}`.padEnd(44, "x"));
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "250" });
+    const mkPair = (m, i) => ({
+      chainId: "solana",
+      url: `https://dexscreener.com/solana/PAIR${i}`,
+      pairAddress: `PAIR${i}`,
+      baseToken: { address: m, name: m, symbol: m },
+      priceUsd: "0.003",
+      marketCap: 1000,
+      fdv: 1000,
+      liquidity: { usd: 100 },
+      volume: { h24: 10, h1: 1, m5: 1 },
+      txns: { m5: { buys: 1, sells: 1 }, h1: { buys: 2, sells: 2 } },
+      priceChange: { m5: 0, h1: 0 },
+      pairCreatedAt: 1,
+    });
+    try {
+      globalThis.fetch = async (url) => {
+        const mints = String(url).split("/").pop().split(",");
+        return new Response(
+          JSON.stringify({ pairs: mints.map((m, i) => mkPair(m, i)) }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+      const held = [];
+      const dex = new DexScreenerClient(cfg, {
+        holdForTick: (p) => {
+          held.push(p);
+        },
+      });
+      // One raise (250 x 1.6 = 400ms) with its refusal long spent: an episode with
+      // a lapsed block and an IDLE queue.
+      const now = Date.now();
+      dex.adoptDurableSpacing(
+        JSON.stringify({ at: now, steps: 1, pairRefusedAt: now - 300_000 }),
+      );
+      const before = dex.getStats();
+      assert.equal(before.intervalMs, 400, "the lane is at exactly one raise");
+      assert.equal(before.blockedForMs, 0, "and its block has lapsed");
+      assert.ok(before.spacingSteps > 0, "so the raises are still in force");
+      const t0 = Date.now();
+      const big = await dex.fetchPairsForTokens(addrs("MANY", 120));
+      const waited = Date.now() - t0;
+      assert.ok(waited < 300, `a 4-batch pass must not be waited on inline (waited ${waited}ms)`);
+      assert.equal(big.size, 0, "the caller keeps its cache hits, not the pass's answer");
+      assert.equal(held.length, 1, "the rotation was handed to the tick's waitUntil");
+      const after = dex.getStats();
+      assert.equal(
+        after.probeDeferrals,
+        before.probeDeferrals + 1,
+        "counted as the episode's first attempt",
+      );
+      // The held pass still runs and still fills the cache for the next tick.
+      await held[0].catch(() => undefined);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   await test("DexScreenerClient.fetchPairsForTokens: the deepest pool represents a token, not its list position", async () => {
     // Measured live 2026-10-02 (Agency): one token's returned pairs spanned
     // mcap $48K-$3.3M across 8 pools — a drained pair at $0 LP, two at ~$3,

@@ -150,6 +150,27 @@ Jupiter 嘅 liquidity 讀數係同一個池嘅另一個 metric，約一半，**�
   `❌ … an episode pass must not wait the raised gap inline (waited 1024ms)` → `552 passed, 1 failed`。
   即係個測試真係捉得到（唔係自我安慰）。
 
+### §3 修正（2026-10-16 06:0xZ：deploy 後量到唔達標，已再落地）
+
+第一次 deploy（commit `956dd03`，run 38858553715 全 success）之後嘅實測：
+block 覆蓋成條 lane 嘅不變量**冇問題**（3/3 blocked tick 讀 `pairsLeg 0`），
+但 `episodeDeferrals` 由 0 只升到 **1**，而 **6 個 episode tick 之中 5 個**照樣付
+`pairsLeg 1,384–2,000ms`（該 tick 總數 1,813–4,932ms）。**即係唔達標。**
+
+**原因**：gate 讀嘅係「隊嘅下一個 slot」。scan 嘅 pair phase 同上一 tick 相隔 ~30s，隊係**空**嘅，
+`nextSlotAt()` 答「即係」，所以 gate 讀成「平」⇒ inline 派。真正成本係**批次之間嘅 spacing**
+（4–7 個 batch × 400–1,200ms），唔係第一個請求嘅等待 —— 「第一個 slot」呢個讀數結構上睇唔到。
+
+**修正**：預算改成**兩半之中較大者** —— 第一 slot 嘅等待，同 pass 自己嘅 pacing
+（`batches × intervalMs ÷ PAIR_BATCH_CONCURRENCY`）；常數改名 `PAIR_INLINE_WAIT_BUDGET_MS`
+（一次涵蓋兩半）。單一個 30 地址 batch 喺空隊仍然 inline（真係平）；~200 地址嘅 rotation 永遠唔平。
+計數語意不變：`probeDeferrals` ＝ episode 第一次嘗試、`episodeDeferrals` ＝ 其餘。
+
+**再驗收**：同 §3 上面一樣，但今次係「6 個 episode tick 之中 0 個」付 `pairsLeg > 400ms`。
+**測試**：新增 `an idle queue still defers an episodic pass the ROTATION makes long`；
+Mutation（把 `inlineWaitMs` 改返 `queueWaitMs`、重 build）：
+`❌ … a 4-batch pass must not be waited on inline (waited 1201ms)` → `553 passed, 1 failed`。
+
 ## 4. 槓桿 2（零 code、最高性價比）：補上 CPU 讀數
 
 今日 repo **冇任何 CPU 讀數** —— `ms`、`dbMs`、`poolLegMs` 全部係 wall clock，而 wall clock 有大量 I/O 等待，

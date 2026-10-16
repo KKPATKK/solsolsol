@@ -1453,8 +1453,22 @@ export const PAIR_BATCH_CACHE_TTL_S = 120;
  * already stretched by refusals — the case this exists for — is deferred.
  * PAIR_BATCH_CONCURRENCY lanes all wait on the same chain, so the number is a
  * floor on what the deferral saves, not an estimate of it.
+ *
+ * IT PRICES BOTH HALVES OF THE WAIT, NOT JUST THE FIRST SLOT (2026-10-16
+ * 06:00–06:06Z — the episode rule's first deploy, measured wrong the OTHER way).
+ * Gating on the queue's next slot alone read "cheap" on 5 of 6 episode ticks,
+ * because the scan's pair phase runs ~30s after the previous one: the queue is
+ * IDLE, `nextSlotAt()` answers "now", and the pass dispatched INLINE — while each
+ * of those ticks actually spent 1,384–2,000ms of its 1,813–4,932ms envelope. The
+ * cost there is the INTER-BATCH spacing at the raised interval (4–7 batches at
+ * 400–1,200ms), not the first request's wait, so a first-slot threshold cannot
+ * see it. The reading is therefore the LARGER of the two halves the caller would
+ * really pay: the first slot's wait, AND the pass's own pacing
+ * (`batches × intervalMs ÷ PAIR_BATCH_CONCURRENCY`). A single 30-address batch on
+ * an idle queue is genuinely cheap and stays inline; the scan's ~200-address
+ * rotation never is — which is exactly the case this exists for.
  */
-const PAIR_PROBE_INLINE_WAIT_MS = 400;
+const PAIR_INLINE_WAIT_BUDGET_MS = 400;
 
 /**
  * After a batched-endpoint 429, skip all batch calls for this long.
@@ -1525,7 +1539,7 @@ export interface DexScreenerHooks {
    * drain and PushWatcher.holdForTick.
    *
    * WHY THE CLIENT NEEDS IT (2026-10-16): a REFUSAL PROBE (see
-   * PAIR_PROBE_INLINE_WAIT_MS) is dispatched off the tick's critical path — the
+   * PAIR_INLINE_WAIT_BUDGET_MS) is dispatched off the tick's critical path — the
    * pair phase returns its cache hits immediately and the probe's one request
    * goes out on the queue's own slot. Without this hand-off that promise would
    * be cancelled the instant the handler returned (the 100%-failure shape the
@@ -2004,7 +2018,7 @@ export class DexScreenerClient {
      * a probe tick with a leg of ~1.2s paid the queue's gap inline. */
     probeDue: boolean;
     /** Probes handed to the invocation's waitUntil instead of waited on (see
-     * PAIR_PROBE_INLINE_WAIT_MS): climbing = the pair phase stopped paying the
+     * PAIR_INLINE_WAIT_BUDGET_MS): climbing = the pair phase stopped paying the
      * raised gap for a request the fleet already knows how to answer. */
     probeDeferrals: number;
     /** When the last probe was deferred, or null while none has been. */
@@ -2958,7 +2972,7 @@ export class DexScreenerClient {
     // single biggest piece left in a probe tick, and the tick's other phases
     // gain nothing from watching it: the pairs it fetched would land in the
     // cache for the next rotation regardless. So a probe whose slot is further
-    // out than PAIR_PROBE_INLINE_WAIT_MS is handed to the invocation's
+    // out than PAIR_INLINE_WAIT_BUDGET_MS is handed to the invocation's
     // waitUntil (see DexScreenerHooks.holdForTick) and the caller gets its cache
     // hits NOW. The refusal is still recorded — the block re-arms, the spacing
     // widens, /health's counters move — one tick later than an inline probe's
@@ -2968,7 +2982,7 @@ export class DexScreenerClient {
     // is unchanged: nothing would keep the deferral alive, so it does not defer.
     // THE OFF-CRITICAL-PATH RULE, APPLIED TO THE WHOLE EPISODE (2026-10-16).
     // The deferral below used to fire only on the episode's FIRST attempt (see
-    // PAIR_PROBE_INLINE_WAIT_MS), which left the rest of the episode paying the
+    // PAIR_INLINE_WAIT_BUDGET_MS), which left the rest of the episode paying the
     // raised gap inline — the 1,221–1,771ms `poolLegMs.pairs` of a 2.7–3.3s tick
     // (see `episodeDeferrals`). The condition is therefore the EPISODE, not the
     // probe: while the lane is refused-and-not-yet-recovered, OR the raises that
@@ -2980,11 +2994,17 @@ export class DexScreenerClient {
     // different readings. A lane with no refusal and no raises is not an episode,
     // so a healthy day's pair leg stays byte-identical.
     const probing = this.probeDue();
-    const probeWaitMs = this.throttle.nextSlotAt() - Date.now();
+    const queueWaitMs = this.throttle.nextSlotAt() - Date.now();
+    // BOTH halves of the wait the caller would pay, not just the first slot (see
+    // PAIR_INLINE_WAIT_BUDGET_MS): an idle queue still owes the raised
+    // INTER-BATCH spacing when the rotation spans several batches — which is the
+    // measured shape, and the one a first-slot check reads as free.
+    const passPacingMs = (batches.length * this.spacing.currentMs) / PAIR_BATCH_CONCURRENCY;
+    const inlineWaitMs = Math.max(queueWaitMs, passPacingMs);
     if (
       this.hooks.holdForTick &&
       this.inRefusalEpisode() &&
-      probeWaitMs > PAIR_PROBE_INLINE_WAIT_MS
+      inlineWaitMs > PAIR_INLINE_WAIT_BUDGET_MS
     ) {
       if (probing) {
         this.probeDeferrals += 1;

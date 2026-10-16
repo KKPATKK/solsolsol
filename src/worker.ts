@@ -4501,7 +4501,7 @@ async function ensureInitialized(env: Env): Promise<void> {
       onBatch429: (at) => {
         void recordDex429(at);
       },
-      // The refusal PROBE's hand-off (see PAIR_PROBE_INLINE_WAIT_MS): the pair
+      // The refusal PROBE's hand-off (see PAIR_INLINE_WAIT_BUDGET_MS): the pair
       // phase returns its cache hits immediately while the probe's one request
       // rides the queue's own slot, so that promise has to outlive the handler
       // — the same waitUntil the tick's deferred writes already ride
