@@ -1684,6 +1684,28 @@ export class DexScreenerClient {
   /** When the last probe was deferred, or null. Published for the same reason as the count. */
   private lastProbeDeferredAt: number | null = null;
   /**
+   * EPISODE deferrals: pair passes handed to the invocation's waitUntil instead
+   * of waited on because the lane was still inside a REFUSAL EPISODE (see
+   * inRefusalEpisode) — the raises the refusal earned are still in force — even
+   * though the tick itself owed no probe.
+   *
+   * WHY IT IS NOT `probeDeferrals` (measured 2026-10-16 05:30–05:33Z). The probe
+   * rule covers only the episode's FIRST attempt. In the minutes after it, the
+   * durable spacing row is still raised (`fleetSteps 3`, `intervalMs 1,200`)
+   * while the 90s block has lapsed, so a lane that had SERVED since the refusal
+   * is no longer "probing" — it is "working" — and it dispatched INLINE, paying
+   * the whole raised gap on the tick's critical path. Live: `poolLegMs.pairs`
+   * 1,221–1,771ms inside 2,727–3,272ms ticks, with `pairsJup` >= `pairs`
+   * (Jupiter answered everything) — i.e. the wall clock was spent WAITING IN THE
+   * SPACING QUEUE, not on the wire. The same request, off the tick's path, is
+   * exactly what the probe rule already buys; this counter is that rule applied
+   * to the rest of the episode. A lane with no raises and no refusal is not an
+   * episode, so a healthy day never reaches it and its pair leg is unchanged.
+   */
+  private episodeDeferrals = 0;
+  /** When the last episode pass was deferred, or null while none has been. */
+  private lastEpisodeDeferredAt: number | null = null;
+  /**
    * Epoch of this isolate's last BATCH-lane refusal (see note429), or 0. It is
    * the value the durable row carries (see durableSpacingWrite) so the block
    * below is not re-earned by every isolate that runs a tick.
@@ -1987,6 +2009,19 @@ export class DexScreenerClient {
     probeDeferrals: number;
     /** When the last probe was deferred, or null while none has been. */
     lastProbeDeferredAt: number | null;
+    /**
+     * EPISODE passes handed to the invocation's waitUntil because the lane was
+     * still inside a refusal episode (see inRefusalEpisode) while owing no probe
+     * (see `probeDeferrals`): the raises the refusal earned were still in force,
+     * so the queue would have made the pass wait its raised gap inline.
+     *
+     * Read WITH `poolLegMs.pairs`: this climbing while the leg stays near 0 is
+     * the reading that says the tick stopped paying that gap — the same pair data
+     * still lands, one tick later, out of the pair cache.
+     */
+    episodeDeferrals: number;
+    /** When the last episode pass was deferred, or null while none has been. */
+    lastEpisodeDeferredAt: number | null;
     /** Consecutive boosts refusals — the ladder's input (0 after a serve, or
      * when no boosts fetch has been refused in this isolate). */
     boostsConsecutive429: number;
@@ -2020,6 +2055,8 @@ export class DexScreenerClient {
       probeDue: this.probeDue(),
       probeDeferrals: this.probeDeferrals,
       lastProbeDeferredAt: this.lastProbeDeferredAt,
+      episodeDeferrals: this.episodeDeferrals,
+      lastEpisodeDeferredAt: this.lastEpisodeDeferredAt,
     };
   }
 
@@ -2690,6 +2727,31 @@ export class DexScreenerClient {
   }
 
   /**
+   * Whether the pair lane is inside a REFUSAL EPISODE: this host (or the fleet)
+   * has been refused and the reaction it earned is still in force — either the
+   * 90s cache-only block, or the spacing raise the refusal bought.
+   *
+   * WHY THE RAISE COUNTS, NOT JUST THE BLOCK (measured 2026-10-16
+   * 05:30–05:33Z). The two have different lifetimes: the block decides WHETHER a
+   * request may go out at all, the spacing decides HOW LONG the queue makes the
+   * next one wait. Live, the block had lapsed (`blockedForMs 0`, the fleet's
+   * refusal `pairFleetRefusedAgeMs 97,138`) while the row still read
+   * `spacingFleetSteps 3` / `intervalMs 1,200` — and a lane that had served in
+   * the meantime dispatched INLINE, so its first batch sat in the queue for the
+   * raised interval before its request even started. That wait buys nothing the
+   * deferred pass does not: the request still goes out on the queue's own slot,
+   * still lands in the pair cache for the next tick, and the Jupiter fallback
+   * still covers the current one. So the episode is precisely the state in which
+   * the lane must not wait inline.
+   *
+   * Read WITH `probeDue`: a probe is the episode's FIRST attempt, this reading
+   * covers the rest of it.
+   */
+  private inRefusalEpisode(): boolean {
+    return this.probeDue() || this.spacing.growthSteps > 0;
+  }
+
+  /**
    * Fetch live pair data for up to 30 addresses per request.
    * The /latest/dex/tokens endpoint returns a flat `pairs` array, so we
    * group pairs by baseToken.address and keep the DEEPEST Solana pool per
@@ -2753,8 +2815,17 @@ export class DexScreenerClient {
       misses.push(a);
     }
     if (misses.length === 0) return result;
-    // Blocked by a recent hard 429: don't hammer the endpoint (and don't
-    // burn the tick's budget on doomed retries) — cache-only for now.
+    // THE FLEET'S BLOCK COVERS THE WHOLE LANE, NOT JUST THE PROBE (2026-10-16).
+    // `batchBlockedUntil` is this isolate's own refusal OR the FLEET's, adopted
+    // raise-only from the durable row (see adoptDurableSpacing /
+    // dexFleetPairBlockUntil) — so while the window is armed nothing here
+    // dispatches at all: not the rotation, not a probe, not an inline wait in
+    // the spacing queue. The window's ONE probe attempt is the attempt that
+    // happens after it lapses (see the off-critical-path rule below), and its
+    // own refusal re-arms the window: that is the "one probe per backoff
+    // window" shape, and it is why a blocked tick reads `poolLegMs.pairs 0`
+    // with `pairsJup === pairs` (live 05:30–05:33Z: blockedForMs 25,040 →
+    // pairsLeg 0, pairs 199, pairsJup 199).
     if (Date.now() < this.batchBlockedUntil) return result;
 
     // A caller deadline ALREADY IN THE PAST is honoured as "send nothing"
@@ -2895,10 +2966,33 @@ export class DexScreenerClient {
     //
     // A caller with no hold hook (the Node container, an ad-hoc call, a test)
     // is unchanged: nothing would keep the deferral alive, so it does not defer.
+    // THE OFF-CRITICAL-PATH RULE, APPLIED TO THE WHOLE EPISODE (2026-10-16).
+    // The deferral below used to fire only on the episode's FIRST attempt (see
+    // PAIR_PROBE_INLINE_WAIT_MS), which left the rest of the episode paying the
+    // raised gap inline — the 1,221–1,771ms `poolLegMs.pairs` of a 2.7–3.3s tick
+    // (see `episodeDeferrals`). The condition is therefore the EPISODE, not the
+    // probe: while the lane is refused-and-not-yet-recovered, OR the raises that
+    // refusal earned are still in force, a pass whose queue slot is further out
+    // than the inline wait is handed to the invocation's waitUntil instead of
+    // waited on. Which counter moves still says which one it was (`probeDeferrals`
+    // = the episode's first attempt, `episodeDeferrals` = the rest), because
+    // "the lane stopped paying the gap" and "the lane finally probed" are
+    // different readings. A lane with no refusal and no raises is not an episode,
+    // so a healthy day's pair leg stays byte-identical.
+    const probing = this.probeDue();
     const probeWaitMs = this.throttle.nextSlotAt() - Date.now();
-    if (this.hooks.holdForTick && this.probeDue() && probeWaitMs > PAIR_PROBE_INLINE_WAIT_MS) {
-      this.probeDeferrals += 1;
-      this.lastProbeDeferredAt = Date.now();
+    if (
+      this.hooks.holdForTick &&
+      this.inRefusalEpisode() &&
+      probeWaitMs > PAIR_PROBE_INLINE_WAIT_MS
+    ) {
+      if (probing) {
+        this.probeDeferrals += 1;
+        this.lastProbeDeferredAt = Date.now();
+      } else {
+        this.episodeDeferrals += 1;
+        this.lastEpisodeDeferredAt = Date.now();
+      }
       // The SAME budget the inline path would have had, and deliberately no
       // caller signal: the caller is about to return, and its abort means "the
       // phase is over", not "the probe is unwanted".

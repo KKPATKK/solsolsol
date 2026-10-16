@@ -8351,6 +8351,164 @@ async function main() {
     }
   });
 
+  await test("DexScreenerClient: the fleet's block silences the WHOLE lane — one probe per backoff window, not per tick", async () => {
+    // The rule the pair-lane fix rests on (docs/efficiency-2026-10-16.md §3):
+    // while the 90s block is armed — this isolate's refusal OR the FLEET's,
+    // adopted raise-only from the durable row (see dexFleetPairBlockUntil) — the
+    // pair lane makes NO request at all, and hands NO pass to the waitUntil
+    // either. The window's ONE probe is the attempt that runs after it lapses,
+    // and since a refused probe re-arms the window, a long outage produces one
+    // probe per window rather than one per tick. Live 05:30–05:33Z: a blocked
+    // tick read blockedForMs 25,040 with pairsLeg 0 / pairs 199 / pairsJup 199.
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const origFetch = globalThis.fetch;
+    const addrs = (prefix) =>
+      Array.from({ length: 30 }, (_, i) => `${prefix}${i}`.padEnd(44, "x"));
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "250" });
+    try {
+      let calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return new Response("rate limited", { status: 429 });
+      };
+      const held = [];
+      const dex = new DexScreenerClient(cfg, {
+        holdForTick: (p) => {
+          held.push(p);
+        },
+      });
+      // The refusal that arms the window: the lane is not an episode yet (no
+      // refusal, no raises), so this first attempt is the normal inline dispatch
+      // — and earning the refusal is what it is for.
+      await dex.fetchPairsForTokens(addrs("MINT"));
+      const settled = calls;
+      const armed = dex.getStats();
+      assert.ok(settled >= 1, "the refusal came from a real request");
+      assert.ok(armed.blockedForMs > 0, "and it armed the 90s window");
+      assert.ok(armed.spacingSteps >= 1, "with the raise that refusal earned");
+      // Inside the window the WHOLE lane is silent: no request, no deferral, and
+      // the caller still gets its (empty) cache answer immediately.
+      const before = dex.getStats();
+      const t0 = Date.now();
+      const during = await dex.fetchPairsForTokens(addrs("OTHER"));
+      const waited = Date.now() - t0;
+      assert.ok(waited < 200, `a blocked lane must not wait the gap (waited ${waited}ms)`);
+      assert.equal(during.size, 0, "and it has no pairs to hand back");
+      assert.equal(calls, settled, "no request went out inside the window");
+      assert.equal(held.length, 0, "and no pass was handed to the waitUntil either");
+      const after = dex.getStats();
+      assert.equal(after.probeDeferrals, before.probeDeferrals, "not counted as a probe");
+      assert.equal(after.episodeDeferrals, before.episodeDeferrals, "nor as an episode pass");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("DexScreenerClient: the rest of a refusal episode is dispatched off the pair phase too", async () => {
+    // Measured live 2026-10-16 05:30–05:33Z: the 90s block and the spacing that
+    // refusal earned lapse at DIFFERENT times. A tick read `blockedForMs 0`
+    // beside `spacingFleetSteps 3 / intervalMs 1,200` and dispatched inline, so
+    // its first batch sat in the queue for the raised gap — `poolLegMs.pairs`
+    // 1,221–1,771ms of a 2,727–3,272ms tick — while Jupiter answered every pair
+    // (`pairsJup 157/199`, `200/200`). That wait is the queue, not the wire, so
+    // an episode pass belongs off the tick's path. And because that lane HAD
+    // served, it is not a probe: `episodeDeferrals` moves, `probeDeferrals` must
+    // not — the two say different things and a healthy day must still read
+    // zero on both.
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const origFetch = globalThis.fetch;
+    const addrs = (prefix) =>
+      Array.from({ length: 30 }, (_, i) => `${prefix}${i}`.padEnd(44, "x"));
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "250" });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const mkPair = (m, i) => ({
+      chainId: "solana",
+      url: `https://dexscreener.com/solana/PAIR${i}`,
+      pairAddress: `PAIR${i}`,
+      baseToken: { address: m, name: m, symbol: m },
+      priceUsd: "0.003",
+      marketCap: 1000,
+      fdv: 1000,
+      liquidity: { usd: 100 },
+      volume: { h24: 10, h1: 1, m5: 1 },
+      txns: { m5: { buys: 1, sells: 1 }, h1: { buys: 2, sells: 2 } },
+      priceChange: { m5: 0, h1: 0 },
+      pairCreatedAt: 1,
+    });
+    try {
+      const served = [];
+      globalThis.fetch = async (url) => {
+        const mints = String(url).split("/").pop().split(",");
+        served.push(mints.length);
+        return new Response(
+          JSON.stringify({ pairs: mints.map((m, i) => mkPair(m, i)) }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+      const held = [];
+      const dex = new DexScreenerClient(cfg, {
+        holdForTick: (p) => {
+          held.push(p);
+        },
+      });
+      // A healthy serve first, so the lane is demonstrably WORKING (a refusal
+      // older than the serve cannot make the next attempt a probe).
+      const first = await dex.fetchPairsForTokens(addrs("MINT"));
+      assert.equal(first.size, 30, "the lane served its pairs inline while healthy");
+      // …then the fleet's raises arrive with its refusal already long spent:
+      // the 90s block is LAPSED while the spacing is still up — exactly the live
+      // `blockedForMs 0 / spacingFleetSteps 3` state.
+      const now = Date.now();
+      dex.adoptDurableSpacing(
+        JSON.stringify({ at: now, steps: 3, pairRefusedAt: now - 300_000 }),
+      );
+      const raised = dex.getStats();
+      assert.ok(raised.spacingSteps >= 3, `the raises are adopted (${raised.spacingSteps})`);
+      assert.equal(raised.blockedForMs, 0, "and the block has lapsed");
+      assert.ok(raised.intervalMs > 400, "so the queue's gap is wider than the inline wait");
+      assert.equal(raised.probeDue, false, "and this tick owes no probe");
+      const before = dex.getStats();
+      const t0 = Date.now();
+      const second = await dex.fetchPairsForTokens(addrs("OTHER"));
+      const waited = Date.now() - t0;
+      assert.ok(
+        waited < 300,
+        `an episode pass must not wait the raised gap inline (waited ${waited}ms)`,
+      );
+      assert.equal(second.size, 0, "the caller keeps its cache hits, not the pass's answer");
+      assert.equal(held.length, 1, "the pass was handed to the tick's waitUntil");
+      const after = dex.getStats();
+      assert.equal(
+        after.episodeDeferrals,
+        before.episodeDeferrals + 1,
+        "counted as an episode pass",
+      );
+      assert.equal(after.probeDeferrals, before.probeDeferrals, "and NOT as a probe");
+      assert.ok(typeof after.lastEpisodeDeferredAt === "number", "and stamped");
+      assert.equal(after.lastProbeDeferredAt, null, "with the probe's stamp untouched");
+      // The held pass really runs (off the tick) and still lands its pairs.
+      const wired = served.length;
+      for (let i = 0; i < 120 && served.length === wired; i++) await sleep(25);
+      assert.ok(served.length > wired, "the deferred pass did dispatch its request");
+      await held[0].catch(() => undefined);
+      // A healthy lane (no raises, no refusal) is untouched: inline dispatch, and
+      // both deferral counters stay at zero.
+      const healthy = new DexScreenerClient(cfg, {
+        holdForTick: (p) => {
+          held.push(p);
+        },
+      });
+      const handed = held.length;
+      const ok = await healthy.fetchPairsForTokens(addrs("HEALTHY"));
+      assert.equal(ok.size, 30, "a healthy lane serves its pairs inline");
+      assert.equal(healthy.getStats().episodeDeferrals, 0, "and defers nothing");
+      assert.equal(healthy.getStats().probeDeferrals, 0, "neither as a probe");
+      assert.equal(held.length, handed, "nothing was handed off");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   await test("DexScreenerClient.fetchPairsForTokens: the deepest pool represents a token, not its list position", async () => {
     // Measured live 2026-10-02 (Agency): one token's returned pairs spanned
     // mcap $48K-$3.3M across 8 pools — a drained pair at $0 LP, two at ~$3,
