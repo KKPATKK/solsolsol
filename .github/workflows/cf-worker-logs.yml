@@ -1,0 +1,65 @@
+name: Workers Logs per-invocation CPU
+
+# WHY THIS EXISTS (2026-10-16): wrangler.toml now carries `[observability]
+# enabled = true`, which is what makes Workers Logs record `$workers.cpuTimeMs`
+# per invocation. Every CPU reading the repo had before that was wall clock
+# (`ms`, `dbMs`, `poolLegMs`) and a tick waits on DexScreener/Jupiter/D1 far
+# more than it computes, so none of them could say whether CPU is a ceiling —
+# let alone WHICH invocation spent it.
+#
+# This workflow is how that second half gets read without a dashboard: it runs
+# scripts/cf-worker-logs.mjs against the Workers Observability query API with
+# the deploy workflow's own token secret, so the operator can read the answer
+# out of the run log with `gh run view --log`.
+#
+# TWO HALVES, ONE QUESTION. `scripts/cf-invocations.mjs` (workflow
+# cf-invocations.yml) answers the BUDGET question off the GraphQL quantiles and
+# works with no observability setting at all. This one answers the INVOCATION
+# question — which tick, `scheduled` or `fetch`, at which trigger, and the
+# uncapped max — and has nothing to read until the `[observability]` change has
+# actually been deployed.
+#
+# Path-scoped push, like cf-invocations.yml: a push that touches the probe
+# itself is what runs it, so a rename of a field this API owns shows up as a
+# run, not as a stale reading nobody re-took. The main-branch push also fires
+# the deploy workflow, which is harmless — the probe only reads.
+on:
+  push:
+    paths:
+      - ".github/workflows/cf-worker-logs.yml"
+      - "scripts/cf-worker-logs.mjs"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How many minutes back to query (Workers Logs retains 7 days)"
+        required: false
+        default: "60"
+      limit:
+        description: "Invocation-page size (the percentile half is uncapped)"
+        required: false
+        default: "200"
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The script prints the table to the log AND appends it to the run
+      # summary, so a failed run still shows whatever Cloudflare answered: a
+      # permissions error and an empty window look nothing alike.
+      - name: Read per-invocation CPU from Workers Logs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER: solana-meme-bot
+          MINUTES: ${{ inputs.minutes || '60' }}
+          LIMIT: ${{ inputs.limit || '200' }}
+        run: node scripts/cf-worker-logs.mjs
