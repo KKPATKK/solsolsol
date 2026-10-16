@@ -43,7 +43,7 @@ on:
       limit:
         description: "Invocation-page size (the percentile half is uncapped)"
         required: false
-        default: "1000"
+        default: "4000"
 
 jobs:
   cpu:
@@ -67,5 +67,5 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           WORKER: solana-meme-bot
           MINUTES: ${{ inputs.minutes || '60' }}
-          LIMIT: ${{ inputs.limit || '1000' }}
+          LIMIT: ${{ inputs.limit || '4000' }}
         run: node scripts/cf-worker-logs.mjs
