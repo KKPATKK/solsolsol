@@ -114,14 +114,18 @@ DexScreener 只係問一兩次，而嗰一兩次就係嗰 1.2–1.7s。
 
 **After 讀數：見 §8。**
 
-## 6. 下一個槓桿（未做，要新量度）
+## 6. 下一個槓桿（第 1、3 條已做：見 `docs/tick-probe-and-feed-legs-2026-10-16.md`）
 
-1. **Jupiter 補底嘅 418–635ms**：block 生效之後佢就係 pair 相位嘅全部。佢係
-   `fetchTokenDataBatch` 分 batch 打 `lite-api.jup.ag`（~4–5 個 request/tick），
-   可以睇嘅係 batch 大小／併發，同埋「pair 數據可唔可以 reuse 上一 tick 嘅」。
+1. **探測 tick 嘅 ~1.0–1.4s**（§8.3）——✅ 已做（純 latency）：探測唔再喺 tick 嘅
+   臨界路徑上等 queue 嘅 gap，交畀 `waitUntil`；見新文件 §1。
 2. **`feedsMs` 666–1,343ms**：profiles/boosts/feed fan-out。佢嘅 edge cache 讀數
    （`listCacheHits` vs `listCacheMisses`／`listCacheRefused`）係決定 TTL 嘅料。
+   — ✅ 讀數已加（`feedLegMs` / `feedJoinMs`，見新文件 §2）：**砍邊條要等兩三日嘅
+   分佈**，唔係今次就砍。
 3. **`poolMs`／`front-write`**：0–98ms，暫時唔係槓桿。
+4. **Jupiter 補底嘅 418–635ms**：block 生效之後佢就係 pair 相位嘅全部。佢係
+   `fetchTokenDataBatch` 分 batch 打 `lite-api.jup.ag`（~4–5 個 request/tick），
+   可以睇嘅係 batch 大小／併發，同埋「pair 數據可唔可以 reuse 上一 tick 嘅」。
 
 ## 7. 限制（唔可以當過）
 

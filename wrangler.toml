@@ -722,6 +722,21 @@ DEX_REQUEST_INTERVAL_MS = "250"
 # `blockedForMs`: a block with a non-null age on an isolate that has never been
 # refused itself is a block that crossed the boundary.
 #
+# THE PROBE NO LONGER WAITS FOR ITS SLOT (2026-10-16, same day, the §8 follow-up):
+# with the fleet block working, the only pair request a refused episode still
+# makes is its 90s PROBE — and it was paying the queue's whole raised gap
+# (`intervalMs` = this interval's ceiling) to make it: probe ticks measured
+# 2,773-3,658ms with `poolLegMs.pairs` 986-1,190ms, while the pairs behind it
+# were Jupiter's (0-26 of ~200 from the batch lane, `pairsJup == pairs`). A probe
+# whose slot is further out than 400ms (PAIR_PROBE_INLINE_WAIT_MS, = this base
+# plus a margin) is now handed to the invocation's waitUntil
+# (DexScreenerHooks.holdForTick) and the pair phase returns immediately; the
+# refusal still lands, one tick later than it used to be read. A lane that has
+# SERVED since its last refusal is never a probe, so a healthy egress (steps 0,
+# no refusal) dispatches exactly as before — the deferral cannot fire at all.
+# Read `heartbeat.dex.probeDue` / `probeDeferrals` / `lastProbeDeferredAt`
+# beside `poolLegMs.pairs` on a probe tick.
+#
 # SIZING THE DECAY (measured 2026-09-29T01:24-01:26Z): the first cut of the
 # window was 15s, sized against the in-isolate walk-back (6 consecutive 2xx =
 # 1.5s of dispatch at the base), and it was inert — the scan is what reads the

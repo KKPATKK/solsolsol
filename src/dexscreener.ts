@@ -1435,6 +1435,28 @@ const PAIR_CACHE_MAX = 4_000;
  */
 export const PAIR_BATCH_CACHE_TTL_S = 120;
 /**
+ * The most of the queue's dispatch gap a PROBE may spend INLINE, ms.
+ *
+ * WHY (measured 2026-10-16 00:46–00:56Z): with the fleet block armed, a probe is
+ * the only DexScreener pair request a refusal episode makes — and it was paying
+ * the WHOLE raised gap to make it. The probe ticks read 2,773–3,658ms against
+ * 1,224–1,681ms for the ticks that inherited a live block, with
+ * `poolLegMs.pairs` 986–1,190ms and 0–26 pairs of ~200 coming back (the Jupiter
+ * fallback answered the rest in 630–652ms). The gap is the SPACING's own pacing,
+ * not the request: the lane already bounds every attempt by a deadline and
+ * counts an attempt the queue cannot start as "never sent" (see the loop's
+ * nextSlotAt check). A probe therefore does not need the tick to WAIT for its
+ * slot — it needs the request to go out, which is what the deferral below does.
+ *
+ * SIZED at the configured base spacing (DEX_REQUEST_INTERVAL_MS 250) plus a
+ * margin: an idle queue (the healthy case) dispatches inline, and only a queue
+ * already stretched by refusals — the case this exists for — is deferred.
+ * PAIR_BATCH_CONCURRENCY lanes all wait on the same chain, so the number is a
+ * floor on what the deferral saves, not an estimate of it.
+ */
+const PAIR_PROBE_INLINE_WAIT_MS = 400;
+
+/**
  * After a batched-endpoint 429, skip all batch calls for this long.
  *
  * THE LANE'S OWN REACTION, one refusal's worth. It is armed per isolate (see
@@ -1497,6 +1519,22 @@ export interface DexScreenerHooks {
    * batch refusal, whether or not that refusal is recorded.
    */
   onBatch429?: (at: number) => void;
+  /**
+   * Keep this promise alive past the caller's return — the invocation's
+   * waitUntil, exactly as the worker's tick tail hands it to the deferred write
+   * drain and PushWatcher.holdForTick.
+   *
+   * WHY THE CLIENT NEEDS IT (2026-10-16): a REFUSAL PROBE (see
+   * PAIR_PROBE_INLINE_WAIT_MS) is dispatched off the tick's critical path — the
+   * pair phase returns its cache hits immediately and the probe's one request
+   * goes out on the queue's own slot. Without this hand-off that promise would
+   * be cancelled the instant the handler returned (the 100%-failure shape the
+   * write drain was fixed for), i.e. the lane would stop learning that the
+   * endpoint had recovered. A caller WITHOUT a hold hook never defers a probe
+   * in the first place — nothing would keep it alive — so the hook's presence
+   * is the deferral's own switch.
+   */
+  holdForTick?: (promise: Promise<unknown>) => void;
 }
 
 /**
@@ -1634,6 +1672,17 @@ export class DexScreenerClient {
   >();
   /** Until this epoch the endpoint 429'd — serve pair cache only. */
   private batchBlockedUntil = 0;
+  /**
+   * Epoch of the last SERVED batch-lane response, or 0 when this isolate has
+   * never had one. The pair lane's episode reading (see probeDue): a refusal
+   * newer than the last serve means the lane has not answered since, which is
+   * what makes the next attempt a PROBE rather than an attempt.
+   */
+  private pairServedAt = 0;
+  /** PROBES handed to the invocation's waitUntil instead of waited on (see fetchPairsForTokens). */
+  private probeDeferrals = 0;
+  /** When the last probe was deferred, or null. Published for the same reason as the count. */
+  private lastProbeDeferredAt: number | null = null;
   /**
    * Epoch of this isolate's last BATCH-lane refusal (see note429), or 0. It is
    * the value the durable row carries (see durableSpacingWrite) so the block
@@ -1927,6 +1976,17 @@ export class DexScreenerClient {
      * lane split, kept in both directions).
      */
     boostsBlockedForMs: number;
+    /** Whether the NEXT pair-lane attempt is a probe (see probeDue): the pair
+     * lane was refused and has not served since. Read WITH `poolLegMs.pairs`:
+     * a probe tick whose leg reads 0 was DEFERRED (see `probeDeferrals`), while
+     * a probe tick with a leg of ~1.2s paid the queue's gap inline. */
+    probeDue: boolean;
+    /** Probes handed to the invocation's waitUntil instead of waited on (see
+     * PAIR_PROBE_INLINE_WAIT_MS): climbing = the pair phase stopped paying the
+     * raised gap for a request the fleet already knows how to answer. */
+    probeDeferrals: number;
+    /** When the last probe was deferred, or null while none has been. */
+    lastProbeDeferredAt: number | null;
     /** Consecutive boosts refusals — the ladder's input (0 after a serve, or
      * when no boosts fetch has been refused in this isolate). */
     boostsConsecutive429: number;
@@ -1957,6 +2017,9 @@ export class DexScreenerClient {
       lastDropLeg: this.lastDropLeg,
       boostsBlockedForMs: Math.max(0, this.boostsBlockedUntil - Date.now()),
       boostsConsecutive429: this.boostsConsecutive429,
+      probeDue: this.probeDue(),
+      probeDeferrals: this.probeDeferrals,
+      lastProbeDeferredAt: this.lastProbeDeferredAt,
     };
   }
 
@@ -2322,6 +2385,10 @@ export class DexScreenerClient {
         if (!res.ok) {
           return null; // deterministic client error — retrying won't help
         }
+        // A SERVED batch ends the refusal episode (see probeDue): the endpoint
+        // is answering, so the next attempt is an attempt, not a liveness probe
+        // — and a deferred probe's late landed answer reads here too.
+        if (pairLane) this.pairServedAt = Date.now();
         // Date the CONTENT, not the receipt (see PairInfo.contentAt). The
         // response's own clocks are the only reading that survives the three
         // cache layers this client sits behind: every layer re-stamps when it
@@ -2601,6 +2668,28 @@ export class DexScreenerClient {
   }
 
   /**
+   * Whether the pair lane's next attempt is a PROBE — the first try after a
+   * refusal this lane has not recovered from (a serve) yet.
+   *
+   * WHY IT IS A READING AND NOT A TIMER (2026-10-16): the lane's shape during a
+   * refusal episode is "one probe per cached-only window", and the probe is the
+   * only request the episode makes (measured: `pairs` 0–26 of ~200 while the
+   * Jupiter fallback answered the rest). Naming the episode is what lets the
+   * probe be dispatched off the tick's critical path WITHOUT changing the shape
+   * of a healthy lane: a lane that served a batch since its last refusal is not
+   * probing — it is working — so nothing about its pacing is touched.
+   *
+   * Both refusals count: this isolate's own (`pairRefusedAt`) and the FLEET's as
+   * the durable row last carried it (`fleetPairRefusedAt`, see
+   * adoptDurableSpacing), because a fresh isolate inherits an episode in
+   * progress exactly as it inherits the block.
+   */
+  private probeDue(): boolean {
+    const servedAt = this.pairServedAt;
+    return this.pairRefusedAt > servedAt || this.fleetPairRefusedAt > servedAt;
+  }
+
+  /**
    * Fetch live pair data for up to 30 addresses per request.
    * The /latest/dex/tokens endpoint returns a flat `pairs` array, so we
    * group pairs by baseToken.address and keep the DEEPEST Solana pool per
@@ -2696,13 +2785,21 @@ export class DexScreenerClient {
     let nextBatch = 0;
     let saw429 = false;
 
-    const worker = async (): Promise<void> => {
+    /**
+     * ONE pass over the batch queue, dispatching until its own deadline or the
+     * first 429. Parameterized (2026-10-16) so the PROBE deferral below runs the
+     * very same loop, with the same budget, off the tick's critical path: the
+     * pacing, the 429 reaction, the drop accounting and the cache writes stay
+     * one implementation, and the only difference between the two callers is
+     * WHO waits for it.
+     */
+    const dispatchBatches = async (endAt: number, signal?: AbortSignal): Promise<void> => {
       while (nextBatch < batches.length && !saw429) {
         // The caller gave up: nothing left to fetch FOR, so the rest of the
         // rotation stops here — its tokens stay in the pool and are re-read
         // next tick, the same as a spent budget.
-        if (callerSignal?.aborted) return;
-        if (Date.now() > deadline) return; // keep the tick inside its budget
+        if (signal?.aborted) return;
+        if (Date.now() > endAt) return; // keep the tick inside its budget
         // A batch the throttle cannot START inside this phase's window is not
         // a drop — it is not attempted AT ALL (2026-09-26).
         //
@@ -2718,7 +2815,7 @@ export class DexScreenerClient {
         // reading. So the phase ENDS instead: `nextSlotAt` is the queue's own
         // plan, and this is the same arithmetic its drop check would have
         // applied one call later.
-        if (this.throttle.nextSlotAt() >= deadline) return;
+        if (this.throttle.nextSlotAt() >= endAt) return;
         const batch = batches[nextBatch++];
         let data: { pairs?: Array<Record<string, unknown>> } | null;
         /**
@@ -2732,14 +2829,14 @@ export class DexScreenerClient {
         try {
           data = (await this.getJson(
             `/latest/dex/tokens/${batch.join(",")}`,
-            deadline,
+            endAt,
             // See PAIR_BATCH_CACHE_TTL_S: the batches are keyed by the address
             // set, which the edge-cached pool snapshot keeps stable across
             // ticks, so a cold isolate rides the previous tick's fetch instead
             // of paying the shared egress (and its 429s) again.
             PAIR_BATCH_CACHE_TTL_S,
             contentAt,
-            callerSignal,
+            signal,
           )) as { pairs?: Array<Record<string, unknown>> } | null;
         } catch (err) {
           // A rate-limited batch means the remaining ones will 429 too — stop
@@ -2782,12 +2879,51 @@ export class DexScreenerClient {
         }
       }
     };
+    // THE PROBE'S SLOT (2026-10-16). The first attempt after a refusal the lane
+    // has not yet recovered from exists to answer ONE question — "is this egress
+    // IP still refused?" — and its data is the Jupiter fallback's to cover
+    // anyway (measured: 0–26 pairs of ~200 while Jupiter answered every one of
+    // them). Waiting ~1.2s of the queue's raised gap for that answer is the
+    // single biggest piece left in a probe tick, and the tick's other phases
+    // gain nothing from watching it: the pairs it fetched would land in the
+    // cache for the next rotation regardless. So a probe whose slot is further
+    // out than PAIR_PROBE_INLINE_WAIT_MS is handed to the invocation's
+    // waitUntil (see DexScreenerHooks.holdForTick) and the caller gets its cache
+    // hits NOW. The refusal is still recorded — the block re-arms, the spacing
+    // widens, /health's counters move — one tick later than an inline probe's
+    // would, which is the same order the fleet block already runs on.
+    //
+    // A caller with no hold hook (the Node container, an ad-hoc call, a test)
+    // is unchanged: nothing would keep the deferral alive, so it does not defer.
+    const probeWaitMs = this.throttle.nextSlotAt() - Date.now();
+    if (this.hooks.holdForTick && this.probeDue() && probeWaitMs > PAIR_PROBE_INLINE_WAIT_MS) {
+      this.probeDeferrals += 1;
+      this.lastProbeDeferredAt = Date.now();
+      // The SAME budget the inline path would have had, and deliberately no
+      // caller signal: the caller is about to return, and its abort means "the
+      // phase is over", not "the probe is unwanted".
+      const deferred = Promise.all(
+        Array.from({ length: Math.min(PAIR_BATCH_CONCURRENCY, batches.length) }, () =>
+          dispatchBatches(Date.now() + PAIRS_FETCH_BUDGET_MS),
+        ),
+      ).then(() => undefined);
+      try {
+        this.hooks.holdForTick(deferred);
+      } catch {
+        // A stale context must never break the pair phase (see the same
+        // hand-off on the worker's tick tail).
+        void deferred;
+      }
+      return result;
+    }
     // Pipelined dispatch: N workers pull batches from the shared queue so a
     // batch's network latency overlaps the next batch's throttle spacing
     // instead of stacking on it. All workers share one deadline; a 429 in any
     // worker halts new dispatches and the caller backs off across ticks.
     const workerCount = Math.min(PAIR_BATCH_CONCURRENCY, batches.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    await Promise.all(
+      Array.from({ length: workerCount }, () => dispatchBatches(deadline, callerSignal)),
+    );
     // `saw429` only stops the remaining batches of THIS call; the backoff and
     // the telemetry were already handled by note429 in getJson (which sees the
     // status even when the retry loop degrades it to a null response).

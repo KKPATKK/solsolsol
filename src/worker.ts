@@ -145,6 +145,7 @@ import { AxiomClient, parseAxiomTokenInfo, type AxiomTokenInfo } from "./axiom";
 import { renderMessage } from "./render";
 import type {
   FrontLeg,
+  FeedLeg,
   PassRelayTag,
   QualifyingCoin,
   ScanSummary,
@@ -2686,9 +2687,9 @@ let preTickEntryAt = 0;
  * (8-14s, 00:49-01:06Z) could not be attributed after the fact: the split
  * existed only while that tick's /health answered. This ring keeps the last
  * TICK_LEG_RING_SIZE ticks of THIS isolate with the split intact — the front
- * (preStart / preRace / steps), every scan leg (feeds / pool / poolWait /
- * poolLegMs / pairs / pairs-jup / eval / db), the counters, the cut note and
- * the subrequest spend.
+ * (preStart / preRace / steps), every scan leg (feeds / feedLegMs / feedJoinMs
+ * / pool / poolWait / poolLegMs / pairs / pairs-jup / eval / db), the counters,
+ * the cut note and the subrequest spend.
  *
  * COST, stated plainly: module memory only — no Turso round trip, no
  * subrequest, nothing added to the tick's critical path. The trade-off is the
@@ -2730,6 +2731,16 @@ export interface TickLegRow {
   poolMs: number | null;
   poolWaitMs: number | null;
   poolLegMs: Partial<Record<FrontLeg, number>> | null;
+  /**
+   * The discovery-feed legs' own wall times and the wait at their join (see
+   * ScanSummary.feedLegMs / feedJoinMs): the phase `feedsMs` reports as one
+   * number, split by leg. Carried here because the ring is the only place a
+   * finished tick's SPLIT survives — the heartbeat keeps the latest tick's
+   * summary and scan_history keeps eight columns, so "which feed leg held the
+   * 2026-10-16 tick" would otherwise rotate out before anyone read it.
+   */
+  feedLegMs: Partial<Record<FeedLeg, number>> | null;
+  feedJoinMs: number | null;
   pairs: number | null;
   pairsJup: number | null;
   pairsMissing: number | null;
@@ -2787,6 +2798,8 @@ export function buildTickLegRow(input: {
     poolMs: s?.poolMs ?? null,
     poolWaitMs: s?.poolWaitMs ?? null,
     poolLegMs: s?.poolLegMs ? { ...s.poolLegMs } : null,
+    feedLegMs: s?.feedLegMs ? { ...s.feedLegMs } : null,
+    feedJoinMs: s?.feedJoinMs ?? null,
     pairs: s?.pairs ?? null,
     pairsJup: s?.pairsJup ?? null,
     pairsMissing: s?.pairsMissing ?? null,
@@ -4460,6 +4473,23 @@ async function ensureInitialized(env: Env): Promise<void> {
     dex = new DexScreenerClient(config, {
       onBatch429: (at) => {
         void recordDex429(at);
+      },
+      // The refusal PROBE's hand-off (see PAIR_PROBE_INLINE_WAIT_MS): the pair
+      // phase returns its cache hits immediately while the probe's one request
+      // rides the queue's own slot, so that promise has to outlive the handler
+      // — the same waitUntil the tick's deferred writes already ride
+      // (tickWaitUntil). This hook's PRESENCE is also the deferral's switch: a
+      // caller without one (the Node container, an ad-hoc call) is unchanged.
+      holdForTick: (promise) => {
+        if (tickWaitUntil) {
+          try {
+            tickWaitUntil(promise);
+            return;
+          } catch {
+            // A stale context must never break the pair phase.
+          }
+        }
+        void promise;
       },
     });
     // Record what each pair fetch ACTUALLY returned (see observedLiquidity):

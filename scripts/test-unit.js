@@ -8056,6 +8056,103 @@ async function main() {
     assert.ok(src.includes("this.closeFrontLeg();\n        this.lastSummary = diag;"), "and settle closes the open one");
   });
 
+  await test("feed legs: every discovery leg reports its own wall time, and the join reports its wait", async () => {
+    // 2026-10-16: the pair lane is answered, so the feed phase (666–1,343ms of
+    // the tick) is the next lever — but `feedsMs` reports it as ONE number, so
+    // "which leg to trim" was a guess. Each leg now banks its own
+    // dispatch-to-settle time and the fan-out's join banks its wait, both on the
+    // heartbeat the tick already writes: no request, no round trip, no column.
+    const { Scanner } = require("../dist/scanner.js");
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const scan = async ({ profilesMs, pumpMs }) => {
+      const t = tmpDb();
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+      try {
+        const db = new Db(t.p, undefined, t.client);
+        await db.init();
+        await db.saveChatSettings({ chatId: "chat-on", ...DEFAULT_SETTINGS, enabled: true });
+        const cfg = loadConfig({});
+        const dex = new DexScreenerClient(cfg);
+        dex.fetchLatestSolanaProfiles = async () => {
+          await sleep(profilesMs);
+          return [{ tokenAddress: "FEEDCOIN1" }];
+        };
+        dex.fetchPairsForTokens = async () => new Map([["FEEDCOIN1", {}]]);
+        const pumpfun = {
+          fetchNewestCoins: async () => {
+            await sleep(pumpMs);
+            return [{ tokenAddress: "PUMPCOIN1" }];
+          },
+        };
+        const scanner = new Scanner(
+          db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+          null, null, null, undefined, pumpfun,
+        );
+        await scanner.runOnce();
+        return scanner.lastSummary;
+      } finally {
+        globalThis.fetch = origFetch;
+        await t.cleanup();
+      }
+    };
+    const s = await scan({ profilesMs: 30, pumpMs: 120 });
+    assert.ok(s && s.feedLegMs, "the summary must carry the per-leg reading");
+    assert.ok(
+      typeof s.feedLegMs.profiles === "number" && s.feedLegMs.profiles >= 20,
+      `the profiles leg reports its own 30ms (got ${s.feedLegMs.profiles})`,
+    );
+    assert.ok(
+      typeof s.feedLegMs.pump === "number" && s.feedLegMs.pump >= 100,
+      `the pump leg reports its own 120ms (got ${s.feedLegMs.pump})`,
+    );
+    assert.deepEqual(
+      Object.keys(s.feedLegMs).sort(),
+      ["profiles", "pump"],
+      "exactly the legs that ran — every other feed has no client or is sized 0 here",
+    );
+    assert.equal(
+      s.feedLegMs.backfill,
+      undefined,
+      "a leg that could not fetch (no Birdeye client) is absent, never a fabricated 0ms",
+    );
+    // The join is the wait AFTER every leg was dispatched, so it tracks the
+    // fan-out's own leg (pump, 120ms) — not the serial profiles leg (30ms).
+    assert.ok(
+      typeof s.feedJoinMs === "number" && s.feedJoinMs >= 90,
+      `the join waits on the fan-out's own leg (got ${s.feedJoinMs}ms)`,
+    );
+    assert.ok(s.feedsMs >= s.feedJoinMs, "and the phase's own reading contains it");
+    // The serial profiles leg is what the fan-out behind it starts behind, so a
+    // slow profiles leg is NOT a slow join: the two are different quantities.
+    const slowProfiles = await scan({ profilesMs: 150, pumpMs: 0 });
+    assert.ok(slowProfiles.feedLegMs.profiles >= 140, "the serial leg reports its cost");
+    assert.ok(
+      slowProfiles.feedJoinMs < 60,
+      `while the join stays small — those legs were already settled (got ${slowProfiles.feedJoinMs}ms)`,
+    );
+    // The roster and the wrapping are pinned at the source too: a leg added to
+    // the union must be wrapped and named, or the reading would silently miss it.
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    const union = src.slice(src.indexOf("export type FeedLeg ="));
+    const roster = [...union.slice(0, union.indexOf(";")).matchAll(/"([A-Za-z]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(
+      roster.sort(),
+      ["axiom", "backfill", "boosts", "gecko", "geoTrend", "gmgn", "jup", "jupTrend", "meteora", "profiles", "pump", "raydium"],
+      "the roster is the phase's own legs, named once",
+    );
+    assert.equal(
+      (src.match(/this\.feedLeg\(/g) || []).length,
+      roster.length,
+      "every leg in the roster is wrapped, so none can go unmeasured",
+    );
+    assert.ok(
+      src.includes("feedLegMs?: Partial<Record<FeedLeg, number>>;"),
+      "the reading is declared on the summary the heartbeat serializes",
+    );
+  });
+
   await test("DexScreenerClient.fetchPairsForTokens: a caller deadline already in the past sends nothing", async () => {
     // The clamp only means something if a SPENT window actually stops the
     // wire: the old arithmetic (`callerDeadlineMs > now ? callerDeadlineMs :
@@ -8079,6 +8176,176 @@ async function main() {
       const live = await dex.fetchPairsForTokens(["AAA"], Date.now() + 5_000);
       assert.equal(wire, 1, "a usable window still goes to the wire");
       assert.equal(typeof live, "object");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("DexScreenerClient: a refusal PROBE is dispatched off the pair phase, not waited on", async () => {
+    // 2026-10-16 §6: with the pair lane's fleet block in place, the only pair
+    // request a refusal episode still makes is its PROBE — and it was paying the
+    // queue's whole raised gap to make it (measured 986–1,190ms inside
+    // 2,773–3,658ms probe ticks) for 0–26 pairs of ~200 while the Jupiter
+    // fallback answered the rest. A probe whose slot is further out than 400ms
+    // is now handed to the invocation's waitUntil (DexScreenerHooks.holdForTick)
+    // and the pair phase returns its cache hits NOW, while the refusal still
+    // lands (block re-arms, spacing widens, /health moves) one tick later.
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const origFetch = globalThis.fetch;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const addrs = (prefix) =>
+      Array.from({ length: 30 }, (_, i) => `${prefix}${i}`.padEnd(44, "x"));
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "600" });
+    try {
+      let calls = 0;
+      let status = 404;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(status === 404 ? "nope" : "rate limited", { status });
+      };
+      const held = [];
+      const dex = new DexScreenerClient(cfg, {
+        holdForTick: (p) => {
+          held.push(p);
+        },
+      });
+      // A dispatch that neither served nor refused (a deterministic 4xx is not
+      // retried) leaves the queue HOT — its next slot is one full gap out, which
+      // is the state a probe meets.
+      await dex.fetchPairsForTokens(addrs("MINT"));
+      assert.equal(calls, 1, "the setup attempt really went to the wire");
+      const now = Date.now();
+      // The fleet's row carries a refusal long past, so the lane's 90s block has
+      // LAPSED without a serve since — exactly when an episode produces a probe.
+      dex.adoptDurableSpacing(
+        JSON.stringify({ at: now - 300_000, steps: 0, pairRefusedAt: now - 300_000 }),
+      );
+      const before = dex.getStats();
+      assert.equal(before.probeDue, true, "the next attempt is a probe");
+      assert.equal(before.blockedForMs, 0, "and the block has lapsed, so it is really attempted");
+      assert.ok(before.intervalMs > 400, "the gap is wider than the inline wait");
+      status = 429;
+      const t0 = Date.now();
+      const pairs = await dex.fetchPairsForTokens(addrs("OTHER"));
+      const waited = Date.now() - t0;
+      assert.ok(
+        waited < 300,
+        `a deferred probe must not wait the gap inline (waited ${waited}ms)`,
+      );
+      assert.equal(pairs.size, 0, "the caller keeps its cache hits, not the probe's answer");
+      assert.equal(calls, 1, "and no request was sent inside the call either");
+      assert.equal(held.length, 1, "the probe's promise was handed to the tick's waitUntil");
+      const after = dex.getStats();
+      assert.equal(after.probeDeferrals, 1, "the deferral is counted");
+      assert.ok(typeof after.lastProbeDeferredAt === "number", "and stamped");
+      // The held probe really runs: its one request goes out on the queue's own
+      // slot and the refusal it earns re-arms the block.
+      for (let i = 0; i < 80 && calls < 2; i++) await sleep(25);
+      assert.equal(calls, 2, "the deferred probe did dispatch its one request");
+      const ended = dex.getStats();
+      assert.ok(ended.blockedForMs > 0, "and its refusal re-arms the 90s block");
+      assert.equal(ended.probeDue, true, "still mid-episode: refused, not served");
+      await held[0].catch(() => undefined);
+      // ...and the hook is WIRED, not just supported: a deferral nobody holds is
+      // the cancelled-promise shape the write drain was fixed for, and neither
+      // half can be told from the other in a test that only calls the client.
+      const workerSrc = fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8");
+      const clientAt = workerSrc.indexOf("new DexScreenerClient(");
+      const hookAt = workerSrc.indexOf("holdForTick: (promise) => {", clientAt);
+      assert.ok(clientAt > 0, "the worker builds the tick's client");
+      assert.ok(
+        hookAt > clientAt && hookAt - clientAt < 2_000,
+        "and hands it the invocation's waitUntil as the probe's hold hook",
+      );
+      assert.ok(
+        workerSrc.includes("tickWaitUntil(promise);"),
+        "the hook rides the same waitUntil the tick's deferred writes ride",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("DexScreenerClient: the probe deferral is opt-in, and a lane that served is never a probe", async () => {
+    // The other half of the switch. A caller that cannot keep the promise alive
+    // (no hold hook: the Node container, an ad-hoc call) must never create one —
+    // the deferral would be cancelled the moment the handler returned. And a
+    // lane that has SERVED since its last refusal is working, not probing, so
+    // not even the hook may touch its pacing: that is what keeps a healthy day's
+    // pair leg byte-identical.
+    const { DexScreenerClient } = require("../dist/dexscreener.js");
+    const origFetch = globalThis.fetch;
+    const addrs = (prefix) =>
+      Array.from({ length: 30 }, (_, i) => `${prefix}${i}`.padEnd(44, "x"));
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "600" });
+    const mkPair = (m, i) => ({
+      chainId: "solana",
+      url: `https://dexscreener.com/solana/PAIR${i}`,
+      pairAddress: `PAIR${i}`,
+      baseToken: { address: m, name: m, symbol: m },
+      priceUsd: "0.003",
+      marketCap: 1000,
+      fdv: 1000,
+      liquidity: { usd: 100 },
+      volume: { h24: 10, h1: 1, m5: 1 },
+      txns: { m5: { buys: 1, sells: 1 }, h1: { buys: 2, sells: 2 } },
+      priceChange: { m5: 0, h1: 0 },
+      pairCreatedAt: 1,
+    });
+    try {
+      const now = Date.now();
+      const lapsedRow = JSON.stringify({
+        at: now - 300_000,
+        steps: 0,
+        pairRefusedAt: now - 300_000,
+      });
+      let calls = 0;
+      let status = 404;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(status === 404 ? "nope" : "rate limited", { status });
+      };
+      const plain = new DexScreenerClient(cfg, {});
+      await plain.fetchPairsForTokens(addrs("MINT"));
+      plain.adoptDurableSpacing(lapsedRow);
+      assert.equal(plain.getStats().probeDue, true, "the same probe shape, and no hook");
+      status = 429;
+      const t0 = Date.now();
+      await plain.fetchPairsForTokens(addrs("OTHER"));
+      const waited = Date.now() - t0;
+      assert.ok(
+        waited >= 400,
+        `without a hold hook the probe stays inline (waited ${waited}ms)`,
+      );
+      assert.equal(calls, 2, "its request went out inside the call, not off it");
+      assert.equal(plain.getStats().probeDeferrals, 0, "and nothing was deferred");
+      assert.equal(plain.getStats().lastProbeDeferredAt, null, "nor stamped");
+      // A lane that has SERVED is never a probe, even with the same refusal on
+      // the row and a hook in hand.
+      const held = [];
+      const serving = new DexScreenerClient(cfg, {
+        holdForTick: (p) => {
+          held.push(p);
+        },
+      });
+      calls = 0;
+      globalThis.fetch = async (url) => {
+        calls += 1;
+        const mints = String(url).split("/").pop().split(",");
+        return new Response(
+          JSON.stringify({ pairs: mints.map((m, i) => mkPair(m, i)) }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+      serving.adoptDurableSpacing(lapsedRow);
+      const served = await serving.fetchPairsForTokens(addrs("MINT"));
+      assert.equal(served.size, 30, "the healthy lane really served its pairs");
+      assert.equal(serving.getStats().probeDue, false, "a served batch ends the episode");
+      const second = await serving.fetchPairsForTokens(addrs("OTHER"));
+      assert.equal(second.size, 30, "and the next rotation is served normally");
+      assert.equal(calls, 2, "one inline request per batch, as always");
+      assert.equal(held.length, 0, "nothing was handed to the waitUntil");
+      assert.equal(serving.getStats().probeDeferrals, 0, "and the counters say so");
     } finally {
       globalThis.fetch = origFetch;
     }

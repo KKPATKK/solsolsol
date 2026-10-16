@@ -16,7 +16,7 @@
 
 - `src/worker.ts` 模組級 `tickLegRing`：保留**本 isolate** 最近 `TICK_LEG_RING_SIZE = 120` 個 tick（≈ 2 小時）。
 - 每個 tick 喺 completion flush **之前**記錄（flush 慢／失手都唔會帶走分段），cut／shed／early-return 全部照記。
-- 每行＝`buildTickLegRow` 投影：`at / via / ok / ms / err / cut / cutNote / skip / subs`、front（`preStartMs / preRaceMs / raceMs / steps`）、scan legs（`feedsMs / preFeedMs / poolMs / poolWaitMs / poolLegMs / pairs / pairsJup / pairsMissing / evalMs / dbMs`）、counters（`profiles / pool / candidates / pushed`）。
+- 每行＝`buildTickLegRow` 投影：`at / via / ok / ms / err / cut / cutNote / skip / subs`、front（`preStartMs / preRaceMs / raceMs / steps`）、scan legs（`feedsMs / preFeedMs / feedLegMs / feedJoinMs / poolMs / poolWaitMs / poolLegMs / pairs / pairsJup / pairsMissing / evalMs / dbMs`；`feedLegMs` 係逐條 discovery 腿嘅自己時間，`feedJoinMs` 係 fan-out join 嘅等待——見 `docs/tick-probe-and-feed-legs-2026-10-16.md`）、counters（`profiles / pool / candidates / pushed`）。
 - 冇 summary 嘅 tick（cut/shed/早退）leg 一律記 `null`，唔會造假 0——「冇讀數」同「用咗 0ms」係兩回事。
 
 ### 2. 持久慢 tick 環（`slow`）

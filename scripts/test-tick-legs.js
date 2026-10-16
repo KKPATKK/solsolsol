@@ -101,6 +101,8 @@ test("a full tick maps every leg and the front split", () => {
           pairs: 1202,
           "pairs-jup": 168,
         },
+        feedLegMs: { profiles: 210, pump: 320, boosts: 490 },
+        feedJoinMs: 505,
         pairs: 98,
         pairsJup: 98,
         pairsMissing: 0,
@@ -127,6 +129,11 @@ test("a full tick maps every leg and the front split", () => {
     pairs: 1202,
     "pairs-jup": 168,
   });
+  // The FEED phase's split rides the same row (2026-10-16): `feedsMs` is one
+  // number, and the ring is where a finished tick's per-leg reading survives —
+  // the heartbeat keeps only the latest tick and scan_history eight columns.
+  assert.deepEqual(row.feedLegMs, { profiles: 210, pump: 320, boosts: 490 });
+  assert.equal(row.feedJoinMs, 505);
   assert.equal(row.pairs, 98);
   assert.equal(row.pairsJup, 98);
   assert.equal(row.evalMs, 1624);
@@ -137,16 +144,19 @@ test("a full tick maps every leg and the front split", () => {
 test("the row copies its maps — later mutation must not rewrite a tick", () => {
   const steps = { ...STEP_ZERO, init: 1 };
   const legMap = { pairs: 5 };
+  const feedMap = { pump: 6 };
   const row = buildTickLegRow(
     input({
       preTick: { at: 1, steps, preStartMs: 1, preRaceMs: 2, raceMs: 3 },
-      summary: { poolLegMs: legMap },
+      summary: { poolLegMs: legMap, feedLegMs: feedMap },
     }),
   );
   steps.init = 99;
   legMap.pairs = 99;
+  feedMap.pump = 99;
   assert.equal(row.steps.init, 1);
   assert.equal(row.poolLegMs.pairs, 5);
+  assert.equal(row.feedLegMs.pump, 6);
 });
 
 test("a cut tick with no summary records null legs, not zeros", () => {
@@ -165,6 +175,8 @@ test("a cut tick with no summary records null legs, not zeros", () => {
   assert.equal(row.feedsMs, null);
   assert.equal(row.poolMs, null);
   assert.equal(row.poolLegMs, null);
+  assert.equal(row.feedLegMs, null, "no summary = no feed legs, not empty maps");
+  assert.equal(row.feedJoinMs, null);
   assert.equal(row.evalMs, null);
   assert.equal(row.poolStale, null);
   assert.equal(row.preStartMs, null);

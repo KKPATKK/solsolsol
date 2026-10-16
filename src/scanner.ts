@@ -2064,6 +2064,35 @@ const FRONT_LEG_STAGES: ReadonlySet<string> = new Set<string>([
   "pairs-jup",
 ]);
 
+/**
+ * The discovery-feed legs, named for ScanSummary.feedLegMs.
+ *
+ * WHY THEY ARE NAMED INDIVIDUALLY (2026-10-16). The pair lane was the tick's
+ * biggest piece and is answered (see docs/tick-pair-phase-2026-10-16.md); the
+ * feed phase is the next lever — but `feedsMs` reports it as ONE number, 666–
+ * 1,343ms of a 3,125–3,816ms tick, so "which leg to trim" could only be
+ * guessed. These names make the long pole readable before anything is cut.
+ *
+ * The roster is the legs the phase actually has: `gecko` (new-pools, keyed and
+ * cadence-held) and `geoTrend` (trending, keyless) are one client's two legs
+ * and stay apart on purpose — different cadences, different sizes. `backfill`
+ * is the one leg the fan-out does NOT carry: it is awaited in series after the
+ * join, which is exactly the shape a per-leg reading exists to make visible.
+ */
+export type FeedLeg =
+  | "profiles"
+  | "gecko"
+  | "pump"
+  | "raydium"
+  | "meteora"
+  | "geoTrend"
+  | "boosts"
+  | "gmgn"
+  | "axiom"
+  | "jup"
+  | "jupTrend"
+  | "backfill";
+
 export interface ScanSummary {
   profiles: number;
   /**
@@ -2173,6 +2202,40 @@ export interface ScanSummary {
    * spent past 650ms of that window.
    */
   preFeedMs?: number;
+  /**
+   * Wall time (ms) each DISCOVERY-FEED leg took, by name (see FeedLeg):
+   * measured from the leg's DISPATCH to its SETTLE — whether it delivered or
+   * refused — so the phase's long pole is readable instead of inferred.
+   *
+   * WHY IT EXISTS (2026-10-16). The pair lane's 1.2–1.7s is answered; the feed
+   * phase is what is left of a 3,125–3,816ms tick (666–1,343ms), and it is
+   * where the next trim has to come from — but a phase-level `feedsMs` cannot
+   * say which of its twelve legs to trim. Measured at the legs themselves, so
+   * they ride the heartbeat the tick already writes: no new request, no new
+   * round trip, no new column.
+   *
+   * THE LEGS OVERLAP, so this is NOT a partition of feedsMs — each entry is
+   * that leg's own cost, and the fan-out runs them together. The phase's SERIAL
+   * cost is the `profiles` leg (the tick awaits it before dispatching the rest,
+   * so its entry is also the delay the others started behind).
+   *
+   * An absent leg did not run this tick — disabled, cadence-held, or dropped by
+   * the subrequest floor (`subreqSkip` names the drop). "Did not run" and "ran
+   * instantly" are different readings, the same distinction poolLegMs keeps.
+   */
+  feedLegMs?: Partial<Record<FeedLeg, number>>;
+  /**
+   * Wall-clock ms the tick WAITED at the feed fan-out's join once every leg was
+   * dispatched — the residual the join added, read WITH `feedLegMs` and
+   * `feedsMs`. The join ends when the LAST leg settles, so a reading near the
+   * widest `feedLegMs` entry means the fan-out was fully overlapped, while a
+   * small one means the legs had already settled when the join was reached.
+   *
+   * WHY IT EXISTS: `feedsMs` also carries the serial `profiles` leg in front of
+   * the fan-out and the series `backfill` leg behind it, so without this number
+   * the fan-out itself cannot be told apart from them.
+   */
+  feedJoinMs?: number;
   /**
    * Whether the profiles call ANSWERED inside the feed window. False means
    * this tick evaluated the make-up fallback instead (see the profiles call
@@ -3125,6 +3188,50 @@ export class Scanner {
     const legs = (diag.poolLegMs ??= {});
     const leg = stage as FrontLeg;
     legs[leg] = (legs[leg] ?? 0) + Math.max(0, Date.now() - at);
+  }
+  /**
+   * Bank one feed leg's own wall time (see ScanSummary.feedLegMs). Called by
+   * the wrapper below at SETTLE, so a leg needs no timer of its own and cannot
+   * forget to stop one — the same rule closeFrontLeg follows for the front's
+   * legs.
+   */
+  private feedLegDone(
+    diag: ScanSummary,
+    leg: FeedLeg,
+    dispatchedAt: number,
+  ): void {
+    const legs = (diag.feedLegMs ??= {});
+    legs[leg] = (legs[leg] ?? 0) + Math.max(0, Date.now() - dispatchedAt);
+  }
+  /**
+   * Wrap one feed leg so its DISPATCH-to-SETTLE wall time lands in feedLegMs
+   * (see the field's note).
+   *
+   * The clock starts when the leg's promise is CREATED, not when it first
+   * reaches the wire: for the gated legs (gecko, boosts) and the chained one
+   * (meteora awaits gecko's job before deciding) the wait for that decision IS
+   * part of what the tick pays for the leg.
+   *
+   * BOTH outcomes bank the reading. A refusal that burns the whole feed window
+   * is exactly the shape an operator is looking for, and it is the one a
+   * success-only reading would hide.
+   */
+  private feedLeg<T>(
+    diag: ScanSummary,
+    leg: FeedLeg,
+    call: Promise<T>,
+  ): Promise<T> {
+    const dispatchedAt = Date.now();
+    return call.then(
+      (value) => {
+        this.feedLegDone(diag, leg, dispatchedAt);
+        return value;
+      },
+      (err: unknown) => {
+        this.feedLegDone(diag, leg, dispatchedAt);
+        throw err;
+      },
+    );
   }
   /**
    * Pair data THIS tick's pair phase already paid for (the DexScreener
@@ -5047,7 +5154,11 @@ export class Scanner {
         parseProfileFeedSnapshot(front.gates.get(DEX_PROFILES_LAST_KEY) ?? null),
       () => null,
     );
-    const profilesCall = this.dex.fetchLatestSolanaProfiles(profileFeedSeed).then(
+    const profilesCall = this.feedLeg(
+      diag,
+      "profiles",
+      this.dex.fetchLatestSolanaProfiles(profileFeedSeed),
+    ).then(
       (list) => ({ list, settled: true }),
       (err: unknown) => {
         console.error(
@@ -5464,7 +5575,7 @@ export class Scanner {
               );
             });
         geckoJob = geckoPromise;
-        feedJobs.push(geckoPromise);
+        feedJobs.push(this.feedLeg(diag, "gecko", geckoPromise));
       }
       // THE LAUNCH SLOT (2026-09-28): three keyless non-DexScreener sources, and
       // the shape BETWEEN them changed the day gecko got a key. Before, gecko's
@@ -5533,7 +5644,7 @@ export class Scanner {
         });
         // Pushed straight onto the fan-out: nothing downstream waits on a
         // pump job any more (Meteora waits on the GECKO job — see below).
-        feedJobs.push(pumpPromise);
+        feedJobs.push(this.feedLeg(diag, "pump", pumpPromise));
       }
       // Raydium LaunchLab — the FOURTH launch feed (see src/raydiumlaunch.ts),
       // and an ALWAYS-ON one like pump.fun: the LaunchLab mint API's
@@ -5548,7 +5659,7 @@ export class Scanner {
       let raydiumLaunchProfiles: TokenProfile[] = [];
       if (this.raydiumLaunch && this.config.raydiumLaunchLimit > 0 && !dropOptionalLeg("raydium")) {
         feedJobs.push(
-          this.fetchFeedCapped(
+          this.feedLeg(diag, "raydium", this.fetchFeedCapped(
             () =>
               this.raydiumLaunch!.fetchNewLaunches(
                 this.config.raydiumLaunchLimit,
@@ -5566,6 +5677,7 @@ export class Scanner {
                 err instanceof Error ? err.message : err,
               );
             }),
+          ),
         );
       }
       // Meteora DAMM v2 — GECKO'S COVER (see src/meteora.ts). It is an
@@ -5578,7 +5690,7 @@ export class Scanner {
       let meteoraProfiles: TokenProfile[] = [];
       if (this.meteora && this.config.meteoraFallbackLimit > 0 && !dropOptionalLeg("meteora")) {
         feedJobs.push(
-          (async () => {
+          this.feedLeg(diag, "meteora", (async () => {
             if (geckoJob !== null) await geckoJob;
             // A gecko tick that DELIVERED stops the chain — no reason to pay
             // for a second DEX launch list. Do not read `diag.geo` before the
@@ -5597,7 +5709,7 @@ export class Scanner {
               "[scanner] meteora discovery failed:",
               err instanceof Error ? err.message : err,
             );
-          }),
+          })),
         );
       }
       // GeckoTerminal trending-pools — momentum feed (free, no key), the
@@ -5607,7 +5719,7 @@ export class Scanner {
       let geoTrendProfiles: TokenProfile[] = [];
       if (this.gecko && this.config.geckoterminalTrendingLimit > 0 && !dropOptionalLeg("geoTrend")) {
         feedJobs.push(
-          this.fetchFeedCapped(
+          this.feedLeg(diag, "geoTrend", this.fetchFeedCapped(
             async () => {
               const trending = await this.gecko!.fetchTrendingPools(
                 this.config.geckoterminalTrendingLimit,
@@ -5632,6 +5744,7 @@ export class Scanner {
                 err instanceof Error ? err.message : err,
               );
             }),
+          ),
         );
       }
       // DexScreener boosted tokens — the newest PAID promotion slots. The
@@ -5676,7 +5789,7 @@ export class Scanner {
           frontDeadline,
         );
         feedJobs.push(
-          this.fetchFeedCapped(
+          this.feedLeg(diag, "boosts", this.fetchFeedCapped(
             async () => {
               // Stamped at DISPATCH, inside the closure, for the reasons the
               // gecko gate above documents: fetchFeedCapped refuses to call
@@ -5719,6 +5832,7 @@ export class Scanner {
                 err instanceof Error ? err.message : err,
               );
             }),
+          ),
         );
       }
       // GMGN trending discovery — momentum-ranked candidates with GMGN's
@@ -5728,7 +5842,7 @@ export class Scanner {
       let gmgnProfiles: TokenProfile[] = [];
       if (this.gmgn && this.config.gmgnTrendingLimit > 0 && !dropOptionalLeg("gmgn")) {
         feedJobs.push(
-          this.fetchFeedCapped(
+          this.feedLeg(diag, "gmgn", this.fetchFeedCapped(
             async () => {
               const trending = await this.gmgn!.fetchTrending(
                 this.config.gmgnTrendingLimit,
@@ -5753,6 +5867,7 @@ export class Scanner {
                 err instanceof Error ? err.message : err,
               );
             }),
+          ),
         );
       }
       // Axiom Trade trending — momentum feed with sniper/insider/bundle/
@@ -5765,7 +5880,7 @@ export class Scanner {
       let axiomProfiles: TokenProfile[] = [];
       if (this.axiom && this.config.axiomTrendingLimit > 0 && !dropOptionalLeg("axiom")) {
         feedJobs.push(
-          this.fetchFeedCapped(
+          this.feedLeg(diag, "axiom", this.fetchFeedCapped(
             async () => {
               const trending = await this.fetchTrendingCached();
               return trending
@@ -5788,6 +5903,7 @@ export class Scanner {
                 err instanceof Error ? err.message : err,
               );
             }),
+          ),
         );
       }
       // Jupiter Token v2 recent-launches — seconds-old launchpad launches
@@ -5799,7 +5915,7 @@ export class Scanner {
       let jupProfiles: TokenProfile[] = [];
       if (this.jupiter && this.config.jupiterRecentLimit > 0) {
         feedJobs.push(
-          this.fetchFeedCapped(
+          this.feedLeg(diag, "jup", this.fetchFeedCapped(
             () =>
               this.jupiter!.fetchRecentTokens(this.config.jupiterRecentLimit),
             [],
@@ -5815,6 +5931,7 @@ export class Scanner {
                 err instanceof Error ? err.message : err,
               );
             }),
+          ),
         );
       }
       // Jupiter Token v2 trending — momentum feed (free, no key). Mostly
@@ -5833,7 +5950,7 @@ export class Scanner {
         // costs (see jupfeeds.parseJupTrendTokens and pairsForTracker).
         const trendBand = trendBandFromChats(chats, RE_EVAL_AGE_MARGIN_MIN);
         feedJobs.push(
-          this.fetchFeedCapped(
+          this.feedLeg(diag, "jupTrend", this.fetchFeedCapped(
             () =>
               this.jupiter!.fetchTrendingTokens(
                 this.config.jupiterTrendLimit,
@@ -5852,13 +5969,21 @@ export class Scanner {
                 err instanceof Error ? err.message : err,
               );
             }),
+          ),
         );
       }
       // Await the fan-out (each job is individually deadline-raced and
       // error-swallowed, so Promise.all here cannot reject and is bounded
       // by the feed deadline). A tripped tick budget lands at the next
       // phase boundary (below) instead of inside the fan-out.
+      //
+      // The join's own reading (see ScanSummary.feedJoinMs): every leg is in
+      // flight by this line, so the wait here is the residual the fan-out cost
+      // the tick AFTER the last dispatch — read it against feedLegMs, whose
+      // widest entry is what a fully overlapped join waits for.
+      const fanDispatchedAt = Date.now();
       await Promise.all(feedJobs);
+      diag.feedJoinMs = Math.max(0, Date.now() - fanDispatchedAt);
       // Periodic Birdeye backfill — safety net for discovery gaps. Every
       // BIRDEYE_BACKFILL_INTERVAL_MIN the scanner walks back the lookback
       // window of Birdeye's new_listing feed (which includes pump.fun
@@ -5881,11 +6006,23 @@ export class Scanner {
         this.birdeye !== null && this.config.birdeyeBackfillEnabled;
       if (!maintFresh && !(backfillArmed && dropOptionalLeg("backfill"))) {
         try {
-          diag.backfill = await this.fetchFeedCapped(
+          // Wrapped like a fan-out leg even though it runs in SERIES after the
+          // join: it is inside feedsMs, so "which feed leg costs what" would be
+          // wrong without it (see FeedLeg's note on this one).
+          //
+          // Only a tick that COULD have fetched reports it (see backfillArmed):
+          // with no Birdeye client — or with the leg disabled — this step is a
+          // no-op that returns 0, and a 0ms entry would read as "the leg ran and
+          // was instant". An absent leg did not run, which is the distinction
+          // feedLegMs keeps for every OTHER leg too.
+          const backfillLeg = this.fetchFeedCapped(
             () => this.runPeriodicBackfill(),
             0,
             feedDeadline,
           );
+          diag.backfill = await (backfillArmed
+            ? this.feedLeg(diag, "backfill", backfillLeg)
+            : backfillLeg);
         } catch (err) {
           console.error(
             "[scanner] periodic backfill failed:",
