@@ -9,7 +9,7 @@
 | # | 發現（實測） | 代價 | 已做 |
 |---|---|---|---|
 | 1 | **tick 嘅最大一件係 eval 相位內嘅 pair fetch**：五個 tick 入面四個，`poolLegMs.pairs`（DexScreener 批次腿）1,202–1,693ms + `pairs-jup`（Jupiter 補底）418–635ms = 佔 tick 嘅 60–74%；`feedsMs` 666–1,343ms，`poolMs` 0–98ms，`dbTickSteps` 77–190ms | 一個 3,125–3,816ms tick 入面 ~2.0–2.3s | — |
-| 2 | **嗰 1,202–1,693ms 買到 0–26 條 pair**（request 總數 ~200）：DexScreener 嘅 shared egress IP 幾乎每次都 429，而佢嘅 90s cache-only block（`PAIR_BATCH_BACKOFF_MS`）係**per isolate**，isolate 每 ~30s 換一次 —— 即係每個新 isolate 都用 ~1.2s 嘅 dispatch 間距（`intervalMs` 已升到上限 1,200）去**重新賺同一個已知嘅拒絕** | 五個 tick 入面四個重複付，~1.2–1.7s × 每個 tick | 把拒絕搬上 `dex_spacing` 呢一行（`pairRefusedAt`），令 block 同 spacing 一樣跨 isolate；每個 episode 由「每個 isolate 試一次」變「全隊每 90s 試一次」 |
+| 2 | **嗰 1,202–1,693ms 買到 0–26 條 pair**（request 總數 ~200）：DexScreener 嘅 shared egress IP 幾乎每次都 429，而佢嘅 90s cache-only block（`PAIR_BATCH_BACKOFF_MS`）係**per isolate**，isolate 每 ~30s 換一次 —— 即係每個新 isolate 都用 ~1.2s 嘅 dispatch 間距（`intervalMs` 已升到上限 1,200）去**重新賺同一個已知嘅拒絕** | 五個 tick 入面四個重複付，~1.2–1.7s × 每個 tick | 把拒絕搬上 `dex_spacing` 呢一行（`pairRefusedAt`），令 block 同 spacing 一樣跨 isolate；每個 episode 由「每個 isolate 試一次」變「全隊每 90s 試一次」。**實測：`poolLegMs.pairs` 1,202–1,693 → 0ms（7/10 tick），`scan_history.ms` p50 2,942 → 1,648（§8）** |
 | 3 | Jupiter 補底一直係真正送貨嗰條腿：`pairsJup == pairs`（193–198 條）而 Dex 只回 0–26；一個**繼承咗活 block** 嘅 tick 讀 `poolLegMs.pairs 0` + `pairs-jup 418ms` —— 即係「跳過已知拒絕」嘅形狀係啱嘅 | — | 保留 fail-open：block 一定買到恢復探測（過期就重新問） |
 
 ## 1. 量度：一個 tick 嘅解剖（2026-10-16 00:25–00:27Z，`/health` 取樣）
@@ -137,8 +137,62 @@ DexScreener 只係問一兩次，而嗰一兩次就係嗰 1.2–1.7s。
 - 呢個修正**唔會**令健康嘅 egress 快啲：`spacingSteps 0`／冇拒絕嘅一日，pair 腿嘅行為
   同改前逐個 byte 一樣（測試釘住 legacy row 唔會無中生有 block）。
 
-## 8. 落地清單
+## 8. 部署後實測（2026-10-16 00:45:16Z deploy，commit `5a68a60`）
 
-1. `npm run test:unit`（build + 13 個腳本，包括新嗰個跨 isolate 個案）—— ✅ 本地全綠。
-2. Push → `deploy.yml`（migrate / deploy / catchup）綠。
-3. 5 / 15 分鐘後讀 §5 嗰四個位，並把 after 讀數寫入 §8。
+**Run 38831072548 三個 job 全綠**：`migrate` 00:43:12→35、`deploy` 00:43:37→00:45:27
+（unit tests 過 → `Uploaded solana-meme-bot (7.85 sec)` → `Deployed … triggers`）、
+`catchup` 00:45:29→49。
+
+### 8.1 持久讀數：`scan_history.ms`（跨 isolate 嘅真正記錄）
+
+| 窗口 | n | min | **p50** | mean | max |
+|---|---|---|---|---|---|
+| 改之前 00:38:37–00:45:36 | 14 | 1,959 | **2,942** | 2,845 | 3,379 |
+| 改之後 00:46:10–00:51:01 | 10 | 1,238 | **1,648** | 2,096 | 3,658 |
+
+分佈係雙峰，而且分得對應設計：**7 個 tick 1,238–1,656ms**（繼承到仍然生效嘅 fleet block，
+pair 腿 0ms）＋ **3 個探測 tick 2,773–3,658ms**（block 用完，問一次 → 429 → 重新武裝）。
+90s episode ÷ ~30s tick ≈ 三次入面一次探測，同窗口嘅 3/10 吻合（00:48:20 嗰個 3,658ms
+同時仲有一個 candidate chain）。
+
+### 8.2 tick 側逐條腿（`/health` 取樣）
+
+| tick (UTC) | `ms` | `feedsMs` | `evalMs` | `poolLegMs.pairs` | `pairs-jup` | `blockedForMs` | `pairFleetRefusedAgeMs` | 自己嘅 `http429` |
+|---|---|---|---|---|---|---|---|---|
+| 00:46:10 | 2,773 | 1,020 | 1,637 | 986 | 636 | 89,364 | null | 3 |
+| 00:47:00 | **1,639** | 722 | 828 | **0** | 426 | 39,324 | 50,676 | 0 |
+| 00:48:52 | **1,628** | 676 | 858 | **0** | 474 | 57,584 | 32,416 | 2 |
+| 00:49:24 | **1,238** | 561 | 580 | **0** | 564 | 25,584 | 64,416 | 0 |
+| 00:49:57 | 2,814 | 806 | 1,880 | 1,190 | 652 | 89,348 | 97,603 | 3 |
+| 00:50:29 | **1,656** | 672 | 884 | **0** | 871 | 57,057 | 32,943 | 4 |
+| 00:51:01 | **1,322** | — | — | **0** | — | 25,405 | 64,595 | 3 |
+
+驗收點逐條：
+
+1. `poolLegMs.pairs` **1,202–1,693ms → 0ms**（7/10 個 tick；探測 tick 係 986–1,190ms，
+   即係由「每個 isolate 每次」變成「全隊每 90s 一次」）；
+2. **block 真係跨咗邊界**：`pairFleetRefusedAgeMs` 32,416–97,603ms 非 null，而同一批
+   tick 嘅本地 `http429` 有 0（00:47:00、00:49:24）——即係嗰個 block 唔係呢個 isolate
+   自己賺嘅；`blockedForMs 25,405–89,364` 同 `pairRefusedAt` 喺 row 上對得上
+   （`worker_state.dex_spacing = {"at":1792111861191,"steps":4,"pairRefusedAt":1792111796580}`，
+   `pairRefusedAt` = 00:49:56.58Z 嗰次探測嘅 429）；
+3. **coverage 冇跌**：`pairs` 187–201（改前 196–219），`pairsJup == pairs`、
+   `pairsMissing 1`、`pushed`／`fails` 同改前同一形狀；
+4. **tick 冇斷**：`ok 1` 全部 24 行、`writeDrainError null`、`deadTickStreak 0`、
+   `initError null`、`dbReady true`、tracker pass `trackerMs 274ms`（`relay inner`）、
+   冇 `cut`。
+
+### 8.3 呢批讀數嘅限制
+
+- 窗口係 14 個 tick（改前）對 10 個 tick（改後）；`scan_history.ms` 係跨 isolate 嘅持久記錄
+  （最硬），但 `poolLegMs`／`dex.*` 係 `/health` 取樣（每次落到邊個 isolate 唔受控）。
+- 探測 tick **冇消失**，只係變疏：佢仍然要 ~1.0–1.4s（一個 1,200ms 嘅 dispatch 間距 + 429），
+  呢個係 §6 嘅下一個槓桿；pair 相位喺跳過嘅 tick 上剩返 `pairs-jup` 426–871ms。
+- 呢批讀數係喺「egress IP 持續被拒」嘅氣候下量嘅 —— 即係今次修正針對嘅情形。
+  健康嘅一日（`spacingSteps 0`、`pairRefusedAt` 缺）pair 腿同改前逐個 byte 一樣。
+
+## 9. 落地清單
+
+1. `npm run test:unit`（build + 13 個腳本，包括新嗰個跨 isolate 個案）—— ✅ 本地全綠（545 passed / 0 failed）。
+2. Push → `deploy.yml`（migrate / deploy / catchup）—— ✅ 三個 job 全綠，見 §8。
+3. 5 / 15 分鐘後讀 §5 嗰四個位 —— ✅ after 讀數見 §8。
