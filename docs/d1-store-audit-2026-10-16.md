@@ -289,6 +289,25 @@ per-tick 嘅口徑係上面嘅 delta。
 
 **同場對照**：`dbStore` 仍然 `"d1"`、`dbMs > 0`、`scan_history` 最新行仍然緊貼（§5.3）；`subs` 9–11（見 §3.5 —— 佢唔包 D1 call，所以同 `dbCalls` 唔可以直接相加比較）。
 
+### 5.5 §2.5／§2.6 嘅 deploy 後實測（commit `aced930`，run 38848169345，04:01:17Z）
+
+**`/health.heartbeat.subreqs`（scan 窗口，04:01:09Z 開）**
+```
+budget 10000   unseenAllowance 12   usable 9988   windows 1
+current: owner "scan"  total 19
+hosts: d1 10 | lite-api.jup.ag 4 | api.dexscreener.com 1 |
+       damm-v2.datapi.meteora.ag 1 | frontend-api-v3.pump.fun 1 |
+       launch-mint-v1.raydium.io 1 | www.cloudflare.com 1
+```
+⇒ 同一種窗口修之前讀 **9–11**（只有 fetch），現在 **19**：**`d1` 那 10 個就是之前數唔到嘅份額**，
+而且 host split 把它單獨列出來，唔會同 `(unknown)` 混在一起。額度亦已跟文件：`budget 10000`／`usable 9988`。
+
+**`/debug/tick-legs`（deploy 後第一個可讀 tick）**
+```
+04:03:30Z  subs=17  dbCalls=8  dbStmts=17  profiles=25
+```
+⇒ `subs` 已經包 D1 call（9–11 fetch ＋ 8 個 D1 call ≈ 17），而 `dbStmts`／`dbCalls` 不變。
+
 ## 6. 限制（唔可以當過）
 
 - **§2.1／§2.2 已 deploy 並 live 核對**（§5.3）；**§2.4 嘅新儀器（`dbStmts`／`dbStatements`）未 deploy**：
@@ -301,9 +320,8 @@ per-tick 嘅口徑係上面嘅 delta。
   phase 1／2／3 全行，寫入路徑（註冊、DDL、`runOnce`）真跑。**archive 模式仍然只可以明加
   `--allow-archive-write`**，而嗰條路今次**冇跑** —— 即係「寫凍結 archive」嘅路徑依然未驗。
 - **queries／tick 由 deploy 之後改讀 per-tick 嘅 `dbStmts`**（§2.4）：實測 **15–27 句**（§5.4），而 ~75 係 24 小時平均上界（包所有 invocation）。
-- **§2.5／§2.6 未 deploy**：reader 分切、D1 subrequest 計數同 `SUBREQ_BUDGET` 只到「代碼＋測試」級（typecheck 過、
-  `test-d1-transport` 12、`test-unit` 551）；live 驗收讀數：`/health.heartbeat.subreqs.budget === 10000`、
-  `hosts` 有 `d1` 一行、而 `subs` 由 9–11 升到「加埋 D1 call」嘅水平。
+- **§2.5／§2.6 已 deploy 並 live 核對**（commit `aced930`，run 38848169345，deploy 完 04:01:17Z）——
+  見 §5.5。reader 分切嘅證據仍然係測試級（要過 100 個 token 才會觸發，現場冇）。
   但 §5.4 嘅樣本係**一個 isolate 嘅 3 個 tick**，唔係全 fleet 統計 —— 要一概分佈就要等 ring 累積或者讀 D1 側。
 - **`subs` 已經包 D1 call**（§2.6），但 `SUBREQ_UNSEEN_ALLOWANCE = 12` **故意冇動**：它係 2026-09-24（Turso 年代）量到嘅大小，
   唯一可以重訂它嘅係下一次拒絕自己報出嘅數字。而 `SUBREQ_BUDGET = 10,000` 嘅改動**係 inert 嘅**，因為所有 gate 都係絕對常數
