@@ -141,3 +141,71 @@ queue 嘅 **dispatch 間距**：lane 為咗問「你仲拒絕我嗎？」而企�
 - 呢批改動冇郁任何產品參數（feed size、cadence、gate 門檻、`PAIRS_FETCH_BUDGET_MS`、
   `DEX_REQUEST_INTERVAL_MS` 全部不變）；`PAIR_PROBE_INLINE_WAIT_MS` 只係「幾遠
   嘅 slot 值得延後」嘅門檻，健康嘅 egress 永遠唔會撞到。
+
+## 6. 部署後實測（2026-10-16 01:57:13Z deploy，commit `57ff3dd`）
+
+**Run 38837693022 三個 job 全綠**：`migrate` 25s、`deploy` 1m41s（unit tests 過 →
+`Uploaded solana-meme-bot (3.04 sec)` → `Deployed solana-meme-bot triggers
+(0.89 sec)` @ 01:57:13Z）、`catchup` 25s。
+
+### 6.1 讀數 3（item 3）：feed 相位逐條腿——上線即見
+
+`/health` 取樣（每次落到邊個 isolate 唔受控；`pairs == pairsJup` 全部呢批樣本都係）：
+
+| tick (UTC) | `ms` | `feedsMs` | `feedJoinMs` | `feedLegMs`（ms） |
+|---|---|---|---|---|
+| 01:59:02 | 3,789 | 1,009 | 1,009 | boosts 1,009, jupTrend 668, raydium 631, meteora 296, jup 90, pump 86, profiles 12 |
+| 02:00:02 | 3,466 | 688 | 688 | jupTrend 688, raydium 407, meteora 310, jup 148, pump 81, profiles 21 |
+| 02:02:27 | 3,032 | 862 | 802 | jupTrend 802, raydium 412, meteora 367, pump 133, jup 126, profiles 94 |
+| 02:03:33 | 1,869 | 1,057 | 1,057 | gecko 1,057, meteora 1,057, jupTrend 695, raydium 359, jup 176, pump 78, profiles 34 |
+| 02:04:00 | 1,984 | 1,195 | 1,195 | boosts 1,195, jupTrend 666, raydium 385, meteora 284, pump 61, jup 36, profiles 9 |
+
+三點：
+
+1. **`feedJoinMs` 每次都等於最闊嗰條腿**（1,009 / 688 / 802 / 1,057 / 1,195）——
+   fan-out 完全重疊，相位嘅時間就係最慢嗰條腿，唔係「等咗先開」：`profiles`
+   9–94ms，serial 部分唔係樽頸。
+2. **長杆已經有數**：`gecko` 1,057（keyed，5 分鐘 cadence）、`boosts` 1,009–1,195
+   （cadence）、`jupTrend` 666–802；第二層係 `raydium` 334–412 ＋ `meteora`
+   264–367；`jup`/`pump`/`profiles` 36–176。砍邊條要兩三日分佈先講（見 §4 第 1 點）。
+3. Ring row 亦帶住：`/debug/tick-legs` 一行樣本 ＝
+   `feedLegMs {"profiles":21,"pump":81,"jup":148,"meteora":310,"raydium":407,"jupTrend":688}`
+   ＋ `feedJoinMs 688`，而同一個 tick 嘅 `poolLegMs {"pool-read":0,"front-write":57,"pairs":2001,"pairs-jup":592}`。
+   `feedLegMs.backfill` 冇出現——maintenance 揀咗嗰步，腿冇跑（absent，唔係 0）✓。
+
+### 6.2 讀數 1（item 1）：探測唔再等 gap——episode 期間先讀到
+
+部署後嘅窗口係**混合形狀**（egress 喺 deploy 後一分鐘內由「持續被拒」變成「斷續
+成功」），所以三個形狀要分開睇：
+
+| 形狀 | 樣本 tick | `poolLegMs.pairs` | `probeDeferrals` | 備註 |
+|---|---|---|---|---|
+| 繼承活 block | 02:03:33、02:04:00、02:06:04、02:06:43、02:08:20、02:09:25、02:09:57 | 0 | 0 | 舊行為（fleet block）不變，`ms` 1,229–1,980 |
+| serve 中（唔係探測） | 01:59:02–02:02:27、02:04:37、02:07:17 | 1,200–2,001 | 0 | `probeDue false`→deferral 唔應該出手，亦冇出手 ✓ |
+| **block 過期、未 serve 過（＝真探測）** | 02:05:00、02:08:52 | **0** | **1**（`lastProbeDeferredAt` 有值） | `blockedForMs 0`、183–191 條 `pairs` 全部由 Jupiter 送、`ms` 1,342–1,755 |
+
+- **deferral 真係觸發咗**：`heartbeat.dex.probeDeferrals` 由 0 → **1**，
+  `lastProbeDeferredAt` 有值（第一次喺 02:04:25Z 前後）；嗰批 tick 讀
+  `poolLegMs.pairs 0` + `blockedForMs 0` + `pairs == pairsJup`（183–191 條）。對比
+  §8.2 嘅探測 tick（`pairsLeg` 986–1,190ms、`ms` 2,773–3,658），即係
+  **lapsed-block tick 由 986–1,190ms 落到 0ms**（樣本 2 個），而 coverage 冇跌。
+- **拒絕照樣學到**：`worker_state.dex_spacing` ＝
+  `{"at":"02:07:17.057","steps":4,"pairRefusedAt":"02:07:16.419"}`——02:07:17 嗰個
+  tick（`pairsLeg` 1,200、`probeDue` 開始時 false：佢嗰個 isolate serve 過）照樣
+  inline 交學費，deferral 唔會 touch 一個 serve 過嘅 lane ✓；而 `pairFleetRefusedAgeMs`
+  24,781–159,859 非 null 配本地 `429 0` 嘅 tick 照樣出現，即係 block 仍然跨 isolate。
+- **tick 冇斷**：after 窗口 21 行 `scan_history` 全部 `ok 1`、`ms` 1,229–3,789、
+  冇 `cut`。
+
+### 6.3 呢批讀數嘅限制
+
+- `probeDeferrals` / `lastProbeDeferredAt` 係 **per isolate**、而且只保留**最新 tick**
+  （同 `http429` 一樣）；`scan_history` 8 欄冇佢。所以「deferral 幾次、幾時」係由
+  抽樣嘅 `/health` 讀到（0 → 1、`lastDef` 有值），唔係 durable 記錄。
+- 樣本細：lapsed-block tick 得 2 個；pre-deploy 對照係 §8.2 嘅 3 個探測 tick。
+- after 窗口嘅 egress 由「持續被拒」轉「斷續成功」，所以 `scan_history.ms` 嘅前後
+  p50（after 頭 9 個 2,562 vs pre 1,727）**唔可以**當成本次改動嘅效果——serve 中嘅
+  tick 本來就會用滿 pair budget（2,000ms，8 個 batch 喺 640–1,200ms spacing 之下）。
+  要讀嘅係「lapsed-block tick 嘅 `poolLegMs.pairs`」。
+- 如果將來要 durable 記 deferral：ring row 加 `probeDeferrals` / `lastProbeDeferredAt`
+  係同 `feedLegMs` 一樣嘅做法（0 個 round trip）——今次冇做，唔喺範圍內。
