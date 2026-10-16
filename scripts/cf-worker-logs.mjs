@@ -565,14 +565,28 @@ if (gqlNote) {
       "or minutes whose events fell off the page).",
   );
   say("");
-  say("| minute (UTC) | gql requests | gql cpuP50 ms | gql cpuP99 ms | gql cpuMax ms | logs n | logs median ms | logs mean ms | logs max ms |");
-  say("|---|---|---|---|---|---|---|---|---|");
+  // Where does Cloudflare's per-minute "P50" land inside that minute's REAL
+  // per-invocation CPU values? Rank 0.5 would mean the two sources report the
+  // same statistic and merely disagree by noise; a rank near 1.0 means the
+  // "P50" is the minute's MAXIMUM wearing a median's name. The rank is the
+  // reading that answers "why 2.2x" without appealing to either API's
+  // internals, so it is computed per minute and summarised across minutes.
+  const ranks = [];
+  let p50EqualsMax = 0;
+  say("| minute (UTC) | gql requests | gql cpuP50 ms | gql cpuP99 ms | gql cpuMax ms | logs n | logs median ms | logs p75 ms | logs p90 ms | logs mean ms | logs max ms | gqlP50 rank in logs |");
+  say("|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const m of bothMinutes) {
     const g = gqlByMinute.get(m);
     const l = logByMinute.get(m);
+    const sorted = [...l.cpu].sort((a, b) => a - b);
+    const p50 = g.p50 / 1000;
+    const rank = sorted.filter((v) => v <= p50).length / sorted.length;
+    ranks.push(rank);
+    if (Math.abs(p50 - sorted[sorted.length - 1]) < 1) p50EqualsMax++;
     say(
-      `| ${m} | ${g.requests} | **${ms(g.p50 / 1000)}** | ${ms(g.p99 / 1000)} | ${ms(g.cpuMax / 1000)} | ` +
-        `${l.cpu.length} | ${ms(median(l.cpu))} | ${ms(mean(l.cpu))} | ${Math.max(...l.cpu)} |`,
+      `| ${m} | ${g.requests} | **${ms(p50)}** | ${ms(g.p99 / 1000)} | ${ms(g.cpuMax / 1000)} | ` +
+        `${sorted.length} | ${ms(median(sorted))} | ${ms(pct(sorted, 75))} | ${ms(pct(sorted, 90))} | ` +
+        `${ms(mean(sorted))} | ${sorted[sorted.length - 1]} | ${(rank * 100).toFixed(0)}% |`,
     );
   }
 
@@ -589,6 +603,14 @@ if (gqlNote) {
   say(`| GraphQL cpuP50 — **mean across minutes** | ${ms(mean(gqlP50s))} ms |`);
   say(`| Logs per-invocation **median** | ${ms(median(logCpu))} ms |`);
   say(`| Logs per-invocation **mean** | ${ms(mean(logCpu))} ms |`);
+  say(
+    `| GraphQL per-minute P50's **rank inside the same minute's records** ` +
+      `(median across minutes; 50% would mean both report the median) | ` +
+      `${ms(median(ranks) * 100)}% (min ${ms(Math.min(...ranks) * 100)}%, max ${ms(Math.max(...ranks) * 100)}%) |`,
+  );
+  say(
+    `| minutes where that P50 equals the minute's MAX | ${p50EqualsMax} of ${bothMinutes.length} |`,
+  );
   say("");
   say(
     `LIKE FOR LIKE — per-minute median vs per-invocation median: ` +
@@ -600,6 +622,15 @@ if (gqlNote) {
       `Those two are different questions: the first is whether the datasets agree, ` +
       `the second is why a monthly figure built from a median-like series and a ` +
       `mean land 2x apart.`,
+  );
+  say(
+    `THE RANK IS THE ANSWER TO \"WHY DO THEY DISAGREE\": GraphQL's per-minute ` +
+      `P50 typically sits at the ${ms(median(ranks) * 100)}th percentile of that ` +
+      `minute's own per-invocation CPU values (and IS the minute's max in ` +
+      `${p50EqualsMax} of ${bothMinutes.length} minutes), not at the 50th. A ` +
+      `statistic at the 80th percentile is not a "typical invocation" figure, ` +
+      `so multiplying it by an invocation count cannot measure a monthly CPU ` +
+      `total — which is what the retired 21% did.`,
   );
 }
 
