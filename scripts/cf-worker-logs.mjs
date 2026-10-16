@@ -639,10 +639,11 @@ if (gqlNote) {
       `${ms(median(joinedP50s))} ms median / ${ms(mean(joinedP50s))} ms mean; ` +
       `the Workers Logs records in those same minutes: ` +
       `${ms(median(joinedLogCpu))} ms median / ${ms(mean(joinedLogCpu))} ms mean. ` +
-      `So per-minute median vs per-invocation median is ` +
-      `${ms((median(joinedLogCpu) ?? 0) / (median(joinedP50s) || 1))}x, and ` +
-      `per-minute median vs per-invocation mean is ` +
-      `${ms((mean(joinedLogCpu) ?? 0) / (median(joinedP50s) || 1))}x. ` +
+      `So GraphQL's per-minute P50 sits at ` +
+      `${ms((median(joinedP50s) ?? 0) / (median(joinedLogCpu) || 1))}x the ` +
+      `per-invocation MEDIAN and ` +
+      `${ms((median(joinedP50s) ?? 0) / (mean(joinedLogCpu) || 1))}x the ` +
+      `per-invocation MEAN. ` +
       `Those are different questions: one is whether the datasets agree, the ` +
       `other is why a monthly figure built from a median-like series and a ` +
       `per-invocation mean land ~2x apart.`,

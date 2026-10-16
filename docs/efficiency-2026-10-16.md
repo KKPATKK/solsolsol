@@ -12,7 +12,7 @@
 | # | 槓桿 | 今日讀數 | 值唔值 | 風險 |
 |---|---|---|---|---|
 | 1 | **pair lane 空轉**（**已修**，見 §3）：lane 喺 refusal episode 內喺間距隊白等 | block 內嘅 tick 已經係 `poolLegMs.pairs 0`；殘餘係 `blockedForMs 0 / spacingFleetSteps 3 / intervalMs 1,200` 嘅 tick 等足 **1,024ms** | **最高**（單一最大嘅 tick 成本） | 中 — 已保住「復原探測」同 DexScreener 讀數，唔係整條 lane 砍走 |
-| 2 | ~~CPU 讀數~~ **已做（§4）** | 用**既有** `scripts/cf-invocations.mjs` 就讀到（GraphQL 一直有 `cpuTimeP50/P99`）：**21%**，唔係樽頸；Workers Logs 已喺 `wrangler.toml` 開（零 code）**並已 deploy（07:40:49Z，§4b）** —— per-invocation 讀數：median 15ms／avg 25.8ms／max 133ms ⇒ 月用量 **27–46%**，唔係天花板但餘裕只有 2–4× | ~~高~~ 完成 | 低 |
+| 2 | ~~CPU 讀數~~ **已做（§4）** | Workers Logs 已喺 `wrangler.toml` 開（零 code）**並已 deploy（07:40:49Z，§4b）**；逐個 invocation 實測（36 分鐘窗口）：median **6ms**／mean **17.75ms**／p90 **53ms**／max **140ms** ⇒ 月用量 **32%（calculations 視圖 38%）**，唔係天花板但餘裕只有 **2.6–3.2×**。GraphQL 嗰個 **21% 已退役**：佢用嘅 `cpuTimeP50` 實測落喺每分鐘嘅 ~p85（§4c），唔係 per-invocation 統計量 | ~~高~~ 完成 | 低 |
 | 3 | **cadence 天花板 = `rows written`**（唔係 tick 預算、唔係 subrequest） | 30s ＝ 30.1M/月（**60%** 額度；同日晚複讀 1.02M／日 → 30.7M／月 ＝ **61%**。兩者係同一個 24h 窗口移動，唔係矛盾）；20s ≈ 90%；15s ≈ 120%（≈$10/月） | 高（決策輸入） | 低（純算術） |
 | 4 | **寫入裁剪**（只為換 cadence 而做） | ⚠️ **唔可以照 KB 排**：額度數 **row**，14.6KB 同 40 bytes 都係 1 row。每 tick 固定嘅係 **~3 row**（`scan_heartbeat` 1 row／`tick_leg_slow` 1 row／`scan_history` 1 row）＝ **~8.6K row／日 ≈ 0.9%**，裁佢哋換唔到 cadence。真槓桿係**跟每 tick 觀察到嘅 token 而變**嘅寫入（`token_stats` 更新加佢個 partial index entry）——抽樣密啲就會**睇到多啲變化** | 中（係 #3 嘅前置） | 中（要逐 table 按 **row** 量，見 §8） |
 | 5 | D1 read replication / 搬去 DO / 加大存儲 / 砍 index | 全部**唔應該做**，理由見 §6 | 0 | — |
@@ -203,8 +203,10 @@ Mutation（把 `inlineWaitMs` 改返 `queueWaitMs`、重 build）：
    所以 §2 嘅請求餘裕由 ~55× 修正為 **18.7×**（0.53M 對 10M）。
 2. **break-even 唔係 165ms 而係 56ms。** 30,000,000 ÷ 533,760 ≈ **56ms／invocation**。
    「165ms」係用一個細 2.9× 嘅分母算出嚟嘅，把風險睇細咗。用返真分母，**實測仍然只係 21%**，
-   所以結論冇變 —— 但「有 4.8× 餘裕」而家係**量出嚟**，唔再係算術。（**但見 §4b**：
-   per-invocation 記錄讀到 27–46%，所以「4.8×」要收窄成 2–4×；21% 係兩個 dataset 之中樂觀嗰個。）
+   所以結論冇變 —— 但「有 4.8× 餘裕」而家係**量出嚟**，唔再係算術。（**但見 §4c**：
+   6.31M 等於攞一個「每分鐘分位數」乘 invocation 數，而同一個窗口逐分鐘對照顯示嗰個 `cpuTimeP50`
+   實際落喺同一分鐘自己嗰批記錄嘅 **~p85**；逐個 invocation 直接量到嘅係 mean 17.75ms ⇒ **32%**
+   （38% 用 calculations 視圖 21.39ms），所以「4.8×」要收窄做 **2.6–3.2×**。）
 
 ### §4b per-invocation 讀數（Workers Logs）—— 邊個 invocation 燒嘅 CPU
 
@@ -233,8 +235,8 @@ count／min／median／avg／max／p90／p99。同 `cf-invocations.mjs` 一樣�
 | 計數（calculations；樣本 interval **1.21** ⇒ 連 Workers Logs 都抽樣，數字係估計） | **n ≈ 103** |
 | min ／ median ／ avg | **1 ／ 15 ／ 25.76 ms** |
 | p90 ／ p99 ／ max | **70 ／ 131 ／ 133 ms** |
-| 推算月用量（avg × 533,760） | **13.7M ms ＝ 30M 嘅 46%** |
-| 推算月用量（median × 533,760） | **8.0M ms ＝ 30M 嘅 27%** |
+| 推算月用量（avg × 533,760） | 13.7M ms ＝ 46% —— **8 分鐘窗口，已被 §4c 嘅 33 分鐘複讀取代** |
+| 推算月用量（median × 533,760） | 8.0M ms ＝ 27% —— 同上 |
 
 **邊個 invocation 貴**：頭 15 名**全部**係 `fetch`、`outcome ok`、trigger `POST /internal/cron-relay`
 （即 tick 本體），cpu **133／131／112／112／111ms**，wall 1,697–3,238ms。按 eventType 分：
@@ -253,18 +255,72 @@ count／min／median／avg／max／p90／p99。同 `cf-invocations.mjs` 一樣�
 2. **spike 睇得到。** 月總量嘅讀數（§4a）睇唔到單一 invocation：呢個窗口 max **133ms**、p99 131ms。
    §4a 嘅每分鐘 `max.cpuTime`（p50 74.6ms、max 188.8ms）同呢度一致 —— 兩個 dataset 對**尾部**
    冇分歧。
-3. **21% 係樂觀嗰一端，餘裕要由「4.8×」收窄做 2–4×。** §4a 嘅 6.31M／月等於
-   **11.8ms／invocation**（6.31M ÷ 533,760），但 per-invocation 記錄直接讀到 **avg 25.8ms、
-   median 15ms** ⇒ **46%／27%**。兩個 dataset 對「典型值」差 2.2×、對尾部一致，最可能嘅解釋係
-   `cpuTimeP50` 係**每分鐘**嘅分位數（每分鐘只有 ~12 個 invocation，加上雲端 adaptive sampling），
-   唔係 per-invocation 平均。**方向唔變**（CPU 離天花板仍遠），但「唔逼近」嘅程度要用 2–4× 講。
-   （獨立交叉檢查：呢個窗口 **101 個／~8 分鐘 ≈ 12.8／分鐘**，對 §4a 嘅 **12.32／分鐘** ——
+3. **峰值一致、中間唔一致 —— 而且成因查清咗（§4c），唔係「21% 樂觀」咁簡單。** 同一個窗口逐分鐘對照：
+   兩邊嘅每分鐘 max **33 分鐘之中 30 分鐘一模一樣**（即係睇到同一批 invocation），但 GraphQL 每分鐘
+   `cpuTimeP50` 喺**同一分鐘自己嗰批記錄裡面嘅百分位**中位數係 **84.6%** —— 即係 Cloudflare 個「P50」
+   實際上係嗰分鐘嘅 **~p85**，唔係中位數。所以 §4a 嘅 21%（＝ 11.8ms／invocation）係一個分位數乘 invocation 數，
+   唔可以直接用；逐個 invocation 量到嘅係 mean **17.48ms**。
+   （獨立交叉檢查：呢個窗口 **475 個 group／~36 分鐘 ≈ 13.2／分鐘**，對 §4a 嘅 **12.32／分鐘** ——
    兩個 dataset 對 invocation 速率一致，即係 0.53M／月 呢個分母冇問題。）
 
-**限制**：窗口只有 **~8 分鐘**（Workers Logs 由 deploy 那一刻才入庫）—— 覆蓋 ~101 個 invocation、
-~8 個 tick 週期，未跨 deploy／cold start，亦未覆蓋重腳（Axiom／Birdeye backfill）。要一個跨整日嘅讀數，
-就係再 push 一次 `cf-worker-logs.yml`（path-scoped push 係 run 掣 —— read-only token 唔可以
-`workflow_dispatch`，會 403 `Resource not accessible by integration`）。
+**複讀（36 分鐘窗口）**：同一支探針再 push（run `38872589328`，窗口 07:16:35–08:16:35Z；
+Workers Logs 由 07:41:06 起入庫 ⇒ 有數據嘅係 **~36 分鐘**）—— 475 個 group（469 個帶
+`$workers.cpuTimeMs`），逐個 invocation **mean 17.75ms／median 6ms／p90 53ms／max 140ms**；
+calculations 視圖（n=403、sampleInterval 1.05）**median 10／avg 21.39／p90 56／p99 119／max 140 ms**；
+按 eventType：`fetch` **338**（mean 24.3、max 140）、`alarm` **57**（1.5）、`scheduled` **74**（0.2）。
+**即係第一次 8 分鐘嘅 25.8ms 係最貴嗰一端**（deploy 之後幾分鐘最貴），窗口一長就回落 —— 所以
+<30 分鐘嘅窗口唔應該用嚟外推月總量。
+
+**限制**：窗口只有 **~33 分鐘**（Workers Logs 由 deploy 那一刻才入庫）—— 未跨 deploy／cold start，
+亦未覆蓋重腳（Axiom／Birdeye backfill）。要一個跨整日嘅讀數，就係再 push 一次 `cf-worker-logs.yml`
+（path-scoped push 係 run 掣 —— read-only token 唔可以 `workflow_dispatch`，會 403
+`Resource not accessible by integration`）。
+
+### §4c 兩個 dataset 差 2.2× —— 已查清：`cpuTimeP50` 係 ~p85，唔係中位數
+
+**做法**：同一支探針、同一次 run 問兩個 dataset 同一個窗口 —— Workers Logs（`view: "invocations"`，逐個
+invocation 記錄）同 GraphQL `workersInvocationsAdaptive`（每分鐘一列：`quantiles.cpuTimeP50/P99`、
+`max.cpuTime`、`sum.requests`），然後**逐分鐘 join**。兩邊都有數據嘅係 **36 分鐘**（GraphQL 另外 25 分鐘
+係 deploy 之前，冇 per-invocation 記錄可以比）。
+
+**三個讀數**
+
+1. **兩邊對「峰值」完全一致。** GraphQL 每分鐘 `max.cpuTime` 同 Workers Logs 同一分鐘嘅 max，
+   喺 **36 分鐘之中 33 分鐘一模一樣**（±1ms 內；112.44／112、133.75／133、140.69／140、81.06／81 …；
+   3 分鐘唔對，係跨分鐘邊界 —— 07:59、08:01、同窗口最後一分鐘）。
+   單位唔同（GraphQL 係 **µs**、Logs 係 **ms**），換返 ms 就對得上 ⇒ 兩個 dataset 睇到嘅係**同一批
+   invocation、同一個 CPU 量**，唔係「一個計多一個計少」。
+2. **分歧喺「中間」，而且方向同原先嘅假設相反。** Cloudflare 每分鐘 `cpuTimeP50` 喺**同一分鐘自己嗰批
+   per-invocation 值裡面嘅百分位**：中位數 **84.6%**（最低 50%、最高 100%），當中 **1 分鐘佢等於該分鐘嘅 max**。
+   即係**「P50」實際上係嗰分鐘嘅 ~p85**：36 分鐘 join 嘅每分鐘 P50 係 **中位 30.25ms／平均 29.45ms**，
+   而同一批分鐘逐個 invocation 係 **median 6ms／mean 17.75ms** ⇒ 即係 **5.0× median、1.7× mean**，
+   而且**偏高**（唔係原先以為嘅偏低）。抽 7 分鐘睇（完整 36 行喺 run log）：
+
+   | minute (UTC) | gql requests | gql cpuP50 | logs n | logs median | logs p75 | logs p90 | logs max | P50 落喺 Logs 嘅 |
+   |---|---|---|---|---|---|---|---|---|
+   | 07:41 | 12 | **53.39** | 12 | 20 | 34 | 70 | 112 | 83% |
+   | 07:44 | 11 | **26.87** | 11 | 20 | 54 | 75 | 112 | 64% |
+   | 07:55 | 13 | **11.84** | 17 | 3 | 11 | 58 | 105 | 76% |
+   | 08:02 | 12 | 48.05 | 14 | 4.5 | 16 | 44 | 48 | **100%（＝該分鐘 max）** |
+   | 08:08 | 9 | **17.05** | 12 | 3 | 9 | 17 | 45 | 92% |
+   | 08:12 | 12 | **48.05** | 15 | 16 | 31 | 48 | 61 | 93% |
+   | 08:15 | 13 | **27.3** | 16 | 6 | 18 | 52 | 114 | 81% |
+
+3. **所以 §4a 嘅 21% 要退役。** 6.31M／月 → 11.8ms／invocation 係攞一個「每分鐘分位數」乘 invocation 數；
+   同一個窗口直接量到嘅逐個 invocation 統計係 mean **17.75ms**（calculations 視圖 **21.39ms**）／
+   median **6ms**（視圖 10ms）／p90 **53ms**（視圖 56ms）／max **140ms**。乘返 533,760：
+   **mean ⇒ 9.47M ms／月 ＝ 32%**、**calculations avg ⇒ 11.4M ＝ 38%**、median ⇒ 3.2M ＝ 11%（視圖 10ms ⇒ 18%）。
+   **結論方向唔變**（CPU 離天花板仍遠），但餘裕係 **2.6–3.2×**，唔係 4.8×，亦唔係第一次讀到嘅 46%。
+
+**Cloudflare 官方文件解答唔到呢件事**：`workersInvocationsAdaptive` 係 adaptive-sampled dataset
+（官方只講 quantiles 係估算、CPU 分位數用 reservoir sampling），**冇任何文檔**講佢點加權、或者點解
+讀出嚟似 p85 而唔係 median；亦冇文檔講 Workers Logs 嘅 `sampleInterval`（呢次 1.03）嘅抽樣同 CPU 有冇關係。
+所以上面嘅結論係**實測**（可重複：再 push 一次 `cf-worker-logs.mjs` 就再量一次），唔係引用官方定義。
+
+**仍然未解釋（呢個窗口分唔開）**：GraphQL 每分鐘 P50 嘅**水平**喺窗口內亦變過 —— 07:41 之前中位 ~12ms，
+之後 33 分鐘 ~30ms。個 step 啱啱就喺 deploy 前後，兩個可能：tick 負載真係重咗，或者**開 Workers Logs
+本身要 CPU**（每次寫 log 都要序列化／送出）。用現有數據**分唔開**（deploy 之前冇 per-invocation 記錄）；
+要分開就要一個冇 deploy 嘅長窗口複讀。
 
 **成本上限（不變）**：57 個 `console.log` 站點 × 0.53M invocation ＝ 病態情況 ~30M events／月
 （超 20M 額度），實況 tick 只出幾行、health poll 更少，即 ~1–2M／月；`head_sampling_rate` 就係旋鈕。
