@@ -18,7 +18,7 @@
 | 7 | D1 額度（rows written／read、queries、DB 大小） | 大量餘裕（寫入 57%） | 只記讀數（§4） |
 | 8 | read replication | `disabled` | 維持（§3.3） |
 | 9 | Time Travel（唯一 DR 路徑） | **有 bookmark**，即係可以還原 | 記落嚟（§5.1） |
-| 10 | 一個 tick 出幾多句 statement（vs D1 嘅 per-invocation 上限） | **冇讀數**（只有 24h 平均可以推） | **新增儀器**（§2.4）＋測試 |
+| 10 | 一個 tick 出幾多句 statement（vs D1 嘅 per-invocation 上限） | **冇讀數**（只有 24h 平均可以推） | **新增儀器**（§2.4）＋測試；deploy 後量到 **15–27 句／tick**（§5.4） |
 | 11 | `npm test`（`scripts/test-filters.js`）可不可以安全咁跑 DB 階段 | **之前只可以：跳過，或寫凍結 archive** | **新增 local 模式**（§3.4），今日實跑 |
 | 12 | `subs`（`subreqView`）數唔數到 D1 call | **數唔到**（只數 `fetch`；D1 call 唔係 fetch），Paid 額度文件係 10,000 而 repo 常數係 1,000 | 記落嚟，未改（§3.5） |
 
@@ -190,7 +190,7 @@ Cloudflare 文件的事實（查證日期 2026-10-16）：
 | 100 bound params／statement | 六個 writer 切到 ≤100；reader 最長 26 | —— |
 | 100 KB SQL 文字／statement（唔包 parameter） | 最大 shape 係 chunk 後嘅 INSERT（`d1-migration` §2 有逐個列） | —— |
 | 2 MB／value 或 row | `worker_state` 最大 33 KB（push-audit ring） | ~60× |
-| 1,000 queries／invocation（Paid） | **~75 句／tick**（216,643 queries／24h ÷ 2,880 ticks，平均上界；deploy 後改讀 `tick-legs.dbStmts`，per-tick） | ~13× |
+| 1,000 queries／invocation（Paid） | **15–27 句／tick（實測，§5.4）**；24h rollup 嘅平均上界係 ~75（216,643 queries ÷ 2,880 ticks，包所有 invocation） | 37–67× |
 | 30 秒／batch | 一個 batch 係 1 個請求，15–55ms 級 | —— |
 | 50M rows written／月 | 954,630／日 → **~57%** 額度 | 1.75× |
 | 25B rows read／月 | 13.9M／日 → **~1.7%** 額度 | 59× |
@@ -221,9 +221,30 @@ Commit `00a2637`（run 38843036295：`migrate`／`deploy`／`catchup` 全 succes
   03:02:00Z ＝ **82ms** ✅。
 - 寫入路徑冇壞：`scan_history` 最新三行 03:01:11Z／03:01:34Z／03:02:00Z（tick 每 ~25–30s 完成 flush）。
 
-### 5.4 §2.4 嘅新儀器要下一次 deploy 才讀得到
-`dbStmts`／`dbCalls`／`dbStatements` 係新增欄位：deploy 之後嘅驗收讀數係
-`/debug/tick-legs` 任何一行有 `dbStmts`（非 null），而同一個回應嘅 `/health.dbStatements.stmts` 會隨時間上升。
+### 5.4 §2.4 嘅新儀器：deploy 之後嘅實測（commit `ebbe9ff`，run 38844968920，deploy 完 03:22:42Z）
+
+**`/debug/tick-legs`（每個 tick 由 entry 到收尾嘅 delta；03:2x–03:3xZ）**
+
+| tick（完成時間） | ms | `dbStmts` | `dbCalls` | `dbMs` | `subs` | profiles | via |
+|---|---|---|---|---|---|---|---|
+| 03:23:02Z | 2,830 | **27** | 12 | 171 | 11 | 22 | cron |
+| 03:30:01Z | 2,499 | **22** | 10 | 253 | 10 | 22 | cron |
+| 03:35:59Z | 3,191 | **15** | 9 | 155 | 11 | 23 | clock |
+
+即係一個 scan tick ＝ **15–27 句 statement／9–12 個 request**，大概 **2 句一個 request**（chunk 之後嘅 batch 形狀，同 `runChunked` 嘅設計一致）。
+對 D1 嘅 **1,000 queries／invocation** 係 **37–67× 餘裕**；`dbMs` 155–253ms／tick 亦貼合 §5.3 嘅 placed 路徑讀數。
+
+**`/health.dbStatements`（per-isolate 窗口，兩個不同 isolate）**
+
+| 時間 | isolate 窗口 | stmts | calls | scanCount |
+|---|---|---|---|---|
+| 03:40:39Z | 187s | 55 | 24 | 0（還未 tick） |
+| 03:40:59Z | 1,081s | 326 | 135 | 4 |
+
+窗口包住該 isolate 嘅**全部**請求（`/health`、`/debug` 讀、tick 都算），所以呢個係「這個 isolate 用咗幾多句」而不是 per-tick；
+per-tick 嘅口徑係上面嘅 delta。
+
+**同場對照**：`dbStore` 仍然 `"d1"`、`dbMs > 0`、`scan_history` 最新行仍然緊貼（§5.3）；`subs` 9–11（見 §3.5 —— 佢唔包 D1 call，所以同 `dbCalls` 唔可以直接相加比較）。
 
 ## 6. 限制（唔可以當過）
 
@@ -236,7 +257,8 @@ Commit `00a2637`（run 38843036295：`migrate`／`deploy`／`catchup` 全 succes
 - **`npm test`（`scripts/test-filters.js`）今次真跑過**（§3.4，local 模式，exit 0）：
   phase 1／2／3 全行，寫入路徑（註冊、DDL、`runOnce`）真跑。**archive 模式仍然只可以明加
   `--allow-archive-write`**，而嗰條路今次**冇跑** —— 即係「寫凍結 archive」嘅路徑依然未驗。
-- **queries／tick 由 deploy 之後改讀 per-tick 嘅 `dbStmts`**（§2.4）；今日嘅 ~75 係 24 小時平均上界。
+- **queries／tick 由 deploy 之後改讀 per-tick 嘅 `dbStmts`**（§2.4）：實測 **15–27 句**（§5.4），而 ~75 係 24 小時平均上界（包所有 invocation）。
+  但 §5.4 嘅樣本係**一個 isolate 嘅 3 個 tick**，唔係全 fleet 統計 —— 要一概分佈就要等 ring 累積或者讀 D1 側。
 - **`subs` 讀數偏低**：D1 call 唔經 `fetch`，所以 `subreqView()` 數唔到（§3.5）；未改，因為它係決策輸入。
 - **D1 單線程**：一個 tick 內多個請求會排隊，所以單次 call 嘅 `max` 唔代表成本（睇每 tick 加總）。
 - 樣本細：`/debug/db-latency` 每個 op 5 個 sample，`tick-legs` 5 個 tick。
