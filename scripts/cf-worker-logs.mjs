@@ -591,18 +591,40 @@ if (gqlNote) {
   }
 
   const logCpu = rows.map((r) => r.cpuTimeMs);
+  /**
+   * The JOINED set, not the whole window. The two sources cover different
+   * minutes here (Workers Logs only starts at the deploy), so "median across
+   * minutes" over every GraphQL bucket is a statistic about a different set of
+   * minutes than the Logs mean — which is the exact mistake that produced the
+   * original 21% figure: two numbers that were never the same measurement,
+   * compared anyway. Anything quoted as a ratio is therefore computed on the
+   * minutes BOTH sources have, and the whole-window figure is printed beside it
+   * only so the difference is visible.
+   */
+  const joinedP50s = bothMinutes.map((m) => gqlByMinute.get(m).p50 / 1000);
+  const joinedLogCpu = bothMinutes.flatMap((m) => logByMinute.get(m).cpu);
 
   say("");
   say("### the two statistics, side by side");
   say("");
   say("| statistic | value |");
   say("|---|---|");
-  say(`| GraphQL minute buckets in the window | ${gqlByMinute.size} |`);
-  say(`| GraphQL requests summed over those minutes | ${gqlRequests} |`);
-  say(`| GraphQL cpuP50 — **median across minutes** | ${ms(median(gqlP50s))} ms |`);
-  say(`| GraphQL cpuP50 — **mean across minutes** | ${ms(mean(gqlP50s))} ms |`);
-  say(`| Logs per-invocation **median** | ${ms(median(logCpu))} ms |`);
-  say(`| Logs per-invocation **mean** | ${ms(mean(logCpu))} ms |`);
+  say(
+    `| GraphQL minute buckets in the window | ${gqlByMinute.size}` +
+      ` (${bothMinutes.length} of them shared with Workers Logs) |`,
+  );
+  say(`| GraphQL requests summed over those buckets | ${gqlRequests} |`);
+  say(`| GraphQL cpuP50 — median across ALL buckets | ${ms(median(gqlP50s))} ms |`);
+  say(`| GraphQL cpuP50 — mean across ALL buckets | ${ms(mean(gqlP50s))} ms |`);
+  say(`| GraphQL cpuP50 — **median across the JOINED minutes** | ${ms(median(joinedP50s))} ms |`);
+  say(`| GraphQL cpuP50 — **mean across the JOINED minutes** | ${ms(mean(joinedP50s))} ms |`);
+  say(`| Logs per-invocation **median** (joined minutes) | ${ms(median(joinedLogCpu))} ms |`);
+  say(`| Logs per-invocation **mean** (joined minutes) | ${ms(mean(joinedLogCpu))} ms |`);
+  say(`| Logs per-invocation median (whole window, for reference) | ${ms(median(logCpu))} ms |`);
+  say(`| Logs per-invocation mean (whole window, for reference) | ${ms(mean(logCpu))} ms |`);
+  say(
+    `| Logs records in the joined minutes | ${joinedLogCpu.length} of ${rows.length} |`,
+  );
   say(
     `| GraphQL per-minute P50's **rank inside the same minute's records** ` +
       `(median across minutes; 50% would mean both report the median) | ` +
@@ -613,15 +635,17 @@ if (gqlNote) {
   );
   say("");
   say(
-    `LIKE FOR LIKE — per-minute median vs per-invocation median: ` +
-      `${ms(median(gqlP50s))} ms vs ${ms(median(logCpu))} ms ` +
-      `(${ms((median(logCpu) ?? 0) / (median(gqlP50s) || 1))}x); ` +
-      `per-invocation mean vs per-invocation median (the heavy tail): ` +
-      `${ms(mean(logCpu))} ms vs ${ms(median(logCpu))} ms ` +
-      `(${ms((mean(logCpu) ?? 0) / (median(logCpu) || 1))}x). ` +
-      `Those two are different questions: the first is whether the datasets agree, ` +
-      `the second is why a monthly figure built from a median-like series and a ` +
-      `mean land 2x apart.`,
+    `LIKE FOR LIKE, joined minutes only — GraphQL's per-minute P50 series: ` +
+      `${ms(median(joinedP50s))} ms median / ${ms(mean(joinedP50s))} ms mean; ` +
+      `the Workers Logs records in those same minutes: ` +
+      `${ms(median(joinedLogCpu))} ms median / ${ms(mean(joinedLogCpu))} ms mean. ` +
+      `So per-minute median vs per-invocation median is ` +
+      `${ms((median(joinedLogCpu) ?? 0) / (median(joinedP50s) || 1))}x, and ` +
+      `per-minute median vs per-invocation mean is ` +
+      `${ms((mean(joinedLogCpu) ?? 0) / (median(joinedP50s) || 1))}x. ` +
+      `Those are different questions: one is whether the datasets agree, the ` +
+      `other is why a monthly figure built from a median-like series and a ` +
+      `per-invocation mean land ~2x apart.`,
   );
   say(
     `THE RANK IS THE ANSWER TO \"WHY DO THEY DISAGREE\": GraphQL's per-minute ` +
