@@ -259,7 +259,7 @@ count／min／median／avg／max／p90／p99。同 `cf-invocations.mjs` 一樣�
    兩邊嘅每分鐘 max **33 分鐘之中 30 分鐘一模一樣**（即係睇到同一批 invocation），但 GraphQL 每分鐘
    `cpuTimeP50` 喺**同一分鐘自己嗰批記錄裡面嘅百分位**中位數係 **84.6%** —— 即係 Cloudflare 個「P50」
    實際上係嗰分鐘嘅 **~p85**，唔係中位數。所以 §4a 嘅 21%（＝ 11.8ms／invocation）係一個分位數乘 invocation 數，
-   唔可以直接用；逐個 invocation 量到嘅係 mean **17.48ms**。
+   唔可以直接用；逐個 invocation 量到嘅係 mean **17.75ms**。
    （獨立交叉檢查：呢個窗口 **475 個 group／~36 分鐘 ≈ 13.2／分鐘**，對 §4a 嘅 **12.32／分鐘** ——
    兩個 dataset 對 invocation 速率一致，即係 0.53M／月 呢個分母冇問題。）
 
@@ -271,7 +271,7 @@ calculations 視圖（n=403、sampleInterval 1.05）**median 10／avg 21.39／p9
 **即係第一次 8 分鐘嘅 25.8ms 係最貴嗰一端**（deploy 之後幾分鐘最貴），窗口一長就回落 —— 所以
 <30 分鐘嘅窗口唔應該用嚟外推月總量。
 
-**限制**：窗口只有 **~33 分鐘**（Workers Logs 由 deploy 那一刻才入庫）—— 未跨 deploy／cold start，
+**限制**：窗口只有 **~36 分鐘**（Workers Logs 由 deploy 那一刻才入庫）—— 未跨 deploy／cold start，
 亦未覆蓋重腳（Axiom／Birdeye backfill）。要一個跨整日嘅讀數，就係再 push 一次 `cf-worker-logs.yml`
 （path-scoped push 係 run 掣 —— read-only token 唔可以 `workflow_dispatch`，會 403
 `Resource not accessible by integration`）。
@@ -314,11 +314,11 @@ invocation 記錄）同 GraphQL `workersInvocationsAdaptive`（每分鐘一列�
 
 **Cloudflare 官方文件解答唔到呢件事**：`workersInvocationsAdaptive` 係 adaptive-sampled dataset
 （官方只講 quantiles 係估算、CPU 分位數用 reservoir sampling），**冇任何文檔**講佢點加權、或者點解
-讀出嚟似 p85 而唔係 median；亦冇文檔講 Workers Logs 嘅 `sampleInterval`（呢次 1.03）嘅抽樣同 CPU 有冇關係。
+讀出嚟似 p85 而唔係 median；亦冇文檔講 Workers Logs 嘅 `sampleInterval`（呢幾次 1.03–1.21）嘅抽樣同 CPU 有冇關係。
 所以上面嘅結論係**實測**（可重複：再 push 一次 `cf-worker-logs.mjs` 就再量一次），唔係引用官方定義。
 
 **仍然未解釋（呢個窗口分唔開）**：GraphQL 每分鐘 P50 嘅**水平**喺窗口內亦變過 —— 07:41 之前中位 ~12ms，
-之後 33 分鐘 ~30ms。個 step 啱啱就喺 deploy 前後，兩個可能：tick 負載真係重咗，或者**開 Workers Logs
+之後 36 分鐘 ~30ms。個 step 啱啱就喺 deploy 前後，兩個可能：tick 負載真係重咗，或者**開 Workers Logs
 本身要 CPU**（每次寫 log 都要序列化／送出）。用現有數據**分唔開**（deploy 之前冇 per-invocation 記錄）；
 要分開就要一個冇 deploy 嘅長窗口複讀。
 
