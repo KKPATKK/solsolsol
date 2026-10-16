@@ -67,8 +67,32 @@
  * They are deliberately left at their sizes rather than re-scaled: a reserve
  * that cannot bind costs nothing, while re-scaling them would re-arm exactly
  * the refusals the wider allowance exists to remove.
+ *
+ * CORRECTED 2026-10-16 — THE PAID DEFAULT IS 10,000, NOT 1,000. The 1,000 was
+ * read off the Workers limits table in its pre-2026 form; Cloudflare's current
+ * page (developers.cloudflare.com/workers/platform/limits) reads
+ *
+ *     Subrequests per invocation        50         10,000 (up to 10M)
+ *     Subrequests to internal services  1,000      Matches configured limit
+ *                                                  (default 10,000)
+ *
+ * — i.e. BOTH rows answer 10,000 on this plan, and D1 is named in the page's
+ * own definition of a subrequest ("any request a Worker makes using the Fetch
+ * API or to Cloudflare services like R2, KV, or D1"). `wrangler.toml` sets no
+ * `[limits] subrequests`, so the documented default is the fact here; if that
+ * config is ever added, this constant must move with it (the wrangler field is
+ * `[limits] subrequests`, and the docs' own example configures a value BELOW
+ * the default, so pinning one is possible).
+ *
+ * WHY THE CHANGE IS BEHAVIOURALLY INERT, which is why it was safe to make: every
+ * gate listed above is an absolute constant (TRACKER_SUBREQ_FLOOR 3,
+ * TRACKER_SUBREQ_RESERVE 6, TRACKER_MAINTENANCE_SUBREQ_FLOOR 9, the scan's own
+ * floors), and the measured spend is tens — a tick reads `subs` 9-11 plus its
+ * D1 calls, so it is nowhere near EITHER number. Raising the budget does not
+ * re-arm a dropped call; it makes the reading stop claiming a ceiling ten times
+ * lower than the platform's.
  */
-export const SUBREQ_BUDGET = 1_000;
+export const SUBREQ_BUDGET = 10_000;
 /**
  * The Workers Free allowance (50) this counter was designed against. Kept as
  * the REFERENCE for every reading taken before 2026-09-28: /health and the
@@ -107,6 +131,15 @@ export const SUBREQ_BUDGET_FREE = 50;
  * ONE constant, moved by measurement: every occurrence now reports its own
  * number in the err note, so the next one re-sizes this without any further
  * instrumentation.
+ *
+ * 2026-10-16, AFTER THE D1 CUTOVER: the measurement above was taken while the
+ * store was Turso, whose calls came through the wrapped global `fetch` and were
+ * therefore counted. D1 is a BINDING — no fetch at all — so the seam this
+ * reserve existed for had silently grown by a whole store, ~8-12 calls a tick
+ * (measured: TickLegRow.dbCalls). Those calls are now counted at their own seam
+ * (see src/d1.ts), which is why this constant stays where the measurement put
+ * it instead of being reduced on a theory: it is a size, and the only thing
+ * that may re-size it is the next refusal that reports its own number.
  */
 export const SUBREQ_UNSEEN_ALLOWANCE = 12;
 
@@ -304,15 +337,23 @@ export function beginSubreqWindow(
  * the same discipline the Birdeye CU ledger uses (an attempt that is billed is
  * counted whether or not it lands), because a request the runtime refuses
  * mid-flight was still an attempt.
+ *
+ * `host` is the EXPLICIT label for a call that has no URL to parse: a D1
+ * binding call is a subrequest to a Cloudflare service (the Workers limits page
+ * names D1 in its own definition) but it carries no hostname, and passing it
+ * through `hostOf` would have filed every one of them under `(unknown)` beside
+ * genuinely unparseable targets. See src/d1.ts, which counts one per binding
+ * call — ONE per `execute`/`batch`, because that is one call to the service
+ * however many statements ride inside it.
  */
-export function countSubreq(input?: unknown): void {
+export function countSubreq(input?: unknown, host?: string): void {
   current.total += 1;
-  const host = hostOf(input);
-  const seen = current.hosts.get(host);
+  const label = host ?? hostOf(input);
+  const seen = current.hosts.get(label);
   if (seen !== undefined) {
-    current.hosts.set(host, seen + 1);
+    current.hosts.set(label, seen + 1);
   } else if (current.hosts.size < SUBREQ_HOST_TRACK_MAX) {
-    current.hosts.set(host, 1);
+    current.hosts.set(label, 1);
   } else {
     current.hosts.set(SUBREQ_OTHER_HOST, (current.hosts.get(SUBREQ_OTHER_HOST) ?? 0) + 1);
   }

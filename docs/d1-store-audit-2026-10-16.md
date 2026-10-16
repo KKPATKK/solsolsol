@@ -11,7 +11,7 @@
 |---|---|---|---|
 | 1 | 形狀翻譯（`meta.changes`→`rowsAffected`、batch 全有全無、`SELECT/WITH/PRAGMA` 走 `all()`） | **完好**（live `changes` 自我校正 `verdict: verified`） | 已有測試守，唔改 |
 | 2 | 100 bound-param 上限：六個 **writer** 已按 `paramLimit()` 切 | 完好（每句 ≤ 100，仍然一個請求） | 已有測試守 |
-| 3 | 同一上限：**reader** 嘅 `IN (?,?,…)` 清單（`getTokenStatsMany` 等）冇切 | **今日安全**：實測每 tick 只有 **24–26** 個 token（上限 100） | 記界線（§3.1），唔改 |
+| 3 | 同一上限：**reader** 嘅 `IN (?,?,…)` 清單（`getTokenStatsMany` ／ `getHolderClusters`）冇切 | 今日安全（24–26 個 token），但係「配置一改就爆」嘅形狀 | **已修**（§2.5）：過 ceiling 切 statement、仍然一個請求 |
 | 4 | `diag.dbMs`（`/debug/tick-legs` 嘅 `dbMs`） | **喺 D1 係死嘅：每個 tick 都答 `0`** | **已修**（§2.1）＋新測試 |
 | 5 | `/health` 講唔講「而家用邊個 store」 | **唔講**（只有 `/debug/db-latency` 講） | **已修**（§2.2）＋新測試 |
 | 6 | `claimTokenPush` **輸**咗要答 `false`（D1 翻譯嘅反向） | **冇任何測試釘** | **已加測試**（§2.3） |
@@ -20,7 +20,7 @@
 | 9 | Time Travel（唯一 DR 路徑） | **有 bookmark**，即係可以還原 | 記落嚟（§5.1） |
 | 10 | 一個 tick 出幾多句 statement（vs D1 嘅 per-invocation 上限） | **冇讀數**（只有 24h 平均可以推） | **新增儀器**（§2.4）＋測試；deploy 後量到 **15–27 句／tick**（§5.4） |
 | 11 | `npm test`（`scripts/test-filters.js`）可不可以安全咁跑 DB 階段 | **之前只可以：跳過，或寫凍結 archive** | **新增 local 模式**（§3.4），今日實跑 |
-| 12 | `subs`（`subreqView`）數唔數到 D1 call | **數唔到**（只數 `fetch`；D1 call 唔係 fetch），Paid 額度文件係 10,000 而 repo 常數係 1,000 | 記落嚟，未改（§3.5） |
+| 12 | `subs`（`subreqView`）數唔數到 D1 call；`SUBREQ_BUDGET` 對唔對得上平台 | **數唔到**（只數 `fetch`）；常數 1,000 vs 文件 10,000 | **已修**（§2.6）：D1 call 每個計 1（host `d1`）、常數改 10,000 連引用 |
 
 ## 1. 現況讀數（2026-10-16 02:4x–02:5xZ，全部現讀）
 
@@ -115,9 +115,52 @@ D1 自己嘅 24 小時 rollup，所以「一個 tick 會唔會撞到 D1 嘅 per-
 ＝ 3 條／1 request、string 形 batch 同樣計數、`/health` 同 ring 嘅接線要存在、baseline 一定要 lazy）；
 `scripts/test-tick-legs.js` 釘住 ring row 真係帶 `dbStmts`／`dbCalls`。
 
+### 2.5 reader 嘅 `IN (?)` 清單：過 ceiling 就切，但仍然一個請求
+§3.1 嘅診斷（10-15 嗰次只做咗 writer，讀者冇）已修：新增 `Db.readChunkedList()`（`runChunked` 嘅讀版本），
+兩個由**呼叫者數據**驅動嘅 reader 已接上——
+
+| reader | 今日實測 | 接上之後 |
+|---|---|---|
+| `getTokenStatsMany(tokens)` | feed 24–26 個 token | 250 個 token → **3 句（100/100/50）一個 request** |
+| `getHolderClusters(owners, …)` | 每張卡一包 holders（~10），另有 1 個 wallet 呼叫 | 120 個 owner ＋ 自己 2 個 binding → **2 句（98/22）一個 request** |
+
+規則同 writer 一樣：**天花板切 statement，唔切請求**（一個 `batch()`）；而**放得落就完全唔變**
+（`chunks.length === 1` → 原本嗰個單句 `execute`），所以 libsql 側（limit 32,766）profile 一格都冇動。
+**測試**（`scripts/test-d1-transport.js`）：
+`Db on D1: a list-shaped READ wider than the ceiling still runs in ONE request`（250 token ／ 120 owner；
+亦釘住 40 個 token 仍然係單句），同 libsql 側嘅 `250 token 仍然係一句 250-parameter 嘅 execute()`。
+fake binding 本身會 enforce D1 嘅 100-param 規則（同一檔案早一段嘅測試釘住），即係修之前這條測試會直接 throw。
+唔接嘅剩低係**內部常數**清單（`getWorkerStates`／`readScanFront`／`readHealthFront`／`readPostScanTelemetry`
+嘅 state keys 5–12 個、`seenChatIds` 嘅 enabled chats），因為它們唔係 caller 數據；到有人把它們變成
+可成長嘅輸入時，同一個 helper 就係接法。
+
+### 2.6 `subs` 數唔到 D1 call（而 Paid 額度文件係 10,000，唔係 1,000）
+§3.5 嘅診斷已修，兩件：
+1. **D1 binding call 現在計入 subrequest 窗口**（`src/d1.ts` 嘅 `countD1Call` → `countSubreq(undefined, "d1")`）：
+   `execute`／`batch` 各計 **1**，因為一個 batch 係「one call to the database」而句數另計（§2.4）。
+   喺發出之前計，跟 `countSubreq` 嘅 attempt-not-result 紀律。host split 會見到 **`d1`** 這一行。
+2. **`SUBREQ_BUDGET` 1,000 → 10,000**，引 Cloudflare 現行 limits 頁（2026-10-16 讀）：
+   `Subrequests per invocation 50 | 10,000 (up to 10M)`、`Subrequests to internal services 1,000 | Matches configured limit (default 10,000)`，
+   而同頁嘅定義原文係「A subrequest is any request a Worker makes using the Fetch API **or to Cloudflare services like R2, KV, or D1**」。
+   `wrangler.toml` 冇 `[limits] subrequests`，所以文件默認值就係事實；若日後加王這行 config（wrangler 嘅欄位名就係 `[limits] subrequests`，文件示例甚至設一個**低於默認**嘅值），這個常數要一齊改。
+   **為何改得安全**：所有花費於此嘅 gate 都是**絕對常數**（`TRACKER_SUBREQ_FLOOR` 3、`TRACKER_SUBREQ_RESERVE` 6、
+   `TRACKER_MAINTENANCE_SUBREQ_FLOOR` 9、scan 自己嘅 floors），而實測花費係「幾十」，兩個數字都遠離；
+   所以它只係把一個偏低十倍嘅**讀數**改正，冇重新啟動任何被砍嘅呼叫。
+   `SUBREQ_UNSEEN_ALLOWANCE = 12` **故意不動**：它係量度出嘅大小（2026-09-24，當時嘅 store 係 Turso，
+   經 fetch，所以嗰個 gap 唔係 D1），而唯一可以重訂它嘅係下一次拒絕自己報出嘅數字。
+
+**測試**：`scripts/test-unit.js` — `subreqs: the budget and the ring sizes are the platform facts`（10,000，連引用）、
+`subreqs: a D1 binding call is a subrequest — the seam fetch cannot see`（execute＋batch ＝ 2，唔係 4；hosts 係 `d1` 唔係 `unknown`）。
+Mutation 實測（拆走 `countD1Call()`、重 build）：
+
+```
+❌ subreqs: a D1 binding call is a subrequest — the seam fetch cannot see:
+   execute + batch = two binding calls, not four        → 550 passed, 1 failed
+```
+
 ## 3. 檢查過但**唔改**（連理由）
 
-### 3.1 reader 嘅 `IN (?)` 清單冇按 `paramLimit()` 切
+### 3.1 reader 嘅 `IN (?)` 清單唔按 `paramLimit()` 切 —— **已修，見 §2.5**（下面保留診斷）
 `getTokenStatsMany(tokens)`（一個 `?` 一個 token）、`getHolderClusters(owners)`、`getWorkerStates(keys)`、
 `readScanFront(stateKeys)`、`readHealthFront(keys)`、`readPostScanTelemetry(stateKeys)`、`seenChatIds` 子句
 都係「清單幾長就綁幾個 parameter」。D1 每句上限 100，libsql 係 32,766 —— 即係呢批讀者係**切換帶入**嘅新風險面，
@@ -128,8 +171,8 @@ D1 自己嘅 24 小時 rollup，所以「一個 tick 會唔會撞到 D1 嘅 per-
 **幾時會爆**：`PUMPFUN_PROFILE_LIMIT` 可以設到 300（`src/config.ts`），或者多條 feed 疊加令
 `feedProfiles` 嘅 union 過 100。爆嘅形狀係 `getTokenStatsMany` throw →
 caller 已經有 catch（`diag.dbDegraded = "stats-read"`，跳過**整個 tick** 嘅註冊）——
-即係「唔會壞資料，但新幣喺 densest ticks 會靜靜地唔入 pool」。所以呢條係**配置界線**，唔係今日嘅 bug；
-如果日後要調高 feed 上限，呢個係要一齊切嘅位。
+即係「唔會壞資料，但新幣喺 densest ticks 會靜靜地唔入 pool」—— 即係上面嘅出口係「配置界線」，唔係「今日安全」。
+所以它今次就切了（§2.5），而不是等 feed 上限先改。
 
 ### 3.2 `writeCensus` 唔可以用嚟量 statement 數（所以另加一個 counter，見 §2.4）
 佢係 **per-isolate**（module scope）而且**只計 `rowsAffected > 0` 嘅 statement**，所以「一個 tick 出幾多句」
@@ -164,7 +207,7 @@ caller 已經有 catch（`diag.dbDegraded = "stats-read"`，跳過**整個 tick*
   `seen_tokens` 清理後 0 行。（`scan_history` 0 行係預期：完成 flush 係 worker 嘅工作，唔係 scanner 的。）
 - **archive 冇碰**：這條 run 只連本地 file（URL／TOKEN 根本冇傳過）。
 
-### 3.5 未修但已查實：`subreqView`（`subs`）而家數唔到 D1 call
+### 3.5 `subreqView`（`subs`）數唔到 D1 call —— **已修，見 §2.6**（下面保留查證來源）
 `src/subreqs.ts` 只數 global `fetch`，而 **D1 binding call 唔係 fetch** —— 所以切換之後
 `/debug/tick-legs` 嘅 `subs` 由 Turso 年代嘅 ~29–39 跌到 **9–11**，減嘅正好係 DB 嘅份額。
 
@@ -258,7 +301,14 @@ per-tick 嘅口徑係上面嘅 delta。
   phase 1／2／3 全行，寫入路徑（註冊、DDL、`runOnce`）真跑。**archive 模式仍然只可以明加
   `--allow-archive-write`**，而嗰條路今次**冇跑** —— 即係「寫凍結 archive」嘅路徑依然未驗。
 - **queries／tick 由 deploy 之後改讀 per-tick 嘅 `dbStmts`**（§2.4）：實測 **15–27 句**（§5.4），而 ~75 係 24 小時平均上界（包所有 invocation）。
+- **§2.5／§2.6 未 deploy**：reader 分切、D1 subrequest 計數同 `SUBREQ_BUDGET` 只到「代碼＋測試」級（typecheck 過、
+  `test-d1-transport` 12、`test-unit` 551）；live 驗收讀數：`/health.heartbeat.subreqs.budget === 10000`、
+  `hosts` 有 `d1` 一行、而 `subs` 由 9–11 升到「加埋 D1 call」嘅水平。
   但 §5.4 嘅樣本係**一個 isolate 嘅 3 個 tick**，唔係全 fleet 統計 —— 要一概分佈就要等 ring 累積或者讀 D1 側。
-- **`subs` 讀數偏低**：D1 call 唔經 `fetch`，所以 `subreqView()` 數唔到（§3.5）；未改，因為它係決策輸入。
+- **`subs` 已經包 D1 call**（§2.6），但 `SUBREQ_UNSEEN_ALLOWANCE = 12` **故意冇動**：它係 2026-09-24（Turso 年代）量到嘅大小，
+  唯一可以重訂它嘅係下一次拒絕自己報出嘅數字。而 `SUBREQ_BUDGET = 10,000` 嘅改動**係 inert 嘅**，因為所有 gate 都係絕對常數
+  —— 但這也意味着「tick 用得幾多」現在才第一次讀得準（實測極少，~10 個 D1 call + ~10 個 fetch）。
+- **reader 分切只接了兩個由 caller 數據驅動嘅**（§2.5）；其餘 state-key／chat-id 清單仍是單句，這是刻意，
+  但也是「它們一旦變成可成長嘅輸入就同樣會爆」嘅已知界線。
 - **D1 單線程**：一個 tick 內多個請求會排隊，所以單次 call 嘅 `max` 唔代表成本（睇每 tick 加總）。
 - 樣本細：`/debug/db-latency` 每個 op 5 個 sample，`tick-legs` 5 個 tick。

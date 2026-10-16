@@ -58,9 +58,40 @@
  * live via /health (`dbTickSteps`, `writeCensus`).
  */
 import type { Row } from "@libsql/client/web";
+import { countSubreq } from "./subreqs";
 
 /** D1's documented bound-parameter ceiling for ONE statement. */
 export const D1_MAX_BOUND_PARAMS = 100;
+
+/**
+ * The host label binding calls carry in the subrequest split (see countSubreq).
+ *
+ * WHY THIS MODULE HAS TO COUNT AT ALL (2026-10-16). `src/subreqs.ts` counts the
+ * global `fetch`, and the Workers limits page defines a subrequest as "any
+ * request a Worker makes using the Fetch API or to Cloudflare services like R2,
+ * KV, or D1" — so a D1 binding call IS one, is charged against the invocation
+ * by the runtime, and had no counter at all after the 2026-10-15 cutover: the
+ * tick-legs `subs` fell from the Turso-era 29-39 to 9-11, and the difference was
+ * exactly the database. The reading is what the tick's own gates consult
+ * (`subreqRemaining`), so it has to cover every seam that spends the budget.
+ *
+ * COUNTED HERE, NOT IN Db: this is the place that knows a call is being issued
+ * to the service, and it counts ONE per `execute`/`batch` — a batch is one call
+ * however many statements it carries (D1 documents `batch` as "multiple SQL
+ * statements inside a single call to the database"), while the STATEMENTS a
+ * tick issues are counted separately for D1's own query allowance (see
+ * Db.dbStatementView).
+ */
+export const D1_SUBREQ_HOST = "d1";
+
+/**
+ * One binding call = one subrequest, counted BEFORE it is issued: the same
+ * attempt-not-result discipline `countSubreq` documents, because a call the
+ * runtime refuses mid-flight was still an attempt.
+ */
+function countD1Call(): void {
+  countSubreq(undefined, D1_SUBREQ_HOST);
+}
 
 /**
  * The part of a D1 result `Db` reads. Mirrors the binding's shape without
@@ -146,12 +177,14 @@ export function createD1Transport(d1: D1DatabaseLike): D1Transport {
     async execute(stmt) {
       const prepared = prepare(d1, stmt);
       const sql = typeof stmt === "string" ? stmt : stmt.sql;
+      countD1Call();
       return normalizeD1Result(
         RETURNS_ROWS.test(sql) ? await prepared.all() : await prepared.run(),
       );
     },
     async batch(stmts) {
       if (stmts.length === 0) return [];
+      countD1Call();
       const results = await d1.batch(stmts.map((s) => prepare(d1, s)));
       return results.map((r) => normalizeD1Result(r));
     },

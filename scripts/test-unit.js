@@ -19370,12 +19370,19 @@ async function main() {
   // ---------- Subrequest counter (src/subreqs.ts) ----------
 
   await test("subreqs: the budget and the ring sizes are the platform facts", async () => {
-    // 1,000 subrequests per invocation is the Workers Paid allowance the
-    // Worker runs on since 2026-09-28, and the number every reading in
-    // /health.heartbeat.subreqs is spent against; the runtime's throw is what
-    // kills a tick before its completion flush, and at this size what a tick
-    // drops is decided by the scan's own floors rather than by the platform.
-    assert.equal(SUBREQ_BUDGET, 1_000);
+    // 10,000 subrequests per invocation is the Workers PAID allowance, from
+    // Cloudflare's limits page as read on 2026-10-16:
+    //   "Subrequests per invocation        50   10,000 (up to 10M)"
+    //   "Subrequests to internal services  1,000  Matches configured limit
+    //                                             (default 10,000)"
+    // The constant read 1,000 for three weeks because that was the table's
+    // pre-2026 Paid value; both rows now answer 10,000 on this plan and
+    // wrangler.toml sets no `[limits] subrequests`. The number matters as a
+    // READING, not as a lever: every gate that spends against it is an absolute
+    // constant (TRACKER_SUBREQ_FLOOR 3, _RESERVE 6, the scan's own floors), so a
+    // tick that measures tens of subrequests stands down at the same point
+    // either way.
+    assert.equal(SUBREQ_BUDGET, 10_000);
     // 50 is Workers Free's documented cap, kept as the reference every reading
     // taken before that date was measured against.
     assert.equal(SUBREQ_BUDGET_FREE, 50);
@@ -19384,6 +19391,51 @@ async function main() {
     // Two finished windows: the window right before a tick can be a plain
     // HTTP request, and the reader is after the tick-sized one.
     assert.equal(SUBREQ_RECENT_WINDOWS, 2);
+  });
+
+  await test("subreqs: a D1 binding call is a subrequest — the seam fetch cannot see", async () => {
+    // THE BUG THIS PINS (2026-10-16). `src/subreqs.ts` counts the global fetch,
+    // and Cloudflare's limits page defines a subrequest as "any request a Worker
+    // makes using the Fetch API or to Cloudflare services like R2, KV, or D1" —
+    // so the runtime charges D1 binding calls, while the counter could not see
+    // them at all: after the 2026-10-15 cutover `subs` fell from the Turso-era
+    // 29-39 to 9-11, and the missing share was the database (measured
+    // `dbCalls` 8-12 per tick). The gates consult `subreqRemaining()`, so a
+    // budget the DB does not spend against is a budget that reads high.
+    const { createD1Transport, D1_SUBREQ_HOST } = require("../dist/d1.js");
+    const calls = [];
+    const fake = {
+      prepare(sql) {
+        calls.push(sql);
+        const stmt = {
+          bind: () => stmt,
+          all: async () => ({ results: [], meta: { changes: 0 } }),
+          run: async () => ({ results: [], meta: { changes: 1 } }),
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        return stmts.map(() => ({ results: [], meta: { changes: 1 } }));
+      },
+    };
+    const transport = createD1Transport(fake);
+    resetSubreqWindows();
+    beginSubreqWindow(1_000, "scan");
+    await transport.execute({ sql: "SELECT 1", args: [] });
+    await transport.batch([
+      { sql: "SELECT 2", args: [] },
+      { sql: "SELECT 3", args: [] },
+      { sql: "SELECT 4", args: [] },
+    ]);
+    const view = subreqView();
+    assert.equal(view.current.total, 2, "execute + batch = two binding calls, not four");
+    assert.deepEqual(
+      view.current.hosts,
+      [{ host: D1_SUBREQ_HOST, count: 2 }],
+      "…attributed to the binding, not folded into (unknown)",
+    );
+    assert.equal(view.budget, 10_000, "the reading is spent against the current Paid default");
+    resetSubreqWindows();
   });
 
   await test("subreqs: calls accumulate into the open window", async () => {
@@ -19446,7 +19498,7 @@ async function main() {
     // allowance the same 38 counted calls left exactly 0, which is what the
     // row and stage gates needed to see. On the paid allowance they leave 950.
     assert.equal(SUBREQ_BUDGET_FREE - SUBREQ_UNSEEN_ALLOWANCE - 38, 0);
-    assert.equal(SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE - 38, 950);
+    assert.equal(SUBREQ_BUDGET - SUBREQ_UNSEEN_ALLOWANCE - 38, 9_950);
     resetSubreqWindows();
   });
 

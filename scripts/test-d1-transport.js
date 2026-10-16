@@ -389,6 +389,63 @@ async function main() {
     client.close();
   });
 
+  await test("Db on D1: a list-shaped READ wider than the ceiling still runs in ONE request", async () => {
+    // THE READER HALF OF THE CEILING (2026-10-16). The cutover chunked the
+    // writers that size a statement by ROW COUNT, but a reader sized by CALLER
+    // DATA had the same 100-parameter ceiling and no treatment: a feed wider
+    // than 100 tokens made `getTokenStatsMany` a hard error that the scanner can
+    // only absorb by skipping a whole tick's registration (`stats-read`).
+    const { client } = tmpClient();
+    const fake = new FakeD1(client);
+    const db = new Db("", undefined, undefined, fake);
+    await db.init();
+    await db.recordTokenStatsMany(bigStatsList(250));
+
+    // 250 tokens = 250 bindings on one statement: illegal on D1, one request in
+    // three statements when split (100/100/50).
+    fake.reset();
+    const tokens = Array.from({ length: 250 }, (_, i) => `tok${i}`);
+    const stats = await db.getTokenStatsMany(tokens);
+    assert.equal(stats.size, 250, "every token in the wide feed comes back");
+    assert.deepEqual(
+      fake.roundTrips,
+      { singles: 0, batches: 1, batchStatements: 3 },
+      "250 tokens must be 3 statements in ONE request, never three requests",
+    );
+    assert.equal(fake.maxArgs <= D1_MAX_BOUND_PARAMS, true, `max bound ${fake.maxArgs}`);
+
+    // A narrower list keeps the single-statement shape: re-asking for 40 is one
+    // statement, so the split only ever fires at the ceiling.
+    fake.reset();
+    assert.equal((await db.getTokenStatsMany(tokens.slice(0, 40))).size, 40);
+    assert.deepEqual(fake.roundTrips, { singles: 1, batches: 0, batchStatements: 0 });
+
+    // The other list-shaped reader: 120 owners + its two own bindings
+    // (`pushed_at > ?`, `HAVING coins >= ?`) → 98 a statement, so 2.
+    const owners = Array.from({ length: 120 }, (_, i) => `own${i}`);
+    await db.recordPushedHolders(
+      Array.from({ length: 120 }, (_, i) => ({
+        token: `hold${i}`,
+        owner: `own${i}`,
+        rank: i + 1,
+        uiAmount: 1000 + i,
+        isCreator: i === 0,
+        crimeHit: false,
+      })),
+      1_700_000_000_000,
+    );
+    fake.reset();
+    const clusters = await db.getHolderClusters(owners, 1_600_000_000_000, 1);
+    assert.equal(clusters.length, 120, "every owner's cluster row is merged back");
+    assert.deepEqual(
+      fake.roundTrips,
+      { singles: 0, batches: 1, batchStatements: 2 },
+      "120 owners + 2 own bindings = 2 statements of 98, in ONE request",
+    );
+    assert.equal(fake.maxArgs <= D1_MAX_BOUND_PARAMS, true, `max bound ${fake.maxArgs}`);
+    client.close();
+  });
+
   await test("Db on D1: a duplicated push claim answers false — the guard's own 0", async () => {
     // The claim is what stops a second card for a coin: an `INSERT OR IGNORE`
     // into seen_tokens whose row count the caller reads as the answer. A LOST
@@ -458,8 +515,12 @@ async function main() {
     let sent = [];
     /** Requests, the way the transport bills them: one per batch() call. */
     let batches = 0;
+    /** Single-statement calls, counted apart from `batches` for the READERS:
+     *  a read that fits the ceiling must stay the execute() it always was. */
+    let singles = 0;
     const counting = {
       execute: (stmt) => {
+        singles += 1;
         sent.push({ sql: String(stmt.sql), args: (stmt.args ?? []).length });
         return client.execute(stmt);
       },
@@ -517,6 +578,19 @@ async function main() {
       measure("max_mcap_observed ="),
       { statements: 1, maxArgs: 420, requests: 1 },
       "max-mcap must stay ONE 420-parameter statement in ONE request on libsql",
+    );
+
+    // The list-shaped READER: 250 tokens is 250 bindings, far under libsql's
+    // 32,766 — so the new chunking must NOT fire here, or every wide feed would
+    // quietly buy extra statements on a store that never asked for them.
+    sent = [];
+    batches = 0;
+    singles = 0;
+    await db.getTokenStatsMany(Array.from({ length: 250 }, (_, i) => `tok${i}`));
+    assert.deepEqual(
+      { ...measure("SELECT * FROM token_stats"), singles },
+      { statements: 1, maxArgs: 250, requests: 0, singles: 1 },
+      "a 250-token read must stay ONE 250-parameter statement in ONE execute() call on libsql",
     );
 
     client.close();

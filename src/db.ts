@@ -1623,6 +1623,54 @@ export class Db {
   }
 
   /**
+   * The READ twin of `runChunked` (2026-10-16): runs a list-shaped
+   * `IN (?,?,\u2026)`, splitting it by the transport's parameter ceiling and
+   * sending the chunks as ONE request.
+   *
+   * WHY IT EXISTS. The cutover fixed the WRITERS that sized a statement by row
+   * count, but a reader sized by CALLER DATA had the same ceiling and no
+   * treatment: D1 rejects any statement binding more than 100 parameters, so a
+   * feed wider than 100 tokens turned `getTokenStatsMany` into a hard error the
+   * scanner can only absorb by skipping a whole tick's registration (see
+   * `diag.dbDegraded = "stats-read"`) — a silent miss at exactly the density it
+   * is least affordable. See docs/d1-store-audit-2026-10-16.md \u00a73.1.
+   *
+   * ONE REQUEST, N STATEMENTS: the same discipline `runChunked` documents — a
+   * batch is one service call however many statements it carries, so the
+   * ceiling splits statements and never the round trip. A list that FITS
+   * (`chunks.length === 1`) keeps the exact single-`execute` shape every reader
+   * had before, so the libsql profile is unchanged: there the ceiling is 32,766
+   * and every caller in this file passes one chunk.
+   *
+   * `leadingArgs` is the statement's own bindings outside the list, subtracted
+   * from the ceiling before dividing (the group-by aggregate spends two: the
+   * window's `pushed_at > ?` and its `HAVING coins >= ?`).
+   */
+  private async readChunkedList(
+    list: readonly string[],
+    /** Bindings ONE list item costs (1 for every reader here). */
+    argsPerItem: number,
+    /** Bindings the statement spends outside the list. */
+    leadingArgs: number,
+    build: (slice: readonly string[]) => SqlStatement,
+    onRow: (row: Row) => void,
+  ): Promise<void> {
+    if (list.length === 0) return;
+    const chunks = chunkForParamLimit(
+      list,
+      argsPerItem,
+      this.paramLimit() - leadingArgs,
+    );
+    if (chunks.length === 1) {
+      const res = await this.get().execute(build(chunks[0]!));
+      for (const row of res.rows) onRow(row);
+      return;
+    }
+    const results = await this.get().batch(chunks.map((slice) => build(slice)));
+    for (const res of results) for (const row of res.rows) onRow(row);
+  }
+
+  /**
    * Many keys, ONE round trip. Every getWorkerState call is a subrequest, and
    * the invocation's budget counts Turso's HTTP requests too (Workers Free: 50
    * subrequests per invocation) — so the tick-front reads (scan_heartbeat plus
@@ -4779,17 +4827,25 @@ export class Db {
    */
   async getTokenStatsMany(tokens: string[]): Promise<Map<string, TokenStats>> {
     const out = new Map<string, TokenStats>();
-    if (tokens.length === 0) return out;
-    const res = await this.get().execute({
-      sql: `SELECT * FROM token_stats WHERE token IN (${tokens
-        .map(() => "?")
-        .join(",")})`,
-      args: tokens,
-    });
-    for (const row of res.rows) {
-      const stats = this.statsFromRow(row);
-      out.set(stats.token, stats);
-    }
+    // One `?` per token, and the caller's list is a FEED's — it is the one
+    // reader whose length this file does not control, so it chunks (see
+    // readChunkedList). Under the ceiling it is still one statement in one
+    // request, exactly as before.
+    await this.readChunkedList(
+      tokens,
+      1,
+      0,
+      (slice) => ({
+        sql: `SELECT * FROM token_stats WHERE token IN (${slice
+          .map(() => "?")
+          .join(",")})`,
+        args: [...slice],
+      }),
+      (row) => {
+        const stats = this.statsFromRow(row);
+        out.set(stats.token, stats);
+      },
+    );
     return out;
   }
 
@@ -5963,24 +6019,40 @@ export class Db {
       isCreator: boolean;
     }>
   > {
-    if (owners.length === 0) return [];
-    const res = await this.get().execute({
-      sql: `SELECT owner,
+    const out: Array<{
+      owner: string;
+      coins: number;
+      lastSeenAt: number;
+      isCreator: boolean;
+    }> = [];
+    if (owners.length === 0) return out;
+    // Two bindings outside the list (`pushed_at > ?` and `HAVING coins >= ?`),
+    // so the ceiling is shared 98 ways per statement — see readChunkedList.
+    await this.readChunkedList(
+      owners,
+      1,
+      2,
+      (slice) => ({
+        sql: `SELECT owner,
                    COUNT(DISTINCT token) AS coins,
                    MAX(pushed_at) AS last_seen,
                    MAX(is_creator) AS is_creator
             FROM pushed_holders
-            WHERE owner IN (${owners.map(() => "?").join(",")}) AND pushed_at > ?
+            WHERE owner IN (${slice.map(() => "?").join(",")}) AND pushed_at > ?
             GROUP BY owner
             HAVING coins >= ?`,
-      args: [...owners, sinceMs, minCoins],
-    });
-    return res.rows.map((row) => ({
-      owner: String(row.owner),
-      coins: Number(row.coins ?? 0),
-      lastSeenAt: Number(row.last_seen ?? 0),
-      isCreator: Number(row.is_creator ?? 0) === 1,
-    }));
+        args: [...slice, sinceMs, minCoins],
+      }),
+      (row) => {
+        out.push({
+          owner: String(row.owner),
+          coins: Number(row.coins ?? 0),
+          lastSeenAt: Number(row.last_seen ?? 0),
+          isCreator: Number(row.is_creator ?? 0) === 1,
+        });
+      },
+    );
+    return out;
   }
 
   /**
