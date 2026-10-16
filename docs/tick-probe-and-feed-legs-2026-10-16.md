@@ -209,3 +209,12 @@ queue 嘅 **dispatch 間距**：lane 為咗問「你仲拒絕我嗎？」而企�
   要讀嘅係「lapsed-block tick 嘅 `poolLegMs.pairs`」。
 - 如果將來要 durable 記 deferral：ring row 加 `probeDeferrals` / `lastProbeDeferredAt`
   係同 `feedLegMs` 一樣嘅做法（0 個 round trip）——今次冇做，唔喺範圍內。
+- **CI 一次紅、一次綠（同本次改動無關）**：code commit `57ff3dd` 嘅
+  run 38837693022 全綠（Typecheck ✓、Unit tests ✓、`Uploaded 3.04s / Deployed
+  0.89s`）；跟住嘅 docs-only commit `0d65b09`（run 38839136291）喺 Unit tests 紅一個，
+  而且唔係新加嘅測試：`❌ WalletAnalyzer: deadline clamps the profiling budget` 嘅
+  `r.holders.checked >= 1`（同一個 code 喺本地連跑兩次 548/0，CI 上一個 run 亦綠）。
+  嗰個個案淨係建 `WalletAnalyzer` ＋ stub Helius，唔經 scanner／dexscreener 嘅代碼，
+  係負載敏感嘅計時斷言；`gh run rerun` 喺呢個 workspace 嘅 GitHub App 權限下唔允許
+  （`Resource not accessible by integration`），所以無重跑。生產跑嘅係 `57ff3dd`（01:57:13Z），
+  即係本次改動本身已經全綠落線。
