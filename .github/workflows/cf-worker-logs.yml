@@ -23,6 +23,12 @@ name: Workers Logs per-invocation CPU
 # itself is what runs it, so a rename of a field this API owns shows up as a
 # run, not as a stale reading nobody re-took. The main-branch push also fires
 # the deploy workflow, which is harmless — the probe only reads.
+#
+# NOTE ON workflow_dispatch: a token that can only READ this repo (the agent's)
+# cannot create a dispatch event — it answers 403 "Resource not accessible by
+# integration". That is not a misconfiguration; the path-scoped push above is
+# the way to make this run on demand. The dispatch inputs are for a human with
+# Actions write access.
 on:
   push:
     paths:
@@ -37,7 +43,7 @@ on:
       limit:
         description: "Invocation-page size (the percentile half is uncapped)"
         required: false
-        default: "200"
+        default: "1000"
 
 jobs:
   cpu:
@@ -61,5 +67,5 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           WORKER: solana-meme-bot
           MINUTES: ${{ inputs.minutes || '60' }}
-          LIMIT: ${{ inputs.limit || '200' }}
+          LIMIT: ${{ inputs.limit || '1000' }}
         run: node scripts/cf-worker-logs.mjs
