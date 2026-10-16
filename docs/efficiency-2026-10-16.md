@@ -12,7 +12,7 @@
 | # | 槓桿 | 今日讀數 | 值唔值 | 風險 |
 |---|---|---|---|---|
 | 1 | **pair lane 空轉**（**已修**，見 §3）：lane 喺 refusal episode 內喺間距隊白等 | block 內嘅 tick 已經係 `poolLegMs.pairs 0`；殘餘係 `blockedForMs 0 / spacingFleetSteps 3 / intervalMs 1,200` 嘅 tick 等足 **1,024ms** | **最高**（單一最大嘅 tick 成本） | 中 — 已保住「復原探測」同 DexScreener 讀數，唔係整條 lane 砍走 |
-| 2 | ~~CPU 讀數~~ **已做（§4）** | 用**既有** `scripts/cf-invocations.mjs` 就讀到（GraphQL 一直有 `cpuTimeP50/P99`）：**21%**，唔係樽頸；Workers Logs 亦已喺 `wrangler.toml` 開（零 code，未 deploy） | ~~高~~ 完成 | 低 |
+| 2 | ~~CPU 讀數~~ **已做（§4）** | 用**既有** `scripts/cf-invocations.mjs` 就讀到（GraphQL 一直有 `cpuTimeP50/P99`）：**21%**，唔係樽頸；Workers Logs 已喺 `wrangler.toml` 開（零 code）**並已 deploy（07:40:49Z，§4b）** —— per-invocation 讀數：median 15ms／avg 25.8ms／max 133ms ⇒ 月用量 **27–46%**，唔係天花板但餘裕只有 2–4× | ~~高~~ 完成 | 低 |
 | 3 | **cadence 天花板 = `rows written`**（唔係 tick 預算、唔係 subrequest） | 30s ＝ 30.1M/月（**60%** 額度；同日晚複讀 1.02M／日 → 30.7M／月 ＝ **61%**。兩者係同一個 24h 窗口移動，唔係矛盾）；20s ≈ 90%；15s ≈ 120%（≈$10/月） | 高（決策輸入） | 低（純算術） |
 | 4 | **寫入裁剪**（只為換 cadence 而做） | ⚠️ **唔可以照 KB 排**：額度數 **row**，14.6KB 同 40 bytes 都係 1 row。每 tick 固定嘅係 **~3 row**（`scan_heartbeat` 1 row／`tick_leg_slow` 1 row／`scan_history` 1 row）＝ **~8.6K row／日 ≈ 0.9%**，裁佢哋換唔到 cadence。真槓桿係**跟每 tick 觀察到嘅 token 而變**嘅寫入（`token_stats` 更新加佢個 partial index entry）——抽樣密啲就會**睇到多啲變化** | 中（係 #3 嘅前置） | 中（要逐 table 按 **row** 量，見 §8） |
 | 5 | D1 read replication / 搬去 DO / 加大存儲 / 砍 index | 全部**唔應該做**，理由見 §6 | 0 | — |
@@ -172,10 +172,12 @@ block 覆蓋成條 lane 嘅不變量**冇問題**（3/3 blocked tick 讀 `pairsL
 Mutation（把 `inlineWaitMs` 改返 `queueWaitMs`、重 build）：
 `❌ … a 4-batch pass must not be waited on inline (waited 1201ms)` → `553 passed, 1 failed`。
 
-## 4. 槓桿 2 —— **已做（2026-10-16）**：CPU 讀數到手，係 21%
+## 4. 槓桿 2 —— **已做（2026-10-16）**：CPU 有讀數，月用量 27–46%，唔係天花板
 
 原本 repo **冇任何 CPU 讀數** —— `ms`、`dbMs`、`poolLegMs` 全部係 wall clock，而 wall clock 有大量 I/O 等待，
 唔可以用嚟判「係唔係 CPU 樽頸」。
+
+### §4a 預算讀數（GraphQL，唔使開 Workers Logs）
 
 **讀嘅方法（零 code，而且唔使開 Workers Logs）**：`scripts/cf-invocations.mjs` 本身已經用 deploy workflow 嘅 token
 讀 Cloudflare GraphQL `workersInvocationsAdaptive`，而個 dataset 一直都有
@@ -201,15 +203,71 @@ Mutation（把 `inlineWaitMs` 改返 `queueWaitMs`、重 build）：
    所以 §2 嘅請求餘裕由 ~55× 修正為 **18.7×**（0.53M 對 10M）。
 2. **break-even 唔係 165ms 而係 56ms。** 30,000,000 ÷ 533,760 ≈ **56ms／invocation**。
    「165ms」係用一個細 2.9× 嘅分母算出嚟嘅，把風險睇細咗。用返真分母，**實測仍然只係 21%**，
-   所以結論冇變 —— 但「有 4.8× 餘裕」而家係**量出嚟**，唔再係算術。
+   所以結論冇變 —— 但「有 4.8× 餘裕」而家係**量出嚟**，唔再係算術。（**但見 §4b**：
+   per-invocation 記錄讀到 27–46%，所以「4.8×」要收窄成 2–4×；21% 係兩個 dataset 之中樂觀嗰個。）
 
-**已落地（零 code）**：`wrangler.toml` 加咗 `[observability] enabled = true` ＋ `head_sampling_rate = 1`
-（純 config：冇 binding、冇 var、冇改一行 source）。要下一次 `npx wrangler deploy`（push main）才生效；
-dashboard 開（Workers & Pages → 本 Worker → Settings → Observability → Workers Logs）等效且即刻生效。
-驗證：`npx wrangler deploy --dry-run` 綠燈；mutation 檢查（把 `head_sampling_rate` 改成字串）→
-`Expected "observability.head_sampling_rate" to be of type number`，證明 wrangler **真係識呢個 key**（唔係靜靜忽略）。
-成本上限：57 個 `console.log` 站點 × 0.53M invocation ＝ 病態情況 ~30M events／月（超 20M 額度），
-實況 tick 只出幾行、health poll 更少，即 ~1–2M／月；`head_sampling_rate` 就係旋鈕。
+### §4b per-invocation 讀數（Workers Logs）—— 邊個 invocation 燒嘅 CPU
+
+**已 deploy**：`wrangler.toml` 嘅 `[observability] enabled = true` ＋ `head_sampling_rate = 1`
+（純 config：冇 binding、冇 var、冇改一行 source）已經隨 commit `44491b4` 經 deploy run **38868524921**
+（success）上線 —— 唔再係「等下一次 deploy」。新版本實際上線係 **07:40:49Z**（`Deployed
+solana-meme-bot triggers`，Version ID `a9311571`），而 Workers Logs 第一批記錄係 **07:41:06Z**，
+即係開關真係喺呢一日呢一秒開始入庫。
+dashboard 開（Workers & Pages → 本 Worker → Settings → Observability → Workers Logs）等效。
+deploy 前嘅驗證：`npx wrangler deploy --dry-run` 綠燈；mutation 檢查（把 `head_sampling_rate`
+改成字串）→ `Expected "observability.head_sampling_rate" to be of type number`，
+證明 wrangler **真係識呢個 key**（唔係靜靜忽略）。
+
+**讀嘅方法（新）**：`scripts/cf-worker-logs.mjs` ＋ workflow `cf-worker-logs.yml` —— 打 Cloudflare
+Workers Observability query API（`POST /accounts/{id}/workers/observability/telemetry/query`），
+`view: "invocations"` 攞 per-invocation 記錄（`$workers.cpuTimeMs`／`wallTimeMs` ＋ `eventType`／
+`outcome`／`$metadata.trigger`），再用 `view: "calculations"` 攞**唔受 limit 限制**嘅
+count／min／median／avg／max／p90／p99。同 `cf-invocations.mjs` 一樣用 deploy workflow 嘅 token，
+所以答案喺 run log 度讀（`gh run view --log`），唔需要 dashboard。
+
+**實測（run 38869664557，窗口 06:49:43–07:49:43Z）**：入庫由 07:41:06Z 起，即係 60 分鐘嘅窗口裡
+只有 **~8 分鐘**有資料 —— **101 個 invocation group**（其中 **100 個**帶 `$workers.cpuTimeMs`）。
+
+| 讀數 | 值 |
+|---|---|
+| 計數（calculations；樣本 interval **1.21** ⇒ 連 Workers Logs 都抽樣，數字係估計） | **n ≈ 103** |
+| min ／ median ／ avg | **1 ／ 15 ／ 25.76 ms** |
+| p90 ／ p99 ／ max | **70 ／ 131 ／ 133 ms** |
+| 推算月用量（avg × 533,760） | **13.7M ms ＝ 30M 嘅 46%** |
+| 推算月用量（median × 533,760） | **8.0M ms ＝ 30M 嘅 27%** |
+
+**邊個 invocation 貴**：頭 15 名**全部**係 `fetch`、`outcome ok`、trigger `POST /internal/cron-relay`
+（即 tick 本體），cpu **133／131／112／112／111ms**，wall 1,697–3,238ms。按 eventType 分：
+
+| eventType | n | mean cpuMs | max cpuMs |
+|---|---|---|---|
+| `fetch`（relay ＝ tick 本體） | 80 | 29.3 | 133 |
+| `alarm` | 5 | 2.2 | 3 |
+| `scheduled`（只係派一個 self-fetch） | 15 | **0.1** | 1 |
+
+**三件新事實**
+
+1. **貴嘅係 relay 嗰個 fetch，唔係 cron entry。** 15 個 `scheduled` 平均 **0.1ms** CPU，wall 卻
+   945–1,881ms —— 個 entry 只係派一個 self-fetch，真成本喺 relay 嗰邊（同 `wrangler.toml` 頂部
+   嘅 relay routing 一致）。
+2. **spike 睇得到。** 月總量嘅讀數（§4a）睇唔到單一 invocation：呢個窗口 max **133ms**、p99 131ms。
+   §4a 嘅每分鐘 `max.cpuTime`（p50 74.6ms、max 188.8ms）同呢度一致 —— 兩個 dataset 對**尾部**
+   冇分歧。
+3. **21% 係樂觀嗰一端，餘裕要由「4.8×」收窄做 2–4×。** §4a 嘅 6.31M／月等於
+   **11.8ms／invocation**（6.31M ÷ 533,760），但 per-invocation 記錄直接讀到 **avg 25.8ms、
+   median 15ms** ⇒ **46%／27%**。兩個 dataset 對「典型值」差 2.2×、對尾部一致，最可能嘅解釋係
+   `cpuTimeP50` 係**每分鐘**嘅分位數（每分鐘只有 ~12 個 invocation，加上雲端 adaptive sampling），
+   唔係 per-invocation 平均。**方向唔變**（CPU 離天花板仍遠），但「唔逼近」嘅程度要用 2–4× 講。
+   （獨立交叉檢查：呢個窗口 **101 個／~8 分鐘 ≈ 12.8／分鐘**，對 §4a 嘅 **12.32／分鐘** ——
+   兩個 dataset 對 invocation 速率一致，即係 0.53M／月 呢個分母冇問題。）
+
+**限制**：窗口只有 **~8 分鐘**（Workers Logs 由 deploy 那一刻才入庫）—— 覆蓋 ~101 個 invocation、
+~8 個 tick 週期，未跨 deploy／cold start，亦未覆蓋重腳（Axiom／Birdeye backfill）。要一個跨整日嘅讀數，
+就係再 push 一次 `cf-worker-logs.yml`（path-scoped push 係 run 掣 —— read-only token 唔可以
+`workflow_dispatch`，會 403 `Resource not accessible by integration`）。
+
+**成本上限（不變）**：57 個 `console.log` 站點 × 0.53M invocation ＝ 病態情況 ~30M events／月
+（超 20M 額度），實況 tick 只出幾行、health poll 更少，即 ~1–2M／月；`head_sampling_rate` 就係旋鈕。
 （官方講 Workers Logs 由 **2026-12-01** 起轉去 Observability 定價，到時要重睇。）
 
 ## 5. 槓桿 3：cadence 嘅真天花板係 `rows written`（唔係 tick 預算）

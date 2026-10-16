@@ -30,6 +30,14 @@ compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 # deploy. Cloudflare's docs require a redeploy for the wrangler route, so
 # nothing here is live until the next deploy lands.
 #
+# LIVE SINCE 2026-10-16 07:40:49Z — deploy run 38868524921 (commit 44491b4)
+# carried it to version a9311571, and the first record the switch stored is
+# 07:41:06Z. The reading it unlocked is docs/efficiency-2026-10-16.md §4b: that
+# first window (~8 min, n~103 invocations) read median 15ms / avg 25.8ms / max
+# 133ms per invocation -> 27-46% of the 30M cpu-ms/month allowance. Still not
+# the ceiling, but the headroom is 2-4x, not the 4.8x the per-minute GraphQL
+# quantile implied.
+#
 # COST: included on Workers Paid — 20M log events/month, 7-day retention,
 # $0.60 per million beyond. The ceiling is countable: 57 `console.log` call
 # sites across src/*.ts and ~532K invocations/month (measured, §1 of the doc —
