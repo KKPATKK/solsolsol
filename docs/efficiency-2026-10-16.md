@@ -12,9 +12,9 @@
 | # | 槓桿 | 今日讀數 | 值唔值 | 風險 |
 |---|---|---|---|---|
 | 1 | **pair lane 空轉**（**已修**，見 §3）：lane 喺 refusal episode 內喺間距隊白等 | block 內嘅 tick 已經係 `poolLegMs.pairs 0`；殘餘係 `blockedForMs 0 / spacingFleetSteps 3 / intervalMs 1,200` 嘅 tick 等足 **1,024ms** | **最高**（單一最大嘅 tick 成本） | 中 — 已保住「復原探測」同 DexScreener 讀數，唔係整條 lane 砍走 |
-| 2 | **CPU 讀數**（Workers Logs，$5 plan 已包） | repo **完全冇** CPU 讀數；`ms`／`dbMs` 都係 wall clock | **高、零 code** | 低 |
-| 3 | **cadence 天花板 = `rows written`**（唔係 tick 預算、唔係 subrequest） | 30s ＝ 30.1M/月（**60%** 額度）；20s ≈ 90%；15s ≈ 120%（≈$10/月） | 高（決策輸入） | 低（純算術） |
-| 4 | **寫入裁剪**（只為換 cadence 而做） | 每個 tick 固定寫：`scan_heartbeat` 14.6KB、`tick_leg_slow` 12.6KB、`scan_history` 1 行、`token_stats` 更新 × partial index predicate | 中（係 #3 嘅前置） | 中 |
+| 2 | ~~CPU 讀數~~ **已做（§4）** | 用**既有** `scripts/cf-invocations.mjs` 就讀到（GraphQL 一直有 `cpuTimeP50/P99`）：**21%**，唔係樽頸；Workers Logs 亦已喺 `wrangler.toml` 開（零 code，未 deploy） | ~~高~~ 完成 | 低 |
+| 3 | **cadence 天花板 = `rows written`**（唔係 tick 預算、唔係 subrequest） | 30s ＝ 30.1M/月（**60%** 額度；同日晚複讀 1.02M／日 → 30.7M／月 ＝ **61%**。兩者係同一個 24h 窗口移動，唔係矛盾）；20s ≈ 90%；15s ≈ 120%（≈$10/月） | 高（決策輸入） | 低（純算術） |
+| 4 | **寫入裁剪**（只為換 cadence 而做） | ⚠️ **唔可以照 KB 排**：額度數 **row**，14.6KB 同 40 bytes 都係 1 row。每 tick 固定嘅係 **~3 row**（`scan_heartbeat` 1 row／`tick_leg_slow` 1 row／`scan_history` 1 row）＝ **~8.6K row／日 ≈ 0.9%**，裁佢哋換唔到 cadence。真槓桿係**跟每 tick 觀察到嘅 token 而變**嘅寫入（`token_stats` 更新加佢個 partial index entry）——抽樣密啲就會**睇到多啲變化** | 中（係 #3 嘅前置） | 中（要逐 table 按 **row** 量，見 §8） |
 | 5 | D1 read replication / 搬去 DO / 加大存儲 / 砍 index | 全部**唔應該做**，理由見 §6 | 0 | — |
 
 一句講完：**DB 同 tick 預算嘅效率已經解決晒**（SQL 0.2ms、round trip 11–51ms、tick 用 1.4–3.3s 而預算係 20s），
@@ -76,8 +76,8 @@ $ worker_state 行大小 TOP
 
 | 額度 | $5 Workers Paid | 今日用量 | 餘裕 |
 |---|---|---|---|
-| Workers 請求 | 10M／月 | §1 每日約 6.0K 個 invocation（2,880 scan ＋ 2,880 pass ＋ 288 maint）→ ~0.18M／月 | ~55× |
-| CPU 時間 | **30M CPU ms／月**（每次 HTTP invocation 預設 30s，可調到 5 min；cron／queue 15 min） | **未量到**（見 §4） | ? |
+| Workers 請求 | 10M／月 | **實測 4,448 個／6h ＝ 17,792／日 → 0.53M／月**（唔止 cron：2,880 scan ＋ 2,880 pass ＋ 288 maint ＝ 6,048／日，即 **2.9×** —— `/health` 輪詢、Telegram webhook、debug 頁全部係 invocation） | **18.7×** |
+| CPU 時間 | **30M CPU ms／月**（每次 HTTP invocation 預設 30s，可調到 5 min；cron／queue 15 min） | **實測 6.3M ms／月 ＝ 21%**（見 §4） | 4.8× |
 | D1 rows written | 50M／月，之後 $1/M | 1.00M／日 → **30.1M／月 ＝ 60%** | 1.66× |
 | D1 rows read | 25B／月，之後 $0.001/M | 16.9M／日 → 506M／月 ＝ **2.0%** | 49× |
 | D1 storage | 5GB 內含（10GB／db，1TB／帳號） | 15.7MB ＝ **0.3%** | 318× |
@@ -90,8 +90,9 @@ $ worker_state 行大小 TOP
 且**每次 invocation 都帶 CPU time＋wall time**）、`…/d1/platform/pricing`（25B read／50M write／5GB／1000 queries）、
 `…/d1/platform/limits`、`…/d1/platform/release-notes`、`…/d1/best-practices/read-replication`（replica 唔另收費，要用 Sessions API）。
 
-**所以「效率」喺呢個系統度已經唔係賬單**（讀 2%、存 0.3%、請求 2%）：唯一有壓力嘅係
-**rows written 60%**，而同佢一齊係**未量到嘅 CPU**。其餘全部係上游 API 同 latency。
+**所以「效率」喺呢個系統度已經唔係賬單**（讀 2%、存 0.3%、請求 5%）：唯一有壓力嘅係
+**rows written 60%**。CPU 亦已經量到（**21%**），證實**唔係**第二個天花板 —— 呢點之前只係假設。
+其餘全部係上游 API 同 latency。
 
 ## 3. 槓桿 1（最大）：pair lane 為一個 fleet 已知嘅 429 付間距
 
@@ -171,20 +172,45 @@ block 覆蓋成條 lane 嘅不變量**冇問題**（3/3 blocked tick 讀 `pairsL
 Mutation（把 `inlineWaitMs` 改返 `queueWaitMs`、重 build）：
 `❌ … a 4-batch pass must not be waited on inline (waited 1201ms)` → `553 passed, 1 failed`。
 
-## 4. 槓桿 2（零 code、最高性價比）：補上 CPU 讀數
+## 4. 槓桿 2 —— **已做（2026-10-16）**：CPU 讀數到手，係 21%
 
-今日 repo **冇任何 CPU 讀數** —— `ms`、`dbMs`、`poolLegMs` 全部係 wall clock，而 wall clock 有大量 I/O 等待，
+原本 repo **冇任何 CPU 讀數** —— `ms`、`dbMs`、`poolLegMs` 全部係 wall clock，而 wall clock 有大量 I/O 等待，
 唔可以用嚟判「係唔係 CPU 樽頸」。
 
-**$5 plan 已經包咗答案**：Workers Logs（Paid 20M log events／月、保留 7 日）嘅 invocation log 帶
-**CPU time ＋ wall time**；metrics 儀表板亦有 **CPU Time per execution** 嘅歷史 quantile。
-喺 dashboard 開 Workers Logs（同埋 observability）就讀得到，**唔需要改一行 code**。
-（注意：官方講 Workers Logs 由 **2026-12-01** 起轉去 Observability 定價。）
+**讀嘅方法（零 code，而且唔使開 Workers Logs）**：`scripts/cf-invocations.mjs` 本身已經用 deploy workflow 嘅 token
+讀 Cloudflare GraphQL `workersInvocationsAdaptive`，而個 dataset 一直都有
+`quantiles { cpuTimeP50 cpuTimeP99 }` 同 `max { cpuTime wallTime memoryUsageBytes }` ——
+即係「讀 P50/P99 CPU」呢一步**由頭到尾都唔需要 Workers Logs**，一個 invocations 前就讀得到。
+（Workers Logs 另加嘅係 **per-invocation** 記錄 —— 邊個 invocation 燒嘅 CPU —— 同 log 行本身。）
 
-**為何要量**：額度係 30M CPU ms／月，而每日約 6,048 個 invocation ⇒
-**break-even ＝ 30,000,000 ÷ 30 ÷ 6,048 ≈ 165ms CPU／invocation（平均）**。
-即係「每個 invocation 平均燒幾多 CPU」直接決定 30M 夠唔夠。若果 P50/P99 遠低過 165ms，CPU 唔係樽頸；
-若果接近，就係 cadence（§5）之前必須先解決嘅第二個天花板。**未量到之前，唔可以講 CPU 有餘裕。**
+**實測（2026-10-16 00:43:40–06:43:40Z，6h，`HOURS=6 node scripts/cf-invocations.mjs`）**
+
+| 讀數 | 值 |
+|---|---|
+| invocations | **4,448**（361 分鐘，平均 **12.32／分鐘** → **17,792／日 → 0.53M／月**） |
+| status | 全部 `success`，**0** 個非 `success` |
+| subrequests／invocation（平均） | **2.2**（對 1,000 額度零壓力） |
+| `cpuTimeP50`（典型分鐘） | **5,922µs** |
+| `max.cpuTime` 每分鐘 | p50 **74.6ms**、mean **79.1ms**、p90 **117.4ms**、max **188.8ms** |
+| 推算月用量 | **6.31M ms ＝ 30M 嘅 21%**（唔係逼近） |
+
+**⚠️ 同時修正兩個喺呢份文件入面嘅錯數（原本兩條都錯）**
+
+1. **invocation 數唔係每日 6,048。** 原本只數 cron（2,880 scan ＋ 2,880 pass ＋ 288 maint），
+   但 `/health` 輪詢、Telegram webhook、debug 頁**全部**都係 invocation：實測 **17,792／日 ＝ 6,048 嘅 2.9×**。
+   所以 §2 嘅請求餘裕由 ~55× 修正為 **18.7×**（0.53M 對 10M）。
+2. **break-even 唔係 165ms 而係 56ms。** 30,000,000 ÷ 533,760 ≈ **56ms／invocation**。
+   「165ms」係用一個細 2.9× 嘅分母算出嚟嘅，把風險睇細咗。用返真分母，**實測仍然只係 21%**，
+   所以結論冇變 —— 但「有 4.8× 餘裕」而家係**量出嚟**，唔再係算術。
+
+**已落地（零 code）**：`wrangler.toml` 加咗 `[observability] enabled = true` ＋ `head_sampling_rate = 1`
+（純 config：冇 binding、冇 var、冇改一行 source）。要下一次 `npx wrangler deploy`（push main）才生效；
+dashboard 開（Workers & Pages → 本 Worker → Settings → Observability → Workers Logs）等效且即刻生效。
+驗證：`npx wrangler deploy --dry-run` 綠燈；mutation 檢查（把 `head_sampling_rate` 改成字串）→
+`Expected "observability.head_sampling_rate" to be of type number`，證明 wrangler **真係識呢個 key**（唔係靜靜忽略）。
+成本上限：57 個 `console.log` 站點 × 0.53M invocation ＝ 病態情況 ~30M events／月（超 20M 額度），
+實況 tick 只出幾行、health poll 更少，即 ~1–2M／月；`head_sampling_rate` 就係旋鈕。
+（官方講 Workers Logs 由 **2026-12-01** 起轉去 Observability 定價，到時要重睇。）
 
 ## 5. 槓桿 3：cadence 嘅真天花板係 `rows written`（唔係 tick 預算）
 
@@ -203,13 +229,23 @@ token_stats sweep）大致同 tick 數成正比，所以：
 | 20s | 4,320 | ~1.50M（×1.5 上界） | 45.1M | **90%** | — |
 | 15s | 5,760 | ~2.01M（×2.0 上界） | 60.2M | **120%** | ~10.2M → **≈$10／月** |
 
-（線性推算係**上界**：push 相關嘅寫入係跟卡片數，唔跟 cadence；但每 tick 固定嘅寫入係主體，所以方向啱。）
+（線性推算係**上界**：push 相關嘅寫入跟卡片數，唔跟 cadence。注意方向嘅**來源唔係**「每 tick 固定寫入」
+—— 佢只佔 ~0.9%，裁咗都換唔到 cadence —— 而係**同一批 token 被抽樣多咗 → 被觀察到嘅變化多咗**。
+所以要真係加 cadence 之前，必須逐 table 按 **row** 量清楚，唔可以只靠呢個上界。）
 
-**結論**：想要 20s 就要先**裁剪每 tick 固定寫入**（候選：`scan_heartbeat` 14.6KB ＋ `tick_leg_slow` 12.6KB
-每 tick 一寫、`scan_history` 一行、以及 `token_stats` 更新被
+**結論**：想要 20s 就要先**裁剪每 tick 寫入**，但**唔可以按 KB 揀** —— 額度數嘅係 row，
+所以 `scan_heartbeat` 14.6KB 同 `tick_leg_slow` 12.6KB 兩個大細差幾倍，實際各佔 **1 row／tick**；
+佢哋加 `scan_history` 合共 ~3 row／tick（~8.6K／日 ＝ 1.00M 嘅 **0.9%**）—— 裁呢三條換唔到 cadence。
+真正跟 cadence 走嘅係**每次觀察而寫嘅 token 行**：抽樣密啲，同一個 token 就會**被睇到多啲次變化**，
+即係寫入量跟嘅係「覆蓋 × 頻率」，唔係「tick 數」。呢部分要逐 table 按 **row** 量（§8 已記低未做）。
+
 `idx_pool_band_m48000 ON token_stats(launch_ms) WHERE (max_mcap_observed IS NULL OR max_mcap_observed >= 48000)`
-嘅 **predicate** 放大 —— 每次 `max_mcap_observed` 跨過 48,000 都會重寫條 index entry）；
-想要 15s 就係**用錢買**（≈$10／月超額），要明講。
+係一個**乘數**而唔係一個獨立來源：凡 UPDATE 一條喺 band 內（或 `max_mcap_observed` 仍係 NULL）嘅
+`token_stats` row，SQLite 都會**順手重寫佢條 index entry**，所以嗰啲 update 嘅 row 成本 **×2**。
+band 只會隨時間填滿（`max_mcap_observed` 單調上升，過咗 48,000 就唔會出返去），
+即係呢個乘數作用喺「update **次數**」之上，唔係每個 tick 一次。
+
+想要 15s 就係**用錢買**（≈$10／月超額，見上表），要明講。
 
 ## 6. 檢查過、但**唔改**（連理由）
 
@@ -228,7 +264,9 @@ token_stats sweep）大致同 tick 數成正比，所以：
 
 ## 7. 建議次序
 
-1. **開 Workers Logs**（dashboard；零 code），讀 P50/P99 CPU ms／invocation，對 165ms break-even。
+1. ~~開 Workers Logs，讀 P50/P99 CPU ms／invocation，對 165ms break-even~~ **已做（§4）**：
+   CPU ＝ 6.3M ms／月 ＝ **21%**；`wrangler.toml` 已開 `[observability]`（未 deploy）；
+   break-even 由 165ms 修正為 **56ms**（分母本身錯咗 2.9×）。
 2. ~~量 pair lane~~ **已做（§3）**：量度顯示 block 已經覆蓋成條 lane，真正成本係 spacing 喺 critical path 白等；
    已改成整個 refusal episode 都 off-path（`inRefusalEpisode()`）。驗收讀數見 §3。
 3. **先有 (1)(2) 嘅讀數，才決定 cadence**：20s 睇 §5 嘅 90%，15s 明碼 ≈$10／月。
@@ -238,10 +276,18 @@ token_stats sweep）大致同 tick 數成正比，所以：
 ## 8. 限制（唔可以當過）
 
 - 樣本細：`tick-legs` 3 個 tick，`db-latency` 每個 op 3 個 sample。
-- **CPU 未量到**：§2 同 §4 嘅 CPU 全部係額度＋算術，唔係讀數；喺開 Workers Logs 之前唔可以講「CPU 有餘裕」。
-- `rows_written` 包含 index entry，所以「邊個 table 佔幾多」唔可以精確歸因；`writeCensus` 係 **per-isolate**
+- ~~CPU 未量到~~ **已量（§4）：21%**，但有兩個限制不可以當「CPU 完全冇問題」——(a) 係**一個 6h 窗口一個 sample**，
+  未跨越一次 deploy／cold-start 週期，亦未覆蓋 Axiom／Birdeye backfill 嘅間歇重腳；
+  (b) `max.cpuTime` 去到 **188.8ms**，即係**個別 tick 可以遠高過平均**，所以 21% 係「月總量」嘅讀數，
+  唔係「每個 tick 都有 4.8× 餘裕」。
+- §4 嗰個 reading 全部嚟自 **GraphQL**（唔係 Workers Logs）——`[observability]` 已寫入 `wrangler.toml` 但**未 deploy**，
+  per-invocation CPU 要等下次 deploy 之後才讀得到。
+- `rows_written` 係 **row 數**、而且包含 index entry：所以 (a) **byte 大細唔等於 row 數**
+  （14.6KB 嘅 row 同 40 bytes 嘅 row 都係 1 row，所以「邊個 payload 最大」唔可以用嚟排裁剪次序），
+  同 (b)「邊個 table 佔幾多」唔可以精確歸因；`writeCensus` 係 **per-isolate**
   （§1 嗰個 isolate 睇到 541 rows／h，而 fleet 係 ~41,783 rows／h），唔可以當 fleet 度量。
-- §5 嘅 cadence 推算係**線性上界**：假設每 tick 固定寫入佔主體，未逐項拆分。
+- §5 嘅 cadence 推算係**線性上界**，而個上界嘅**機制本身未經量度**。此處原本寫「假設每 tick 固定寫入佔主體」
+  —— 呢句**係錯嘅**（經查固定寫入只佔 ~0.9%），已喺 §5 更正；要真正判 20s 可唔可行，必須逐 table 按 **row** 量一次。
 - §3 嘅診斷係**假設**，未用 `pairFleetRefusedAgeMs`／`probeDeferrals` 證實；證實之前唔應改 code。
 - 呢份文件 §1–§2 係評估讀數；**§3 嘅改動已落地**（`src/dexscreener.ts` ＋ 兩個 `scripts/test-unit.js` 測試），
   跑過 `npm run typecheck`（0）同 `npm run test:unit`（全部 suite 0 failed，`test-unit` 553 passed）。

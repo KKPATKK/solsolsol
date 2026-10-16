@@ -13,6 +13,48 @@ compatibility_date = "2026-08-09"
 # -> this Worker's fetch handler.
 compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
+# Workers Logs (2026-10-16): the one resource this Worker had never MEASURED.
+# Every reading the repo had — `ms` on the tick row, `dbMs`, `poolLegMs` — is
+# WALL clock, and a tick waits on DexScreener/Jupiter/Turso far more than it
+# computes, so none of them can say whether CPU is a ceiling (that is exactly
+# how docs/efficiency-2026-10-16.md §2 came to carry "CPU: 未量到"). Workers
+# Logs records CPU and wall time on EVERY invocation as `$workers.cpuTimeMs` /
+# `$workers.wallTimeMs` (Cloudflare, 2025-04-09: "For Workers Logs, CPU time
+# and Wall time are surfaced in the Invocation Log"), which turns the 30M CPU
+# ms/month allowance from arithmetic into a reading.
+#
+# ZERO CODE: this block IS the whole change — no binding, no var, no source
+# edit. It takes effect on the next `npx wrangler deploy` (deploy.yml, push to
+# main); the equivalent dashboard toggle (Workers & Pages -> this Worker ->
+# Settings -> Observability -> Workers Logs) does the same thing without a
+# deploy. Cloudflare's docs require a redeploy for the wrangler route, so
+# nothing here is live until the next deploy lands.
+#
+# COST: included on Workers Paid — 20M log events/month, 7-day retention,
+# $0.60 per million beyond. The ceiling is countable: 57 `console.log` call
+# sites across src/*.ts and ~532K invocations/month (measured, §1 of the doc —
+# note that is 2.9x the cron-only count, because /health polls and the
+# Telegram webhook are invocations too), so a pathological "every site fires on
+# every invocation" month would be ~30M events and 1.5x the allowance. A real
+# tick emits a handful of lines and a health poll fewer, i.e. ~1-2M/month.
+# head_sampling_rate is the knob if the first month's usage says otherwise;
+# it is 1 (log every request) because the point of this reading is the CPU of
+# the EXPENSIVE invocation, and a sampled-away tick is a missing reading.
+# Cloudflare says the Workers Logs prices above run until 2026-12-01, when
+# Workers Logs moves to Cloudflare Observability pricing — re-check then.
+#
+# WHAT IT IS NOT: it does not replace scripts/cf-invocations.mjs, which already
+# reads CPU percentiles straight off the GraphQL `workersInvocationsAdaptive`
+# dataset (`quantiles { cpuTimeP50 cpuTimeP99 }`, `max { cpuTime wallTime }`)
+# with the deploy workflow's token and needs no observability setting at all —
+# that probe is where the CPU BUDGET reading comes from (live 2026-10-16 6h
+# window: ~6.3M ms/month projected = 21% of 30M). Workers Logs is what adds the
+# PER-INVOCATION record — which invocation spent the CPU — and the log lines.
+# Reference: docs/efficiency-2026-10-16.md §4.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # Both expressions fire every minute (the free-tier minimum), and each one is
 # a SEPARATE invocation with its own 50-subrequest budget — which is the
 # whole point of the second string (2026-09-27):
