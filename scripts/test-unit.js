@@ -23290,6 +23290,28 @@ async function main() {
     );
   });
 
+  // A LOST D1 BINDING IS NOT A CRASH, IT IS A DIFFERENT DATABASE (2026-10-16).
+  // `env.DB` is the cutover switch, and the Turso store it replaced is now a
+  // FROZEN archive (docs/d1-migration-2026-10-15.md §5): a deploy that lost
+  // `[[d1_databases]]` keeps ticking, keeps pushing, and reads a day-old state
+  // machine — the shape that produces duplicate cards. /health is the endpoint
+  // anything watching this Worker polls, so the store has to be readable THERE;
+  // the same label on a /debug route answers only when a human asks.
+  await test("/health names the store in use, so a lost D1 binding is visible to a monitor", () => {
+    const worker = fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8");
+    const start = worker.indexOf('url.pathname === "/health"');
+    const end = worker.indexOf('url.pathname === "/debug/scan-history"');
+    assert.ok(
+      start > 0 && end > start,
+      "the /health route must be registered ahead of the debug routes",
+    );
+    const health = worker.slice(start, end);
+    assert.ok(
+      health.includes('dbStore: env.DB ? "d1" : "turso"'),
+      "/health must answer which store the binding gave this Worker",
+    );
+  });
+
   // The placement lever lives in wrangler.toml, so it is pinned like every
   // other deployed knob: an explicit region near the database, and NOT Smart
   // Placement (which needs a traffic pattern this Worker's fetch path cannot

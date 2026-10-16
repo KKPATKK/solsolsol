@@ -389,6 +389,69 @@ async function main() {
     client.close();
   });
 
+  await test("Db on D1: a duplicated push claim answers false — the guard's own 0", async () => {
+    // The claim is what stops a second card for a coin: an `INSERT OR IGNORE`
+    // into seen_tokens whose row count the caller reads as the answer. A LOST
+    // claim has to answer false, and that is D1's `meta.changes` for an insert
+    // SQLite skipped — the negative direction of the translation, i.e. the one
+    // whose failure mode is duplicate cards. Only the winning case was pinned
+    // before (the batch test above), so this is the other half.
+    const { client } = tmpClient();
+    const fake = new FakeD1(client);
+    const db = new Db("", undefined, undefined, fake);
+    await db.init();
+    assert.equal(await db.claimTokenPush("1", "dup"), true, "the first claim must win");
+    assert.equal(await db.claimTokenPush("1", "dup"), false, "the second claim must lose");
+    assert.equal(await db.isTokenSeen("1", "dup"), true, "…and the row is still there");
+    // ONE row, ONE counted claim: the paired counter statement rides the same
+    // batch and asks SQLite's own `changes()`, so a lost claim must not move it
+    // (the count is what `/health` publishes and what the reconcile compares).
+    const rows = await client.execute("SELECT COUNT(*) AS n FROM seen_tokens");
+    assert.equal(Number(rows.rows[0].n), 1);
+    const counter = await client.execute(
+      "SELECT value FROM worker_state WHERE key = 'telemetry_seen_tokens_count'",
+    );
+    assert.equal(Number(counter.rows[0].value), 1, "one winning claim, one counted row");
+    client.close();
+  });
+
+  await test("Db on D1: a scan still reports what its round trips cost", async () => {
+    // WHY THIS ONE IS PINNED (2026-10-16). `diag.dbMs` (/debug/tick-legs' `dbMs`)
+    // is the tick's own un-raced DB cost, and on libsql it exists because the
+    // SCAN client installs the wall's `onCost` hook (see ensureScanClient). The
+    // D1 branch used to serve both modes from connect(), which passes no hook —
+    // so every D1 tick reported `dbMs: 0` and the reading was silently dead on
+    // the store the tick now uses (measured live: every /debug/tick-legs row,
+    // 2026-10-16). The hook belongs on the scan client, because `get()` picks
+    // that client exactly while the scan window is open.
+    const { client } = tmpClient();
+    const fake = new FakeD1(client);
+    // ONE deliberately slow statement: the wall's onCost is wall time, and a
+    // temp-file SQLite round trip can settle inside the same millisecond this
+    // test started in — a real delay is what makes "cost > 0" mean something.
+    const rawExec = fake.exec.bind(fake);
+    fake.exec = async (sql, args) => {
+      if (args.includes("slow-probe")) await new Promise((r) => setTimeout(r, 40));
+      return rawExec(sql, args);
+    };
+    const db = new Db("", undefined, undefined, fake);
+    await db.init();
+
+    db.enterScanMode();
+    await db.getWorkerState("slow-probe");
+    const cost = db.exitScanMode();
+    assert.ok(cost >= 40, `a scan must report the round trips it paid for (got ${cost}ms)`);
+
+    // Leaving scan mode still answers: the wrapper changed the counter, not the
+    // binding. Outside the window the same read must NOT be counted at all
+    // (that number is the scan's, and exitScanMode already reset it).
+    assert.equal(await db.getWorkerState("anything"), null);
+    db.enterScanMode();
+    const idle = db.exitScanMode();
+    assert.equal(idle, 0, "a scan with no round trips must report 0ms, not a stale count");
+    client.close();
+  });
+
   await test("Db on libsql: the same calls keep their original statement shape, in ONE request", async () => {
     const { client } = tmpClient();
     /** Every statement the Db sent, so each writer can be counted on its own. */

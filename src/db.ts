@@ -2315,8 +2315,10 @@ export class Db {
     if (this.d1) {
       // D1: the binding call IS the transport, so there is nothing to bound
       // with a fetch signal — the hard wall still guards the call (1.2x
-      // DB_REQUEST_TIMEOUT_MS), and the wall's own `onCost` hook keeps the
-      // tick's `dbMs` reading working on this store too.
+      // DB_REQUEST_TIMEOUT_MS). This is the OUT-OF-SCAN client only: the
+      // tick's `dbMs` reading belongs to the scan client, which is the one
+      // place the cost hook is installed on this store (see
+      // ensureScanClient).
       this.client = wrapClientWithHardWall(createD1Transport(this.d1));
       return this.client;
     }
@@ -2368,12 +2370,27 @@ export class Db {
   private ensureScanClient(): SqlTransport {
     if (this.scanClient) return this.scanClient;
     if (this.d1) {
-      // One D1 transport for both modes: there is no HTTP request to abort at
-      // SCAN_DB_TIMEOUT_MS (the binding call is the RPC), so a second client
-      // would only re-wrap the same binding. The wall still applies through
-      // connect(), and the scan-mode cost counter is served by the same
-      // onCost hook the libsql path installs below.
-      return (this.scanClient = this.connect());
+      // A second wrapper over the SAME binding — for the COUNTER, not for the
+      // leash. There is no HTTP request to abort on this store (the binding
+      // call is the RPC), so a shorter wall here would only turn D1's own
+      // queueing into failed tick writes; the budget therefore stays
+      // DB_REQUEST_TIMEOUT_MS. What the scan client still owes is the cost
+      // hook: `diag.dbMs` is defined as what the SCAN's own round trips took
+      // (see exitScanMode) and `get()` picks this client exactly while the
+      // scan window is open. Without it that reading is dead on the store the
+      // tick now uses — measured live 2026-10-16, every /debug/tick-legs row
+      // answered `dbMs: 0` (the libsql scan client below is what kept the
+      // reading alive before the cutover).
+      return (this.scanClient = wrapClientWithHardWall(
+        createD1Transport(this.d1),
+        DB_REQUEST_TIMEOUT_MS,
+        (ms) => {
+          // Same one-sided bias as the libsql scan client below: a call that
+          // settles after exitScanMode() adds its ms to the NEXT tick's count,
+          // so this can overstate the cost, never hide it.
+          this.scanDbMs += ms;
+        },
+      ));
     }
     const raw = this.injectedClient ?? this.createRawClient(SCAN_DB_TIMEOUT_MS);
     const wrapped = asSqlTransport(wrapClientWithHardWall(raw, SCAN_DB_TIMEOUT_MS, (ms) => {

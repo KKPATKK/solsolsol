@@ -7419,6 +7419,15 @@ const worker = {
         scanCount,
         lastScanOk,
         lastScanAt: lastScanAt ? new Date(lastScanAt).toISOString() : null,
+        // WHICH STORE, read off the BINDING (the same label /debug/db-latency
+        // reports, and for the same reason: TURSO_DATABASE_URL still lives in
+        // the Worker for the archive/Node path, so a URL cannot answer it).
+        // `env.DB` IS the cutover switch, and the Turso side is now a FROZEN
+        // archive (docs/d1-migration-2026-10-15.md §5): a deploy that lost
+        // `[[d1_databases]]` would keep running this exact code against a
+        // day-old state machine and re-push what it already pushed — silently,
+        // unless the endpoint a monitor polls says which store answered.
+        dbStore: env.DB ? "d1" : "turso",
         dbReady,
         botReady,
         scannerReady,
