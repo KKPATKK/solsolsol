@@ -16,8 +16,11 @@
 | 5 | `/health` 講唔講「而家用邊個 store」 | **唔講**（只有 `/debug/db-latency` 講） | **已修**（§2.2）＋新測試 |
 | 6 | `claimTokenPush` **輸**咗要答 `false`（D1 翻譯嘅反向） | **冇任何測試釘** | **已加測試**（§2.3） |
 | 7 | D1 額度（rows written／read、queries、DB 大小） | 大量餘裕（寫入 57%） | 只記讀數（§4） |
-| 8 | read replication | `disabled` | 維持（§5.3） |
+| 8 | read replication | `disabled` | 維持（§3.3） |
 | 9 | Time Travel（唯一 DR 路徑） | **有 bookmark**，即係可以還原 | 記落嚟（§5.1） |
+| 10 | 一個 tick 出幾多句 statement（vs D1 嘅 per-invocation 上限） | **冇讀數**（只有 24h 平均可以推） | **新增儀器**（§2.4）＋測試 |
+| 11 | `npm test`（`scripts/test-filters.js`）可不可以安全咁跑 DB 階段 | **之前只可以：跳過，或寫凍結 archive** | **新增 local 模式**（§3.4），今日實跑 |
+| 12 | `subs`（`subreqView`）數唔數到 D1 call | **數唔到**（只數 `fetch`；D1 call 唔係 fetch），Paid 額度文件係 10,000 而 repo 常數係 1,000 | 記落嚟，未改（§3.5） |
 
 ## 1. 現況讀數（2026-10-16 02:4x–02:5xZ，全部現讀）
 
@@ -91,6 +94,27 @@ Mutation 實測（把鉤改成 no-op、重新 build）：
 而佢壞咗嘅後果正正係重複卡。**加測試**（`Db on D1: a duplicated push claim answers false — the guard's own 0`）：
 第一次 `true`、第二次 `false`、`seen_tokens` 仍然只有 1 行、配對計數器（`telemetry_seen_tokens_count`）仍然係 1。
 
+### 2.4 一個 tick 出幾多句 statement —— 之前冇讀數，而家逐 tick 讀得到
+`d1-migration-2026-10-15.md` §8 同 `d1-efficiency-2026-10-15.md` §6 都記住同一條未答嘅問題：
+**「一個 tick 嘅 statement 總數同預算嘅關係」**。當時唯一嘅讀數係 `dbTickSteps`（per-method 時間）同
+D1 自己嘅 24 小時 rollup，所以「一個 tick 會唔會撞到 D1 嘅 per-invocation 上限」只可以由平均值推（§4）。
+
+**新增儀器（`dbStatementView`，`src/db.ts`）**：每個 statement 都會經過硬牆（`wrapClientWithHardWall`），
+所以就在那裏數——`execute` ＝ 1 statement／1 request，`batch` ＝ N statements／1 request（D1 文件把 per-statement
+上限「apply to each individual statement contained within a batch statement」，即係一句 batch 算 N 條 query，
+但只算一次 request）。
+
+- `/health.dbStatements` ＝ 這個 isolate 嘅 `{ stmts, calls, sinceMs }`（同 `writeCensus` 一樣係 per-isolate、
+  唔會 reset 嘅窗口，時鐘同樣係 lazy：module scope 喺 pre-init 評估，`Date.now()` 答 0）。
+- `/debug/tick-legs` 嘅每一行加 `dbStmts` ／ `dbCalls` ＝ **由 tick entry 到收尾嘅 delta**（entry 同 ring row
+  捕捉兩次，計數器單調所以一定唔會負）。`subs` 唔可以代替它們：`subs` 只數 `fetch`，而 D1 binding call 唔係 fetch
+  （見 §3.5）。
+
+**測試**：`scripts/test-unit.js` —
+`db statements: a tick's queries are counted the way D1's allowance counts them`（1 execute ＝ 1 條、3-statement batch
+＝ 3 條／1 request、string 形 batch 同樣計數、`/health` 同 ring 嘅接線要存在、baseline 一定要 lazy）；
+`scripts/test-tick-legs.js` 釘住 ring row 真係帶 `dbStmts`／`dbCalls`。
+
 ## 3. 檢查過但**唔改**（連理由）
 
 ### 3.1 reader 嘅 `IN (?)` 清單冇按 `paramLimit()` 切
@@ -107,15 +131,57 @@ caller 已經有 catch（`diag.dbDegraded = "stats-read"`，跳過**整個 tick*
 即係「唔會壞資料，但新幣喺 densest ticks 會靜靜地唔入 pool」。所以呢條係**配置界線**，唔係今日嘅 bug；
 如果日後要調高 feed 上限，呢個係要一齊切嘅位。
 
-### 3.2 `writeCensus` 唔可以用嚟量 statement 數
+### 3.2 `writeCensus` 唔可以用嚟量 statement 數（所以另加一個 counter，見 §2.4）
 佢係 **per-isolate**（module scope）而且**只計 `rowsAffected > 0` 嘅 statement**，所以「一個 tick 出幾多句」
-喺佢身上答唔到（`d1-migration` §8 同 `d1-efficiency` §6 都記住呢點）。今日嘅 tick 讀數仍然係 method 級。
+喺佢身上答唔到（`d1-migration` §8 同 `d1-efficiency` §6 都記住呢點）；`dbSteps` 亦只係 method 級。
+所以唔改佢，而是加一個專用嘅 statement／request 計數器（§2.4）。
 
 ### 3.3 read replication
 `disabled`（§1）。佢要 `withSession()`／read-your-writes 手續，而呢個 Worker 係 **read-after-write**
 （單飛鎖、`seen_tokens`、tracker CAS、pool 讀同 tick 自己寫嘅 `token_stats`）——
 喺 placement 已經釘喺 primary 隔籬嘅前提下，開佢只有風險冇收益。維持，並記住驗收條件：
 如果 `served_by_colo` 唔再係 DFW（Cloudflare 可以因維護自動調整 placement），先值得重新討論。
+
+### 3.4 `npm test`（`scripts/test-filters.js`）而家真跑到 DB 階段
+呢個檔案係 `npm test`，而 10-15 嘅 archive 護欄留下兩個選擇：只跑 phase 1（DB 階段完全唔碰
+`Db` 同 `Scanner.runOnce`），或者寫凍結嘅 Turso archive。但 phase 2／3 覆蓋嘅係**寫入路徑**
+（註冊、claim、完成 flush），所以「npm test 跳過它」等於「寫入路徑冇手動檢查」。
+
+**新增 LOCAL 模式**：`FILTERS_LOCAL_DB=/tmp/filters.db npm test` —— 經注入 client seam
+（`Db(url, token, injectedClient)`）跑一個真正嘅本地 SQLite file，唔要憑證、冇 remote store 可達。
+兩個性質保證它唔係護欄嘅洞：**archive opt-in 優先**（帶 `--allow-archive-write` 時完全忽略 `FILTERS_LOCAL_DB`，
+即係一個陳舊嘅環境變數唔可能偷偷把一個刻意嘅 archive run 改道），同名為 `USE_LOCAL = Boolean(LOCAL_DB) && !ARCHIVE_WRITE_OK`；
+以及 local Db 一定建在本地 file 上（唔係 Turso URL），連 phase 3 嘅 `seen_tokens` 清理都一樣。
+同一個 pin（`scripts/test-d1-migrate.js`）同時守住舊有嘅「archive 要旗標 AND 憑證」規則。
+
+**今日實跑（2026-10-16，`FILTERS_LOCAL_DB=/tmp/filters-test.db npm test`，exit 0）**：
+- Phase 1：14 項 config／文案檢查 ✅；種一個 enabled chat（唔種嘅話 scanner 會早退
+  `no chats with push enabled, skipping`，phase 3 就變成量一個 early return）。
+- Phase 2：live DexScreener **22 profiles** + 逐條件 verdict 表 ✅。
+- Phase 3：真 `Scanner.runOnce`（mock bot）**1,129ms**，寫入路徑真跑過 ——
+  `[db] pool band index ready: idx_pool_band_m32000`（DDL）、`token_stats` 39 行、
+  日誌 `scan done in 1127ms: 22 profiles, 22/22 pooled, 0 candidates, 0 pushed`，
+  `seen_tokens` 清理後 0 行。（`scan_history` 0 行係預期：完成 flush 係 worker 嘅工作，唔係 scanner 的。）
+- **archive 冇碰**：這條 run 只連本地 file（URL／TOKEN 根本冇傳過）。
+
+### 3.5 未修但已查實：`subreqView`（`subs`）而家數唔到 D1 call
+`src/subreqs.ts` 只數 global `fetch`，而 **D1 binding call 唔係 fetch** —— 所以切換之後
+`/debug/tick-legs` 嘅 `subs` 由 Turso 年代嘅 ~29–39 跌到 **9–11**，減嘅正好係 DB 嘅份額。
+
+Cloudflare 文件的事實（查證日期 2026-10-16）：
+- Workers Limits 頁：**「A subrequest is any request a Worker makes using the Fetch API or to Cloudflare
+  services like R2, KV, or D1.」** ⇒ D1 binding call **係** subrequest，即係運行時會計，而本 repo 嘅 counter 唔計。
+- 同一頁現在給 Paid 嘅 subrequest 額度係 **10,000／invocation（可配置至 10M）**，而本 repo 嘅常數係
+  `SUBREQ_BUDGET = 1_000`（subreqs.ts，2026-09-28 落）：即係**現行代碼比平台上限保守十倍**
+  （除非帳號喺 wrangler／dashboard 另外限過 —— `wrangler.toml` 冇 `[limits]` block）。
+- D1 Limits 頁：**1,000 queries／invocation（Paid）**，而 batch 頁寫明 per-statement 限制
+  「apply to each individual statement contained within a batch statement」——即係一句 batch 算 N 條 query
+  （§2.4 嘅計數器就係照這個口徑數）；batch 嘅**最大句數冇文件寫明**。
+
+**為何未即改**：`subreqRemaining()` 係 opt-in legs／tracker pass 收手的依據。
+把 D1 call 計進去（或者把 1,000 改成 10,000）係改**決策輸入**，要先量到自己嘅 D1 call/tick 分佈
+（§2.4 新儀器給嘅 `dbCalls` 正是這個）才值得動。今日嘅保守方向係安全側（早點收手），
+唔係壞嘅方向；但它令「tick 用咗幾多 subrequest」這個讀數**偏低**，寫落嚟免得日後有人用它做面積計算。
 
 ## 4. D1 上限 vs 今日用量（完全冇一個接近）
 
@@ -124,7 +190,7 @@ caller 已經有 catch（`diag.dbDegraded = "stats-read"`，跳過**整個 tick*
 | 100 bound params／statement | 六個 writer 切到 ≤100；reader 最長 26 | —— |
 | 100 KB SQL 文字／statement（唔包 parameter） | 最大 shape 係 chunk 後嘅 INSERT（`d1-migration` §2 有逐個列） | —— |
 | 2 MB／value 或 row | `worker_state` 最大 33 KB（push-audit ring） | ~60× |
-| 1,000 queries／invocation（Paid） | **~75 句／tick**（216,643 queries／24h ÷ 2,880 ticks） | ~13× |
+| 1,000 queries／invocation（Paid） | **~75 句／tick**（216,643 queries／24h ÷ 2,880 ticks，平均上界；deploy 後改讀 `tick-legs.dbStmts`，per-tick） | ~13× |
 | 30 秒／batch | 一個 batch 係 1 個請求，15–55ms 級 | —— |
 | 50M rows written／月 | 954,630／日 → **~57%** 額度 | 1.75× |
 | 25B rows read／月 | 13.9M／日 → **~1.7%** 額度 | 59× |
@@ -147,20 +213,30 @@ $ npx wrangler d1 time-travel info solana-meme-bot --json
 （回滾之後會失去 D1 窗口內嘅寫入＝重複卡風險，所以只可以即刻做）。呢次**冇**加 fail-closed 守衛：
 凍結 archive 係官方記低嘅回滾方向，硬停會令嗰條路要改 code —— 改成「睇得到」係同風險成比例嘅一步。
 
-### 5.3 兩個 fix 要 deploy 才生效
-到今日為止 `dbStore` 只喺 `/debug/db-latency`、`dbMs` 仍然係 0。**Deploy 之後嘅驗收讀數**：
-`/health.dbStore === "d1"`、`/debug/tick-legs` 任何一個 tick 嘅 `dbMs > 0`（同 libsql 側一樣係 scan 嘅 round trip 總和）。
+### 5.3 2026-10-16 早上：已 deploy，驗收讀數
+Commit `00a2637`（run 38843036295：`migrate`／`deploy`／`catchup` 全 success）之後嘅 live 讀數：
+- `/health.dbStore` ＝ **`"d1"`** ✅（`dbReady true`、`initError null`、`writeDrainError null`、`deadTickStreak 0`、
+  `heartbeat.colo DFW`）。
+- `/debug/tick-legs` 嘅 `dbMs`：deploy 前最後一個 tick（02:59:35Z）＝ `0`，deploy 後 03:00:00Z ＝ **102ms**、
+  03:02:00Z ＝ **82ms** ✅。
+- 寫入路徑冇壞：`scan_history` 最新三行 03:01:11Z／03:01:34Z／03:02:00Z（tick 每 ~25–30s 完成 flush）。
+
+### 5.4 §2.4 嘅新儀器要下一次 deploy 才讀得到
+`dbStmts`／`dbCalls`／`dbStatements` 係新增欄位：deploy 之後嘅驗收讀數係
+`/debug/tick-legs` 任何一行有 `dbStmts`（非 null），而同一個回應嘅 `/health.dbStatements.stmts` 會隨時間上升。
 
 ## 6. 限制（唔可以當過）
 
-- **呢兩個 fix 未 deploy**：上面 §2 全部係「代碼＋測試」級證據（build／typecheck 過、mutation 過），
-  唔係 live 讀數。Live 驗收要等下一次 deploy，讀 §5.3 嗰兩個位。
+- **§2.1／§2.2 已 deploy 並 live 核對**（§5.3）；**§2.4 嘅新儀器（`dbStmts`／`dbStatements`）未 deploy**：
+  佢嘅證據目前只到「代碼＋測試」（typecheck 過、新測試釘住 ring 同 /health 嘅接線）。驗收讀數見 §5.4。
 - **跑過嘅檢查**：`npm run typecheck`（`tsc --noEmit`）＋ CI 條鏈嘅全部 suite
-  （`test-unit` 549、`test-deferred-priority`、`test-tick-path`、`test-schema-gate`、`test-health-front`、
-  `test-dex-list-cache`、`test-usd-formatter`、`test-dex-last-profiles`、`test-tick-legs`、
+  （`test-unit` **550**、`test-deferred-priority`、`test-tick-path`、`test-schema-gate`、`test-health-front`、
+  `test-dex-list-cache`、`test-usd-formatter`、`test-dex-last-profiles`、`test-tick-legs` 9、
   `test-unconfirmed-cards`、`test-d1-transport` 11、`test-d1-migrate` 18），全部 0 failed。
-  **冇跑** `npm test`（`scripts/test-filters.js`）：佢要 DB 憑證而且會寫 archive，冇 `--allow-archive-write` 就唔碰
-  （`d1-migration-2026-10-15.md` §5 嘅護欄）—— 即係今次冇驗過佢，唔可以當佢過。
-- **queries／tick 係 24 小時平均嘅上界**，唔係 per-tick 量度（per-statement 讀數仍然未有）。
+- **`npm test`（`scripts/test-filters.js`）今次真跑過**（§3.4，local 模式，exit 0）：
+  phase 1／2／3 全行，寫入路徑（註冊、DDL、`runOnce`）真跑。**archive 模式仍然只可以明加
+  `--allow-archive-write`**，而嗰條路今次**冇跑** —— 即係「寫凍結 archive」嘅路徑依然未驗。
+- **queries／tick 由 deploy 之後改讀 per-tick 嘅 `dbStmts`**（§2.4）；今日嘅 ~75 係 24 小時平均上界。
+- **`subs` 讀數偏低**：D1 call 唔經 `fetch`，所以 `subreqView()` 數唔到（§3.5）；未改，因為它係決策輸入。
 - **D1 單線程**：一個 tick 內多個請求會排隊，所以單次 call 嘅 `max` 唔代表成本（睇每 tick 加總）。
 - 樣本細：`/debug/db-latency` 每個 op 5 個 sample，`tick-legs` 5 個 tick。

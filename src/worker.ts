@@ -19,6 +19,7 @@ import {
   parseScheduledTickRing,
   parseTelemetryCounter,
   parseTradeModeOverride,
+  dbStatementView,
   telemetryCounterUsable,
   writeCensusView,
   type ScanTrigger,
@@ -2679,6 +2680,15 @@ let preTick: PreTickView = {
 };
 /** Handler entry of the tick in progress (0 = nothing recorded). */
 let preTickEntryAt = 0;
+/**
+ * Statements and round trips at THIS tick's entry (see dbStatementView): the
+ * per-tick reading is the difference at the end, because the counters are
+ * per-ISOLATE totals that never reset. Snapshotted where the entry stamp is
+ * taken, so "what this tick issued" starts before its first front read — the
+ * claim batch included.
+ */
+let preTickEntryStmts = 0;
+let preTickEntryCalls = 0;
 
 /**
  * PER-TICK LEG RING (see /debug/tick-legs). What the durable rows cannot
@@ -2718,6 +2728,16 @@ export interface TickLegRow {
   skip: string | null;
   /** Subrequests spent at completion. */
   subs: number | null;
+  /**
+   * D1 statements this tick issued since its entry, and the round trips that
+   * carried them (see dbStatementView). The per-invocation query allowance
+   * (D1: 1,000 on Paid) is spent PER STATEMENT, a batch counting N — so this is
+   * the number that answers "does a tick fit", which `subs` cannot: `subs`
+   * counts fetch calls only, and a D1 binding call is not a fetch. Null when
+   * the tick ran without the Db (a shed, or a delivery that never reached it).
+   */
+  dbStmts: number | null;
+  dbCalls: number | null;
   preStartMs: number | null;
   preRaceMs: number | null;
   raceMs: number | null;
@@ -2770,6 +2790,8 @@ export function buildTickLegRow(input: {
   cutNote: string | null;
   preTick: PreTickView | null;
   subs: number | null;
+  dbStmts: number | null;
+  dbCalls: number | null;
   summary: ScanSummary | null;
   skip: string | null;
 }): TickLegRow {
@@ -2785,6 +2807,8 @@ export function buildTickLegRow(input: {
     cutNote: input.cutNote,
     skip: input.skip,
     subs: input.subs,
+    dbStmts: input.dbStmts,
+    dbCalls: input.dbCalls,
     preStartMs: p?.preStartMs ?? null,
     preRaceMs: p?.preRaceMs ?? null,
     raceMs: p?.raceMs ?? null,
@@ -3199,6 +3223,9 @@ export function preTickView(): PreTickView {
  */
 function markPreTickEntry(entryAt: number): void {
   preTickEntryAt = entryAt;
+  const stmtsAtEntry = dbStatementView();
+  preTickEntryStmts = stmtsAtEntry.stmts;
+  preTickEntryCalls = stmtsAtEntry.calls;
   preTick = {
     at: entryAt,
     steps: { ...PRE_TICK_ZERO_STEPS },
@@ -5629,6 +5656,11 @@ async function runScan(
         cutNote: cutStageNote || null,
         preTick,
         subs: subreqView().current.total,
+        // The DB half of the invocation's spend, as a delta from the entry
+        // snapshot (see preTickEntryStmts). Monotonic counters, so this cannot
+        // go negative inside one invocation.
+        dbStmts: dbStatementView().stmts - preTickEntryStmts,
+        dbCalls: dbStatementView().calls - preTickEntryCalls,
         summary,
         skip: skipView?.reason ?? null,
       });
@@ -7519,6 +7551,11 @@ const worker = {
         // (watch `heartbeat.owner`) give the rate, and keys[0] names the
         // loudest writer without a tick-level window.
         writeCensus: writeCensusView(),
+        // How many statements and round trips THIS isolate has issued, and for
+        // how long — the per-tick figures ride /debug/tick-legs (dbStmts /
+        // dbCalls). Statements, not requests, are what D1's 1,000-per-invocation
+        // allowance counts; see dbStatementView.
+        dbStatements: dbStatementView(),
         lastSkip: scanner?.lastSkip ?? null,
         scanRunning,
         // Cross-isolate single-flight: how often this isolate skipped a

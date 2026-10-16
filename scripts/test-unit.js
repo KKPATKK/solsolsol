@@ -24245,6 +24245,60 @@ async function main() {
     );
   });
 
+  await test("db statements: a tick's queries are counted the way D1's allowance counts them", async () => {
+    // D1 limits QUERIES per Worker invocation (1,000 on Paid), and its limits
+    // page applies the per-statement rules "to each individual statement
+    // contained within a batch statement" — so a batch is ONE request carrying
+    // N queries. Nothing in this repo counted either, which left "does a tick
+    // fit the query budget" answerable only by dividing D1's 24h rollup by the
+    // tick count (docs/d1-store-audit-2026-10-16.md §4). This pins both numbers
+    // at the seam that sees every statement (wrapClientWithHardWall).
+    const { dbStatementView, wrapClientWithHardWall } = require("../dist/db.js");
+    const before = dbStatementView();
+    const client = wrapClientWithHardWall({
+      execute: async () => ({ rows: [], rowsAffected: 0 }),
+      batch: async (stmts) => stmts.map(() => ({ rows: [], rowsAffected: 0 })),
+    });
+    await client.execute({ sql: "SELECT 1", args: [] });
+    await client.batch([
+      { sql: "SELECT 2", args: [] },
+      { sql: "SELECT 3", args: [] },
+      { sql: "SELECT 4", args: [] },
+    ]);
+    const after = dbStatementView();
+    assert.equal(after.calls - before.calls, 2, "two calls: one execute, one batch");
+    assert.equal(after.stmts - before.stmts, 4, "1 + 3 statements, not 2 requests");
+    // A batch handed plain SQL strings must count its statements too (the
+    // transport accepts both shapes; the census above already assumes it).
+    await client.batch(["SELECT 5", "SELECT 6"]);
+    assert.equal(
+      dbStatementView().stmts - after.stmts,
+      2,
+      "a string-shaped batch still carries its statements",
+    );
+    // The per-tick reading is a DELTA between two snapshots (the counters are
+    // monotonic per isolate), so both ends have to be published: /health for
+    // the isolate window, the leg ring for the tick.
+    const worker = fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8");
+    assert.ok(worker.includes("dbStatements: dbStatementView()"), "/health must publish the count");
+    assert.ok(
+      worker.includes("dbStmts: dbStatementView().stmts - preTickEntryStmts"),
+      "the tick's statements ride the leg ring as an entry-to-completion delta",
+    );
+    assert.ok(
+      worker.includes("dbCalls: dbStatementView().calls - preTickEntryCalls"),
+      "…and so do the round trips that carried them",
+    );
+    // The baseline stamp has to stay LAZY for the same reason the census's does:
+    // module scope runs in pre-init, where Date.now() answers 0.
+    const dbSrc = fs.readFileSync(path.join(__dirname, "..", "src", "db.ts"), "utf8");
+    assert.ok(
+      !/const dbStatementsSince = Date\.now\(\)/.test(dbSrc) &&
+        dbSrc.includes("function dbStatementClock()"),
+      "the statement window is stamped on first use, never at module scope",
+    );
+  });
+
   // ---------- the /debug/backfill cooldown has to be durable ----------
   //
   // The endpoint walks 42h of Birdeye `new_listing` and spends 30–80 CU a run,

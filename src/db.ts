@@ -736,6 +736,71 @@ export function writeCensusKey(sql: string): string {
 }
 
 /** Rows one libsql result reports as affected (a batch answers per statement). */
+/**
+ * Statements and round trips THIS isolate has issued since its first call.
+ *
+ * WHY THIS COUNTER EXISTS (2026-10-16). D1 limits QUERIES per Worker
+ * invocation (1,000 on Paid), and it documents its per-statement limits as
+ * applying to each statement inside a `batch()` — i.e. a batch is one request
+ * but N queries. Nothing in this repo counted either, so the only reading of
+ * the tick's DB traffic was per-METHOD wall time (`dbSteps`) plus D1's own 24h
+ * rollup, and "does a tick fit the per-invocation query budget" could only be
+ * inferred by dividing that rollup by the tick count (docs/
+ * d1-store-audit-2026-10-16.md §4). This is the missing number, taken at the
+ * one seam every statement already passes through (see wrapClientWithHardWall).
+ *
+ * PER ISOLATE, LIKE THE WRITE CENSUS: module scope outlives a warm isolate's
+ * requests, so a raw total is a window over whoever landed here — the per-TICK
+ * reading is a DELTA between two snapshots (see the tick front in src/worker.ts
+ * and TickLegRow.dbStmts).
+ */
+let dbStatements = 0;
+let dbCalls = 0;
+/**
+ * Epoch of the first counted statement (0 = none yet). LAZY for the same
+ * reason as writeCensusSince: module scope is evaluated during the runtime's
+ * PRE-INIT, where `Date.now()` answers 0, so an eager stamp reads as 1970.
+ */
+let dbStatementsSince = 0;
+
+function dbStatementClock(): number {
+  if (dbStatementsSince === 0) dbStatementsSince = Date.now();
+  return dbStatementsSince;
+}
+
+/**
+ * Count ONE call off the wall, the way the store's limits do: an `execute` is
+ * one statement in one request, and a `batch` is ONE request carrying N — D1
+ * counts its 1,000-query allowance per statement, not per batch (its limits
+ * page: "Limits for individual queries … apply to each individual statement
+ * contained within a batch statement"), while a request is what a subrequest
+ * budget pays for. Both numbers are kept because they answer different
+ * questions; neither is derivable from the other.
+ */
+function noteDbStatements(op: string | symbol, first: unknown): void {
+  dbStatementClock();
+  dbCalls += 1;
+  dbStatements += op === "batch" && Array.isArray(first) ? first.length : 1;
+}
+
+/**
+ * This isolate's statement and round-trip totals (see /health's dbStatements).
+ * `sinceMs` is how long the window covers. Read it as a DELTA: the counters
+ * never reset, so a per-tick figure is `after - before`.
+ */
+export function dbStatementView(): {
+  stmts: number;
+  calls: number;
+  sinceMs: number;
+} {
+  return {
+    stmts: dbStatements,
+    calls: dbCalls,
+    sinceMs: Date.now() - dbStatementClock(),
+  };
+}
+
+/** Rows one libsql result reports as affected (a batch answers per statement). */
 function rowsAffectedOf(result: unknown): number {
   if (Array.isArray(result)) return result.reduce((n, r) => n + rowsAffectedOf(r), 0);
   const ra = (result as { rowsAffected?: unknown } | null)?.rowsAffected;
@@ -821,6 +886,10 @@ export function wrapClientWithHardWall<T extends object>(
       }
       return (...args: unknown[]) => {
         const t0 = Date.now();
+        // The tick's statement/request reading rides the same seam as the
+        // census below (see noteDbStatements): every statement the Db issues
+        // goes through here, on both stores.
+        noteDbStatements(prop, args[0]);
         const op = (
           Reflect.get(target, prop) as (...a: unknown[]) => Promise<unknown>
         ).apply(target, args);

@@ -69,6 +69,8 @@ function input(over = {}) {
     cutNote: null,
     preTick: null,
     subs: null,
+    dbStmts: null,
+    dbCalls: null,
     summary: null,
     skip: null,
     ...over,
@@ -86,6 +88,11 @@ test("a full tick maps every leg and the front split", () => {
         raceMs: 15_090,
       },
       subs: 29,
+      // The DB half of the invocation's spend (2026-10-16): `subs` counts fetch
+      // calls only and a D1 binding call is not a fetch, so the statements a
+      // tick issued ride their own pair of fields.
+      dbStmts: 118,
+      dbCalls: 41,
       summary: {
         profiles: 21,
         pool: 79,
@@ -119,6 +126,8 @@ test("a full tick maps every leg and the front split", () => {
   assert.equal(row.steps.init, 1223);
   assert.equal(row.steps.claim, 260);
   assert.equal(row.subs, 29);
+  assert.equal(row.dbStmts, 118);
+  assert.equal(row.dbCalls, 41);
   assert.equal(row.pool, 79);
   assert.equal(row.feedsMs, 530);
   assert.equal(row.poolMs, 2400);

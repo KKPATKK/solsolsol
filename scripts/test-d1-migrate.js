@@ -869,6 +869,35 @@ async function main() {
       /if \(USE_ARCHIVE\) \{/,
       "test-filters.js phase 1 must gate the real settings read on USE_ARCHIVE",
     );
+
+    // …and there is a THIRD way to run the database phases that reaches no
+    // remote store at all: FILTERS_LOCAL_DB, a throwaway SQLite file through
+    // the injected-client seam. It exists because the guard above left the
+    // writing path (registration, claims, the flush) with no hand-run check —
+    // either skip the DB or write the frozen archive. Two properties keep it
+    // from becoming a hole: the explicit archive opt-in WINS (a stale variable
+    // cannot redirect a deliberate archive run), and the local Db is built on
+    // the local file, never on the Turso URL.
+    assert.match(
+      filters,
+      /const USE_LOCAL = Boolean\(LOCAL_DB\) && !ARCHIVE_WRITE_OK;/,
+      "the local DB mode must be unusable while the archive opt-in is on",
+    );
+    assert.match(
+      filters,
+      /const USE_DB = USE_ARCHIVE \|\| USE_LOCAL;/,
+      "the phases must gate on `a store exists`, not on the archive alone",
+    );
+    assert.match(
+      filters,
+      /new Db\(`file:\$\{LOCAL_DB\}`/,
+      "local mode must build its Db on the local file, not on the Turso URL",
+    );
+    assert.match(
+      filters,
+      /USE_LOCAL\s*\n?\s*\? createClient\(\{ url: `file:\$\{LOCAL_DB\}` \}\)/,
+      "…and its seen_tokens cleanup must stay on the same file",
+    );
   });
 
   await test("the pool backfill asks the deployed Worker, and can write no store itself", () => {

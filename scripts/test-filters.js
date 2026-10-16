@@ -56,6 +56,41 @@ const ARCHIVE_WRITE_OK =
   /^(1|true|yes)$/i.test(process.env.ALLOW_ARCHIVE_WRITE || "");
 const USE_ARCHIVE = Boolean(URL && TOKEN) && ARCHIVE_WRITE_OK;
 
+/**
+ * LOCAL MODE (2026-10-16): run the database phases against a throwaway SQLite
+ * file instead of any remote store.
+ *   FILTERS_LOCAL_DB=/tmp/filters.db node scripts/test-filters.js
+ *
+ * WHY IT EXISTS. The guard above left exactly two ways to run this script: the
+ * config checks alone (phases 2 and 3 never touch `Db` or `Scanner.runOnce`), or
+ * the frozen Turso archive. But the code those phases cover is the WRITING path
+ * — registration, claims, the completion flush — so "npm test skips it" is the
+ * same statement as "the writing path has no hand-run check". A local file
+ * drives the real `Db` and the real scanner through the injected-client seam the
+ * offline suites already use (`Db(url, token, injectedClient)`), needs no
+ * credentials, and has no remote store to reach.
+ *
+ * PRECEDENCE: the explicit archive opt-in WINS. With `--allow-archive-write`
+ * this run reads the archive and ignores FILTERS_LOCAL_DB, so a stale variable
+ * in the environment can never silently redirect a deliberate archive run.
+ */
+const LOCAL_DB = process.env.FILTERS_LOCAL_DB || null;
+/** The chat the local mode seeds, so phase 3 does not early-return (see below). */
+const LOCAL_CHAT_ID = "local-test-chat";
+const USE_LOCAL = Boolean(LOCAL_DB) && !ARCHIVE_WRITE_OK;
+/** Any real store at all: the phases gate on THIS, not on USE_ARCHIVE. */
+const USE_DB = USE_ARCHIVE || USE_LOCAL;
+
+/**
+ * The local-mode Db: a real SQLite file, reached through the same injected
+ * client the offline test suites pass in. `createClient` below is the NODE
+ * client (this file already requires it) — the web client `Db` builds for a
+ * remote URL refuses `file:` outright.
+ */
+function localDb() {
+  return new Db(`file:${LOCAL_DB}`, undefined, createClient({ url: `file:${LOCAL_DB}` }));
+}
+
 /** Why the database phases are not running, phrased for whoever just ran it. */
 function archiveSkipReason() {
   if (!URL || !TOKEN) return "⚠️  TURSO 未配置，跳过";
@@ -114,21 +149,42 @@ async function phase1() {
     console.log(`  ${ok ? "✅" : "❌"} /help 文案不再包含 "${t}"（已移除该 filter）`);
   }
 
+  // The local file first: it is the only mode that no environment can turn
+  // into a remote write.
+  if (USE_LOCAL) {
+    const db = localDb();
+    await db.init();
+    console.log(`  🧪 本地模式：${LOCAL_DB}（SQLite file，經 injected-client seam，唔會碰任何 remote store）`);
+    // Seed ONE enabled chat. Without it the scanner takes its "no chats with
+    // push enabled, skipping" branch and phase 3 measures an early return
+    // instead of the writing path (front claim, registration, completion
+    // flush) this mode exists to exercise — measured 2026-10-16: runOnce
+    // settled in 12ms and wrote no token_stats row at all.
+    await db.saveChatSettings({ ...DEFAULT_SETTINGS, chatId: LOCAL_CHAT_ID, enabled: true });
+    console.log(`  🧪 已種一個 enabled chat（${LOCAL_CHAT_ID}），令 phase 3 真係行寫入路徑`);
+    await printEnabledChats(db);
+    return db;
+  }
   // Real chat settings from the database (archive only with an explicit opt-in).
   if (USE_ARCHIVE) {
     const db = new Db(URL, TOKEN);
     await db.init();
-    const chats = await db.listEnabledChats();
-    console.log(`\n  📋 已开启推送的 chat 数量: ${chats.length}`);
-    for (const c of chats) {
-      console.log(
-        `  chat=${c.chatId} | 市值 ${USD(c.minMarketCapUsd)}–${USD(c.maxMarketCapUsd)} | 上线 ${c.minAgeMinutes}–${c.maxAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 1h量≥${USD(c.min1hVolUsd)} | 5m涨幅≥${c.min5mChgPct}%`,
-      );
-    }
+    await printEnabledChats(db);
     return db;
   }
   console.log(`  ${archiveSkipReason()}`);
   return null;
+}
+
+/** The enabled chats of whichever store this run is on, printed for the operator. */
+async function printEnabledChats(db) {
+  const chats = await db.listEnabledChats();
+  console.log(`\n  📋 已开启推送的 chat 数量: ${chats.length}`);
+  for (const c of chats) {
+    console.log(
+      `  chat=${c.chatId} | 市值 ${USD(c.minMarketCapUsd)}–${USD(c.maxMarketCapUsd)} | 上线 ${c.minAgeMinutes}–${c.maxAgeMinutes}m | 5m量≥${USD(c.min5mVolUsd)} | 1h量≥${USD(c.min1hVolUsd)} | 5m涨幅≥${c.min5mChgPct}%`,
+    );
+  }
 }
 
 async function phase2(db, cfg, dex, birdeye, rugcheck) {
@@ -300,10 +356,10 @@ async function phase2(db, cfg, dex, birdeye, rugcheck) {
 
 async function phase3(db, cfg, dex, birdeye, rugcheck) {
   console.log("\n===== PHASE 3: 真实 Scanner.runOnce 端到端（mock bot，不实际发送） =====\n");
-  // `db` is only ever non-null under USE_ARCHIVE (phase 1 returns it there),
-  // but the guard is restated here so every DB touchpoint in this file is
-  // gated by the opt-in rather than by inference.
-  if (!db || !USE_ARCHIVE) {
+  // `db` is only ever non-null when phase 1 opened a store (archive opt-in or
+  // the local file), but the guard is restated here so every DB touchpoint in
+  // this file is gated by the mode rather than by inference.
+  if (!db || !USE_DB) {
     console.log(`  ${archiveSkipReason()}`);
     return;
   }
@@ -334,8 +390,12 @@ async function phase3(db, cfg, dex, birdeye, rugcheck) {
     if (kb) console.log("    [按钮] " + JSON.stringify(kb[0]));
   }
 
-  // Undo seen_tokens side effects created during this test.
-  const raw = createClient({ url: URL, authToken: TOKEN });
+  // Undo seen_tokens side effects created during this test — in the SAME store
+  // this run used (the local file in local mode: the cleanup must not reach for
+  // the archive URL the phases never talked to).
+  const raw = USE_LOCAL
+    ? createClient({ url: `file:${LOCAL_DB}` })
+    : createClient({ url: URL, authToken: TOKEN });
   await raw.execute({ sql: "DELETE FROM seen_tokens WHERE first_seen_at >= ?", args: [testStart] });
   await raw.close();
   console.log(`  🧹 已清理测试期间写入的 seen_tokens 记录`);
@@ -353,11 +413,13 @@ async function main() {
   await phase3(db, cfg, dex, birdeye, rugcheck);
 
   console.log("\n===== 测试完成 =====");
-  const turso = USE_ARCHIVE
-    ? "Turso archive ✅ (--allow-archive-write)"
-    : URL && TOKEN
-      ? "Turso 🚫 唯讀 archive（未開 --allow-archive-write）"
-      : "Turso ⚠️未配";
+  const turso = USE_LOCAL
+    ? `本地 SQLite file 🧪 (${LOCAL_DB})`
+    : USE_ARCHIVE
+      ? "Turso archive ✅ (--allow-archive-write)"
+      : URL && TOKEN
+        ? "Turso 🚫 唯讀 archive（未開 --allow-archive-write；要跑 DB 階段可加 FILTERS_LOCAL_DB）"
+        : "Turso ⚠️未配（要跑 DB 階段可加 FILTERS_LOCAL_DB）";
   if (USE_ARCHIVE && BKEY) {
     console.log(`  数据源: DexScreener ✅ / ${turso} / Birdeye ✅ / RugCheck ✅`);
   } else {
