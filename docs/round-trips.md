@@ -4380,7 +4380,8 @@ liquidity = 0.0000004 – 12.9 USD
    非可比 leg 報 ≤ $500 就當「已抽乾」照判斷，> $500 維持 `null`（level 唔可比），
    `null` 讀數亦維持 `null`（「冇數字」唔等於「冇池」）。
    為何唔會誤殺：Jupiter 讀數 0.46–0.58x，$500 喺 Dex 尺度最多 ~$1,100 ——
-   低過所有設定嘅 floor（`MIN_LIQUIDITY_USD = 8,000`）同 pool prune（0.8 × 8,000）。
+   低過 chat 嘅 floor（`DEFAULT_SETTINGS.minLiquidityUsd = $10,000`）同 pool prune
+   （0.8 × 8,000 = $6,400）。部署後生產 reject ring 印嘅正是 `流动性 $x < $10K`。
    `liquidityIsComparable` 本身**冇改**，所以 push-watch 嘅 💧 drain 規則同
    `maxLiquidityObserved` 高水位照舊唔會食 Jupiter 數字。
 2. **Reject 文案分家**：市值 ≤ 0 時寫「市值 冇讀數（冇價格／池已抽乾） < $60K」，

@@ -3133,10 +3133,12 @@ export function jupiterGateVerdict(
  * judges that shape on the leg that answered.
  *
  * WHY THE THRESHOLD CANNOT BITE A LIVE COIN: Jupiter reads 0.46-0.58x of
- * DexScreener's reserve, so $500 here is at most ~$1,100 there — under every
- * configured floor (MIN_LIQUIDITY_USD is 8,000) and under the pool's own prune
- * (0.8 x 8,000). A reading this small therefore cannot promote a coin the
- * calibrated leg would have kept; it only names a pool that holds nothing.
+ * DexScreener's reserve, so $500 here is at most ~$1,100 there — under the
+ * chat floor (DEFAULT_SETTINGS.minLiquidityUsd = $10,000; the live reject ring
+ * prints that same `$10K`) and far under the pool's own prune (0.8 x 8,000 =
+ * $6,400, see POOL_LIQUIDITY_PRUNE_RATIO). A reading this small therefore
+ * cannot promote a coin the calibrated leg would have kept; it only names a
+ * pool that holds nothing.
  */
 export const DRAINED_POOL_LIQUIDITY_USD = 500;
 
