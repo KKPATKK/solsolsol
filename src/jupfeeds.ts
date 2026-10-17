@@ -61,6 +61,25 @@ function combineAbortSignals(
   return combined.signal;
 }
 
+/**
+ * Minimum gap a PRIORITY call keeps from the last dispatch of the same lane
+ * (see `Throttle.run`'s `priority` argument).
+ *
+ * WHY THE LANE HAS TWO GAPS (2026-10-17). One Jupiter client serves a whole
+ * tick: the two discovery feeds and the pair fallback's chunks (which, with
+ * DexScreener's pair lane refused fleet-wide, run EVERY tick and carry all
+ * ~200 addresses — see docs/efficiency-2026-10-16.md), and then one read per
+ * card whose answer the CARD ITSELF waits for. At JUPITER_REQUEST_INTERVAL_MS
+ * = 500 that queue pushes a card's read a full spacing (or more) behind every
+ * bulk call already waiting — and the card's line, unlike theirs, is gone for
+ * good when the wall passes (best-effort reads are not retried next tick). So
+ * the card read dispatches with this smaller gap instead: it still respects a
+ * floor between requests (never a burst), but it does not queue behind
+ * coverage work that the next tick will redo anyway. At most one or two calls
+ * per tick can use it (one per card), so the load profile is unchanged.
+ */
+export const JUP_PRIORITY_GAP_MS = 150;
+
 /** Spaces out HTTP requests so we stay well under Jupiter's rate limit. */
 class Throttle {
   private lastCallAt = 0;
@@ -72,10 +91,23 @@ class Throttle {
    * other clients' queues produce, see PushWatcher.bounded): a given-up
    * attempt may not spend a slot the calls behind it would pay for. Without a
    * signal the behaviour is exactly what it was.
+   *
+   * `priority` is the card read's slot (see fetchOrganicScore): it waits out
+   * JUP_PRIORITY_GAP_MS instead of the full interval, so a single call with a
+   * hard, non-retryable deadline is not queued behind the tick's bulk lanes.
+   * It never skips the queue silently — the dispatch still paces `lastCallAt`,
+   * so the call behind it waits its full interval from THIS dispatch.
    */
-  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T | null> {
+  async run<T>(
+    fn: () => Promise<T>,
+    signal?: AbortSignal,
+    priority = false,
+  ): Promise<T | null> {
     if (signal?.aborted) return null;
-    const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
+    const gap = priority
+      ? Math.min(JUP_PRIORITY_GAP_MS, this.intervalMs)
+      : this.intervalMs;
+    const wait = Math.max(0, this.lastCallAt + gap - Date.now());
     if (wait > 0) {
       if (signal === undefined) {
         await sleep(wait);
@@ -388,10 +420,76 @@ export function jupToPairInfos(data: unknown): Map<string, PairInfo> {
   return out;
 }
 
+/**
+ * Why a card read (
+ * `fetchOrganicScore`) produced the reading it did — `ok` is the only value
+ * that carries one. A card whose 🌱 有機度 line is missing is exactly a read
+ * whose value is not `ok`, and until 2026-10-17 NOTHING in the fleet recorded
+ * WHICH of these had happened: the operator saw the line vanish and the repo
+ * had three separate investigations (§4.23/§4.24 of docs/round-trips.md) that
+ * could only say "no window" or "no data" after manually probing the mints.
+ * Every read now names its own reason, and the tick publishes it.
+ */
+export type JupCardReadWhy =
+  /** The reading landed. */
+  | "ok"
+  /** A 429 has paused this client; nothing was sent (see rateLimitedUntil). */
+  | "backoff"
+  /** An HTTP answer that was not 2xx — `status` names it. */
+  | "http"
+  /** 2xx but the body was not the documented JSON array. */
+  | "body"
+  /** The array answered, but carried no entry for the mint. */
+  | "no-entry"
+  /** Jupiter has no organic data for this token (every field absent). */
+  | "empty"
+  /** Transport: a throw, a timeout, or a body that would not parse. */
+  | "error";
+
+/**
+ * The outcome of ONE card read, kept per client so the tick can publish it
+ * (see the scanner's `organicWhy` / `organicCards`).
+ */
+export interface JupCardReadNote {
+  /** When the read started (epoch ms). */
+  at: number;
+  /** Dispatch → answer, both attempts included. */
+  ms: number;
+  /** Why the answer is what it is. */
+  why: JupCardReadWhy;
+  /** The last attempt's HTTP status (0 = nothing reached the wire). */
+  status: number;
+  /** Whether a second attempt was spent on a reading-less first one. */
+  retried: boolean;
+  /** Whether a reading came back (i.e. the card has its line). */
+  landed: boolean;
+}
+
+/** One card read's reading (what the 🌱 有機度 line renders from). */
+export interface JupOrganicReading {
+  score: number | null;
+  label: string | null;
+  tradersH1: number | null;
+  tradersWindow: "1h" | "6h" | "24h" | null;
+  /** Jupiter flagged this token as suspicious (audit.isSus present+true). */
+  sus: boolean;
+  /** Deployer's share of supply, in percent (audit.devBalancePercentage). */
+  devBalancePct: number | null;
+}
+
 export class JupTokensClient {
   private readonly throttle: Throttle;
   /** Timestamp until which all calls are skipped (after a 429). */
   private rateLimitedUntil = 0;
+  /**
+   * The LAST transport's HTTP status (0 = none this call). Read right after a
+   * `null` from `get` to say WHICH half failed: the wire (http) or the
+   * transport itself (error). One slot, not a log — the note it feeds is read
+   * by the tick that made the call.
+   */
+  private lastStatus = 0;
+  /** The last card read's outcome (see JupCardReadNote). */
+  private lastCardRead: JupCardReadNote | null = null;
 
   constructor(
     config: AppConfig,
@@ -411,6 +509,24 @@ export class JupTokensClient {
   }
 
   /**
+   * Whether a 429 has this client paused right now — the reading that turns
+   * "the feed was empty" into "the provider refused us" (a whole
+   * JUP_RATE_LIMIT_BACKOFF_MS window of missing card lines is the same event).
+   */
+  isRateLimited(): boolean {
+    return this.rateLimited();
+  }
+
+  /**
+   * The LAST card read's outcome — null until `fetchOrganicScore` is asked
+   * (see JupCardReadNote). Last call wins, which is what the reader wants:
+   * the tick asks right after the read it just made.
+   */
+  cardReadNote(): JupCardReadNote | null {
+    return this.lastCardRead;
+  }
+
+  /**
    * Shared GET: throttle-spaced, 429-aware; null on any failure.
    *
    * The optional `signal` is the CALLER's abort for a read that has given up
@@ -419,9 +535,17 @@ export class JupTokensClient {
    * dispatched (see Throttle.run), and one aborted in flight is cancelled by
    * the fetch itself (see combineAbortSignals). Optional, so every existing
    * caller keeps its exact shape.
+   *
+   * `priority` rides straight into the lane (see Throttle.run) and is set only
+   * by the card read.
    */
-  private async get(path: string, signal?: AbortSignal): Promise<unknown> {
+  private async get(
+    path: string,
+    signal?: AbortSignal,
+    priority = false,
+  ): Promise<unknown> {
     if (this.rateLimited()) return null;
+    this.lastStatus = 0;
     try {
       const doFetch =
         this.fetcher ??
@@ -435,10 +559,14 @@ export class JupTokensClient {
       const res = await this.throttle.run(
         () => doFetch(`${BASE_URL}${path}`, signal),
         signal,
+        priority,
       );
       // A cut is NOT a request: the caller gave up while this attempt waited
       // for its slot, so there is no response — and no counter — to read.
       if (res === null) return null;
+      // Recorded BEFORE the status checks so a caller reading a null answer
+      // can name what happened (see lastStatus / JupCardReadNote).
+      this.lastStatus = res.status;
       if (res.status === 429) {
         this.rateLimitedUntil = Date.now() + JUP_RATE_LIMIT_BACKOFF_MS;
         return null;
@@ -475,25 +603,98 @@ export class JupTokensClient {
    * "| 1h 交易者" half of the card line. Fall back to the 6h then 24h
    * window and report which window the count came from (null = no
    * trader data in any window).
+   *
+   * THE LINE IS NON-RETRYABLE, SO THE READ IS ARMED THREE WAYS (2026-10-17).
+   * This is the third recurrence of "the 有機度 line vanished from many cards"
+   * (2026-09-17, 2026-09-26, now — see §4.23/§4.24 of docs/round-trips.md),
+   * and both earlier rounds found the same shape: the reading EXISTS (measured
+   * again 2026-10-17 from the deployed Worker's own egress: 21 recent pushes,
+   * every mint answered in 44–268ms), and the card lost it to the TICK, not to
+   * Jupiter. Unlike every feed in this file the card read is not re-tried by
+   * the next tick — the card ships without the line, forever — so it is the one
+   * call that must not be left to luck:
+   *   1. it takes the lane's PRIORITY slot (see Throttle.run), so the bulk
+   *      lanes a tick opens in front of it — two discovery feeds plus the pair
+   *      fallback's chunks, which carry every address now that DexScreener's
+   *      pair lane is refused fleet-wide — cannot push it past the chain wall;
+   *   2. a first attempt that comes back WITHOUT a reading is retried ONCE, so
+   *      a transient 5xx / broken body / single dropped search does not cost a
+   *      card its line. `no-entry` / `empty` are retried too: a seconds-old
+   *      launch is exactly when the search index can still be catching up, and
+   *      for a coin that IS indexed those answers are the same one request to
+   *      confirm. A 429 is NOT retried: the client is paused for
+   *      JUP_RATE_LIMIT_BACKOFF_MS and a second call would either be sent into
+   *      the same wall or (worse) counted as another request against a
+   *      provider that just refused us;
+   *   3. every read reports WHY (see JupCardReadNote, surfaced on the tick as
+   *      `organicWhy`), because "the line is missing" and "the provider said
+   *      429" were indistinguishable in production for three rounds.
    */
   async fetchOrganicScore(
     mint: string,
-  ): Promise<{
-    score: number | null;
-    label: string | null;
-    tradersH1: number | null;
-    tradersWindow: "1h" | "6h" | "24h" | null;
-    /** Jupiter flagged this token as suspicious (audit.isSus present+true). */
-    sus: boolean;
-    /** Deployer's share of supply, in percent (audit.devBalancePercentage). */
-    devBalancePct: number | null;
-  } | null> {
-    const data = await this.get(`/search?query=${mint}`);
-    if (!Array.isArray(data)) return null;
+    /**
+     * Optional sink for THIS read's outcome (see JupCardReadNote). A callback
+     * rather than a read of `cardReadNote()` later, because the reader is a
+     * card loop: two reads can be in flight across coins and the last-settled
+     * note is not the one this card's line is about.
+     */
+    onNote?: (note: JupCardReadNote) => void,
+  ): Promise<JupOrganicReading | null> {
+    const startedAt = Date.now();
+    let attempt = await this.readOrganicOnce(mint);
+    let retried = false;
+    if (attempt.reading === null && attempt.why !== "backoff") {
+      retried = true;
+      attempt = await this.readOrganicOnce(mint);
+    }
+    const note: JupCardReadNote = {
+      at: startedAt,
+      ms: Date.now() - startedAt,
+      why: attempt.reading !== null ? "ok" : attempt.why,
+      status: attempt.status,
+      retried,
+      landed: attempt.reading !== null,
+    };
+    this.lastCardRead = note;
+    onNote?.(note);
+    return attempt.reading;
+  }
+
+  /**
+   * ONE attempt at the card read, with the REASON it produced what it did
+   * (see JupCardReadNote). Never throws: a failure is a `why`, not an
+   * exception, because the caller's whole contract is "the card omits the line
+   * and pushes anyway" — the reason only has to survive to the tick summary.
+   *
+   * The single-mint read here is the ONE caller that takes the priority slot
+   * (see Throttle.run and fetchOrganicScore).
+   */
+  private async readOrganicOnce(mint: string): Promise<{
+    reading: JupOrganicReading | null;
+    why: JupCardReadWhy;
+    /** The attempt's HTTP status (0 = nothing reached the wire). */
+    status: number;
+  }> {
+    if (this.rateLimited()) return { reading: null, why: "backoff", status: 0 };
+    const data = await this.get(`/search?query=${mint}`, undefined, true);
+    const status = this.lastStatus;
+    if (data === null) {
+      // A 429 raised by THIS call (get sets the pause) is named as such; any
+      // other null is split by what the wire said — 0 or 200 means the
+      // transport itself failed (throw / timeout / unparseable body), a
+      // non-2xx status means the provider answered and refused.
+      if (this.rateLimited()) return { reading: null, why: "backoff", status };
+      return {
+        reading: null,
+        why: status === 0 || status === 200 ? "error" : "http",
+        status,
+      };
+    }
+    if (!Array.isArray(data)) return { reading: null, why: "body", status };
     const entry = data.find(
       (x) => (x as Record<string, unknown>).id === mint,
     ) as Record<string, unknown> | undefined;
-    if (!entry) return null;
+    if (!entry) return { reading: null, why: "no-entry", status };
     const s1 = (entry.stats1h ?? {}) as Record<string, unknown>;
     // organicScore of 0 is a REAL value (BAOJIN/Nudaeng) — distinguish
     // "field absent" (undefined) from a genuine zero via typeof.
@@ -530,14 +731,25 @@ export class JupTokensClient {
     // The flag ALONE is a reason to return a reading: a flagged token whose
     // organic score and trader count are both missing must still reach the
     // gate, or the gate would fail open exactly where it matters most.
-    if (score === null && tradersH1 === null && !sus) return null;
+    //
+    // This is also the ONE shape a retry cannot fix: the search answered, in
+    // time, for this mint, and Jupiter simply has no organic data for it
+    // (`empty`) — so the note says exactly that instead of "no data".
+    if (score === null && tradersH1 === null && !sus) {
+      return { reading: null, why: "empty", status };
+    }
     return {
-      score,
-      label: typeof entry.organicScoreLabel === "string" ? entry.organicScoreLabel : null,
-      tradersH1,
-      tradersWindow,
-      sus,
-      devBalancePct,
+      reading: {
+        score,
+        label:
+          typeof entry.organicScoreLabel === "string" ? entry.organicScoreLabel : null,
+        tradersH1,
+        tradersWindow,
+        sus,
+        devBalancePct,
+      },
+      why: "ok",
+      status,
     };
   }
 
@@ -675,12 +887,32 @@ export class JupTokensClient {
         // timeout), so one stalled call could carry this phase — and the
         // gate/push phase behind it — past the scan's deadline. A chunk that
         // expires contributes nothing; the other lane's chunk is unaffected.
+        // The race's LOSER is now ABORTED (2026-10-17): a chunk whose window
+        // ran out used to keep its queued attempt, which then dispatched
+        // LATER — past the phase that wanted it — and spent a full throttle
+        // slot the CARD's own organic read (same client, same lane) was
+        // waiting for. With the pair lane refused fleet-wide this leg runs on
+        // every tick, so those orphan dispatches landed right where the
+        // card's read needed its slot. A cut attempt dies at the cut: while
+        // still queued it never dispatches (Throttle.run), and one already on
+        // the wire is cancelled by the fetch itself.
+        const chunkAbort = new AbortController();
+        let chunkTimer: ReturnType<typeof setTimeout> | undefined;
         const data = await Promise.race([
-          this.get(`/search?query=${chunk.join(",")}`, signal),
-          new Promise<null>((resolve) =>
-            setTimeout(() => resolve(null), remaining),
+          this.get(
+            `/search?query=${chunk.join(",")}`,
+            combineAbortSignals(signal, chunkAbort.signal),
           ),
+          new Promise<null>((resolve) => {
+            chunkTimer = setTimeout(() => {
+              chunkAbort.abort(new Error("chunk window spent"));
+              resolve(null);
+            }, remaining);
+          }),
         ]);
+        // Cleared either way: a pending timer would abort a LATER chunk's
+        // signal (the lanes share this client) and hold the isolate open.
+        if (chunkTimer !== undefined) clearTimeout(chunkTimer);
         for (const [k, v] of jupToPairInfos(data)) out.set(k, v);
       }
     };

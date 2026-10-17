@@ -19,7 +19,7 @@ const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dis
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseRaydiumLaunches, RaydiumLaunchClient, RAYDIUM_LAUNCH_BASE_URL, RAYDIUM_LAUNCH_MAX_LIMIT, RAYDIUM_LAUNCH_BACKOFF_MS } = require("../dist/raydiumlaunch.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
-const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS } = require("../dist/jupfeeds.js");
+const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS, JUP_PRIORITY_GAP_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS, BOOSTS_429_BACKOFF_MS, BOOSTS_BACKOFF_MAX_MS, boostsBackoffMs } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, TRACKER_PAIRS_HARD_CAP_MS, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse, trackerLaneStatus, TRACKER_LANE_STALE_MS, runningPassStamp } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
@@ -11531,6 +11531,243 @@ async function main() {
     assert.equal(await make({}).fetchOrganicScore(mint), null);
   });
 
+  await test("fetchOrganicScore: a reading-less first attempt is retried once, and every read names why", async () => {
+    // 2026-10-17. The card's 🌱 有機度 line is the ONE reading in this file that
+    // the next tick cannot redo — the card ships without it, forever — so a
+    // transient 5xx / broken body / dropped search must not cost a card its
+    // row. One retry, and never into a 429 pause. The note is the other half:
+    // three rounds of this symptom were diagnosed blind, because "no window",
+    // "no data" and "the provider refused us" all looked identical from
+    // outside (docs/round-trips.md §4.23/§4.24).
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const good = JSON.stringify([
+      { id: mint, organicScore: 61, stats1h: { numTraders: 7 } },
+    ]);
+    const make = (respond) => {
+      let calls = 0;
+      const client = new JupTokensClient(
+        { jupiterRequestIntervalMs: 0 },
+        async () => {
+          calls += 1;
+          return respond(calls);
+        },
+      );
+      return { client, calls: () => calls };
+    };
+    const shape = (note) => ({
+      why: note.why,
+      status: note.status,
+      retried: note.retried,
+      landed: note.landed,
+    });
+
+    // (1) A 503 on the first attempt: the retry lands the reading, and the note
+    // says so (the card DID get its line, after two calls).
+    const flaky = make((n) =>
+      n === 1
+        ? new Response("upstream", { status: 503 })
+        : new Response(good, { status: 200 }),
+    );
+    const notes = [];
+    const landed = await flaky.client.fetchOrganicScore(mint, (note) => notes.push(note));
+    assert.equal(landed.score, 61);
+    assert.equal(flaky.calls(), 2, "one retry — not a retry loop");
+    assert.equal(notes.length, 1);
+    assert.deepEqual(shape(notes[0]), {
+      why: "ok",
+      status: 200,
+      retried: true,
+      landed: true,
+    });
+    assert.ok(Number.isFinite(notes[0].ms) && notes[0].ms >= 0, "the note carries a wall time");
+    // The client keeps the same note, so a caller that passes no callback still
+    // has one place to look (and it is the LAST read's).
+    assert.deepEqual(flaky.client.cardReadNote(), notes[0]);
+
+    // (2) A reading on the FIRST attempt is never re-asked: this lane is shared
+    // with the tick's feeds, so an unconditional second call would be load with
+    // no reading behind it.
+    const clean = make(() => new Response(good, { status: 200 }));
+    const notes2 = [];
+    await clean.client.fetchOrganicScore(mint, (note) => notes2.push(note));
+    assert.equal(clean.calls(), 1, "a landed read is not retried");
+    assert.equal(notes2[0].retried, false);
+    assert.equal(notes2[0].why, "ok");
+
+    // (3) A 429 pauses the WHOLE client (JUP_RATE_LIMIT_BACKOFF_MS): the read is
+    // not retried into that pause, and the note says `backoff` — the reading
+    // that separates "every card line is missing for five minutes" from
+    // "Jupiter has no data for this coin".
+    const limited = make(() => new Response("slow down", { status: 429 }));
+    const notes3 = [];
+    assert.equal(await limited.client.fetchOrganicScore(mint, (n) => notes3.push(n)), null);
+    assert.equal(limited.calls(), 1, "a 429 is never retried");
+    assert.deepEqual(shape(notes3[0]), {
+      why: "backoff",
+      status: 429,
+      retried: false,
+      landed: false,
+    });
+    assert.equal(limited.client.isRateLimited(), true, "and the pause is readable");
+
+    // (4) A transport failure (a throw): `error` with status 0 (nothing reached
+    // the wire) — and it IS retried, because a dropped connection is exactly
+    // the transient case the retry exists for.
+    const down = make(() => {
+      throw new Error("socket closed");
+    });
+    const notes4 = [];
+    assert.equal(await down.client.fetchOrganicScore(mint, (n) => notes4.push(n)), null);
+    assert.equal(down.calls(), 2);
+    assert.deepEqual(shape(notes4[0]), {
+      why: "error",
+      status: 0,
+      retried: true,
+      landed: false,
+    });
+
+    // (5) The remaining reasons, each named rather than collapsed into "null":
+    // a body that is not the documented array, an answer that does not carry
+    // this mint, and Jupiter having no organic data for it at all.
+    const reasons = [
+      [make(() => new Response(JSON.stringify({ nope: true }), { status: 200 })), "body"],
+      [
+        make(() =>
+          new Response(
+            JSON.stringify([{ id: "Other11111111111111111111111111111111111111" }]),
+            { status: 200 },
+          ),
+        ),
+        "no-entry",
+      ],
+      [make(() => new Response(JSON.stringify([{ id: mint }]), { status: 200 })), "empty"],
+    ];
+    for (const [probe, why] of reasons) {
+      const seen = [];
+      assert.equal(await probe.client.fetchOrganicScore(mint, (n) => seen.push(n)), null);
+      assert.equal(seen[0].why, why, `a ${why} answer must name itself`);
+      assert.equal(seen[0].status, 200, "an answer is not a failure of the wire");
+      assert.equal(probe.calls(), 2, `${why} is one of the answers a retry is for`);
+    }
+    // The priority gap is a FLOOR between requests, never a burst: it has to
+    // stay well under the bulk spacing it jumps.
+    assert.ok(
+      JUP_PRIORITY_GAP_MS > 0 && JUP_PRIORITY_GAP_MS < 250,
+      `the card's slot keeps a floor, it does not skip the queue (${JUP_PRIORITY_GAP_MS}ms)`,
+    );
+  });
+
+  await test("fetchOrganicScore: the card read takes the priority slot instead of queueing behind a bulk lane", async () => {
+    // The mechanism the operator's report points at. ONE client serves a tick's
+    // feeds and the pair fallback's chunks (every address now that DexScreener's
+    // pair lane is refused fleet-wide) and THEN the card's read — so at the
+    // deployed JUPITER_REQUEST_INTERVAL_MS = 500 the card's read queued a full
+    // spacing behind each bulk call already waiting, while being the only call
+    // on that lane whose deadline cannot be retried tomorrow.
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const body = JSON.stringify([
+      { id: mint, organicScore: 61, stats1h: { numTraders: 7 } },
+    ]);
+    const dispatches = [];
+    const client = new JupTokensClient({ jupiterRequestIntervalMs: 500 }, async (url) => {
+      dispatches.push(Date.now());
+      return new Response(body, { status: 200 });
+    });
+    // The bulk call takes the lane first (its wait is 0).
+    await client.fetchRecentTokens(3);
+    assert.equal(dispatches.length, 1);
+    // The card read arrives with the lane busy: it must keep only the priority
+    // gap, not the full bulk spacing...
+    await client.fetchOrganicScore(mint);
+    const priorityGap = dispatches[1] - dispatches[0];
+    assert.ok(priorityGap >= 100, `the priority slot keeps a floor (${priorityGap}ms)`);
+    assert.ok(priorityGap < 470, `...and does not wait the bulk spacing (${priorityGap}ms)`);
+    // ...while a BULK call behind it still pays the full interval — the priority
+    // slot may not open a burst behind itself.
+    await client.fetchRecentTokens(3);
+    const bulkGap = dispatches[2] - dispatches[1];
+    assert.ok(bulkGap >= 450, `a bulk call still waits the full spacing (${bulkGap}ms)`);
+  });
+
+  await test("fetchTokenDataBatch: a chunk whose window ran out is aborted, not left queued for a later slot", async () => {
+    // 2026-10-17. The race bounds the PHASE but not the request: the loser kept
+    // its queued attempt and dispatched LATER — after the phase that wanted it
+    // had already answered — spending the throttle slot the CARD's own organic
+    // read (same client, same lane) was waiting for. With DexScreener's pair
+    // lane refused fleet-wide this leg runs on every tick, so those orphan
+    // dispatches landed exactly where the card's line needed its slot.
+    const mints = Array.from({ length: 200 }, (_, i) =>
+      ("M" + i.toString(36).replace(/[0OlI]/g, "z")).padEnd(44, "1"),
+    );
+    const calls = [];
+    const client = new JupTokensClient({ jupiterRequestIntervalMs: 500 }, async () => {
+      calls.push(Date.now());
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    // Warm the lane: one dispatch, so every chunk of the NEXT call sits in the
+    // queue for a full spacing.
+    await client.fetchRecentTokens(3);
+    assert.equal(calls.length, 1);
+    // A window long enough to OPEN a chunk but shorter than the spacing it has
+    // to wait: both lanes' races expire while their attempts are still queued.
+    await client.fetchTokenDataBatch(mints, Date.now() + 400);
+    assert.equal(calls.length, 1, "no chunk had room, so none was dispatched");
+    // Past the moment the abandoned queue entries would have fired.
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(calls.length, 1, "an expired chunk is never dispatched later");
+  });
+
+  await test("the scanner publishes WHY a card lost its 有機度 line", async () => {
+    // The fields exist so "many first-push cards have no 有機度" is answerable ON
+    // the tick ("3 reads, 1 landed, why: backoff") instead of by probing the
+    // day's pushed mints from outside — which is how both earlier rounds of
+    // this symptom had to be diagnosed (docs/round-trips.md §4.23/§4.24).
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    for (const needle of [
+      "organicCards: number;",
+      "organicNoLine: number;",
+      "organicRetried: number;",
+      "organicWhy?: JupCardReadWhy | null;",
+      "organicMs?: number | null;",
+      "organicStatus?: number | null;",
+      "organicCards: 0,",
+      "organicNoLine: 0,",
+      "organicRetried: 0,",
+      "organicWhy: null,",
+      "organicMs: null,",
+      "organicStatus: null,",
+    ]) {
+      assert.ok(src.includes(needle), `the tick summary must carry ${needle}`);
+    }
+    // The slot counts every card it opens a read for...
+    assert.ok(src.includes("diag.organicCards += 1;"), "every card slot must be counted");
+    // ...and the READ's own note fills the rest, from the callback (not read
+    // back off the client afterwards: two coins' reads can overlap, and the
+    // last-settled note is not necessarily this card's).
+    const slot = src.slice(src.indexOf("diag.organicCards += 1;"));
+    const body = slot.slice(0, slot.indexOf("const organicBox"));
+    for (const needle of [
+      "jupiterOrganic.fetchOrganicScore(",
+      "coin.stats.token,",
+      "(note) => {",
+      "diag.organicWhy = note.why;",
+      "diag.organicMs = note.ms;",
+      "diag.organicStatus = note.status;",
+      "if (note.retried) diag.organicRetried += 1;",
+      "if (!note.landed) diag.organicNoLine += 1;",
+    ]) {
+      assert.ok(body.includes(needle), `the card slot must publish ${needle}`);
+    }
+    // `organic` keeps its old meaning — the readings the CARD could use (the
+    // box), so `organicCards - organic` is still "cards built without the
+    // line"; the note-based counters above say WHY they were built without it.
+    const box = slot.slice(slot.indexOf("const organicBox"));
+    assert.ok(
+      box.slice(0, box.indexOf("// Bundler")).includes("if (v) diag.organic++;"),
+      "the landed count stays the card's own box",
+    );
+  });
+
   await test("jupSusBlockReason: only a Jupiter flag blocks, and the flag alone is enough", () => {
     assert.equal(jupSusBlockReason(false, 25), null);
     assert.equal(jupSusBlockReason(false, null), null);
@@ -21323,11 +21560,17 @@ async function main() {
     const scannerSrc = read("src/scanner.ts");
     const workerSrc = read("src/worker.ts");
     const applied = {
+      // 2026-10-17: the slot now carries the read's own note sink (the
+      // callback that publishes WHY a card lost its line — see the summary
+      // fields organicWhy/organicCards and the tests for them). Same call, same
+      // count, same wall: still opened with the batch, still walled at the TICK
+      // deadline, still read late-bound from the box.
       "scanner (the slot rides the batch's dispatch but not its await)":
         scannerSrc.includes("constorganicSlot=this.bestEffort(") &&
         scannerSrc.includes(
-          "?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token):null,tickDeadline,null,",
+          "?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token,(note)=>{",
         ) &&
+        scannerSrc.includes("},):null,tickDeadline,null,);") &&
         scannerSrc.includes(
           "voidorganicSlot.then((v)=>{organicBox.value=v;if(v)diag.organic++;});",
         ),

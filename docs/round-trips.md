@@ -4166,3 +4166,79 @@ curl -s ".../debug/token?mint=$(curl -s .../health | jq -r '.summary.rejects[0].
 - **呢個改動只係「之後可以 join」，唔等於已經 join 完**：live 驗收要等 deploy 之後嘅第一個 heartbeat。
 - **只覆蓋會落到 log 嘅 reject**（EVAL 20 + chain 5，budget 決定邊條入選），唔係全量 reject。
 - **撞名唔會因此消失**：mint 只係令撞名唔再阻礙判讀；同一個 symbol 多個 mint 係 pump.fun 嘅事實。
+
+---
+
+## 4.63 有機度第四擊：卡片讀數搶 lane 前排、失手補一次、孤兒 chunk 斷氣（2026-10-17）
+
+營運報告：「好多首次推送卡都冇咗 🌱 有機度」。同 §4.23 / §4.24 同一個病（**資料在、窗冇**），
+但今次連「窗」係邊個都冇讀數——呢一點本身就係要修嘅嘢。
+
+### 一、先量上游：讀數一直都在，而且很快
+
+用 worker 自己嘅 egress 行 `JupTokensClient.fetchOrganicScore`（`/debug/jupiter?organic=<mint>`），
+問 audit ring 內 **21 張 initial 推送卡** 嘅 mint：
+
+```
+21/21 全部有讀數，44–268ms（例：Gato 54.2 / tr 905、FLEG 43.4 / tr 1、HUGO 61.1 / tr 96）
+```
+
+即係同前兩次一樣：唔係資料冇，係張卡攞唔到嗰口窗。**而「攞唔到」今日喺成個 fleet 冇任何痕跡**：
+條線係 display-only best-effort，冇讀數就唔出線——reject log 唔會有（幣照推）、push audit 只有
+token/mcap、DB 冇 organic 欄。難怪同一個病要斷第三次。
+
+### 二、三個機制（都係一齊修）
+
+1. **卡片讀數排喺 bulk lane 後面**。一個 `JupTokensClient` 服務成個 tick：兩個 discovery feed
+   ＋ pair fallback 嘅 chunk（DexScreener pair lane fleet-wide 被拒絕之後，**每個 tick 都由佢扛
+   成 200 個地址**，見 `docs/efficiency-2026-10-16.md` §3）＋ 每張卡一次讀數。
+   `JUPITER_REQUEST_INTERVAL_MS = 500` 之下，卡片讀數要等前面每一個 bulk call 一個間距；
+   而 bulk call 下個 tick 可以再做，**卡片嘅線冇下一個 tick**。
+2. **一次 429 = 五分鐘全黑**。`get()` 一見 429 就 `rateLimitedUntil = now + 5min`，之後
+   所有 call（feed、fallback、卡片讀數）即刻回 null——而且 Jupiter 兩個閘（`JUP_SUS_BLOCK`、
+   `ORGANIC_MIN_SCORE`）喺冇讀數時**fail open**，即係「線唔見」同一時間「閘靜靜哋失效」。
+3. **孤兒 chunk 遲到搶位**。`fetchTokenDataBatch` 嘅 `Promise.race` 只綁 phase 唔綁 request：
+   輸咗嘅 chunk 保留自己排緊隊嘅嘗試，等窗口過去之後**照 dispatch**——用嘅正係卡片讀數等緊嗰個 slot。
+
+### 三、做法（`src/jupfeeds.ts` ＋ `src/scanner.ts`）
+
+- **優先 slot**：`Throttle.run(fn, signal, priority)`，卡片讀數只守 `JUP_PRIORITY_GAP_MS = 150`
+  而唔係成個間距（仍然有下限，唔會變 burst；後面嘅 bulk call 一樣由**呢次** dispatch 起計滿一個間距）。
+  一個 tick 最多一兩次（每張卡一次），負載形狀不變。
+- **失手補一次**：`fetchOrganicScore` 第一次冇讀數就 retry **一次**（5xx／爛 body／掉包都補得返）；
+  **429 唔補**——client 已經暫停，再打只係再撞同一道牆。`no-entry` / `empty` 都補，因為
+  秒級新 launch 正好係 search index 未追到嘅時候。
+- **孤兒 chunk 斷氣**：race 輸咗就 `abort()`——排緊隊嘅永遠唔會 dispatch，已經上線嘅由 fetch 自己取消。
+- **每次讀數講自己嘅原因**：`JupCardReadNote` = `{ why: ok|backoff|http|body|no-entry|empty|error, status, ms, retried, landed }`，
+  經 callback 交回 scanner，發上 tick summary：`organicCards` / `organic` / `organicNoLine` /
+  `organicRetried` / `organicWhy` / `organicMs` / `organicStatus`。
+
+### 四、測試（main suite **554 → 558 passed, 0 failed**；其餘 8 個 suite 全綠）
+
+- retry／原因：503→成功（`retried:true, why:"ok"`）、首發成功唔補第二次、429（`why:"backoff"`,
+  只出一槍）、throw（`why:"error", status 0` 而且有補）、`body` / `no-entry` / `empty` 各自有名。
+- 優先 slot：lane 忙緊時卡片讀數嘅間距 < 470ms（實測 ~150ms），而佢後面嘅 bulk call ≥ 450ms。
+- 孤兒 chunk：窗口 400ms、間距 500ms → 兩條 lane 都喺排隊時過期；等過原本會 dispatch 嘅時間點，
+  fetcher 呼叫次數仍然係 1。
+- drift guard 更新：§4.24 嗰條「slot 唔畀 await」嘅形狀 pin 加埋 note callback。
+- **mutation check**：`JUP_PRIORITY_GAP_MS → 500`（501ms 肥）、retry 條件停用（`reading` 讀 null）、
+  `abort()` 拎走（孤兒照 dispatch）——三個各自單獨變紅，其餘 555 條全綠。
+
+### 五、驗收（deploy 之後睇呢幾個數）
+
+```bash
+# 有卡嘅 tick（/health 最新 tick，或者 /debug/tick 手動掃一次）
+curl -s .../health | jq '.summary | {organicCards, organic, organicNoLine, organicRetried, organicWhy, organicMs}'
+curl -s .../debug/tick | jq '.summary | {candidates, pushed, organic, organicCards, organicWhy}'
+```
+
+- 正常：有卡嘅 tick `organicCards == organic`、`organicWhy: "ok"`、`organicMs` 幾百 ms。
+- `organicWhy: "backoff"` → 捉到機制 (2)：**五分鐘全黑**，下一步就係處理佢（縮短 backoff /
+  或者單 mint 讀數唔受 bulk lane 嘅 429 暫停影響）。
+- `organicWhy: "http"` 配 `organicStatus` → provider 真係拒絕，唔關窗事。
+
+### 六、界線（老實講）
+
+- 呢個改動係**攞返口窗**，唔係改讀數：有機度數值、閘門檻（55 / 1400）同 fail-open 全部不變。
+- retry 令失敗個案最多多一次請求（每張卡、每 tick），成功個案一個都唔多。
+- 無讀數時卡片照推（fail-open 契約不變）；新欄位只係令「為咩冇線」有得讀。

@@ -55,6 +55,7 @@ import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
 import {
   JUP_FALLBACK_MIN_ROOM_MS,
   trendBandFromChats,
+  type JupCardReadWhy,
   type JupTokensClient,
 } from "./jupfeeds";
 import { renderMessage } from "./render";
@@ -2181,8 +2182,49 @@ export interface ScanSummary {
   arkham: number;
   /** Jupiter organic-score card enrichments this scan (0 = the 🌱 有機度 line
    * had no data). Counted so a line that vanishes from the card is visible in
-   * /health instead of only being noticed on the card itself. */
+   * /health instead of only being noticed on the card itself. Read TOGETHER
+   * with `organicCards` below, which is what makes it a rate rather than a
+   * count. */
   organic: number;
+  /**
+   * Card reads ATTEMPTED this scan — one per coin that reached the 🌱 有機度
+   * slot (see the slot in the candidate chain). Read with `organic`:
+   * `organicCards - organic` is "how many cards lost the line this scan", and
+   * `organicWhy` names the reason for the last one.
+   *
+   * WHY IT EXISTS (2026-10-17). The operator reported that many first-push
+   * cards had stopped showing 有機度, and NOTHING in the fleet could answer it:
+   * the reading is display-only and best-effort, so a card that lost it left no
+   * trace anywhere — not in the reject log (the coin was pushed), not in the
+   * push audit (token + mcap only), not in a column. Both previous rounds of
+   * this exact symptom were diagnosed by manually probing the day's pushed
+   * mints against Jupiter from outside (§4.23/§4.24 of docs/round-trips.md).
+   * These fields are that probe, run every tick, on the tick itself.
+   */
+  organicCards: number;
+  /**
+   * Card reads that came back with NO reading (their card hid the line).
+   * Counted from the read's own note, so it also catches a read that answered
+   * AFTER the slot's wall (the card was built without it) — `organicMs` then
+   * names how late it was. It is NOT `organicCards - organic`, on purpose:
+   * those disagree exactly when the tick was the problem.
+   */
+  organicNoLine: number;
+  /** How many of this scan's card reads spent a SECOND attempt. */
+  organicRetried: number;
+  /**
+   * The last card read's reason (see JupCardReadNote): `ok` | `backoff` (a 429
+   * has the client paused — the whole JUP_RATE_LIMIT_BACKOFF_MS window loses
+   * every card line, and the Jupiter gates fail open inside it) | `http` (see
+   * `organicStatus`) | `body` | `no-entry` (the search answered without this
+   * mint) | `empty` (Jupiter has no organic data for it) | `error` (transport:
+   * throw / timeout / unparseable body).
+   */
+  organicWhy?: JupCardReadWhy | null;
+  /** Wall ms the last card read took, both attempts included. */
+  organicMs?: number | null;
+  /** The last card read's HTTP status (0 = nothing reached the wire). */
+  organicStatus?: number | null;
   /** Coins whose creator/top-holder wallets matched the crime-wallet list. */
   crime: number;
   /** Coins that got a wallet analysis (creator/holder/cluster enrichment). */
@@ -5037,6 +5079,12 @@ export class Scanner {
       axiom: 0,
       arkham: 0,
       organic: 0,
+      organicCards: 0,
+      organicNoLine: 0,
+      organicRetried: 0,
+      organicWhy: null,
+      organicMs: null,
+      organicStatus: null,
       crime: 0,
       walletAnalysis: 0,
       backfill: 0,
@@ -6899,9 +6947,27 @@ export class Scanner {
         // the card reads whatever landed by render time: same call, same
         // count, same fallback (null → the line is hidden), and no wait added
         // anywhere. Its wall is the tick deadline because it blocks nobody.
+        diag.organicCards += 1;
         const organicSlot = this.bestEffort(
           jupiterOrganic
-            ? () => jupiterOrganic.fetchOrganicScore(coin.stats.token)
+            ? () =>
+                jupiterOrganic.fetchOrganicScore(
+                  coin.stats.token,
+                  // The read's OWN outcome (see JupCardReadNote): the reason a
+                  // card lost its line, on the tick summary, so "many cards
+                  // have no 有機度" becomes a reading ("3 reads, 1 landed,
+                  // why: backoff") instead of a guess. Written from the
+                  // callback rather than read back from the client, because
+                  // two coins' reads can overlap and the last-settled note is
+                  // not necessarily this card's.
+                  (note) => {
+                    diag.organicWhy = note.why;
+                    diag.organicMs = note.ms;
+                    diag.organicStatus = note.status;
+                    if (note.retried) diag.organicRetried += 1;
+                    if (!note.landed) diag.organicNoLine += 1;
+                  },
+                )
             : null,
           tickDeadline,
           null,
