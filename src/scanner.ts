@@ -58,6 +58,7 @@ import {
   trendBandFromChats,
   type JupCardReadNote,
   type JupCardReadWhy,
+  type JupOrganicReading,
   type JupTokensClient,
 } from "./jupfeeds";
 import { renderMessage } from "./render";
@@ -373,6 +374,34 @@ const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
  * removes and `/health.deferral.pending` counts the deferrals it adds.
  */
 export const CANDIDATE_PUSH_RESERVE_MS = 1_500;
+/**
+ * The wall the 🌱 有機度 card read is given, in ms from its own dispatch.
+ *
+ * WHY IT OUTLIVES THE TICK (2026-10-17, third round of "the line is missing
+ * from the card"). The read is un-awaited: the card renders from whatever has
+ * landed and nothing on the push path waits for it, so the only thing a longer
+ * wall buys is a reading that would otherwise never arrive — against a provider
+ * whose refusals last 1-10s (5 requests / ~10s window, see
+ * jupfeeds.rateLimitPauseMs). It is deliberately longer than
+ * JUP_RATE_LIMIT_WAIT_MAX_MS so the wait the cap allows is actually payable,
+ * plus room for the first attempt and the retry's own round trip: the wait is
+ * gated on `room > pause + 750ms`, so a wall that only just covered the cap
+ * would refuse the top of the 1-10s band the moment the first attempt spent a
+ * second of it.
+ *
+ * What it does NOT do: delay the card, spend a slot the gates need (their
+ * judgement is made at render, from the box), or hold the invocation open on
+ * its own — the promise that carries the late line is handed to the tick's
+ * waitUntil (see appendLateOrganicLine / keepAlive).
+ */
+export const JUP_CARD_READ_WALL_MS = 15_000;
+/**
+ * How long the late-line append waits for the read before giving up, from the
+ * moment the card was sent. Covers the read's own wall plus its last round
+ * trip; past it the append is dropped silently (the card simply keeps the
+ * shape it shipped with, exactly as before this change).
+ */
+export const ORGANIC_LATE_LINE_WAIT_MS = 20_000;
 /**
  * Preferred slice for the initial-card Telegram send (see the send in
  * sendTo). The send is the LAST step of the push path and the only one that
@@ -2242,6 +2271,17 @@ export interface ScanSummary {
    */
   organicWaited: number;
   /**
+   * Cards whose missing 🌱 有機度 line was APPENDED by an edit after the send
+   * (attempts), and how many of those edits Telegram accepted — cumulative on
+   * the isolate, because the append lands after the tick that sent the card
+   * (see appendLateOrganicLine). Read with `organicNoLine`: a card counted in
+   * `organicNoLine` that ends in `organicLateLanded` had its line added a few
+   * seconds later, and the two counters are what make "the card lacked it" and
+   * "the operator never saw it" different readings.
+   */
+  organicLateEdits: number;
+  organicLateLanded: number;
+  /**
    * Jupiter BULK calls stood down this scan so the card read keeps its slot
    * (see jupfeeds.JUP_WINDOW_BULK_MAX, `JUP_RESERVE_CARD_SLOT`). The
    * reservation's cost, in one number: a non-zero reading is a bulk request
@@ -3409,6 +3449,21 @@ export class Scanner {
   private readonly deferredPushes = new DeferredPushLedger();
   /** Cumulative initial-card deferrals this isolate has refused. */
   private cardSendDeferredTotal = 0;
+  /**
+   * Late 有機度 appends (see appendLateOrganicLine): attempts, and the ones
+   * whose edit Telegram accepted. Cumulative on the instance, not per tick,
+   * because the append lands AFTER the tick that sent the card — a per-tick
+   * counter would be re-zeroed before anyone could read it.
+   */
+  private organicLateEditsTotal = 0;
+  private organicLateLandedTotal = 0;
+  /**
+   * The tick's waitUntil hand-off (see runOnce's keepAlive): the only thing
+   * that keeps the late-line append alive past the handler. Null on a caller
+   * without one (the Node container, a test), where the append is simply
+   * best-effort within the invocation.
+   */
+  private scanHoldForTick: ((promise: Promise<unknown>) => void) | null = null;
   /** Cumulative abandoned (unknown-delivery) card sends this isolate recorded. */
   private cardSendAbandonedTotal = 0;
   /** Cumulative tracker cards this isolate failed to deliver (from PushWatcher). */
@@ -5160,8 +5215,20 @@ export class Scanner {
     ]);
   }
 
-  /** Runs one full scan. Safe to call concurrently (overlapping runs are skipped). */
-  async runOnce(subreqLeft: () => number = subreqRemaining): Promise<void> {
+  /**
+   * Runs one full scan. Safe to call concurrently (overlapping runs are skipped).
+   *
+   * `keepAlive` is the invocation's waitUntil, when the caller has one — the
+   * same hand-off the tracker pass already takes (see runTrackerPass): work
+   * created at the tail of the tick but finishing after it must be held, or it
+   * is cancelled with the handler. The scan uses it for ONE thing, the late
+   * 有機度 line (see appendLateOrganicLine).
+   */
+  async runOnce(
+    subreqLeft: () => number = subreqRemaining,
+    keepAlive?: (promise: Promise<unknown>) => void,
+  ): Promise<void> {
+    this.scanHoldForTick = keepAlive ?? null;
     if (this.running) {
       // A scan held longer than the budget is wedged: on Workers, the
       // watchdog timer below never fires while the isolate is frozen (it
@@ -5235,6 +5302,10 @@ export class Scanner {
       organicNoLine: 0,
       organicRetried: 0,
       organicWaited: 0,
+      // Cumulative, not per tick (see organicLateEditsTotal): the append lands
+      // after the tick that sent the card.
+      organicLateEdits: this.organicLateEditsTotal,
+      organicLateLanded: this.organicLateLandedTotal,
       jupReserved: 0,
       organicWhy: null,
       organicMs: null,
@@ -7108,52 +7179,50 @@ export class Scanner {
         // box (see cardOrganicAudit), which is what makes "this card had no
         // 有機度, why" answerable after the fact.
         let organicNote: JupCardReadNote | null = null;
+        // The read ITSELF, held apart from the racing slot below: bestEffort
+        // stops WAITING at tickDeadline, but the promise it raced keeps going —
+        // and that late arrival is what the card's line is appended from (see
+        // appendLateOrganicLine). One call, unchanged: the thunk below hands
+        // this same promise back to bestEffort.
+        const organicRead = jupiterOrganic
+          ? jupiterOrganic.fetchOrganicScore(
+              coin.stats.token,
+              // The read's OWN outcome (see JupCardReadNote): the reason a
+              // card lost its line, on the tick summary, so "many cards
+              // have no 有機度" becomes a reading ("3 reads, 1 landed,
+              // why: backoff") instead of a guess. Written from the
+              // callback rather than read back from the client, because
+              // two coins' reads can overlap and the last-settled note is
+              // not necessarily this card's.
+              (note) => {
+                organicNote = note;
+                diag.organicWhy = note.why;
+                diag.organicMs = note.ms;
+                diag.organicStatus = note.status;
+                if (note.retried) diag.organicRetried += 1;
+                if (note.waited) diag.organicWaited += 1;
+                if (!note.landed) diag.organicNoLine += 1;
+              },
+              // The read's wall (see JUP_CARD_READ_WALL_MS): neither the
+              // chain's nor the tick's, because nothing waits on this read.
+              // The third argument is the only input to ONE decision — may a
+              // 429 pause be waited out for a second attempt (pause <=
+              // JUP_RATE_LIMIT_WAIT_MAX_MS AND room > pause + 750ms) — and
+              // since the line can now be appended AFTER the card, the wall
+              // that decision reads may outlive the push path it used to
+              // protect. Measured 2026-10-17: the advertised reset lands in
+              // the 1-10s band, and the chain's wall (tick start + 6.5s)
+              // refused everything past ~3.75s — every card in that day's
+              // audit was `why:"backoff"`, `waited:false`.
+              Date.now() + JUP_CARD_READ_WALL_MS,
+            )
+          : null;
         const organicSlot = this.bestEffort(
-          jupiterOrganic
-            ? () =>
-                jupiterOrganic.fetchOrganicScore(
-                  coin.stats.token,
-                  // The read's OWN outcome (see JupCardReadNote): the reason a
-                  // card lost its line, on the tick summary, so "many cards
-                  // have no 有機度" becomes a reading ("3 reads, 1 landed,
-                  // why: backoff") instead of a guess. Written from the
-                  // callback rather than read back from the client, because
-                  // two coins' reads can overlap and the last-settled note is
-                  // not necessarily this card's.
-                  (note) => {
-                    organicNote = note;
-                    diag.organicWhy = note.why;
-                    diag.organicMs = note.ms;
-                    diag.organicStatus = note.status;
-                    if (note.retried) diag.organicRetried += 1;
-                    if (note.waited) diag.organicWaited += 1;
-                    if (!note.landed) diag.organicNoLine += 1;
-                  },
-                  // The read's wall is the TICK's, not the chain's (2026-10-17,
-                  // operator report: first-push cards still losing the line
-                  // with `why:"backoff"`, `waited:false`).
-                  //
-                  // The third argument is the only input to ONE decision: may a
-                  // 429 pause be waited out for a second attempt (see
-                  // fetchOrganicScore: pause <= JUP_RATE_LIMIT_WAIT_MAX_MS AND
-                  // room > pause + 750ms). It was `chainDeadline` — tick start +
-                  // 6.5s, i.e. tickDeadline MINUS CANDIDATE_PUSH_RESERVE_MS —
-                  // but that reserve protects the PUSH path, and this slot is
-                  // late-bound: it is never awaited, so a slower read cannot
-                  // delay the card. What it decides is only whether the second
-                  // attempt happens. Measured cost of the old wall: a slot that
-                  // opens ~2s in had ~4.5s of room, so any advertised pause at
-                  // or past ~3.75s was refused outright (and a second card in
-                  // the same chain, opening later, had less), which is exactly
-                  // the 3-4s band Jupiter's `x-ratelimit-reset` lands in.
-                  //
-                  // The reading is still judged again at render (see
-                  // jupiterGatesBlocked), so a read that lands late is not a
-                  // lost gate — only a lost line. Trading a few seconds of an
-                  // un-awaited slot for the line is the cheaper side of that.
-                  tickDeadline,
-                )
-            : null,
+          organicRead ? () => organicRead : null,
+          // The chain's wall still bounds WHAT THE TICK IS OFFERED (the early
+          // gate await below reads this same slot): the reading has to be in
+          // hand by then for the gates to judge it, and a late one is handled
+          // by the append, not by holding the tick open.
           tickDeadline,
           null,
         );
@@ -7449,26 +7518,33 @@ export class Scanner {
         const organicReading = organicBox.value;
         if (this.jupiterGatesBlocked(diag, coin, organicReading)) continue;
         const tokenAddress = coin.pair.baseToken.address;
-        const message = renderMessage(
-          coin,
-          rugcheck.bundlerPct,
-          rugcheck.top10Pct,
-          // null (not false) while the check is disabled: the card HIDES the
-          // 供應流 line instead of printing an idle "未分析" on every push.
-          this.config.supplyFlow.enabled ? flow.status === "clean" : null,
-          rugcheck.creator,
-          gmgn,
-          arkham,
-          crime,
-          wallet,
-          // The late-bound reading (see organicSlot): the very snapshot the
-          // gate above judged — or null → the line is hidden.
-          organicReading,
-          axiomInfo,
-          // null = forensics disabled → line hidden; { report: null } =
-          // configured but nothing to report (non-pump mint / skip).
-          this.flurry ? { report: flurryReport } : null,
-        );
+        /**
+         * The card's own render, as a function of its 有機度 reading — ONE
+         * call site, so the edit that appends a late line cannot drift from
+         * the message that was sent (see appendLateOrganicLine).
+         */
+        const renderCard = (organic: JupOrganicReading | null): string =>
+          renderMessage(
+            coin,
+            rugcheck.bundlerPct,
+            rugcheck.top10Pct,
+            // null (not false) while the check is disabled: the card HIDES the
+            // 供應流 line instead of printing an idle "未分析" on every push.
+            this.config.supplyFlow.enabled ? flow.status === "clean" : null,
+            rugcheck.creator,
+            gmgn,
+            arkham,
+            crime,
+            wallet,
+            // The late-bound reading (see organicSlot): the very snapshot the
+            // gate above judged — or null → the line is hidden.
+            organic,
+            axiomInfo,
+            // null = forensics disabled → line hidden; { report: null } =
+            // configured but nothing to report (non-pump mint / skip).
+            this.flurry ? { report: flurryReport } : null,
+          );
+        const message = renderCard(organicReading);
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
           const deferCard = (why: string): void => {
             diag.cardSendDeferred = (diag.cardSendDeferred ?? 0) + 1;
@@ -7546,15 +7622,18 @@ export class Scanner {
             // timeout is the ABSENCE of one, and not conflating the two is the
             // whole fix.
             this.markPhase(diag, "send:telegram", startedAt);
+            // Built ONCE so the edit below carries the same buttons the card
+            // was sent with (an edit without reply_markup drops them).
+            const cardKeyboard = {
+              inline_keyboard: tradeKeyboard(
+                tokenAddress,
+                this.trade ? this.trade.buySizeLabel : "",
+                tradeMode,
+                { modeSwitch: Boolean(this.trade), unwatch: true },
+              ),
+            };
             const inFlight = this.bot.api.sendMessage(c.chatId, message, {
-              reply_markup: {
-                inline_keyboard: tradeKeyboard(
-                  tokenAddress,
-                  this.trade ? this.trade.buySizeLabel : "",
-                  tradeMode,
-                  { modeSwitch: Boolean(this.trade), unwatch: true },
-                ),
-              },
+              reply_markup: cardKeyboard,
             });
             const settled = inFlight.then(
               (m) => ({ status: "sent" as const, message: m }),
@@ -7613,6 +7692,28 @@ export class Scanner {
             };
             if (plan.audit && raced.status === "sent") {
               await auditDelivery(Number(raced.message.message_id ?? 0));
+            }
+            // THE LATE LINE (2026-10-17, operator report: first-push cards
+            // still shipping without 有機度). The card rendered from the box,
+            // and the read that owes the line is still in flight — its wall
+            // now outlives the tick on purpose (JUP_CARD_READ_WALL_MS).
+            // Nothing waits for it here: the append is a background task
+            // handed to the tick's waitUntil (see appendLateOrganicLine), so
+            // it delays neither this card nor the next one, and the operator
+            // gets the number seconds later instead of never.
+            if (
+              plan.audit &&
+              raced.status === "sent" &&
+              organicRead !== null &&
+              organicReading === null
+            ) {
+              this.appendLateOrganicLine({
+                chatId: c.chatId,
+                messageId: Number(raced.message.message_id ?? 0),
+                reading: organicRead,
+                render: renderCard,
+                replyMarkup: cardKeyboard,
+              });
             }
             if (plan.recordUnconfirmed) {
               // ABANDONED. The request is still in flight, so the card may
@@ -8176,6 +8277,94 @@ export class Scanner {
         err instanceof Error ? err.message : err,
       );
       return { status: "hold" };
+    }
+  }
+
+  /**
+   * Append the 🌱 有機度 line to a first-push card that shipped without one
+   * (2026-10-17).
+   *
+   * THE PROBLEM IT SOLVES is structural, not a bug: the card may never wait on
+   * its own reading (the push reserve exists for the SEND), while the provider
+   * refuses the read with a window that lasts seconds (5 requests / ~10s, see
+   * jupfeeds.rateLimitPauseMs). Every previous round traded one side for the
+   * other — wait and the card is late, don't wait and the line is gone forever.
+   * Editing the card breaks the trade: the message goes out on time, and the
+   * number is appended the moment the read lands.
+   *
+   * BOUNDED AND DROPPED, never retried: the task waits at most
+   * ORGANIC_LATE_LINE_WAIT_MS for a reading, appends nothing when the read came
+   * back with no number to print ("no entry" / "empty"), and swallows a failed
+   * edit — the card then keeps the shape it was sent with, exactly the old
+   * behaviour. ONE edit per card: the task is created once, at the send.
+   *
+   * NOT SILENTLY LATE: the append says so (`推送後 Ns 補上`), because a line
+   * appearing minutes later would otherwise read as if the number had been
+   * there at push time. When the late reading is one the GATES would have
+   * BLOCKED on (the JANE shape — a card pushed on a reading no gate ever
+   * judged), the note names that too: the coin is already out, and the operator
+   * is the one who has to know.
+   *
+   * The promise is handed to the tick's waitUntil (see `keepAlive` in runOnce):
+   * an un-awaited task is cancelled the moment the handler returns, which is
+   * how the line would be lost a second time.
+   */
+  private appendLateOrganicLine(args: {
+    chatId: string;
+    messageId: number;
+    reading: Promise<JupOrganicReading | null>;
+    /** The card's own render (one call site, so it cannot drift). */
+    render: (organic: JupOrganicReading | null) => string;
+    /** The keyboard the card was sent with — kept on the edit. */
+    replyMarkup: unknown;
+  }): void {
+    const api = this.bot.api as unknown as {
+      editMessageText?: (...a: unknown[]) => Promise<unknown>;
+    };
+    if (typeof api.editMessageText !== "function") return;
+    this.organicLateEditsTotal += 1;
+    const startedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const task = (async (): Promise<void> => {
+      const late = await Promise.race([
+        args.reading.catch(() => null),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), ORGANIC_LATE_LINE_WAIT_MS);
+        }),
+      ]);
+      if (late === null) return;
+      // A reading with no number to print ("no entry", every field absent) is
+      // not a line — appending an em-dash would be noise, not news.
+      if (late.score === null && late.tradersH1 === null) return;
+      const verdict = jupiterGateVerdict(late, {
+        jupSusBlock: this.config.jupSusBlock,
+        organicMinScore: this.config.organicMinScore,
+        organicMaxTradersH1: this.config.organicMaxTradersH1,
+      });
+      const lateSec = Math.round((Date.now() - startedAt) / 1000);
+      const note = verdict
+        ? `\n（🌱 有機度 推送後 ${lateSec}s 才到 ⚠️ 此讀數本應攔住：${verdict.reason}）`
+        : `\n（🌱 有機度 推送後 ${lateSec}s 補上）`;
+      try {
+        await api.editMessageText?.(args.chatId, args.messageId, `${args.render(late)}${note}`, {
+          reply_markup: args.replyMarkup,
+        });
+        this.organicLateLandedTotal += 1;
+      } catch {
+        /* best-effort: the card keeps the shape it shipped with */
+      }
+    })();
+    // The timer is cleared with the task, and the tick's waitUntil keeps the
+    // work alive past the handler (see runOnce's keepAlive).
+    void task.finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
+    if (this.scanHoldForTick) {
+      try {
+        this.scanHoldForTick(task);
+      } catch {
+        /* a stale context must never break the push path */
+      }
     }
   }
 

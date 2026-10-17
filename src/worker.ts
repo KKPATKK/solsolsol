@@ -5691,15 +5691,21 @@ async function runScan(
         // a row that will still be inside the window then is one the pass stage
         // is bound to stand down for, which is what keeps the two decisions from
         // disagreeing about a row that crosses the window in between.
-        scanOwner.runOnce(() =>
-          scanSubreqLeft(
-            subreqRemaining(),
-            scanOwner.trackerPassSlice(
-              TRACKER_PASS_FALLBACK_FRESH_MS,
-              TRACKER_PASS_SUBREQ_RESERVE,
-              startedAt + SCAN_TICK_BUDGET_MS,
+        scanOwner.runOnce(
+          () =>
+            scanSubreqLeft(
+              subreqRemaining(),
+              scanOwner.trackerPassSlice(
+                TRACKER_PASS_FALLBACK_FRESH_MS,
+                TRACKER_PASS_SUBREQ_RESERVE,
+                startedAt + SCAN_TICK_BUDGET_MS,
+              ),
             ),
-          ),
+          // The tick's waitUntil, for the ONE promise the scan creates that is
+          // meant to finish after the tick: the late 🌱 有機度 line appended to
+          // a card that shipped without it (see Scanner.appendLateOrganicLine).
+          // An un-awaited task is cancelled the moment the handler returns.
+          tickWaitUntil ? (p: Promise<unknown>) => tickWaitUntil!(p) : undefined,
         ),
         new Promise<void>((resolve) => {
           setTimeout(() => {

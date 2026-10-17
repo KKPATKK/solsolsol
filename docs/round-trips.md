@@ -4277,3 +4277,66 @@ curl -s .../debug/tick | jq '.summary | {candidates, pushed, organic, organicCar
 三個新測試各自變紅（558 pass / 3 fail）。真 HTTP 重播：bulk 打爆窗口 → `pause = 8.4s`（舊值會係 300s），卡片讀數**照出**（`status 429`）
 但 8.4s > 4s 等唔到 → `waited:false`、fail-open；**未解決嘅殘餘就係嗰度**：真要「幾乎每次」，要喺 5 槍窗口裡留一槍畀卡片讀數
 （即係某個 bulk call 要 stand down 一格——揀邊個係產品決定：trending feed 只 yield 8 隻，pair fallback 每槍 yield ~100 個地址）。
+
+## 4.64 有機度第五擊：張卡唔等讀數，讀數唔等 tick —— 遲到就補一行（2026-10-17）
+
+營運報告（同日第三次）：「**剛剛收到嘅首推送卡，有機度依然缺失**」。§4.63 已經做咗三件事（priority
+lane、失手補一次、429 窗口跟 header），但嗰三件事全部係「**喺 tick 之內**拿到讀數」。今日嘅形狀唔同：
+**讀數係喺張卡送出之後才到**，而送出之後就再冇任何嘢會望佢一眼。
+
+### 一、為啲乜 §4.63 之後仍然會缺
+
+三條路，全部都會令張卡落閘之前手上冇讀數：
+
+1. **429 窗口買唔起**。`fetchOrganicScore` 要等窗口過去，條件係
+   `room > pause + 750ms`，而 `room` 來自 caller 嘅 wall。舊 wall 係 `chainDeadline`
+   （tick 開始 + 6.5s，slot 開喺 ~2s → 得 ~4.5s），而實測 reset 係 1–10s，
+   所以 3–4s 以上嘅一概拒絕（`waited:false`）。§4.63 已改成 tick wall，但 tick 本身亦會 cut。
+2. **tick cut 之後個 promise 仲活，但冇人接**。`bestEffort` 只係停止**等**，條 request 繼續行；
+   讀數幾百 ms 後返到嚟，張卡已經 render 完、送完——`organicBox.value` 之後再寫都冇用。
+3. **`no-entry` 係新幣常態**。pump.fun 幾秒前嘅 mint，Jupiter search index 未入，兩個 attempt 都
+   係 `no-entry`。呢個唔係 bug，係時間問題。
+
+即係：**問題唔再係「點樣喺 tick 之內拿到」，而係「送出之後仲可唔可以補」**。
+
+### 二、改咗三樣（`src/scanner.ts` / `src/jupfeeds.ts` / `src/worker.ts`）
+
+1. **讀數自己一條 wall，唔再跟 tick**（`JUP_CARD_READ_WALL_MS = 15_000`）。個 promise 由
+   `organicRead` 單獨揸住，`bestEffort` 照樣用 `tickDeadline` 賽（三個閘讀嘅仲係同一口 promise，
+   冇多一個 call），但**冇人等佢**。15s 係為咗買得起最長嘅等窗口：`wall > cap + 1.5s`
+   （見下一點），而 15s 完全喺 `waitUntil` 嘅 30s 之內。
+2. **等窗口嘅上限 4s → 10s**（`JUP_RATE_LIMIT_WAIT_MAX_MS`）。舊上限係為「張卡等緊讀數」而設；
+   而家張卡唔等，等嘅成本只係牆鐘。10s 剛好覆蓋實測嘅 5 request / ~10s 窗口，仍然遠低於
+   5 分鐘嘅 `JUP_RATE_LIMIT_BACKOFF_MS`。
+3. **送出之後補一行**（`Scanner.appendLateOrganicLine`）。卡照舊即時送；如果 render 嗰刻手上
+   仍然係 null 而讀數 promise 未死，就開一個背景 task：
+   - 等到讀數返（最多 `ORGANIC_LATE_LINE_WAIT_MS = 20s`，由送卡起計）；
+   - 用**同一個 `renderCard()`** 重新砌一次（一個 call site，edit 唔會同原卡漂移），
+     末尾加 `（🌱 有機度 推送後 Ns 補上）`——遲到要講明，唔可以扮成推送時就有；
+   - 如果呢個遲到讀數**本來會被閘攔住**（JANE 形狀：卡印住 `有機度 0.0（low）` 照推），
+     note 改成 `⚠️ 此讀數本應攔住：<reason>`——幣已經出咗，營運要知；
+   - `editMessageText` 帶返原本嘅 `reply_markup`（edit 唔帶會甩走按鈕）；
+   - 讀數冇數可印（`score` 同 `tradersH1` 都 null）、或者 20s 內都未返 → **唔 edit**，
+     張卡保持原狀，同改動前一樣。
+   - 個 task 交畀 tick 嘅 `waitUntil`（`runOnce(subreqLeft, keepAlive)`）：唔 hand off 嘅
+     un-awaited promise 會隨 handler 一齊死，即係第二次失去條線。
+
+**新讀數**：tick summary 加 `organicLateEdits` / `organicLateLanded`（累積喺 instance，唔係 per tick
+——補行係喺**送卡**之後才 land）。配 `organicNoLine` 一齊睇：「卡冇線」同「營運冇見到線」由此分開。
+
+### 三、驗收
+
+- `npm run build` + full unit suite：**572 passed, 0 failed**（`test:unit` 全套 12 個檔案逐一跑過）。
+- 新測試 `appendLateOrganicLine: …`：正常遲到（一行 edit、帶 keyboard、`organicLateLanded` +1）、
+  會被閘攔嘅遲到（`本應攔住`）、冇數可印（0 edit）、永遠唔返（0 edit、張卡不變）、
+  `waitUntil` hand-off；再加兩條不變量 `wall > cap + 1.5s`、`append wait > wall`。
+- pin 更新：`the Jupiter gates are judged twice …`（render 由 `renderMessage(` 改成
+  `renderCard(organicReading)`）、`organic slot is late-bound`（dispatch 由 inline thunk 變成
+  `organicRead`，仍然係同一個 call、同一個 tick wall）。
+
+### 四、殘餘（講明）
+
+- 兩次 attempt 都 429、或者新幣 20s 內都未入 index → 張卡始終冇線。呢個係 provider 嘅窗口／index 延遲，
+  唔係卡片路徑；可以再補嘅只有「多一次遲到重讀」，但每個 tick 得 5 槍，代價要另外量。
+- 補行係 edit，所以 Telegram 會顯示「已編輯」。遲到 > ~1 分鐘嘅情況唔會出現（20s 上限），
+  而 note 本身有秒數，讀者唔會誤會。

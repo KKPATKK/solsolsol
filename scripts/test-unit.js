@@ -264,12 +264,21 @@ async function main() {
     // point: the slice is not a constant any more, it is ASKED FOR — from the
     // scanner, with the window and the slice, at the last moment this
     // invocation could start a pass.
-    const flatWorker = workerSrc.replace(/\s+/g, "");
+    // Comments stripped too: the pin is about the CALL's shape, and a comment
+    // that explains the arguments must not be what keeps it matching.
+    const flatWorker = workerSrc
+      .replace(/\/\/[^\n]*/g, "")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\s+/g, "");
+    // The call also carries the tick's waitUntil as runOnce's second argument
+    // (2026-10-17): the ONE promise the scan creates that is meant to finish
+    // after the tick — the late 🌱 有機度 line (see appendLateOrganicLine) —
+    // dies with the handler without it.
     assert.ok(
       flatWorker.includes(
-        "scanOwner.runOnce(()=>scanSubreqLeft(subreqRemaining(),scanOwner.trackerPassSlice(TRACKER_PASS_FALLBACK_FRESH_MS,TRACKER_PASS_SUBREQ_RESERVE,startedAt+SCAN_TICK_BUDGET_MS,),),)",
+        "scanOwner.runOnce(()=>scanSubreqLeft(subreqRemaining(),scanOwner.trackerPassSlice(TRACKER_PASS_FALLBACK_FRESH_MS,TRACKER_PASS_SUBREQ_RESERVE,startedAt+SCAN_TICK_BUDGET_MS,),),tickWaitUntil?(p:Promise<unknown>)=>tickWaitUntil!(p):undefined,)",
       ),
-      "the scan's counter must carry the slice the tick will actually need",
+      "the scan's counter must carry the slice the tick will actually need, and the tick's waitUntil must ride along",
     );
   });
 
@@ -11894,6 +11903,38 @@ async function main() {
     assert.equal(roomyNotes[0].retried, true);
     assert.equal(roomyNotes[0].why, "ok");
 
+    // (a2) THE 2026-10-17 BAND (6s): the provider's window is 5 requests /
+    // ~10s, so its advertised reset lands right where the old 4s cap refused.
+    // The card read's own wall now covers it — the read is un-awaited and its
+    // line is appended by edit if it lands late, so the wait costs the card
+    // nothing.
+    const six = (() => {
+      let calls = 0;
+      const client = new JupTokensClient(
+        { jupiterRequestIntervalMs: 0, jupReserveCardSlot: false },
+        async () => {
+          calls += 1;
+          if (calls === 1) {
+            return new Response("slow down", {
+              status: 429,
+              headers: { "Retry-After": "0.05" },
+            });
+          }
+          return new Response(body, { status: 200 });
+        },
+      );
+      // A wall that can never afford the wait, so the decision under test is
+      // the CAP and not the room: 5ms of pause, 1ms of wall.
+      return { client, calls: () => calls };
+    })();
+    assert.ok(
+      JUP_RATE_LIMIT_WAIT_MAX_MS >= 10_000,
+      `the cap must cover the provider's measured 5-requests/~10s window (${JUP_RATE_LIMIT_WAIT_MAX_MS}ms)`,
+    );
+    const capped = await six.client.fetchOrganicScore(mint, undefined, Date.now() + 1);
+    assert.equal(capped, null, "a wall with no room still refuses (the cap is only a ceiling)");
+    assert.equal(six.calls(), 1, "and no second attempt was spent");
+
     // (b) The same pause against a wall with no room for pause + margin: no
     // wait, no retry, `backoff` — the exact card the operator saw.
     const tight = make();
@@ -12035,6 +12076,10 @@ async function main() {
       "organicWhy: null,",
       "organicMs: null,",
       "organicStatus: null,",
+      // The two counters that make "the card lacked the line" and "the
+      // operator never saw it" different readings (see organicLateEdits).
+      "organicLateEdits: this.organicLateEditsTotal,",
+      "organicLateLanded: this.organicLateLandedTotal,",
     ]) {
       assert.ok(src.includes(needle), `the tick summary must carry ${needle}`);
     }
@@ -12055,13 +12100,28 @@ async function main() {
       "if (note.retried) diag.organicRetried += 1;",
       "if (note.waited) diag.organicWaited += 1;",
       "if (!note.landed) diag.organicNoLine += 1;",
-      // The read's wall rides along, and it is the TICK's (2026-10-17): the
-      // slot is un-awaited, so a longer wait cannot delay the card, and the
-      // chain's 1.5s push reserve was refusing every 3-4s pause outright.
+      // The read's wall rides along, and it is the CARD READ's own
+      // (JUP_CARD_READ_WALL_MS, 2026-10-17): nothing waits on this read — the
+      // card renders from the box and the line is appended by an edit if the
+      // reading lands late — so its wall may outlive the tick it is created
+      // in, which is what lets it wait out the provider's 1-10s window.
+      "Date.now() + JUP_CARD_READ_WALL_MS,",
+      // The slot keeps its TICK wall: the EARLY gate await below reads this
+      // same promise, so what the tick is OFFERED must stay bounded.
       "tickDeadline,",
     ]) {
       assert.ok(body.includes(needle), `the card slot must publish ${needle}`);
     }
+    // The RAW promise is held apart from the racing slot, so a reading that
+    // lands after the tick still reaches the card (see appendLateOrganicLine).
+    assert.ok(
+      src.includes("const organicRead = jupiterOrganic"),
+      "the read itself must be held, not just the bestEffort race's answer",
+    );
+    assert.ok(
+      src.includes("organicRead ? () => organicRead : null"),
+      "and the slot must race the SAME promise (one call, unchanged)",
+    );
     // `organic` keeps its old meaning — the readings the CARD could use (the
     // box), so `organicCards - organic` is still "cards built without the
     // line"; the note-based counters above say WHY they were built without it.
@@ -12070,6 +12130,167 @@ async function main() {
       box.slice(0, box.indexOf("// Bundler")).includes("if (v) diag.organic++;"),
       "the landed count stays the card's own box",
     );
+    // THE APPEND (2026-10-17): the card and the edit are built by ONE render
+    // call site, the append is sorted into the sent/audited branch only, and
+    // the tick's waitUntil holds it (an un-awaited task dies with the
+    // handler). Each of these is a way the line could silently not appear.
+    assert.ok(
+      src.includes("const renderCard = (organic: JupOrganicReading | null): string =>"),
+      "the card's render must be a function of its reading (one call site)",
+    );
+    assert.ok(src.includes("const message = renderCard(organicReading);"));
+    const sent = src.slice(
+      src.indexOf('if (plan.audit && raced.status === "sent") {'),
+    );
+    const append = sent.slice(0, sent.indexOf("if (plan.recordUnconfirmed)"));
+    for (const needle of [
+      "this.appendLateOrganicLine({",
+      "organicRead !== null",
+      "organicReading === null",
+      "replyMarkup: cardKeyboard,",
+    ]) {
+      assert.ok(append.includes(needle), `the sent branch must schedule it: ${needle}`);
+    }
+    assert.ok(
+      src.includes("this.scanHoldForTick(task);"),
+      "the append must ride the tick's waitUntil",
+    );
+  });
+
+  await test("appendLateOrganicLine: the card's missing 有機度 is appended by an edit when the read lands late (2026-10-17)", async () => {
+    // The card can never wait on its own reading (the push reserve is for the
+    // SEND), and the provider refuses the read with a 1-10s window — so the two
+    // old outcomes were "card late" and "line gone". The edit is the third:
+    // the card ships on time and the number appears when the read lands.
+    const {
+      Scanner,
+      ORGANIC_LATE_LINE_WAIT_MS,
+      JUP_CARD_READ_WALL_MS,
+    } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const edits = [];
+      const held = [];
+      const bot = {
+        api: {
+          sendMessage: async () => ({ message_id: 1 }),
+          editMessageText: async (...args) => {
+            edits.push(args);
+            return {};
+          },
+        },
+      };
+      const scanner = new Scanner(
+        db, bot, new DexScreenerClient(cfg), cfg,
+        null, null, null, null, null, null, null,
+      );
+      const reading = (over = {}) => ({
+        score: 57.9,
+        label: "medium",
+        tradersH1: 374,
+        tradersWindow: "1h",
+        sus: false,
+        devBalancePct: null,
+        ...over,
+      });
+      const render = (organic) =>
+        organic === null ? "🪙 CARD" : `🪙 CARD\n🌱 有機度: ${organic.score}`;
+
+      // The ordinary late case: the read lands, the line is appended, and the
+      // edit says HOW late it was (a line that appears minutes later must not
+      // read as if it had been there at push time).
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 42,
+        reading: Promise.resolve(reading()),
+        render,
+        replyMarkup: { inline_keyboard: [] },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(edits.length, 1, "one edit, one line");
+      assert.equal(edits[0][0], "c");
+      assert.equal(edits[0][1], 42, "the edit must name the CARD's own message");
+      assert.match(String(edits[0][2]), /🌱 有機度: 57\.9/);
+      assert.match(String(edits[0][2]), /推送後 \d+s 補上/);
+      assert.deepEqual(
+        edits[0][3],
+        { reply_markup: { inline_keyboard: [] } },
+        "the card's keyboard must survive the edit",
+      );
+      assert.equal(scanner.organicLateEditsTotal, 1);
+      assert.equal(scanner.organicLateLandedTotal, 1, "the counter must say Telegram took it");
+
+      // A late reading the GATES would have blocked on is named on the card:
+      // the coin is already out, and this is the JANE shape.
+      edits.length = 0;
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 43,
+        reading: Promise.resolve(reading({ score: 0, label: "low" })),
+        render,
+        replyMarkup: null,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      assert.match(String(edits[0][2]), /本應攔住/, "a gate-blocking late reading must say so");
+
+      // A read with NO number to print is not a line: nothing is edited.
+      edits.length = 0;
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 44,
+        reading: Promise.resolve(reading({ score: null, tradersH1: null })),
+        render,
+        replyMarkup: null,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(edits.length, 0, "no number, no edit");
+
+      // A reading that never lands costs nothing (the card keeps its shape).
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 45,
+        reading: Promise.resolve(null),
+        render,
+        replyMarkup: null,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(edits.length, 0);
+
+      // The task is handed to the tick's waitUntil — an un-awaited promise is
+      // cancelled the moment the handler returns, which is how the line would
+      // be lost a second time.
+      scanner.scanHoldForTick = (p) => held.push(p);
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 46,
+        reading: new Promise(() => {}),
+        render,
+        replyMarkup: null,
+      });
+      assert.equal(held.length, 1, "the append must ride the tick's waitUntil");
+      assert.ok(
+        ORGANIC_LATE_LINE_WAIT_MS >= 20_000,
+        "and it must wait longer than the read's own wall, or every late line is dropped",
+      );
+      // The two numbers must stay payable against each other: the read waits
+      // out a 429 pause only when `room > pause + 750ms`, so a wall that just
+      // covered the cap would refuse the top of the measured 1-10s band as
+      // soon as the first attempt spent a second of it.
+      assert.ok(
+        JUP_CARD_READ_WALL_MS > JUP_RATE_LIMIT_WAIT_MAX_MS + 1_500,
+        `the card read's wall (${JUP_CARD_READ_WALL_MS}ms) must be able to pay the longest wait the cap allows (${JUP_RATE_LIMIT_WAIT_MAX_MS}ms)`,
+      );
+      assert.ok(
+        ORGANIC_LATE_LINE_WAIT_MS > JUP_CARD_READ_WALL_MS,
+        "and the append must outlast the wall it is accounting for",
+      );
+      await held[0].catch(() => {});
+    } finally {
+      await t.cleanup();
+    }
   });
 
   await test("429: the pause follows the provider's window, not the fixed five minutes", async () => {
@@ -12581,17 +12802,26 @@ async function main() {
       1,
       "one snapshot: the verdict and the card read the same value",
     );
+    // The card is built from the very snapshot the gate judged — now through
+    // ONE render call site, so the edit that appends a late 有機度 line cannot
+    // drift from the message that was sent (2026-10-17,
+    // Scanner.appendLateOrganicLine).
     assert.equal(
-      src.split("organicReading," + String.fromCharCode(10)).length - 1,
+      src.split("const message = renderCard(organicReading);").length - 1,
       1,
       "the card is built from the very snapshot the gate judged",
+    );
+    assert.equal(
+      src.split("const renderCard = (organic: JupOrganicReading | null): string =>").length - 1,
+      1,
+      "and built by ONE render function of its reading",
     );
     const early = src.indexOf("this.jupiterGatesBlocked(diag, coin, jupReading)");
     const wallets = src.indexOf("this.markPhase(diag, \"wallets\", startedAt)");
     const mode = src.indexOf("const tradeMode = this.trade");
     const snapshot = src.indexOf("const organicReading = organicBox.value;");
     const late = src.indexOf("this.jupiterGatesBlocked(diag, coin, organicReading)");
-    const render = src.indexOf("const message = renderMessage(");
+    const render = src.indexOf("const message = renderCard(organicReading);");
     assert.ok(
       early > 0 && wallets > early,
       "the early call is in front of the wallet/Flurry legs, so a blocked coin saves them",
@@ -22239,12 +22469,19 @@ async function main() {
       // deadline, still read late-bound from the box. 2026-10-17: the WAIT
       // decision now takes that same tick wall (it was chainDeadline), so a
       // 3-4s refusal can be waited out instead of costing the card its line.
+      // The dispatch is now its OWN value (`organicRead`) so the late-line
+      // append can hold the same promise the slot raced (2026-10-17,
+      // Scanner.appendLateOrganicLine). Still ONE call, still opened with the
+      // batch, still NOT awaited by it: the slot below merely races that same
+      // promise against the tick deadline.
       "scanner (the slot rides the batch's dispatch but not its await)":
-        scannerSrc.includes("constorganicSlot=this.bestEffort(") &&
         scannerSrc.includes(
-          "?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token,(note)=>{",
+          "constorganicRead=jupiterOrganic?jupiterOrganic.fetchOrganicScore(coin.stats.token,(note)=>{",
         ) &&
-        scannerSrc.includes("},tickDeadline,):null,tickDeadline,null,);") &&
+        scannerSrc.includes("},Date.now()+JUP_CARD_READ_WALL_MS,):null;") &&
+        scannerSrc.includes(
+          "constorganicSlot=this.bestEffort(organicRead?()=>organicRead:null,tickDeadline,null,);",
+        ) &&
         scannerSrc.includes(
           "voidorganicSlot.then((v)=>{organicBox.value=v;if(v)diag.organic++;});",
         ),
@@ -22254,7 +22491,7 @@ async function main() {
         ) &&
         scannerSrc.includes("const[gmgn,arkham]=awaitdisplayBatch;") &&
         scannerSrc.includes("constorganicReading=organicBox.value;") &&
-        scannerSrc.includes("organicReading,"),
+        scannerSrc.includes("constmessage=renderCard(organicReading);"),
       "worker (the probe asks from the worker's own egress, with its latency)":
         workerSrc.includes(
           'constorganicMint=(url.searchParams.get("organic")??"").trim();',

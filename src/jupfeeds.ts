@@ -25,12 +25,25 @@ export const JUP_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
  */
 export const JUP_RATE_LIMIT_MIN_PAUSE_MS = 250;
 /**
- * The longest pause the CARD's read will wait out for a second attempt. A
- * card's wall is the chain (tick start + 6.5s) and the slot opens ~2s in, so a
- * few seconds is affordable; a multi-minute pause is not, and waiting one would
- * eat the push reserve.
+ * The longest pause the CARD's read will wait out for a second attempt.
+ *
+ * RAISED 4s → 10s (2026-10-17, the third round of "the 有機度 line is missing
+ * from the card"). The old cap was sized for a read whose result the CARD was
+ * waiting on (a card's wall is the chain, and waiting would have eaten the
+ * push reserve). That is no longer what this call is: the read is un-awaited,
+ * the card renders from whatever has landed and the line is appended by EDIT
+ * when the reading arrives later (see Scanner.appendLateOrganicLine), so the
+ * wait costs wall clock the card never pays. Meanwhile the provider's window
+ * is 5 requests / ~10s (see rateLimitPauseMs), i.e. the advertised reset lands
+ * exactly in the band the 4s cap refused — measured on the live cards: every
+ * `why:"backoff"` card in the 2026-10-17 audit was `waited:false`, and the
+ * wait was the only lever there was.
+ *
+ * The true bound is still the caller's wall (room > pause + margin); this is
+ * only the ceiling on what a wall may buy. Still far under
+ * JUP_RATE_LIMIT_BACKOFF_MS, so an unusable header can never park the card.
  */
-export const JUP_RATE_LIMIT_WAIT_MAX_MS = 4_000;
+export const JUP_RATE_LIMIT_WAIT_MAX_MS = 10_000;
 /**
  * Headroom added to a waited-out pause before retrying: the round trip plus
  * scheduling, so the retry cannot land 10ms before the window opens and get
@@ -899,9 +912,12 @@ export class JupTokensClient {
     onNote?: (note: JupCardReadNote) => void,
     /**
      * The caller's WALL for this read (epoch ms) — the scanner hands it
-     * `chainDeadline`. Only one decision uses it: whether a 429 pause is short
-     * enough to wait out before the second attempt (see below). Optional, so
-     * every existing caller keeps its exact shape (no deadline = never wait).
+     * `Date.now() + JUP_CARD_READ_WALL_MS` (the read is un-awaited: the card
+     * never waits on it, its line is appended by edit if it lands late — see
+     * Scanner.appendLateOrganicLine). Only one decision uses it: whether a 429
+     * pause is short enough to wait out before the second attempt (see below).
+     * Optional, so every existing caller keeps its exact shape (no deadline =
+     * never wait).
      */
     deadlineMs?: number,
   ): Promise<JupOrganicReading | null> {
