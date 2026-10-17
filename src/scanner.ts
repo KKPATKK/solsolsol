@@ -15,6 +15,7 @@ import {
   SCAN_FRONT_GATE_KEYS,
   poolRotationSlot,
   type Db,
+  type PushAuditOrganic,
   type ScanFront,
   type TokenStats,
 } from "./db";
@@ -55,6 +56,7 @@ import type { CrimeCheckResult, CrimeWalletClient } from "./crimewallets";
 import {
   JUP_FALLBACK_MIN_ROOM_MS,
   trendBandFromChats,
+  type JupCardReadNote,
   type JupCardReadWhy,
   type JupTokensClient,
 } from "./jupfeeds";
@@ -2221,6 +2223,14 @@ export interface ScanSummary {
    */
   organicWaited: number;
   /**
+   * Jupiter BULK calls stood down this scan so the card read keeps its slot
+   * (see jupfeeds.JUP_WINDOW_BULK_MAX, `JUP_RESERVE_CARD_SLOT`). The
+   * reservation's cost, in one number: a non-zero reading is a bulk request
+   * (in practice the pair fallback's last chunk) that this tick did NOT make,
+   * traded for the card's line and its gates. Zero on a normal tick.
+   */
+  jupReserved: number;
+  /**
    * The last card read's reason (see JupCardReadNote): `ok` | `backoff` (a 429
    * has the client paused — the whole JUP_RATE_LIMIT_BACKOFF_MS window loses
    * every card line, and the Jupiter gates fail open inside it) | `http` (see
@@ -2898,6 +2908,48 @@ export function organicTradersBlockReason(
   if (tradersH1 === null || !Number.isFinite(tradersH1)) return null;
   if (tradersH1 < maxTraders) return null;
   return `1h 交易者 ${tradersH1.toLocaleString("en-US")} ≥ ${maxTraders}（已經太多人參與，唔追呢一浸）`;
+}
+
+/**
+ * The `push_audit` stamp of one card's 🌱 有機度 line (see
+ * db.PushAuditOrganic): the reading the CARD PRINTED, plus the read's own
+ * reason.
+ *
+ * It takes TWO inputs because the card and the read are allowed to disagree
+ * (the reading is late-bound, see the organic slot in the candidate chain):
+ * the snapshot that was rendered, and the note the read produced. Every
+ * disagreement is named instead of smoothed over — a card with no line whose
+ * read DID land is `late` (the reading exists, arrived after render, and no
+ * gate ever judged it), and a card with no line and no note at all is `null`
+ * (the read never answered before the card was built). Without that split the
+ * audit would report `ok` for a card that visibly has no line.
+ *
+ * Pure and exported so the shapes are unit-tested rather than only observed on
+ * a live card.
+ */
+export function cardOrganicAudit(
+  reading: {
+    score: number | null;
+    tradersH1?: number | null;
+    tradersWindow?: "1h" | "6h" | "24h" | null;
+  } | null,
+  note: JupCardReadNote | null,
+): PushAuditOrganic {
+  const why =
+    reading !== null
+      ? note?.why ?? "ok"
+      : note === null
+        ? null
+        : note.landed
+          ? "late"
+          : note.why;
+  return {
+    score: reading?.score ?? null,
+    tradersH1: reading?.tradersH1 ?? null,
+    tradersWindow: reading?.tradersWindow ?? null,
+    why,
+    waited: note?.waited ?? false,
+  };
 }
 
 /**
@@ -5052,6 +5104,13 @@ export class Scanner {
     this.runningSince = Date.now();
     this.abortRequested = false;
     const startedAt = Date.now();
+    // The window reservation's cumulative counter as this tick found it (see
+    // jupReserved): the delta published with the summary is what THIS tick
+    // traded, not the isolate's lifetime total.
+    // `?.()` on the METHOD, not just the client: the scanner's test doubles
+    // are plain feed objects with no ledger, and a missing counter reads as
+    // "nothing stood down" rather than as a tick that throws.
+    const jupBulkBefore = this.jupiter?.bulkStoodDownCount?.() ?? 0;
     const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
     // The front phases (feeds + pool read + pair fetch) must ALL be done by
     // here, so the gate/push phase below always keeps its reserved slice of
@@ -5091,6 +5150,7 @@ export class Scanner {
       organicNoLine: 0,
       organicRetried: 0,
       organicWaited: 0,
+      jupReserved: 0,
       organicWhy: null,
       organicMs: null,
       organicStatus: null,
@@ -6957,6 +7017,12 @@ export class Scanner {
         // count, same fallback (null → the line is hidden), and no wait added
         // anywhere. Its wall is the tick deadline because it blocks nobody.
         diag.organicCards += 1;
+        // THIS card's read outcome, per card: the client's own cardReadNote()
+        // is last-call-wins across coins, so two reads in flight would stamp
+        // the wrong reason on the wrong card. The delivery audit reads this
+        // box (see cardOrganicAudit), which is what makes "this card had no
+        // 有機度, why" answerable after the fact.
+        let organicNote: JupCardReadNote | null = null;
         const organicSlot = this.bestEffort(
           jupiterOrganic
             ? () =>
@@ -6970,6 +7036,7 @@ export class Scanner {
                   // two coins' reads can overlap and the last-settled note is
                   // not necessarily this card's.
                   (note) => {
+                    organicNote = note;
                     diag.organicWhy = note.why;
                     diag.organicMs = note.ms;
                     diag.organicStatus = note.status;
@@ -7429,6 +7496,11 @@ export class Scanner {
                   messageId,
                   mcapAtPush: c.pair.marketCap,
                   kind: "initial",
+                  // One row per card: the exact reading that card printed, the
+                  // trader count its 1h ceiling would have judged, and why
+                  // there is no line (or `late` = the read landed after the
+                  // card). See db.PushAuditOrganic.
+                  organic: cardOrganicAudit(organicReading, organicNote),
                 });
               } catch {
                 /* audit is best-effort */
@@ -7661,6 +7733,8 @@ export class Scanner {
       // Only a still-current scan may publish summary/state; a timed-out scan
       // that eventually settles must not clobber a newer scan's results.
       if (seq === this.scanSeq) {
+        // The reservation's cost for THIS tick (see jupBulkBefore).
+        diag.jupReserved = (this.jupiter?.bulkStoodDownCount?.() ?? 0) - jupBulkBefore;
         // Flurry RPC spend is cumulative across ticks (isolate lifetime) —
         // surface it on every heartbeat so actual cost stays observable.
         const fs = this.flurry?.stats();

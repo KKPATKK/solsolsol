@@ -157,6 +157,33 @@ function combineAbortSignals(
  */
 export const JUP_PRIORITY_GAP_MS = 150;
 
+/**
+ * The provider's rolling window, and how much of it the BULK lanes may spend.
+ *
+ * MEASURED (2026-10-17, from this repo's own sandbox egress): lite-api allows
+ * **5 requests per ~10-second window** (`x-ratelimit-current: 5`), and a tick
+ * with DexScreener's pair lane refused fleet-wide spends all five on bulk work
+ * — two discovery feeds plus the pair fallback's chunks, which carry every
+ * address now. The card's read is the SIXTH call, and it is the one call that
+ * cannot be redone next tick: a card that loses its line has lost it forever,
+ * and the same read feeds the three Jupiter gates. Observed live as
+ * `organicWaited` ticks and, when the window did not reopen in time, cards
+ * with no 🌱 有機度 at all.
+ *
+ * So the bulk lanes stop at 4 dispatches per window: the fifth is LEFT for the
+ * card. This is a deliberate coverage trade, not a free win — whichever bulk
+ * call arrives with the window full stands down (in practice the last chunk of
+ * the pair fallback, ~100 addresses) and its tokens keep their re-eval slot
+ * for the next tick. `JUP_RESERVE_CARD_SLOT=0` turns it off (bulk may spend all
+ * five again), so the trade can be re-measured instead of trusted.
+ *
+ * Only dispatches from THIS client count: each isolate has its own client, so
+ * the ledger cannot see another isolate's calls. That is enough here because a
+ * tick's bulk burst is what closes the window for its own card.
+ */
+export const JUP_RATE_WINDOW_MS = 10_000;
+export const JUP_WINDOW_BULK_MAX = 4;
+
 /** Spaces out HTTP requests so we stay well under Jupiter's rate limit. */
 class Throttle {
   private lastCallAt = 0;
@@ -575,6 +602,10 @@ export class JupTokensClient {
   private lastStatus = 0;
   /** The last card read's outcome (see JupCardReadNote). */
   private lastCardRead: JupCardReadNote | null = null;
+  /** Dispatch starts inside the provider's rolling window, oldest first. */
+  private windowDispatchesAt: number[] = [];
+  /** Bulk calls stood down so the card read keeps its slot (2026-10-17). */
+  private bulkStoodDown = 0;
 
   constructor(
     config: AppConfig,
@@ -587,10 +618,45 @@ export class JupTokensClient {
     private readonly fetcher?: (url: string, signal?: AbortSignal) => Promise<Response>,
   ) {
     this.throttle = new Throttle(config.jupiterRequestIntervalMs);
+    // JUP_RESERVE_CARD_SLOT=0 turns the reservation off (default on, see
+    // JUP_WINDOW_BULK_MAX). Kept on the instance so the dispatch check below
+    // is one field read instead of a config lookup per call.
+    this.reserveCardSlot = config.jupReserveCardSlot !== false;
   }
+
+  private readonly reserveCardSlot: boolean;
 
   private rateLimited(): boolean {
     return Date.now() < this.rateLimitedUntil;
+  }
+
+  /**
+   * Drop dispatches that have rolled out of the provider's window. Called at
+   * every dispatch AND by the readers, so the ledger cannot grow without
+   * bound on a client that a tick only sends a few calls from.
+   */
+  private pruneWindow(now: number): void {
+    while (
+      this.windowDispatchesAt.length > 0 &&
+      now - this.windowDispatchesAt[0] >= JUP_RATE_WINDOW_MS
+    ) {
+      this.windowDispatchesAt.shift();
+    }
+  }
+
+  /** Dispatches this client has made inside the provider's window right now. */
+  windowDispatches(now = Date.now()): number {
+    this.pruneWindow(now);
+    return this.windowDispatchesAt.length;
+  }
+
+  /**
+   * Bulk calls stood down to leave the card read its slot (cumulative for this
+   * isolate's client). A non-zero reading on a tick is the reservation doing
+   * work, and its size is the coverage that tick traded for the card's line.
+   */
+  bulkStoodDownCount(): number {
+    return this.bulkStoodDown;
   }
 
   /**
@@ -658,8 +724,25 @@ export class JupTokensClient {
             // comes first (see combineAbortSignals).
             signal: combineAbortSignals(s, AbortSignal.timeout(10_000)),
           }));
-      const res = await this.throttle.run(
-        () => doFetch(`${BASE_URL}${path}`, signal),
+      const res = await this.throttle.run<Response | null>(
+        () => {
+          // The card's reserved slot (see JUP_WINDOW_BULK_MAX). Checked at
+          // DISPATCH, not at enqueue: the throttle may have held this call for
+          // a second, and the window that matters is the one the request
+          // actually lands in. A stood-down bulk call is NOT a failure — it is
+          // a request the next tick will make — so it answers the same null an
+          // unreachable provider does, and the counter is what tells the two
+          // apart afterwards.
+          if (!priority && this.reserveCardSlot) {
+            const now = Date.now();
+            if (this.windowDispatches(now) >= JUP_WINDOW_BULK_MAX) {
+              this.bulkStoodDown += 1;
+              return Promise.resolve(null);
+            }
+          }
+          this.windowDispatchesAt.push(Date.now());
+          return doFetch(`${BASE_URL}${path}`, signal);
+        },
         signal,
         priority,
       );

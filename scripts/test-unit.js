@@ -30,7 +30,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, slicePoolTwoLanes, RE_EVAL_FAST_LANE_SHARE, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, slicePoolTwoLanes, RE_EVAL_FAST_LANE_SHARE, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -11657,6 +11657,53 @@ async function main() {
     );
   });
 
+  await test("jupiter window: the bulk lanes leave the card read one request per 10s window", async () => {
+    // Measured 2026-10-17: lite-api allows 5 requests per ~10s, and a tick's
+    // own bulk lanes (two discovery feeds + the pair fallback's chunks) spend
+    // all five — which is how a card lost its line and the three Jupiter gates
+    // lost their reading. The reservation: bulk stops at four, the fifth is the
+    // card's.
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const body = JSON.stringify([{ id: mint, organicScore: 61, stats1h: { numTraders: 100 } }]);
+    const urls = [];
+    const client = new JupTokensClient({ jupiterRequestIntervalMs: 0 }, async (u) => {
+      urls.push(String(u));
+      return new Response(body, { status: 200 });
+    });
+    for (let i = 0; i < 5; i += 1) await client.fetchRecentTokens(5);
+    assert.equal(urls.length, 4, "the fifth bulk request stands down, it is not sent");
+    assert.equal(client.bulkStoodDownCount(), 1, "and the trade is counted, not hidden");
+    assert.equal(client.windowDispatches(), 4);
+    // The card's read — the one call that cannot be redone next tick — still
+    // reaches the wire, inside that same window.
+    const reading = await client.fetchOrganicScore(mint);
+    assert.equal(reading.score, 61);
+    assert.equal(urls.length, 5, "the reserved slot is the card's");
+    assert.equal(client.windowDispatches(), 5, "now the provider's window is full");
+    // And nothing burst past it: another bulk call stands down again.
+    await client.fetchRecentTokens(5);
+    assert.equal(urls.length, 5);
+    assert.equal(client.bulkStoodDownCount(), 2);
+    // JUP_RESERVE_CARD_SLOT=0 restores the old behaviour, so the trade can be
+    // re-measured instead of trusted.
+    const legacyUrls = [];
+    const legacy = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0, jupReserveCardSlot: false },
+      async (u) => {
+        legacyUrls.push(String(u));
+        return new Response(body, { status: 200 });
+      },
+    );
+    for (let i = 0; i < 5; i += 1) await legacy.fetchRecentTokens(5);
+    assert.equal(legacyUrls.length, 5, "with the knob off, bulk spends the whole window");
+    assert.equal(legacy.bulkStoodDownCount(), 0);
+    // The knob's own config reading: on unless explicitly 0/false.
+    assert.equal(loadConfig({}).jupReserveCardSlot, true);
+    assert.equal(loadConfig({ JUP_RESERVE_CARD_SLOT: "0" }).jupReserveCardSlot, false);
+    assert.equal(loadConfig({ JUP_RESERVE_CARD_SLOT: "false" }).jupReserveCardSlot, false);
+    assert.equal(loadConfig({ JUP_RESERVE_CARD_SLOT: "junk" }).jupReserveCardSlot, true);
+  });
+
   await test("fetchOrganicScore: the card read takes the priority slot instead of queueing behind a bulk lane", async () => {
     // The mechanism the operator's report points at. ONE client serves a tick's
     // feeds and the pair fallback's chunks (every address now that DexScreener's
@@ -11974,6 +12021,100 @@ async function main() {
       "organic",
     );
     assert.equal(jupiterGateVerdict(flagged, { jupSusBlock: false, organicMinScore: 0 }), null);
+  });
+
+  await test("cardOrganicAudit: a card's own 🌱 reading, with every late/absent shape named", () => {
+    // The audit row exists so each card answers for itself afterwards. Its
+    // inputs are the snapshot the card was BUILT from and that read's own note
+    // — not the client's last-call-wins note, which belongs to whichever coin
+    // settled last.
+    const note = (over) => ({
+      at: 0,
+      ms: 120,
+      why: "ok",
+      status: 200,
+      retried: false,
+      waited: false,
+      landed: true,
+      ...over,
+    });
+    const reading = { score: 61.2, tradersH1: 243, tradersWindow: "1h" };
+    assert.deepEqual(cardOrganicAudit(reading, note()), {
+      score: 61.2,
+      tradersH1: 243,
+      tradersWindow: "1h",
+      why: "ok",
+      waited: false,
+    });
+    // A read that had to wait out the provider's window still landed — and the
+    // wait is stamped, because it is the reading that says the tick crowded
+    // its own card.
+    assert.deepEqual(cardOrganicAudit(reading, note({ waited: true })), {
+      score: 61.2,
+      tradersH1: 243,
+      tradersWindow: "1h",
+      why: "ok",
+      waited: true,
+    });
+    // No line because the provider refused: the provider's reason, not a
+    // generic "missing".
+    assert.deepEqual(
+      cardOrganicAudit(null, note({ why: "backoff", landed: false, status: 429 })),
+      { score: null, tradersH1: null, tradersWindow: null, why: "backoff", waited: false },
+    );
+    // LATE: the read landed, but after the card was rendered. Claiming `ok`
+    // here would say a line the card does not have was judged — the exact
+    // blind spot the pre-card gate exists for.
+    assert.equal(cardOrganicAudit(null, note()).why, "late");
+    // Nothing at all: the card was built before the read answered, so this card
+    // has no reason (not `ok`, not `empty`).
+    assert.equal(cardOrganicAudit(null, null).why, null);
+    // The 6h/24h fallback is carried: the 1400 ceiling must not judge it.
+    assert.equal(
+      cardOrganicAudit({ score: 5, tradersH1: 13, tradersWindow: "6h" }, note()).tradersWindow,
+      "6h",
+    );
+  });
+
+  await test("push audit: each initial card stamps its own reading, and the tick counts what the reservation cost", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "src", "scanner.ts"),
+      "utf8",
+    );
+    // The note is per CARD (the client's note is last-call-wins across coins).
+    assert.ok(
+      src.includes("let organicNote: JupCardReadNote | null = null;"),
+      "a per-card note box must exist",
+    );
+    assert.ok(
+      src.includes("organicNote = note;"),
+      "the slot's callback must fill it",
+    );
+    // The rendered snapshot is the one stamped (see the gate's own rule).
+    assert.ok(src.includes("const organicReading = organicBox.value;"));
+    const callAt = src.indexOf("await this.db.recordPushDelivery({");
+    assert.ok(callAt > 0, "the initial-card audit call must exist");
+    const call = src.slice(callAt, callAt + 1200);
+    assert.ok(call.includes('kind: "initial"'), "the stamp rides the INITIAL card's row");
+    assert.ok(
+      call.includes("organic: cardOrganicAudit(organicReading, organicNote)"),
+      "with the card's own reading and its own note",
+    );
+    // The reservation's cost is a per-tick reading, not an isolate total.
+    assert.ok(src.includes("const jupBulkBefore = this.jupiter?.bulkStoodDownCount?.() ?? 0;"));
+    assert.ok(
+      src.includes(
+        "diag.jupReserved = (this.jupiter?.bulkStoodDownCount?.() ?? 0) - jupBulkBefore;",
+      ),
+      "the summary must publish what THIS tick stood down",
+    );
+    // And the durable entry type carries it (db.ts is the ring's home).
+    const dbSrc = fs.readFileSync(
+      path.join(__dirname, "..", "src", "db.ts"),
+      "utf8",
+    );
+    assert.ok(dbSrc.includes("organic?: PushAuditOrganic;"), "recordPushDelivery must accept it");
+    assert.ok(dbSrc.includes("export interface PushAuditOrganic"), "and name its shape");
   });
 
   await test("ORGANIC_MIN_SCORE: default 55, 0 and junk disable, the scale is clamped", () => {

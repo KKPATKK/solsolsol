@@ -1465,6 +1465,45 @@ export const TELEMETRY_SEED_MARKER_KEY = "telemetry_counts_seeded_v1";
 type BatchRows = Awaited<ReturnType<SqlTransport["batch"]>>;
 
 /**
+ * What a first-push card's 🌱 有機度 line was actually judged on, stamped into
+ * its `push_audit` entry (2026-10-17).
+ *
+ * WHY IT IS IN THE AUDIT RING. The line is display-only and best-effort, so a
+ * card that lost it left no trace anywhere: the tick summary carried one
+ * reason for the LAST read of the tick (`organicWhy`), the card carried no
+ * field at all, and both earlier investigations of "many cards have no 有機度"
+ * (§4.23/§4.24 of docs/round-trips.md) had to re-probe the day's pushed mints
+ * by hand. With this stamp every card answers, after the fact and for that
+ * card alone: was a reading printed (`score`), what was the trader count the
+ * 1h ceiling would have judged (`tradersH1` + the window it came from), and did
+ * the GATE see it (`why`).
+ *
+ * `why` is `JupCardReadWhy` (`ok` | `backoff` | `http` | `body` | `no-entry` |
+ * `empty` | `error`), with two shapes that only exist here:
+ *   - `null` — the card was built before the read answered (its wall passed),
+ *     so no reason exists for that card;
+ *   - `late` — the read DID land, but after the card was rendered. A reading
+ *     that arrives late is invisible on the card and was already tested for
+ *     by nobody, which is exactly the shape the pre-card gate exists to catch.
+ */
+export interface PushAuditOrganic {
+  /** Jupiter organic score printed on the card (null = the line was hidden). */
+  score: number | null;
+  /** Trader count printed on the card (null = no trader data in any window). */
+  tradersH1: number | null;
+  /**
+   * Which Jupiter window `tradersH1` came from. Load-bearing: only `1h` is the
+   * ruler the 1400 ceiling judges, so `6h`/`24h` says the ceiling deliberately
+   * did not look at this number.
+   */
+  tradersWindow: "1h" | "6h" | "24h" | null;
+  /** The read's reason — see the two audit-only shapes in the docs above. */
+  why: string | null;
+  /** Whether the read had to WAIT OUT the provider's 429 window first. */
+  waited: boolean;
+}
+
+/**
  * A `worker_state.push_audit` ring as read from its row: an array of
  * entries, or `[]` for an absent / unreadable / non-array value.
  * Tolerant on purpose — every reader of this ring treats "nothing readable" as
@@ -4644,6 +4683,11 @@ export class Db {
     /** "initial" = first push card (scanner); "followup" = tracker alert. */
     kind?: string;
     /**
+     * What the card's 🌱 有機度 line was judged on (initial cards only).
+     * See PushAuditOrganic.
+     */
+    organic?: PushAuditOrganic;
+    /**
      * The tracker card's transition signature (see CUT_MARK_PREFIX in
      * src/pushwatch.ts): the identity a re-derivation of the SAME card can be
      * matched against, so a proof can only ever stand for the transition it is
@@ -4710,6 +4754,8 @@ export class Db {
       kind?: string;
       /** The card's transition sig (recordPushDelivery / cardProofKey). */
       sig?: string;
+      /** The 🌱 有機度 reading this card printed (and why, if it had none). */
+      organic?: PushAuditOrganic;
       at: number;
     }>
   > {

@@ -526,6 +526,14 @@ export interface AppConfig {
   /** Minimum spacing between Jupiter HTTP requests (rate limiting). */
   jupiterRequestIntervalMs: number;
   /**
+   * Keep one request of the provider's 5-per-10s window for the push card's
+   * organic read (`JUP_RESERVE_CARD_SLOT`, default true). Bulk lanes then stop
+   * at four dispatches per window; the fifth is the card's. Set `0` to let the
+   * bulk lanes spend the whole window again — the card can then lose its line
+   * to the tick's own load (see jupfeeds.JUP_WINDOW_BULK_MAX).
+   */
+  jupReserveCardSlot: boolean;
+  /**
    * Post-push tracker (PUSH_WATCH_ENABLED, default true): every pushed coin
    * is watched for `windowHours` and refreshed from ONE DexScreener batch
    * call per tick; follow-up alerts report continuation (🚀 stages) or
@@ -989,6 +997,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     )
       ? Math.max(0, Number(env.JUPITER_REQUEST_INTERVAL_MS ?? 1000))
       : 1000,
+    // Fail-open on junk (the reservation stays ON, which is the shipped
+    // behaviour); only an explicit "0"/"false" turns it off.
+    jupReserveCardSlot:
+      (env.JUP_RESERVE_CARD_SLOT ?? "1") !== "0" &&
+      (env.JUP_RESERVE_CARD_SLOT ?? "1") !== "false",
     pushWatch: {
       enabled: (env.PUSH_WATCH_ENABLED ?? "true") !== "0" && (env.PUSH_WATCH_ENABLED ?? "true") !== "false",
       maxTracked: Number.isFinite(Number(env.PUSH_WATCH_MAX_TRACKED ?? 30))
