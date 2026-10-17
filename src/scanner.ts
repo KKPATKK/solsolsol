@@ -7067,9 +7067,29 @@ export class Scanner {
                     if (note.waited) diag.organicWaited += 1;
                     if (!note.landed) diag.organicNoLine += 1;
                   },
-                  // The read's wall: a 429 pause is only waited out while the
-                  // chain (tick start + 6.5s) can still afford it.
-                  chainDeadline,
+                  // The read's wall is the TICK's, not the chain's (2026-10-17,
+                  // operator report: first-push cards still losing the line
+                  // with `why:"backoff"`, `waited:false`).
+                  //
+                  // The third argument is the only input to ONE decision: may a
+                  // 429 pause be waited out for a second attempt (see
+                  // fetchOrganicScore: pause <= JUP_RATE_LIMIT_WAIT_MAX_MS AND
+                  // room > pause + 750ms). It was `chainDeadline` — tick start +
+                  // 6.5s, i.e. tickDeadline MINUS CANDIDATE_PUSH_RESERVE_MS —
+                  // but that reserve protects the PUSH path, and this slot is
+                  // late-bound: it is never awaited, so a slower read cannot
+                  // delay the card. What it decides is only whether the second
+                  // attempt happens. Measured cost of the old wall: a slot that
+                  // opens ~2s in had ~4.5s of room, so any advertised pause at
+                  // or past ~3.75s was refused outright (and a second card in
+                  // the same chain, opening later, had less), which is exactly
+                  // the 3-4s band Jupiter's `x-ratelimit-reset` lands in.
+                  //
+                  // The reading is still judged again at render (see
+                  // jupiterGatesBlocked), so a read that lands late is not a
+                  // lost gate — only a lost line. Trading a few seconds of an
+                  // un-awaited slot for the line is the cheaper side of that.
+                  tickDeadline,
                 )
             : null,
           tickDeadline,

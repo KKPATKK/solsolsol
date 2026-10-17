@@ -11758,6 +11758,62 @@ async function main() {
     );
   });
 
+  await test("fetchOrganicScore: a 429 pause is waited out only while the CALLER's wall can afford it", async () => {
+    // 2026-10-17, the second half of the operator's report: cards still lost the
+    // line with `why:"backoff"`, `waited:false`. The wait exists (see
+    // JUP_RATE_LIMIT_WAIT_MAX_MS) but it is gated on the caller's deadline: it
+    // fires only when the advertised pause is <= 4s AND the remaining room is
+    // more than pause + JUP_RATE_LIMIT_WAIT_MARGIN_MS. The scanner now hands
+    // the TICK's wall, because the 🌱 slot is un-awaited (it cannot delay the
+    // card) and the chain's wall refused the 3-4s band outright. Both halves
+    // are pinned here — the same 1s pause, once with room and once without.
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const body = JSON.stringify([{ id: mint, organicScore: 44, stats1h: { numTraders: 9 } }]);
+    const make = () => {
+      let calls = 0;
+      const client = new JupTokensClient(
+        { jupiterRequestIntervalMs: 0, jupReserveCardSlot: false },
+        async () => {
+          calls += 1;
+          if (calls === 1) {
+            return new Response("slow down", {
+              status: 429,
+              headers: { "Retry-After": "1" },
+            });
+          }
+          return new Response(body, { status: 200 });
+        },
+      );
+      return { client, calls: () => calls };
+    };
+
+    // (a) Room to spare: wait the advertised window out, retry once, land.
+    const roomy = make();
+    const roomyNotes = [];
+    const landed = await roomy.client.fetchOrganicScore(
+      mint,
+      (n) => roomyNotes.push(n),
+      Date.now() + 4_000,
+    );
+    assert.equal(landed.score, 44, "the second attempt lands the reading");
+    assert.equal(roomy.calls(), 2, "one wait, one retry");
+    assert.equal(roomyNotes[0].waited, true, "the note says the pause was waited out");
+    assert.equal(roomyNotes[0].retried, true);
+    assert.equal(roomyNotes[0].why, "ok");
+
+    // (b) The same pause against a wall with no room for pause + margin: no
+    // wait, no retry, `backoff` — the exact card the operator saw.
+    const tight = make();
+    const tightNotes = [];
+    assert.equal(
+      await tight.client.fetchOrganicScore(mint, (n) => tightNotes.push(n), Date.now() + 1_600),
+      null,
+    );
+    assert.equal(tight.calls(), 1, "a pause the wall cannot afford is not waited out");
+    assert.equal(tightNotes[0].waited, false);
+    assert.equal(tightNotes[0].why, "backoff");
+  });
+
   await test("jupiter window: the bulk lanes leave the card read one request per 10s window", async () => {
     // Measured 2026-10-17: lite-api allows 5 requests per ~10s, and a tick's
     // own bulk lanes (two discovery feeds + the pair fallback's chunks) spend
@@ -11906,9 +11962,10 @@ async function main() {
       "if (note.retried) diag.organicRetried += 1;",
       "if (note.waited) diag.organicWaited += 1;",
       "if (!note.landed) diag.organicNoLine += 1;",
-      // The read's wall rides along, so a 429 window can only be waited out
-      // while the chain can still afford it.
-      "chainDeadline,",
+      // The read's wall rides along, and it is the TICK's (2026-10-17): the
+      // slot is un-awaited, so a longer wait cannot delay the card, and the
+      // chain's 1.5s push reserve was refusing every 3-4s pause outright.
+      "tickDeadline,",
     ]) {
       assert.ok(body.includes(needle), `the card slot must publish ${needle}`);
     }
@@ -22005,13 +22062,15 @@ async function main() {
       // callback that publishes WHY a card lost its line — see the summary
       // fields organicWhy/organicCards and the tests for them). Same call, same
       // count, same wall: still opened with the batch, still walled at the TICK
-      // deadline, still read late-bound from the box.
+      // deadline, still read late-bound from the box. 2026-10-17: the WAIT
+      // decision now takes that same tick wall (it was chainDeadline), so a
+      // 3-4s refusal can be waited out instead of costing the card its line.
       "scanner (the slot rides the batch's dispatch but not its await)":
         scannerSrc.includes("constorganicSlot=this.bestEffort(") &&
         scannerSrc.includes(
           "?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token,(note)=>{",
         ) &&
-        scannerSrc.includes("},chainDeadline,):null,tickDeadline,null,);") &&
+        scannerSrc.includes("},tickDeadline,):null,tickDeadline,null,);") &&
         scannerSrc.includes(
           "voidorganicSlot.then((v)=>{organicBox.value=v;if(v)diag.organic++;});",
         ),

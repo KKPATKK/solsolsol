@@ -261,3 +261,46 @@ score floor 同呢個 ceiling（同一個 payload、同一個閘門家族），�
 **判斷點**：同 score floor 一樣係「一個 reading、三個判斷」，兩次判斷（early leg-saving
 ＋ render 最後一判）都經 `jupiterGateVerdict`，所以唔會漂移；`jupReading` 嘅 await 條件亦
 加上 `organicMaxTradersH1 > 0`（唔係就會出現「configured 但冇讀數」嘅死閘門，測試 pin 住）。
+
+## 9. 2026-10-17: 首次推送卡仍然缺 有機度 —— 429 嘅「等唔等」用錯牆
+
+**營運者報告（今日）**：首次推送卡仲有缺 `🌱 有機度` 嘅情況。查 `push_audit` 嘅 per-card
+記錄（`/debug/push-audit`，`kind=initial`）得出嘅形狀：
+
+| 期間 | initial 卡 | 缺線 |
+|---|---|---|
+| 03:53–04:38Z | 5 | 5（全 `why:"backoff"`、`waited:false`） |
+| 04:52Z（改動 deploy）之後 | 4 | 2（05:01 DORF、06:03 EGG） |
+| 最近兩張 | 2 | 0（07:18 illusion 55.0、07:36 SEXCOIN 57.9） |
+
+（環內 12 張「冇 score」嘅行係 audit 欄上線前嘅紀錄，唔算證據。）
+
+**成因唔係「冇數據」，係「等唔到」**：卡嘅第一次讀數自己都喺 shared 5 req/10s 窗口被 429。
+重試本來就有（`JUP_RATE_LIMIT_WAIT_MAX_MS` 4s），但條件係
+`pauseMs <= 4,000 && room > pauseMs + 750`，而 `room` 一直用 **`chainDeadline`**
+（tick start + 6.5s ＝ `tickDeadline` **減** `CANDIDATE_PUSH_RESERVE_MS` 1.5s）。
+slot 喺 tick 開始後 ~2s 打開 ⇒ 只剩 ~4.5s，即係 **3.75s 以上嘅 pause 一律唔等**，
+而 Jupiter `x-ratelimit-reset` 實測正正落喺 1–10s（3–4s 呢一段就係今次跌出嚟嗰批）。
+`waited:false` 就係呢個意思。
+
+**改動**：`fetchOrganicScore` 嘅第三個參數（唯一用途就係「等唔等」）由 `chainDeadline`
+改成 **`tickDeadline`**。三點理由，缺一不可：
+
+1. 個 slot 係 **late-bound**（`void organicSlot.then(...)`），從來冇 await，所以慢幾秒
+   **唔會延遲張卡**；`CANDIDATE_PUSH_RESERVE_MS` 保護嘅係 push 路徑，唔係呢個讀數。
+2. 讀數**喺 render 會再判一次**（`jupiterGatesBlocked`），所以「遲到」只係少咗條線，
+   唔會變成少咗個閘 —— 而遲到總好過冇。
+3. 換到嘅係 3–4s 呢一段（同 chain 後段第二張卡嘅全部 room）。上限 4s
+   （`JUP_RATE_LIMIT_WAIT_MAX_MS`）**冇改**，所以最壞情況仍然係「唔等」，唔會食 push reserve。
+
+**驗收**：`push_audit` 嘅 `initial` 卡 `organic.why` 應該見到 `waited:true` 嘅 `ok`（之前 10 張全部都係
+`waited:false`），而 `backoff` 只應該剩返 >4s 嘅窗口；tick 層係
+`summary.organicWaited` 由 0 開始升。若 `backoff` 仍然常見，下一步就係把
+`JUP_RATE_LIMIT_WAIT_MAX_MS` 提到實測窗口（~10s）—— 今次刻意冇做，因為佢會撞正
+render timing，要另外量。
+
+**測試**：`fetchOrganicScore: a 429 pause is waited out only while the CALLER's wall can afford it`
+（同一個 1s pause：room 4s → `waited:true` 並補到讀數；room 1.6s → `waited:false`、`backoff`），
+加 source pin 改為 `tickDeadline`。Mutation：把條件改成 `true`（唔睇 wall）→
+`❌ … a pause the wall cannot afford is not waited out`（另有既有 429 測試一齊紅）；
+把 scanner 參數改回 `chainDeadline` → `❌ half-applied: scanner (the slot rides the batch's dispatch but not its await)`。
