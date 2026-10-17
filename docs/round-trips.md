@@ -4464,3 +4464,22 @@ consumer 死喺 `sendMessage` 前後，claim 同「卡有冇出」嘅判斷就�
 `test-d1-migrate` 嘅 table 清單與 archive fixture 都加入 `tick_legs`（18 passed）。
 部署後驗收：`/debug/tick-legs?hours=1` 嘅 `db` 要有新行、`feed_legs` 有 per-leg 毫秒、
 `at` 每 30s 遞增。
+
+### 五、第一次部署撞到嘅嘢：archive 係凍結嘅（同日修正）
+
+`tick_legs` 上線嘅第一次 deploy（run 39029490919）**migrate 步驟直接失敗**：
+
+```
+[copy] schema from a local init(): 10 tables
+d1-copy failed: SQLITE_UNKNOWN: SQLite error: no such table: tick_legs
+```
+
+原因唔係表名寫錯，而係 copy 嘅**表單嚟自本地 `init()`**（跟 schema 生長），但 archive 係
+**2026-10-15 凍結**嘅 Turso 快照——新表只喺一邊存在。呢個係結構性嘅，唔係一次性：
+之後每次加表都會再撞。
+
+修正（`scripts/d1-copy.js`）：新增 `archiveHasTable()`（一次 `sqlite_master` 查詢，per-run memo），
+`copyTable` / `archiveCounts` / `verify` 三處都當「archive 冇呢張表」＝ **0 行**，並喺 log 寫明
+`absent in the archive (added after the 2026-10-15 snapshot) — nothing to copy`。
+測試：archive 建好之後 `DROP TABLE tick_legs`，複製照跑、`rows 0 / statements 0`、
+`scan_history` 照樣複製 1 行、`verify` 讀到 0。

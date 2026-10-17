@@ -220,6 +220,32 @@ function d1Transport() {
   return { api, transport: createD1Transport(createRestBinding(api, databaseId)) };
 }
 
+/**
+ * Does the ARCHIVE have this table at all?
+ *
+ * THE MIGRATION'S TABLE LIST COMES FROM THE LOCAL SCHEMA (introspect() runs the
+ * current `Db.init()`), but the archive is a FROZEN snapshot — Turso stopped
+ * being written on 2026-10-15. So every table added after that snapshot exists
+ * on one side only, and reading it blindly fails the whole seed with
+ * `SQLITE_UNKNOWN: no such table` (live 2026-10-17, the first deploy after
+ * `tick_legs` was added: the migrate job died before the deploy step could run).
+ * A table the archive predates holds ZERO rows to copy — that is a real reading,
+ * not an error, and the D1 side is created by the same init that listed it.
+ *
+ * One sqlite_master probe per table per run, memoised, because copyAll, the
+ * baseline and the verify pass all ask the same question.
+ */
+async function archiveHasTable(client, name, cache) {
+  if (cache.has(name)) return cache.get(name);
+  const res = await client.execute({
+    sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    args: [name],
+  });
+  const has = res.rows.length > 0;
+  cache.set(name, has);
+  return has;
+}
+
 /** One page of rows, keyset-paginated on rowid (OFFSET would rescan per page). */
 async function readPage(client, table, columns, afterRowid, limit) {
   const list = columns.map((c) => quoteIdent(c.name)).join(", ");
@@ -318,7 +344,32 @@ function portableValue(value, table, column) {
  * largest here is 59k rows) and a failure's progress is real rows, not a
  * half-built array.
  */
-async function copyTable({ client, transport, table, mode, dryRun, pageRows, onProgress }) {
+async function copyTable({ client, transport, table, mode, dryRun, pageRows, onProgress, archiveTables }) {
+  const probe = archiveTables ?? new Map();
+  // A table the frozen archive predates (see archiveHasTable) has nothing to
+  // copy: zero rows read, zero statements written, and the D1 table is left to
+  // init(). Reported rather than silent, so the log says which side is empty
+  // and why.
+  if (!(await archiveHasTable(client, table.name, probe))) {
+    onProgress?.({
+      table: table.name,
+      rows: 0,
+      statements: 0,
+      changes: 0,
+      maxParams: 0,
+      absentInArchive: true,
+    });
+    return {
+      table: table.name,
+      rows: 0,
+      statements: 0,
+      changes: 0,
+      maxParams: 0,
+      rowsPerStatement: 1,
+      requests: 0,
+      absentInArchive: true,
+    };
+  }
   // The chunk size is the SHARED rule (src/d1.ts), not a local guess: one row
   // costs one binding per column, and D1 rejects a statement over 100.
   const argsPerRow = Math.max(1, table.columns.length);
@@ -387,6 +438,9 @@ async function copyTable({ client, transport, table, mode, dryRun, pageRows, onP
 /** Every table, in name order. `only` narrows to a `--tables=` list. */
 async function copyAll({ client, transport, tables, mode, dryRun, pageRows, log }) {
   const out = [];
+  // One probe cache for the whole run: the archive's table set does not change
+  // while the copy reads it (see archiveHasTable).
+  const archiveTables = new Map();
   for (const table of tables) {
     const result = await copyTable({
       client,
@@ -395,7 +449,13 @@ async function copyAll({ client, transport, tables, mode, dryRun, pageRows, log 
       mode,
       dryRun,
       pageRows,
-      onProgress: (p) => log(`${table.name}: ${p.rows} rows read → ${p.statements} statements, ${p.changes} rows written`),
+      archiveTables,
+      onProgress: (p) =>
+        log(
+          p.absentInArchive
+            ? `${table.name}: absent in the archive (added after the 2026-10-15 snapshot) — nothing to copy`
+            : `${table.name}: ${p.rows} rows read → ${p.statements} statements, ${p.changes} rows written`,
+        ),
     });
     log(
       `${table.name}: ${result.rows} rows → ${result.statements} statements ` +
@@ -427,7 +487,14 @@ async function countRows(transport, table) {
  */
 async function archiveCounts(client, tables) {
   const out = new Map();
+  const archiveTables = new Map();
   for (const table of tables) {
+    // A table the archive predates counts as 0 here for the same reason it
+    // copies 0 rows: it is not missing EVIDENCE, it simply did not exist yet.
+    if (!(await archiveHasTable(client, table.name, archiveTables))) {
+      out.set(table.name, 0);
+      continue;
+    }
     const res = await client.execute(`SELECT COUNT(*) AS n FROM ${quoteIdent(table.name)}`);
     out.set(table.name, Number(res.rows[0]?.n ?? 0));
   }
@@ -444,10 +511,15 @@ async function verify({ client, transport, tables, log, mode = "sane", baseline 
   const rows = [];
   let short = 0;
   const empty = [];
+  const archiveTables = new Map();
   for (const table of tables) {
-    const archive = Number(
-      (await client.execute(`SELECT COUNT(*) AS n FROM ${quoteIdent(table.name)}`)).rows[0]?.n ?? 0,
-    );
+    // Absent in the archive = 0 rows there (see archiveHasTable); D1 owning
+    // rows in it is then the expected shape, never a "short" copy.
+    const archive = (await archiveHasTable(client, table.name, archiveTables))
+      ? Number(
+          (await client.execute(`SELECT COUNT(*) AS n FROM ${quoteIdent(table.name)}`)).rows[0]?.n ?? 0,
+        )
+      : 0;
     const read = baseline?.get(table.name) ?? null;
     const d1 = await countRows(transport, table.name);
     // `strict` is held to the baseline (what the copy read); the live archive

@@ -366,6 +366,65 @@ async function main() {
     }
   });
 
+  await test("a table the archive predates copies as zero rows instead of failing the seed", async () => {
+    // THE SHAPE THAT BROKE THE 2026-10-17 DEPLOY. The table list comes from the
+    // LOCAL init() (so it grows with the schema), while the archive is a frozen
+    // 2026-10-15 snapshot. `tick_legs` existed on one side only, and the seed
+    // died with `SQLITE_UNKNOWN: no such table: tick_legs` before the deploy
+    // step could run. A table the archive predates holds zero rows — a reading,
+    // not a failure — and D1's copy of it is created by the same init.
+    const old = tmpDb("archive-pre-tick-legs");
+    try {
+      await initLocal(old.client);
+      await old.client.execute("DROP TABLE tick_legs");
+      await old.client.execute(
+        "INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed) VALUES (1700000000000, 1, 4000, NULL, 12, 30, 5, 1)",
+      );
+      const tables = await introspect();
+      // A dry run plans statements and sends none, so it needs no D1; the
+      // verify half below only counts rows, so a one-row stub answers it.
+      const stub = {
+        batch: async () => [],
+        execute: async () => ({ rows: [{ n: 1 }] }),
+      };
+      const runs = await copyAll({
+        client: old.client,
+        transport: stub,
+        tables,
+        mode: "upsert",
+        dryRun: true,
+        pageRows: 1,
+        log: () => {},
+      });
+      const legs = runs.find((r) => r.table === "tick_legs");
+      assert.ok(legs, "the table list still carries the new table");
+      assert.equal(legs.rows, 0, "nothing to read from an archive that predates it");
+      assert.equal(legs.statements, 0, "and nothing to plan");
+      assert.equal(legs.absentInArchive, true, "and the log says WHY it is empty");
+      assert.equal(
+        runs.find((r) => r.table === "scan_history").rows,
+        1,
+        "the tables the archive does have are still copied",
+      );
+      // Both other readers of the archive side must agree with the copy.
+      const counts = await archiveCounts(old.client, tables);
+      assert.equal(counts.get("tick_legs"), 0);
+      const report = await verify({
+        client: old.client,
+        transport: stub,
+        tables,
+        log: () => {},
+        mode: "sane",
+      });
+      const legRow = (report.rows ?? report).find?.((r) => r.table === "tick_legs");
+      if (legRow) assert.equal(legRow.archive, 0, "verify counts it as 0, not as missing");
+    } finally {
+      // tmpDb only hands back the client + path (the libsql client has no
+      // close()); every other test in this file cleans up the same way.
+      await fs.promises.rm(old.file, { force: true });
+    }
+  });
+
   // ---- the whole copy, against a D1 that enforces D1's rules ---------------
   const api = new FakeD1Api("acct");
   const databaseId = await createDatabase(api, "solana-meme-bot");
