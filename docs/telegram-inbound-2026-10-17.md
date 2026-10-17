@@ -37,9 +37,17 @@ GET /debug/webhook
 **故意唔送 `allowed_updates`**：default 集合包含 `callback_query`；一旦寫死一個子集，
 就會得到「收到訊息、收唔到按鈕」—— 同今次一模一樣嘅症狀，但更難查。
 
-**讀得到**：`/debug/webhook` 除咗 Telegram 原始答案，仲回報 `selfHeal`
-（`at` / `url` / `result`: `ok`|`set`|`skipped`|`failed`|`timeout`），
-所以「heal 有冇跑」唔再只係 isolate 內嘅一行 log。
+**讀得到（第二版，因為第一版答錯咗問題）**：第一版把 `selfHeal` 放在 module
+state，deploy 後量到 **九次 `/debug/webhook` 連續 `{"at":0}`** —— maintenance
+係 relay 到邊個 isolate 就在邊個 isolate 跑，而 `/debug/webhook` 係另一個
+isolate 答的。所以讀數改為 **durable**：寫入 `worker_state` 的
+`telegram_webhook_heal`（只在 `result` **改變**時寫，否則每 5 分鐘一行的
+288 筆/日就唔係讀數）；`/debug/webhook` 讀嗰行，回報
+`selfHeal`（`at` / `url` / `result`: `ok`|`set`|`skipped`|`failed`|`timeout`）。
+
+**即刻確認**：`/debug/webhook?check=1` 會**當下**跑一次 `ensureTelegramWebhook`
+（同一個 function，同一條 `CRON_RELAY_URL`），寫 stamp，再回報 `check`——
+唔需要等下一次 5 分鐘 delivery。deploy 之後的確認就是用它。
 
 ## 3. 驗證（真 update，唔係只看 code）
 

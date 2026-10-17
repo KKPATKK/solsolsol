@@ -764,16 +764,56 @@ export async function ensureTelegramWebhook(
 }
 
 /**
- * The bounded, recorded form of the check the maintenance delivery runs (see
+ * Durable mirror of the last self-heal attempt.
+ *
+ * Module state alone was NOT enough: the maintenance delivery runs in whatever
+ * isolate the relay lands in, so `/debug/webhook` served elsewhere read
+ * `at: 0` forever (measured 2026-10-17 02:09-02:12Z, nine reads in a row right
+ * after the deploy, every one `{at:0}` while the delivery had already run).
+ * The row is written only when the RESULT CHANGES — the check runs every five
+ * minutes and an unconditional row would be 288 writes/day of the same
+ * answer.
+ */
+export const WEBHOOK_HEAL_STATE_KEY = "telegram_webhook_heal";
+
+async function recordWebhookHeal(base: string | undefined, result: string): Promise<void> {
+  webhookHeal.at = Date.now();
+  webhookHeal.url = base ? telegramWebhookUrl(base) : null;
+  webhookHeal.result = result;
+  if (!db || !dbReady) return;
+  try {
+    const prev = await db.getWorkerState(WEBHOOK_HEAL_STATE_KEY);
+    let prevResult: string | null = null;
+    if (prev) {
+      try {
+        prevResult = (JSON.parse(prev) as { result?: string }).result ?? null;
+      } catch {
+        prevResult = null;
+      }
+    }
+    if (prevResult === result) return;
+    await db.setWorkerState(
+      WEBHOOK_HEAL_STATE_KEY,
+      JSON.stringify({ at: webhookHeal.at, url: webhookHeal.url, result }),
+    );
+  } catch (err) {
+    // The heal happened; only its reading failed to persist.
+    console.warn(
+      "[worker] telegram webhook heal stamp not written:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/**
+ * The bounded form of the check the maintenance delivery runs (see
  * runMaintenanceInvocation). Bounded because nothing here may outlive the
- * delivery's budget, and recorded because "the heal ran" has to be readable
- * from outside the isolate — `/debug/webhook` reports it.
+ * delivery's budget.
  */
 async function maybeHealTelegramWebhook(env: Env): Promise<void> {
-  webhookHeal.at = Date.now();
-  webhookHeal.url = env.CRON_RELAY_URL ? telegramWebhookUrl(env.CRON_RELAY_URL) : null;
+  let result = "failed";
   try {
-    webhookHeal.result = await Promise.race([
+    result = await Promise.race([
       ensureTelegramWebhook(fetch, env.CRON_RELAY_URL, env.TELEGRAM_BOT_TOKEN),
       new Promise<string>((resolve) =>
         setTimeout(() => resolve("timeout"), WEBHOOK_HEAL_BOUND_MS),
@@ -782,12 +822,12 @@ async function maybeHealTelegramWebhook(env: Env): Promise<void> {
   } catch (err) {
     // ensureTelegramWebhook does not throw; this is the belt-and-braces arm
     // for anything the race itself could reject with.
-    webhookHeal.result = "failed";
     console.warn(
       "[worker] telegram webhook self-heal failed:",
       err instanceof Error ? err.message : err,
     );
   }
+  await recordWebhookHeal(env.CRON_RELAY_URL, result);
 }
 
 // Diagnostics surfaced via /health so the state of the serverless runtime can
@@ -9353,14 +9393,37 @@ const worker = {
           const j: unknown = await r.json();
           return Response.json({ ok: true, action: "set", url: whUrl, telegram: j });
         }
+        // `?check=1` runs the self-heal NOW, from this isolate, and records
+        // it: the confirmation an operator (or a deploy) needs, without
+        // waiting for the next five-minute delivery.
+        let check: { result: string; url: string | null } | null = null;
+        if (url.searchParams.get("check") === "1") {
+          const result = await ensureTelegramWebhook(
+            fetch,
+            env.CRON_RELAY_URL,
+            token,
+          );
+          await recordWebhookHeal(env.CRON_RELAY_URL, result);
+          check = { result, url: webhookHeal.url };
+        }
         const r = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`);
         const j: unknown = await r.json();
-        // `selfHeal` is the maintenance delivery's last attempt (see
-        // ensureTelegramWebhook): an empty `telegram.result.url` together with
-        // `selfHeal.result` says whether the Worker has noticed and re-pointed
-        // it, which is the difference between "nobody has run the check yet"
-        // and "Telegram refuses the registration".
-        return Response.json({ ok: true, selfHeal: webhookHeal, telegram: j });
+        // `selfHeal` is DURABLE (see WEBHOOK_HEAL_STATE_KEY): the maintenance
+        // delivery runs in whatever isolate the relay lands in, so module
+        // state answered `at: 0` on every other isolate. An empty
+        // `telegram.result.url` beside a `selfHeal.result` says whether the
+        // Worker has noticed and re-pointed the registration, which is the
+        // difference between "nothing has checked yet" and "Telegram refuses".
+        let selfHeal: unknown = { at: 0, url: null, result: null };
+        if (db && dbReady) {
+          try {
+            const raw = await db.getWorkerState(WEBHOOK_HEAL_STATE_KEY);
+            if (raw) selfHeal = JSON.parse(raw);
+          } catch {
+            // Degrade to "no attempt recorded" rather than failing the read.
+          }
+        }
+        return Response.json({ ok: true, selfHeal, check, telegram: j });
       } catch (err) {
         return Response.json({
           ok: false,

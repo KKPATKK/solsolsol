@@ -24949,10 +24949,54 @@ async function main() {
       "one call site, on the delivery whose result nobody waits on",
     );
     // And the reading is reachable from outside the isolate, or "the heal ran"
-    // is only a log line in an isolate nobody can inspect.
+    // is only a log line in an isolate nobody can inspect. The DURABLE form is
+    // the one asserted by the test below this one; here it is the response
+    // shape that matters.
     assert.ok(
-      src.includes("selfHeal: webhookHeal"),
+      src.includes("return Response.json({ ok: true, selfHeal, check, telegram: j });"),
       "/debug/webhook must report the last attempt",
+    );
+  });
+
+  await test("telegram inbound: the heal's reading is durable, and ?check=1 runs it now", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "src", "worker.ts"),
+      "utf8",
+    );
+    assert.ok(
+      src.includes('export const WEBHOOK_HEAL_STATE_KEY = "telegram_webhook_heal"'),
+      "the reading needs a durable key",
+    );
+    // MEASURED, not assumed: right after the first deploy of this check,
+    // /debug/webhook answered `{"at":0}` on nine reads in a row because the
+    // delivery runs in another isolate. A per-isolate reading answers the
+    // wrong question.
+    assert.ok(
+      src.includes("db.getWorkerState(WEBHOOK_HEAL_STATE_KEY)"),
+      "/debug/webhook must read the durable row, not module state",
+    );
+    // Written only on a CHANGE: the delivery runs every five minutes and 288
+    // identical rows a day is not a reading.
+    assert.ok(
+      src.includes("if (prevResult === result) return;"),
+      "a repeated result must not write",
+    );
+    assert.ok(
+      src.includes("await recordWebhookHeal(env.CRON_RELAY_URL, result);"),
+      "the delivery records through the one recorder",
+    );
+    // And the on-demand arm: a deploy (or an operator) can confirm without
+    // waiting for the next five-minute delivery.
+    assert.ok(
+      src.includes('if (url.searchParams.get("check") === "1")'),
+      "/debug/webhook?check=1 must run the check",
+    );
+    const checkAt = src.indexOf('url.searchParams.get("check") === "1"');
+    const runAt = src.indexOf("await ensureTelegramWebhook(", checkAt);
+    assert.ok(runAt > checkAt, "the check must actually run");
+    assert.ok(
+      src.indexOf("await recordWebhookHeal(", runAt) > runAt,
+      "and be recorded, so the next read sees it",
     );
   });
 
