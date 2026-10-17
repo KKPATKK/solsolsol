@@ -10,7 +10,84 @@ const BASE_URL = "https://lite-api.jup.ag/tokens/v2";
  * re-hit it every tick. One skipped feed round costs nothing — the
  * re-eval pool keeps coverage.
  */
-const JUP_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+/**
+ * CAP on a 429 pause (and the fallback when the answer advertises nothing).
+ * Kept at the old fixed value on purpose: whatever a header says, a broken or
+ * hostile stamp can never hold the client down longer than this. See
+ * rateLimitPauseMs for the measured window this replaced a flat five minutes
+ * with, and why the difference matters to a card.
+ */
+export const JUP_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+/**
+ * The shortest pause a 429 may set. A `Retry-After`/reset stamp already in the
+ * past (or a clock skew) must not turn into "retry immediately" — the pause
+ * exists to keep us off a provider that just refused us.
+ */
+export const JUP_RATE_LIMIT_MIN_PAUSE_MS = 250;
+/**
+ * The longest pause the CARD's read will wait out for a second attempt. A
+ * card's wall is the chain (tick start + 6.5s) and the slot opens ~2s in, so a
+ * few seconds is affordable; a multi-minute pause is not, and waiting one would
+ * eat the push reserve.
+ */
+export const JUP_RATE_LIMIT_WAIT_MAX_MS = 4_000;
+/**
+ * Headroom added to a waited-out pause before retrying: the round trip plus
+ * scheduling, so the retry cannot land 10ms before the window opens and get
+ * refused again.
+ */
+const JUP_RATE_LIMIT_WAIT_MARGIN_MS = 750;
+
+/**
+ * How long a 429 should pause this client — a PURE rule, exported because the
+ * number decides whether a card keeps its line and the three Jupiter gates.
+ *
+ * WHY IT IS NOT A FIXED FIVE MINUTES (measured 2026-10-17 from this repo's own
+ * sandbox egress, 22 spaced requests): lite-api allows **5 requests per
+ * ~10-second window**, and its 429 answers with
+ *
+ *   `x-ratelimit-current: 5`, `x-ratelimit-remaining: 0`,
+ *   `x-ratelimit-reset: <epoch seconds>`  (and NO `Retry-After`)
+ *
+ * i.e. the refusal lasts seconds — 1-10s in the measurement. Against that, a
+ * blanket 5-minute pause was 30-300x too long, and because ONE 429 silences
+ * every call, the tick that exhausted the window also blanked the CARD's read
+ * and the gates for five minutes (≈10 ticks) — exactly the shape the operator
+ * reported as "many first-push cards have no 有機度".
+ *
+ * So: honour what the provider advertises (`Retry-After` in seconds or as an
+ * HTTP date, else Jupiter's own `x-ratelimit-reset`), CLAMPED to
+ * [JUP_RATE_LIMIT_MIN_PAUSE_MS, JUP_RATE_LIMIT_BACKOFF_MS] — a hostile or
+ * broken header can neither disable the pause nor hold the client down for
+ * longer than the old fixed window. No stamp at all keeps the old floor of five
+ * minutes, which is the documented worst case, not the common one.
+ */
+export function rateLimitPauseMs(
+  headers: { get(name: string): string | null },
+  nowMs: number,
+): number {
+  const clamp = (ms: number): number =>
+    Math.min(
+      JUP_RATE_LIMIT_BACKOFF_MS,
+      Math.max(JUP_RATE_LIMIT_MIN_PAUSE_MS, ms),
+    );
+  // 1) Retry-After: delta-seconds, or an HTTP date (both legal shapes).
+  const retryAfter = (headers.get("retry-after") ?? "").trim();
+  if (retryAfter) {
+    const secs = Number(retryAfter);
+    if (Number.isFinite(secs)) return clamp(secs * 1000);
+    const at = Date.parse(retryAfter);
+    if (Number.isFinite(at)) return clamp(at - nowMs);
+  }
+  // 2) Jupiter's own window stamp, in epoch SECONDS.
+  const rawReset = headers.get("x-ratelimit-reset");
+  if (rawReset !== null) {
+    const secs = Number(rawReset);
+    if (Number.isFinite(secs) && secs > 0) return clamp(secs * 1000 - nowMs);
+  }
+  // 3) Nothing advertised: the documented worst case.
+  return JUP_RATE_LIMIT_BACKOFF_MS;
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -461,6 +538,14 @@ export interface JupCardReadNote {
   status: number;
   /** Whether a second attempt was spent on a reading-less first one. */
   retried: boolean;
+  /**
+   * Whether that second attempt first WAITED OUT a 429 window (see
+   * fetchOrganicScore). Separate from `retried` because the two say different
+   * things: a retry after a 5xx is a blip, a retry after a wait is "the tick
+   * itself exhausted the provider's 6/10s window" — the reading the operator
+   * needs to know whether the pair fallback is crowding the card's read.
+   */
+  waited: boolean;
   /** Whether a reading came back (i.e. the card has its line). */
   landed: boolean;
 }
@@ -510,11 +595,21 @@ export class JupTokensClient {
 
   /**
    * Whether a 429 has this client paused right now — the reading that turns
-   * "the feed was empty" into "the provider refused us" (a whole
-   * JUP_RATE_LIMIT_BACKOFF_MS window of missing card lines is the same event).
+   * "the feed was empty" into "the provider refused us" (a pause of missing
+   * card lines is the same event).
    */
   isRateLimited(): boolean {
     return this.rateLimited();
+  }
+
+  /**
+   * How much of the 429 pause is left, in ms (0 = not paused). The card read
+   * compares this with its own wall to decide whether waiting the window out is
+   * affordable (see fetchOrganicScore), and `cardReadNote()` records what
+   * happened.
+   */
+  rateLimitedForMs(): number {
+    return Math.max(0, this.rateLimitedUntil - Date.now());
   }
 
   /**
@@ -538,13 +633,20 @@ export class JupTokensClient {
    *
    * `priority` rides straight into the lane (see Throttle.run) and is set only
    * by the card read.
+   *
+   * `allowPaused` is the CARD READ's one call (2026-10-17): it may try even
+   * while a 429 has the client paused, because the provider's window is seconds
+   * long and by the time a card slot opens it has usually reopened — while the
+   * card's line and its three gates are the only calls that cannot be redone
+   * next tick. Bulk lanes keep the pause.
    */
   private async get(
     path: string,
     signal?: AbortSignal,
     priority = false,
+    allowPaused = false,
   ): Promise<unknown> {
-    if (this.rateLimited()) return null;
+    if (this.rateLimited() && !allowPaused) return null;
     this.lastStatus = 0;
     try {
       const doFetch =
@@ -568,10 +670,20 @@ export class JupTokensClient {
       // can name what happened (see lastStatus / JupCardReadNote).
       this.lastStatus = res.status;
       if (res.status === 429) {
-        this.rateLimitedUntil = Date.now() + JUP_RATE_LIMIT_BACKOFF_MS;
+        const now = Date.now();
+        // What the provider advertises, clamped — see rateLimitPauseMs for the
+        // measured 5-requests-per-10s window this replaced a fixed 5min with.
+        this.rateLimitedUntil = now + rateLimitPauseMs(res.headers, now);
         return null;
       }
       if (!res.ok) return null;
+      // An answer to the PROBE proves the provider is serving us again AFTER
+      // the refusal, so end the pause early instead of sitting out the rest of
+      // it (the feeds benefit on the next tick). A concurrent BULK answer is
+      // NOT that proof — its request predates the 429 — and letting it clear
+      // the pause would resurrect the burst the refusal just stopped (see the
+      // one-shared-gate rule in fetchTokenDataBatch).
+      if (allowPaused) this.rateLimitedUntil = 0;
       return await res.json();
     } catch {
       return null;
@@ -639,13 +751,48 @@ export class JupTokensClient {
      * note is not the one this card's line is about.
      */
     onNote?: (note: JupCardReadNote) => void,
+    /**
+     * The caller's WALL for this read (epoch ms) — the scanner hands it
+     * `chainDeadline`. Only one decision uses it: whether a 429 pause is short
+     * enough to wait out before the second attempt (see below). Optional, so
+     * every existing caller keeps its exact shape (no deadline = never wait).
+     */
+    deadlineMs?: number,
   ): Promise<JupOrganicReading | null> {
     const startedAt = Date.now();
-    let attempt = await this.readOrganicOnce(mint);
+    // 1) ONE attempt ALWAYS — even while a 429 has the client paused. The
+    // provider's window is seconds long (measured: 5 requests / ~10s, see
+    // rateLimitPauseMs), and a card slot opens ~2s into the tick, i.e. after
+    // the bulk lanes that earned the 429 have themselves stopped: the window is
+    // usually open again by now. This is the one call that cannot be redone
+    // next tick, and it is also what the three Jupiter gates read.
+    let attempt = await this.readOrganicOnce(mint, true);
     let retried = false;
-    if (attempt.reading === null && attempt.why !== "backoff") {
-      retried = true;
-      attempt = await this.readOrganicOnce(mint);
+    let waited = false;
+    if (attempt.reading === null) {
+      if (attempt.why === "backoff") {
+        // The provider refused THIS attempt too. If what it advertised is a
+        // few seconds and the card's wall can afford it, wait the window out
+        // and take the second attempt — otherwise the card loses its line to a
+        // window that a tick's own bulk load closed.
+        const pauseMs = this.rateLimitedForMs();
+        const room = deadlineMs === undefined ? 0 : deadlineMs - Date.now();
+        if (
+          pauseMs > 0 &&
+          pauseMs <= JUP_RATE_LIMIT_WAIT_MAX_MS &&
+          room > pauseMs + JUP_RATE_LIMIT_WAIT_MARGIN_MS
+        ) {
+          retried = true;
+          waited = true;
+          await sleep(pauseMs + 50);
+          attempt = await this.readOrganicOnce(mint, true);
+        }
+      } else if (!this.rateLimited()) {
+        // 2) A reading-less first attempt that was NOT a 429 is retried once
+        // (transient 5xx / broken body / index lag on a fresh launch).
+        retried = true;
+        attempt = await this.readOrganicOnce(mint, false);
+      }
     }
     const note: JupCardReadNote = {
       at: startedAt,
@@ -653,6 +800,7 @@ export class JupTokensClient {
       why: attempt.reading !== null ? "ok" : attempt.why,
       status: attempt.status,
       retried,
+      waited,
       landed: attempt.reading !== null,
     };
     this.lastCardRead = note;
@@ -667,16 +815,23 @@ export class JupTokensClient {
    * and pushes anyway" — the reason only has to survive to the tick summary.
    *
    * The single-mint read here is the ONE caller that takes the priority slot
-   * (see Throttle.run and fetchOrganicScore).
+   * (see Throttle.run and fetchOrganicScore) AND the one caller allowed to try
+   * while a 429 pause is active (`allowPaused`).
    */
-  private async readOrganicOnce(mint: string): Promise<{
+  private async readOrganicOnce(
+    mint: string,
+    /** May this attempt go out while a 429 has the client paused? */
+    allowPaused: boolean,
+  ): Promise<{
     reading: JupOrganicReading | null;
     why: JupCardReadWhy;
     /** The attempt's HTTP status (0 = nothing reached the wire). */
     status: number;
   }> {
-    if (this.rateLimited()) return { reading: null, why: "backoff", status: 0 };
-    const data = await this.get(`/search?query=${mint}`, undefined, true);
+    if (this.rateLimited() && !allowPaused) {
+      return { reading: null, why: "backoff", status: 0 };
+    }
+    const data = await this.get(`/search?query=${mint}`, undefined, true, allowPaused);
     const status = this.lastStatus;
     if (data === null) {
       // A 429 raised by THIS call (get sets the pause) is named as such; any

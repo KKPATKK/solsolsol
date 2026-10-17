@@ -19,7 +19,7 @@ const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dis
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseRaydiumLaunches, RaydiumLaunchClient, RAYDIUM_LAUNCH_BASE_URL, RAYDIUM_LAUNCH_MAX_LIMIT, RAYDIUM_LAUNCH_BACKOFF_MS } = require("../dist/raydiumlaunch.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
-const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS, JUP_PRIORITY_GAP_MS } = require("../dist/jupfeeds.js");
+const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS, JUP_PRIORITY_GAP_MS, rateLimitPauseMs, JUP_RATE_LIMIT_MIN_PAUSE_MS, JUP_RATE_LIMIT_WAIT_MAX_MS, JUP_RATE_LIMIT_BACKOFF_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS, BOOSTS_429_BACKOFF_MS, BOOSTS_BACKOFF_MAX_MS, boostsBackoffMs } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, TRACKER_PAIRS_HARD_CAP_MS, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse, trackerLaneStatus, TRACKER_LANE_STALE_MS, runningPassStamp } = require("../dist/pushwatch.js");
 const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
@@ -11727,12 +11727,14 @@ async function main() {
       "organicCards: number;",
       "organicNoLine: number;",
       "organicRetried: number;",
+      "organicWaited: number;",
       "organicWhy?: JupCardReadWhy | null;",
       "organicMs?: number | null;",
       "organicStatus?: number | null;",
       "organicCards: 0,",
       "organicNoLine: 0,",
       "organicRetried: 0,",
+      "organicWaited: 0,",
       "organicWhy: null,",
       "organicMs: null,",
       "organicStatus: null,",
@@ -11754,7 +11756,11 @@ async function main() {
       "diag.organicMs = note.ms;",
       "diag.organicStatus = note.status;",
       "if (note.retried) diag.organicRetried += 1;",
+      "if (note.waited) diag.organicWaited += 1;",
       "if (!note.landed) diag.organicNoLine += 1;",
+      // The read's wall rides along, so a 429 window can only be waited out
+      // while the chain can still afford it.
+      "chainDeadline,",
     ]) {
       assert.ok(body.includes(needle), `the card slot must publish ${needle}`);
     }
@@ -11766,6 +11772,135 @@ async function main() {
       box.slice(0, box.indexOf("// Bundler")).includes("if (v) diag.organic++;"),
       "the landed count stays the card's own box",
     );
+  });
+
+  await test("429: the pause follows the provider's window, not the fixed five minutes", async () => {
+    // Measured 2026-10-17 from this repo's own egress (22 spaced requests):
+    // lite-api allows **5 requests per ~10s**, and its 429 answers with
+    // `x-ratelimit-current: 5`, `x-ratelimit-remaining: 0`,
+    // `x-ratelimit-reset: <epoch seconds>` — and NO Retry-After. So the fixed
+    // 5-minute pause was 30–300x too long, and since ONE 429 silences every
+    // call it also blanked the card's line AND the three Jupiter gates for
+    // ~10 ticks. (Same tick, 5 calls: the tick already spends its whole window
+    // on 2 feeds + the pair fallback's chunks.)
+    const now = 1_792_200_000_000; // fixed instant: this rule is pure
+    const h = (o) => ({ get: (k) => (k in o ? o[k] : null) });
+    // 1) Retry-After, delta-seconds (what most providers send).
+    assert.equal(rateLimitPauseMs(h({ "retry-after": "2" }), now), 2_000);
+    assert.equal(rateLimitPauseMs(h({ "retry-after": "30" }), now), 30_000);
+    // 2) Retry-After as an HTTP date (the other legal shape).
+    const date = new Date(now + 4_000).toUTCString();
+    assert.ok(Math.abs(rateLimitPauseMs(h({ "retry-after": date }), now) - 4_000) <= 1_000);
+    // 3) Jupiter's own stamp, in epoch SECONDS — the header it actually sends.
+    const reset = Math.floor(now / 1000) + 7;
+    assert.ok(
+      Math.abs(rateLimitPauseMs(h({ "x-ratelimit-reset": String(reset) }), now) - 7_000) <= 1_000,
+    );
+    // The CLAMP: never shorter than the floor (a past stamp is clock skew, not
+    // permission to hammer) and never longer than the old fixed window.
+    assert.equal(
+      rateLimitPauseMs(h({ "x-ratelimit-reset": String(reset - 100) }), now),
+      JUP_RATE_LIMIT_MIN_PAUSE_MS,
+    );
+    assert.equal(rateLimitPauseMs(h({ "retry-after": "0" }), now), JUP_RATE_LIMIT_MIN_PAUSE_MS);
+    assert.equal(rateLimitPauseMs(h({ "retry-after": "99999" }), now), JUP_RATE_LIMIT_BACKOFF_MS);
+    // Anything unusable keeps the documented worst case, never "no pause".
+    assert.equal(rateLimitPauseMs(h({}), now), JUP_RATE_LIMIT_BACKOFF_MS);
+    assert.equal(rateLimitPauseMs(h({ "retry-after": "soon" }), now), JUP_RATE_LIMIT_BACKOFF_MS);
+    assert.equal(rateLimitPauseMs(h({ "x-ratelimit-reset": "abc" }), now), JUP_RATE_LIMIT_BACKOFF_MS);
+    assert.ok(JUP_RATE_LIMIT_WAIT_MAX_MS > 0 && JUP_RATE_LIMIT_WAIT_MAX_MS < JUP_RATE_LIMIT_BACKOFF_MS);
+
+    // Integration: the client's own pause comes from the 429's headers.
+    const client = new JupTokensClient(
+      { jupiterRequestIntervalMs: 0 },
+      async () =>
+        new Response("slow down", {
+          status: 429,
+          headers: { "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 2) },
+        }),
+    );
+    assert.deepEqual(await client.fetchRecentTokens(3), [], "a 429 answers no rows");
+    const pause = client.rateLimitedForMs();
+    assert.ok(pause > 900 && pause <= 2_100, `a two-second window must pause ~2s, not 5min (${pause}ms)`);
+  });
+
+  await test("429: the card read still gets ONE attempt while the client is paused, and a success ends the pause", async () => {
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const good = JSON.stringify([{ id: mint, organicScore: 61, stats1h: { numTraders: 7 } }]);
+    const calls = [];
+    let status = 429;
+    const client = new JupTokensClient({ jupiterRequestIntervalMs: 0 }, async (url) => {
+      calls.push(String(url));
+      return new Response(status === 429 ? "slow down" : good, { status });
+    });
+    // (1) The first read earns the pause (no advertised stamp → worst case).
+    const first = [];
+    assert.equal(await client.fetchOrganicScore(mint, (n) => first.push(n)), null);
+    assert.equal(client.isRateLimited(), true);
+    assert.equal(first[0].why, "backoff");
+    assert.equal(calls.length, 1);
+    // (2) A BULK call during the pause still never leaves the client — the
+    // probe is the card read's privilege, not a general bypass.
+    assert.deepEqual(await client.fetchRecentTokens(3), []);
+    assert.equal(calls.length, 1, "bulk lanes keep the pause");
+    // (3) The CARD's read takes its one attempt anyway: by the time a card slot
+    // opens (~2s in) the provider's window has usually reopened, so it lands.
+    status = 200;
+    const second = [];
+    const reading = await client.fetchOrganicScore(mint, (n) => second.push(n));
+    assert.equal(reading.score, 61);
+    assert.equal(calls.length, 2, "exactly one attempt while paused");
+    assert.deepEqual(
+      { why: second[0].why, retried: second[0].retried, waited: second[0].waited, landed: second[0].landed },
+      { why: "ok", retried: false, waited: false, landed: true },
+    );
+    // A success ends the pause, so the FEEDS resume on the next tick instead of
+    // sitting out the rest of a five-minute window.
+    assert.equal(client.isRateLimited(), false);
+    assert.equal(client.rateLimitedForMs(), 0);
+    assert.equal((await client.fetchRecentTokens(3)).length, 1);
+    assert.equal(calls.length, 3, "the lane is live again");
+  });
+
+  await test("429: while paused, the card read waits a SHORT window out — and never past its own wall", async () => {
+    const mint = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const good = JSON.stringify([{ id: mint, organicScore: 64.6, stats1h: { numTraders: 141 } }]);
+    const run = async (deadlineInMs) => {
+      let n = 0;
+      const client = new JupTokensClient({ jupiterRequestIntervalMs: 0 }, async () => {
+        n += 1;
+        if (n === 1) {
+          // A window that ends 1-2s from now (the reset is a whole SECOND, so
+          // the wait it implies depends on where we are in the current one).
+          return new Response("slow down", {
+            status: 429,
+            headers: { "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 2) },
+          });
+        }
+        return new Response(good, { status: 200 });
+      });
+      const notes = [];
+      const started = Date.now();
+      const reading = await client.fetchOrganicScore(mint, (x) => notes.push(x), Date.now() + deadlineInMs);
+      return { reading, note: notes[0], calls: n, elapsed: Date.now() - started };
+    };
+    // Room for the window (1-2s) plus the margin: one wait, then it lands — the
+    // card keeps its line even on the tick that exhausted the window.
+    const roomy = await run(6_000);
+    assert.equal(roomy.reading.score.toFixed(1), "64.6");
+    assert.equal(roomy.calls, 2);
+    assert.equal(roomy.note.why, "ok");
+    assert.equal(roomy.note.waited, true, "the note says it waited a window out");
+    assert.equal(roomy.note.retried, true);
+    assert.ok(roomy.elapsed >= 900, `it waited for the window (${roomy.elapsed}ms)`);
+    assert.ok(roomy.elapsed <= 2_200 + 900, `...and only for the window (${roomy.elapsed}ms)`);
+    // No room: it does NOT wait and says backoff — the card pushes without the
+    // line rather than the chain blowing the wall it exists to protect.
+    const tight = await run(700);
+    assert.equal(tight.reading, null);
+    assert.equal(tight.calls, 1);
+    assert.equal(tight.note.waited, false);
+    assert.equal(tight.note.why, "backoff");
   });
 
   await test("jupSusBlockReason: only a Jupiter flag blocks, and the flag alone is enough", () => {
@@ -21570,7 +21705,7 @@ async function main() {
         scannerSrc.includes(
           "?()=>jupiterOrganic.fetchOrganicScore(coin.stats.token,(note)=>{",
         ) &&
-        scannerSrc.includes("},):null,tickDeadline,null,);") &&
+        scannerSrc.includes("},chainDeadline,):null,tickDeadline,null,);") &&
         scannerSrc.includes(
           "voidorganicSlot.then((v)=>{organicBox.value=v;if(v)diag.organic++;});",
         ),

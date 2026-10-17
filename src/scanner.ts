@@ -2213,6 +2213,14 @@ export interface ScanSummary {
   /** How many of this scan's card reads spent a SECOND attempt. */
   organicRetried: number;
   /**
+   * How many of them had to WAIT OUT a 429 window first (see
+   * JupCardReadNote.waited). This is the reading that says the tick's own bulk
+   * lanes closed the provider's window on the card's read — measured
+   * 2026-10-17: lite-api allows 5 requests / ~10s, and a tick with DexScreener's
+   * pair lane refused spends five calls on feeds + fallback chunks.
+   */
+  organicWaited: number;
+  /**
    * The last card read's reason (see JupCardReadNote): `ok` | `backoff` (a 429
    * has the client paused — the whole JUP_RATE_LIMIT_BACKOFF_MS window loses
    * every card line, and the Jupiter gates fail open inside it) | `http` (see
@@ -5082,6 +5090,7 @@ export class Scanner {
       organicCards: 0,
       organicNoLine: 0,
       organicRetried: 0,
+      organicWaited: 0,
       organicWhy: null,
       organicMs: null,
       organicStatus: null,
@@ -6965,8 +6974,12 @@ export class Scanner {
                     diag.organicMs = note.ms;
                     diag.organicStatus = note.status;
                     if (note.retried) diag.organicRetried += 1;
+                    if (note.waited) diag.organicWaited += 1;
                     if (!note.landed) diag.organicNoLine += 1;
                   },
+                  // The read's wall: a 429 pause is only waited out while the
+                  // chain (tick start + 6.5s) can still afford it.
+                  chainDeadline,
                 )
             : null,
           tickDeadline,

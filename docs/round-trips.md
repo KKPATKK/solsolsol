@@ -4242,3 +4242,38 @@ curl -s .../debug/tick | jq '.summary | {candidates, pushed, organic, organicCar
 - 呢個改動係**攞返口窗**，唔係改讀數：有機度數值、閘門檻（55 / 1400）同 fail-open 全部不變。
 - retry 令失敗個案最多多一次請求（每張卡、每 tick），成功個案一個都唔多。
 - 無讀數時卡片照推（fail-open 契約不變）；新欄位只係令「為咩冇線」有得讀。
+
+---
+
+### 4.63.1 實測咗個 429：係 **5 request / ~10 秒**，唔係五分鐘（2026-10-17 晚）
+
+上一節留低嘅洞係「一次 429 = 五分鐘全黑」。量咗 lite-api 真正嘅窗口（同一 egress 連打 22 槍）：
+
+```
+#1 200 current=1 remaining=4 reset=+10s      #6 429 current=5 remaining=0 reset=+4s
+#2 200 current=2 remaining=3                #10 200 （窗口一過即刻返）
+#3 200 current=3 remaining=2                429 header: x-ratelimit-current / -remaining / -reset
+#4 200 current=4 remaining=1                   （**冇 Retry-After**）
+#5 200 current=5 remaining=0
+```
+
+即係：**5 request / 約 10 秒**，拒一次只係幾秒。而一個 tick 本身就係 5 槍（live `subreqs.hosts`：`lite-api.jup.ag 5`——2 feeds ＋ pair fallback 2-3 個 chunk），
+**卡片嘅讀數正好係第 6 槍** → 429 → 舊 code 停足五分鐘 → 嗰 5 分鐘內所有卡冇線，兼且三個 Jupiter 閘 fail open。
+呢個就係「好多首次推送卡冇咗有機度」最貼合嘅機制（DexScreener pair lane 被拒之後，tick 先開始每 tick 用盡個窗口）。
+
+**改咗四樣**（`src/jupfeeds.ts`）：
+
+1. **暫停跟 provider 講嘅窗口**：`rateLimitPauseMs()` 讀 `Retry-After`（秒數或 HTTP date）→ 再讀 Jupiter 自己嘅 `x-ratelimit-reset`（epoch 秒），
+   clamp 到 **[250ms, 5min]** —— header 壞／離譜都唔會令暫停消失，亦唔會長過舊嗰個五分鐘。冇 header 才用返五分鐘（最壞情況）。
+2. **卡片讀數喺暫停期間照出一次**（`allowPaused`）：slot 開喺 tick +2s 左右，而賺到 429 嘅 bulk lane 已經停手，窗口通常已經返。
+   呢一槍就係三個閘唯一嘅讀數來源；bulk lane 照樣唔准出（`fetchTokenDataBatch` 嘅「one shared gate」測試照綠）。
+3. **短窗口等得就等**：暫停 ≤ `JUP_RATE_LIMIT_WAIT_MAX_MS`（4s）而且 caller 嘅 wall（scanner 传 `chainDeadline`）買得起，就等窗口過去再試一次。
+   等唔到（例如 reset 仲有 8.4s，實測）就照舊 fail-open，唔會拖爆 push reserve。
+4. **只有 probe 嘅成功才解暫停**：bulk 嘅 200 唔算數（佢嘅 request 早過個 429），否則會復活啱啱被拒嗰陣 burst。
+
+新讀數：note 加 `waited`，tick summary 加 **`organicWaited`**（有幾多張卡係「等完窗口才拿到讀數」）。
+
+**驗收**：main suite **558 → 561 passed, 0 failed**；mutation（`rateLimitPauseMs` 恆回 5min、probe 唔准出、清暫停拎走、等窗口停用）
+三個新測試各自變紅（558 pass / 3 fail）。真 HTTP 重播：bulk 打爆窗口 → `pause = 8.4s`（舊值會係 300s），卡片讀數**照出**（`status 429`）
+但 8.4s > 4s 等唔到 → `waited:false`、fail-open；**未解決嘅殘餘就係嗰度**：真要「幾乎每次」，要喺 5 槍窗口裡留一槍畀卡片讀數
+（即係某個 bulk call 要 stand down 一格——揀邊個係產品決定：trending feed 只 yield 8 隻，pair fallback 每槍 yield ~100 個地址）。
