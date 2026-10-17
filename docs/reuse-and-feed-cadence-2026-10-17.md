@@ -135,6 +135,135 @@ Mutation 實測（唔係自我安慰）：
 | pair cache 完全冇 TTL（prune no-op ＋ `if (hit)`） | `❌ … an expired reading must be asked again` → 568 passed, 1 failed |
 | cadence gate 關掉（`false &&`） | `❌ … a list younger than the cadence is REUSED, not re-asked`（2 !== 1） |
 
-## 4. After
+## 4. After（deploy `a91f343` 04:52Z；加讀數嗰個 `5c10b07` 05:12Z）
 
-deploy 之後用同一把尺再量，數字同對照見 §5（append）。
+### 4.1 live sample（52 ticks，27 分鐘，05:14:09–05:41:01Z）
+
+同 §1.2 同一支探針、同一個 interval。
+
+| reading | before | after |
+|---|---|---|
+| scan ms p50 / p90 / max | 1,844 / 2,480 / 4,263 | **1,227 / 1,864 / 2,247** |
+| **feedsMs p50 / p90 / max** | 675 / 843 / 1,162 | **362 / 607 / 1,039** |
+| feedJoinMs p50 | 670 | **362** |
+| feedLeg jupTrend | 661 / 709 | —（腿已關） |
+| feedLeg jup | 112 / 235 | 166 / 209 |
+| feedLeg pump | 70 / 118 | 70 / 153 |
+| feedLeg raydium | 364 / 590 | 352 / 454 |
+| feedLeg meteora | 277 / 439 | 286 / 509 |
+| feedLeg profiles | 13 / 45 | **8 / 19** |
+| pairs p50 | 200 | 202 |
+| pairsJup p50 | 200 | 201 |
+| **pairsMissing p50 / p90 / max** | 0 / 95 / 95 | **0 / 0 / 0** |
+| **pairsMissing share** | 6.2% | **0.0%** |
+| organicNoLine / organicWaited / organicRetried | 1 / 6 / 6 | **0 / 0 / 0** |
+| **jupReserved** total / ticks>0 | 36 / 35 of 67 | **0 / 0 of 52** |
+| profiles p50 / min / max | 27 / 0 / 28 | 25 / 0 / 25 |
+| candidates total | 68 | 21 |
+
+逐項閱讀：
+
+- **feedsMs 675 → 362ms**：關掉 jupTrend（661ms 嘅腿）＋ boosts（每 tick 一個 request），
+  feed join 嘅上界即刻由 jupTrend 交返畀 pump/jup/raydium。呢個係 2A 嘅直接效果，唔係推算。
+- **pairsMissing 6.2% → 0%**：呢個唔係 1A 嘅功勞（下面講），係 **3A** 嘅副作用 —— profiles list 由
+  5 分鐘內重用，令同一個 list 嘅幣喺多個 tick 之間被反覆評估，第一次因為 chunk 用盡而未拿到 pair 嘅幣，
+  下一個 tick 仲有機會補上（`pairs 202 / pairsJup 201`，即係幾乎全部都有讀數）。
+- **jupReserved 36 → 0**：trending 腿關掉之後，bulk lane 冇再撞到 provider 嘅 5-call 窗口，所以冇一個 tick
+  需要為卡片嘅 有機度 讀數讓路（`organicWaited` 6 → 0 係同一件事嘅另一端）。
+- **profiles p50 27 → 25**：頁面本身嘅大小（重用嗰個 list 冇改變評估對象，只係唔再問）。
+
+### 4.2 1A 嘅實測：reuse 只有 2.5%，唔係一半
+
+新讀數 `summary.jupPairCache`（per-tick delta）：
+
+| reading | 52 ticks |
+|---|---|
+| hits / fetched（sum） | **149 / 5,850** |
+| reuse share | **2.5%** |
+| ttlMs / size p50 | 90,000 / 202 |
+
+原因睇得見：tick 由 `/internal/cron-relay` 嘅 self-fetch 執行，**每次可能落在唔同 isolate**，而 cache
+係 per-isolate 嘅（`size` p50 = 202 ≈ 一個 tick 嘅 slice，即係每次都係冷快取開始）。偶然同一 isolate
+連續服務兩個 tick 就會命中（實測見過一格 `71 hits / 114 fetched / size 297`）。
+
+**所以 1A 冇達到原本嘅預期**（原本假設「同一個 client 連續幾 tick 問同一批幣」）。要講清楚：
+佢而家係一個**正確但邊際**嘅改動 —— 2.5% 嘅讀數重用、~0.05 個 request／tick —— 真正嘅收益嚟自 2A/3A。
+保留佢嘅理由：暖 isolate 真係會中（上表 149 個 pair 就係），成本只係每個 isolate ~200 個物件，
+而 `JUP_PAIR_CACHE_SECONDS="0"` 係一個字就關返。
+
+### 4.3 3A 嘅實測：暖 isolate 40–57% 嘅 profile fetch 被 skip
+
+| reading | value |
+|---|---|
+| `feedMakeup.cadenceSkips`（單一 isolate 最多） | 4 |
+| 同一 tick 嘅 `feedRequests`（最多） | 3 |
+| **profile-list tick 被 skip 嘅中位 share** | **40%**（31 個有讀數嘅 tick） |
+| `feedMakeup.failedTotal`（最多） | 2（before 11） |
+
+同 1A 同一個結構限制：**cold isolate 一定問一次**（故意嘅，咁 `lastRawProfiles`／`failedTotal`
+先至仍然係上游嘅真實讀數），所以 fleet 層面嘅 request 減幅細過「暖 isolate 嘅 40%」。
+
+### 4.4 每 feed 新幣（同一把尺）
+
+窗口長度唔同（before 29 分鐘、after 27 分鐘），所以同時列 10 分鐘桶嘅原始序列，免得用一個比率
+蓋過變異。
+
+| feed | before（29 min） | after（27 min） |
+|---|---|---|
+| pump | 674 | 615 |
+| jup | 184 | 115 |
+| meteora | 14 | 16 |
+| gecko | 6 | 2 |
+| raydium | 0 | 7 |
+| **dex（profiles）** | **0** | **0** |
+| **boosts** | 2 | **0（腿已關）** |
+| **jupTrend** | **0** | **0（腿已關）** |
+
+10 分鐘桶（`first_seen_at`，pump / jup）：
+
+```
+03:40 245/91   03:50 221/78   04:00 244/56   04:10 196/53   04:20 254/81
+04:30 235/55   04:40 207/62   04:50 199/52   05:00 209/46   05:10 223/31
+05:20 260/62   05:30 218/31
+```
+
+**jup 由 184 跌到 115 唔係改動造成**：同一個 feed 喺 before 窗口自己都喺 46–91／10min 之間浮動，
+after 嘅 05:20 桶係 62（before 嘅中位數附近），05:30 桶 31（before 05:00 桶都係 46）。
+pump 由 232 → 228／10min（雜訊內），所以市場成交量冇變。
+
+真正要睇嘅係兩條被關嘅腿：**boosts 由 2 → 0**（呢個係代價，見 §2A：24h 23 個幣）、
+**jupTrend 由 0 → 0**（冇損失）、**dex 由 0 → 0**（cadence gate 冇令任何一個幣消失）。
+
+### 4.5 durable 窗口（`scan_history`）
+
+兩個切法，因為 deploy 之後未夠鐘寫滿 240 個 tick：
+
+**(a) 同一個 240-tick 尺（before 齊、after 未夠鐘）**
+
+| reading | before（240 ticks） | after（90 ticks，0.78h） |
+|---|---|---|
+| scan ms p50 / p90 / max | 1,679 / 2,108 / 4,531 | **1,213 / 1,633 / 2,247** |
+| profiles p50 / min / max | 27 / 26 / 28 | 25 / 25 / 27 |
+| pool p50 | 1,187 | 1,131 |
+| tick gap p50 / p90 | 32.0s / 40.7s | 31.8s / 41.4s |
+| gaps > 120s | 0 | 0 |
+
+**(b) 等長、相鄰、同一小時（最硬嘅對照：79 vs 79 ticks）**
+
+| reading | before 04:30–05:12（79 ticks） | after 05:12–05:53（79 ticks） |
+|---|---|---|
+| scan ms p50 / p90 / max | 1,712 / 2,923 / 4,187 | **1,218 / 1,633 / 2,247** |
+| profiles p50 | 25 | **25** |
+| pool p50 | 1,200 | 1,130 |
+| candidates | 127 | 31 |
+| pushed | 3 | 0 |
+
+**candidates 127 → 31 要老實講，唔可以歸功／歸咎於呢次改動。** 兩個窗口相隔 40 分鐘但市場唔同：
+05:30 之後 24 分鐘係 **0 candidates**，而同一個鐘數 2026-10-16 本身都只有 3–7 個／30 min
+（10-16 05:00–06:00：3、7；06:30：1；09:30：1）—— 即係呢個時段本身就係最靜。
+支撐「唔關事」嘅讀數：`profiles p50` 兩個窗口一樣（25，覆蓋冇跌）、`pairs 202 / pairsJup 201`、
+`pairsMissing 0%`（before 6.2%）、而該 tick 嘅 reject 係 **178 個 `市值 — < $60K`**，名單係 age 660–750
+分鐘嘅 pool 舊幣（唔係 profiles 嘅新幣），所以「profiles list 重用」唔可能係成因。
+
+**（待真 240-tick after）**：deploy 夠鐘之後
+`node scripts/tick-metrics.mjs durable --label after --rows 240` 就係同一把尺，唔需要再改 code。
