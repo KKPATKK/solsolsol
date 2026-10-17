@@ -11260,6 +11260,107 @@ async function main() {
     assert.equal(requests.length, 2, "a paused client makes zero requests, not a probe per lane");
   });
 
+  await test("fetchTokenDataBatch: inside JUP_PAIR_CACHE_SECONDS a reading is reused — only the missing addresses are asked", async () => {
+    // WHY (2026-10-17): with DexScreener's pair lane refused, this fallback IS
+    // the gate data, and the tick's slice is largely the same feed coins every
+    // tick — so it re-asked ~200 addresses per tick, two of the provider's
+    // five window slots spent on readings the previous tick already had. The
+    // TTL is the STALENESS BOUND the gates accept for that reuse: inside it a
+    // reading is served, past it the mint is asked again.
+    const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    const mintAt = (i) => {
+      let s = "";
+      for (let n = i; n > 0; n = Math.floor(n / 58)) s = B58[n % 58] + s;
+      return "1".repeat(3 - s.length) + s + "9".repeat(41);
+    };
+    const make = (ttlMs) => {
+      const requests = [];
+      const state = { omit: null };
+      // jupReserveCardSlot OFF so the case measures the CACHE alone: with
+      // the card's slot reserved (the production default) the 5th dispatch
+      // inside the 10s window is stood down by design, which would read as a
+      // cache miss here. It is the other side of the same coin: every reused
+      // reading is a dispatch the card read keeps.
+      const client = new JupTokensClient(
+        ttlMs === undefined
+          ? { jupiterRequestIntervalMs: 0, jupReserveCardSlot: false }
+          : { jupiterRequestIntervalMs: 0, jupPairCacheMs: ttlMs, jupReserveCardSlot: false },
+        async (url) => {
+          requests.push(url);
+          const query = url.split("query=")[1];
+          const ids = query.split(",").filter((id) => id !== state.omit);
+          return new Response(
+            JSON.stringify(ids.map((id) => ({ id, mcap: 5 }))),
+            { status: 200 },
+          );
+        },
+      );
+      return { client, requests, state };
+    };
+    const list = Array.from({ length: 150 }, (_, i) => mintAt(i));
+    const run = make(60_000);
+    const first = await run.client.fetchTokenDataBatch(list);
+    assert.equal(first.size, 150, "a cold cache asks for every address");
+    assert.equal(run.requests.length, 2, "150 addresses = two chunks");
+    let stats = run.client.pairCacheStats();
+    assert.equal(stats.hits, 0);
+    assert.equal(stats.fetched, 150);
+    assert.equal(stats.ttlMs, 60_000);
+
+    // The SAME slice on the next tick: not one request, same readings.
+    const second = await run.client.fetchTokenDataBatch(list);
+    assert.equal(second.size, 150, "cached readings still feed every gate");
+    assert.equal(second.get(list[0]).marketCap, 5);
+    assert.equal(run.requests.length, 2, "a slice the cache already covers must open ZERO requests");
+    stats = run.client.pairCacheStats();
+    assert.equal(stats.hits, 150, "every served entry is counted, per client");
+    assert.equal(stats.fetched, 150, "a cache hit is not a fetch");
+
+    // The rotation ADDS addresses: only those are asked.
+    const extended = [...list, ...Array.from({ length: 40 }, (_, i) => mintAt(1000 + i))];
+    const third = await run.client.fetchTokenDataBatch(extended);
+    assert.equal(third.size, 190);
+    assert.equal(run.requests.length, 3, "only the 40 new addresses are asked (one chunk)");
+
+    // A mint the provider has no entry for is NEVER remembered as empty — if
+    // it were, the coin would be missing from every later tick's gates.
+    const gap = mintAt(5000);
+    const answered = mintAt(5001);
+    run.state.omit = gap;
+    const withGap = await run.client.fetchTokenDataBatch([gap, answered]);
+    assert.equal(withGap.size, 1, "a mint with no entry contributes nothing");
+    run.state.omit = null;
+    const asksAfterGap = run.requests.length;
+    const retried = await run.client.fetchTokenDataBatch([gap, answered]);
+    assert.equal(
+      run.requests.length,
+      asksAfterGap + 1,
+      "the gap mint is re-asked while the answered one is reused",
+    );
+    assert.equal(retried.size, 2, "and the retry resolves it");
+
+    // TTL expiry: past the bound the reading is re-fetched, never served.
+    const shortLived = make(20);
+    await shortLived.client.fetchTokenDataBatch([list[0]]);
+    await new Promise((r) => setTimeout(r, 40));
+    await shortLived.client.fetchTokenDataBatch([list[0]]);
+    assert.equal(shortLived.requests.length, 2, "an expired reading must be asked again");
+
+    // 0 / an absent field = the pre-change shape (every call asks).
+    const off = make(0);
+    await off.client.fetchTokenDataBatch([list[0]]);
+    await off.client.fetchTokenDataBatch([list[0]]);
+    assert.equal(off.requests.length, 2, "jupPairCacheMs 0 must not reuse anything");
+    const absent = make(undefined);
+    await absent.client.fetchTokenDataBatch([list[0]]);
+    await absent.client.fetchTokenDataBatch([list[0]]);
+    assert.equal(
+      absent.requests.length,
+      2,
+      "a config without the field (an old test double) keeps the old behaviour",
+    );
+  });
+
   await test("JupTokensClient: the caller's abort reaches the batch leg — never queued in, never left in flight", async () => {
     // WHY (2026-10-10, the §22.8 remaining bullet): the tracker's bounded()
     // cap aborts the pair lookup, but this leg's own fetch never carried the
@@ -19387,6 +19488,54 @@ async function main() {
     );
   });
 
+  await test("loadConfig: the pair-reuse TTL and the profiles cadence — defaults, 0 and junk", () => {
+    // 2026-10-17: the two knobs that pay for themselves without changing what
+    // the tick evaluates (see wrangler.toml's JUP_PAIR_CACHE_SECONDS /
+    // DEXSCREENER_PROFILES_INTERVAL_SECONDS blocks). Their 0 semantics differ
+    // ON PURPOSE and both are pinned here:
+    //  - the pair TTL's 0 / junk = NEVER reuse, i.e. the pre-change shape (a
+    //    staleness bound nobody chose is worse than no reuse at all);
+    //  - the profiles cadence's 0 = every tick, but JUNK fails CLOSED to the
+    //    300s default, because an unparseable knob must not silently restore
+    //    the per-tick request the gate exists to remove.
+    assert.equal(loadConfig({}).jupPairCacheMs, 90_000, "90s is the shipped staleness bound");
+    assert.equal(loadConfig({ JUP_PAIR_CACHE_SECONDS: "30" }).jupPairCacheMs, 30_000);
+    assert.equal(
+      loadConfig({ JUP_PAIR_CACHE_SECONDS: "0" }).jupPairCacheMs,
+      0,
+      "0 = never reuse (the pre-change shape)",
+    );
+    assert.equal(
+      loadConfig({ JUP_PAIR_CACHE_SECONDS: "nope" }).jupPairCacheMs,
+      0,
+      "junk means no reuse — never a TTL nobody chose",
+    );
+    assert.equal(loadConfig({ JUP_PAIR_CACHE_SECONDS: "-5" }).jupPairCacheMs, 0);
+    assert.equal(
+      loadConfig({ JUP_PAIR_CACHE_SECONDS: "99999" }).jupPairCacheMs,
+      600_000,
+      "capped at 10 minutes: a typo must not turn a 90s bound into an hour",
+    );
+    assert.equal(loadConfig({}).dexscreenerProfilesIntervalMs, 300_000);
+    assert.equal(
+      loadConfig({ DEXSCREENER_PROFILES_INTERVAL_SECONDS: "60" })
+        .dexscreenerProfilesIntervalMs,
+      60_000,
+    );
+    assert.equal(
+      loadConfig({ DEXSCREENER_PROFILES_INTERVAL_SECONDS: "0" })
+        .dexscreenerProfilesIntervalMs,
+      0,
+      "0 is the explicit no-gate value",
+    );
+    assert.equal(
+      loadConfig({ DEXSCREENER_PROFILES_INTERVAL_SECONDS: "nope" })
+        .dexscreenerProfilesIntervalMs,
+      300_000,
+      "junk fails CLOSED to the default, never open to a fetch every tick",
+    );
+  });
+
   await test("out-of-window patch: the launch slot's knobs, the prune ratio and the gecko key (gecko-key-launch-chain-2026-09-28.apply.js)", () => {
     // The wiring, cross-file and past the file tool's edit window: the ratio is
     // a CONSTANT (never a copied 0.6), the pool query uses it, the cadence gate
@@ -23798,15 +23947,40 @@ async function main() {
       const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
       const jupSrc = fs.readFileSync(path.join(__dirname, "..", "src", "jupfeeds.ts"), "utf8");
 
-      // 7 — boosts: production runs the upstream's ceiling (30 rows, the
-      // clamp). MEASURED 2026-09-28: raising it from 20 changed nothing —
+      // 7 — boosts: production used to run the upstream's ceiling (30 rows,
+      // the clamp). MEASURED 2026-09-28: raising it from 20 changed nothing —
       // `boosts 17` before and after — because the upstream's 30 rows are
       // cross-chain and the client filters to solana before slicing, so the
-      // Solana subset was already under 20. This pin holds the DEPLOYED value
-      // honest; it is not evidence of a gain.
+      // Solana subset was already under 20. MEASURED 2026-10-17 over 240
+      // ticks, the lane produced ZERO coins while being the tick's longest
+      // feed leg — so the DEPLOYED value is 0 (off) and this pin holds THAT
+      // honest. The cadence knob beside it is how it comes back cheaply.
       assert.ok(
-        toml.includes('DEXSCREENER_BOOSTS_LIMIT = "30"'),
-        "wrangler.toml runs the boosts leg at the upstream's 30-row ceiling",
+        toml.includes('DEXSCREENER_BOOSTS_LIMIT = "0"'),
+        "wrangler.toml keeps the boosts leg OFF (0) until a reading says it pays",
+      );
+      assert.ok(
+        toml.includes('DEXSCREENER_BOOSTS_INTERVAL_SECONDS = "300"'),
+        "and the cadence knob that would bring it back is deployed beside it, not left implicit",
+      );
+      // 8 — the same reading for Jupiter's trending lane: zero coins over 240
+      // ticks (`discovered_via` jupTrend last gained a row 16 days earlier) for
+      // one request per tick out of the card read's own five-slot window.
+      assert.ok(
+        toml.includes('JUPITER_TRENDING_LIMIT = "0"'),
+        "wrangler.toml keeps the trending lane OFF (0) until a reading says it pays",
+      );
+      // 9 — the two reuse knobs this change added. Their DEPLOYED values are
+      // numbers a reader has to be able to trust (a typo would silently
+      // restore the per-tick requests they remove), so they are pinned here
+      // next to the code defaults the config test covers.
+      assert.ok(
+        toml.includes('DEXSCREENER_PROFILES_INTERVAL_SECONDS = "300"'),
+        "the profiles cadence is deployed at the measured 5 minutes",
+      );
+      assert.ok(
+        toml.includes('JUP_PAIR_CACHE_SECONDS = "90"'),
+        "and the pair-reading TTL is deployed at its 90s staleness bound",
       );
       assert.equal(
         loadConfig({ DEXSCREENER_BOOSTS_LIMIT: "30" }).dexscreenerBoostsLimit,

@@ -405,7 +405,17 @@ SCAN_PROFILE_LIMIT = "200"
 # gives up when it does not. Watch /health heartbeat.summary.boosts together
 # with scanMs and subreqSkip; set this back to "0" if scanMs climbs or the leg
 # starts appearing in subreqSkip.
-DEXSCREENER_BOOSTS_LIMIT = "30"
+# OFF SINCE 2026-10-17 (was 30). WHAT IT COST, measured over 240 ticks that
+# day: the lane was the LONGEST feed leg in the tick's join (997ms in the leg
+# ring — it set the feed phase's upper bound) and it produced NO new coin in
+# that 1.9h window. WHAT IT WAS WORTH, over the 24h around the same reading:
+# `token_stats.discovered_via='boosts'` 23 coins, best `max_mcap_observed`
+# $639K, and 4 pushes all-time — i.e. ~1 coin/hour for one request every tick.
+# That is the trade being made: the cadence knob below brings the lane back at
+# 1/10 the request cost ("30" = once every 5 min) if a card ever depends on
+# it, and until then the tick stops paying for a page whose coins do not fit
+# this bot's band.
+DEXSCREENER_BOOSTS_LIMIT = "0"
 # Minimum spacing between boosts-lane FETCHES, in seconds (code default 300 =
 # one fetch per 5 min; 0 = no gate, one per tick — the pre-2026-10-07 shape).
 #
@@ -601,6 +611,20 @@ RAYDIUM_LAUNCH_LIMIT = "20"
 # keyless feed (whose pause IS the interval, and escalates past it) keeps
 # exactly the cadence it had. `summary.geoRetryAt` is the reading that proves a
 # retry was scheduled, and `summary.gecko.http429` is where it came from.
+# How often the DexScreener PROFILE list may be fetched, in seconds (code
+# default 300; "0" = every tick, the pre-2026-10-17 behaviour).
+#
+# WHY THE GATE (measured over 240 ticks, 2026-10-17): the page delivered 2 new
+# coins in two hours while costing one request every tick, and the reason is
+# in the lane's own counters — `dexListCache` reads hits 38,326 / misses 8, so
+# the list is almost always what Cloudflare's edge already had, and the
+# page's own churn is what a request cannot change. Inside the cadence the
+# tick REUSES the last good list, so it still evaluates the same coins (which
+# is exactly what it was doing) and stops asking. A cold isolate always asks
+# once, so `feedMakeup.lastRawProfiles` / `failedTotal` stay honest readings
+# of the upstream. Watch `feedMakeup.cadenceSkips` against `feedRequests`, and
+# the per-feed `discovered_via=dex` row, before lowering or raising this.
+DEXSCREENER_PROFILES_INTERVAL_SECONDS = "300"
 GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS = "300"
 # GeckoTerminal trending-pools feed size per scan (code default 20 when unset;
 # 0 = the leg is off — scanner.ts only builds it while this is > 0).
@@ -679,7 +703,32 @@ JUPITER_REQUEST_INTERVAL_MS = "500"
 # band filter runs at parse time, so the extra entries never reach the pair
 # phase (see jupfeeds.parseJupTrendTokens + docs/profiles-feed-zeros.md).
 # 0 = the leg is off entirely.
-JUPITER_TRENDING_LIMIT = "100"
+# OFF SINCE 2026-10-17 (was 100). The band filter above is why: over the 24h
+# around this reading the leg contributed ZERO coins to token_stats
+# (`discovered_via` jupTrend last gained a row on 2026-10-01, 16 days before
+# this change, and none in the last 240 ticks) while
+# costing one Jupiter request every tick — a request that competes for the
+# same 5-requests-per-10s provider window the push card's own organic read
+# needs (see JUP_WINDOW_BULK_MAX / diag.jupReserved). Its own probe still
+# answers 5 rows today, so the endpoint works; the coins simply never fit this
+# bot's window. Set back to "100" only with a fresh reading that says
+# otherwise.
+JUPITER_TRENDING_LIMIT = "0"
+# How long a pair reading from Jupiter's batch lane may be REUSED, in seconds
+# (code default 90; "0" = never reuse, the pre-2026-10-17 behaviour; capped at
+# 600).
+#
+# WHY (measured 2026-10-17): with DexScreener's pair lane refused fleet-wide,
+# that batch lane is the ONLY source of the gate data (mcap / liquidity /
+# volume / change), and it re-asked all ~200 addresses of the tick's slice on
+# every tick — mostly the same feed coins (`jup 30 / pump 20 / profiles 28`
+# are near-identical tick to tick), i.e. two of the provider's five window
+# slots spent on readings the previous tick already had. The TTL is the
+# STALENESS BOUND the gates accept for those repeats: an older reading is
+# re-fetched, never served. Read it against `pairsJup` (chunks actually sent)
+# and `pairsMissing` (coins the gates could not judge) — if `pairsMissing`
+# climbs while this is non-zero, the bound is too loose for the pool.
+JUP_PAIR_CACHE_SECONDS = "90"
 # DexScreener dispatch spacing, ms (code default 350). 2026-09-15: 350 → 250.
 # The pair phase is a fixed 1.5s window (PAIRS_FETCH_BUDGET_MS) and the shared
 # throttle spaces every request START, so the window held 5 dispatch slots at

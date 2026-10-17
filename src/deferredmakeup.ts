@@ -545,6 +545,17 @@ export interface FeedMakeupView {
   injectedTotal: number;
   /** Coins the LAST feed request appended (0 = nothing was pending). */
   lastInjected: number;
+  /**
+   * Ticks that REUSED the last list on the cadence gate instead of asking the
+   * wire (`DEXSCREENER_PROFILES_INTERVAL_SECONDS`, 2026-10-17), lifetime for
+   * this isolate. Counted apart from `feedRequests` on purpose: a skip is not
+   * a fetch, and reporting it as one would report refusals that never
+   * happened. Read WITH `feedRequests` — skips climbing while requests stay
+   * flat is the gate doing its job.
+   */
+  cadenceSkips: number;
+  /** When the most recent cadence skip happened. */
+  lastCadenceSkipAt: number | null;
 }
 
 let feedView: FeedMakeupView = {
@@ -556,7 +567,22 @@ let feedView: FeedMakeupView = {
   lastFailedAt: null,
   injectedTotal: 0,
   lastInjected: 0,
+  cadenceSkips: 0,
+  lastCadenceSkipAt: null,
 };
+
+/**
+ * Record one cadence SKIP (see FeedMakeupView.cadenceSkips): the tick reused
+ * the last good list instead of asking DexScreener for a page it would have
+ * received unchanged.
+ */
+export function noteProfileCadenceSkip(at: number): void {
+  feedView = {
+    ...feedView,
+    cadenceSkips: feedView.cadenceSkips + 1,
+    lastCadenceSkipAt: at,
+  };
+}
 
 /**
  * Record one profile fetch: `raw` is what the endpoint returned (before the
@@ -571,6 +597,8 @@ export function noteProfileFeed(
 ): void {
   const answeredEmpty = !failed && raw === 0;
   feedView = {
+    // Spread so the cadence fields (which a fetch never moves) ride along.
+    ...feedView,
     feedRequests: feedView.feedRequests + 1,
     lastRawProfiles: raw,
     emptyFeedTotal: feedView.emptyFeedTotal + (answeredEmpty ? 1 : 0),
@@ -592,6 +620,8 @@ export function resetFeedMakeup(): void {
   feedView = {
     feedRequests: 0,
     lastRawProfiles: 0,
+    cadenceSkips: 0,
+    lastCadenceSkipAt: null,
     emptyFeedTotal: 0,
     lastEmptyFeedAt: null,
     failedTotal: 0,

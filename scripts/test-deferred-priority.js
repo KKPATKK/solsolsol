@@ -23,7 +23,17 @@ const {
   feedMakeupView,
   resetFeedMakeup,
 } = require("../dist/deferredmakeup.js");
-const { loadConfig } = require("../dist/config.js");
+const { loadConfig: loadConfigRaw } = require("../dist/config.js");
+/**
+ * This suite exercises the profiles FETCH (refusals, budgets, drops, list
+ * caching) and ticks that stub a DIFFERENT body per tick — not the cadence
+ * gate, which has its own test (cadenceTests) and its own knob. So the gate is
+ * off for every client built here unless a case says otherwise: with the
+ * production 5-minute default a second call in the same client would REUSE the
+ * list instead of asking, which is a different behaviour, not a stricter test.
+ */
+const loadConfig = (env = {}) =>
+  loadConfigRaw({ DEXSCREENER_PROFILES_INTERVAL_SECONDS: "0", ...env });
 
 // ---------- the pool's rotation priority (a deferred coin in the query) ----
 const ledger = new DeferredPushLedger();
@@ -97,7 +107,13 @@ async function feedTests() {
   // inside the tick's 600ms feed window), and the throttle's 250ms spacing
   // between two calls of the SAME client would eat that budget in a way the
   // scan never sees — the feed call is the first DexScreener request of a tick.
-  const freshDex = () => new DexScreenerClient(loadConfig({}));
+  //
+  // CADENCE OFF HERE (2026-10-17): these cases pin what the FETCH does (refusal
+  // reuse, empty feed, budgets). With the 5-minute gate live, a second call on
+  // the same client would reuse the list instead of asking — a different
+  // behaviour, pinned by its own test below (cadenceTests).
+  const freshDex = () =>
+    new DexScreenerClient(loadConfig({ DEXSCREENER_PROFILES_INTERVAL_SECONDS: "0" }));
   reg.defer("PAID_LATE", 100);
   stub(feedBody);
   let dex = freshDex();
@@ -408,6 +424,70 @@ async function feedTests() {
   reg.recover("FEED_A");
 }
 
+// ---------- the profiles cadence gate (DEXSCREENER_PROFILES_INTERVAL_SECONDS) --
+// Measured 2026-10-17 over 240 ticks: the page delivered 2 new coins in ~2h
+// while costing one request per tick (listCacheHits 38,326 vs 8 misses). The
+// gate reuses a list younger than the interval, so the tick evaluates exactly
+// the coins it was evaluating and the request is gone. These cases pin the
+// three readings that make it safe: no request inside the cadence, the same
+// list (make-up included), and 0 = the pre-change one-fetch-per-tick shape.
+async function cadenceTests() {
+  resetFeedMakeup();
+  reg.recover("FEED_A");
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify(feedBody), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  // The RAW loader on purpose: this is the ONLY case that wants the shipped
+  // 300s default, so it must not inherit the suite-wide gate-off wrapper.
+  const gated = new DexScreenerClient(loadConfigRaw({}));
+  const first = await gated.fetchLatestSolanaProfiles();
+  assert.equal(calls, 1, "the first call of a cold client always asks");
+  const second = await gated.fetchLatestSolanaProfiles();
+  assert.equal(calls, 1, "a list younger than the cadence is REUSED, not re-asked");
+  assert.deepEqual(
+    second.map((p) => p.tokenAddress),
+    first.map((p) => p.tokenAddress),
+    "the skipped tick evaluates exactly the coins the fetch would have returned",
+  );
+  const view = feedMakeupView();
+  assert.equal(view.cadenceSkips, 1, "the skip is counted where /health can read it");
+  assert.equal(view.lastCadenceSkipAt !== null, true, "and stamped");
+  assert.equal(view.feedRequests, 1, "a skip is NOT a fetch — reporting it as one would invent refusals");
+  assert.equal(view.lastRawProfiles, 1, "the outage reading still describes the last real fetch");
+
+  // A coin deferred between the fetch and the skipped tick still makes up on
+  // the skipped tick: the reuse is of the LIST, not of the make-up lane.
+  reg.defer("PAID_SKIP", 200);
+  const third = await gated.fetchLatestSolanaProfiles();
+  assert.equal(calls, 1, "still no request");
+  assert.deepEqual(
+    third.map((p) => p.tokenAddress),
+    ["FEED_A", "PAID_SKIP"],
+    "a skipped tick still carries the deferred coin",
+  );
+  assert.equal(feedMakeupView().feedRequests, 1, "and the skip is still not counted as a fetch");
+  reg.recover("PAID_SKIP");
+
+  // 0 = the gate off: every tick asks, which is the shape this replaced.
+  const open = new DexScreenerClient(
+    loadConfigRaw({ DEXSCREENER_PROFILES_INTERVAL_SECONDS: "0" }),
+  );
+  await open.fetchLatestSolanaProfiles();
+  const before = calls;
+  await open.fetchLatestSolanaProfiles();
+  assert.equal(calls, before + 1, "0 = one request per tick (the pre-2026-10-17 shape)");
+  assert.equal(
+    feedMakeupView().cadenceSkips,
+    2,
+    "the two skips above stay put — a gate-off fetch adds none",
+  );
+}
+
 // ---------- the whole tick: the make-up coin is EVALUATED, not just listed ----
 // The feed test above proves the profiles list carries the deferred coin. This
 // one proves the tick then acts on it: the coin reaches the pair phase (and
@@ -545,10 +625,16 @@ async function subreqFloorTest() {
     // and the production 300s cadence would make the second tick skip gecko for
     // a reason that has nothing to do with the floor (the stamp is durable and
     // the ticks are milliseconds apart). One axis at a time.
+    // DEXSCREENER_PROFILES_INTERVAL_SECONDS=0 for the same reason as gecko's
+    // line below (and it became load-bearing on 2026-10-17): each tick above
+    // stubs a DIFFERENT profiles body, and the production 5-minute cadence
+    // would make the second tick reuse the first tick's list — the chain test
+    // would then never see its own coin. One axis at a time.
     const cfg = loadConfig({
       METEORA_FALLBACK_LIMIT: "20",
       GECKOTERMINAL_TRENDING_LIMIT: "20",
       GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS: "0",
+      DEXSCREENER_PROFILES_INTERVAL_SECONDS: "0",
       JUPITER_TRENDING_LIMIT: "100",
       PUMPFUN_PROFILE_LIMIT: "0",
       PUMPFUN_FALLBACK_LIMIT: "0",
@@ -1173,6 +1259,7 @@ const reloaded = loadPushDeferralSnapshot(JSON.stringify(durable));
 assert.deepEqual(reloaded.pendingTokens, ["DURABLE_TOKEN"]);
 
 feedTests()
+  .then(cadenceTests)
   .then(tickMakeupTest)
   .then(subreqFloorTest)
   .then(dexListCacheTest)

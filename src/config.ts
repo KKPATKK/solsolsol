@@ -534,6 +534,26 @@ export interface AppConfig {
    */
   jupReserveCardSlot: boolean;
   /**
+   * How long a pair reading fetched from Jupiter's batch lane may be REUSED
+   * (`JUP_PAIR_CACHE_SECONDS`, default 90; 0 disables). With DexScreener's
+   * pair lane refused fleet-wide, that fallback is what feeds every gate, and
+   * it re-asked all ~200 addresses of the tick's slice on EVERY tick — the
+   * same feed coins over and over (measured 2026-10-17: `jup 30 / pump 20 /
+   * profiles 28` are near-identical tick to tick). The TTL is the staleness
+   * bound the gates accept for those repeats: a reading older than this is
+   * re-fetched, never served.
+   */
+  jupPairCacheMs: number;
+  /**
+   * Minimum spacing between DexScreener PROFILE-list fetches
+   * (`DEXSCREENER_PROFILES_INTERVAL_SECONDS`, default 300; 0 = every tick).
+   * The page is a SLOW source — over 240 ticks it delivered 2 new coins while
+   * costing one request per tick — so a list younger than this is reused
+   * instead of re-asked. Per isolate, not fleet-wide: a cold isolate always
+   * asks once, which keeps the outage signal (`lastRawProfiles`) honest.
+   */
+  dexscreenerProfilesIntervalMs: number;
+  /**
    * Post-push tracker (PUSH_WATCH_ENABLED, default true): every pushed coin
    * is watched for `windowHours` and refreshed from ONE DexScreener batch
    * call per tick; follow-up alerts report continuation (🚀 stages) or
@@ -846,6 +866,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rawBoostsIntervalSec = Number(
     env.DEXSCREENER_BOOSTS_INTERVAL_SECONDS ?? 300,
   );
+  const rawProfilesIntervalSec = Number(
+    env.DEXSCREENER_PROFILES_INTERVAL_SECONDS ?? 300,
+  );
   const rawDexInterval = Number(env.DEX_REQUEST_INTERVAL_MS ?? 350);
   const rawTradeMode = (env.TRADE_MODE ?? "off").toLowerCase();
   const tradeAmount = Number(env.TRADE_AMOUNT_SOL ?? 0.1);
@@ -1002,6 +1025,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     jupReserveCardSlot:
       (env.JUP_RESERVE_CARD_SLOT ?? "1") !== "0" &&
       (env.JUP_RESERVE_CARD_SLOT ?? "1") !== "false",
+    // 0 = OFF (no reuse), junk fails closed to 0 rather than to a TTL nobody
+    // chose; the ceiling keeps a typo from turning a 90-second bound into a
+    // ten-minute one on data every gate reads.
+    jupPairCacheMs: (() => {
+      if (env.JUP_PAIR_CACHE_SECONDS === undefined) return 90_000;
+      const v = Number(env.JUP_PAIR_CACHE_SECONDS);
+      return Number.isFinite(v) && v > 0 ? Math.min(v, 600) * 1000 : 0;
+    })(),
+    // Same stance as the other cadence gates: 0 = every tick, and junk fails
+    // CLOSED to the 300s default (an unparseable knob must not silently
+    // restore the per-tick request this gate exists to remove).
+    dexscreenerProfilesIntervalMs:
+      Number.isFinite(rawProfilesIntervalSec) && rawProfilesIntervalSec > 0
+        ? Math.floor(rawProfilesIntervalSec) * 1000
+        : env.DEXSCREENER_PROFILES_INTERVAL_SECONDS === "0"
+          ? 0
+          : 300_000,
     pushWatch: {
       enabled: (env.PUSH_WATCH_ENABLED ?? "true") !== "0" && (env.PUSH_WATCH_ENABLED ?? "true") !== "false",
       maxTracked: Number.isFinite(Number(env.PUSH_WATCH_MAX_TRACKED ?? 30))

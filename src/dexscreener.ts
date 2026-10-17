@@ -1,5 +1,9 @@
 import type { AppConfig } from "./config";
-import { missingDeferredTokens, noteProfileFeed } from "./deferredmakeup";
+import {
+  missingDeferredTokens,
+  noteProfileCadenceSkip,
+  noteProfileFeed,
+} from "./deferredmakeup";
 
 const BASE_URL = "https://api.dexscreener.com";
 
@@ -2609,6 +2613,34 @@ export class DexScreenerClient {
   async fetchLatestSolanaProfiles(
     seed?: Promise<ProfileFeedSnapshot | null>,
   ): Promise<TokenProfile[]> {
+    // CADENCE GATE (2026-10-17, see config.dexscreenerProfilesIntervalMs):
+    // measured over 240 ticks this page delivered 2 new coins while costing
+    // one request every tick — the list is edge-cached (listCacheHits 38,326
+    // vs 8 misses) and its own churn is what a request cannot change. A list
+    // younger than the cadence is therefore REUSED, not re-asked: the tick
+    // still evaluates exactly the same coins (which is what it was doing
+    // anyway) and the request is gone.
+    //
+    // Deliberately keyed on THIS isolate's last good list, not the durable
+    // row: on a cold isolate there is no list to reuse and the feed is asked
+    // at once, so the outage signal (noteProfileFeed's raw/failed counters)
+    // keeps reporting what the upstream did on every isolate that could not
+    // prove it had a fresh list. A cadence skip does NOT touch those counters
+    // — it is not a fetch, and reporting it as one would report a refusal
+    // that never happened.
+    const cadenceMs = this.config.dexscreenerProfilesIntervalMs ?? 0;
+    const lastGoodAt = this.lastGoodProfiles?.at ?? null;
+    if (
+      cadenceMs > 0 &&
+      lastGoodAt !== null &&
+      Date.now() - lastGoodAt < cadenceMs
+    ) {
+      const reused = this.lastGoodProfiles!.list;
+      noteProfileCadenceSkip(Date.now());
+      const makeup = missingDeferredTokens(reused.map((p) => p.tokenAddress));
+      if (makeup.length === 0) return reused;
+      return [...reused, ...makeup.map((tokenAddress) => ({ tokenAddress }))];
+    }
     let data: unknown = null;
     let failed = false;
     // The deadline bounds the WHOLE call, attempt 1 included (see

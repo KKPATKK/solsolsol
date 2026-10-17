@@ -184,6 +184,14 @@ export const JUP_PRIORITY_GAP_MS = 150;
 export const JUP_RATE_WINDOW_MS = 10_000;
 export const JUP_WINDOW_BULK_MAX = 4;
 
+/**
+ * Upper bound on the reusable pair readings this client keeps (see
+ * fetchTokenDataBatch). The tick's own slice is ~200 addresses and the pool
+ * rotates ~1,100, so 1,500 covers a full rotation plus the tracker head — a
+ * cap, not a budget: entries are pruned by age on every write as well.
+ */
+export const JUP_PAIR_CACHE_MAX = 1_500;
+
 /** Spaces out HTTP requests so we stay well under Jupiter's rate limit. */
 class Throttle {
   private lastCallAt = 0;
@@ -606,6 +614,18 @@ export class JupTokensClient {
   private windowDispatchesAt: number[] = [];
   /** Bulk calls stood down so the card read keeps its slot (2026-10-17). */
   private bulkStoodDown = 0;
+  /**
+   * Pair readings this client may REUSE (see fetchTokenDataBatch): the batch
+   * lane is the gate data of last resort — with DexScreener refused
+   * fleet-wide it is the only one — and the tick's slice is largely the same
+   * feed coins every time, so re-asking all ~200 of them each tick spent two
+   * of the provider's five window slots on readings the previous tick already
+   * had. Insertion-ordered; bounded by JUP_PAIR_CACHE_MAX and pruned on write.
+   */
+  private readonly pairCache = new Map<string, { pair: PairInfo; at: number }>();
+  /** Batch entries served from the cache / asked of the wire (see the TTL). */
+  private pairCacheHits = 0;
+  private pairCacheFetched = 0;
 
   constructor(
     config: AppConfig,
@@ -622,9 +642,52 @@ export class JupTokensClient {
     // JUP_WINDOW_BULK_MAX). Kept on the instance so the dispatch check below
     // is one field read instead of a config lookup per call.
     this.reserveCardSlot = config.jupReserveCardSlot !== false;
+    // JUP_PAIR_CACHE_SECONDS=0 turns the reuse off (see fetchTokenDataBatch).
+    // A missing/zero TTL means "always ask the wire", which is the behaviour
+    // this replaced — so an old test double without the field still works.
+    this.pairCacheTtlMs = Number.isFinite(config.jupPairCacheMs)
+      ? Math.max(0, Number(config.jupPairCacheMs))
+      : 0;
   }
 
   private readonly reserveCardSlot: boolean;
+  private readonly pairCacheTtlMs: number;
+
+  /**
+   * Batch readings served from the reuse cache / asked of the wire, per client
+   * (isolate). A climbing hit share is the TTL doing its job; a hit share that
+   * stays 0 with a non-zero TTL means the tick's slice never repeats and the
+   * cache is dead weight.
+   */
+  pairCacheStats(): { hits: number; fetched: number; ttlMs: number; size: number } {
+    return {
+      hits: this.pairCacheHits,
+      fetched: this.pairCacheFetched,
+      ttlMs: this.pairCacheTtlMs,
+      size: this.pairCache.size,
+    };
+  }
+
+  /**
+   * Drop entries past the TTL, then the oldest if the cap is still exceeded.
+   *
+   * The scan is the WHOLE map rather than a break on the first live entry: a
+   * re-fetched mint keeps its original insertion position while its `at`
+   * moves, so the map is not strictly ordered by time and a break would leave
+   * stale entries behind forever. Called once per batch call, on a map bounded
+   * by JUP_PAIR_CACHE_MAX, so the walk is free.
+   */
+  private prunePairCache(now: number): void {
+    if (this.pairCacheTtlMs <= 0) return;
+    for (const [mint, hit] of this.pairCache) {
+      if (now - hit.at >= this.pairCacheTtlMs) this.pairCache.delete(mint);
+    }
+    while (this.pairCache.size > JUP_PAIR_CACHE_MAX) {
+      const oldest = this.pairCache.keys().next();
+      if (oldest.done === true) break;
+      this.pairCache.delete(oldest.value);
+    }
+  }
 
   private rateLimited(): boolean {
     return Date.now() < this.rateLimitedUntil;
@@ -1088,6 +1151,25 @@ export class JupTokensClient {
   ): Promise<Map<string, PairInfo>> {
     const out = new Map<string, PairInfo>();
     const list = mints.filter((m) => MINT_RE.test(m)).slice(0, Math.max(0, max));
+    const nowMs = Date.now();
+    // REUSE FIRST (2026-10-17, see pairCache): serve the readings this client
+    // already has inside the TTL, and ask the wire only for the rest. The TTL
+    // is the staleness bound every gate accepts — an older reading is never
+    // served, it is re-fetched below.
+    let asked = list;
+    if (this.pairCacheTtlMs > 0) {
+      this.prunePairCache(nowMs);
+      asked = [];
+      for (const mint of list) {
+        const hit = this.pairCache.get(mint);
+        if (hit && nowMs - hit.at < this.pairCacheTtlMs) {
+          out.set(mint, hit.pair);
+          this.pairCacheHits += 1;
+        } else {
+          asked.push(mint);
+        }
+      }
+    }
     const deadline = Math.min(
       Date.now() + JUP_FALLBACK_BUDGET_MS,
       typeof callerDeadlineMs === "number"
@@ -1098,7 +1180,7 @@ export class JupTokensClient {
     // (slice + increment are one uninterrupted step, so two lanes can never
     // claim the same chunk), then does its own round trip inside the ONE
     // shared deadline. See JUP_FALLBACK_CONCURRENCY for why the lanes exist.
-    const chunkCount = Math.ceil(list.length / JUP_BATCH_SIZE);
+    const chunkCount = Math.ceil(asked.length / JUP_BATCH_SIZE);
     let nextChunk = 0;
     const lane = async (): Promise<void> => {
       while (nextChunk < chunkCount) {
@@ -1114,7 +1196,7 @@ export class JupTokensClient {
         // and its tokens keep their pool slot for the next rotation.
         const remaining = deadline - Date.now();
         if (remaining <= JUP_FALLBACK_MIN_ROOM_MS || signal?.aborted) return;
-        const chunk = list.slice(
+        const chunk = asked.slice(
           nextChunk * JUP_BATCH_SIZE,
           (nextChunk + 1) * JUP_BATCH_SIZE,
         );
@@ -1151,7 +1233,16 @@ export class JupTokensClient {
         // Cleared either way: a pending timer would abort a LATER chunk's
         // signal (the lanes share this client) and hold the isolate open.
         if (chunkTimer !== undefined) clearTimeout(chunkTimer);
-        for (const [k, v] of jupToPairInfos(data)) out.set(k, v);
+        for (const [k, v] of jupToPairInfos(data)) {
+          out.set(k, v);
+          // Stored even when the value came back, never when it did not: a
+          // mint the provider has no entry for must be re-asked next tick,
+          // not remembered as empty.
+          this.pairCacheFetched += 1;
+          if (this.pairCacheTtlMs > 0) {
+            this.pairCache.set(k, { pair: v, at: Date.now() });
+          }
+        }
       }
     };
     await Promise.all(
