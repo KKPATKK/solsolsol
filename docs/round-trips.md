@@ -4340,3 +4340,63 @@ lane、失手補一次、429 窗口跟 header），但嗰三件事全部係「**
   唔係卡片路徑；可以再補嘅只有「多一次遲到重讀」，但每個 tick 得 5 槍，代價要另外量。
 - 補行係 edit，所以 Telegram 會顯示「已編輯」。遲到 > ~1 分鐘嘅情況唔會出現（20s 上限），
   而 note 本身有秒數，讀者唔會誤會。
+
+## 4.65 「市值 —」查完之後：真死幣，唔係讀數遺失；但流動性閘要識得認「池已抽乾」（2026-10-17）
+
+§4.64 之後嘅跟進。審計見到 reject ring 有 **62% 市值淘汰印住「—」**，即係冇 mcap 讀數；
+呢個究竟係「讀數唔見咗」（漏推風險）抑或「真係冇價」（正確淘汰）？
+
+### 一、對數：55 / 55 都係死幣
+
+抽 12 個 tick summary 嘅 reject ring → 83 隻被拒幣，其中 55 隻係「市值 —」。一次 batch
+問 Jupiter 同一條 endpoint（`/tokens/v2/search?query=a,b,c…`）：
+
+```
+55/55 有返回，mcap = null、fdv = null、usdPrice = null
+liquidity = 0.0000004 – 12.9 USD
+```
+
+再用 DexScreener `/latest/dex/tokens/<mint>` 交叉核對：pair 存在，但 `liquidity.usd = 0`
+（仍然印一個紙上市值：REECE $687、AE $103,814、CITYBAN $81,911）；對照組 DI 正常
+（mcap $141,248、liq $33,479）。所以「—」係**真讀數**：隻幣冇價、池已抽乾。
+
+**冇漏推**：以 AE 為例，就算 pair 由 DexScreener 供（紙上 $103.8K 落在 60K–460K band 內），
+亦會喺流動性閘以「$0 < $8K」被拒；用 Jupiter leg 就喺市值閘以 0 被拒。兩條路都拒。
+
+### 二、但查出一個真問題：pair lane 被拒嘅時候，流動性閘根本冇執行
+
+`gateLiquidityUsd` 對 Jupiter / Gecko 嘅 pair 一律回 `null`（唔判斷），因為佢哋嘅 liquidity
+係同一個池嘅另一個尺度（Jupiter ≈ DexScreener 嘅 0.46–0.58x），而流動性下限同 mcap/LP 比率
+係**絕對 USD 規則**。呢個設計本身冇錯——但 2026-10-17 當日 pair lane fleet-wide 被 429
+（28,657 次，約 1/min；每個 tick `pairs 199 pairsJup 199`，即 100% 由 Jupiter 供），
+結果**每個 tick 嘅流動性下限都冇執行**，市值 band 成為唯一嘅規模測試。
+
+今日嗰 55 隻死幣係「好彩」被 mcap 0 擋住；一隻「池抽乾但 Jupiter 條目仍然有價」嘅幣，
+兩閘都過得。呢個係 §4.64 之前冇人量到嘅形狀。
+
+### 三、改咗兩樣（`src/scanner.ts`）
+
+1. **`DRAINED_POOL_LIQUIDITY_USD = 500`，並喺 `gateLiquidityUsd` 加一個例外**：
+   非可比 leg 報 ≤ $500 就當「已抽乾」照判斷，> $500 維持 `null`（level 唔可比），
+   `null` 讀數亦維持 `null`（「冇數字」唔等於「冇池」）。
+   為何唔會誤殺：Jupiter 讀數 0.46–0.58x，$500 喺 Dex 尺度最多 ~$1,100 ——
+   低過所有設定嘅 floor（`MIN_LIQUIDITY_USD = 8,000`）同 pool prune（0.8 × 8,000）。
+   `liquidityIsComparable` 本身**冇改**，所以 push-watch 嘅 💧 drain 規則同
+   `maxLiquidityObserved` 高水位照舊唔會食 Jupiter 數字。
+2. **Reject 文案分家**：市值 ≤ 0 時寫「市值 冇讀數（冇價格／池已抽乾） < $60K」，
+   有真讀數時維持「市值 $x < $60K」。`fmtUsd(0)` 係「—」，兩件事印成一樣
+   就係今次兩輪審計嘅起因。
+
+### 四、未做（同埋為咩）
+
+- **「修 pair lane」冇得直接修**：429 係 DexScreener 對共享 egress IP 嘅拒絕，唔係我哋嘅 bug；
+  code 已經有 250ms spacing、120s pair cache、probe 同每 tick 嘅 Jupiter fallback。
+  可以做嘅只有「明知被拒就唔好再問」——省 2–3 個註定 429 嘅 request，但對資料冇改變，
+  留待下次量度（本輪只做用戶指定嘅第二條路）。
+- 死幣仍然會每個 tick 重新評估直到 dead prune；今次冇改佢嘅節奏。
+
+### 五、驗收
+
+`npm run build` + full unit suite：**573 passed, 0 failed**。新測試覆蓋：Jupiter 0 / dust /
+$500 邊界（判）、$501 同 $7,950（唔判）、`liquidity: null`（唔判）、
+drained Jupiter pool 會 fail floor、文案分家嘅 source pin。

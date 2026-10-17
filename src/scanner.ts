@@ -3113,13 +3113,43 @@ export function jupiterGateVerdict(
  * next DexScreener-served tick judges it normally, so the cost is a delayed
  * push, never a wrong one. A COMPARABLE leg with no reading still counts as
  * $0 depth — a drained pool reports 0 and must keep failing the floor.
+ *
+ * THE ONE EXCEPTION (2026-10-17): a NON-COMPARABLE leg reporting a pool that
+ * is essentially empty. The scale argument above is about LEVELS — "half of
+ * DexScreener's" is only meaningful when there is something to halve. A
+ * reading at or under DRAINED_POOL_LIQUIDITY_USD is the same fact on any
+ * scale, so it is judged like a DexScreener 0 instead of being waved through.
+ *
+ * WHY IT MATTERED ENOUGH TO CHANGE THE RULE. The DexScreener pair lane is
+ * refused fleet-wide (measured 2026-10-17: 28,657 429s, ~1/min; every pair of
+ * that tick came from the Jupiter fallback, `pairs 199 pairsJup 199`), so for
+ * those ticks the liquidity floor was not executing AT ALL — the market-cap
+ * band was the only size test. Live evidence from the same day: 55 of the 83
+ * coins the reject ring named carried "市值 —" (no valuation), and Jupiter's
+ * own answer for all 55 was `mcap/fdv/usdPrice: null`, `liquidity` 4e-7-12.9
+ * USD — drained pools, i.e. exactly what a $500 floor is for. They were being
+ * rejected on the missing mcap by luck, not by the floor; a drained coin whose
+ * Jupiter entry still carried a price would have passed both. The floor now
+ * judges that shape on the leg that answered.
+ *
+ * WHY THE THRESHOLD CANNOT BITE A LIVE COIN: Jupiter reads 0.46-0.58x of
+ * DexScreener's reserve, so $500 here is at most ~$1,100 there — under every
+ * configured floor (MIN_LIQUIDITY_USD is 8,000) and under the pool's own prune
+ * (0.8 x 8,000). A reading this small therefore cannot promote a coin the
+ * calibrated leg would have kept; it only names a pool that holds nothing.
  */
+export const DRAINED_POOL_LIQUIDITY_USD = 500;
+
 export function gateLiquidityUsd(pair: {
   liquidity: { usd: number | null };
   feedSource?: "dexscreener" | "jupiter" | "gecko";
 }): number | null {
-  if (!liquidityIsComparable(pair)) return null;
-  return pair.liquidity.usd ?? 0;
+  if (liquidityIsComparable(pair)) return pair.liquidity.usd ?? 0;
+  // Another leg's level is unjudged — unless there is effectively no pool.
+  // null (no reading at all) stays unjudged: "no number" is not "no pool".
+  const usd = pair.liquidity.usd;
+  if (usd !== null && usd <= DRAINED_POOL_LIQUIDITY_USD) return usd;
+  return null;
 }
 
 /**
@@ -9038,7 +9068,17 @@ export class Scanner {
         }
         if (pair.marketCap < chat.minMarketCapUsd) {
           fails.mcap++;
-          reject(`市值 ${fmtUsd(pair.marketCap)} < ${fmtUsd(chat.minMarketCapUsd)}`);
+          // NO VALUATION vs TOO SMALL (2026-10-17). `fmtUsd(0)` prints "—", so
+          // `市值 — < $60K` read as "the reading went missing" and sent two
+          // audits after a data bug that did not exist: Jupiter answers
+          // `mcap/fdv/usdPrice: null` for all of them, i.e. the coin has no
+          // price at all (drained pool), which is a VERDICT and not a gap.
+          // Naming the two apart is what keeps the next audit cheap.
+          reject(
+            pair.marketCap > 0
+              ? `市值 ${fmtUsd(pair.marketCap)} < ${fmtUsd(chat.minMarketCapUsd)}`
+              : `市值 冇讀數（冇價格／池已抽乾） < ${fmtUsd(chat.minMarketCapUsd)}`,
+          );
           continue; // too small
         }
         if (pair.marketCap > chat.maxMarketCapUsd) {

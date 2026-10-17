@@ -30,7 +30,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, slicePoolRotation, slicePoolTwoLanes, RE_EVAL_FAST_LANE_SHARE, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, DRAINED_POOL_LIQUIDITY_USD, slicePoolRotation, slicePoolTwoLanes, RE_EVAL_FAST_LANE_SHARE, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -3158,13 +3158,37 @@ async function main() {
     // counts as $0 depth: neither may be waved through the floor.
     assert.equal(gateLiquidityUsd({ liquidity: { usd: 0 }, feedSource: "dexscreener" }), 0);
     assert.equal(gateLiquidityUsd({ liquidity: { usd: null }, feedSource: "dexscreener" }), 0);
-    // Another leg's number is UNJUDGED, never $0: reading Jupiter's ~half
+    // Another leg's LEVEL is UNJUDGED, never $0: reading Jupiter's ~half
     // metric as $0 depth is what made this gate twice as strict on its tick.
     assert.equal(gateLiquidityUsd({ liquidity: { usd: 7_950.39 }, feedSource: "jupiter" }), null);
-    assert.equal(gateLiquidityUsd({ liquidity: { usd: 0 }, feedSource: "jupiter" }), null);
     assert.equal(gateLiquidityUsd({ liquidity: { usd: 10_640 }, feedSource: "gecko" }), null);
-    // So the two rules can only reject on the calibrated leg — the same number
-    // that is a false "drained" from Jupiter is a real drain from DexScreener.
+    // ...but "there is no pool" is the same fact on ANY scale (2026-10-17).
+    // The pair lane is refused fleet-wide, so without this the liquidity floor
+    // simply did not execute on those ticks: 55 of 83 rejected coins that day
+    // were drained pools whose Jupiter entry carried no price at all.
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: 0 }, feedSource: "jupiter" }), 0);
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: 0 }, feedSource: "gecko" }), 0);
+    assert.equal(
+      gateLiquidityUsd({ liquidity: { usd: DRAINED_POOL_LIQUIDITY_USD }, feedSource: "jupiter" }),
+      DRAINED_POOL_LIQUIDITY_USD,
+      "the threshold itself is judged (a floor is a floor)",
+    );
+    assert.equal(
+      gateLiquidityUsd({ liquidity: { usd: 0.00016445751250818895 }, feedSource: "jupiter" }),
+      0.00016445751250818895,
+      "a dust reading is still a reading: the floor must see it",
+    );
+    // One cent over the threshold is a LEVEL again — unjudged, exactly as before.
+    assert.equal(
+      gateLiquidityUsd({ liquidity: { usd: DRAINED_POOL_LIQUIDITY_USD + 1 }, feedSource: "jupiter" }),
+      null,
+    );
+    // No number at all is not "no pool": a missing reading stays unjudged, or
+    // a provider that omits `liquidity` would reject every coin it answered.
+    assert.equal(gateLiquidityUsd({ liquidity: { usd: null }, feedSource: "jupiter" }), null);
+    // So a LEVEL from another leg still cannot reach the floor — the same
+    // number that is a false "drained" from Jupiter is a real drain from
+    // DexScreener. Only the ~0 reading crosses over (the cases above).
     const floor = 10_000;
     const ratioMax = 10;
     const jup = gateLiquidityUsd({ liquidity: { usd: 7_950.39 }, feedSource: "jupiter" });
@@ -3177,6 +3201,32 @@ async function main() {
       "and cannot fire the mcap/LP ratio either",
     );
     assert.match(mcapRatioBlockReason(150_000, dex, ratioMax), /18\.9x/);
+    // A drained pool on the unjudged leg DOES fail the floor, and the mcap/LP
+    // ratio still reads null there (it needs a positive LP) — the floor is the
+    // rule that has to catch it.
+    const drained = gateLiquidityUsd({ liquidity: { usd: 12.9 }, feedSource: "jupiter" });
+    assert.equal(drained !== null && drained < floor, true, "a drained Jupiter pool fails the floor");
+    assert.equal(mcapRatioBlockReason(0, drained ?? 0, ratioMax), null);
+  });
+
+  await test("the reject ring names a missing valuation apart from a small one (2026-10-17)", () => {
+    // `fmtUsd(0)` is "—", so `市值 — < $60K` sent two audits after a data bug
+    // that did not exist: Jupiter reports no price at all for those mints
+    // (drained pools), which is a verdict. Naming the two apart is what keeps
+    // the next "why was this coin skipped" cheap.
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8");
+    assert.ok(
+      src.includes("市值 冇讀數（冇價格／池已抽乾） <"),
+      "the no-valuation case must say so instead of printing an em dash",
+    );
+    assert.ok(
+      src.includes("pair.marketCap > 0\n              ? `市值 ${fmtUsd(pair.marketCap)} <"),
+      "and a real reading keeps the old wording",
+    );
+    assert.ok(
+      src.includes("DRAINED_POOL_LIQUIDITY_USD"),
+      "the drained threshold must exist",
+    );
   });
 
   await test("push-watch: a Jupiter-sourced reading can neither rug nor crash a live coin", () => {
