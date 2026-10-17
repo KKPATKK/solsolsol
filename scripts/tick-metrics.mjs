@@ -84,6 +84,18 @@ function tickRow(health) {
     organicWaited: num(sm.organicWaited),
     organicRetried: num(sm.organicRetried),
     jupReserved: num(sm.jupReserved),
+    // Per-tick DELTAS published by the scanner (see ScanSummary.jupPairCache):
+    // hits = gate readings served from the cache, fetched = pairs the wire
+    // returned. Absent before the 2026-10-17 deploy, which is why a before
+    // window reads n/a here.
+    jupPairCache: sm.jupPairCache
+      ? {
+          hits: num(sm.jupPairCache.hits),
+          fetched: num(sm.jupPairCache.fetched),
+          size: num(sm.jupPairCache.size),
+          ttlMs: num(sm.jupPairCache.ttlMs),
+        }
+      : null,
     candidates: num(sm.candidates),
     pushed: num(sm.pushed),
     feedMakeup: {
@@ -237,6 +249,19 @@ function report() {
   line("organicNoLine total", sum(ticks.map((t) => t.organicNoLine)));
   line("organicWaited total", sum(ticks.map((t) => t.organicWaited)));
   line("organicRetried total", sum(ticks.map((t) => t.organicRetried)));
+  const cache = ticks
+    .map((t) => t.jupPairCache)
+    .filter((c) => c && typeof c.hits === "number" && typeof c.fetched === "number");
+  if (cache.length) {
+    const hitSum = sum(cache.map((c) => c.hits));
+    const fetchedSum = sum(cache.map((c) => c.fetched));
+    line("jupPairCache hits / fetched (sum)", `${hitSum} / ${fetchedSum}`);
+    line(
+      "jupPairCache reuse share of resolved pairs",
+      hitSum + fetchedSum > 0 ? `${((hitSum / (hitSum + fetchedSum)) * 100).toFixed(1)}%` : "n/a",
+    );
+    line("jupPairCache ttlMs / size p50", `${cache[0].ttlMs} / ${stats(cache.map((c) => c.size)).p50}`);
+  }
   const reserved = ticks.map((t) => t.jupReserved).filter((v) => typeof v === "number");
   if (reserved.length) {
     line("jupReserved total", sum(reserved));
@@ -247,32 +272,52 @@ function report() {
   line("candidates total", sum(ticks.map((t) => t.candidates)));
   line("pushed total", sum(ticks.map((t) => t.pushed)));
 
-  // Counters: the FIRST and LAST reading of the window, as a delta. A cold
-  // isolate restarts them, so a negative delta is reported as a restart rather
-  // than silently printed as a decrease.
-  const delta = (pick) => {
-    const a = pick(first);
-    const b = pick(last);
-    if (typeof a !== "number" || typeof b !== "number") return null;
-    return b - a;
+  // Counters are PER ISOLATE (a tick can land on a fresh one, restarting them),
+  // so a sum or a first→last delta over the window would be arithmetic on
+  // unrelated lifetimes. Two honest readings instead:
+  //  - MAX: the furthest an isolate got inside this window.
+  //  - SHARE: for a pair of counters that move together on ONE isolate, the
+  //    median of their per-tick ratio — the number the gate actually changes.
+  const maxOf = (pick) => {
+    const v = ticks.map(pick).filter((x) => typeof x === "number" && Number.isFinite(x));
+    return v.length ? Math.max(...v) : null;
   };
-  const fmRequests = delta((t) => t.feedMakeup?.feedRequests);
-  const fmSkips = delta((t) => t.feedMakeup?.cadenceSkips);
-  const fmFailed = delta((t) => t.feedMakeup?.failedTotal);
-  const fmInjected = delta((t) => t.feedMakeup?.injectedTotal);
-  const fmt = (v) => (v === null ? "n/a" : v >= 0 ? `+${v}` : `${v} (isolate restart)`);
-  console.log("\n| counter delta (first → last tick) | value |");
+  const medianShare = (a, b) => {
+    const shares = ticks
+      .map((t) => [a(t), b(t)])
+      .filter(([x, y]) => typeof x === "number" && typeof y === "number" && x + y > 0)
+      .map(([x, y]) => x / (x + y))
+      .sort((x, y) => x - y);
+    return shares.length
+      ? `${(shares[Math.floor(shares.length / 2)] * 100).toFixed(0)}% of ${shares.length} ticks`
+      : null;
+  };
+  const show = (v) => (v === null ? "n/a" : String(v));
+  console.log("\n| per-isolate counter | max on a tick |");
   console.log("|---|---|");
-  line("feedMakeup.feedRequests", fmt(fmRequests));
-  line("feedMakeup.cadenceSkips", fmt(fmSkips));
-  line("feedMakeup.failedTotal", fmt(fmFailed));
-  line("feedMakeup.injectedTotal", fmt(fmInjected));
-  line("dex.pairCacheHits", fmt(delta((t) => t.dex?.pairCacheHits)));
-  line("dex.pairCacheMisses", fmt(delta((t) => t.dex?.pairCacheMisses)));
-  line("dex.listCacheHits", fmt(delta((t) => t.dex?.listCacheHits)));
-  line("dex.http429", fmt(delta((t) => t.dex?.http429)));
-  line("dex.probeDeferrals", fmt(delta((t) => t.dex?.probeDeferrals)));
-  line("dex.episodeDeferrals", fmt(delta((t) => t.dex?.episodeDeferrals)));
+  line("feedMakeup.feedRequests", show(maxOf((t) => t.feedMakeup?.feedRequests)));
+  line("feedMakeup.cadenceSkips", show(maxOf((t) => t.feedMakeup?.cadenceSkips)));
+  line(
+    "profile-list ticks SKIPPED (median share)",
+    show(
+      medianShare(
+        (t) => t.feedMakeup?.cadenceSkips,
+        (t) => t.feedMakeup?.feedRequests,
+      ),
+    ),
+  );
+  line("feedMakeup.failedTotal", show(maxOf((t) => t.feedMakeup?.failedTotal)));
+  line("feedMakeup.injectedTotal", show(maxOf((t) => t.feedMakeup?.injectedTotal)));
+  line("dex.pairCacheHits", show(maxOf((t) => t.dex?.pairCacheHits)));
+  line("dex.pairCacheMisses", show(maxOf((t) => t.dex?.pairCacheMisses)));
+  line(
+    "pair readings REUSED (median share)",
+    show(medianShare((t) => t.dex?.pairCacheHits, (t) => t.dex?.pairCacheMisses)),
+  );
+  line("dex.listCacheHits", show(maxOf((t) => t.dex?.listCacheHits)));
+  line("dex.http429", show(maxOf((t) => t.dex?.http429)));
+  line("dex.probeDeferrals", show(maxOf((t) => t.dex?.probeDeferrals)));
+  line("dex.episodeDeferrals", show(maxOf((t) => t.dex?.episodeDeferrals)));
 
   if (feeds.length >= 2) {
     const a = feeds[0];

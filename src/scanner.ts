@@ -2231,6 +2231,25 @@ export interface ScanSummary {
    */
   jupReserved: number;
   /**
+   * The pair-reading reuse THIS TICK (see jupfeeds.JUP_PAIR_CACHE_MAX / the
+   * client's pairCacheStats): how many gate readings came from the cache and
+   * how many pairs the wire actually returned. Published as a DELTA because
+   * the client's counters are per isolate and a lifetime total cannot say
+   * whether the tick in front of the reader reused anything.
+   *
+   * WHY IT EXISTS (2026-10-17): the change's whole claim is "the same coins,
+   * fewer requests", and `pairsJup` cannot show it — a cached reading is still
+   * counted in the map the gates read. Without this the deploy is unverifiable
+   * from /health; `ttlMs` 0 beside `hits` 0 says the knob is off, not that the
+   * slice never repeats.
+   */
+  jupPairCache?: {
+    hits: number;
+    fetched: number;
+    size: number;
+    ttlMs: number;
+  } | null;
+  /**
    * The last card read's reason (see JupCardReadNote): `ok` | `backoff` (a 429
    * has the client paused — the whole JUP_RATE_LIMIT_BACKOFF_MS window loses
    * every card line, and the Jupiter gates fail open inside it) | `http` (see
@@ -5111,6 +5130,10 @@ export class Scanner {
     // are plain feed objects with no ledger, and a missing counter reads as
     // "nothing stood down" rather than as a tick that throws.
     const jupBulkBefore = this.jupiter?.bulkStoodDownCount?.() ?? 0;
+    // Same shape for the pair-reading reuse (see jupPairCache): the tick
+    // publishes a delta, so a reader never has to subtract two snapshots it
+    // did not take.
+    const jupPairCacheBefore = this.jupiter?.pairCacheStats?.() ?? null;
     const tickDeadline = startedAt + SCAN_TICK_DEADLINE_MS;
     // The front phases (feeds + pool read + pair fetch) must ALL be done by
     // here, so the gate/push phase below always keeps its reserved slice of
@@ -7735,6 +7758,18 @@ export class Scanner {
       if (seq === this.scanSeq) {
         // The reservation's cost for THIS tick (see jupBulkBefore).
         diag.jupReserved = (this.jupiter?.bulkStoodDownCount?.() ?? 0) - jupBulkBefore;
+        // ...and what the pair cache saved it (see jupPairCache). A double with
+        // no stats method publishes nothing rather than throwing.
+        const jupPairCacheAfter = this.jupiter?.pairCacheStats?.() ?? null;
+        diag.jupPairCache =
+          jupPairCacheBefore && jupPairCacheAfter
+            ? {
+                hits: jupPairCacheAfter.hits - jupPairCacheBefore.hits,
+                fetched: jupPairCacheAfter.fetched - jupPairCacheBefore.fetched,
+                size: jupPairCacheAfter.size,
+                ttlMs: jupPairCacheAfter.ttlMs,
+              }
+            : null;
         // Flurry RPC spend is cumulative across ticks (isolate lifetime) —
         // surface it on every heartbeat so actual cost stays observable.
         const fs = this.flurry?.stats();

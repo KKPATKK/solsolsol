@@ -12209,6 +12209,22 @@ async function main() {
       ),
       "the summary must publish what THIS tick stood down",
     );
+    // The pair cache's per-tick reading (2026-10-17): the change's claim is
+    // "the same coins, fewer requests", and `pairsJup` cannot show it — a
+    // cached reading is still in the map the gates read. The summary must
+    // carry the DELTA the tick made, not the isolate's lifetime counters.
+    assert.ok(
+      src.includes("const jupPairCacheBefore = this.jupiter?.pairCacheStats?.() ?? null;"),
+      "the tick must snapshot the pair cache before the scan",
+    );
+    assert.ok(
+      src.includes("hits: jupPairCacheAfter.hits - jupPairCacheBefore.hits,"),
+      "and publish the delta it produced",
+    );
+    assert.ok(
+      src.includes("jupPairCache?: {"),
+      "the summary type must name the reading",
+    );
     // And the durable entry type carries it (db.ts is the ring's home).
     const dbSrc = fs.readFileSync(
       path.join(__dirname, "..", "src", "db.ts"),
