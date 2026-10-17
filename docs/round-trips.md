@@ -4483,3 +4483,34 @@ d1-copy failed: SQLITE_UNKNOWN: SQLite error: no such table: tick_legs
 `absent in the archive (added after the 2026-10-15 snapshot) — nothing to copy`。
 測試：archive 建好之後 `DROP TABLE tick_legs`，複製照跑、`rows 0 / statements 0`、
 `scan_history` 照樣複製 1 行、`verify` 讀到 0。
+
+## 4.67 用返 $5 版嘅閒置額度：feed deadline、R2 cold archive、Analytics Engine、D1 usage 讀數（2026-10-17）
+
+前置讀數（240 ticks，14:53–16:59Z）：tick `ms` p50 1,188 / p95 2,504，pool 998–1,257，
+feed leg p50 profiles 8（cache/5 分鐘 cadence）、pump 76、jup 126、meteora 296、raydium 352；
+**3 個 tick 嘅 meteora/gecko 讀 1,558ms 之後回 0**（cap 1,600 − dispatch），而 tick 只用 20s budget 嘅 ~6%。
+
+1. **`FEED_DEADLINE_MS 1_600 → 2_800`、`SCAN_TICK_DEADLINE_MS 8_000 → 9_600`**。
+   front window 6,400 → 8,000ms，front caps 總和 2,800 + 2,400 + 2,000 = 7,200 仍有 800ms 剩；
+   gate reserve 1,600 不變。`test-unit` 嘅 pre-race headroom pin 由 7,500 → 5,900。
+   驗收：`feedLegs.meteora/gecko` 唔再出現 1,558ms 截斷，`meteora 0` 只剩 geo>0 嘅設計情況。
+2. **R2 cold archive**（`src/coldarchive.ts` + `Db.archiveColdRows`）：prune 前 SELECT 冷 row（2,000/批、
+   最多 3 批）→ NDJSON put → 只 DELETE 已寫出嘅 batch；put 失敗**唔 delete**。
+   key = `cold/<table>/<day>/<firstAt>-<lastAt>.ndjson`，重試覆寫同一 object。
+   綁定由 `scripts/r2-bind.js` 喺 deploy 前**盡試**建立/注入；token 冇 R2:Edit 就警告並 exit 0，
+   wrangler.toml 不變（實測：`r2 bucket list` HTTP 403 → 跳過、deploy 照跑）。
+   冇 binding 時 prune 維持原本 bulk DELETE，所以呢個 commit 唔會令 deploy 失敗。
+3. **Analytics Engine**：`[[analytics_engine_datasets]] binding = "TELEMETRY" dataset = "scan_metrics"`，
+   每 tick 一個 point（`src/scanmetrics.ts`，13 個 tick double + 5 條 feed leg ms、4 個 blob）。
+   唔加 D1 row；`/health.telemetryBound` 講明 deployment 有冇帶。
+4. **`scripts/cf-d1-usage.mjs` + `.github/workflows/cf-d1-usage.yml`**：讀 `AccountD1AnalyticsAdaptiveGroups`
+   （introspection 定 field 名，schema 實測 type 有 `Groups` 後綴）出每日 rows written/read + 月投影。
+   首次實測（14 日窗口，2026-10-17）：10/16 = **492,691 written/day → 29.6%/月**、
+   18.6M read/day → 2.2%/月；10/17 未完結嗰日 357,549。
+
+**限制**：R2 路徑喺呢個帳戶**未啟用**（token 冇 R2:Edit；`archiveBound:false`），代碼同 CI 注入已就緒，
+加權限後下一個 deploy 自動開。A1 嘅 2,800/9,600 係按 p95 同 front window 推算，未經 deploy 實測。
+
+**測試**：`npm run build` 綠；`npm run test:unit` **exit 0**（575 / 8 / 7 / 5 / 14 / 4 / 14 / 9 / 5 / 12 / 19，0 failed）：
+新增 `scripts/test-cold-archive.js` 8 項（key/NDJSON/archive-then-delete/put 失敗保留/無 binding 不動/
+批大小覆蓋一日 tick/AE point shape/err 截斷），`r2-bind --print` 與 `wrangler deploy --dry-run` 均驗證綁定。

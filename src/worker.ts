@@ -29,6 +29,11 @@ import {
 // Subclass with the last-good pool fallback: the method it wraps lives past
 // the file-sync window in src/db.ts, so the production path is adjusted here.
 import { PoolFallbackDb, poolFallbackStats } from "./poolfallback";
+// Cold-row archive (R2) and the Analytics Engine data point: both are optional
+// bindings, so the types are the minimal slices the code touches (see
+// src/coldarchive.ts and src/scanmetrics.ts for why they exist).
+import type { ColdArchive } from "./coldarchive";
+import { buildScanDataPoint, type AnalyticsEngineSink } from "./scanmetrics";
 // The store seam: D1 (a Workers binding) or Turso (libsql over HTTP). See
 // src/d1.ts for why the same state machine can run on either — and why the two
 // are never mixed inside one tick.
@@ -209,7 +214,7 @@ interface Env {
    * has to admit the binding (2026-10-15): `DB` is an object, not a string, and
    * a `string`-only signature rejects it at the interface itself.
    */
-  [key: string]: string | D1DatabaseLike | undefined;
+  [key: string]: string | D1DatabaseLike | ColdArchive | AnalyticsEngineSink | undefined;
   TELEGRAM_BOT_TOKEN?: string;
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
@@ -222,6 +227,14 @@ interface Env {
    * exactly as before. See src/d1.ts and Db's transport seam.
    */
   DB?: D1DatabaseLike;
+  /**
+   * R2 cold archive, when the deploy injected the binding (scripts/r2-bind.js).
+   * Optional: without it the history prune keeps its original bulk DELETE, so
+   * an account without R2:Edit deploys and runs exactly as before.
+   */
+  ARCHIVE?: ColdArchive;
+  /** Workers Analytics Engine dataset `scan_metrics` (paid-plan allowance). */
+  TELEMETRY?: AnalyticsEngineSink;
   BIRDEYE_API_KEY?: string;
   HELIUS_API_KEY?: string;
   SCAN_INTERVAL_SECONDS?: string;
@@ -4546,6 +4559,7 @@ async function ensureInitialized(env: Env): Promise<void> {
             config.tursoAuthToken,
             undefined,
             d1,
+            env.ARCHIVE ?? null,
           );
           await db.init();
           dbReady = true;
@@ -5830,6 +5844,32 @@ async function runScan(
         skip: skipView?.reason ?? null,
       });
       recordTickLeg(legRow);
+      // ANALYTICS ENGINE (2026-10-17): one data point per tick, written beside
+      // the D1 row and never instead of it. AE has its own allowance (10M
+      // points/month) and a SQL API, so the long-window "was this feed silent"
+      // question stops depending on the 72-hour tick_legs retention. Sync,
+      // fire-and-forget, and guarded: an unbound dataset costs nothing.
+      const telemetry = envRef?.TELEMETRY;
+      if (telemetry) {
+        try {
+          telemetry.writeDataPoint(
+            buildScanDataPoint({
+              via: scanVia,
+              ok: lastScanOk,
+              err: lastScanError,
+              skip: legRow.skip,
+              ms: flushedMs,
+              summary,
+            }),
+          );
+        } catch (err) {
+          // A telemetry sink can never fail a tick.
+          console.error(
+            "[worker] analytics engine write failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
       // The durable half (see TICK_LEG_SLOW_KEY): the in-memory ring lives in
       // the isolate that TICKED, which is not the one HTTP reads reach — so a
       // slow tick also lands in worker_state. Fired, never awaited; the
@@ -7652,6 +7692,12 @@ const worker = {
         // day-old state machine and re-push what it already pushed — silently,
         // unless the endpoint a monitor polls says which store answered.
         dbStore: env.DB ? "d1" : "turso",
+        // WHICH OPTIONAL BINDINGS this deployment actually carries (2026-10-17).
+        // Both are injected in CI and both are no-ops when absent, so a reader
+        // has to be able to tell "the feature is off" from "the feature is
+        // broken": the archive and the Analytics Engine dataset say so here.
+        archiveBound: Boolean(env.ARCHIVE),
+        telemetryBound: Boolean(env.TELEMETRY),
         dbReady,
         botReady,
         scannerReady,

@@ -20,6 +20,15 @@ import {
   type DbLatencyOp,
   type DbLatencyRaw,
 } from "./dblatency";
+import {
+  COLD_ARCHIVE_BATCH_ROWS,
+  COLD_ARCHIVE_MAX_PASSES,
+  COLD_SCAN_HISTORY_RETAIN_MS,
+  COLD_TICK_LEGS_RETAIN_MS,
+  coldArchiveKey,
+  rowsToNdjson,
+  type ColdArchive,
+} from "./coldarchive";
 
 /**
  * THE TRANSPORT SEAM (2026-10-15). `Db` drives the database through exactly two
@@ -1663,12 +1672,23 @@ export class Db {
     authToken?: string,
     injectedClient?: Client,
     d1?: D1DatabaseLike,
+    /**
+     * R2 cold archive, when the deployment binds one (see src/coldarchive.ts).
+     * Optional by design: an unbound bucket leaves the prune exactly as it was
+     * (delete without export), so a token without R2:Edit never blocks a
+     * deploy and a Worker without the binding never pays for the path.
+     */
+    archive?: ColdArchive | null,
   ) {
     this.url = url;
     this.authToken = authToken;
     this.injectedClient = injectedClient;
     this.d1 = d1;
+    this.archive = archive ?? null;
   }
+
+  /** The R2 sink the prune exports cold rows through (null = delete only). */
+  private readonly archive: ColdArchive | null;
 
   /**
    * How many bound parameters ONE statement may carry on this transport.
@@ -4346,6 +4366,64 @@ export class Db {
   }
 
   /**
+   * Export cold rows to R2 and delete exactly what was exported (2026-10-17).
+   *
+   * The prune used to be a bare DELETE: `scan_history` older than 30 days and
+   * `tick_legs` older than 72 hours disappeared without a copy. This method is
+   * the archive-then-delete order — a failed put leaves the rows in D1 (only
+   * that table stops), and the object key is a function of the batch's own `at`
+   * range, so a retry overwrites its own object instead of duplicating rows.
+   *
+   * Only called when an R2 binding exists (see the constructor); with no
+   * binding the prune keeps its original bulk DELETE, which is why an account
+   * without R2:Edit loses nothing but the export itself.
+   */
+  async archiveColdRows(now = Date.now()): Promise<{ archived: number; failed: string[] }> {
+    if (!this.archive) return { archived: 0, failed: [] };
+    const c = this.get();
+    const plan: Array<{ table: string; cutoff: number }> = [
+      { table: "scan_history", cutoff: now - COLD_SCAN_HISTORY_RETAIN_MS },
+      { table: "tick_legs", cutoff: now - COLD_TICK_LEGS_RETAIN_MS },
+    ];
+    const out: { archived: number; failed: string[] } = { archived: 0, failed: [] };
+    for (const { table, cutoff } of plan) {
+      for (let pass = 0; pass < COLD_ARCHIVE_MAX_PASSES; pass++) {
+        const res = await c.execute({
+          sql: `SELECT * FROM ${table} WHERE at < ? ORDER BY at ASC LIMIT ?`,
+          args: [cutoff, COLD_ARCHIVE_BATCH_ROWS],
+        });
+        // `Row` carries its columns as own enumerable properties on both
+        // transports; the spread is what makes that an explicit promise rather
+        // than a JSON.stringify implementation detail.
+        const rows = res.rows.map((r) => ({ ...(r as Record<string, unknown>) }));
+        if (rows.length === 0) break;
+        const firstAt = Number(rows[0].at);
+        const lastAt = Number(rows[rows.length - 1].at);
+        try {
+          await this.archive.put(
+            coldArchiveKey(table, firstAt, lastAt),
+            rowsToNdjson(rows),
+            { httpMetadata: { contentType: "application/x-ndjson" } },
+          );
+        } catch (err) {
+          // No delete: the batch is still the only copy. The next prune run
+          // retries it (and the object key is stable, so a retry after a
+          // committed-but-lost response is harmless).
+          out.failed.push(table);
+          console.error(
+            `[db] cold archive failed for ${table}:`,
+            err instanceof Error ? err.message : err,
+          );
+          break;
+        }
+        await c.execute({ sql: `DELETE FROM ${table} WHERE at <= ?`, args: [lastAt] });
+        out.archived += rows.length;
+      }
+    }
+    return out;
+  }
+
+  /**
    * In-memory mirror of history_last_prune: the prune check used to read
    * worker_state on EVERY insert, adding a Turso round-trip to the tick's
    * completion path (which must fit in the ~30s wall clock — observed
@@ -4492,19 +4570,28 @@ export class Db {
     this.lastHistoryPruneCheckAt = Date.now();
     const lastPrune = await this.getWorkerState("history_last_prune");
     if (!lastPrune || Date.now() - Number(lastPrune) > 24 * 3600_000) {
-      await c.execute({
-        sql: "DELETE FROM scan_history WHERE at < ?",
-        args: [Date.now() - 30 * 24 * 3600_000],
-      });
-      // tick_legs keeps THREE days, not thirty: one row per tick is ~2,900/day,
-      // and every question the table exists for is "what happened in the last
-      // few hours". Three days still covers a weekend of forensics without the
-      // table becoming the largest thing in a 16MB database.
-      await c.execute({
-        sql: "DELETE FROM tick_legs WHERE at < ?",
-        args: [Date.now() - 72 * 3600_000],
-      });
-      await this.setWorkerState("history_last_prune", String(Date.now()));
+      const pruneNow = Date.now();
+      if (this.archive) {
+        // Archive-then-delete (2026-10-17): the export has ALREADY deleted
+        // exactly what it wrote, so the bulk DELETEs below must not run — they
+        // would take the rows the export did not reach (a first run's 72-hour
+        // backlog, or a table whose put failed).
+        await this.archiveColdRows(pruneNow);
+      } else {
+        await c.execute({
+          sql: "DELETE FROM scan_history WHERE at < ?",
+          args: [pruneNow - COLD_SCAN_HISTORY_RETAIN_MS],
+        });
+        // tick_legs keeps THREE days, not thirty: one row per tick is ~2,900/day,
+        // and every question the table exists for is "what happened in the last
+        // few hours". Three days still covers a weekend of forensics without the
+        // table becoming the largest thing in a 16MB database.
+        await c.execute({
+          sql: "DELETE FROM tick_legs WHERE at < ?",
+          args: [pruneNow - COLD_TICK_LEGS_RETAIN_MS],
+        });
+      }
+      await this.setWorkerState("history_last_prune", String(pruneNow));
     }
   }
 

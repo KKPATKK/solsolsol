@@ -206,8 +206,20 @@ const SCAN_TIMEOUT_MS = 25_000;
  * 2026-09-28 (measured, same day): the rotation slice was doubled alongside
  * these caps and REVERTED — it bought judgments of the pool's dead-liquidity
  * tail, not candidates (see the RE_EVAL_PER_TICK_MAX note for the numbers).
+ *
+ * 2026-10-17 (8_000 → 9_600): the same trade as 2026-09-28, made on a
+ * measurement. A 240-tick audit (14:53–16:59Z) found three ticks whose
+ * meteora/gecko leg returned 0 coins after reading 1,558ms — the 1_600ms feed
+ * deadline minus dispatch overhead — while meteora's own p95 was 1,306ms, i.e.
+ * the ceiling sat INSIDE the normal distribution rather than above it. The
+ * tick spends ~2s of its 20s budget and the race window is ~15.5s, so this
+ * 1_600ms is wall time the invocation would otherwise leave idle.
+ * SCAN_GATE_RESERVE_MS is unchanged at 1_600 and the front caps grow by 1_200
+ * (FEED_DEADLINE_MS 2_800 + POOL_FETCH_BUDGET_MS 2_400 + PAIRS_FETCH_BUDGET_MS
+ * 2_000 = 7_200, inside the 8_000ms window with 800ms left for the gate
+ * chain).
  */
-export const SCAN_TICK_DEADLINE_MS = 8_000;
+export const SCAN_TICK_DEADLINE_MS = 9_600;
 /**
  * Subrequests the scan refuses to spend on OPTIONAL work, so the tick's tail
  * still fits (`SCAN_SUBREQ_FLOOR`).
@@ -993,11 +1005,26 @@ const FLURRY_ANALYZE_CAP_MS = 1_500;
  * nearly every minute, and the legs that lose that race are the slower
  * momentum ones (jupTrend / geoTrend / boosts), so partial feed counts were
  * the routine reading rather than the exception.
+ *
+ * 2026-10-17 (1_600 → 2_800): 1_600 was still cutting real legs. The 240-tick
+ * audit found three ticks whose meteora/gecko leg read 1,558ms — the cap minus
+ * dispatch overhead — and returned 0 coins; meteora's p95 was 1,306ms, i.e.
+ * the ceiling was part of the normal distribution, not an outlier. The front
+ * window is 8_000ms now (SCAN_TICK_DEADLINE_MS 9_600 - gate reserve 1_600) and
+ * the tick uses ~2s of its 20s budget, so the extra 1_200ms is idle wall time
+ * spent on coverage rather than on a queue. The sum of the front caps (FEED
+ * 2_800 + POOL_FETCH_BUDGET_MS 2_400 + PAIRS_FETCH_BUDGET_MS 2_000 = 7_200)
+ * still fits the 8_000ms window with 800ms of slack for the gate chain.
  */
-const FEED_DEADLINE_MS = 1_600;
+const FEED_DEADLINE_MS = 2_800;
 /**
  * The BOOSTS list leg's OWN window (2026-10-03) — not the shared feed
- * deadline's, because the shared one can never hold this leg's worst case.
+ * deadline's, because the shared one could not hold this leg's worst case
+ * when this was written (1_600ms against the leg's 1_680ms ceiling). The
+ * shared deadline is 2_800ms since 2026-10-17, i.e. above that ceiling now,
+ * but this window stays: it is the bound the leg's own arithmetic sized, and
+ * re-pointing the leg at a constant that moves for other reasons would let a
+ * feed-deadline change silently retune this one.
  *
  * WHY (see BOOST_FEED_SELF_BUDGET_MS for the mechanism): the boosts budget is
  * its queue SLOT plus one attempt, and the slot is set by the tick's FIRST
@@ -1017,15 +1044,16 @@ const FEED_DEADLINE_MS = 1_600;
  * So the old cap bought no headroom for anything and cost the tick its entire
  * boosts list. 2_000 holds the ceiling arithmetic (1680) with ~320ms of slack
  * for the pre-feed steps (live `preFeedMs` 7-62ms) and keeps the front's cap
- * sum inside FRONT_PHASE_WINDOW_MS (2_000 + POOL_FETCH_BUDGET_MS 2_400 +
- * PAIRS_FETCH_BUDGET_MS 2_000 = 6_400), which is the property
+ * sum inside FRONT_PHASE_WINDOW_MS (FEED_DEADLINE_MS 2_800 +
+ * POOL_FETCH_BUDGET_MS 2_400 + PAIRS_FETCH_BUDGET_MS 2_000 = 7_200, in the
+ * 8_000ms window since 2026-10-17), which is the property
  * SCAN_GATE_RESERVE_MS exists to preserve.
  *
  * THE COST, NAMED: on a ceiling tick the feed phase can now run to ~1680ms
  * instead of ending the instant the leg was dropped, so the pair phase STARTS
  * later by about one gap + an attempt. What it does not lose is window: the
  * pair phase begins after the feed/pool joins (~2.4s worst case), its own cap
- * is PAIRS_FETCH_BUDGET_MS 2_000, and FRONT_PHASE_WINDOW_MS is 6_400 — so its
+ * is PAIRS_FETCH_BUDGET_MS 2_000, and FRONT_PHASE_WINDOW_MS is 8_000 — so its
  * 2_000ms still fit with seconds to spare and the gates' reserve
  * (SCAN_GATE_RESERVE_MS) is untouched. The reading that moves is `feedsMs`:
  * it can reach ~1_680ms on a ceiling tick where it used to cap at the 1_600ms
@@ -1094,8 +1122,8 @@ export const BOOST_FEED_WINDOW_MS =
  * the whole failure this raise exists to remove; above it, a failed read
  * arrives as an ERROR and can be answered with the last good pool (see
  * src/poolfallback.ts) instead of costing the tick. The worst case still fits
- * the front window (FEED_DEADLINE_MS 1_600 + 2_400 = 4_000 <
- * FRONT_PHASE_WINDOW_MS 6_400), so it cannot eat the 1_600ms gate reserve.
+ * the front window (FEED_DEADLINE_MS 2_800 + 2_400 = 5_200 <
+ * FRONT_PHASE_WINDOW_MS 8_000), so it cannot eat the 1_600ms gate reserve.
  *
  * 2026-09-28 (1_600 → 2_400, Workers Paid): live `summary.poolMs` reads
  * 159–518ms, so this is not what a healthy tick spends — it is the ceiling a
@@ -5586,7 +5614,7 @@ export class Scanner {
       // Clamped to the FRONT's shared window (see frontDeadline), like every
       // other front-phase cap: the pool read and the prune are front phases,
       // and their 2400ms is one of the terms that window has to hold. Healthy
-      // ticks are unchanged (2400 < 6400); the clamp only bites on a tick that
+      // ticks are unchanged (2400 < 8000); the clamp only bites on a tick that
       // is already late, which is exactly the tick that used to lose the race.
       const poolDeadline = Math.min(poolNow + POOL_FETCH_BUDGET_MS, frontDeadline);
       const poolMinAgeMin = Math.min(...chats.map((c) => c.minAgeMinutes));

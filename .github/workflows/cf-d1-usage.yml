@@ -1,0 +1,48 @@
+name: D1 usage (rows written / read)
+
+# WHY (2026-10-17): the $5 plan's one scarce resource is D1 rows WRITTEN. The
+# 2026-10-16 measurement put it at 30.1M of 50M (60%) while requests sat at 5%
+# and CPU at ~32-38%, and every cadence decision (20s vs 30s) turns on that
+# number. This workflow turns the one-off arithmetic into a daily reading: the
+# D1 GraphQL dataset carries rowsWritten/rowsRead per day, and the deploy
+# workflow's existing token can already read account analytics.
+#
+# It is a READ-ONLY probe. It never deploys, never writes D1, and fails only
+# when it cannot ask Cloudflare at all.
+on:
+  # Daily, :17 — deliberately off the hour and off cf-invocations' :07/:37 so
+  # the two analytics jobs never share a minute.
+  schedule:
+    - cron: "17 1 * * *"
+  # Path-scoped so touching the probe itself runs it immediately (the schedule
+  # is the only trigger a read-only integration can cause).
+  push:
+    paths:
+      - ".github/workflows/cf-d1-usage.yml"
+      - "scripts/cf-d1-usage.mjs"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Days back to query (1-90)"
+        required: false
+        default: "30"
+
+jobs:
+  usage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Query d1AnalyticsAdaptiveGroups
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DAYS: ${{ inputs.days || '30' }}
+        run: node scripts/cf-d1-usage.mjs

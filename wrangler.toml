@@ -1120,3 +1120,43 @@ AXIOM_ENABLED = "0"
 # no session to keep alive while AXIOM_ENABLED is 0 (the Action's schedule is
 # commented out for the same reason). Set BOTH back to "1" when reviving.
 AXIOM_EXTERNAL_REFRESH = "0"
+
+# ---------------------------------------------------------------------------
+# WORKERS ANALYTICS ENGINE — the scan metrics dataset (2026-10-17).
+#
+# A BINDING, not a var: `env.TELEMETRY.writeDataPoint(...)` from src/worker.ts
+# (the builder is src/scanmetrics.ts). One point per tick (~2,880/day, 0.09M/
+# month against the paid plan's 10M) with the tick's ms, feed counts, candidates
+# and pushed, plus each running feed leg's wall time — the same numbers
+# tick_legs holds, but in a dataset with a SQL API and a 30-day+ window instead
+# of D1's 72-hour retention.
+#
+# WHY IT IS SAFE TO SHIP BEFORE ANYONE READS IT: an unbound dataset is a no-op
+# (`env.TELEMETRY` is undefined and the write is skipped), and the dataset is
+# created by Cloudflare on the first write. `/health.telemetryBound` says
+# whether this deployment actually carries it.
+[[analytics_engine_datasets]]
+binding = "TELEMETRY"
+dataset = "scan_metrics"
+
+# ---------------------------------------------------------------------------
+# R2 COLD ARCHIVE — deliberately NOT bound here.
+#
+# The code path is live (src/coldarchive.ts + Db.archiveColdRows): before the
+# 30-day scan_history / 72-hour tick_legs prune, rows are written to R2 as
+# NDJSON and only then deleted. But `wrangler deploy` refuses a binding whose
+# bucket does not exist, and this account's API token currently cannot list R2
+# (measured 2026-10-17: `wrangler r2 bucket list` → Authentication error
+# 10000), so committing a binding here would break the next deploy.
+#
+# The deploy workflow therefore injects this block only when the token can
+# reach/create the bucket (scripts/r2-bind.js; best-effort, never blocks a
+# release). To turn the archive on:
+#   1. give the CLOUDFLARE_API_TOKEN the R2:Edit permission, and
+#   2. push — the workflow creates `solana-meme-bot-cold` and appends:
+#        [[r2_buckets]]
+#        binding = "ARCHIVE"
+#        bucket_name = "solana-meme-bot-cold"
+#   3. `/health.archiveBound` flips to true; the next daily prune exports.
+# Without the permission the prune keeps its original bulk DELETE (no data
+# loss beyond the retention it already had), which is why this is safe.

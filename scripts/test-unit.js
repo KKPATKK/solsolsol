@@ -152,11 +152,12 @@ async function main() {
     );
     // The scan's own deadline (SCAN_TICK_DEADLINE_MS) is what a healthy tick
     // is actually bounded by, so the headroom between the two is the pre-race
-    // budget: 800ms under the free envelope, 7_500ms under the paid one. Past
+    // budget: 5_900ms under the paid envelope (the deadline went 8_000 → 9_600
+    // on 2026-10-17 to widen the front window, not to spend the race). Past
     // that, the race — not the scan's deadline — decides where the sweep stops.
     assert.equal(
       SCAN_TICK_BUDGET_MS - SCAN_FLUSH_RESERVE_MS - SCAN_TICK_DEADLINE_MS,
-      7_500,
+      5_900,
     );
   });
 
@@ -7912,9 +7913,11 @@ async function main() {
       await scan;
       const elapsed = Date.now() - t0;
       assert.ok(settled, "the tick must settle instead of being held by a wedged leg");
-      // The FRONT window (6400ms) plus slack for the front's own write. Pre-fix
-      // this tick sat past 8s on the backfill leg alone, and live it sat past
-      // 13s — which is what made the worker's 15.2s race cut it every minute.
+      // The FRONT window is where the clamped legs stop (8_000ms since
+      // 2026-10-17; 6_400ms when this was written), so a clamped tick settles
+      // well inside it. Pre-fix this tick sat past 8s on the backfill leg
+      // alone, and live it sat past 13s — which is what made the worker's
+      // 15.2s race cut it every minute.
       assert.ok(elapsed < 7_000, `runOnce took ${elapsed}ms — the front's caps are not clamped to the window`);
       assert.ok(scanner.lastSummary, "the tick still publishes a summary instead of being cut");
       // The stage that spent the time names ITSELF to the worker's cut clause:
@@ -7956,8 +7959,9 @@ async function main() {
       await scanner.runOnce();
       assert.equal(typeof seenDeadline, "number", "the scanner must pass its front deadline");
       assert.ok(seenDeadline > t0, "and it must be in the future when the phase starts");
-      // The front window is 6400ms into the scan; allow the scan's own start
-      // offset plus slack, but nothing near the 15.2s race window.
+      // The front window is 8_000ms into the scan (6_400ms when this was
+      // written); allow the scan's own start offset, but nothing near the
+      // 15.2s race window.
       assert.ok(seenDeadline - t0 < 9_000, `front deadline ${seenDeadline - t0}ms out — not the front window`);
       // The JUPITER fallback is the other network leg of this phase, and it was
       // the last one still outside the window (2026-10-01 follow-up): it was
@@ -9527,7 +9531,8 @@ async function main() {
     // CARD_SEND_TAIL_MS is SCAN_TICK_DEADLINE_MS + 200 (scanner.ts): a send may
     // run 200ms past the tick's internal deadline and no further. Both numbers
     // are read off the constant here rather than copied, so the 2026-09-28
-    // raise to 8_000 moves this test with it instead of breaking it.
+    // raise to 8_000 — and the 2026-10-17 raise to 9_600 — move this test with
+    // it instead of breaking it.
     const tail = t0 + SCAN_TICK_DEADLINE_MS + 200;
     // Healthy: unchanged from the pre-fix behaviour — the send still runs to
     // the tick's own internal deadline, because the floor is only a minimum
@@ -9547,8 +9552,11 @@ async function main() {
     // not (the card is deferred, not dropped).
     assert.equal(cardSendDeadline(t0, tail - 250), tail);
     assert.equal(cardSendDeadline(t0, tail - 249), null);
-    // A tick already past the tail can never start one.
-    assert.equal(cardSendDeadline(t0, t0 + 9_000), null);
+    // A tick already past the tail can never start one. `deadline + 100` is
+    // past the tick deadline and leaves only 100ms of the 200ms tail, i.e.
+    // under the 250ms least slice — read off the constant, not hard-coded, so
+    // the boundary tracks SCAN_TICK_DEADLINE_MS.
+    assert.equal(cardSendDeadline(t0, t0 + SCAN_TICK_DEADLINE_MS + 100), null);
     assert.equal(cardSendDeadline(t0, tail + 1), null);
   });
 
@@ -23889,13 +23897,14 @@ async function main() {
     // it comes from the LOCAL, never from module state: the pass's own
     // delivery lands on this isolate and overwrites module-scope readings
     // (measured: a tick's done heartbeat published owner:"pass").
-    // THREE sites since the 2026-10-02 tick-leg ring: both heartbeats plus
+    // FOUR sites since the 2026-10-17 Analytics Engine point: both heartbeats,
     // the ring row the flush records (a slow tick's split must keep its
-    // trigger, or "cron vs fallback" is lost with the leg detail).
+    // trigger, or "cron vs fallback" is lost with the leg detail), and the AE
+    // data point (the long-window copy of the same attribution).
     assert.equal(
       workerSrc.split("via:scanVia,").length - 1,
-      3,
-      "both heartbeats carry via, and the tick-leg ring row names its trigger",
+      4,
+      "both heartbeats, the tick-leg ring row and the AE point name their trigger",
     );
     assert.ok(workerSrc.includes("constscanVia:ScanTrigger=via;"), "via is captured as a local");
     // ...and the completion batch is told which counter to increment: the tag
