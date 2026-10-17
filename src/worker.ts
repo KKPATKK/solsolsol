@@ -678,6 +678,118 @@ let initPromise: Promise<void> | null = null;
  */
 const initBoot: { pendingSince: number } = { pendingSince: 0 };
 
+/**
+ * Telegram inbound SELF-HEAL (2026-10-17).
+ *
+ * The bot's inbound channel is not a file in this repo: it is Telegram's own
+ * webhook registration, and until this block existed nothing owned it. It had
+ * been set once by hand through `/debug/webhook?set=1` and stayed external to
+ * every deploy. On 2026-10-17 the registration was GONE — `getWebhookInfo`
+ * answered `url: ""` — while the Worker kept pushing cards (outbound needs no
+ * webhook), so every tap on a card's `🔕 停止追蹤` was delivered NOWHERE and
+ * the button looked dead: the callback never reached src/bot.ts's handler.
+ * Nothing else in the system can notice that: the tick is healthy, /health is
+ * `ok`, and cards still arrive.
+ *
+ * So the Worker now READS the registration and re-points it at its own
+ * `/webhook` route when it is missing or has moved. One getWebhookInfo and, at
+ * worst, one setWebhook per maintenance delivery (5 min) — no binding, no
+ * durable row, no new cron. `allowed_updates` is deliberately NOT sent: the
+ * default set includes `callback_query`, and naming a subset is exactly how a
+ * live bot ends up receiving messages but not button taps.
+ */
+export const TELEGRAM_WEBHOOK_PATH = "/webhook";
+/** Upper bound on the self-heal's own network work (it never gates a tick). */
+export const WEBHOOK_HEAL_BOUND_MS = 4_000;
+/** What the last self-heal attempt found, read by /debug/webhook. */
+export const webhookHeal: { at: number; url: string | null; result: string | null } = {
+  at: 0,
+  url: null,
+  result: null,
+};
+
+/** `base` may carry a trailing slash; the route is always `<origin>/webhook`. */
+export function telegramWebhookUrl(base: string): string {
+  return `${base.replace(/\/+$/, "")}${TELEGRAM_WEBHOOK_PATH}`;
+}
+
+/**
+ * Ensure Telegram points at `base`'s /webhook route. Pure apart from the two
+ * Telegram calls it makes through `fetchImpl`, so the behaviour is unit-tested
+ * against a stub instead of only being observed live. Never throws: a broken
+ * check logs and reports `failed`, because a dead webhook registration must
+ * not take a maintenance delivery (or anything else) down with it.
+ */
+export async function ensureTelegramWebhook(
+  fetchImpl: typeof fetch,
+  base: string | undefined,
+  token: string | undefined,
+  log: (line: string) => void = (line) => console.log(line),
+): Promise<"ok" | "set" | "skipped" | "failed"> {
+  if (!base || !token) return "skipped";
+  const want = telegramWebhookUrl(base);
+  try {
+    const infoRes = await fetchImpl(
+      `https://api.telegram.org/bot${token}/getWebhookInfo`,
+    );
+    const info = (await infoRes.json()) as {
+      ok?: boolean;
+      result?: { url?: string };
+    };
+    const current = info?.result?.url ?? "";
+    if (info?.ok === true && current === want) return "ok";
+    const setRes = await fetchImpl(
+      `https://api.telegram.org/bot${token}/setWebhook`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: want }),
+      },
+    );
+    const setJson = (await setRes.json()) as { ok?: boolean; description?: string };
+    if (setJson?.ok !== true) {
+      log(
+        `[worker] telegram webhook re-registration REFUSED (${current || "none"} -> ${want}): ${setJson?.description ?? "no description"}`,
+      );
+      return "failed";
+    }
+    log(`[worker] telegram webhook re-registered (${current || "none"} -> ${want})`);
+    return "set";
+  } catch (err) {
+    log(
+      `[worker] telegram webhook check failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return "failed";
+  }
+}
+
+/**
+ * The bounded, recorded form of the check the maintenance delivery runs (see
+ * runMaintenanceInvocation). Bounded because nothing here may outlive the
+ * delivery's budget, and recorded because "the heal ran" has to be readable
+ * from outside the isolate — `/debug/webhook` reports it.
+ */
+async function maybeHealTelegramWebhook(env: Env): Promise<void> {
+  webhookHeal.at = Date.now();
+  webhookHeal.url = env.CRON_RELAY_URL ? telegramWebhookUrl(env.CRON_RELAY_URL) : null;
+  try {
+    webhookHeal.result = await Promise.race([
+      ensureTelegramWebhook(fetch, env.CRON_RELAY_URL, env.TELEGRAM_BOT_TOKEN),
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve("timeout"), WEBHOOK_HEAL_BOUND_MS),
+      ),
+    ]);
+  } catch (err) {
+    // ensureTelegramWebhook does not throw; this is the belt-and-braces arm
+    // for anything the race itself could reject with.
+    webhookHeal.result = "failed";
+    console.warn(
+      "[worker] telegram webhook self-heal failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
 // Diagnostics surfaced via /health so the state of the serverless runtime can
 // be observed directly (no terminal access to the isolate).
 let dbReady = false;
@@ -4992,6 +5104,13 @@ async function runMaintenanceInvocation(
   const initAt = Date.now();
   await recoveryAwait(ensureInitialized(env), FRONT_INIT_BOUND_MS, "init");
   preTick.steps.init = Date.now() - initAt;
+  // Telegram inbound self-heal (see ensureTelegramWebhook): this delivery is
+  // the one invocation whose result nobody waits on, so the check lives here
+  // rather than in a tick's front path or in init (which is bounded at 3.5s).
+  // It runs BEFORE the scanner gate on purpose — a cut init is exactly when
+  // nothing else would notice the bot has no inbound channel — and it never
+  // throws.
+  await maybeHealTelegramWebhook(env);
   // No scanner = init failed or was cut. Nothing to do and nothing to record:
   // this delivery is not a scan arrival, and the row it would have written is
   // what tells the tick to fall back — which it will, on the next tick.
@@ -9236,7 +9355,12 @@ const worker = {
         }
         const r = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`);
         const j: unknown = await r.json();
-        return Response.json({ ok: true, telegram: j });
+        // `selfHeal` is the maintenance delivery's last attempt (see
+        // ensureTelegramWebhook): an empty `telegram.result.url` together with
+        // `selfHeal.result` says whether the Worker has noticed and re-pointed
+        // it, which is the difference between "nobody has run the check yet"
+        // and "Telegram refuses the registration".
+        return Response.json({ ok: true, selfHeal: webhookHeal, telegram: j });
       } catch (err) {
         return Response.json({
           ok: false,

@@ -24831,6 +24831,131 @@ async function main() {
     );
   });
 
+  // ---------- telegram inbound self-heal (src/worker.ts) ----------
+  //
+  // Live 2026-10-17: `getWebhookInfo` answered `url: ""` while the Worker kept
+  // pushing cards, so a tap on a card's `🔕 停止追蹤` was delivered nowhere and
+  // the button read as dead. The handler in src/bot.ts was fine — the callback
+  // never arrived. Outbound works without a registration, so nothing else can
+  // notice; the check below is what makes it self-healing rather than a manual
+  // call to /debug/webhook?set=1.
+  await test("telegram inbound: a missing webhook is re-pointed at this Worker's own route", async () => {
+    const {
+      ensureTelegramWebhook,
+      telegramWebhookUrl,
+      TELEGRAM_WEBHOOK_PATH,
+    } = require("../dist/worker.js");
+
+    // The route is the Worker's own, and a trailing slash on the configured
+    // origin cannot produce `//webhook` (Telegram answers 400 for that).
+    assert.equal(TELEGRAM_WEBHOOK_PATH, "/webhook");
+    assert.equal(telegramWebhookUrl("https://w.example"), "https://w.example/webhook");
+    assert.equal(telegramWebhookUrl("https://w.example/"), "https://w.example/webhook");
+
+    // No origin or no token = nothing to check and NOT ONE request. This is
+    // also what keeps the routing tests above offline: they boot the worker
+    // without CRON_RELAY_URL.
+    const never = async () => {
+      throw new Error("a skipped check must make no request");
+    };
+    assert.equal(await ensureTelegramWebhook(never, undefined, "bot:t"), "skipped");
+    assert.equal(await ensureTelegramWebhook(never, "https://w.example", undefined), "skipped");
+
+    // The live shape (empty registration) → exactly one setWebhook, pointed at
+    // the Worker and carrying NO allowed_updates: the default set includes
+    // callback_query, and naming a subset is how a bot ends up receiving
+    // messages but not button taps.
+    const reqs = [];
+    const emptyThenSet = async (url, init) => {
+      reqs.push({ url: String(url), init });
+      return { json: async () => (init ? { ok: true } : { ok: true, result: { url: "" } }) };
+    };
+    assert.equal(
+      await ensureTelegramWebhook(emptyThenSet, "https://w.example/", "bot:t"),
+      "set",
+    );
+    assert.equal(reqs.length, 2, "one read, then the single write");
+    assert.ok(reqs[0].url.endsWith("/getWebhookInfo"), reqs[0].url);
+    assert.ok(reqs[1].url.endsWith("/setWebhook"), reqs[1].url);
+    assert.equal(reqs[1].init.method, "POST");
+    assert.deepEqual(JSON.parse(reqs[1].init.body), {
+      url: "https://w.example/webhook",
+    });
+
+    // A moved registration (the host changed) is corrected too, and a correct
+    // one costs only the read — no write on every delivery.
+    const moved = [];
+    const movedStub = async (url, init) => {
+      moved.push({ url: String(url), init });
+      return {
+        json: async () =>
+          init ? { ok: true } : { ok: true, result: { url: "https://old.example/webhook" } },
+      };
+    };
+    assert.equal(await ensureTelegramWebhook(movedStub, "https://w.example", "bot:t"), "set");
+    assert.equal(moved.length, 2);
+    assert.deepEqual(JSON.parse(moved[1].init.body), { url: "https://w.example/webhook" });
+
+    const correct = [];
+    const correctStub = async (url, init) => {
+      correct.push({ url: String(url), init });
+      return { json: async () => ({ ok: true, result: { url: "https://w.example/webhook" } }) };
+    };
+    assert.equal(await ensureTelegramWebhook(correctStub, "https://w.example", "bot:t"), "ok");
+    assert.equal(correct.length, 1, "an already-correct registration is read-only");
+
+    // Telegram refusing (a bad token) and a thrown check are both REPORTS: a
+    // dead registration must never take the delivery that noticed it down.
+    const refuse = async (url, init) => ({
+      json: async () =>
+        init ? { ok: false, description: "Unauthorized" } : { ok: true, result: { url: "" } },
+    });
+    assert.equal(
+      await ensureTelegramWebhook(refuse, "https://w.example", "bot:t", () => {}),
+      "failed",
+    );
+    assert.equal(
+      await ensureTelegramWebhook(
+        async () => {
+          throw new Error("boom");
+        },
+        "https://w.example",
+        "bot:t",
+        () => {},
+      ),
+      "failed",
+    );
+  });
+
+  await test("telegram inbound: the check rides the maintenance delivery, not a tick's front path", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "src", "worker.ts"),
+      "utf8",
+    );
+    const fnAt = src.indexOf("async function runMaintenanceInvocation(");
+    assert.ok(fnAt > 0, "the maintenance invocation must exist");
+    const callAt = src.indexOf("await maybeHealTelegramWebhook(env);", fnAt);
+    assert.ok(callAt > fnAt, "the delivery must run the check");
+    // BEFORE the scanner gate: a cut init is exactly when nothing else would
+    // notice the bot has no inbound channel.
+    const gateAt = src.indexOf("if (!scanner) return;", fnAt);
+    assert.ok(callAt < gateAt, "the check must run even when init was cut");
+    // Exactly one call site. Inside ensureInitialized it would spend part of
+    // the tick's 3.5s FRONT_INIT_BOUND_MS; anywhere in a tick it competes with
+    // the card chain for wall clock the delivery does not need.
+    assert.equal(
+      src.split("maybeHealTelegramWebhook(env)").length - 1,
+      1,
+      "one call site, on the delivery whose result nobody waits on",
+    );
+    // And the reading is reachable from outside the isolate, or "the heal ran"
+    // is only a log line in an isolate nobody can inspect.
+    assert.ok(
+      src.includes("selfHeal: webhookHeal"),
+      "/debug/webhook must report the last attempt",
+    );
+  });
+
   await test("db write census: rows are attributed to the statement's verb + table", async () => {
     const {
       writeCensusKey,
