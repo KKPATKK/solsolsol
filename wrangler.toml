@@ -407,8 +407,9 @@ SCAN_PROFILE_LIMIT = "200"
 # starts appearing in subreqSkip.
 # OFF SINCE 2026-10-17 (was 30). WHAT IT COST, measured over 240 ticks that
 # day: the lane was the LONGEST feed leg in the tick's join (997ms in the leg
-# ring — it set the feed phase's upper bound) and it produced NO new coin in
-# that 1.9h window. WHAT IT WAS WORTH, over the 24h around the same reading:
+# ring — it set the feed phase's upper bound) and it produced ONE new coin in
+# that 1.9h window (the profiles lane produced two). WHAT IT WAS WORTH, over
+# the 24h around the same reading:
 # `token_stats.discovered_via='boosts'` 23 coins, best `max_mcap_observed`
 # $639K, and 4 pushes all-time — i.e. ~1 coin/hour for one request every tick.
 # That is the trade being made: the cadence knob below brings the lane back at
