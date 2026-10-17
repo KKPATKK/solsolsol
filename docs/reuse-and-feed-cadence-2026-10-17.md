@@ -241,7 +241,7 @@ After 窗口由 deploy（`05:12:33Z`）之後累積滿 240 個 tick 才讀；`ro
 `05:15:37.878–07:21:39.136Z`，所以冇一行係 before。兩邊都係同一支 command：
 
 ```
-node scripts/tick-metrics.mjs durable --label before --rows 240   # 01:48–03:41Z
+node scripts/tick-metrics.mjs durable --label before --rows 240   # 01:46–03:41Z
 node scripts/tick-metrics.mjs durable --label after  --rows 240   # 05:13–07:20Z
 ```
 
@@ -267,7 +267,7 @@ node scripts/tick-metrics.mjs durable --label after  --rows 240   # 05:13–07:2
   係 §4.3 嘅 `cadenceSkips`。
 - **pushed 2 vs 3**：同一個 2 小時量級、同一張卡池，仍然有卡出；`candidates 92 → 57`  係市場供給，
   唔係 gate 加嚴 —— 同一日嘅 30 分鐘桶由 **1 到 91** 都出現過（§4.4 嘅 10 分鐘序列亦一樣），
-  而兩個窗口相隔 3 個鐘（01:48 vs 05:13），唔係同一批幣。
+  而兩個窗口相隔 3 個鐘（01:46 vs 05:15），唔係同一批幣。
 
 **(b) 補充：等長、相鄰嘅窗口（79 vs 79 ticks，同一小時）**，用嚟排除「時段唔同」：
 
