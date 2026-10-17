@@ -1528,6 +1528,69 @@ export function parsePushAuditRing(
 }
 
 /**
+ * One tick's per-leg row, as `tick_legs` stores it (2026-10-17).
+ *
+ * THE QUESTION THIS ROW EXISTS FOR is the one two audits in one day could not
+ * answer: "did every feed scan in the last four hours, and which tick was
+ * slow". `scan_history` has eight columns and the per-leg ring lives in one
+ * isolate's memory, so both answers needed sampling luck. Every field is a
+ * summary reading — nullable because a cut tick publishes fewer of them than a
+ * completed one; a null is "the tick never got that far", never a zero.
+ */
+export interface TickLegInsert {
+  /** Epoch ms of the tick — the same value scan_history stores. PK. */
+  at: number;
+  /** Which invocation ran it (cron | clock | http | manual). */
+  via: string | null;
+  ms: number | null;
+  profiles: number | null;
+  pool: number | null;
+  pairs: number | null;
+  /** Pairs the Jupiter fallback supplied (see ScanSummary.pairsJup). */
+  pairsJup: number | null;
+  /** Discovery legs' coin counts, by feed. */
+  jup: number | null;
+  pump: number | null;
+  meteora: number | null;
+  raydium: number | null;
+  geo: number | null;
+  boosts: number | null;
+  /** Per-leg wall ms ({<FeedLeg>: ms}) — the field the ring measured. */
+  feedLegs: Record<string, number | undefined> | null;
+  candidates: number | null;
+  pushed: number | null;
+  /** Jupiter card read's reason for THIS tick's last card (see ScanSummary). */
+  organicWhy: string | null;
+}
+
+function numOrNull(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * `tick_legs.feed_legs` → the map it was written from. Tolerant: a malformed
+ * value is "no per-leg reading" (null), not a failed read — the same stance
+ * parsePushAuditRing takes, and for the same reason.
+ */
+export function parseFeedLegs(raw: unknown): Record<string, number> | null {
+  if (typeof raw !== "string" || raw === "") return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      const n = numOrNull(v);
+      if (n !== null) out[k] = n;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Every token with an "initial" audit entry, out of an ALREADY-PARSED ring
  * (see parsePushAuditRing). The rule lives here so Db.getInitialPushAuditTokens
  * and the tracker heal's carried read cannot drift — they answer the same
@@ -2672,6 +2735,41 @@ export class Db {
           pushed INTEGER
         );`,
         `CREATE INDEX IF NOT EXISTS idx_scan_history_at ON scan_history(at);`,
+        // PER-TICK LEG HISTORY (2026-10-17). scan_history carries eight
+        // columns — enough for "the tick ran", never for "which feed was
+        // silent at 04:00". The only per-leg record was the isolate's 120-row
+        // in-memory ring, and /debug/tick-legs proved it twice in one day: an
+        // HTTP read lands on an isolate that never ticked and returns 0-1
+        // rows, so two audits of "did every feed scan" had to sample /health
+        // and hope. One row per tick (~2,880/day) is +0.9% of the D1 rows-written
+        // allowance — the cheapest durable answer this project can buy.
+        //
+        // `at` is the PRIMARY KEY because a tick IS its timestamp (the same
+        // `at` scan_history uses): a flush retried after a committed-but-lost
+        // response REPLACEs its own row instead of duplicating it.
+        //
+        // `feed_legs` is JSON ({<FeedLeg>: ms}) rather than five columns: the
+        // roster changes with the phase (gecko/geoTrend/backfill come and go),
+        // and D1's SQLite answers json_extract() when a query needs one leg.
+        `CREATE TABLE IF NOT EXISTS tick_legs (
+          at INTEGER PRIMARY KEY,
+          via TEXT,
+          ms INTEGER,
+          profiles INTEGER,
+          pool INTEGER,
+          pairs INTEGER,
+          pairs_jup INTEGER,
+          jup INTEGER,
+          pump INTEGER,
+          meteora INTEGER,
+          raydium INTEGER,
+          geo INTEGER,
+          boosts INTEGER,
+          feed_legs TEXT,
+          candidates INTEGER,
+          pushed INTEGER,
+          organic_why TEXT
+        );`,
         // The re-eval pool query filters token_stats by first_seen_at and
         // anti-joins seen_tokens every tick; these indexes keep it fast as
         // both tables grow (token_stats is pruned each tick).
@@ -4209,6 +4307,45 @@ export class Db {
   }
 
   /**
+   * One tick's per-leg row (see the tick_legs schema note). Every field is the
+   * summary's own reading, nullable because a cut tick publishes fewer of them
+   * than a completed one — a null here is "the tick never got that far", never
+   * a zero.
+   */
+  async getTickLegs(
+    opts: { sinceMs?: number; limit?: number } = {},
+  ): Promise<TickLegInsert[]> {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 240));
+    const since = opts.sinceMs ?? 0;
+    const res = await this.get().execute({
+      sql: `SELECT at, via, ms, profiles, pool, pairs, pairs_jup, jup, pump,
+                   meteora, raydium, geo, boosts, feed_legs, candidates,
+                   pushed, organic_why
+            FROM tick_legs WHERE at >= ? ORDER BY at DESC LIMIT ?`,
+      args: [since, limit],
+    });
+    return res.rows.map((r) => ({
+      at: Number(r.at),
+      via: r.via === null ? null : String(r.via),
+      ms: r.ms === null ? null : Number(r.ms),
+      profiles: numOrNull(r.profiles),
+      pool: numOrNull(r.pool),
+      pairs: numOrNull(r.pairs),
+      pairsJup: numOrNull(r.pairs_jup),
+      jup: numOrNull(r.jup),
+      pump: numOrNull(r.pump),
+      meteora: numOrNull(r.meteora),
+      raydium: numOrNull(r.raydium),
+      geo: numOrNull(r.geo),
+      boosts: numOrNull(r.boosts),
+      feedLegs: parseFeedLegs(r.feed_legs),
+      candidates: numOrNull(r.candidates),
+      pushed: numOrNull(r.pushed),
+      organicWhy: r.organic_why === null ? null : String(r.organic_why),
+    }));
+  }
+
+  /**
    * In-memory mirror of history_last_prune: the prune check used to read
    * worker_state on EVERY insert, adding a Turso round-trip to the tick's
    * completion path (which must fit in the ~30s wall clock — observed
@@ -4256,6 +4393,13 @@ export class Db {
      * is counted. Null = do not count (heartbeat-only flushes are not scans).
      */
     via: ScanTrigger | null = null,
+    /**
+     * This tick's per-leg row (see TickLegInsert / the tick_legs schema note).
+     * Rides THIS batch for the same reason `via` does: one row per tick costs
+     * no extra round trip and no extra subrequest, and it commits only when the
+     * completion it describes commits. Null on a heartbeat-only flush.
+     */
+    leg: TickLegInsert | null = null,
   ): Promise<void> {
     const c = this.get();
     const ops: Array<{
@@ -4303,6 +4447,38 @@ export class Db {
         ],
       });
     }
+    if (leg) {
+      // INSERT OR REPLACE, not delete-then-insert: `at` is the PK (a tick IS
+      // its timestamp), so a flush retried after a committed-but-lost response
+      // rewrites its own row instead of failing on the constraint — the same
+      // idempotence the scan_history delete above buys, in one statement.
+      ops.push({
+        sql: `INSERT OR REPLACE INTO tick_legs
+                (at, via, ms, profiles, pool, pairs, pairs_jup, jup, pump,
+                 meteora, raydium, geo, boosts, feed_legs, candidates, pushed,
+                 organic_why)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          leg.at,
+          leg.via,
+          leg.ms,
+          leg.profiles,
+          leg.pool,
+          leg.pairs,
+          leg.pairsJup,
+          leg.jup,
+          leg.pump,
+          leg.meteora,
+          leg.raydium,
+          leg.geo,
+          leg.boosts,
+          leg.feedLegs === null ? null : JSON.stringify(leg.feedLegs),
+          leg.candidates,
+          leg.pushed,
+          leg.organicWhy,
+        ],
+      });
+    }
     await c.batch(ops, "write");
     // Prune gate — cheap on the hot path: one read per hour per isolate at
     // most; the DELETE itself stays gated by the DB timestamp (once/day).
@@ -4319,6 +4495,14 @@ export class Db {
       await c.execute({
         sql: "DELETE FROM scan_history WHERE at < ?",
         args: [Date.now() - 30 * 24 * 3600_000],
+      });
+      // tick_legs keeps THREE days, not thirty: one row per tick is ~2,900/day,
+      // and every question the table exists for is "what happened in the last
+      // few hours". Three days still covers a weekend of forensics without the
+      // table becoming the largest thing in a 16MB database.
+      await c.execute({
+        sql: "DELETE FROM tick_legs WHERE at < ?",
+        args: [Date.now() - 72 * 3600_000],
       });
       await this.setWorkerState("history_last_prune", String(Date.now()));
     }

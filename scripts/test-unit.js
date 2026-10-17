@@ -9868,6 +9868,114 @@ async function main() {
     }
   });
 
+  await test("tick_legs: one row per tick in the completion batch, idempotent by `at`, read by window (2026-10-17)", async () => {
+    // THE QUESTION: "did every feed scan between 04:00 and 06:00, and which
+    // tick was slow". Before this table the only per-leg record was an
+    // isolate's 120-row memory ring — and /debug/tick-legs returned 0-1 rows
+    // twice in one day because an HTTP read lands on an isolate that never
+    // ticked. The row is written in the flush's own batch, so it costs no
+    // extra round trip and cannot land without the completion it describes.
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      const leg = (over = {}) => ({
+        at: now,
+        via: "clock",
+        ms: 942,
+        profiles: 25,
+        pool: 1112,
+        pairs: 202,
+        pairsJup: 184,
+        jup: 30,
+        pump: 20,
+        meteora: 20,
+        raydium: 20,
+        geo: 0,
+        boosts: 0,
+        feedLegs: { profiles: 6, jup: 132, pump: 204, meteora: 259, raydium: 343 },
+        candidates: 1,
+        pushed: 0,
+        organicWhy: "backoff",
+        ...over,
+      });
+      const history = {
+        at: now,
+        ok: true,
+        ms: 942,
+        err: null,
+        profiles: 25,
+        pool: 1112,
+        candidates: 1,
+        pushed: 0,
+      };
+      await db.persistScanCompletion("x", history, null, "clock", leg());
+      let rows = await db.getTickLegs({ limit: 10 });
+      assert.equal(rows.length, 1, "one tick, one row");
+      assert.equal(rows[0].at, now);
+      assert.equal(rows[0].via, "clock");
+      assert.equal(rows[0].pairsJup, 184, "the Jupiter share is what tells a refused pair lane");
+      assert.equal(rows[0].pushed, 0);
+      assert.equal(rows[0].organicWhy, "backoff", "the card-read reason survives the tick");
+      assert.deepEqual(
+        rows[0].feedLegs,
+        { profiles: 6, jup: 132, pump: 204, meteora: 259, raydium: 343 },
+        "the per-leg ms round-trips (JSON column, tolerant parse)",
+      );
+      // A flush retried after a committed-but-lost response re-sends the SAME
+      // `at`: `at` is the primary key, so the retry rewrites its own row.
+      await db.persistScanCompletion("x", history, null, "clock", leg({ ms: 1200 }));
+      rows = await db.getTickLegs({ limit: 10 });
+      assert.equal(rows.length, 1, "a retried flush must not duplicate its tick");
+      assert.equal(rows[0].ms, 1200, "the retry's reading wins");
+      // The window is the whole point: `?hours=` becomes sinceMs.
+      assert.equal((await db.getTickLegs({ sinceMs: now + 1, limit: 10 })).length, 0);
+      assert.equal((await db.getTickLegs({ sinceMs: now - 1, limit: 10 })).length, 1);
+      // A heartbeat-only flush is not a tick: no leg row, no history row.
+      await db.persistScanCompletion("x", null);
+      assert.equal((await db.getTickLegs({ limit: 10 })).length, 1);
+      // A leg row with no feed timings (the ring may not have them) still
+      // reads back as "no per-leg reading", never as an empty object.
+      await db.persistScanCompletion(
+        "x",
+        { ...history, at: now + 1 },
+        null,
+        "cron",
+        leg({ at: now + 1, feedLegs: null, organicWhy: null }),
+      );
+      const two = await db.getTickLegs({ limit: 10 });
+      assert.equal(two.length, 2);
+      assert.equal(two[0].feedLegs, null);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("tick_legs wiring: the tick's flush writes it and /debug/tick-legs reads it", () => {
+    const workerSrc = fs.readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8");
+    // The write rides the SAME call as scan_history (no second round trip on
+    // the wall-clock-critical flush path) and carries the per-leg readings.
+    const flush = workerSrc.slice(workerSrc.indexOf("db?.persistScanCompletion("));
+    const call = flush.slice(0, flush.indexOf("?? Promise.resolve()"));
+    for (const needle of [
+      "scanVia,",
+      "feedLegs: summary.feedLegMs ?? null,",
+      "organicWhy: summary.organicWhy ?? null,",
+      "pairsJup: summary.pairsJup ?? null,",
+    ]) {
+      assert.ok(call.includes(needle), `the flush must hand over ${needle}`);
+    }
+    // The read is the durable half of the route the audits kept asking for.
+    assert.ok(workerSrc.includes("await db?.getTickLegs({"), "the route must read the table");
+    assert.ok(workerSrc.includes("db: durable,"), "and publish it beside `rows`/`slow`");
+    // The table is created by init and pruned with the history row's own gate.
+    const dbSrc = fs.readFileSync(path.join(__dirname, "..", "src", "db.ts"), "utf8");
+    assert.ok(dbSrc.includes("CREATE TABLE IF NOT EXISTS tick_legs"), "init must create it");
+    assert.ok(dbSrc.includes("INSERT OR REPLACE INTO tick_legs"), "the batch write must be idempotent");
+    assert.ok(dbSrc.includes("DELETE FROM tick_legs WHERE at < ?"), "and it must be pruned");
+  });
+
   await test("getScanHistory: newest-first with mapped fields and limit", async () => {
     const t = tmpDb();
     try {
@@ -23791,11 +23899,18 @@ async function main() {
     );
     assert.ok(workerSrc.includes("constscanVia:ScanTrigger=via;"), "via is captured as a local");
     // ...and the completion batch is told which counter to increment: the tag
-    // is the flush call's last argument (whitespace stripped, so the shape is
-    // exact), i.e. the same round trip the flush already pays.
+    // rides the flush call (whitespace stripped, so the shape is exact), i.e.
+    // the same round trip the flush already pays. Since 2026-10-17 the same
+    // call also carries the tick's per-leg row (see tick_legs), which is why
+    // the tag is no longer the LAST argument — what must hold is that the tag
+    // is still handed over inside THIS call, before the leg it precedes.
     assert.ok(
-      workerSrc.includes("scanVia,)??Promise.resolve();"),
+      workerSrc.includes("scanVia,//THEPER-LEGROW"),
       "the flush passes the tag into the completion batch",
+    );
+    assert.ok(
+      workerSrc.includes("feedLegs:summary.feedLegMs??null,"),
+      "and the per-leg row rides the same call, not a second write",
     );
     // The counts /health publishes ride the front statement, so the reading
     // costs no extra subrequest — and a cold isolate primes them at boot.

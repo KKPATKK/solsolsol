@@ -352,6 +352,9 @@ async function main() {
         "scan_history",
         "seen_tokens",
         "sell_log",
+        // One row per tick (2026-10-17) — the copy carries it like any other
+        // table; its `at` primary key makes a re-copy idempotent per tick.
+        "tick_legs",
         "token_stats",
         "trade_log",
         "worker_state",
@@ -404,6 +407,16 @@ async function main() {
   );
   await archive.client.execute(
     "INSERT INTO scan_history (at, ok, ms, err, profiles, pool, candidates, pushed) VALUES (1700000000000, 1, 4000, NULL, 12, 30, 5, 1)",
+  );
+  // PER-TICK LEG HISTORY (2026-10-17): nullable-by-design columns (a cut tick
+  // publishes fewer readings than a completed one), and a JSON column whose
+  // value must survive the copy byte for byte — the same shape the live table
+  // stores.
+  await archive.client.execute(
+    "INSERT INTO tick_legs (at, via, ms, profiles, pool, pairs, pairs_jup, jup, pump, meteora, raydium, geo, boosts, feed_legs, candidates, pushed, organic_why) VALUES (1700000000000, 'clock', 942, 25, 1112, 202, 184, 30, 20, 20, 20, 0, 0, '{\"jup\":132,\"pump\":204}', 1, 0, 'backoff')",
+  );
+  await archive.client.execute(
+    "INSERT INTO tick_legs (at, via, ms, profiles, pool) VALUES (1700000001000, NULL, NULL, NULL, NULL)",
   );
   await archive.client.execute(
     "INSERT INTO chat_settings (chat_id, min_liquidity_usd, enabled) VALUES ('chat-1', 12345, 1)",

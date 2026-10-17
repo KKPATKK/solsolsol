@@ -5981,6 +5981,33 @@ async function runScan(
           // read — so "cron vs fallback" survives this isolate and never
           // depends on module state (see runScan's `via`).
           scanVia,
+          // THE PER-LEG ROW (2026-10-17, see db.TickLegInsert): one row per
+          // tick in the SAME batch, so a "which feed was silent / which tick
+          // was slow" question is a SQL read over three days instead of a
+          // sample of /health. Null on a tick that never published a summary
+          // (cut before the phases ran) — the row's absence is then the
+          // reading, and scan_history already records the cut.
+          summary
+            ? {
+                at: flushedAt,
+                via: scanVia ?? null,
+                ms: flushedMs,
+                profiles: summary.profiles ?? null,
+                pool: summary.pool ?? null,
+                pairs: summary.pairs ?? null,
+                pairsJup: summary.pairsJup ?? null,
+                jup: summary.jup ?? null,
+                pump: summary.pump ?? null,
+                meteora: summary.meteora ?? null,
+                raydium: summary.raydium ?? null,
+                geo: summary.geo ?? null,
+                boosts: summary.boosts ?? null,
+                feedLegs: summary.feedLegMs ?? null,
+                candidates: summary.candidates ?? null,
+                pushed: summary.pushed ?? null,
+                organicWhy: summary.organicWhy ?? null,
+              }
+            : null,
         ) ?? Promise.resolve();
       const flushStartedAt = Date.now();
       // Every await on the flush path is bounded by what is LEFT of the
@@ -7906,6 +7933,32 @@ const worker = {
         // Debug route: an unreadable durable ring must not fail the
         // in-memory half.
       }
+      // THE DURABLE HALF (2026-10-17, tick_legs): `rows` is still THIS
+      // isolate's ring — which is why two audits had to sample /health, since
+      // an HTTP read lands on an isolate that never ticked — and `db` is the
+      // fleet's own per-tick record over the requested window. `?hours=` sets
+      // it (default 6, capped at the table's 72h retention) and `?dbRows=`
+      // sets the row cap; a caller that only wants the ring pays nothing for
+      // it only in CPU terms — the read is one query, same as any debug page.
+      let durable: unknown[] = [];
+      try {
+        const hours = Math.min(
+          72,
+          Math.max(1, Number(url.searchParams.get("hours") ?? 6) || 6),
+        );
+        const dbRows = Math.min(
+          500,
+          Math.max(1, Number(url.searchParams.get("dbRows") ?? 240) || 240),
+        );
+        durable =
+          (await db?.getTickLegs({
+            sinceMs: Date.now() - hours * 3600_000,
+            limit: dbRows,
+          })) ?? [];
+      } catch {
+        // Same stance as the slow ring: a failed durable read must not take
+        // the in-memory half down with it.
+      }
       return Response.json({
         ok: true,
         now: new Date().toISOString(),
@@ -7915,6 +7968,9 @@ const worker = {
         slowCapacity: TICK_LEG_SLOW_RING_SIZE,
         rows: tickLegRows(limit),
         slow,
+        db: durable,
+        dbNote:
+          "tick_legs: one row per tick (at = PK), ?hours= (1-72, default 6) + ?dbRows= (<=500)",
       });
     }
 

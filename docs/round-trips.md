@@ -4401,3 +4401,66 @@ liquidity = 0.0000004 – 12.9 USD
 `npm run build` + full unit suite：**573 passed, 0 failed**。新測試覆蓋：Jupiter 0 / dust /
 $500 邊界（判）、$501 同 $7,950（唔判）、`liquidity: null`（唔判）、
 drained Jupiter pool 會 fail floor、文案分家嘅 source pin。
+
+## 4.66 逐 tick 逐 feed 落 D1：`tick_legs` 一行一個 tick（2026-10-17）
+
+同一日兩次審計都撞同一幅牆。第一次（240 tick 健檢）想答「邊條 feed 停咗／邊個 tick 慢」，
+手上只有：`scan_history` 8 欄（`at/ok/ms/err/profiles/pool/candidates/pushed`）＋
+`/debug/tick-legs` 嘅**記憶體**環（每 isolate 120 tick）——而 HTTP 讀數落到唔會 tick 嘅 isolate，
+實測回 **0–1 行**，所以兩次都係「抽 7–12 個 `/health` summary 再靠運氣」。
+
+### 一、形狀
+
+`tick_legs`（`at` 係 PRIMARY KEY；一個 tick 就係佢嘅時間戳）：
+
+```
+at, via, ms, profiles, pool, pairs, pairs_jup,
+jup, pump, meteora, raydium, geo, boosts,
+feed_legs (JSON {<FeedLeg>: ms}), candidates, pushed, organic_why
+```
+
+三個設計決定：
+
+1. **寫入搭 completion flush 嘅同一個 batch**（`Db.persistScanCompletion` 第 5 個參數），
+   所以零額外 round trip、零額外 subrequest，而且「completion 落地 = 呢行落地」。
+   用 `INSERT OR REPLACE`（`at` 係 PK）——flush 在「committed but response lost」之後重試都唔會重複。
+2. **`feed_legs` 用 JSON，唔係五條欄**：leg 名單會隨 phase 變（`gecko`/`geoTrend`/`backfill` 開開關關），
+   要單獨查一條 leg 就用 SQLite 嘅 `json_extract()`。
+3. **保留 72 小時**，同 `scan_history` 嘅 prune gate 共用（同一個 worker_state 標記、同一個小時檢查）。
+   ~2,900 row/日 ⇒ 3 日約 8,700 row，對 50M/月嘅寫入額度係 **+0.9%**，storage 0.3% 之下無感。
+
+`/debug/tick-legs` 亦加咗 `db`（＋`dbNote`）：`?hours=`（1–72，預設 6）＋`?dbRows=`（≤500），
+`rows`/`slow` 兩個舊欄照舊，所以舊 callers 唔變。
+
+### 二、兩個原本要做、量完決定唔做（附呢個 repo 自己嘅讀數）
+
+- **`RE_EVAL_PER_TICK_MAX 90 → 180`：唔做。** §4.5（2026-09-28）已經試過並量到：
+  slice 90 → 180 之後 `evalMs 968–1,082 → 1,987–2,109`、tick `1,780–2,539 → 3,400–3,737`，
+  而 `candidates` 照樣 0–1、`agedEval` 6–7 → 7 唔動；多出嘅 90 個判斷幾乎全部落喺
+  `fails.other`（流動性／24h 量）——即係判多咗 dust，唔係撈多咗幣。當時已 revert 返 90。
+  要提升覆蓋，文件指向 **coin mix**（`minQualifyLiquidity`、band 限額、`RE_EVAL_POOL_SIZE`），
+  唔係呢個 slice。
+- **`TRACKER_PAIR_HEAD 30 → 40`：唔需要。** 實測追蹤池 40 行之中 **19 行 active**
+  （21 行 `rug` 已終止，設計上唔再檢查），而每次 pass 已經讀 `rows 19/19`——head 從未成為瓶頸；
+  調高只會令 pair batch 變大，換唔到任何覆蓋。
+- **Tracker pass 已經係自己一個 invocation**（`TRACKER_CRON = "*\/1 * * * *"` 的 cron delivery），
+  tick 內嗰次只係 fallback：peer pass 嘅 durable 行唔夠新（`TRACKER_PASS_FALLBACK_FRESH_MS`）才接手。
+  即係「拆開」呢件事本身早已落地，唔使再拆。
+
+### 三、Queues（卡片發送）— 未做，講明為咩
+
+`sendTo` 今日同時擁有：三態發送（sent/failed/abandoned）、claim 保留、push audit、
+unconfirmed 記錄、deferral ledger、429/5xx 重試、以及**遲到有機度補行**（佢要等 tick 手上嗰條
+`organicRead` promise）。搬去 Queue 就等於把呢六件事嘅擁有權跨 invocation 拆開——
+consumer 死喺 `sendMessage` 前後，claim 同「卡有冇出」嘅判斷就要重新設計（Queue 重試會令
+`seen_tokens`/dedupe 語意改變）。呢個係推送路徑，係呢隻 bot 唯一嘅輸出，唔可以同其他改動
+一齊盲上。做法應該係獨立一個 change：queue consumer 擁有 send + audit + claim 釋放，
+有機度由 consumer 自己讀（佢有自己嘅 subrequest 額度），並且先用 flag 只放一個 chat 試。
+
+### 四、驗收
+
+`npm run build` + full unit suite（12 個檔案）**exit 0，全部綠**：
+`tick_legs` 新增 2 個測試（寫入/冪等/時間窗/JSON round-trip/接線），
+`test-d1-migrate` 嘅 table 清單與 archive fixture 都加入 `tick_legs`（18 passed）。
+部署後驗收：`/debug/tick-legs?hours=1` 嘅 `db` 要有新行、`feed_legs` 有 per-leg 毫秒、
+`at` 每 30s 遞增。
