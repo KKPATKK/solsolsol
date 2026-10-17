@@ -745,6 +745,25 @@ export const PIN_SNAPSHOT_TTL_MS = 120_000;
  */
 export const PIN_SNAPSHOT_MAX = 512;
 /**
+ * How often the pin lane may spend an ORIGIN request on the by-address
+ * lookup; passes in between serve their pools from the snapshot chain alone
+ * (see poolPairsForTracker).
+ *
+ * WHY (2026-10-17). The pinned pools are ~21 rows re-asked every pass (≈30s),
+ * i.e. 2 origin requests a minute for data whose verdicts (a -48% death, a
+ * trough recovery) move on a minutes scale — while the shared egress IP
+ * refuses that very endpoint, so every other pass paid a request to be told
+ * 429 (`pin-snap 21` on pass after pass, oldest 4–84s). Halving the asks costs
+ * at most one pass of snapshot age (the tolerated band keeps judging to 180s,
+ * see PUSH_WATCH_STALE_TOLERANCE_MS) and halves the refusals the lane has to
+ * ride out, which is what the block behind it is FOR.
+ *
+ * IT ONLY DEFERS WHAT THE SNAPSHOT CAN COVER: a pool with no snapshot yet —
+ * a coin pushed since the last ask — is fetched immediately, so a NEW row
+ * never waits for the clock (the pass would otherwise skip it as `pin-skip`).
+ */
+export const PIN_REFRESH_MS = 60_000;
+/**
  * The pin snapshot's colo cache (caches.default) — the same pattern as the
  * re-eval pool snapshot above, for the same reason. The map below is per
  * ISOLATE, and Cloudflare runs these ticks across several: measured
@@ -3376,6 +3395,13 @@ export class Scanner {
    */
   private pinSnapshots = new Map<string, { pair: PairInfo; at: number }>();
   /**
+   * When this isolate last DISPATCHED a by-address lookup, or 0 for never
+   * (see PIN_REFRESH_MS). Stamped on the attempt, not on an answer: a refusal
+   * is evidence the lane may not spend, and re-asking one pass later is the
+   * shape the cadence exists to remove.
+   */
+  private lastPinFetchAt = 0;
+  /**
    * Cross-tick bookkeeping for deferred initial cards (see
    * DeferredPushLedger): the deferral writes nothing, so this is the only
    * place that can say whether the deferred coin ever came back.
@@ -4782,6 +4808,14 @@ export class Scanner {
     snapshots: number;
     /** Age (ms) of the OLDEST snapshot served this pass; 0 = none served. */
     snapshotOldestMs: number;
+    /**
+     * The pass served its pools from the snapshot chain WITHOUT asking the
+     * origin, because the cadence (PIN_REFRESH_MS) said this pass is not the
+     * lane's turn. Named apart from `snapshots` so the note can tell a
+     * DEFERRAL from a REFUSAL — "we chose not to ask" and "we asked and were
+     * told no" are different readings, and only the second is a 429 episode.
+     */
+    deferred: boolean;
   }> {
     const out = new Map<string, PairInfo | null>();
     const missing: string[] = [];
@@ -4799,7 +4833,38 @@ export class Scanner {
       else missing.push(a);
     }
     if (missing.length === 0)
-      return { pairs: out, snapshots: 0, snapshotOldestMs: 0 };
+      return { pairs: out, snapshots: 0, snapshotOldestMs: 0, deferred: false };
+    /**
+     * Pools this pass CONFIRMED absent. They stay out of every carrier merge
+     * (see mergePinSnapshotsFromEdge): an answered absence is the one thing a
+     * snapshot must never undo, and another isolate's stale carrier entry is
+     * exactly how it could come back.
+     */
+    const absent: string[] = [];
+    // THE CADENCE (see PIN_REFRESH_MS): a pass inside the window asks nothing
+    // — but only for pools the snapshot chain can already answer. The serve
+    // below is the same one the refusal path uses (local map, then the colo
+    // carrier), so nothing here can invent a pool: a pool with no snapshot is
+    // asked about right away and a NEW row never waits for the clock.
+    let deferred = false;
+    if (
+      this.lastPinFetchAt > 0 &&
+      Date.now() - this.lastPinFetchAt < PIN_REFRESH_MS
+    ) {
+      const served = await this.serveSnapshotsFor(out, missing, absent);
+      // Every requested pool covered → the pass is done, and no origin
+      // request was spent on it.
+      if (missing.every((a) => out.has(a))) {
+        this.trimPinSnapshots();
+        deferred = true;
+        return {
+          pairs: out,
+          snapshots: served.served,
+          snapshotOldestMs: served.oldestMs,
+          deferred,
+        };
+      }
+    }
     let snapshots = 0;
     /** Age (ms) of the OLDEST snapshot served this pass (0 = none). */
     let snapshotOldestMs = 0;
@@ -4808,14 +4873,11 @@ export class Scanner {
      * absence): the colo carrier is republished so other isolates see it.
      */
     let dirty = false;
-    /**
-     * Pools this pass CONFIRMED absent. They stay out of every carrier merge
-     * (see mergePinSnapshotsFromEdge): an answered absence is the one thing a
-     * snapshot must never undo, and another isolate's stale carrier entry is
-     * exactly how it could come back.
-     */
-    const absent: string[] = [];
     try {
+      // The attempt — not its answer — arms the cadence: a refusal is
+      // evidence the lane may not spend, so the next pass serves snapshots
+      // instead of paying a second request for another 429.
+      this.lastPinFetchAt = Date.now();
       const res = await this.dex.fetchPairsByAddresses(
         missing,
         deadlineMs,
@@ -4862,7 +4924,7 @@ export class Scanner {
       await this.mergePinSnapshotsFromEdge(absent);
       await this.writePinSnapshotsToEdge();
     }
-    return { pairs: out, snapshots, snapshotOldestMs };
+    return { pairs: out, snapshots, snapshotOldestMs, deferred };
   }
 
   /**

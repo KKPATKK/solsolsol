@@ -8756,17 +8756,28 @@ async function main() {
       );
       scanner.lastPairs = new Map();
 
+      // The cadence (see PIN_REFRESH_MS) is what decides whether a pass ASKS:
+      // every phase below is a pass of its own, so the clock is rewound to
+      // keep the pre-cadence behaviour under test. The cadence itself is
+      // asserted on its own right after this test.
+      const asFreshPass = () => {
+        scanner.lastPinFetchAt = 0;
+      };
+
       // Cold memory (fresh isolate): a refusal is still a skip — the memory
       // invents nothing.
       mode = "refused";
+      asFreshPass();
       let res = await scanner.poolPairsForTracker(["COLD"], Date.now() + 800);
       assert.equal(res.pairs.has("COLD"), false, "no snapshot, no answer — the row still skips");
       assert.equal(res.snapshots, 0);
       assert.equal(res.snapshotOldestMs, 0, "no snapshot served means no age to report");
+      assert.equal(res.deferred, false, "the ask happened — a refusal is not a deferral");
 
       // An answered lookup with the pool: judged as before, and the answer is
       // remembered for the next refusal.
       mode = "hit";
+      asFreshPass();
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.get("POOL").marketCap, 333_000, "an answered lookup is used as before");
       assert.equal(res.snapshots, 0, "nothing snapshot-served on an answered pass");
@@ -8780,9 +8791,11 @@ async function main() {
       // note's `(oldest Xs)` must carry the served snapshot's age.
       scanner.pinSnapshots.get("POOL").at = Date.now() - 100_000;
       mode = "refused";
+      asFreshPass();
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.get("POOL").marketCap, 333_000, "a ~100s-old snapshot must judge at the 120s TTL (the 01:57:53Z shape)");
       assert.equal(res.snapshots, 1, "and the pass note can name it (pin-snap)");
+      assert.equal(res.deferred, false, "this snapshot is a REFUSAL's, not the cadence's (the note must not read as `pin-defer`)");
       assert.ok(
         res.snapshotOldestMs >= 99_000 && res.snapshotOldestMs <= 101_000,
         `the note's oldest age must be the served snapshot's age: ${res.snapshotOldestMs}`,
@@ -8791,12 +8804,14 @@ async function main() {
       // An ANSWERED absence is the switch evidence the snapshot must never
       // paper over — and it clears the entry.
       mode = "absent";
+      asFreshPass();
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.get("POOL"), null, "an answered absence is still a confirmed switch");
       assert.equal(res.snapshots, 0);
 
       // Refused again: the confirmed switch must NOT be undone by memory.
       mode = "refused";
+      asFreshPass();
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.has("POOL"), false, "a gone pool must not be resurrected from a snapshot");
       assert.equal(res.snapshots, 0);
@@ -8808,10 +8823,88 @@ async function main() {
         pair,
         at: Date.now() - PIN_SNAPSHOT_TTL_MS - 1,
       });
+      asFreshPass();
       res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
       assert.equal(res.pairs.has("POOL"), false, "an expired snapshot is not evidence");
       assert.equal(res.snapshotOldestMs, 0, "an expired snapshot reports no age either");
       assert.equal(scanner.pinSnapshots.has("POOL"), false, "and it is evicted on sight");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner.poolPairsForTracker: the pin cadence — a pass inside PIN_REFRESH_MS serves the snapshot and asks NOTHING (2026-10-17)", async () => {
+    // Live 2026-10-17: the tracker re-asked its ~21 pinned pools every pass
+    // (≈30s) while the shared egress IP refused that endpoint pass after pass —
+    // `pin-snap 21 (oldest 63s)` every time, and the 90s batch block that
+    // refusal armed then starved the token lane into `stale 21` whole-rotation
+    // skips. The cadence spends ONE ask per window and lets the snapshots carry
+    // the passes between; the caller can tell the two apart (`deferred`).
+    const { Scanner, PIN_REFRESH_MS } = require("../dist/scanner.js");
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      const pair = {
+        pairAddress: "POOL",
+        marketCap: 333_000,
+        feedSource: "dexscreener",
+      };
+      const asks = { n: 0 };
+      dex.fetchPairsByAddresses = async () => {
+        asks.n += 1;
+        return { pairs: new Map([["POOL", pair]]), answered: true };
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, null, null,
+      );
+      scanner.lastPairs = new Map();
+
+      // Pass 1: the window has no stamp yet, so the lane ASKS (and remembers).
+      let res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(asks.n, 1, "the first pass asks");
+      assert.equal(res.deferred, false);
+      assert.equal(res.pairs.get("POOL").marketCap, 333_000);
+
+      // Pass 2 — one pass later, inside the window: the snapshot answers and
+      // the origin is never touched.
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(asks.n, 1, `a pass inside PIN_REFRESH_MS (${PIN_REFRESH_MS}ms) must not spend an ask`);
+      assert.equal(res.deferred, true, "and it says so, so the note can print `pin-defer`");
+      assert.equal(res.pairs.get("POOL").marketCap, 333_000, "served from the snapshot chain");
+      assert.equal(res.snapshots, 1);
+      assert.ok(res.snapshotOldestMs >= 0 && res.snapshotOldestMs < 5_000);
+
+      // A pool with NO snapshot is asked about immediately: a NEW row must not
+      // wait for the clock (the pass would otherwise skip it as `pin-skip`).
+      res = await scanner.poolPairsForTracker(["NEWPOOL"], Date.now() + 800);
+      assert.equal(asks.n, 2, "a pool the snapshot cannot cover is asked for right away");
+      assert.equal(res.deferred, false, "that was an ask, not a deferral");
+
+      // Past the window the lane asks again.
+      scanner.lastPinFetchAt = Date.now() - PIN_REFRESH_MS - 1;
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(asks.n, 3, "past PIN_REFRESH_MS the lane spends its ask again");
+      assert.equal(res.deferred, false);
+
+      // A REFUSAL inside the window also stamps the clock (the attempt, not
+      // the answer, is what the cadence counts): one refused ask must not be
+      // followed by a second ask on the very next pass.
+      dex.fetchPairsByAddresses = async () => {
+        asks.n += 1;
+        return { pairs: new Map(), answered: false };
+      };
+      scanner.lastPinFetchAt = 0;
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(asks.n, 4);
+      const before = asks.n;
+      res = await scanner.poolPairsForTracker(["POOL"], Date.now() + 800);
+      assert.equal(asks.n, before, "the refusal armed the cadence: the next pass serves the snapshot instead of re-asking");
+      assert.equal(res.deferred, true);
+      assert.equal(res.pairs.get("POOL").marketCap, 333_000, "and the row is still judged off its own pool's last answer");
     } finally {
       await t.cleanup();
     }
@@ -12968,6 +13061,13 @@ async function main() {
         return { pairs: new Map([["pool-A", null]]), snapshots: 0, snapshotOldestMs: 0 }; // answered, absent = switch
       if (pinLookups.length === 5)
         return { pairs: new Map([["pool-A", pinA]]), snapshots: 1, snapshotOldestMs: 87_000 }; // refused; snapshot stood in
+      if (pinLookups.length === 6)
+        return {
+          pairs: new Map([["pool-A", pinA]]),
+          snapshots: 1,
+          snapshotOldestMs: 87_000,
+          deferred: true, // the pin cadence said this pass is not the lane's turn
+        };
       return { pairs: new Map(), snapshots: 0, snapshotOldestMs: 0 }; // not answered — no evidence
     };
     const pw = new PushWatcher(
@@ -13037,6 +13137,25 @@ async function main() {
     assert.match(String(fifth.note), /pin-snap 1 \(oldest 87s\)/);
     assert.doesNotMatch(String(fifth.note), /pin-skip/);
     assert.equal(repins.length, 1, "a snapshot-served row must never re-pin");
+
+    // Pass 6 — the CADENCE path (2026-10-17, Scanner.PIN_REFRESH_MS): the
+    // lookup was not asked at all this pass, and the note says so. "We chose
+    // not to ask" and "we asked and were refused" both print a snapshot count,
+    // and reading the second when the first happened is how a healthy lane
+    // would look like a 429 episode.
+    rows[0].poolAddress = "pool-A";
+    updated.length = 0;
+    const sixth = await pw.runTick();
+    const aaa6 = updated.find(([t]) => t === "AAA")?.[1];
+    assert.ok(aaa6, `a deferred pass still judges its rows: ${sixth.note}`);
+    assert.equal(aaa6.lastMcap, 333_000);
+    assert.match(String(sixth.note), /pin-snap 1 \(oldest 87s\)/);
+    assert.match(String(sixth.note), /pin-defer 1/, `the note must name the deferral: ${sixth.note}`);
+    assert.equal(
+      repins.length,
+      1,
+      "a cadence-deferred snapshot is still not repin evidence",
+    );
   });
 
   await test("Db.push_watch pool pin: stored at enrollment, write-once by checks, re-pinned by CAS", async () => {
@@ -15816,13 +15935,28 @@ async function main() {
     });
     const cfg = { cooldownMs: 0 };
 
-    // 4 minutes old: the 💀 is WITHHELD and the eval says so on its way out,
-    // so the caller can leave the row (measurements included) untouched.
-    const stale = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: 240_000 });
-    assert.deepEqual(stale.alerts, [], "no 💀 card off a stale reading");
-    assert.equal(stale.readingStale, true, "the eval marks the refusal for the caller");
-    assert.equal(stale.lastState, null, "the row is not moved into the silent watch");
-    assert.equal(stale.deadTroughMcap, null, "nor is a revival anchor armed");
+    // 4 minutes old — INSIDE the tolerated band (see
+    // PUSH_WATCH_STALE_TOLERANCE_MS, 2026-10-17): the 💀 carries, but it says
+    // on its face that the number it quotes is old. The band exists because a
+    // death is a statement about the row's OWN history (still ≥48% below the
+    // stored peak), and because refusing the whole row is what `stale 21`
+    // whole-rotation skips were made of while Dex refused the pin lane.
+    const { PUSH_WATCH_STALE_TOLERANCE_MS } = require("../dist/pushwatch.js");
+    const tolerated = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: 240_000 });
+    assert.equal(tolerated.alerts.length, 1, "the 💀 is announced inside the band");
+    assert.equal(tolerated.alerts[0].sig, "dead");
+    assert.match(tolerated.alerts[0].text, /⚠️ 報價延遲 240s/, "and the card carries the delay on its face");
+    assert.equal(tolerated.readingStale, undefined, "the row is judged, not skipped");
+    assert.equal(tolerated.lastState, "dead", "the transition lands as it always did");
+    assert.equal(tolerated.deadTroughMcap, 121_023, "and the revival anchor is armed from the reading");
+
+    // ONE MILLISECOND past the band (2 × 180s) the whole row is refused again:
+    // a reading that old is not "late news", it is not news.
+    const wayStale = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: PUSH_WATCH_STALE_TOLERANCE_MS + 1 });
+    assert.deepEqual(wayStale.alerts, [], "past the band nothing is announced");
+    assert.equal(wayStale.readingStale, true, "and the caller is told so");
+    assert.equal(wayStale.lastState, null, "the row is not moved into the silent watch");
+    assert.equal(wayStale.deadTroughMcap, null, "nor is a revival anchor armed");
 
     // The SAME numbers dated now: the 💀 card is exactly as it always was.
     // This is the negative control — the gate, not the numbers, suppressed it.
@@ -15833,11 +15967,14 @@ async function main() {
     assert.equal(fresh.deadTroughMcap, 121_023, "and the trough is armed as usual");
     assert.equal(fresh.readingStale, undefined, "nothing is marked on an ordinary pass");
 
-    // The boundary: exactly at the bound is judged, one ms past is refused.
+    // The boundary: exactly at the bound is judged WITHOUT a marker (it is
+    // inside the fresh ceiling), one ms past it is judged but marked.
     const edge = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: MAX_AGE });
     assert.equal(edge.alerts[0].sig, "dead", "age == bound is still fresh enough");
+    assert.doesNotMatch(edge.alerts[0].text, /報價延遲/, "and at the bound no delay is claimed");
     const past = evaluateWatch(row(), 11_000_000, live(), { ...cfg, readingAgeMs: MAX_AGE + 1 });
-    assert.deepEqual(past.alerts, [], "one millisecond past it is not");
+    assert.equal(past.alerts[0].sig, "dead", "one millisecond past it still announces the 💀 (tolerated band)");
+    assert.match(past.alerts[0].text, /報價延遲 180s/, "and the card says so");
 
     // Undated readings (fixtures, synthetic rows, the Jupiter/Gecko legs) are
     // judged exactly as before: fail OPEN, the "missing data never judges"
@@ -15857,20 +15994,32 @@ async function main() {
     const reviveFresh = evaluateWatch(dead, 11_000_000, live({ mcap: 381_369 }), { ...cfg, readingAgeMs: 30_000 });
     assert.equal(reviveFresh.alerts[0].sig, "revive", "a FRESH reversal still revives");
     assert.equal(reviveFresh.resetBaselineMcap, 381_369);
-    // NO card at all off a stale reading — not just no 💀. The rules derive a
-    // ⚠️ w45 off these same numbers one step earlier (a live -63% drawdown),
-    // and its card quotes the same wrong 現價 the operator reported; a 🚀 the
-    // same. The stage marks are persistent, so nothing is lost by waiting for
-    // a fresh reading: the card lands (naming every stage it swallowed) then.
-    const lateWeak = evaluateWatch(row({ upStages: "w35" }), 11_000_000, live(), { ...cfg, readingAgeMs: 300_000 });
-    assert.deepEqual(lateWeak.alerts, [], "the ⚠️ that would quote the same wrong number is withheld too");
+    // NO UP-TYPE card off an old reading, ever — the band admits the 💀 and
+    // nothing else. A ⚠️ w45 and a 🚀 are both derived from the same numbers a
+    // step earlier, and their cards quote a 現價 the operator reported as
+    // wrong; they wait for a fresh reading, and nothing is lost by waiting
+    // (the stage marks are persistent).
+    const lateWeak = evaluateWatch(row({ upStages: "w35", peakMcap: 140_000, mcapAtPush: 140_000 }), 11_000_000, live({ mcap: 118_000 }), { ...cfg, readingAgeMs: 300_000 });
+    assert.deepEqual(lateWeak.alerts, [], "the ⚠️ that would quote the same wrong number is withheld too (no death in these numbers)");
+    assert.equal(lateWeak.readingStale, true, "and that pass refuses the row");
     const lateRocket = evaluateWatch(
       row({ peakMcap: 100_000, mcapAtPush: 100_000 }),
       11_000_000,
       live({ mcap: 190_000, chg5m: 12 }),
       { ...cfg, readingAgeMs: 300_000 },
     );
-    assert.deepEqual(lateRocket.alerts, [], "and every other card with it");
+    assert.deepEqual(lateRocket.alerts, [], "and every up-type card with it");
+    assert.equal(lateRocket.readingStale, true);
+    // The band is NOT a licence for up cards: the same numbers that satisfy
+    // the death rule still only produce a 💀 when a fresh reading is not on
+    // offer, and the rocket stays in its pocket until one arrives.
+    const bandRocket = evaluateWatch(
+      row({ peakMcap: 330_340, mcapAtPush: 177_869 }),
+      11_000_000,
+      live({ mcap: 121_023, chg5m: 12 }),
+      { ...cfg, readingAgeMs: 300_000 },
+    );
+    assert.deepEqual(bandRocket.alerts.map((a) => a.sig), ["dead"], "the band admits 💀 alone — no 🚀 rides the same pass out");
     // …while the same row on a FRESH reading is announced exactly as before.
     const freshRocket = evaluateWatch(
       row({ peakMcap: 100_000, mcapAtPush: 100_000 }),
@@ -15886,7 +16035,10 @@ async function main() {
     // reading is not "checked" at all — no claim, no write, no card and no
     // position lost (it stays at the front of the rotation) — and the note
     // names it, so a starved pass can never read as healthy (`ok:N/N`).
-    const { PUSH_WATCH_MAX_READING_AGE_MS: MAX_AGE } = require("../dist/pushwatch.js");
+    const {
+      PUSH_WATCH_MAX_READING_AGE_MS: MAX_AGE,
+      PUSH_WATCH_STALE_TOLERANCE_MS: TOLERANCE,
+    } = require("../dist/pushwatch.js");
     const deadRow = () =>
       termRow({ peakMcap: 330_340, mcapAtPush: 177_869, upStages: null, lastLiquidity: 30_000 });
     const pairAt = (token, contentAt) => ({
@@ -15898,15 +16050,37 @@ async function main() {
       new PushWatcher(db, { api: { sendMessage: onSend } }, null, loadConfig({}),
         async (addrs) => new Map(addrs.map((a) => [a, pairAt(a, staleAt)])), null);
 
-    let staleAt = Date.now() - MAX_AGE - 60_000;
+    // PAST the tolerated band (see PUSH_WATCH_STALE_TOLERANCE_MS): the whole
+    // row is refused as before — no claim, no write, no card, no position
+    // lost. This is the shape that stays exactly as it was.
+    let staleAt = Date.now() - TOLERANCE - 60_000;
     let staleSends = 0;
     const staleDb = termDb([deadRow()]);
     const staleOut = await makeWatcher(staleDb, async () => { staleSends += 1; return { message_id: 1 }; })
       .runTick(Date.now() + 1_500);
-    assert.equal(staleSends, 0, "no 💀 card off the stale reading");
+    assert.equal(staleSends, 0, "no 💀 card past the band");
     assert.equal(staleOut.checked, 0, "the row is not checked");
     assert.equal(staleDb.updated.length, 0, "nothing is written — not even the measurements");
     assert.match(String(staleOut.note), / stale 1/, `the note names it: ${staleOut.note}`);
+
+    // INSIDE the band (180s…360s) the 💀 is judged — the pass-level half of the
+    // tolerated band — and the card says how old its number is. This is the
+    // shape that date changed: those passes used to be `stale 21` whole-rotation
+    // skips while Dex refused the pin lane.
+    staleAt = Date.now() - MAX_AGE - 60_000;
+    let bandSends = 0;
+    let bandText = "";
+    const bandDb = termDb([deadRow()]);
+    const bandOut = await makeWatcher(bandDb, async (chatId, text) => {
+      bandSends += 1;
+      bandText = String(text);
+      return { message_id: 9 };
+    }).runTick(Date.now() + 1_500);
+    assert.equal(bandSends, 1, "a reading inside the band still announces the 💀");
+    assert.equal(bandOut.checked, 1);
+    assert.match(bandText, /💀 走死/, `the card is the ordinary 💀: ${bandText}`);
+    assert.match(bandText, /報價延遲 2\d\ds/, `and it carries its own age: ${bandText}`);
+    assert.equal(bandDb.updated.length, 1, "the transition lands with the row write");
 
     // Same row, same numbers, dated now: the 💀 card goes out and the row is
     // written. The negative control for the whole pass.

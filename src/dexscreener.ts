@@ -1489,6 +1489,48 @@ const PAIR_INLINE_WAIT_BUDGET_MS = 400;
  */
 const PAIR_BATCH_BACKOFF_MS = 90_000;
 /**
+ * The PIN lane's own 429 ladder: base 15s, ×1.7 per consecutive refusal, cap
+ * 60s — and ZERO on the first served answer.
+ *
+ * WHY IT IS NOT PAIR_BATCH_BACKOFF_MS (2026-10-17). The two pair endpoints do
+ * not cost the same thing. The token batch asks for up to 30 tokens of the
+ * scan's ~200-address rotation; a refusal there wastes the tick's widest
+ * request, so 90s of silence is cheap by comparison. The by-address lookup
+ * (fetchPairsByAddresses) asks ONE question — the 21–40 pinned pools the
+ * tracker judges its cards from — and it is the only source of those pools'
+ * authoritative mcap. Measured live: `pin-snap 21 (oldest 63s)` pass after
+ * pass, i.e. every pin lookup refused, every card judged off a snapshot, and
+ * 90s of blackout after each refusal = 3 passes of no fresh pin content while
+ * the token lane (which the same 429 also blocked fleet-wide) went stale and
+ * `stale 21` skipped the whole rotation.
+ *
+ * A 15s base is shorter than one pass (≈30s), so a burst that ends inside a
+ * pass still gets one attempt per pass instead of one per three; the ladder
+ * only widens while the refusals CONTINUE, which is the shape that deserves
+ * patience. It never touches the adaptive spacing (that pacing exists for the
+ * wide batches) and it is deliberately NOT remembered in the fleet row: a pin
+ * refusal is one request's worth of evidence, and a cold isolate paying 15s to
+ * learn it again is cheaper than a fleet-wide 90s blackout for a lane that
+ * costs 1 request per pass.
+ */
+export const PIN_LANE_BACKOFF_BASE_MS = 15_000;
+/** Cap of the pin lane's ladder — one pass and a half, never the batch's 90s. */
+export const PIN_LANE_BACKOFF_MAX_MS = 60_000;
+/** Growth per consecutive refusal (1.7 ≈ 15s → 25.5 → 43 → 60 cap). */
+const PIN_LANE_BACKOFF_GROWTH = 1.7;
+
+/**
+ * How long a pin-lane refusal blocks the by-address lookup, pure so the
+ * ladder is unit-tested rather than only observed. 0 refusals = no block.
+ */
+export function pinLaneBackoffMs(consecutive429: number): number {
+  if (!Number.isFinite(consecutive429) || consecutive429 <= 0) return 0;
+  const grown =
+    PIN_LANE_BACKOFF_BASE_MS *
+    PIN_LANE_BACKOFF_GROWTH ** Math.min(Math.floor(consecutive429) - 1, 8);
+  return Math.min(PIN_LANE_BACKOFF_MAX_MS, Math.max(PIN_LANE_BACKOFF_BASE_MS, grown));
+}
+/**
  * Minimum gap between two durable 429 records (see note429).
  *
  * WHY IT EXISTS (2026-10-01). The notify used to be debounced by the batch
@@ -1690,6 +1732,15 @@ export class DexScreenerClient {
   >();
   /** Until this epoch the endpoint 429'd — serve pair cache only. */
   private batchBlockedUntil = 0;
+  /**
+   * The PIN lane's own refusal state (see pinLaneBackoffMs / note429). Kept
+   * apart from `batchBlockedUntil` on purpose: a by-address refusal must not
+   * cost the token batch its 90s window, and — the direction that actually
+   * hurt — the token batch's block must not leave the pinned pools unaskable
+   * for three passes (live 2026-10-17: `pin-snap 21` every pass).
+   */
+  private pinBlockedUntil = 0;
+  private pinConsecutive429 = 0;
   /**
    * Epoch of the last SERVED batch-lane response, or 0 when this isolate has
    * never had one. The pair lane's episode reading (see probeDue): a refusal
@@ -1959,6 +2010,15 @@ export class DexScreenerClient {
     http429: number;
     last429At: number | null;
     blockedForMs: number;
+    /**
+     * ms left of the PIN lane's own block (see PIN_LANE_BACKOFF_BASE_MS /
+     * note429), and its consecutive refusal count. Read together with
+     * `pinCacheRefused` and the tracker's `pin-snap`: `blockedForMs 0` with
+     * `pinBlockedForMs` still climbing is the shape this split exists for —
+     * the token lane is free while the pin lane waits its own short ladder.
+     */
+    pinBlockedForMs: number;
+    pinConsecutive429: number;
     cacheSize: number;
     /** List-feed responses served from the colo edge cache (see
      * LIST_FEED_CACHE_TTL_S) — climbing = the origin was never asked. */
@@ -2055,6 +2115,8 @@ export class DexScreenerClient {
       http429: this.http429Total,
       last429At: this.last429At,
       blockedForMs: Math.max(0, this.batchBlockedUntil - Date.now()),
+      pinBlockedForMs: Math.max(0, this.pinBlockedUntil - Date.now()),
+      pinConsecutive429: this.pinConsecutive429,
       cacheSize: this.pairCache.size,
       listCacheHits: listCacheLedger.hits,
       listCacheMisses: listCacheLedger.misses,
@@ -2202,11 +2264,20 @@ export class DexScreenerClient {
     return Number.isFinite(dateMs) ? dateMs : null;
   }
 
-  private note429(batchLane: boolean): void {
+  private note429(batchLane: boolean, pinLane = false): void {
     const now = Date.now();
     this.http429Total++;
     this.last429At = now;
-    if (batchLane) {
+    if (pinLane) {
+      // The by-address lookup's OWN reaction (see pinLaneBackoffMs): a short
+      // ladder on its own clock only. Deliberately NOT here: the adaptive
+      // spacing raise (that pacing prices the wide batch rotation, and one
+      // pinned pool's refusal must not slow the whole queue), and
+      // `pairRefusedAt` (the fleet row's memory of a BATCH refusal — a pin
+      // refusal must not cost every isolate's token batch its 90s window).
+      this.pinConsecutive429 += 1;
+      this.pinBlockedUntil = now + pinLaneBackoffMs(this.pinConsecutive429);
+    } else if (batchLane) {
       this.batchBlockedUntil = now + PAIR_BATCH_BACKOFF_MS;
       this.pairRefusedAt = now;
       this.spacing.noteRefused();
@@ -2416,6 +2487,11 @@ export class DexScreenerClient {
             const cacheStatus = res.headers.get("cf-cache-status");
             if (pairLane) this.notePairCacheOutcome(cacheStatus);
             else noteListCacheOutcome(cacheStatus);
+            // A SERVED pin answer resets the ladder: the refusal it was
+            // guarding against is over (see pinLaneBackoffMs). Any other
+            // pair-lane 2xx (the token batches) says nothing about the pin
+            // endpoint's own standing.
+            if (path.startsWith("/latest/dex/pairs/")) this.pinConsecutive429 = 0;
           } else {
             // …and the refusal, counted on its OWN counter (2026-09-30, see
             // noteListCacheRefused): keeping it out of hit/miss was right and
@@ -2427,7 +2503,10 @@ export class DexScreenerClient {
           }
         }
         if (res.status === 429) {
-          this.note429(pairLane);
+          // The PIN endpoint gets its own, shorter ladder (see note429 and
+          // PIN_LANE_BACKOFF_BASE_MS): same lane, different request, different
+          // verdict on how long a refusal is worth blocking for.
+          this.note429(pairLane, path.startsWith("/latest/dex/pairs/"));
           // The boosts lane arms its OWN pause here (see noteBoostsRefused):
           // the scanner re-arms the durable gate to it, so one refusal costs a
           // tick instead of the whole five-minute window. Deliberately outside
@@ -3141,8 +3220,10 @@ export class DexScreenerClient {
     // about), so the caller can tell it apart from a refusal below.
     if (uniq.length === 0) return { pairs, answered: true };
     // Blocked by a recent hard 429: never send, and never let the caller read
-    // the empty answer as "the pools are gone".
-    if (Date.now() < this.batchBlockedUntil) return { pairs, answered: false };
+    // the empty answer as "the pools are gone". The block is this lane's OWN
+    // (see pinLaneBackoffMs): the token batch's 90s window is not a statement
+    // about the by-address endpoint, and vice versa.
+    if (Date.now() < this.pinBlockedUntil) return { pairs, answered: false };
     const deadline = Math.min(
       Date.now() + PAIRS_FETCH_BUDGET_MS,
       typeof callerDeadlineMs === "number"

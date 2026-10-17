@@ -1159,6 +1159,30 @@ const DEAD_DRAWDOWN_PCT = 48;
  * DATE may be refused for its age.
  */
 export const PUSH_WATCH_MAX_READING_AGE_MS = PAIR_CONTENT_MAX_AGE_MS;
+/**
+ * The ceiling the 💀 ALONE is still judged at, when the reading is older than
+ * PUSH_WATCH_MAX_READING_AGE_MS (2 × = 360s).
+ *
+ * WHY THE DEATH GETS A WIDER BAND (2026-10-17). The 180s refusal is about
+ * CARDS QUOTING A LEVEL: a ⚠️/🚀 whose 現價 is minutes old is wrong news about
+ * a level that has already moved. The 💀 is the one transition that is a
+ * statement about the row's own history — it needs only that the pool STILL
+ * trades ≥48% below the stored peak — and it is also the card whose absence
+ * costs the operator the most, because a row that is neither dead nor silent
+ * keeps being re-judged from the same re-served content: measured live,
+ * `stale 21` skipped the WHOLE rotation on 3 of 10 sampled passes during a Dex
+ * 429 episode, and ~60% of the follow-up cards sent in that window were 💀.
+ *
+ * WHAT IT DOES NOT DO: it never revives a row (a 💀 row stays silent until a
+ * FRESH reading clears trough × 1.5 — see the resurrection branch), and it
+ * never announces an up-type card: the tolerated band is admitted ONLY when
+ * the reading's own numbers already satisfy the death rule, and that rule
+ * RETURNS, so no ⚠️/🚀/💧/💪 can ride the same pass out. The card carries the
+ * delay on its face (`⚠️ 報價延遲 Ns`) because the number it quotes IS older
+ * than the level it is drawn from — the operator's rule: a card may be late,
+ * never silently late.
+ */
+export const PUSH_WATCH_STALE_TOLERANCE_MS = PUSH_WATCH_MAX_READING_AGE_MS * 2;
 /** A coin must have run up at least this much before "weak" can fire. */
 const WEAK_MIN_RUNUP_PCT = 15;
 /** Liquidity crash: current < 45% of the last check AND last ≥ $5K. */
@@ -1941,10 +1965,29 @@ export function evaluateWatch(
    * while the reading was stale is announced (with every stage it swallowed)
    * the moment a fresh reading arrives.
    */
-  const readingStale =
-    typeof cfg.readingAgeMs === "number" &&
-    Number.isFinite(cfg.readingAgeMs) &&
-    cfg.readingAgeMs > PUSH_WATCH_MAX_READING_AGE_MS;
+  const readingAgeMs =
+    typeof cfg.readingAgeMs === "number" && Number.isFinite(cfg.readingAgeMs)
+      ? cfg.readingAgeMs
+      : null;
+  const readingOverAge =
+    readingAgeMs !== null && readingAgeMs > PUSH_WATCH_MAX_READING_AGE_MS;
+  /**
+   * A reading inside the TOLERATED band whose own numbers already satisfy the
+   * death rule (see PUSH_WATCH_STALE_TOLERANCE_MS): it may announce the 💀 and
+   * nothing else. Every condition is deliberate — `lastState !== "dead"` keeps
+   * a stale reading from REVIVING a row (the resurrection would re-base every
+   * later card off a level minutes old), and the drawdown test is what makes
+   * the whole band safe: a reading that is merely old cannot fire anything,
+   * because without a -48% drawdown there is no rule below that can be reached
+   * differently than before — the tolerated pass falls straight through to the
+   * ordinary refusal.
+   */
+  const toleratedStale =
+    readingOverAge &&
+    readingAgeMs <= PUSH_WATCH_STALE_TOLERANCE_MS &&
+    row.lastState !== "dead" &&
+    drawdownFromPeak <= -DEAD_DRAWDOWN_PCT;
+  const readingStale = readingOverAge && !toleratedStale;
   if (readingStale) {
     return {
       alerts: [],
@@ -2382,9 +2425,20 @@ export function evaluateWatch(
   // BELOW the live price. A reading that old never reaches this rule at all
   // now — see PUSH_WATCH_MAX_READING_AGE_MS.
   if (drawdownFromPeak <= -DEAD_DRAWDOWN_PCT) {
+    // A tolerated-band reading says SO on the card (see
+    // PUSH_WATCH_STALE_TOLERANCE_MS): the 💀 is allowed past the fresh ceiling
+    // because the level it describes is the row's own history, but the number
+    // it quotes is older than the level — and the operator reads that off the
+    // line instead of trusting a card that is silently late. A FRESH reading
+    // prints exactly the string it always did (the marker is the only
+    // difference, and only in the band).
+    const staleNote =
+      readingAgeMs !== null && readingAgeMs > PUSH_WATCH_MAX_READING_AGE_MS
+        ? `\n⚠️ 報價延遲 ${Math.round(readingAgeMs / 1000)}s（Dex 429，未經新鮮讀數確認）`
+        : "";
     fire(
       "dead",
-      `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(live.mcap * RESURRECTION_MULT)}＝低點 ×1.5 會再通知）`,
+      `💀 走死 ${symbol} | 峰值 ${fmtUsd(peakMcap)} → 現 ${fmtUsd(live.mcap)} (${pct(drawdownFromPeak)})，轉入靜默監控（收復 ${fmtUsd(live.mcap * RESURRECTION_MULT)}＝低點 ×1.5 會再通知）${staleNote}`,
       "dead",
     );
     // The 💀 card ARMS a new revival (recovery to trough ×1.5), so a stale
@@ -3082,6 +3136,14 @@ export class PushWatcher {
        * nothing snapshot-served may re-pin.
        */
       snapshots: number;
+      /**
+       * The lookup was NOT asked this pass: the cadence (see
+       * Scanner.PIN_REFRESH_MS) said it is not the pin lane's turn, so every
+       * pin was served from the snapshot chain. Optional, absent reads as
+       * false. The note names it (`pin-defer N`) so a snapshot-served pass
+       * that CHOSE not to ask is never read as a pass that was refused.
+       */
+      deferred?: boolean;
       /**
        * Age (ms) of the OLDEST snapshot among those `snapshots` — the note's
        * `(oldest Xs)` half, so a pass riding the TTL boundary can be told
@@ -4202,6 +4264,14 @@ export class PushWatcher {
      * is never read as a live answer — nor as a fresh snapshot.
      */
     let pinSnapshots = 0;
+    /**
+     * Pins served from the snapshot chain because the CADENCE said this pass
+     * is not the pin lane's turn (see the poolPairsFor `deferred` half and
+     * Scanner.PIN_REFRESH_MS): counted apart from the refusal's `pin-snap` so
+     * the note never reads "we asked and were refused" for a pass that chose
+     * not to ask.
+     */
+    let pinDeferred = 0;
     /** Age (ms) of the OLDEST snapshot served this pass (0 = none). */
     let pinOldestMs = 0;
     try {
@@ -4247,6 +4317,7 @@ export class PushWatcher {
           pinPairs = answer.pairs;
           pinSnapshots = answer.snapshots;
           pinOldestMs = answer.snapshotOldestMs ?? 0;
+          if (answer.deferred === true) pinDeferred = answer.snapshots;
         } catch {
           /* unresolved pins stay unresolved — rows skip, nothing re-pins */
         }
@@ -5332,6 +5403,7 @@ export class PushWatcher {
       `rows ${checked}/${activeRows.length} pairs ${pairs.size}/${tokens.length}` +
       `${pinAddrs.length > 0 ? ` pins ${pinPairs.size}/${pinAddrs.length}` : ""}` +
       `${pinSnapshots > 0 ? ` pin-snap ${pinSnapshots} (oldest ${Math.round(pinOldestMs / 1000)}s)` : ""}` +
+      `${pinDeferred > 0 ? ` pin-defer ${pinDeferred}` : ""}` +
       `${staleSkipped > 0 ? ` stale ${staleSkipped}` : ""}` +
       ` miss ${pairMiss} lost ${claimLost}` +
       `${pinSkip > 0 ? ` pin-skip ${pinSkip}` : ""}` +

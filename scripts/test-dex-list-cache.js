@@ -504,6 +504,126 @@ async function main() {
     );
   });
 
+  // ---------- the pin lane's own 429 ladder (2026-10-17) ----------
+  //
+  // The by-address lookup shares the batch LANE (and its telemetry) but not
+  // its price: it asks for ~21 pinned pools, the tracker's cards are judged
+  // off it, and the 90s window a batch refusal earns is worth 3 passes of
+  // blackout for it. These cases pin the split — and the direction that
+  // actually hurt: a PIN refusal must not cost the token batch its window.
+  await test("pinLaneBackoffMs: 15s base, ×1.7 growth, 60s cap, reset at 0", () => {
+    const {
+      pinLaneBackoffMs,
+      PIN_LANE_BACKOFF_BASE_MS,
+      PIN_LANE_BACKOFF_MAX_MS,
+    } = require("../dist/dexscreener.js");
+    assert.equal(pinLaneBackoffMs(0), 0, "no refusal, no block");
+    assert.equal(pinLaneBackoffMs(1), PIN_LANE_BACKOFF_BASE_MS, "one refusal costs one short window");
+    assert.ok(
+      pinLaneBackoffMs(2) > pinLaneBackoffMs(1),
+      "consecutive refusals climb",
+    );
+    assert.equal(pinLaneBackoffMs(99), PIN_LANE_BACKOFF_MAX_MS, "and the ladder is capped");
+    assert.ok(
+      PIN_LANE_BACKOFF_MAX_MS < 90_000,
+      "the cap must stay under the batch block: that 3-pass blackout for a 1-request lane is the shape this split removes",
+    );
+  });
+
+  await test("a PIN-endpoint 429 arms only the pin lane; a token-batch 429 arms only the batch lane", async () => {
+    const origFetch = globalThis.fetch;
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" });
+    try {
+      // The by-address refusal: the pin lane pauses (short), and NOTHING else
+      // moves — no batch block, no fleet stamp, no spacing raise.
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ error: "nope" }), { status: 429 });
+      const dex = new DexScreenerClient(cfg);
+      const refused = await dex.fetchPairsByAddresses(["PINNED"]);
+      assert.equal(refused.answered, false, "a 429 is not an answer about the pool");
+      let stats = dex.getStats();
+      assert.ok(stats.pinBlockedForMs > 0, "the pin lane is blocked");
+      assert.ok(
+        stats.pinBlockedForMs <= 15_100,
+        `and by the ladder's first rung: ${stats.pinBlockedForMs}ms`,
+      );
+      assert.equal(stats.blockedForMs, 0, "the token batch lane is NOT blocked by a pin refusal");
+      assert.equal(stats.pinConsecutive429, 1);
+      assert.equal(
+        stats.spacingSteps,
+        0,
+        "and the adaptive spacing stays put: pacing exists for the wide rotation, not for one pinned pool",
+      );
+      assert.equal(
+        stats.pairFleetRefusedAgeMs,
+        null,
+        "nor does a pin refusal enter the fleet row — every isolate's token batch would pay for it",
+      );
+
+      // The token-batch refusal: the 90s window arms as always, and it leaves
+      // the pin lane's own block exactly where it was.
+      const dex2 = new DexScreenerClient(cfg);
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ pairs: [] }), { status: 429 });
+      await dex2.fetchPairsForTokens(["So11111111111111111111111111111111111111112"]);
+      const stats2 = dex2.getStats();
+      assert.ok(
+        stats2.blockedForMs > 80_000,
+        `a token-batch refusal arms the 90s block: ${stats2.blockedForMs}ms`,
+      );
+      assert.equal(stats2.pinBlockedForMs, 0, "and a batch refusal must not park the pin lane for 3 passes");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  await test("the pin lane's block clears on the SERVE, and only its own ask is refused while it is armed", async () => {
+    const origFetch = globalThis.fetch;
+    const cfg = loadConfig({ DEX_REQUEST_INTERVAL_MS: "0" });
+    try {
+      let calls = 0;
+      let status = 429;
+      globalThis.fetch = async () => {
+        calls += 1;
+        if (status === 429) {
+          return new Response(JSON.stringify({ error: "nope" }), { status: 429 });
+        }
+        return new Response(
+          JSON.stringify({
+            pairs: [{ chainId: "solana", pairAddress: "POOL", fdv: 100, priceUsd: "1" }],
+          }),
+          { status: 200 },
+        );
+      };
+      const dex = new DexScreenerClient(cfg);
+      await dex.fetchPairsByAddresses(["POOL"]);
+      assert.ok(dex.getStats().pinBlockedForMs > 0);
+      const before = calls;
+      // Armed: the lookup is refused WITHOUT a request (the block is a
+      // decision, not telemetry) and the caller may never read that as "gone".
+      const blocked = await dex.fetchPairsByAddresses(["POOL"]);
+      assert.equal(blocked.answered, false, "an armed pin block answers nothing");
+      assert.equal(calls, before, "and it costs no request");
+      // Past the block: served, and the ladder unwinds to zero so the NEXT
+      // refusal starts from the 15s base again.
+      const now = Date.now();
+      globalThis.Date.now = () => now + 20_000;
+      try {
+        status = 200;
+        const served = await dex.fetchPairsByAddresses(["POOL"]);
+        assert.equal(served.answered, true, "past the block the ask happens");
+        assert.equal(
+          dex.getStats().pinConsecutive429,
+          0,
+          "a served answer resets the ladder — the refusal it guarded against is over",
+        );
+      } finally {
+        delete globalThis.Date.now;
+      }    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   console.log(results.join("\n"));
   console.log(`\n  ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
