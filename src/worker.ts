@@ -7044,7 +7044,9 @@ async function handleCronRelay(
  * ceiling.
  *
  * FAILURE SHAPE: every alarm body is caught (never rethrown) and the next alarm
- * is set in `finally`. Cloudflare's rule is why: an alarm() that throws is
+ * is set in `finally` — anchored on the alarm's own scheduled time (see
+ * clockRearmAt), so the loop's period is the configured tickMs and not tickMs
+ * plus whatever its work cost. Cloudflare's rule is why: an alarm() that throws is
  * retried up to 6 times and then the loop is DEAD until the next setAlarm — so
  * a downstream outage, a relay timeout or a bug in this file must not be able
  * to end the clock. A tick whose relays fail is simply lost (the cron carries
@@ -7092,6 +7094,35 @@ export function clockTickMs(env: { CLOCK_TICK_SECONDS?: string }): number {
     TICK_CLOCK_MAX_MS,
     Math.max(TICK_CLOCK_MIN_MS, Math.round(raw * 1000)),
   );
+}
+
+/**
+ * When the clock's next alarm is scheduled for (see TickClock.alarm).
+ *
+ * WHY THIS IS NOT `now + tickMs`: the re-arm runs in `finally`, i.e. AFTER the
+ * alarm's two relays, so the shape this loop shipped with on 2026-10-02 made
+ * its real period `tickMs + work`. Measured live 2026-10-18 — `/debug/clock`
+ * `lastWorkMs 2022` and a durable 240-tick window of 31.5s mean gap / 114.8
+ * ticks an hour against the 120 a strict 30s cadence owes, tail included
+ * (gaps to 46.5s). Anchoring on the alarm's own SCHEDULED time instead makes
+ * the loop fire every `tickMs` of wall clock however long a tick's work took:
+ * the rate is the configured one, and a slow tick cannot push the whole loop
+ * slower.
+ *
+ * `scheduledAtMs <= 0` = nothing to anchor on (the first tick after an /arm,
+ * an eviction that dropped the in-memory reading, or a tick armed by an older
+ * version): fall back to one period from now — one tick of the old shape,
+ * never a jump. `nowMs` floors the result, because an alarm set in the PAST
+ * fires immediately: a tick whose work overran its own period re-arms in the
+ * future and lets the gate/scan lock arbitrate the catch-up.
+ */
+export function clockRearmAt(
+  scheduledAtMs: number,
+  tickMs: number,
+  nowMs: number,
+): number {
+  const anchor = scheduledAtMs > 0 ? scheduledAtMs : nowMs;
+  return Math.max(anchor + tickMs, nowMs);
 }
 
 /**
@@ -7189,7 +7220,12 @@ export class TickClock {
     if ((await this.state.storage.getAlarm()) !== null) return false;
     // Alarm now, not now + period: the arm request is a fresh start, and the
     // first tick should be the one that proves the loop works.
-    await this.state.storage.setAlarm(Date.now());
+    const at = Date.now();
+    await this.state.storage.setAlarm(at);
+    // Remember WHEN it was scheduled for — the tick this alarm delivers
+    // anchors its own re-arm on that time (see clockRearmAt), so the loop's
+    // phase starts here instead of one period plus the tick's own work later.
+    this.lastAlarmAt = at;
     return true;
   }
 
@@ -7249,7 +7285,16 @@ export class TickClock {
       // cron can restart it — which is the intended kill switch.
       if (tickMs > 0) {
         try {
-          this.lastAlarmAt = Date.now() + tickMs;
+          // Anchored on the SCHEDULED time of the tick that just ran, not on
+          // `now` after its work (see clockRearmAt): the old `Date.now() +
+          // tickMs` shape made the period tickMs + the relays' own ~2s — the
+          // 114.8 ticks/hour the 2026-10-18 window measured against the 120 a
+          // strict 30s loop owes.
+          this.lastAlarmAt = clockRearmAt(
+            this.lastAlarmAt ?? 0,
+            tickMs,
+            Date.now(),
+          );
           await this.state.storage.setAlarm(this.lastAlarmAt);
         } catch (err) {
           console.error(

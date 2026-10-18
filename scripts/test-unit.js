@@ -23684,8 +23684,12 @@ async function main() {
     // The class exists under the binding's name, and the loop is wired the way
     // the failure mode demands: every alarm body caught, the re-arm in
     // `finally` (a throw is 6 retries and then a dead loop).
-    const { TickClock, TICK_CLOCK_ARM_PATH, TICK_CLOCK_STATUS_PATH } =
-      require("../dist/worker.js");
+    const {
+      TickClock,
+      clockRearmAt,
+      TICK_CLOCK_ARM_PATH,
+      TICK_CLOCK_STATUS_PATH,
+    } = require("../dist/worker.js");
     assert.equal(typeof TickClock, "function");
     assert.equal(typeof TickClock.prototype.alarm, "function");
     assert.equal(typeof TickClock.prototype.fetch, "function");
@@ -23747,6 +23751,39 @@ async function main() {
       ).json();
       assert.equal(arm.armed, false, "an armed loop is left alone");
       assert.equal(storage.alarmAt, armedAt, "...and its pending alarm is not moved");
+      // PHASE-ANCHORED RE-ARM (2026-10-18, see clockRearmAt): the next alarm is
+      // the PREVIOUS alarm's SCHEDULED time + one period — never `now + period`
+      // after the work. That old shape made the loop's real period tickMs +
+      // work (measured live: lastWorkMs 2,022 and a 31.5s mean scan gap = 114.8
+      // ticks/hour against the 120 a strict 30s loop owes, tail to 46.5s).
+      const now = Date.now();
+      assert.equal(
+        clockRearmAt(now - 1_500, 30_000, now),
+        now + 28_500,
+        "the schedule, not the finish time, is the anchor",
+      );
+      assert.equal(clockRearmAt(now, 30_000, now), now + 30_000);
+      assert.equal(
+        clockRearmAt(0, 30_000, now),
+        now + 30_000,
+        "nothing to anchor on = one period from now (first tick after an /arm)",
+      );
+      assert.equal(
+        clockRearmAt(now - 40_000, 30_000, now),
+        now,
+        "a tick that overran its own period re-arms in the future, never in the past",
+      );
+      // ...and the object really reads its own schedule: a tick that was due
+      // 1.5s ago re-arms to schedule + period even though its relays have long
+      // finished (the work is NOT added back on top).
+      const anchored = new TickClock({ storage }, { CLOCK_TICK_SECONDS: "30" });
+      anchored.lastAlarmAt = now - 1_500;
+      await anchored.alarm();
+      assert.equal(
+        storage.alarmAt,
+        now - 1_500 + 30_000,
+        "the loop anchors on its own schedule, not on when its work finished",
+      );
     })();
   });
 
