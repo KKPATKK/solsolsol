@@ -347,6 +347,10 @@ async function main() {
       tables.map((t) => t.name),
       [
         "chat_settings",
+        // One row per (chat, token) card awaiting a transient retry
+        // (2026-10-18) — the copy carries it like any other table, and its
+        // composite primary key makes a re-copy idempotent per obligation.
+        "push_outbox",
         "push_watch",
         "pushed_holders",
         "scan_history",
@@ -485,6 +489,13 @@ async function main() {
   );
   await archive.client.execute(
     "INSERT INTO pushed_holders (token, owner, rank, ui_amount, pushed_at) VALUES ('tok-1', 'owner-1', 1, 5.5, 1700000000000)",
+  );
+  // THE CARD OUTBOX (2026-10-18): the retry row carries the rendered card and
+  // its keyboard as TEXT (the artifact the tick cannot reconstruct later) plus
+  // the numeric attempt/TTL budget, with a composite primary key that makes a
+  // re-copy idempotent per obligation.
+  await archive.client.execute(
+    "INSERT INTO push_outbox (chat_id, token, symbol, message, keyboard, mcap, liquidity, pool, organic, attempts, next_at, expires_at, created_at, last_error) VALUES ('chat-1', 'tok-2', 'T2', '<b>T2</b> card', '{\"inline_keyboard\":[[{\"text\":\"BUY\"}]]}', 71000, 13000, 'pool-2', NULL, 1, 1700000060000, 1700000600000, 1700000000000, 'Telegram 500: oops')",
   );
   // The trade logs carry an INTEGER PRIMARY KEY (AUTOINCREMENT): the copy must
   // ship the id explicitly or the rows land under new ones.

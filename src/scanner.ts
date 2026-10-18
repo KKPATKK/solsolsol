@@ -13,6 +13,7 @@ import {
   DEX_PROFILES_LAST_KEY,
   GECKO_DISCOVERY_AT_KEY,
   SCAN_FRONT_GATE_KEYS,
+  parseAuditOrganic,
   poolRotationSlot,
   type Db,
   type PushAuditOrganic,
@@ -82,6 +83,14 @@ import {
   missingDeferredTokens,
   noteDeferredCoin,
 } from "./deferredmakeup";
+import {
+  PUSH_OUTBOX_DRAIN_MAX,
+  PUSH_OUTBOX_SEND_CAP_MS,
+  pushOutboxAfterFailure,
+  pushOutboxPreClaim,
+  type PushOutboxDrainView,
+  type PushOutboxRow,
+} from "./pushoutbox";
 
 
 /** Re-fetch RugCheck reports older than this to pick up late bundler detection. */
@@ -3223,10 +3232,6 @@ export function top10MinBlockReason(
     return `Top10 持倉高達 ${top10Pct.toFixed(1)}% > ${pctMax}%（籌碼過度集中：供應鎖死在少數錢包，散戶只當出貨對象）`;
   }
   return null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -7912,8 +7917,7 @@ export class Scanner {
             await sendTo(c);
           } catch (err) {
             // A failed delivery is NOT the end: surface the Telegram error
-            // (code + description, recorded per chat for /debug/chats) and
-            // retry once on transient failures (429 / 5xx / network). The
+            // (code + description, recorded per chat for /debug/chats). The
             // chat-aware re-eval pool re-pushes the coin to this chat on a
             // later scan either way — never mark it seen on failure.
             const info = describePushError(err);
@@ -7921,32 +7925,42 @@ export class Scanner {
             console.error(
               `[scanner] failed to push ${symbol} to ${c.chatId}: ${info.line}`,
             );
-            // A REJECTED card is retried once inside this tick (the retry
-            // re-enters sendTo, so it is bounded by the same claim/send
-            // deadlines and can itself only defer). An ABANDONED send never
-            // reaches this catch at all: it keeps its claim and settles in the
-            // background (see the three-state send in sendTo), so there is no
-            // cut error left to suppress here.
+            // TRANSIENT → THE OUTBOX (2026-10-18, docs/round-trips.md §4.70).
+            // This used to be `sleep(1200)` + a second `sendTo` — a second
+            // 0.6–1.2s Telegram round trip inside this tick's envelope, lost
+            // with the isolate if the tick died before it ran. The retry is
+            // now ONE durable D1 row the tracker cron drains (see
+            // Scanner.drainPushOutbox and src/pushoutbox.ts): the same claim
+            // and delivery-audit rules, one insert instead of a second send,
+            // and it survives this invocation. sendTo's own catch already
+            // released the claim (a rejected send is not delivery), so the
+            // re-eval pool can still race for the coin — the drain checks the
+            // audit proof and the atomic claim before it sends, so whichever
+            // owner wins, exactly one card goes out.
+            //
+            // A PERMANENT rejection (4xx) is deliberately NOT enqueued: a
+            // refusal that cannot fix itself within a second cannot fix
+            // itself within a minute either (see pushoutbox's policy table),
+            // and the re-eval pool keeps the coin for when the condition
+            // clears. An ABANDONED send never reaches this catch at all: it
+            // keeps its claim and settles in the background (see the
+            // three-state send in sendTo), so there is no cut error left to
+            // suppress here.
             if (info.transient) {
-              await sleep(1200);
               try {
-                if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
-                  continue;
-                }
-              } catch (err) {
-                diag.dbDegraded = "seen-read";
+                await this.enqueueCardOutbox(c, {
+                  message,
+                  tradeMode,
+                  organic: cardOrganicAudit(organicReading, organicNote),
+                  error: info.line,
+                });
+              } catch (enqueueErr) {
+                // Fail-open and named: the insert failing means the database
+                // is already in trouble (every other path in this tick reads
+                // it), and the coin keeps its re-eval slot either way.
                 console.error(
-                  "[scanner] retry seen-check failed — treating as unseen:",
-                  err instanceof Error ? err.message : err,
-                );
-              }
-              try {
-                await sendTo(c);
-              } catch (retryErr) {
-                const retryInfo = describePushError(retryErr);
-                await this.recordPushFailure(c.chatId, c.profile.tokenAddress, retryInfo);
-                console.error(
-                  `[scanner] retry failed to push ${symbol} to ${c.chatId}: ${retryInfo.line}`,
+                  "[scanner] outbox enqueue failed:",
+                  enqueueErr instanceof Error ? enqueueErr.message : enqueueErr,
                 );
               }
             }
@@ -8528,20 +8542,347 @@ export class Scanner {
    * the push.
    */
   private async enrollTracking(c: QualifyingCoin): Promise<void> {
+    await this.enrollTrackingFields(
+      c.chatId,
+      c.profile.tokenAddress,
+      c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
+      c.pair.marketCap,
+      c.pair.liquidity.usd,
+      // The PIN (see pushwatch's pool-pinning note): the pool this card is
+      // based on. pinnablePoolAddress refuses a Jupiter/Gecko pair (their
+      // pairAddress is the mint, not a pool).
+      pinnablePoolAddress(c.pair),
+    );
+  }
+
+  /**
+   * The same enrollment from stored fields — the outbox drain's shape (see
+   * drainPushOutbox). Separate from enrollTracking because a retried card has
+   * no QualifyingCoin any more: the tick that found the coin was a different
+   * invocation, and the four facts the tracker needs are the four the outbox
+   * row carries.
+   */
+  private async enrollTrackingFields(
+    chatId: string,
+    token: string,
+    symbol: string | null,
+    mcapAtPush: number,
+    liquidityUsd: number | null,
+    poolAddress: string | null,
+  ): Promise<void> {
     try {
       await this.pushWatcher?.onPush(
-        c.chatId,
-        c.profile.tokenAddress,
-        c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
-        c.pair.marketCap,
-        c.pair.liquidity.usd,
-        // The PIN (see pushwatch's pool-pinning note): the pool this card is
-        // based on. pinnablePoolAddress refuses a Jupiter/Gecko pair (their
-        // pairAddress is the mint, not a pool).
-        pinnablePoolAddress(c.pair),
+        chatId,
+        token,
+        symbol,
+        mcapAtPush,
+        liquidityUsd,
+        poolAddress,
       );
     } catch {
       /* tracking is optional */
+    }
+  }
+
+  /**
+   * Enqueue one card whose tick-time send failed transiently (2026-10-18,
+   * src/pushoutbox.ts). Idempotent per (chat, token): the row is the SAME
+   * identity the claim uses, so a later failure replaces the earlier
+   * obligation instead of stacking two cards for one coin.
+   *
+   * WHAT ONLY THE TICK CAN SUPPLY, and is therefore serialized HERE: the
+   * rendered card and its buttons (the pair, the gates and the Axiom/Birdeye
+   * lines are not reconstructible from a token address), the 🌱 audit object
+   * (the audit must record the snapshot the card printed — see
+   * cardOrganicAudit), and the four enrollment facts the follow-up tracker
+   * needs (symbol, mcap, liquidity, pinned pool). None of them survives the
+   * invocation otherwise.
+   */
+  private async enqueueCardOutbox(
+    c: QualifyingCoin,
+    opts: {
+      message: string;
+      tradeMode: "off" | "manual" | "auto";
+      organic: PushAuditOrganic;
+      error: string | null;
+    },
+  ): Promise<void> {
+    // The keyboard is rebuilt EXACTLY as the failed send built it (same call,
+    // same inputs), so the retried card carries the buttons the operator would
+    // have seen — an edit or a retry that dropped reply_markup would leave a
+    // card nobody can act on.
+    const keyboard = JSON.stringify({
+      inline_keyboard: tradeKeyboard(
+        c.pair.baseToken.address,
+        this.trade ? this.trade.buySizeLabel : "",
+        opts.tradeMode,
+        { modeSwitch: Boolean(this.trade), unwatch: true },
+      ),
+    });
+    await this.db.enqueuePushOutbox({
+      chatId: c.chatId,
+      token: c.profile.tokenAddress,
+      symbol: c.profile.symbol ?? c.pair.baseToken.symbol ?? null,
+      message: opts.message,
+      keyboard,
+      mcap: c.pair.marketCap,
+      liquidity: c.pair.liquidity.usd,
+      pool: pinnablePoolAddress(c.pair),
+      organic: JSON.stringify(opts.organic),
+      error: opts.error,
+      createdAt: Date.now(),
+    });
+  }
+
+  /**
+   * Drain due card-outbox rows — the durable retry the tracker cron owns
+   * (2026-10-18; src/pushoutbox.ts and docs/round-trips.md §4.70).
+   *
+   * The rules are the send path's own, in the same order: PROOF first (an
+   * `initial` delivery audit means the card already went out — a re-eval push
+   * or a late settle won the race, and re-sending would be the exact duplicate
+   * this outbox exists to avoid), then the ATOMIC CLAIM (the mutex between
+   * this drain, the scan and the chat-aware re-eval pool), then the send,
+   * then the audit — and only a claim THIS attempt took is ever released.
+   *
+   * Returns null when the outbox has nothing to say (no due rows, none
+   * pending), so the caller writes no view row. Every failure inside is
+   * swallowed: this is a retry path, and a broken retry must never cost the
+   * invocation that hosts it its real work.
+   */
+  async drainPushOutbox(
+    deadline: number,
+    via = "cron-pass",
+  ): Promise<PushOutboxDrainView | null> {
+    const at = Date.now();
+    let due: { rows: PushOutboxRow[]; pending: number };
+    try {
+      due = await this.db.duePushOutbox(at, PUSH_OUTBOX_DRAIN_MAX);
+    } catch {
+      return null;
+    }
+    if (due.rows.length === 0 && due.pending === 0) return null;
+    const view: PushOutboxDrainView = {
+      at,
+      ms: 0,
+      due: due.rows.length,
+      pending: due.pending,
+      sent: 0,
+      retried: 0,
+      rejected: 0,
+      gaveUp: 0,
+      deferred: 0,
+      delivered: 0,
+      via,
+    };
+    // ONE proof read for every row (see getInitialPushAuditTokens). A failed
+    // read is NOT "no proofs": it degrades to the claim-only rules, which are
+    // still safe (a token claimed by somebody else is never sent by this
+    // drain either) — it only widens the duplicate window, never the loss one.
+    // The read is skipped entirely when there is nothing due.
+    let proofs: Set<string> | null = null;
+    if (due.rows.length > 0) {
+      try {
+        proofs = await this.db.getInitialPushAuditTokens();
+      } catch {
+        proofs = null;
+      }
+    }
+    for (const row of due.rows) {
+      if (Date.now() >= deadline) break;
+      const verdict = pushOutboxPreClaim(row, Date.now(), proofs?.has(row.token) ?? false);
+      if (verdict === "drop-delivered") {
+        await this.dropOutboxRow(row, "delivered (audit proof)");
+        view.delivered += 1;
+        continue;
+      }
+      if (verdict === "give-up") {
+        await this.dropOutboxRow(row, "attempts/TTL exhausted");
+        view.gaveUp += 1;
+        continue;
+      }
+      let claimed = false;
+      try {
+        claimed = await this.db.claimTokenPush(row.chatId, row.token);
+      } catch {
+        continue; // database trouble: the row keeps its slot for the next drain
+      }
+      if (!claimed) {
+        // Another sender owns the claim: an in-flight re-eval push, a card
+        // just delivered whose audit this drain read before the write landed,
+        // or an orphan. NEVER touch a claim this drain did not take — back
+        // the row off and let the audit read or the budget decide it.
+        await this.backoffOutboxRow(row, "claim held by another sender", view);
+        continue;
+      }
+      let messageId: number | null = null;
+      let failure: PushErrorInfo | null = null;
+      try {
+        const sent = await this.sendOutboxCard(row, deadline);
+        messageId = Number(sent.message_id ?? 0) || null;
+      } catch (err) {
+        failure = describePushError(err);
+      }
+      if (messageId !== null) {
+        // DELIVERED. Audit → enroll → retire, in the order a crash can be
+        // recovered from: an audit without a delete is dropped as delivered
+        // by the next drain, while a delete without an audit would re-send a
+        // card Telegram already accepted.
+        try {
+          await this.db.recordPushDelivery({
+            chatId: row.chatId,
+            token: row.token,
+            symbol: row.symbol,
+            messageId,
+            mcapAtPush: row.mcap ?? undefined,
+            kind: "initial",
+            organic: parseAuditOrganic(row.organic),
+          });
+        } catch {
+          /* audit is best-effort (see recordPushDelivery) */
+        }
+        // The claim STAYS: it is what tells the scan this card was delivered
+        // (isTokenSeen / claimTokenPush), exactly like the in-tick success.
+        if (row.mcap !== null) {
+          await this.enrollTrackingFields(
+            row.chatId,
+            row.token,
+            row.symbol,
+            row.mcap,
+            row.liquidity,
+            row.pool,
+          );
+        }
+        // A retried card IS the make-up send a deferral promised (see
+        // DeferredPushLedger.recover).
+        this.deferredPushes.recover(row.token);
+        await this.dropOutboxRow(row, `delivered ${row.symbol ?? row.token}`);
+        view.sent += 1;
+        continue;
+      }
+      // FAILED. Release the claim: a failed send leaves the coin unseen for
+      // BOTH retry owners (this outbox and the chat-aware re-eval pool), the
+      // at-least-once policy the in-tick retry had — an unknown outcome is
+      // not proof of non-delivery (see describePushError), and the audit
+      // check ahead of the next attempt is what keeps the duplicate window
+      // narrow. Permanent rejections are NOT retried (see the policy table in
+      // src/pushoutbox.ts); transient ones are, until the budget runs out.
+      try {
+        await this.db.unclaimTokenPush(row.chatId, row.token);
+      } catch {
+        /* best-effort: the row's next attempt re-claims or backs off */
+      }
+      const info = failure ?? describePushError(new Error("outbox send failed"));
+      const next = pushOutboxAfterFailure(row, Date.now(), info.transient);
+      if (next.retry) {
+        await this.noteOutboxRow(row, next.attempts, next.nextAt, info.line);
+        view.retried += 1;
+      } else {
+        await this.dropOutboxRow(
+          row,
+          info.transient ? "attempts/TTL exhausted" : `rejected: ${info.line}`,
+        );
+        if (info.transient) view.gaveUp += 1;
+        else view.rejected += 1;
+      }
+    }
+    view.ms = Date.now() - at;
+    // The pending count above is a snapshot from the start of the drain;
+    // re-read it only when something was retired, so the view cannot publish a
+    // stale backlog as current (and a quiet drain pays nothing).
+    if (view.sent + view.gaveUp + view.rejected + view.delivered > 0) {
+      try {
+        view.pending = (await this.db.duePushOutbox(Date.now(), 0)).pending;
+      } catch {
+        /* keep the snapshot */
+      }
+    }
+    return view;
+  }
+
+  /**
+   * One bounded outbox send (see PUSH_OUTBOX_SEND_CAP_MS): the same
+   * `bot.api.sendMessage` the in-tick path used, with the card's own
+   * reply_markup, raced against the drain's deadline. A send that misses the
+   * race is an UNKNOWN delivery and is reported as a failure (transient, by
+   * describePushError) — the drain's retry policy owns it from there.
+   */
+  private async sendOutboxCard(
+    row: PushOutboxRow,
+    deadline: number,
+  ): Promise<{ message_id?: number | string }> {
+    const remaining = Math.min(deadline, Date.now() + PUSH_OUTBOX_SEND_CAP_MS) - Date.now();
+    if (remaining <= 0) throw new Error("outbox send had no slice left");
+    const sent = this.bot.api.sendMessage(
+      row.chatId,
+      row.message,
+      row.keyboard ? { reply_markup: JSON.parse(row.keyboard) } : undefined,
+    );
+    // The request may outlive the race below; an un-awaited promise that
+    // rejects would surface as an unhandled rejection in a caller that has
+    // already moved on.
+    sent.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        sent,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`outbox send timed out (${remaining}ms)`)),
+            remaining,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** Note a retry bookkeeping update; a failed write leaves the row as it was. */
+  private async noteOutboxRow(
+    row: PushOutboxRow,
+    attempts: number,
+    nextAt: number,
+    lastError: string,
+  ): Promise<void> {
+    try {
+      await this.db.notePushOutboxAttempt(
+        row.chatId,
+        row.token,
+        attempts,
+        nextAt,
+        lastError.slice(0, 300),
+      );
+    } catch {
+      /* the row keeps its old schedule; the next drain retries it */
+    }
+  }
+
+  /** Back a row off without sending (its claim belongs to another sender). */
+  private async backoffOutboxRow(
+    row: PushOutboxRow,
+    why: string,
+    view: PushOutboxDrainView,
+  ): Promise<void> {
+    const next = pushOutboxAfterFailure(row, Date.now(), true);
+    if (next.retry) {
+      await this.noteOutboxRow(row, next.attempts, next.nextAt, why);
+      view.deferred += 1;
+    } else {
+      await this.dropOutboxRow(row, "attempts/TTL exhausted (claim held)");
+      view.gaveUp += 1;
+    }
+  }
+
+  /** Retire one row; a failed delete keeps it for the next drain. */
+  private async dropOutboxRow(row: PushOutboxRow, why: string): Promise<void> {
+    try {
+      await this.db.deletePushOutbox(row.chatId, row.token);
+      console.log(
+        `[scanner] push outbox ${why}: ${row.symbol ?? row.token} → ${row.chatId}`,
+      );
+    } catch {
+      /* the row keeps its slot; the next drain retries the delete */
     }
   }
 

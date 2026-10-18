@@ -80,6 +80,7 @@ import {
   POOL_LIQUIDITY_PRUNE_RATIO,
 } from "./scanner";
 import { deferralRegistryView, deferredPushTokens, feedMakeupView } from "./deferredmakeup";
+import { PUSH_OUTBOX_DRAIN_BUDGET_MS, PUSH_OUTBOX_STATE_KEY } from "./pushoutbox";
 import {
   installTickProbe,
   dbStepView,
@@ -5091,6 +5092,30 @@ async function runTrackerInvocation(
   // No scanner = init failed or was cut. Nothing to record: this delivery is
   // not a scan arrival, and the pass row is what says whether a pass ran.
   if (!scanner) return;
+  // THE CARD OUTBOX (2026-10-18, docs/round-trips.md §4.70): the durable
+  // retry the scan's tick no longer pays for — a card whose Telegram send
+  // failed transiently is a row here (see Scanner.drainPushOutbox and
+  // src/pushoutbox.ts). It drains BEFORE the pass: a retried card is the
+  // obligation the operator is waiting on, and the drain's own deadline
+  // (PUSH_OUTBOX_DRAIN_BUDGET_MS) keeps it from starving the rotation that
+  // follows. The view is persisted only when the drain had something to say
+  // (null = no due rows and none pending), so a quiet minute costs no write;
+  // /health serves it as `pushOutbox` (the key rides its batched front read).
+  try {
+    const view = await scanner.drainPushOutbox(
+      Date.now() + PUSH_OUTBOX_DRAIN_BUDGET_MS,
+    );
+    if (view && db) {
+      await db.setWorkerState(PUSH_OUTBOX_STATE_KEY, JSON.stringify(view));
+    }
+  } catch (err) {
+    // Never rethrown: the outbox is a retry path, and a broken retry must not
+    // cost the pass below its budget.
+    console.error(
+      "[worker] push outbox drain failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
   // The tick's waitUntil hand-off, for the same reason the tick passes it (see
   // pushwatch.holdForTick): a CUT card's delivery proof is an un-awaited promise
   // created at the pass's tail, and an un-awaited promise is cancelled the
@@ -7456,6 +7481,12 @@ const worker = {
       // costs no round trip: the row it reads already rides the front's ONE
       // batch below (see readHealthFront).
       let pushWatchLane: ReturnType<typeof trackerLaneStatus> | null = null;
+      // The card outbox's last drain, read from the durable view the drain
+      // itself wrote (see runTrackerInvocation). Null = no row = the outbox
+      // had nothing due and nothing pending on the last drain, which is the
+      // healthy reading — an outbox that stopped draining shows up as a view
+      // whose `at` stops moving, exactly like every other durable stamp here.
+      let pushOutbox: unknown = null;
       // Cross-isolate cron diagnostics: the scheduled handler persists a
       // running total + last event time to Turso, so any isolate serving
       // /health can prove whether the Cron Trigger is actually delivering.
@@ -7546,6 +7577,12 @@ const worker = {
           DEX_LIST_CACHE_MISSES_KEY,
           DEX_LIST_CACHE_REFUSED_KEY,
           DEX_LIST_CACHE_LAST_KEY,
+          // The card outbox's last drain (2026-10-18, see
+          // runTrackerInvocation): written only when the drain had something
+          // to report, so an absent row reads as "nothing was retried" — the
+          // healthy shape. Rides this request for the same reason every key
+          // above does.
+          PUSH_OUTBOX_STATE_KEY,
         ]);
         const tickState = front?.states;
         const rawTotal = tickState?.get("scheduled_tick_total") ?? null;
@@ -7592,6 +7629,14 @@ const worker = {
         }
         const rawPass = tickState?.get("push_watch_pass") ?? null;
         pushWatchPass = rawPass ? JSON.parse(rawPass) : null;
+        // Same tolerant parse as every other row on this page: a malformed
+        // view is null, never a failed /health read.
+        const rawOutbox = tickState?.get(PUSH_OUTBOX_STATE_KEY) ?? null;
+        try {
+          pushOutbox = rawOutbox ? JSON.parse(rawOutbox) : null;
+        } catch {
+          pushOutbox = null;
+        }
         // The interpreted half of the same row: age, staleness and the three
         // "a pass is/was not finishing" alarms (see TrackerLaneStatus). An
         // absent or unparsable row is its own reading (`present:false`,
@@ -7826,6 +7871,12 @@ const worker = {
         pushWatchPass,
         pushWatchLane,
         now: new Date().toISOString(),
+        // The card outbox's last drain (2026-10-18, docs/round-trips.md
+        // §4.70): due/pending counts and the four outcomes the retry path can
+        // have (sent / retried / rejected / gaveUp), plus the ones a proof
+        // retired. A view whose `at` stops advancing while `pending` is
+        // non-zero is a drain that stopped running.
+        pushOutbox,
       });
     }
 

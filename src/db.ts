@@ -29,6 +29,12 @@ import {
   rowsToNdjson,
   type ColdArchive,
 } from "./coldarchive";
+import {
+  PUSH_OUTBOX_TTL_MS,
+  pushOutboxRetryDelayMs,
+  type PushOutboxEnqueue,
+  type PushOutboxRow,
+} from "./pushoutbox";
 
 /**
  * THE TRANSPORT SEAM (2026-10-15). `Db` drives the database through exactly two
@@ -1513,6 +1519,33 @@ export interface PushAuditOrganic {
 }
 
 /**
+ * `push_outbox.organic` → the audit object a retried card's delivery entry
+ * carries (see PushAuditOrganic and src/pushoutbox.ts). Tolerant the same way
+ * parsePushAuditRing is: a malformed value is "no organic audit", never a
+ * failed retry — the audit is diagnostics, and a card Telegram accepted must
+ * not be dropped over it.
+ */
+export function parseAuditOrganic(
+  raw: string | null | undefined,
+): PushAuditOrganic | undefined {
+  if (typeof raw !== "string" || raw === "") return undefined;
+  try {
+    const v = JSON.parse(raw) as Partial<PushAuditOrganic> | null;
+    if (!v || typeof v !== "object") return undefined;
+    const window = v.tradersWindow;
+    return {
+      score: numOrNull(v.score),
+      tradersH1: numOrNull(v.tradersH1),
+      tradersWindow: window === "1h" || window === "6h" || window === "24h" ? window : null,
+      why: typeof v.why === "string" ? v.why : null,
+      waited: v.waited === true,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * A `worker_state.push_audit` ring as read from its row: an array of
  * entries, or `[]` for an absent / unreadable / non-array value.
  * Tolerant on purpose — every reader of this ring treats "nothing readable" as
@@ -2871,6 +2904,33 @@ export class Db {
         );`,
         `CREATE INDEX IF NOT EXISTS idx_pushed_holders_owner ON pushed_holders(owner, pushed_at);`,
         `CREATE INDEX IF NOT EXISTS idx_pushed_holders_at ON pushed_holders(pushed_at);`,
+        // Durable retry for a card whose Telegram send failed transiently
+        // (2026-10-18, src/pushoutbox.ts): one row per (chat, token) — the
+        // same identity `seen_tokens` claims, so a retry can never stand for
+        // a different card. Rows are transient by construction (the drain
+        // deletes each one on delivery, permanent rejection or expiry), so
+        // the table holds only live obligations — live volume 0–3 rows.
+        // `message`/`keyboard` are the rendered artifact, not inputs: only
+        // the tick that found the coin can render the card (pair, gates,
+        // Axiom/Birdeye lines), so the retry carries the card itself.
+        `CREATE TABLE IF NOT EXISTS push_outbox (
+          chat_id TEXT NOT NULL,
+          token TEXT NOT NULL,
+          symbol TEXT,
+          message TEXT NOT NULL,
+          keyboard TEXT,
+          mcap REAL,
+          liquidity REAL,
+          pool TEXT,
+          organic TEXT,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          created_at INTEGER NOT NULL,
+          last_error TEXT,
+          PRIMARY KEY (chat_id, token)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_push_outbox_next ON push_outbox(next_at);`,
     ];
 
     // THE BOOT READ (2026-09-29): ONE request answers every question this boot
@@ -4815,6 +4875,122 @@ export class Db {
       ],
       "write",
     );
+  }
+
+  /**
+   * Remember one card whose Telegram send failed transiently (2026-10-18,
+   * see src/pushoutbox.ts and docs/round-trips.md §4.70).
+   *
+   * WHY A D1 ROW AND NOT A PROMISE: the tick's old retry was `sleep(1200)`
+   * plus a second send — a second 0.6–1.2s Telegram round trip inside the
+   * envelope the card already races, and one that dies with the isolate. The
+   * row is the same obligation made durable, drained by the tracker cron
+   * (see Scanner.drainPushOutbox) once a minute.
+   *
+   * INSERT OR REPLACE, not IGNORE: (chat_id, token) is the obligation's whole
+   * identity, and a coin that fails AGAIN after a later attempt is a fresh
+   * obligation — the retried card must be the LATEST render (with the latest
+   * buttons and audit), not the first one. `attempts` restarts with it, which
+   * is the honest reading of "this attempt cycle starts now".
+   */
+  async enqueuePushOutbox(row: PushOutboxEnqueue): Promise<void> {
+    await this.get().execute({
+      sql: `INSERT OR REPLACE INTO push_outbox
+              (chat_id, token, symbol, message, keyboard, mcap, liquidity,
+               pool, organic, attempts, next_at, expires_at, created_at,
+               last_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+      args: [
+        row.chatId,
+        row.token,
+        row.symbol,
+        row.message,
+        row.keyboard,
+        row.mcap,
+        row.liquidity,
+        row.pool,
+        row.organic,
+        row.createdAt + pushOutboxRetryDelayMs(0),
+        row.createdAt + PUSH_OUTBOX_TTL_MS,
+        row.createdAt,
+        row.error,
+      ],
+    });
+  }
+
+  /**
+   * The rows the drain may take now, plus the table's live size in the same
+   * read.
+   *
+   * ONE batch, two statements: the COUNT is what /health publishes as the
+   * outstanding retry count, and it costs nothing extra on a round trip the
+   * drain already pays (the same merge every other paired read in this file
+   * makes). `pending` counts ALL rows, not just due ones — a row waiting on
+   * its backoff is exactly the state an operator needs to see.
+   */
+  async duePushOutbox(
+    now: number,
+    limit: number,
+  ): Promise<{ rows: PushOutboxRow[]; pending: number }> {
+    const res = await this.get().batch(
+      [
+        {
+          sql: `SELECT chat_id, token, symbol, message, keyboard, mcap,
+                       liquidity, pool, organic, attempts, next_at,
+                       expires_at, created_at, last_error
+                FROM push_outbox WHERE next_at <= ?
+                ORDER BY next_at LIMIT ?`,
+          args: [now, limit],
+        },
+        { sql: "SELECT COUNT(*) AS n FROM push_outbox" },
+      ],
+      "read",
+    );
+    const rows = (res[0]?.rows ?? []).map((r) => ({
+      chatId: String(r.chat_id),
+      token: String(r.token),
+      symbol: r.symbol === null ? null : String(r.symbol),
+      message: String(r.message),
+      keyboard: r.keyboard === null ? null : String(r.keyboard),
+      mcap: numOrNull(r.mcap),
+      liquidity: numOrNull(r.liquidity),
+      pool: r.pool === null ? null : String(r.pool),
+      organic: r.organic === null ? null : String(r.organic),
+      attempts: Number(r.attempts ?? 0),
+      nextAt: Number(r.next_at ?? 0),
+      expiresAt: Number(r.expires_at ?? 0),
+      createdAt: Number(r.created_at ?? 0),
+      lastError: r.last_error === null ? null : String(r.last_error),
+    }));
+    const counted = res[1]?.rows?.[0] as { n?: number | bigint } | undefined;
+    return { rows, pending: Number(counted?.n ?? 0) };
+  }
+
+  /**
+   * Move one obligation to its next attempt. Written ONLY by the drain that
+   * took the token's claim (see Scanner.drainPushOutbox) — the claim, not this
+   * row, is what serializes senders, so the update needs no `attempts` guard.
+   */
+  async notePushOutboxAttempt(
+    chatId: string,
+    token: string,
+    attempts: number,
+    nextAt: number,
+    lastError: string | null,
+  ): Promise<void> {
+    await this.get().execute({
+      sql: `UPDATE push_outbox SET attempts = ?, next_at = ?, last_error = ?
+            WHERE chat_id = ? AND token = ?`,
+      args: [attempts, nextAt, lastError, chatId, token],
+    });
+  }
+
+  /** Retire one obligation (delivered, rejected, or given up). */
+  async deletePushOutbox(chatId: string, token: string): Promise<void> {
+    await this.get().execute({
+      sql: "DELETE FROM push_outbox WHERE chat_id = ? AND token = ?",
+      args: [chatId, token],
+    });
   }
 
   /**

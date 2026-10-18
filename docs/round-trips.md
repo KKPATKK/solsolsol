@@ -4514,3 +4514,90 @@ feed leg p50 profiles 8（cache/5 分鐘 cadence）、pump 76、jup 126、meteor
 **測試**：`npm run build` 綠；`npm run test:unit` **exit 0**（575 / 8 / 7 / 5 / 14 / 4 / 14 / 9 / 5 / 12 / 19，0 failed）：
 新增 `scripts/test-cold-archive.js` 8 項（key/NDJSON/archive-then-delete/put 失敗保留/無 binding 不動/
 批大小覆蓋一日 tick/AE point shape/err 截斷），`r2-bind --print` 與 `wrangler deploy --dry-run` 均驗證綁定。
+
+## 4.68 DO SQLite 分流：可行性檢查，結論係「可以，但今日唔值」（2026-10-18）
+
+詳細量測同設計見 `docs/do-sqlite-shard-2026-10-18.md`。**冇改 code、冇 deploy。**
+
+- **技術上可以**：`TickClock` 已經係 `new_sqlite_classes`，DO SQLite 2025-04-07 GA，
+  `ctx.storage.sql` 係 in-process；PITR 有 30 日（唔係「冇 DR」）。
+- **但分流賺唔到嘢**：D1 10-17 寫入 **498,490/day = 29.9%/月**（3.3× 餘裕）；
+  `writeCensus`（22 ticks）顯示 `token_stats` **57.7%**、`push_watch` 24.1%、
+  `worker_state` 16.4%、telemetry（`scan_history`+`tick_legs`）**1.7%**。
+- **切得嘅只有 telemetry**：1.7% ≈ 8K rows/day，DO 成本 ~$0，但解決唔到任何現有問題。
+- **高量嘅表綁死跨表不變量**：pool query 係 `NOT EXISTS (SELECT 1 FROM seen_tokens …)`，
+  `seen_tokens` 又係重複卡唯一閘；`push_watch` 係 `reserve → send → rollback`。切去 DO 就係
+  多一個 consistency domain。
+- **真正嘅替代方案係成個 store 搬入一個 DO**（15.8MB vs 10GB）：技術上可行，但 cron path 唔受
+  placement 管（今日 `select1` p50 36ms、`dbMs` 150–288ms/tick），Worker→DO 仍然係 network hop，
+  而且 7 個 script／workflow 直接經 D1 讀寫要改。
+- **觸發點**：D1 寫入 > ~35M/月，或者 20s cadence 令投影貼近 50M。到時先做 telemetry pilot
+  （1 row/tick、kill switch、24h 0 遺失），再考慮 `push_watch`；`token_stats` 唔好局部切。
+
+## 4.69 Queues 接手卡片發送：好處核對，結論係「真但細，今日唔值」（2026-10-18）
+
+詳細分析見 `docs/queues-card-send-2026-10-18.md`。**冇改 code、冇加 binding、冇 deploy。**
+
+- **量到**：`/debug/push-audit` ring 200 條 / 13.79h = **348 張卡/日**（followup ~323、initial ~21、
+  resend 1、heal 1），全部 1 個 chat；send 實測 0.62–1.23s。
+- **唯一實在嘅好處**：send 唔再食 tick 嘅 send slice（`CANDIDATE_PUSH_RESERVE_MS 1,500`）
+  同 tracker pass budget（5,000ms，每張 ~0.9s）——約 19s/日（tick）＋ ~4.9min/日（pass）嘅預算。
+  但今日 pass 336ms／15 rows、`alerted 0`、`cut 0`、`miss 0`，即係買保險，唔係修好任何嘢。
+- **「1M ops/月」唔值錢**：一個 delivery = **3 ops**（write+read+delete）→ 10,440 msg/月
+  = **31.3K ops = 3.1%**；10× 用量都只係 31.5%（Free plan 10K ops/day 都裝得落）。
+  ops 同 D1 rows written（真正稀缺：10-17 **29.9%/月**）唔互通。
+- **Queue 唔減 D1 寫入**：claim、delivery audit、`push_watch` reserve/rollback 照寫，
+  跨 invocation 釋放 claim 仲要 lease/heartbeat。
+- **代價**：默認 `max_batch_timeout 5s`（平均 4 分鐘一張卡，永遠裝唔滿 10 條一批）＋
+  官方冇 latency SLA；**冇 FIFO**（revive/dead 可倒序或並行）；**at-least-once + retry 3 次**
+  = 新嘅重複卡來源（正係 `docs/duplicate-cards.md` 一直喺度防嘅嘢）——要安全就 consumer
+  每次 send 前查 `push_audit` 嘅 token＋sig proof。
+- **今日唔做**；觸發點：≥10 chats／>3.5K sends/日、`cardSend.cut` 由 0 變常態、或者要
+  per-message retry/DLQ 嘅審計要求。屆時：`max_batch_timeout 0` + `max_concurrency 1` +
+  proof 檢查 + 先 flag 一個 chat pilot 24h；更便宜嘅替代係 D1 outbox + 現有 cron retry。
+
+## 4.70 卡片重試由 D1 outbox + 現有 tracker cron 接手，tick 內嘅 transient retry 拆走（2026-10-18）
+
+§4.69 講咗「唔用 Queues」；呢個就係當時指向嘅替代：**同一樣耐久性，用返 `push_watch`
+嗰套 claim + `push_audit` proof，唔加新服務**。
+
+### 一、做咗啲乜
+
+- **新增 `push_outbox` 表**（`src/db.ts` DDL，schema fingerprint 自動 bust，唔使新 migration flag）：
+  PK `(chat_id, token)`，欄位帶齊重試所需嘅**成品**——`message`（tick 渲染嘅卡）、
+  `keyboard`（`reply_markup` JSON）、`mcap`／`liquidity`／`pool`（enroll tracking 用）、
+  `organic`（`PushAuditOrganic` JSON，audit 要記返卡上嗰個讀數）、`attempts`／`next_at`／
+  `expires_at`／`last_error`。
+- **Scanner 拆走 tick 內 retry**（`sleep(1200)` + 第二次 `sendTo`，成 1.2s＋0.6–1.2s Telegram
+  round trip）。transient 失敗（429/5xx/network）→ `enqueueCardOutbox`（一次 insert）；
+  **永久 4xx 唔入隊**（一秒內解決唔到，一分鐘都解決唔到，交返俾 re-eval pool）。
+- **Drain 由 tracker cron 擁有**（`runTrackerInvocation`，每分鐘一次，relay 兩邊都跑）：
+  `Scanner.drainPushOutbox(deadline)` 最多 3 張／次、每張最多 5s、整體 `PUSH_OUTBOX_DRAIN_BUDGET_MS 4s`，
+  跑喺 pass 之前。
+- **政策**（`src/pushoutbox.ts`，全部純函數）：
+  **proof 先**（`getInitialPushAuditTokens`；有 initial audit = 已送達 → 刪行、唔再送）→
+  **原子 claim**（`claimTokenPush`；拿唔到 = 有其他 sender → backoff，**絕不碰人哋嘅 claim**）→ send →
+  audit → enroll tracking → `recover` deferral → 刪行；失敗就 **unclaim**（留返個 coin 俾兩個
+  retry owner 鬥快），transient 最多 3 次、TTL 10 分鐘、backoff 60s→120s。
+- **View**：`/health.pushOutbox`（key 搭 `readHealthFront` 同一次 batch；drain 有嘢講才寫，
+  靜嘅一分鐘零 write）：`due/pending/sent/retried/rejected/gaveUp/deferred/delivered/ms`。
+
+### 二、語意（要知嘅取捨）
+
+- **延遲**：舊 retry 係 1.2s 後；新嘅係下一個 cron 分鐘（≤60s）——換嚟嘅係「tick 死咗都會重試」。
+- **重複窗口冇變**：任何「Telegram 收咗但回應／audit 遺失」嘅情況，重試都會再出一張——呢個係
+  舊 in-tick retry 已經有嘅窗口；drain 每次 send 前查 audit proof 就係收窄佢嘅方法（唔會關閉）。
+- **Claim 唔會跨 invocation 擁有**：每次嘗試才 claim，失敗即刻放，所以唔會新增「孤兒 claim」class
+  （`seen_tokens` 冇 expiry）；而每次成功都保持 claim = seen，re-eval 唔會重推。
+- **Auto-buy 唔會補做**：重試只補卡片（無條件的話，分鐘後以差價自動買入係另一個決定）。
+- **Drain 只掛喺 tracker cron**：如果嗰條 cron 死咗（§4.66 講過 tick 有 fallback pass，但 outbox 冇），
+  未送嘅行會 TTL 10 分鐘後被 drop，re-eval pool 接手——即係退返「今日之前」嘅行為，唔會漏卡但會慢。
+
+### 三、測試（`npm run test:unit` 已含新檔）
+
+`scripts/test-push-outbox.js` 21 tests：純政策（proof/attempts/TTL/permanent）、DB round-trip
+（INSERT OR REPLACE、next_at、pending count、oldest-first）、**真 Scanner + 假 bot 嘅 drain 端到端**
+（成功＝audit＋保留 claim＋enroll＋刪行；transient＝放 claim＋backoff；4xx＝刪行；已有 proof＝零 send；
+claim 被佔＝零 send 零搶；exhausted＝零 send）＋來源 pin（scanner 冇咗 in-tick retry、worker 有 drain
+同 /health 欄位）。`test-d1-migrate.js` 加咗 `push_outbox`（表單＋archive fixture，19 passed）。
+**全套 exit 0，全部綠**。
