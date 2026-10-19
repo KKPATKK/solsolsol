@@ -4648,3 +4648,64 @@ Telegram 訊息本文（forward 讀完即刪）見到兩個形狀：
 
 - `timeout` / `no-reading` 嘅卡仍然冇線（provider 窗口／index 延遲）；今次只係令佢**有得查**，
   冇加第二次讀數。要「幾乎每次都有」就仲要喺 5 槍窗口裡再讓一槍，或加 bounded 重讀——各自要量。
+
+## 4.72 有機度第七擊：`timeout`／`no-reading` 嘅卡補第二次讀數（2026-10-19）
+
+§4.71 嘅殘餘寫得白：「`timeout` / `no-reading` 嘅卡仍然冇線；要『幾乎每次都有』就仲要喺 5 槍窗口
+裡再讓一槍，或加 bounded 重讀」。今次就係後者——但唔係再讓一槍（會蝕 tick 嘅請求預算），而係
+喺**推送之後**補一次，因為嗰時卡已經出咗，唯一代價係一個 subrequest。
+
+### 一、為何「多等一會」會好
+
+兩個成因本身都有時間性：
+
+- **429 窗口**：provider 實測 5 requests / ~10s，`JupTokensClient` 自己會等（`pauseMs <= 10s` 且
+  caller 嘅 wall 付得起）。第一次讀數喺 tick 開頭 ~2s 發出，正正撞上 bulk lanes 啱啱賺返嚟嘅
+  429；卡片嘅 15s wall 可以等，但 append 嘅 20s 一到就放棄。
+- **index 未追到**：brand-new mint 喺 Jupiter search 度未有 entry（`no-entry`）或者 entry 有但
+  `organicScore` / `numTraders` 全部 absent（`empty`）。呢個係時間問題，唔係「呢個幣冇數據」。
+
+兩者喺 audit 嘅形狀就係 `no-reading`（settled 但冇嘢）同 `no-numbers`（有 entry 冇數）；`timeout`
+係更極端嘅第三種（20s 都未 settle）。三種都**唔係永久**，所以值得多問一次。
+
+### 二、改動
+
+- `src/scanner.ts`
+  - 新常數：`ORGANIC_LATE_RETRY_DELAY_MS = 2_000`（等窗口關、index 追上）、
+    `ORGANIC_LATE_RETRY_WALL_MS = 12_000`（> `JUP_RATE_LIMIT_WAIT_MAX_MS` 10s + 1.5s margin，
+    所以第二次讀數真係付得起一個 429 等待）、`ORGANIC_LATE_RETRY_WAIT_MS = 15_000`（append 等
+    呢次讀數嘅上限，> wall）。
+  - `appendLateOrganicLine` 收一個 `retry?: () => Promise<JupOrganicReading | null>` thunk（call
+    site 用同一個 `jupiterOrganic.fetchOrganicScore`，帶 retry 自己嘅 wall），以及兩個只供測試
+    用嘅時間 override（`retryDelayMs` / `retryWaitMs`）。
+  - 第一次 sweep 嘅四種「冇線」結局（`timeout` / `read-failed` / `no-reading` / `no-numbers`）先
+    **即刻寫一次 audit**（isolate 死咗都仲有記錄），再用**一次**第二讀數；第二次仍然冇嘢就寫
+    最終結局，並且帶住 `first`。
+  - 已經有線嘅卡完全唔會踩 retry（`apply` 之後 `return`），所以「一卡一 edit」冇變。
+  - 條文：`apply()` 集中做 render + edit + record，第一同第二次共用，第 2 次嘅 note 會寫
+    `・第 2 次讀數`，令讀者分得出「慢」同「補」。
+- `src/db.ts`：`PushAuditLateOutcome` 抽成 union、新增 `PushAuditLateAttempt`，同
+  `PushAuditLate.first?: PushAuditLateAttempt`。最終 `outcome` 係第二次 sweep 嘅；`first` 只在
+  真係花過第二次讀數時出現，保留第一次嘅 `outcome` / `lateMs` / `score` / `tradersH1` /
+  `error`（連 read 嘅錯誤文字）。
+- `scripts/test-unit.js`：`appendLateOrganicLine` 測試加 5 個 case——`no-reading` → 第二次讀數
+  landed（note 有 `第 2 次讀數`、audit `first.outcome:"no-reading"`）、`no-numbers` → 仍然
+  `no-numbers`（`first` 保留）、兩次都 throw → `read-failed`（兩個 error 都留住）、第二次
+  timeout → `timeout` + `first:"no-reading"`、第一次就 landed → retry **零次呼叫**。另加三條
+  常數互相可付性嘅斷言，同 call-site 嘅 source pin（`retry: organicRetry`、
+  `const organicRetry = jupiterOrganic`、`Date.now() + ORGANIC_LATE_RETRY_WALL_MS`）。
+
+### 三、代價
+
+- 每個「冇線」卡最多多 **1 個 Jupiter subrequest**；生產最近 200 條 audit 入面 initial 卡係
+  少數（大部分係 followup），所以係每日個位數至數十個額外 call，同 tick 嘅 bulk lanes 唔同量級。
+- Append 嘅 task 最壞由 20s 變 ~37s（20s 第一 wall + 2s gap + 15s 第二 wall），而且只會喺第一次
+  讀數**完全冇 settle** 嘅卡發生；常見嘅 retry（`no-reading` 1–2s 就 settle）係 ~14s。呢個 task
+  本來就係 `waitUntil` 拉住，唔阻 card、唔阻下一個 tick。
+- 代價係 0 喺「有線」嘅卡：retry thunk 只會被 call 一次，而且只喺四個「冇線」出口之後。
+
+### 四、殘餘
+
+- 第二次讀數都失敗嘅卡（兩次 429 疊埋／index 真係冇）仍然冇線，audit 會清楚寫住
+  `outcome` + `first.outcome`。呢個係數據現實，唔再加第三次。
+- 未量到 live 比例：要 deploy 之後嘅一批 initial 卡先答得到「第二次讀數令幾多 % 嘅卡補返線」。

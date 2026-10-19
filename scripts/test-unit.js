@@ -12312,6 +12312,17 @@ async function main() {
       src.includes("const organicLateBox: { value: JupOrganicReading | null } = { value: null };"),
       "the raw read must have its own box, free of the tick wall",
     );
+    // THE SECOND READ (2026-10-19): a thunk for one more fetchOrganicScore
+    // call, built where the client's presence is known and carrying the
+    // retry's own wall — a `no-reading` card must not be lineless forever.
+    assert.ok(
+      src.includes("const organicRetry = jupiterOrganic"),
+      "the card slot must offer the late append a second read",
+    );
+    assert.ok(
+      src.includes("Date.now() + ORGANIC_LATE_RETRY_WALL_MS,"),
+      "and that read must carry its own wall (long enough to pay a 429 pause)",
+    );
     const sent = src.slice(
       src.indexOf('if (plan.audit && raced.status === "sent") {'),
     );
@@ -12321,6 +12332,11 @@ async function main() {
       "organicRead !== null",
       "cardReading === null",
       "replyMarkup: cardKeyboard,",
+      // THE SECOND READ (2026-10-19): the append is given a thunk for one more
+      // `fetchOrganicScore` call, built where the client's presence is known
+      // and carrying the retry's own wall. Without it a `no-reading` card is
+      // permanently lineless, which is the shape the operator reported.
+      "retry: organicRetry,",
     ]) {
       assert.ok(append.includes(needle), `the sent branch must schedule it: ${needle}`);
     }
@@ -12330,7 +12346,7 @@ async function main() {
     );
   });
 
-  await test("appendLateOrganicLine: the card's missing 有機度 is appended by an edit when the read lands late (2026-10-17)", async () => {
+  await test("appendLateOrganicLine: the card's missing 有機度 is appended by an edit when the read lands late (2026-10-17, second read 2026-10-19)", async () => {
     // The card can never wait on its own reading (the push reserve is for the
     // SEND), and the provider refuses the read with a 1-10s window — so the two
     // old outcomes were "card late" and "line gone". The edit is the third:
@@ -12338,6 +12354,9 @@ async function main() {
     const {
       Scanner,
       ORGANIC_LATE_LINE_WAIT_MS,
+      ORGANIC_LATE_RETRY_DELAY_MS,
+      ORGANIC_LATE_RETRY_WALL_MS,
+      ORGANIC_LATE_RETRY_WAIT_MS,
       JUP_CARD_READ_WALL_MS,
     } = require("../dist/scanner.js");
     const t = tmpDb();
@@ -12391,7 +12410,7 @@ async function main() {
           },
         });
       };
-      for (const id of [42, 43, 44, 45, 46, 47, 48]) await seed(id);
+      for (const id of [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]) await seed(id);
       const lateOf = async (messageId) => {
         const row = (await db.getPushAudit()).find((r) => r.messageId === messageId);
         return row?.organic?.late ?? null;
@@ -12529,6 +12548,135 @@ async function main() {
         (await lateOf(46)).outcome,
         "timeout",
         "a read still in flight at the cap must read as timeout, not as an absent read",
+      );
+
+      // ---- THE SECOND READ (2026-10-19) -------------------------------
+      // A card whose first reading produced nothing printable is not the end
+      // of the story: the 429 window closes and Jupiter's index catches up, so
+      // one more call is spent a few seconds later. The audit keeps BOTH
+      // sweeps, because "the read was slow" and "the index had nothing yet"
+      // are different operational facts.
+      const settleMore = () => new Promise((r) => setTimeout(r, 150));
+      edits.length = 0;
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 49,
+        reading: Promise.resolve(null),
+        retry: async () => reading({ score: 61.5, tradersH1: 402 }),
+        retryDelayMs: 0,
+        retryWaitMs: 50,
+        render,
+        replyMarkup: { inline_keyboard: [] },
+      });
+      await settleMore();
+      assert.equal(edits.length, 1, "the second read's number must reach the card");
+      assert.match(String(edits[0][2]), /🌱 有機度: 61\.5/);
+      assert.match(String(edits[0][2]), /第 2 次讀數/, "a retried line says which read it is");
+      assert.match(String(edits[0][2]), /推送後 \d+s 補上/);
+      assert.deepEqual(
+        edits[0][3],
+        { reply_markup: { inline_keyboard: [] } },
+        "the retried edit must keep the card's keyboard too",
+      );
+      const retried = await lateOf(49);
+      assert.equal(retried.outcome, "landed");
+      assert.equal(retried.score, 61.5);
+      assert.equal(retried.tradersH1, 402);
+      assert.equal(retried.first.outcome, "no-reading", "the sweep that needed the retry survives");
+      assert.equal(typeof retried.first.lateMs, "number");
+      assert.equal(retried.first.score, null);
+
+      // `no-numbers` is retried too (the index had the mint but no stats yet),
+      // and a retry that ALSO has nothing printable stays a fact, not a line.
+      edits.length = 0;
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 50,
+        reading: Promise.resolve(reading({ score: null, tradersH1: null })),
+        retry: async () => reading({ score: null, tradersH1: null }),
+        retryDelayMs: 0,
+        retryWaitMs: 50,
+        render,
+        replyMarkup: null,
+      });
+      await settleMore();
+      assert.equal(edits.length, 0, "still no number, still no edit");
+      const stillEmpty = await lateOf(50);
+      assert.equal(stillEmpty.outcome, "no-numbers");
+      assert.equal(stillEmpty.first.outcome, "no-numbers");
+
+      // The retry's own failure is named: a provider that refuses BOTH reads
+      // is `read-failed`, with the message that made it so.
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 51,
+        reading: Promise.reject(new Error("first boom")),
+        retry: async () => {
+          throw new Error("second boom");
+        },
+        retryDelayMs: 0,
+        retryWaitMs: 50,
+        render,
+        replyMarkup: null,
+      });
+      await settleMore();
+      const twiceFailed = await lateOf(51);
+      assert.equal(twiceFailed.outcome, "read-failed");
+      assert.equal(twiceFailed.first.outcome, "read-failed");
+      assert.match(String(twiceFailed.error), /second boom/, "the retry's own error survives");
+      assert.match(String(twiceFailed.first.error), /first boom/, "and so does the first one's");
+
+      // A retry that never settles is a TIMEOUT for the SECOND sweep — the
+      // first one's verdict is preserved beside it.
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 53,
+        reading: Promise.resolve(null),
+        retry: () => new Promise(() => {}),
+        retryDelayMs: 0,
+        retryWaitMs: 20,
+        render,
+        replyMarkup: null,
+      });
+      await settleMore();
+      const retryTimedOut = await lateOf(53);
+      assert.equal(retryTimedOut.outcome, "timeout");
+      assert.equal(retryTimedOut.first.outcome, "no-reading");
+
+      // A card whose FIRST read landed never spends the second call: the retry
+      // is a fallback, not a habit (the thunk is counted, not inferred).
+      let retryCalls = 0;
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 52,
+        reading: Promise.resolve(reading()),
+        retry: async () => {
+          retryCalls += 1;
+          return reading();
+        },
+        retryDelayMs: 0,
+        retryWaitMs: 50,
+        render,
+        replyMarkup: null,
+      });
+      await settleMore();
+      assert.equal(retryCalls, 0, "a card with its line must not pay a second read");
+      assert.equal((await lateOf(52)).outcome, "landed");
+
+      // The timing constants have to stay payable against each other: the
+      // retry's wall must be able to pay the longest 429 pause the client will
+      // wait out, and the task's own wait must outlast that wall.
+      assert.ok(
+        ORGANIC_LATE_RETRY_WALL_MS > JUP_RATE_LIMIT_WAIT_MAX_MS + 1_500,
+        `the retry's wall (${ORGANIC_LATE_RETRY_WALL_MS}ms) must be able to wait out the cap (${JUP_RATE_LIMIT_WAIT_MAX_MS}ms)`,
+      );
+      assert.ok(
+        ORGANIC_LATE_RETRY_WAIT_MS > ORGANIC_LATE_RETRY_WALL_MS,
+        "and the append must outlast the retry's own wall",
+      );
+      assert.ok(
+        ORGANIC_LATE_RETRY_DELAY_MS >= 1_000 && ORGANIC_LATE_RETRY_DELAY_MS <= 10_000,
+        `the gap (${ORGANIC_LATE_RETRY_DELAY_MS}ms) must clear a short index lag without holding the isolate for long`,
       );
     } finally {
       await t.cleanup();

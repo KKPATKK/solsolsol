@@ -17,6 +17,8 @@ import {
   poolRotationSlot,
   type Db,
   type PushAuditLate,
+  type PushAuditLateAttempt,
+  type PushAuditLateOutcome,
   type PushAuditOrganic,
   type ScanFront,
   type TokenStats,
@@ -424,6 +426,45 @@ export const JUP_CARD_READ_WALL_MS = 15_000;
  * shape it shipped with, exactly as before this change).
  */
 export const ORGANIC_LATE_LINE_WAIT_MS = 20_000;
+/**
+ * Gap before the late-line task spends its SECOND read, in ms (2026-10-19).
+ *
+ * WHY A SECOND READ AT ALL. The first one is fired ~2s into the tick, i.e.
+ * while the tick's own bulk lanes are still earning 429s, and a brand-new
+ * mint's Jupiter index entry does not exist yet at that age. So the two live
+ * shapes of "the card still has no line" — `no-reading` (the provider
+ * refused) and `no-numbers` (the mint answered with every field absent) —
+ * are both self-healing given a few seconds: the 429 window is 5 requests /
+ * ~10s, and the index fills in on the order of seconds. The operator's
+ * 2026-10-19 report names exactly these two shapes — a card whose audit says
+ * `no-reading`, and a card whose read never settled — and neither is
+ * permanent: both were still true only at the moment the append gave up.
+ *
+ * The gap is what makes the retry land AFTER those two windows instead of
+ * inside them; the read's own 429 handling (wait out a pause ≤ 10s) covers
+ * the rest. It is not a retry loop: exactly one extra call, ever.
+ */
+export const ORGANIC_LATE_RETRY_DELAY_MS = 2_000;
+/**
+ * The retry read's own wall, in ms from its dispatch (see
+ * fetchOrganicScore's third argument). Same rule as the first read's wall: it
+ * must be able to PAY the longest 429 pause the client will wait out
+ * (`room > pause + 750ms`), so it clears JUP_RATE_LIMIT_WAIT_MAX_MS (10s) by
+ * 1.5s. A second read that cannot wait out the very window it exists for is
+ * a wasted call.
+ */
+export const ORGANIC_LATE_RETRY_WALL_MS = 12_000;
+/**
+ * How long the late-line task waits for the second read, from its dispatch.
+ * Outlasts ORGANIC_LATE_RETRY_WALL_MS so the read's own decision (and its
+ * last round trip) always lands first — the mirror of
+ * ORGANIC_LATE_LINE_WAIT_MS vs JUP_CARD_READ_WALL_MS.
+ *
+ * Worst case for the whole task: first wall 20s + gap 2s + this 15s ≈ 37s,
+ * and only for a card whose FIRST read never settled at all. The common
+ * retry (a `no-reading` that settled in 1-2s) is ~14s.
+ */
+export const ORGANIC_LATE_RETRY_WAIT_MS = 15_000;
 /**
  * Preferred slice for the initial-card Telegram send (see the send in
  * sendTo). The send is the LAST step of the push path and the only one that
@@ -7314,6 +7355,19 @@ export class Scanner {
             },
           );
         }
+        // The second read the late append may spend (see
+        // appendLateOrganicLine's `retry`): built HERE, where the client's
+        // presence is known, and carrying the retry's own wall. Created
+        // eagerly but never CALLED unless the first sweep produced nothing
+        // printable — a thunk, not a request.
+        const organicRetry = jupiterOrganic
+          ? () =>
+              jupiterOrganic.fetchOrganicScore(
+                coin.stats.token,
+                undefined,
+                Date.now() + ORGANIC_LATE_RETRY_WALL_MS,
+              )
+          : undefined;
         // Bundler + top-10 holder share is resolved for the message card but
         // no longer filters — those filters were removed, so coins push even
         // when the RugCheck report is not ready yet (the card shows 未检测).
@@ -7836,6 +7890,13 @@ export class Scanner {
                 reading: organicRead,
                 render: renderCard,
                 replyMarkup: cardKeyboard,
+                // THE SECOND READ (2026-10-19): the same call the card made,
+                // with the retry's own wall (ORGANIC_LATE_RETRY_WALL_MS — long
+                // enough to pay a 429 pause the client will wait out). It runs
+                // only when the first sweep produced nothing printable (`retry`
+                // is never reached otherwise), so a card that already has its
+                // line costs exactly what it did before.
+                retry: organicRetry,
               });
             }
             if (plan.recordUnconfirmed) {
@@ -8424,11 +8485,17 @@ export class Scanner {
    * Editing the card breaks the trade: the message goes out on time, and the
    * number is appended the moment the read lands.
    *
-   * BOUNDED AND DROPPED, never retried: the task waits at most
-   * ORGANIC_LATE_LINE_WAIT_MS for a reading, appends nothing when the read came
-   * back with no number to print ("no entry" / "empty"), and swallows a failed
-   * edit — the card then keeps the shape it was sent with, exactly the old
-   * behaviour. ONE edit per card: the task is created once, at the send.
+   * BOUNDED, AND NOW RETRIED ONCE (2026-10-19): the task waits at most
+   * ORGANIC_LATE_LINE_WAIT_MS for the first reading, appends nothing when that
+   * read came back with no number to print ("no entry" / "empty"), and
+   * swallows a failed edit — the card then keeps the shape it was sent with,
+   * exactly the old behaviour. What it no longer does is give up there: a
+   * `timeout` / `read-failed` / `no-reading` / `no-numbers` first sweep spends
+   * ONE second read (ORGANIC_LATE_RETRY_DELAY_MS later, walled by
+   * ORGANIC_LATE_RETRY_WALL_MS), because both live causes — the provider's 429
+   * window and Jupiter's index lag on a fresh mint — are time-limited and the
+   * card can still be edited. Still ONE edit per card: a landed first sweep
+   * pays nothing extra, and the retry cannot fire twice.
    *
    * EVERY OUTCOME IS RECORDED (2026-10-19): the task's own shape used to live
    * only in two cumulative isolate counters, so a card that still had no line
@@ -8459,6 +8526,23 @@ export class Scanner {
     render: (organic: JupOrganicReading | null) => string;
     /** The keyboard the card was sent with — kept on the edit. */
     replyMarkup: unknown;
+    /**
+     * The SECOND read (2026-10-19) — one more `fetchOrganicScore` call for the
+     * sweeps the first read could not answer: the provider refused (429), the
+     * mint was not indexed yet, or every field came back absent. The caller
+     * supplies it (rather than this method reaching for `this.jupiter`) so the
+     * wall it carries is visible at the one site that owns the client's
+     * options, and so an offline double without a client simply has no retry.
+     */
+    retry?: () => Promise<JupOrganicReading | null>;
+    /**
+     * Timing overrides for the retry, defaulting to
+     * ORGANIC_LATE_RETRY_DELAY_MS / ORGANIC_LATE_RETRY_WAIT_MS. Unit tests set
+     * them to 0 so a retry case does not spend the production gap; production
+     * never passes them.
+     */
+    retryDelayMs?: number;
+    retryWaitMs?: number;
   }): void {
     const api = this.bot.api as unknown as {
       editMessageText?: (...a: unknown[]) => Promise<unknown>;
@@ -8468,23 +8552,25 @@ export class Scanner {
     // offline double without the writer degrades to "no record", never a
     // crash — the same stance recordUnconfirmedCardSend takes.
     const record = (
-      outcome: PushAuditLate["outcome"],
+      outcome: PushAuditLateOutcome,
       extra: { score?: number | null; tradersH1?: number | null; error?: string | null } = {},
+      first: PushAuditLateAttempt | null = null,
     ): Promise<void> => {
       const update = (this.db as Partial<Pick<Db, "updatePushDeliveryLate">>)
         .updatePushDeliveryLate;
       if (typeof update !== "function") return Promise.resolve();
-      return update
-        .call(this.db, args.messageId, {
-          outcome,
-          lateMs: Date.now() - startedAt,
-          score: extra.score ?? null,
-          tradersH1: extra.tradersH1 ?? null,
-          error: extra.error ?? null,
-        })
-        .catch(() => {
-          /* diagnostics only — never a reason to fail the card path */
-        });
+      const late: PushAuditLate = {
+        outcome,
+        lateMs: Date.now() - startedAt,
+        score: extra.score ?? null,
+        tradersH1: extra.tradersH1 ?? null,
+        error: extra.error ?? null,
+      };
+      // Only present when a second read was spent — see PushAuditLate.first.
+      if (first !== null) late.first = first;
+      return update.call(this.db, args.messageId, late).catch(() => {
+        /* diagnostics only — never a reason to fail the card path */
+      });
     };
     if (typeof api.editMessageText !== "function") {
       void record("no-api");
@@ -8492,12 +8578,57 @@ export class Scanner {
     }
     this.organicLateEditsTotal += 1;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
     const task = (async (): Promise<void> => {
+      /**
+       * Put a printable reading on the card (the task's ONE edit) and record
+       * what happened. `first` is carried through so the audit still shows the
+       * sweep that needed a second read (see PushAuditLate.first).
+       */
+      const apply = async (
+        late: JupOrganicReading,
+        first: PushAuditLateAttempt | null,
+        viaRetry: boolean,
+      ): Promise<void> => {
+        const verdict = jupiterGateVerdict(late, {
+          jupSusBlock: this.config.jupSusBlock,
+          organicMinScore: this.config.organicMinScore,
+          organicMaxTradersH1: this.config.organicMaxTradersH1,
+        });
+        const lateSec = Math.round((Date.now() - startedAt) / 1000);
+        // A retry that landed says so: the reader of the chat should be able to
+        // tell a second call from a slow first one without reading the audit.
+        const source = viaRetry ? "・第 2 次讀數" : "";
+        const note = verdict
+          ? `\n（🌱 有機度 推送後 ${lateSec}s 才到${source} ⚠️ 此讀數本應攔住：${verdict.reason}）`
+          : `\n（🌱 有機度 推送後 ${lateSec}s 補上${source}）`;
+        try {
+          await api.editMessageText?.(args.chatId, args.messageId, `${args.render(late)}${note}`, {
+            reply_markup: args.replyMarkup,
+          });
+          this.organicLateLandedTotal += 1;
+          await record("landed", { score: late.score, tradersH1: late.tradersH1 }, first);
+        } catch (err) {
+          // The card keeps the shape it shipped with; the REASON is now durable
+          // instead of swallowed (see PushAuditLate).
+          await record(
+            "edit-failed",
+            {
+              score: late.score,
+              tradersH1: late.tradersH1,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            first,
+          );
+        }
+      };
+
+      // THE FIRST SWEEP.
       let timerFired = false;
-      let readFailed = false;
+      let readError: string | null = null;
       const late = await Promise.race([
-        args.reading.catch(() => {
-          readFailed = true;
+        args.reading.catch((err: unknown) => {
+          readError = err instanceof Error ? err.message : String(err);
           return null;
         }),
         new Promise<null>((resolve) => {
@@ -8507,45 +8638,83 @@ export class Scanner {
           }, ORGANIC_LATE_LINE_WAIT_MS);
         }),
       ]);
+      let firstOutcome: PushAuditLateOutcome;
       if (late === null) {
-        await record(timerFired ? "timeout" : readFailed ? "read-failed" : "no-reading");
+        firstOutcome = timerFired ? "timeout" : readError !== null ? "read-failed" : "no-reading";
+      } else if (late.score === null && late.tradersH1 === null) {
+        // A reading with no number to print ("no entry", every field absent)
+        // is not a line — appending an em-dash would be noise, not news.
+        firstOutcome = "no-numbers";
+      } else {
+        await apply(late, null, false);
         return;
       }
-      // A reading with no number to print ("no entry", every field absent) is
-      // not a line — appending an em-dash would be noise, not news.
-      if (late.score === null && late.tradersH1 === null) {
-        await record("no-numbers", { score: late.score, tradersH1: late.tradersH1 });
-        return;
-      }
-      const verdict = jupiterGateVerdict(late, {
-        jupSusBlock: this.config.jupSusBlock,
-        organicMinScore: this.config.organicMinScore,
-        organicMaxTradersH1: this.config.organicMaxTradersH1,
+      // The first sweep could not answer. Record it NOW — the retry runs tens
+      // of seconds later and the isolate may not live to write again — then
+      // spend exactly one second read on it (see ORGANIC_LATE_RETRY_DELAY_MS).
+      const first: PushAuditLateAttempt = {
+        outcome: firstOutcome,
+        lateMs: Date.now() - startedAt,
+        score: late?.score ?? null,
+        tradersH1: late?.tradersH1 ?? null,
+        error: readError,
+      };
+      await record(firstOutcome, {
+        score: first.score,
+        tradersH1: first.tradersH1,
+        error: first.error,
       });
-      const lateSec = Math.round((Date.now() - startedAt) / 1000);
-      const note = verdict
-        ? `\n（🌱 有機度 推送後 ${lateSec}s 才到 ⚠️ 此讀數本應攔住：${verdict.reason}）`
-        : `\n（🌱 有機度 推送後 ${lateSec}s 補上）`;
+      const retry = args.retry;
+      if (typeof retry !== "function") return;
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, args.retryDelayMs ?? ORGANIC_LATE_RETRY_DELAY_MS);
+      });
+
+      // THE SECOND SWEEP — same shape, its own wall, and every outcome still
+      // durable (with `first` beside it).
+      let retryFired = false;
+      let retryError: string | null = null;
+      let second: JupOrganicReading | null = null;
       try {
-        await api.editMessageText?.(args.chatId, args.messageId, `${args.render(late)}${note}`, {
-          reply_markup: args.replyMarkup,
-        });
-        this.organicLateLandedTotal += 1;
-        await record("landed", { score: late.score, tradersH1: late.tradersH1 });
-      } catch (err) {
-        // The card keeps the shape it shipped with; the REASON is now durable
-        // instead of swallowed (see PushAuditLate).
-        await record("edit-failed", {
-          score: late.score,
-          tradersH1: late.tradersH1,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        second = await Promise.race([
+          // Through `then` so even a thunk that throws BEFORE returning its
+          // promise is one more `read-failed`, never an unhandled rejection in
+          // a task nobody awaits.
+          Promise.resolve()
+            .then(() => retry())
+            .catch((err: unknown) => {
+              retryError = err instanceof Error ? err.message : String(err);
+              return null;
+            }),
+          new Promise<null>((resolve) => {
+            retryTimer = setTimeout(() => {
+              retryFired = true;
+              resolve(null);
+            }, args.retryWaitMs ?? ORGANIC_LATE_RETRY_WAIT_MS);
+          }),
+        ]);
+      } finally {
+        if (retryTimer !== undefined) clearTimeout(retryTimer);
       }
+      if (second === null) {
+        await record(
+          retryFired ? "timeout" : retryError !== null ? "read-failed" : "no-reading",
+          { error: retryError },
+          first,
+        );
+        return;
+      }
+      if (second.score === null && second.tradersH1 === null) {
+        await record("no-numbers", { score: null, tradersH1: null }, first);
+        return;
+      }
+      await apply(second, first, true);
     })();
-    // The timer is cleared with the task, and the tick's waitUntil keeps the
+    // The timers are cleared with the task, and the tick's waitUntil keeps the
     // work alive past the handler (see runOnce's keepAlive).
     void task.finally(() => {
       if (timer !== undefined) clearTimeout(timer);
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
     });
     if (this.scanHoldForTick) {
       try {

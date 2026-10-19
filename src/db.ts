@@ -1532,23 +1532,51 @@ export interface PushAuditOrganic {
 }
 
 /**
+ * What ONE sweep of the late-line task did (see PushAuditLate).
+ *
+ * `timeout` vs `no-reading` is the distinction the operator's report needs:
+ * the first says the read was still in flight when that sweep's wall passed
+ * (the read is slow), the second says it settled and produced nothing (the
+ * provider refused or the mint is not indexed). Since 2026-10-19 neither is
+ * the end of the story — a second read is spent on both (see
+ * PushAuditLate.first), because a 429 window closes and Jupiter's index for a
+ * brand-new mint catches up, and a line appended 30s late is still the line.
+ */
+export type PushAuditLateOutcome =
+  | "landed"
+  | "timeout"
+  | "read-failed"
+  | "no-reading"
+  | "no-numbers"
+  | "no-api"
+  | "edit-failed";
+
+/**
+ * One sweep's numbers, kept when a SECOND read follows it (see the `first`
+ * field). Without it the second write would overwrite the only evidence of
+ * why the first one produced nothing — and "the read was slow" vs "the index
+ * had nothing yet" is the difference the retry policy is built on.
+ */
+export interface PushAuditLateAttempt {
+  outcome: Exclude<PushAuditLateOutcome, "no-api">;
+  /** ms from the append's start to THIS sweep's decision. */
+  lateMs: number;
+  score: number | null;
+  tradersH1: number | null;
+  /** Telegram's rejection text, or the read's error, for this sweep. */
+  error: string | null;
+}
+
+/**
  * The late-line task's own outcome for ONE card (see PushAuditOrganic.late).
  *
- * The distinction that matters operationally is `timeout` vs `no-reading`:
- * the first says the read was still in flight when the append's wall passed
- * (the read is slow), the second says the read settled and produced nothing
- * (the provider refused or the mint is not indexed). Both leave the card
- * without a line, but only the first is a candidate for a longer wall.
+ * The FINAL sweep decides `outcome`; `first` is present only when a second
+ * read was spent, and carries what the first sweep did. A card therefore
+ * answers three questions on its own: did a line land, how late, and — when
+ * two reads were needed — what the first one had run into.
  */
 export interface PushAuditLate {
-  outcome:
-    | "landed"
-    | "timeout"
-    | "read-failed"
-    | "no-reading"
-    | "no-numbers"
-    | "no-api"
-    | "edit-failed";
+  outcome: PushAuditLateOutcome;
   /**
    * ms from the append's start (right after the card was accepted) to the
    * decision. Always a number: even `no-api` is decided immediately.
@@ -1559,6 +1587,12 @@ export interface PushAuditLate {
   tradersH1: number | null;
   /** Telegram's rejection text when `outcome: "edit-failed"`. */
   error: string | null;
+  /**
+   * What the FIRST read did, when a second one was spent on it (2026-10-19).
+   * Absent for a card whose first read was enough — printable, or unusable in
+   * a way no later read can change (`no-api`, `edit-failed`).
+   */
+  first?: PushAuditLateAttempt;
 }
 
 /**
