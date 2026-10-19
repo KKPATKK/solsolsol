@@ -19551,12 +19551,14 @@ async function main() {
     const { Scanner } = require("../dist/scanner.js");
     const db = new Db(opts.t.p, undefined, opts.t.client);
     await db.init();
-    // PUMPFUN_PROFILE_LIMIT=20 is what production runs (wrangler.toml) since
-    // 2026-09-28: the launch feed is ALWAYS ON, and the chain order that used
-    // to hang off it is gone — Meteora now covers the ticks GECKO's 5-minute
-    // cadence skips, not a tick pump.fun left empty. The legacy shape (always-on
-    // limit 0, so pump.fun really is gecko's fallback) is still reachable by
-    // passing PUMPFUN_PROFILE_LIMIT: "0" in cfgEnv.
+    // 20 here is a FIXTURE value, not production's: wrangler.toml has run 50
+    // since 2026-10-18 (3 paged requests at the API's 20-row page cap), and
+    // the shape under test since 2026-09-28 is only that the launch feed is
+    // ALWAYS ON — the chain order that used to hang off it is gone, Meteora
+    // now covers the ticks GECKO's 5-minute cadence skips, not a tick pump.fun
+    // left empty. The legacy shape (always-on limit 0, so pump.fun really is
+    // gecko's fallback) is still reachable by passing PUMPFUN_PROFILE_LIMIT:
+    // "0" in cfgEnv.
     const cfg = loadConfig({ PUMPFUN_PROFILE_LIMIT: "20", ...cfgEnv });
     await db.saveChatSettings({
       chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
@@ -19783,7 +19785,7 @@ async function main() {
     }
     assert.equal(missing.length, 0, `client/config/probe wiring missing: ${missing.join(", ")}`);
     assert.ok(
-      wranglerSrc.includes('RAYDIUM_LAUNCH_LIMIT="20"'),
+      wranglerSrc.includes('RAYDIUM_LAUNCH_LIMIT="50"'),
       "the deployed knob must enable the feed (or explicitly document 0)",
     );
   });
@@ -20356,10 +20358,10 @@ async function main() {
       !scannerSrc.includes("pumpJob"),
       "the pump job variable is gone: nothing downstream waits on it",
     );
-    assert.ok(toml.includes('PUMPFUN_PROFILE_LIMIT = "20"'), "wrangler: pump.fun is the always-on feed");
+    assert.ok(toml.includes('PUMPFUN_PROFILE_LIMIT = "50"'), "wrangler: pump.fun is the always-on feed");
     assert.ok(toml.includes('PUMPFUN_FALLBACK_LIMIT = "0"'), "wrangler: the legacy gecko fallback is off");
     assert.ok(
-      toml.includes('METEORA_FALLBACK_LIMIT = "20"'),
+      toml.includes('METEORA_FALLBACK_LIMIT = "50"'),
       "wrangler: Meteora stays on — it is gecko's cover",
     );
     assert.ok(

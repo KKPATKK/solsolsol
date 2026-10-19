@@ -373,6 +373,12 @@ SCAN_INTERVAL_SECONDS = "60"
 # summary.geoDue before spending them. After any change: /debug/clock's
 # `alarmAt` is the loop's own liveness reading, and /health.scanTriggers.clock
 # is the share of scans the clock drives.
+#
+# 2026-10-18: cadence deliberately LEFT at 30s while the three launch-feed
+# limits went 20 → 50. Live /health already read pairCacheRefused 59 vs
+# pairCacheMisses 44 and budgetDrops 526, so a faster tick would buy more
+# refused pair requests, not more pushes. Revisit only after a day of
+# pairsMissing/dex429 readings on the wider feeds.
 CLOCK_TICK_SECONDS = "30"
 # Max coverage: inspect the newest 200 Solana token profiles per scan
 # (the code caps this at 200). Deferred candidates stay in the re-eval
@@ -543,7 +549,15 @@ REEVAL_POOL_CACHE_SECONDS = "90"
 # Cost: one paginated batch (20 coins = 1 request) per tick on the host that
 # already serves this feed. 0 = the leg is off again; an UNSET variable keeps
 # the historic 100-coin default.
-PUMPFUN_PROFILE_LIMIT = "20"
+#
+# 2026-10-18: 20 → 50 (Workers Paid headroom, cadence unchanged at 30s).
+# The API caps a page at 20 (src/pumpfun.ts PAGE_SIZE), so this is 3 paged
+# requests per tick instead of 1: +2 subrequests against ~20 of 10,000
+# (src/subreqs.ts) and ~+0.7s on the leg under PUMPFUN_REQUEST_INTERVAL_MS
+# 350. What it buys is the coins the newest-20 page drops between ticks.
+# Watch after deploy: tick-legs `feedLegMs.pump` (was p50 78ms) and the tick's
+# own ms. REVERT: back to "20".
+PUMPFUN_PROFILE_LIMIT = "50"
 # GECKO FALLBACK size — LEGACY as of 2026-09-28, and set to 0 because the
 # ALWAYS-ON limit above now covers every tick. It is the "fill gecko's slot"
 # branch of pump.fun's feed: a batch size, not a switch (0 = off), paid only on
@@ -572,7 +586,12 @@ PUMPFUN_FALLBACK_LIMIT = "0"
 # liquidity/volume/fee/apr (and the look-alike `poolSortField` is silently
 # ignored), Orca's pools carry no creation field. One request when reached.
 # See src/meteora.ts.
-METEORA_FALLBACK_LIMIT = "20"
+#
+# 2026-10-18: 20 → 50 — the SAME one request per reached tick (page_size is a
+# parameter of the single page this client asks for, src/meteora.ts
+# fetchNewestPools), so the extra rows cost parse only, no extra subrequest.
+# REVERT: back to "20".
+METEORA_FALLBACK_LIMIT = "50"
 # Raydium LaunchLab newest launches per scan (code default 0 = off, cap 100).
 # THE FOURTH LAUNCH FEED (2026-10-13). Raydium's POOL list cannot answer
 # "newest pools" (no creation-time sortField — `createTime`/`createdAt` 500,
@@ -590,7 +609,11 @@ METEORA_FALLBACK_LIMIT = "20"
 # empty feed (the client pauses 60s on a 429/5xx), never a broken tick.
 # READ /debug/raydium-launch after deploy — the Worker-egress reachability of
 # this host was measured from a clean host only before this change.
-RAYDIUM_LAUNCH_LIMIT = "20"
+#
+# 2026-10-18: 20 → 50 — the API page is FIXED at 100 rows and the client slices
+# it (RAYDIUM_LAUNCH_MAX_LIMIT), so this keeps more of the SAME one request per
+# tick: zero extra subrequests.
+RAYDIUM_LAUNCH_LIMIT = "50"
 # Minimum spacing between GeckoTerminal new-pools FETCHES, in seconds (code
 # default 300 = one fetch per 5 min; 0 = no gate, one per tick). This is the
 # cadence the KEYED leg is spent at: the demo plan is 10K calls/month, one call
