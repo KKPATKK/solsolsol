@@ -12304,7 +12304,14 @@ async function main() {
       src.includes("const renderCard = (organic: JupOrganicReading | null): string =>"),
       "the card's render must be a function of its reading (one call site)",
     );
-    assert.ok(src.includes("const message = renderCard(organicReading);"));
+    assert.ok(src.includes("let message = renderCard(organicReading);"));
+    // The raw read's own box (2026-10-19): organicSlot resolves to null at the
+    // tick wall, so the post-claim refresh cannot read THAT to decide whether
+    // the reading landed inside the claim.
+    assert.ok(
+      src.includes("const organicLateBox: { value: JupOrganicReading | null } = { value: null };"),
+      "the raw read must have its own box, free of the tick wall",
+    );
     const sent = src.slice(
       src.indexOf('if (plan.audit && raced.status === "sent") {'),
     );
@@ -12312,7 +12319,7 @@ async function main() {
     for (const needle of [
       "this.appendLateOrganicLine({",
       "organicRead !== null",
-      "organicReading === null",
+      "cardReading === null",
       "replyMarkup: cardKeyboard,",
     ]) {
       assert.ok(append.includes(needle), `the sent branch must schedule it: ${needle}`);
@@ -12340,10 +12347,12 @@ async function main() {
       const cfg = loadConfig({});
       const edits = [];
       const held = [];
+      let failEdits = false;
       const bot = {
         api: {
           sendMessage: async () => ({ message_id: 1 }),
           editMessageText: async (...args) => {
+            if (failEdits) throw new Error("400 Bad Request: message is not modified");
             edits.push(args);
             return {};
           },
@@ -12364,6 +12373,30 @@ async function main() {
       });
       const render = (organic) =>
         organic === null ? "🪙 CARD" : `🪙 CARD\n🌱 有機度: ${organic.score}`;
+      // The card's audit entry is written BEFORE the append decides, so the
+      // durable late outcome is a PATCH on that entry (Db.updatePushDeliveryLate).
+      const seed = async (messageId) => {
+        await db.recordPushDelivery({
+          chatId: "c",
+          token: `T${messageId}`,
+          symbol: null,
+          messageId,
+          kind: "initial",
+          organic: {
+            score: null,
+            tradersH1: null,
+            tradersWindow: null,
+            why: null,
+            waited: false,
+          },
+        });
+      };
+      for (const id of [42, 43, 44, 45, 46, 47, 48]) await seed(id);
+      const lateOf = async (messageId) => {
+        const row = (await db.getPushAudit()).find((r) => r.messageId === messageId);
+        return row?.organic?.late ?? null;
+      };
+      const settle = () => new Promise((r) => setTimeout(r, 20));
 
       // The ordinary late case: the read lands, the line is appended, and the
       // edit says HOW late it was (a line that appears minutes later must not
@@ -12375,7 +12408,7 @@ async function main() {
         render,
         replyMarkup: { inline_keyboard: [] },
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await settle();
       assert.equal(edits.length, 1, "one edit, one line");
       assert.equal(edits[0][0], "c");
       assert.equal(edits[0][1], 42, "the edit must name the CARD's own message");
@@ -12388,6 +12421,12 @@ async function main() {
       );
       assert.equal(scanner.organicLateEditsTotal, 1);
       assert.equal(scanner.organicLateLandedTotal, 1, "the counter must say Telegram took it");
+      const landed = await lateOf(42);
+      assert.equal(landed.outcome, "landed", "the card's own audit names the late outcome");
+      assert.equal(landed.score, 57.9, "with the score the edit printed");
+      assert.equal(landed.tradersH1, 374);
+      assert.equal(landed.error, null);
+      assert.equal(typeof landed.lateMs, "number");
 
       // A late reading the GATES would have blocked on is named on the card:
       // the coin is already out, and this is the JANE shape.
@@ -12399,10 +12438,12 @@ async function main() {
         render,
         replyMarkup: null,
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await settle();
       assert.match(String(edits[0][2]), /本應攔住/, "a gate-blocking late reading must say so");
+      assert.equal((await lateOf(43)).outcome, "landed");
 
-      // A read with NO number to print is not a line: nothing is edited.
+      // A read with NO number to print is not a line: nothing is edited, and
+      // the audit says why instead of leaving the card unexplained.
       edits.length = 0;
       scanner.appendLateOrganicLine({
         chatId: "c",
@@ -12411,10 +12452,12 @@ async function main() {
         render,
         replyMarkup: null,
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await settle();
       assert.equal(edits.length, 0, "no number, no edit");
+      assert.equal((await lateOf(44)).outcome, "no-numbers");
 
-      // A reading that never lands costs nothing (the card keeps its shape).
+      // The read settled with nothing (429 twice / not indexed): the two
+      // shapes are different readings, and the audit must keep them apart.
       scanner.appendLateOrganicLine({
         chatId: "c",
         messageId: 45,
@@ -12422,12 +12465,40 @@ async function main() {
         render,
         replyMarkup: null,
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await settle();
       assert.equal(edits.length, 0);
+      assert.equal((await lateOf(45)).outcome, "no-reading");
+
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 47,
+        reading: Promise.reject(new Error("boom")),
+        render,
+        replyMarkup: null,
+      });
+      await settle();
+      assert.equal((await lateOf(47)).outcome, "read-failed");
+
+      // A rejected EDIT is the one outcome that used to vanish silently: the
+      // card keeps its shape, but the reason (Telegram's own text) must land.
+      failEdits = true;
+      scanner.appendLateOrganicLine({
+        chatId: "c",
+        messageId: 48,
+        reading: Promise.resolve(reading()),
+        render,
+        replyMarkup: null,
+      });
+      await settle();
+      failEdits = false;
+      const failed = await lateOf(48);
+      assert.equal(failed.outcome, "edit-failed");
+      assert.match(String(failed.error), /not modified/, "Telegram's reason survives");
 
       // The task is handed to the tick's waitUntil — an un-awaited promise is
       // cancelled the moment the handler returns, which is how the line would
-      // be lost a second time.
+      // be lost a second time. A read that never settles is a TIMEOUT, not a
+      // missing request: the audit has to say so after the 20s cap.
       scanner.scanHoldForTick = (p) => held.push(p);
       scanner.appendLateOrganicLine({
         chatId: "c",
@@ -12454,7 +12525,147 @@ async function main() {
         "and the append must outlast the wall it is accounting for",
       );
       await held[0].catch(() => {});
+      assert.equal(
+        (await lateOf(46)).outcome,
+        "timeout",
+        "a read still in flight at the cap must read as timeout, not as an absent read",
+      );
     } finally {
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: a 有機度 reading that lands during the claim is printed by the FIRST card (2026-10-19)", async () => {
+    // The live shape this closes (FAUCET, 2026-10-19 07:16:55Z): the card's
+    // audit said late, its first render had no line, and the line only arrived
+    // through the post-push edit. The reading had landed AFTER the render
+    // snapshot but BEFORE the send — i.e. inside the claim's D1 round trip.
+    // The card must take a second snapshot there, judge it, and render it, so
+    // the message Telegram receives already carries the number.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      // All three Jupiter gates OFF, so the early gate does not await the
+      // deferred read: this test is about the SEND path, not the gate wait.
+      const cfg = loadConfig({
+        JUP_SUS_BLOCK: "false",
+        ORGANIC_MIN_SCORE: "0",
+        ORGANIC_MAX_TRADERS_H1: "0",
+      });
+      await db.saveChatSettings({
+        chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
+        minAgeMinutes: 0, maxAgeMinutes: 100_000,
+        min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+        enabled: true,
+      });
+      const MINT = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: MINT, symbol: "LATE" }];
+      dex.fetchPairsForTokens = async () =>
+        new Map([[
+          MINT,
+          {
+            chainId: "solana",
+            dexId: "raydium",
+            pairAddress: `pair-${MINT}`,
+            baseToken: { address: MINT, symbol: "LATE" },
+            quoteToken: {
+              address: "So11111111111111111111111111111111111111112",
+              symbol: "SOL",
+            },
+            priceUsd: "0.001",
+            marketCap: 150_000,
+            liquidity: { usd: 30_000 },
+            volume: { m5: 20_000, h1: 100_000, h24: 500_000 },
+            priceChange: { m5: 30, h1: 50, h24: 100 },
+            txns: { m5Buys: 30, m5Sells: 20, h1Buys: 200, h1Sells: 100 },
+            pairCreatedAt: Date.now() - 3_600_000,
+          },
+        ]]);
+      let release;
+      const readingReady = new Promise((resolve) => {
+        release = resolve;
+      });
+      const reading = {
+        score: 57.9,
+        label: "medium",
+        tradersH1: 374,
+        tradersWindow: "1h",
+        sus: false,
+        devBalancePct: null,
+      };
+      const jupiter = {
+        fetchRecentTokens: async () => [],
+        fetchTrendingTokens: async () => [],
+        fetchTokenDataBatch: async () => new Map(),
+        fetchOrganicScore: (_mint, onNote) =>
+          readingReady.then((r) => {
+            onNote?.({
+              at: Date.now(),
+              ms: 1,
+              why: "ok",
+              status: 200,
+              retried: false,
+              waited: false,
+              landed: true,
+            });
+            return r;
+          }),
+      };
+      const texts = [];
+      const bot = {
+        api: {
+          sendMessage: async (_chat, text) => {
+            texts.push(text);
+            return { message_id: 9001 };
+          },
+        },
+      };
+      const scanner = new Scanner(
+        db, bot, dex, cfg,
+        null, null, null, null, null, null, jupiter,
+      );
+      // The reading lands INSIDE the claim's round trip — the exact window the
+      // old code left to the post-push edit.
+      const realClaim = db.claimTokenPush.bind(db);
+      let released = false;
+      db.claimTokenPush = async (chatId, token) => {
+        const won = await realClaim(chatId, token);
+        if (won && !released) {
+          released = true;
+          release(reading);
+          // A macrotask boundary lets the read's `.then` chains (the box, the
+          // note, and the late box this test is about) all settle before the
+          // claim returns to the scanner.
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        return won;
+      };
+      await scanner.runOnce();
+      assert.equal(texts.length, 1, "one card, one send");
+      assert.match(
+        texts[0],
+        /🌱 有機度: 57\.9（medium） \| 1h 交易者 374/,
+        "the FIRST send must carry the reading that landed during the claim",
+      );
+      assert.equal(scanner.lastSummary.pushed, 1);
+      assert.equal(
+        scanner.lastSummary.organicLateEdits,
+        0,
+        "nothing was left for the post-push edit to append",
+      );
+      const audit = (await db.getPushAudit()).find((r) => r.messageId === 9001);
+      assert.equal(audit?.organic?.why, "ok", "the audit names the reading the card printed");
+      assert.equal(audit?.organic?.score, 57.9);
+      assert.equal(audit?.organic?.late, undefined, "and there is no late outcome to record");
+    } finally {
+      globalThis.fetch = origFetch;
       await t.cleanup();
     }
   });
@@ -12735,7 +12946,7 @@ async function main() {
     const call = src.slice(callAt, callAt + 1200);
     assert.ok(call.includes('kind: "initial"'), "the stamp rides the INITIAL card's row");
     assert.ok(
-      call.includes("organic: cardOrganicAudit(organicReading, organicNote)"),
+      call.includes("organic: cardOrganicAudit(cardReading, organicNote)"),
       "with the card's own reading and its own note",
     );
     // The reservation's cost is a per-tick reading, not an isolate total.
@@ -12961,7 +13172,21 @@ async function main() {
     assert.equal(
       src.split("this.jupiterGatesBlocked(diag, coin, organicReading)").length - 1,
       1,
-      "one render call, on the snapshot the card is built from",
+      "one render call, on the pre-claim snapshot the card is first built from",
+    );
+    // THE POST-CLAIM REFRESH (2026-10-19): a reading that lands inside the
+    // claim's D1 round trip must be printed by the FIRST send, and printed
+    // only after a gate judged it. One snapshot, one judgement — on the RAW
+    // promise's box, because organicSlot resolves to null at the tick wall.
+    assert.equal(
+      src.split("const latestReading = organicLateBox.value;").length - 1,
+      1,
+      "one post-claim snapshot",
+    );
+    assert.equal(
+      src.split("this.jupiterGatesBlocked(diag, coin, latestReading)").length - 1,
+      1,
+      "and one judgement of the reading it hands the card",
     );
     assert.equal(
       src.split("const organicReading = organicBox.value;").length - 1,
@@ -12973,7 +13198,7 @@ async function main() {
     // drift from the message that was sent (2026-10-17,
     // Scanner.appendLateOrganicLine).
     assert.equal(
-      src.split("const message = renderCard(organicReading);").length - 1,
+      src.split("let message = renderCard(organicReading);").length - 1,
       1,
       "the card is built from the very snapshot the gate judged",
     );
@@ -12987,7 +13212,7 @@ async function main() {
     const mode = src.indexOf("const tradeMode = this.trade");
     const snapshot = src.indexOf("const organicReading = organicBox.value;");
     const late = src.indexOf("this.jupiterGatesBlocked(diag, coin, organicReading)");
-    const render = src.indexOf("const message = renderCard(organicReading);");
+    const render = src.indexOf("let message = renderCard(organicReading);");
     assert.ok(
       early > 0 && wallets > early,
       "the early call is in front of the wallet/Flurry legs, so a blocked coin saves them",
@@ -12995,6 +13220,13 @@ async function main() {
     assert.ok(
       mode > wallets && snapshot > mode && late > snapshot && render > late,
       "the render call is the last judgement in front of the card — after the trade-mode await, so the snapshot it reads cannot go stale",
+    );
+    const latest = src.indexOf("const latestReading = organicLateBox.value;");
+    const send = src.indexOf("const inFlight = this.bot.api.sendMessage(");
+    const claim = src.indexOf("const claimed = await boundClaim(");
+    assert.ok(
+      latest > claim && send > latest,
+      "the post-claim refresh sits between the claim and the send — the last moment a late reading can still make the first card",
     );
   });
 
@@ -19622,7 +19854,7 @@ async function main() {
   };
 
   await test("Scanner: pump.fun fetches every tick and Meteora yields to a gecko tick", async () => {
-    // The 2026-09-28 shape: pump.fun is ALWAYS ON (PUMPFUN_PROFILE_LIMIT=20), so
+    // The 2026-09-28 shape: pump.fun is ALWAYS ON (PUMPFUN_PROFILE_LIMIT=50), so
     // it is no longer gated by gecko's verdict — it runs on every tick, in the
     // same fan-out, and only METEORA steps aside when gecko delivered.
     const t = tmpDb();
@@ -22659,7 +22891,7 @@ async function main() {
         ) &&
         scannerSrc.includes("const[gmgn,arkham]=awaitdisplayBatch;") &&
         scannerSrc.includes("constorganicReading=organicBox.value;") &&
-        scannerSrc.includes("constmessage=renderCard(organicReading);"),
+        scannerSrc.includes("letmessage=renderCard(organicReading);"),
       "worker (the probe asks from the worker's own egress, with its latency)":
         workerSrc.includes(
           'constorganicMint=(url.searchParams.get("organic")??"").trim();',

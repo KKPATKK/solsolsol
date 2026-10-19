@@ -16,6 +16,7 @@ import {
   parseAuditOrganic,
   poolRotationSlot,
   type Db,
+  type PushAuditLate,
   type PushAuditOrganic,
   type ScanFront,
   type TokenStats,
@@ -2211,7 +2212,7 @@ export interface ScanSummary {
   /**
    * True when that pump.fun batch came from the GECKO FALLBACK slot (see
    * pumpfunDiscoveryLimit). LEGACY as of 2026-09-28: production runs
-   * PUMPFUN_PROFILE_LIMIT=20, i.e. the always-on branch, so this flag is only
+   * PUMPFUN_PROFILE_LIMIT=50, i.e. the always-on branch, so this flag is only
    * ever set by a configuration that still routes gecko through the pump
    * fallback (always-on limit 0 + a fallback size > 0).
    */
@@ -5925,10 +5926,10 @@ export class Scanner {
       // Db.GECKO_DISCOVERY_AT_KEY, and the other two are no longer a fallback
       // chain behind it:
       //
-      //   pump.fun v3 /coins      ALWAYS ON (PUMPFUN_PROFILE_LIMIT = 20): one
-      //                           paginated batch per tick, newest coin ~2s
-      //                           old. The one source whose freshness makes a
-      //                           per-tick cadence worth its cost.
+      //   pump.fun v3 /coins      ALWAYS ON (PUMPFUN_PROFILE_LIMIT = 50):
+      //                           three 20-row pages per tick, newest coin
+      //                           ~2s old. The one source whose freshness
+      //                           makes a per-tick cadence worth its cost.
       //   gecko new_pools         ONE FETCH PER DISCOVERY INTERVAL (~5 min).
       //                           Quota-bound, and freshness does not matter to
       //                           it: a launch pool is only judged once it ages
@@ -5958,7 +5959,7 @@ export class Scanner {
           // The legacy shape, kept for a configuration that leaves the
           // always-on limit at 0: only then is pump.fun a fallback for gecko,
           // and only then does a chain order exist at all. Production
-          // (PUMPFUN_PROFILE_LIMIT = 20) never enters this branch — it fetches
+          // (PUMPFUN_PROFILE_LIMIT = 50) never enters this branch — it fetches
           // on every tick, in parallel with every other feed.
           if (pumpAlwaysLimit <= 0) {
             if (geckoJob !== null) await geckoJob;
@@ -7296,6 +7297,23 @@ export class Scanner {
           organicBox.value = v;
           if (v) diag.organic++;
         });
+        // The raw read's own answer, held WITHOUT the tick wall: `organicSlot`
+        // is bestEffort's race and resolves to null at tickDeadline even when
+        // the request keeps going, so the box above cannot answer "did the
+        // reading land before the claim?" — this one can. It feeds ONLY the
+        // post-claim refresh (see the claim branch); `diag.organic` keeps its
+        // old meaning (a reading the tick itself could use).
+        const organicLateBox: { value: JupOrganicReading | null } = { value: null };
+        if (organicRead !== null) {
+          void organicRead.then(
+            (v) => {
+              if (v !== null) organicLateBox.value = v;
+            },
+            () => {
+              /* a failed read is the note's business, not the card's */
+            },
+          );
+        }
         // Bundler + top-10 holder share is resolved for the message card but
         // no longer filters — those filters were removed, so coins push even
         // when the RugCheck report is not ready yet (the card shows 未检测).
@@ -7609,8 +7627,22 @@ export class Scanner {
             // configured but nothing to report (non-pump mint / skip).
             this.flurry ? { report: flurryReport } : null,
           );
-        const message = renderCard(organicReading);
+        let message = renderCard(organicReading);
+        /**
+         * The reading the NEXT send will actually print. It starts as the
+         * pre-claim snapshot and is refreshed once more after the claim (see
+         * the claim branch): a reading that lands inside that D1 round trip
+         * must reach the card the operator receives, not only the post-push
+         * edit. `organicReading` stays the pre-claim snapshot on purpose — it
+         * is what `jupiterGatesBlocked` judged before a claim existed.
+         */
+        let cardReading = organicReading;
+        /** The reading the Jupiter gates have already judged for this coin. */
+        let judgedReading = organicReading;
+        /** Set when the post-claim refresh produced a blocking verdict. */
+        let cardBlocked = false;
         const sendTo = async (c: QualifyingCoin): Promise<void> => {
+          if (cardBlocked) return;
           const deferCard = (why: string): void => {
             diag.cardSendDeferred = (diag.cardSendDeferred ?? 0) + 1;
             this.cardSendDeferredTotal += 1;
@@ -7668,6 +7700,32 @@ export class Scanner {
             }
             deferCard("claim round trip used the whole slice");
             return;
+          }
+          // THE SECOND SNAPSHOT — AFTER THE CLAIM (2026-10-19). The first
+          // snapshot is taken before the claim because the gates must judge
+          // before a claim exists, but the claim is a D1 round trip and the
+          // read runs in the background: live FAUCET (2026-10-19 07:16:55Z)
+          // landed between the render and the send, shipped without its line,
+          // and only got it through the post-push edit. This reads the RAW
+          // promise's answer (organicLateBox — NOT organicSlot, which resolves
+          // to null at the tick wall), and if it changed the card is judged
+          // and re-rendered here: a reading a gate has not seen must never be
+          // printed. A blocking verdict releases the claim and sends nothing —
+          // the one thing a late reading must still be able to do.
+          const latestReading = organicLateBox.value;
+          if (latestReading !== null && latestReading !== judgedReading) {
+            judgedReading = latestReading;
+            if (this.jupiterGatesBlocked(diag, coin, latestReading)) {
+              cardBlocked = true;
+              try {
+                await this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress);
+              } catch {
+                /* best-effort — the re-eval pool still owns the coin */
+              }
+              return;
+            }
+            cardReading = latestReading;
+            message = renderCard(latestReading);
           }
           try {
             // THREE-STATE SEND (2026-10-11 — the landed half of "Patch 2／4"
@@ -7749,7 +7807,7 @@ export class Scanner {
                   // trader count its 1h ceiling would have judged, and why
                   // there is no line (or `late` = the read landed after the
                   // card). See db.PushAuditOrganic.
-                  organic: cardOrganicAudit(organicReading, organicNote),
+                  organic: cardOrganicAudit(cardReading, organicNote),
                 });
               } catch {
                 /* audit is best-effort */
@@ -7770,7 +7828,7 @@ export class Scanner {
               plan.audit &&
               raced.status === "sent" &&
               organicRead !== null &&
-              organicReading === null
+              cardReading === null
             ) {
               this.appendLateOrganicLine({
                 chatId: c.chatId,
@@ -7951,7 +8009,7 @@ export class Scanner {
                 await this.enqueueCardOutbox(c, {
                   message,
                   tradeMode,
-                  organic: cardOrganicAudit(organicReading, organicNote),
+                  organic: cardOrganicAudit(cardReading, organicNote),
                   error: info.line,
                 });
               } catch (enqueueErr) {
@@ -8372,6 +8430,16 @@ export class Scanner {
    * edit — the card then keeps the shape it was sent with, exactly the old
    * behaviour. ONE edit per card: the task is created once, at the send.
    *
+   * EVERY OUTCOME IS RECORDED (2026-10-19): the task's own shape used to live
+   * only in two cumulative isolate counters, so a card that still had no line
+   * could only be answered by forwarding the Telegram message to itself and
+   * reading its text. It now writes `PushAuditLate` onto the card's own audit
+   * entry (Db.updatePushDeliveryLate): landed / timeout / read-failed /
+   * no-reading / no-numbers / no-api / edit-failed, with Telegram's error text
+   * on a rejected edit. That is the difference between "the read was slow" and
+   * "the read returned nothing", which the operator's report needs and the
+   * counters could not tell apart.
+   *
    * NOT SILENTLY LATE: the append says so (`推送後 Ns 補上`), because a line
    * appearing minutes later would otherwise read as if the number had been
    * there at push time. When the late reading is one the GATES would have
@@ -8395,21 +8463,60 @@ export class Scanner {
     const api = this.bot.api as unknown as {
       editMessageText?: (...a: unknown[]) => Promise<unknown>;
     };
-    if (typeof api.editMessageText !== "function") return;
-    this.organicLateEditsTotal += 1;
     const startedAt = Date.now();
+    // The durable half (see the doc comment). Read through a seam so an
+    // offline double without the writer degrades to "no record", never a
+    // crash — the same stance recordUnconfirmedCardSend takes.
+    const record = (
+      outcome: PushAuditLate["outcome"],
+      extra: { score?: number | null; tradersH1?: number | null; error?: string | null } = {},
+    ): Promise<void> => {
+      const update = (this.db as Partial<Pick<Db, "updatePushDeliveryLate">>)
+        .updatePushDeliveryLate;
+      if (typeof update !== "function") return Promise.resolve();
+      return update
+        .call(this.db, args.messageId, {
+          outcome,
+          lateMs: Date.now() - startedAt,
+          score: extra.score ?? null,
+          tradersH1: extra.tradersH1 ?? null,
+          error: extra.error ?? null,
+        })
+        .catch(() => {
+          /* diagnostics only — never a reason to fail the card path */
+        });
+    };
+    if (typeof api.editMessageText !== "function") {
+      void record("no-api");
+      return;
+    }
+    this.organicLateEditsTotal += 1;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const task = (async (): Promise<void> => {
+      let timerFired = false;
+      let readFailed = false;
       const late = await Promise.race([
-        args.reading.catch(() => null),
+        args.reading.catch(() => {
+          readFailed = true;
+          return null;
+        }),
         new Promise<null>((resolve) => {
-          timer = setTimeout(() => resolve(null), ORGANIC_LATE_LINE_WAIT_MS);
+          timer = setTimeout(() => {
+            timerFired = true;
+            resolve(null);
+          }, ORGANIC_LATE_LINE_WAIT_MS);
         }),
       ]);
-      if (late === null) return;
+      if (late === null) {
+        await record(timerFired ? "timeout" : readFailed ? "read-failed" : "no-reading");
+        return;
+      }
       // A reading with no number to print ("no entry", every field absent) is
       // not a line — appending an em-dash would be noise, not news.
-      if (late.score === null && late.tradersH1 === null) return;
+      if (late.score === null && late.tradersH1 === null) {
+        await record("no-numbers", { score: late.score, tradersH1: late.tradersH1 });
+        return;
+      }
       const verdict = jupiterGateVerdict(late, {
         jupSusBlock: this.config.jupSusBlock,
         organicMinScore: this.config.organicMinScore,
@@ -8424,8 +8531,15 @@ export class Scanner {
           reply_markup: args.replyMarkup,
         });
         this.organicLateLandedTotal += 1;
-      } catch {
-        /* best-effort: the card keeps the shape it shipped with */
+        await record("landed", { score: late.score, tradersH1: late.tradersH1 });
+      } catch (err) {
+        // The card keeps the shape it shipped with; the REASON is now durable
+        // instead of swallowed (see PushAuditLate).
+        await record("edit-failed", {
+          score: late.score,
+          tradersH1: late.tradersH1,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     })();
     // The timer is cleared with the task, and the tick's waitUntil keeps the

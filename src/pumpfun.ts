@@ -101,9 +101,9 @@ export function parsePumpCoins(data: unknown): TokenProfile[] {
  * How many pump.fun newest-coins this scan fetches (pure — unit-tested).
  *
  * TWO KNOBS, ONE FEED:
- *  - `pumpfunProfileLimit` is the always-on feed. It is 0 in production: the
- *    legacy host 530'd every Worker request, so the feed was switched off
- *    rather than paying a doomed request per tick.
+ *  - `pumpfunProfileLimit` is the always-on feed. Production runs 50 since
+ *    2026-10-18 (three 20-row pages per tick). It was 0 while the legacy host
+ *    530'd every Worker request; the v3 host answers from Worker egress.
  *  - `pumpfunFallbackLimit` is the GECKO FALLBACK size. GeckoTerminal's
  *    new_pools feed is the other keyless "brand-new coin" source, and when it
  *    delivers nothing on a tick — 429, refusal, or a window cut by the feed

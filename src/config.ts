@@ -407,8 +407,10 @@ export interface AppConfig {
   reevalPoolCacheMs: number;
   /**
    * How many newest pump.fun coins to register per scan (PUMPFUN_PROFILE_LIMIT).
-   * DexScreener's token-profiles feed only returns ~24 Solana profiles per
-   * scan, so pump.fun discovery is the widest free source of brand-new
+   * Production runs 50 (2026-10-18): the API pages at 20 rows, so that is
+   * three requests per tick — 2.5x the launch cohort of 20 for two extra
+   * subrequests. DexScreener's token-profiles feed only returns ~24 Solana
+   * profiles per scan, so pump.fun discovery is the widest free source of brand-new
    * coins — coins without a DexScreener pair yet are registered into the
    * re-eval pool and evaluated the moment their pair appears. Best-effort:
    * if pump.fun blocks the caller (datacenter IPs), discovery returns empty
@@ -453,8 +455,9 @@ export interface AppConfig {
    * window. The other launch sources (pump.fun v3, Meteora, gecko new_pools)
    * are unaffected — this is an additional provider, not a fallback layer.
    * The 30s clock cannot outrun the page: 100 rows cover ~1.4 hours, so a tick
-   * slice of ~20 is always the freshest cohort. Best-effort: any refusal /
-   * bad body / blocked egress degrades to an empty feed and the scan
+   * slice of 50 (production, 2026-10-18) is always the freshest cohort.
+   * Best-effort: any refusal / bad body / blocked egress degrades to an empty
+   * feed and the scan
    * continues (see src/raydiumlaunch.ts; /debug/raydium-launch reports why).
    */
   raydiumLaunchLimit: number;

@@ -533,7 +533,8 @@ REEVAL_FAR_SWEEP_MIN = "12"
 # sweep/TTL alignment, not more ticks. Raise TTL (e.g. 300) to cut rows-read
 # back.
 REEVAL_POOL_CACHE_SECONDS = "90"
-# pump.fun discovery as an ALWAYS-ON feed: ENABLED at 20 (2026-09-28).
+# pump.fun discovery as an ALWAYS-ON feed: ENABLED at 20 (2026-09-28), 50
+# since 2026-10-18. The committed value is what production actually runs.
 #
 # History: the legacy host (frontend-api.pump.fun) 530-blocks Worker egress
 # (CF error 1016, origin DNS gone since ~2026-08-20), so the feed sat at 0 and
@@ -546,15 +547,22 @@ REEVAL_POOL_CACHE_SECONDS = "90"
 # newestAgeS 2`. The two no longer gate each other: pump.fun fetches its batch
 # on EVERY tick and Meteora covers the ticks gecko's cadence skips.
 #
-# Cost: one paginated batch (20 coins = 1 request) per tick on the host that
-# already serves this feed. 0 = the leg is off again; an UNSET variable keeps
-# the historic 100-coin default.
+# Cost (2026-10-18: 20 → 50, Workers Paid headroom, cadence unchanged at
+# 30s): the API caps a page at 20 (src/pumpfun.ts PAGE_SIZE), so this is 3
+# paged requests per tick instead of 1 — ~+240 subrequests/hour against ~20 of
+# 10,000 (src/subreqs.ts), ~+0.7s on the leg under PUMPFUN_REQUEST_INTERVAL_MS
+# 350, and up to 2.5x the new-coin registrations, i.e. more D1 writes. What it
+# buys is the coins the newest-20 page drops between ticks.
 #
-# 2026-10-18: 20 → 50 (Workers Paid headroom, cadence unchanged at 30s).
-# The API caps a page at 20 (src/pumpfun.ts PAGE_SIZE), so this is 3 paged
-# requests per tick instead of 1: +2 subrequests against ~20 of 10,000
-# (src/subreqs.ts) and ~+0.7s on the leg under PUMPFUN_REQUEST_INTERVAL_MS
-# 350. What it buys is the coins the newest-20 page drops between ticks.
+# The size came from the DASHBOARD first (05:05:57Z, the same second as
+# RAYDIUM_LAUNCH_LIMIT), while this file still said 20 — so the next deploy
+# would have silently halved both feeds at an arbitrary moment. This file now
+# follows production, and a 240-tick audit taken AT 50 backs it: 240/240 ticks
+# ok, 120 tick/h, every enabled feed delivered on every due tick, no missed
+# push. To cut the spend back, set 20 here AND in RAYDIUM_LAUNCH_LIMIT — never
+# leave the dashboard as a second source of truth. 0 = the leg is off again; an
+# UNSET variable keeps the historic 100-coin default.
+#
 # Watch after deploy: tick-legs `feedLegMs.pump` (was p50 78ms) and the tick's
 # own ms. REVERT: back to "20".
 PUMPFUN_PROFILE_LIMIT = "50"
@@ -563,7 +571,7 @@ PUMPFUN_PROFILE_LIMIT = "50"
 # branch of pump.fun's feed: a batch size, not a switch (0 = off), paid only on
 # a tick where gecko delivered nothing — see pumpfunDiscoveryLimit, which only
 # reaches this value while PUMPFUN_PROFILE_LIMIT is 0. With the always-on limit
-# at 20 that branch is unreachable, so the old chain (gecko → pump.fun →
+# at 50 that branch is unreachable, so the old chain (gecko → pump.fun →
 # Meteora) is gone: the slot is filled by pump.fun on every tick and by Meteora
 # on the ticks gecko's 5-minute cadence skips. Leave this at 0 unless the
 # always-on feed is deliberately turned off again.
@@ -610,8 +618,9 @@ METEORA_FALLBACK_LIMIT = "50"
 # READ /debug/raydium-launch after deploy — the Worker-egress reachability of
 # this host was measured from a clean host only before this change.
 #
-# 2026-10-18: 20 → 50 — the API page is FIXED at 100 rows and the client slices
-# it (RAYDIUM_LAUNCH_MAX_LIMIT), so this keeps more of the SAME one request per
+# 2026-10-18: 20 → 50 — the same dashboard edit as PUMPFUN_PROFILE_LIMIT. The
+# API page is FIXED at 100 rows and the client slices it
+# (RAYDIUM_LAUNCH_MAX_LIMIT), so this keeps more of the SAME one request per
 # tick: zero extra subrequests.
 RAYDIUM_LAUNCH_LIMIT = "50"
 # Minimum spacing between GeckoTerminal new-pools FETCHES, in seconds (code

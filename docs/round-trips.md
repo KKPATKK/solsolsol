@@ -4601,3 +4601,50 @@ feed leg p50 profiles 8（cache/5 分鐘 cadence）、pump 76、jup 126、meteor
 claim 被佔＝零 send 零搶；exhausted＝零 send）＋來源 pin（scanner 冇咗 in-tick retry、worker 有 drain
 同 /health 欄位）。`test-d1-migrate.js` 加咗 `push_outbox`（表單＋archive fixture，19 passed）。
 **全套 exit 0，全部綠**。
+
+## 4.71 有機度第六擊：claim 之後再攞一次讀數，遲到結果寫入卡片自己嘅 audit（2026-10-19）
+
+營運報告（同日早上）：「剛剛收到嘅首推送卡依然冇有機度」。查生產 `push_audit` + `tick_legs` +
+Telegram 訊息本文（forward 讀完即刪）見到兩個形狀：
+
+- **FAUCET 07:16:55Z（msg 13554）**：audit 係 `why:"late"`、`score:null`。張卡 render 完之後、
+  send 之前讀數返到，所以第一次 render 冇線；`appendLateOrganicLine` 喺推送後 0s 用 edit 補返
+  （張卡而家係有 `🌱 有機度: 50.6（medium） | 1h 交易者 337` 嘅）——但通知唔會更新，operator 第一眼
+  見到嘅版本仍然係冇線。
+- **XBT 06:47:25Z（msg 13550）、KAHO 05:33:37Z（msg 13538）**：audit 係 `why:null`，即係到 audit
+  嗰刻個 read 仲未返；張卡到現在都冇線、亦冇 edit note。呢個係 §4.64 寫明嘅殘餘，但當時冇任何
+  durable 記錄講到「個 read 最後返咗乜」——只可以靠 forward 張卡去讀文字。
+
+### 一、兩個修正
+
+1. **Claim 之後再 snapshot（`src/scanner.ts`）**：張卡嘅第一次 snapshot 喺 claim 之前（gate 要喺
+   claim 存在之前判），但 claim 係一個 D1 round trip，讀數正好可以喺嗰度落地。新增
+   `organicLateBox`（直接接住 `organicRead` 嘅 raw promise——**唔係** `organicSlot`，後者喺
+   tickDeadline 會 resolve 做 null），claim 完之後再讀一次；如果換咗讀數，先用
+   `jupiterGatesBlocked` 判新值（卡永遠唔可以印一個 gate 未見過嘅讀數），判過就 `renderCard()`
+   重新砌 message 再 send；判到 block 就 unclaim + 唔 send。呢個令「render 之後、claim 之內」
+   落地嘅讀數直接入到**第一張卡**，唔使等 edit。
+2. **遲到結果寫入 `push_audit`（`src/db.ts` + `src/scanner.ts`）**：`PushAuditOrganic` 加咗
+   `late?: PushAuditLate`，`Db.updatePushDeliveryLate(messageId, late)` 喺原本嗰條 audit entry
+   上 patch。`appendLateOrganicLine` 每個出口都寫：`landed` / `timeout` / `read-failed` /
+   `no-reading` / `no-numbers` / `no-api` / `edit-failed`（帶 Telegram 嘅錯誤文字），
+   加 `lateMs`、`score`、`tradersH1`。`/debug/push-audit` 直接讀到，唔使再猜。
+   `timeout` 同 `no-reading` 分開：前者係 read 仲喺飛（可以考慮加 wall），後者係 read 返咗
+   但冇嘢可印（429／index 未追到，加 wall 冇用）。
+
+### 二、測試
+
+`npm run test:unit` 全套 **exit 0**：main suite **575 → 576 passed, 0 failed**。
+
+- 新 end-to-end：真 `Db` + 假 bot + deferred 嘅 `fetchOrganicScore`，喺 `claimTokenPush` 裡面
+  放行讀數 → 第一張 `sendMessage` 已經有 `🌱 有機度: 57.9（medium） | 1h 交易者 374`、
+  `organicLateEdits === 0`、audit `why:"ok"`（唔係 `late`）。
+- `appendLateOrganicLine` 測試加咗 durable outcome：landed / no-numbers / no-reading /
+  read-failed / edit-failed（Telegram 文字）/ timeout（等完 20s cap）。
+- Source pin 更新：`const message` → `let message`、append 條件 `cardReading === null`、
+  新增 `organicLateBox` 同 post-claim judgement 各一次、refresh 喺 claim 同 send 之間。
+
+### 三、殘餘
+
+- `timeout` / `no-reading` 嘅卡仍然冇線（provider 窗口／index 延遲）；今次只係令佢**有得查**，
+  冇加第二次讀數。要「幾乎每次都有」就仲要喺 5 槍窗口裡再讓一槍，或加 bounded 重讀——各自要量。

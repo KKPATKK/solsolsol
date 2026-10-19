@@ -37,9 +37,11 @@ import type { TokenProfile } from "./dexscreener";
  *
  * COST/VOLUME: one request per tick (2,880/day) when
  * RAYDIUM_LAUNCH_LIMIT > 0; ~70 launches/hour flow through it, of which the
- * tick's slice (~20) is the newest batch — net-new mints per tick are
- * typically 0-2, so the real cost is the single subrequest, not the pair
- * fetches (feeds are deduped against each other before the pair phase).
+ * tick's slice (~50 in production since 2026-10-18; still one 100-row
+ * request, so the size only widens the slice) is the newest batch — net-new
+ * mints per tick are typically 0-2, so the real cost is the single
+ * subrequest, not the pair fetches (feeds are deduped against each other
+ * before the pair phase).
  *
  * NOT VERIFIED FROM THE WORKER'S OWN EGRESS YET: the sandbox reached it
  * (200), but `launch-mint-v1.raydium.io` has no probe on the deployed Worker

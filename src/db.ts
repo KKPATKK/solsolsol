@@ -1516,6 +1516,49 @@ export interface PushAuditOrganic {
   why: string | null;
   /** Whether the read had to WAIT OUT the provider's 429 window first. */
   waited: boolean;
+  /**
+   * What the POST-PUSH late-line task did with this card (2026-10-19).
+   * Absent when the card was rendered with its line and no append was needed.
+   *
+   * WHY IT EXISTS. Before this stamp the late task's outcome lived only in two
+   * cumulative isolate counters (`organicLateEdits` / `organicLateLanded`), so
+   * a card that still had no line could only be answered by forwarding the
+   * Telegram message to itself and reading its text — which is exactly how the
+   * 2026-10-19 report had to be diagnosed. With this field every card answers
+   * for itself: did the task run, did it time out, did the read come back with
+   * nothing printable, or did Telegram reject the edit (and with what text).
+   */
+  late?: PushAuditLate;
+}
+
+/**
+ * The late-line task's own outcome for ONE card (see PushAuditOrganic.late).
+ *
+ * The distinction that matters operationally is `timeout` vs `no-reading`:
+ * the first says the read was still in flight when the append's wall passed
+ * (the read is slow), the second says the read settled and produced nothing
+ * (the provider refused or the mint is not indexed). Both leave the card
+ * without a line, but only the first is a candidate for a longer wall.
+ */
+export interface PushAuditLate {
+  outcome:
+    | "landed"
+    | "timeout"
+    | "read-failed"
+    | "no-reading"
+    | "no-numbers"
+    | "no-api"
+    | "edit-failed";
+  /**
+   * ms from the append's start (right after the card was accepted) to the
+   * decision. Always a number: even `no-api` is decided immediately.
+   */
+  lateMs: number;
+  /** The score / trader count the late edit printed (or would have printed). */
+  score: number | null;
+  tradersH1: number | null;
+  /** Telegram's rejection text when `outcome: "edit-failed"`. */
+  error: string | null;
 }
 
 /**
@@ -5160,6 +5203,49 @@ export class Db {
     // getInitialPushAuditTokens) are strictly better off with a wider window.
     if (list.length > Db.PUSH_AUDIT_MAX) list = list.slice(-Db.PUSH_AUDIT_MAX);
     await this.setWorkerState("push_audit", JSON.stringify(list));
+  }
+
+  /**
+   * Attach the late-line task's outcome to the audit entry a card already wrote
+   * (2026-10-19). The entry is written BEFORE the append resolves — the send
+   * must not wait on it — so this is a second, best-effort patch by message id.
+   *
+   * Only writes when the entry is found: a ring that has rolled past this card
+   * (200 entries) leaves the row exactly as it was, which is the same "the
+   * audit is never a reason to fail anything" stance recordPushDelivery takes.
+   *
+   * Read-modify-write is acceptable for the same reason it is there: losing a
+   * concurrent append's patch to this one is diagnostics, not state.
+   */
+  async updatePushDeliveryLate(messageId: number, late: PushAuditLate): Promise<void> {
+    const raw = await this.getWorkerState("push_audit");
+    let list: Array<Record<string, unknown>>;
+    try {
+      const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+      list = Array.isArray(parsed) ? (parsed as Array<Record<string, unknown>>) : [];
+    } catch {
+      return;
+    }
+    let found = false;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const entry = list[i];
+      if (!entry || Number(entry.messageId) !== messageId || entry.kind !== "initial") {
+        continue;
+      }
+      const organic = entry.organic;
+      entry.organic = {
+        score: null,
+        tradersH1: null,
+        tradersWindow: null,
+        why: null,
+        waited: false,
+        ...(organic !== null && typeof organic === "object" ? organic : {}),
+        late,
+      };
+      found = true;
+      break;
+    }
+    if (found) await this.setWorkerState("push_audit", JSON.stringify(list));
   }
 
   /**

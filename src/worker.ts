@@ -4836,7 +4836,8 @@ async function ensureInitialized(env: Env): Promise<void> {
           helius,
           trade ?? undefined,
           // pump.fun discovery — the launch slot's ALWAYS-ON feed since
-          // 2026-09-28 (PUMPFUN_PROFILE_LIMIT=20), on every tick; best-effort,
+          // 2026-09-28 (PUMPFUN_PROFILE_LIMIT=50 since 2026-10-18), on every
+          // tick; best-effort,
           // a blocked/degraded feed returns [].
           new PumpFunClient(config),
           // GeckoTerminal new-pools discovery — keyed (COINGECKO_API_KEY) and
