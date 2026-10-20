@@ -4709,3 +4709,52 @@ Telegram 訊息本文（forward 讀完即刪）見到兩個形狀：
 - 第二次讀數都失敗嘅卡（兩次 429 疊埋／index 真係冇）仍然冇線，audit 會清楚寫住
   `outcome` + `first.outcome`。呢個係數據現實，唔再加第三次。
 - 未量到 live 比例：要 deploy 之後嘅一批 initial 卡先答得到「第二次讀數令幾多 % 嘅卡補返線」。
+
+## 4.73 有機度第八擊：張卡喺 send gate 等返自己條讀數（2026-10-19 晚）
+
+營運報告（同日晚上，§4.72 deploy 之後）：「有些首次推送的卡上還是缺失了有機度」。今次唔再係
+「補 edit」嘅問題 —— 係**第一張卡本身**喺讀數返到之前就送咗出去，而通知（notification）永遠
+停留喺第一次 send 嘅版本。查生產（`/debug/push-audit` 200 條 + `tick_legs`）：
+
+- 09:57–23:40Z 之間 19 張 initial 卡：**12 張 `organic.score: null`**，其中 3 張有 late edit
+  （`lateMs 295–540`），**9 張連 `late` 都冇**；另外 7 張有 score。
+- 12 張冇線嘅卡，對應 tick 全部 **8.8–9.3s**（讀數要等完個 429 窗口），而 audit 嘅 `at` 係
+  tick 完成前 154–274ms；7 張有線嘅卡，對應 tick 係 **2.9–4.1s**（讀數早到）。
+- 即係：`tick_legs.organic_why` 係 `ok`（讀數真係返到），但返到嘅時間係喺 render snapshot 之後
+  —— audit 所以係 `why: null`。張卡喺 `chainDeadline`（tick deadline − push reserve = 8.1s）
+  之後照樣行落去，send 喺 ~8.9s；讀數喺 ~9.0–9.1s 落地，永遠差嗰 200–300ms。
+
+### 一、修正
+
+`src/scanner.ts` 新增 **send gate 嘅一次性 grace**（`ORGANIC_CARD_READ_GRACE_MS = 1_200`）：
+
+- 喺 post-claim snapshot 之後、`sendMessage` 之前，如果 `cardReading === null` 而且 raw read
+  仲喺飛，就 `Promise.race` 等佢最多 1.2s（**raw promise**，唔係 `organicSlot` —— 後者喺 tick
+  wall 會 resolve null）。
+- 等到嘅讀數照樣要過 `jupiterGatesBlocked`：block 就 unclaim、唔 send（卡永遠唔可以印一個
+  gate 未見過嘅讀數）；過關就 `renderCard()` 重砌 message，**第一張卡已經有線**。
+- Send 嘅 deadline 跟住實際等咗幾多 ms 一齊shift（`effectiveSendDeadline`），所以張卡嘅
+  send slice 冇少到；absolute cap 係 send tail + grace = **11s**（race window ~15.5s）。
+- `organicCardGraceMs(now, sendDeadline, hardTail)` 係 pure、有單元測試：冇 room 或 send
+  deadline 已過就回 0（嗰種情況係 defer，唔係等）。
+- 有線嘅卡完全唔會等：`organicRead` 已 settle，`organicLateBox`/box 有值，condition 唔成立。
+
+### 二、驗證
+
+- `npm run typecheck` exit 0。
+- `node scripts/test-unit.js`：**578 passed, 0 failed**（+1 個 end-to-end：讀數喺 claim 之後
+  150ms 才 release，第一次 `sendMessage` 已經有 `🌱 有機度: 61.5（medium）| 1h 交易者 412`、
+  `organicLateEdits === 0`、audit `why:"ok"`；+1 個 `organicCardGraceMs` 邊界測試）。
+- 其餘 11 個 standalone suite 全 exit 0（deferred-priority / tick-path / schema-gate /
+  health-front / dex-list-cache / tick-legs / cold-archive / push-outbox / unconfirmed-cards /
+  d1-transport / d1-migrate）。
+
+### 三、代價與界線
+
+- 一個「冇線」卡最多遲 **1.2s** 出（send slice 唔變）；有線嘅卡零成本。9s tick 由 ~9.1s 變
+  ~10.3s，仍然離 15.5s race window 好遠。
+- 讀數真係要 > 1.2s 才返到嘅卡（更長嘅 429／index 未追到）仍然靠 §4.72 嘅 post-push edit；
+  edit 唔會更新通知，所以呢批卡嘅第一眼仍然冇線 —— 呢個係 provider 嘅時間，唔係等待策略。
+- 未量到 live 比例：要 deploy 之後嘅一批 initial 卡先答得到「grace 令幾多 % 嘅卡第一張就有線」。
+  audit 會直接分得清：`why:"ok"` + `late` absent = 第一張已有線；`late.outcome:"landed"` =
+  仍然要靠 edit。

@@ -561,6 +561,55 @@ const CARD_SEND_TAIL_MS = SCAN_TICK_DEADLINE_MS + 200;
 const CARD_SEND_MIN_MS = 250;
 
 /**
+ * How long a card with NO reading may be held at the send gate for the read
+ * that is already in flight, in ms (2026-10-19).
+ *
+ * WHY THE CARD NOW WAITS. The 2026-10-19 audit of 19 first-push cards found 12
+ * with no `organic` score, and the tick rows beside them say why: on the ~9s
+ * ticks (the card read spent its 429 window, see jupfeeds.rateLimitPauseMs)
+ * `organic_why` is `ok` yet the card's own audit says `why: null` — the read
+ * landed a few hundred ms AFTER the send. The chain's wait for it is clamped to
+ * `chainDeadline` (tick deadline minus the push reserve) and the render
+ * snapshot is taken immediately before the send, so a reading that lands inside
+ * that reserve was invisible to the FIRST message and could only ever arrive by
+ * edit. The operator reads the notification (which an edit does not update), so
+ * for them the line was simply missing — three rounds of making the edit more
+ * reliable could not fix that.
+ *
+ * The wait is SAFE because it is paid out of the invocation's spare wall, not
+ * the send's slice: the send deadline is shifted by the time actually waited,
+ * so the card keeps exactly the slice `cardSendDeadline` gave it, and the
+ * absolute cap is the send tail plus this grace (9_800 + 1_200 = 11s of the
+ * ~15.5s race window). It is bounded and one-shot: a read that needs longer
+ * still gets the post-push edit, and a card whose reading landed already never
+ * waits at all (the promise is settled, so the race returns on the spot).
+ */
+export const ORGANIC_CARD_READ_GRACE_MS = 1_200;
+
+/**
+ * The grace a card may spend waiting for its in-flight reading, in ms (see
+ * ORGANIC_CARD_READ_GRACE_MS). Zero when there is no room left before the hard
+ * tail, or when the send's own deadline has already passed (a wait then buys
+ * nothing: the card is deferred, never sent late).
+ *
+ * `sendDeadline` is the deadline `cardSendDeadline` returned; `hardTail` is the
+ * absolute bound the SHIFTED send may reach. Only the shift room matters: the
+ * send keeps `sendDeadline - now` of slice however long the grace runs, so a
+ * room of `hardTail - sendDeadline` is exactly the grace that fits. Pure, so
+ * the boundary is unit-tested rather than inferred from a live tick.
+ */
+export function organicCardGraceMs(
+  now: number,
+  sendDeadline: number,
+  hardTail: number,
+): number {
+  if (!(now < sendDeadline)) return 0;
+  const room = hardTail - sendDeadline;
+  if (!(room > 0)) return 0;
+  return Math.min(ORGANIC_CARD_READ_GRACE_MS, room);
+}
+
+/**
  * Slice the push claim (claimTokenPush) may have, and the room the tick must
  * have left before it is even attempted. The claim is a Turso round trip whose
  * own cap (SCAN_DB_TIMEOUT_MS = 1200ms, hard wall 1.44s with libsql's
@@ -7781,6 +7830,60 @@ export class Scanner {
             cardReading = latestReading;
             message = renderCard(latestReading);
           }
+          // HOLD THE CARD FOR A READING THAT IS ALREADY ARRIVING (2026-10-19).
+          // The snapshot above is free (it reads a box), so a read that lands
+          // a few hundred ms after it — the common 429-window shape, see
+          // ORGANIC_CARD_READ_GRACE_MS — still misses the first message and is
+          // left to the post-push edit, which the notification never shows.
+          // This waits a bounded, one-shot grace on the RAW promise (not the
+          // slot, which resolves to null at the tick wall) and then does the
+          // same work as the snapshot above: judge the reading, render it, and
+          // release the claim instead of sending if it blocks. The send's own
+          // deadline is moved by the time actually waited, so the card keeps
+          // its slice; the hard tail caps the whole wait+send at 11s.
+          let effectiveSendDeadline = sendDeadline;
+          if (cardReading === null && organicRead !== null) {
+            const grace = organicCardGraceMs(
+              Date.now(),
+              sendDeadline,
+              startedAt + CARD_SEND_TAIL_MS + ORGANIC_CARD_READ_GRACE_MS,
+            );
+            if (grace > 0) {
+              this.markPhase(diag, "send:organic-wait", startedAt);
+              const waitStartedAt = Date.now();
+              let graceTimer: ReturnType<typeof setTimeout> | undefined;
+              const arrived = await Promise.race([
+                organicRead.catch(() => null),
+                new Promise<null>((resolve) => {
+                  graceTimer = setTimeout(() => resolve(null), grace);
+                }),
+              ]);
+              if (graceTimer !== undefined) clearTimeout(graceTimer);
+              // The send keeps what cardSendDeadline gave it: the wait moves
+              // its deadline, it does not eat the slice.
+              effectiveSendDeadline = Math.min(
+                startedAt + CARD_SEND_TAIL_MS + ORGANIC_CARD_READ_GRACE_MS,
+                sendDeadline + (Date.now() - waitStartedAt),
+              );
+              if (arrived !== null && arrived !== judgedReading) {
+                judgedReading = arrived;
+                if (this.jupiterGatesBlocked(diag, coin, arrived)) {
+                  cardBlocked = true;
+                  try {
+                    await this.db.unclaimTokenPush(
+                      c.chatId,
+                      c.profile.tokenAddress,
+                    );
+                  } catch {
+                    /* best-effort — the re-eval pool still owns the coin */
+                  }
+                  return;
+                }
+                cardReading = arrived;
+                message = renderCard(arrived);
+              }
+            }
+          }
           try {
             // THREE-STATE SEND (2026-10-11 — the landed half of "Patch 2／4"
             // in docs/scan-completion-loss.md § "(A) cut → unclaim → re-eval
@@ -7820,7 +7923,7 @@ export class Scanner {
             const abandoned = new Promise<{ status: "abandoned" }>((resolve) => {
               cutTimer = setTimeout(
                 () => resolve({ status: "abandoned" }),
-                Math.max(0, sendDeadline - Date.now()),
+                Math.max(0, effectiveSendDeadline - Date.now()),
               );
             });
             const raced = await Promise.race([settled, abandoned]);

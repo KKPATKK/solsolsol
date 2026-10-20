@@ -12818,6 +12818,161 @@ async function main() {
     }
   });
 
+  await test("Scanner: a 有機度 reading that lands just AFTER the claim is still printed by the FIRST card (2026-10-19)", async () => {
+    // The shape the 2026-10-19 audit measured on the 9s ticks: `organic_why`
+    // `ok` on the tick row, but the card's own audit `why: null` and no score —
+    // the read landed a few hundred ms after the send, inside the push reserve
+    // the chain's wait is not allowed to touch. The post-push edit does not
+    // reach the notification, so the operator saw a card with no line. The
+    // send gate now holds the card for up to ORGANIC_CARD_READ_GRACE_MS, judges
+    // what arrives, and re-renders BEFORE the send.
+    const { Scanner, ORGANIC_CARD_READ_GRACE_MS } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({
+        JUP_SUS_BLOCK: "false",
+        ORGANIC_MIN_SCORE: "0",
+        ORGANIC_MAX_TRADERS_H1: "0",
+      });
+      await db.saveChatSettings({
+        chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
+        minAgeMinutes: 0, maxAgeMinutes: 100_000,
+        min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+        enabled: true,
+      });
+      const MINT = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: MINT, symbol: "GRACE" }];
+      dex.fetchPairsForTokens = async () =>
+        new Map([[
+          MINT,
+          {
+            chainId: "solana",
+            dexId: "raydium",
+            pairAddress: `pair-${MINT}`,
+            baseToken: { address: MINT, symbol: "GRACE" },
+            quoteToken: {
+              address: "So11111111111111111111111111111111111111112",
+              symbol: "SOL",
+            },
+            priceUsd: "0.001",
+            marketCap: 150_000,
+            liquidity: { usd: 30_000 },
+            volume: { m5: 20_000, h1: 100_000, h24: 500_000 },
+            priceChange: { m5: 30, h1: 50, h24: 100 },
+            txns: { m5Buys: 30, m5Sells: 20, h1Buys: 200, h1Sells: 100 },
+            pairCreatedAt: Date.now() - 3_600_000,
+          },
+        ]]);
+      let release;
+      const readingReady = new Promise((resolve) => {
+        release = resolve;
+      });
+      const reading = {
+        score: 61.5,
+        label: "medium",
+        tradersH1: 412,
+        tradersWindow: "1h",
+        sus: false,
+        devBalancePct: null,
+      };
+      const jupiter = {
+        fetchRecentTokens: async () => [],
+        fetchTrendingTokens: async () => [],
+        fetchTokenDataBatch: async () => new Map(),
+        fetchOrganicScore: (_mint, onNote) =>
+          readingReady.then((r) => {
+            onNote?.({
+              at: Date.now(),
+              ms: 1,
+              why: "ok",
+              status: 200,
+              retried: false,
+              waited: true,
+              landed: true,
+            });
+            return r;
+          }),
+      };
+      const texts = [];
+      const bot = {
+        api: {
+          sendMessage: async (_chat, text) => {
+            texts.push(text);
+            return { message_id: 9002 };
+          },
+        },
+      };
+      const scanner = new Scanner(
+        db, bot, dex, cfg,
+        null, null, null, null, null, null, jupiter,
+      );
+      // The reading lands AFTER the claim has resolved, i.e. in the window the
+      // old code left to the post-push edit — and inside the grace the send
+      // gate now grants. 150ms is well under the constant this test names, so
+      // the assertion is about the mechanism, not about a tight timing race.
+      const realClaim = db.claimTokenPush.bind(db);
+      let released = false;
+      db.claimTokenPush = async (chatId, token) => {
+        const won = await realClaim(chatId, token);
+        if (won && !released) {
+          released = true;
+          setTimeout(() => release(reading), 150);
+        }
+        return won;
+      };
+      await scanner.runOnce();
+      assert.equal(texts.length, 1, "one card, one send");
+      assert.match(
+        texts[0],
+        /🌱 有機度: 61\.5（medium） \| 1h 交易者 412/,
+        "the FIRST send must carry the reading that landed inside the grace",
+      );
+      assert.equal(scanner.lastSummary.pushed, 1);
+      assert.equal(
+        scanner.lastSummary.organicLateEdits,
+        0,
+        "the line made the first card, so no edit was needed",
+      );
+      const audit = (await db.getPushAudit()).find((r) => r.messageId === 9002);
+      assert.equal(audit?.organic?.why, "ok", "the audit names the reading the card printed");
+      assert.equal(audit?.organic?.score, 61.5);
+      assert.equal(audit?.organic?.late, undefined);
+      assert.ok(
+        ORGANIC_CARD_READ_GRACE_MS >= 600 && ORGANIC_CARD_READ_GRACE_MS <= 3_000,
+        `the grace (${ORGANIC_CARD_READ_GRACE_MS}ms) must cover an in-flight read without holding a card for seconds`,
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("organicCardGraceMs: bounded by the hard tail, and never spent on a send whose deadline has passed", () => {
+    const { organicCardGraceMs, ORGANIC_CARD_READ_GRACE_MS } = require("../dist/scanner.js");
+    const now = 1_000_000;
+    const sendDeadline = now + 700;
+    const hardTail = sendDeadline + 1_400;
+    // Full grace when the tail has room for it.
+    assert.equal(organicCardGraceMs(now, sendDeadline, hardTail), ORGANIC_CARD_READ_GRACE_MS);
+    // The tail is the bound when it is smaller than the constant.
+    assert.equal(organicCardGraceMs(now, sendDeadline, sendDeadline + 500), 500);
+    // The send's own slice is untouched by the wait (the deadline shifts with
+    // it), so only the shift room can clamp the grace.
+    assert.equal(organicCardGraceMs(now, sendDeadline, sendDeadline + 400), 400);
+    // A deadline that has already passed is a deferral, not a wait.
+    assert.equal(organicCardGraceMs(sendDeadline, sendDeadline, hardTail), 0);
+    assert.equal(organicCardGraceMs(sendDeadline + 1, sendDeadline, hardTail), 0);
+    // A tail behind the deadline can never produce a negative grace.
+    assert.equal(organicCardGraceMs(now, sendDeadline, now - 1_000), 0);
+  });
+
   await test("429: the pause follows the provider's window, not the fixed five minutes", async () => {
     // Measured 2026-10-17 from this repo's own egress (22 spaced requests):
     // lite-api allows **5 requests per ~10s**, and its 429 answers with
@@ -13375,6 +13530,25 @@ async function main() {
     assert.ok(
       latest > claim && send > latest,
       "the post-claim refresh sits between the claim and the send — the last moment a late reading can still make the first card",
+    );
+    // THE SEND-GATE GRACE (2026-10-19): a reading that lands just after the
+    // claim's snapshot misses the FIRST message, and the post-push edit never
+    // reaches the notification — so the card waits a bounded grace there, and
+    // the send's own countdown starts from the shifted deadline.
+    const grace = src.indexOf("const grace = organicCardGraceMs(");
+    assert.ok(
+      grace > latest && send > grace,
+      "the grace sits after the post-claim snapshot and in front of the send",
+    );
+    assert.equal(
+      src.split("organicRead.catch(() => null)").length - 1,
+      1,
+      "and it waits on the RAW read (a slot would resolve to null at the tick wall)",
+    );
+    assert.equal(
+      src.split("effectiveSendDeadline - Date.now()").length - 1,
+      1,
+      "the abandonment timer reads the deadline the wait shifted",
     );
   });
 
