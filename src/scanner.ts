@@ -562,9 +562,14 @@ const CARD_SEND_MIN_MS = 250;
 
 /**
  * How long a card with NO reading may be held at the send gate for the read
- * that is already in flight, in ms (2026-10-19).
+ * that is already in flight when NO Jupiter gate is armed, in ms (2026-10-19).
  *
- * WHY THE CARD NOW WAITS. The 2026-10-19 audit of 19 first-push cards found 12
+ * With a gate armed the card holds much longer — until the read's own wall (see
+ * ORGANIC_CARD_GATE_HOLD_MS): there the line is not decoration, it is the only
+ * input the block gate has. This shorter hold stays for the display-only
+ * configuration, where a reading that is slow costs the line and nothing else.
+ *
+ * WHY THE CARD WAITS. The 2026-10-19 audit of 19 first-push cards found 12
  * with no `organic` score, and the tick rows beside them say why: on the ~9s
  * ticks (the card read spent its 429 window, see jupfeeds.rateLimitPauseMs)
  * `organic_why` is `ok` yet the card's own audit says `why: null` — the read
@@ -576,37 +581,112 @@ const CARD_SEND_MIN_MS = 250;
  * for them the line was simply missing — three rounds of making the edit more
  * reliable could not fix that.
  *
+ * WHY 1_200 WAS NOT ENOUGH (2026-10-20, operator: "收到幾張首次推送卡的有機度，
+ * 但閘門沒有生效"). The first grace shipped 2026-10-19 00:23Z. The next three
+ * cards whose line arrived by edit are the evidence (`/debug/push-audit`):
+ * `packs` 48.1 (floor 55), `NS` 44.6, `ChatGBT` 0 — every one of them UNDER the
+ * floor, i.e. cards the gate exists to stop. Their audits read
+ * `score: null, why: null|late` at the send and the late stamp landed 295-443ms
+ * after the card, which is the READ finishing a beat after the 1.2s grace run
+ * out (the edit itself is a Telegram round trip). So the gate was not bypassed:
+ * the reading simply arrived after the last moment the card could look at it,
+ * and the post-push edit then PRINTED a failing score on a card that could no
+ * longer be stopped.
+ *
  * The wait is SAFE because it is paid out of the invocation's spare wall, not
  * the send's slice: the send deadline is shifted by the time actually waited,
- * so the card keeps exactly the slice `cardSendDeadline` gave it, and the
- * absolute cap is the send tail plus this grace (9_800 + 1_200 = 11s of the
- * ~15.5s race window). It is bounded and one-shot: a read that needs longer
- * still gets the post-push edit, and a card whose reading landed already never
- * waits at all (the promise is settled, so the race returns on the spot).
+ * so the card keeps exactly the slice `cardSendDeadline` gave it. A card whose
+ * reading is already in hand never waits at all (the promise is settled, so
+ * the race returns on the spot), and the wait only starts when the card would
+ * otherwise ship with no line at all.
+ *
+ * This is the DISPLAY HOLD, not the gate's: with a gate armed the card waits
+ * until `organicCardReadWall` instead (12_550ms into the tick, the send ending
+ * by 12_800ms), because there the reading is the gate's only input and a
+ * reading that lands after the send is a gate that never ran. See
+ * ORGANIC_CARD_GATE_HOLD_MS.
  */
 export const ORGANIC_CARD_READ_GRACE_MS = 1_200;
 
 /**
- * The grace a card may spend waiting for its in-flight reading, in ms (see
- * ORGANIC_CARD_READ_GRACE_MS). Zero when there is no room left before the hard
- * tail, or when the send's own deadline has already passed (a wait then buys
- * nothing: the card is deferred, never sent late).
+ * Extra wall a card may spend waiting for its in-flight reading when a Jupiter
+ * gate is armed, in ms (2026-10-20).
  *
- * `sendDeadline` is the deadline `cardSendDeadline` returned; `hardTail` is the
- * absolute bound the SHIFTED send may reach. Only the shift room matters: the
- * send keeps `sendDeadline - now` of slice however long the grace runs, so a
- * room of `hardTail - sendDeadline` is exactly the grace that fits. Pure, so
- * the boundary is unit-tested rather than inferred from a live tick.
+ * WHY THE 2026-10-19 HOLD WAS TOO SHORT. `/debug/push-audit` (200 entries,
+ * 2026-10-19 13:03Z – 2026-10-20 01:41Z) has 22 first-push cards; 15 shipped
+ * with `organic.score: null` and 6 of those got their line by edit later. FIVE
+ * of those six readings are UNDER the 55 floor — `PACK` 46.0, `TA` 51.1,
+ * `packs` 48.1, `NS` 44.6, `ChatGBT` 0 — i.e. cards the gate exists to stop, and
+ * the operator's 2026-10-20 report ("收到幾張首次推送卡的有機度，但閘門沒有生效")
+ * is exactly them. The last three came after the 1.2s hold shipped; their late
+ * stamps are 295–443ms, which is mostly the Telegram edit round trip, so the
+ * read settled a beat after the hold run out. The gate was never consulted and
+ * the edit then printed a failing score on a card that could no longer be
+ * stopped.
+ *
+ * WHY A WALL AND NOT A BIGGER CONSTANT. A fixed hold can only be right by
+ * luck: the read's own 429 wait decides when it settles, and that decision was
+ * made against a 15s wall while the card held 1.2s. This constant moves the
+ * READ's wall to `organicCardReadWall` (tail + this - CARD_SEND_MIN_MS) and the
+ * card holds until that very instant, so a pause the read waits out is one the
+ * card is still there for; a pause it refuses is one the card could not have
+ * used. A reading in hand never waits (the promise is already settled).
+ *
+ * BUDGET. The hold only starts once the card is otherwise ready, and with a
+ * gate armed that is never before `chainDeadline` (the early gate await is
+ * clamped there), i.e. 8.1s into the tick. So the longest real hold is ~4.4s
+ * past a 9.8s tail — the send finishes by 12.8s, inside the ~15.5s race window
+ * and the 4.5s flush reserve that follows it. The display-only configuration
+ * (no gate armed) never has that early await, so it keeps the short
+ * ORGANIC_CARD_READ_GRACE_MS instead of holding a fast tick open for seconds.
+ */
+export const ORGANIC_CARD_GATE_HOLD_MS = 3_000;
+
+/**
+ * The wall a card's 有機度 read is handed, and the instant a GATED card with no
+ * reading stops waiting for it (2026-10-20).
+ *
+ * ONE CLOCK FOR BOTH DECISIONS. The read's third argument only decides whether
+ * a 429 pause is worth waiting out (`room > pause + 750ms`); the send gate
+ * decides how long the first message waits. When those two disagreed, the read
+ * could sit out a pause the card would never see the answer to — the card
+ * shipped, the reading landed, and the edit printed a score the gate would have
+ * blocked on (2026-10-20 audit). Handing the read THIS instant makes them the
+ * same decision: a pause is only waited if the answer can still reach the first
+ * message.
+ *
+ * `CARD_SEND_MIN_MS` is reserved at the end so a reading that lands exactly on
+ * the wall still leaves the send its minimum slice (the shifted send deadline
+ * is this wall plus that reserve). Pure, so the constants that must agree are
+ * unit-tested together rather than only observed on a live card.
+ */
+export function organicCardReadWall(startedAt: number): number {
+  return (
+    startedAt + CARD_SEND_TAIL_MS + ORGANIC_CARD_GATE_HOLD_MS - CARD_SEND_MIN_MS
+  );
+}
+
+/**
+ * The grace a card may spend waiting for its in-flight reading, in ms.
+ *
+ * `holdWall` is the instant the wait may not cross: `organicCardReadWall` for a
+ * gated card, and (at most) `now + ORGANIC_CARD_READ_GRACE_MS` for a display-only
+ * one. Zero when the send's own deadline has already passed — a wait then buys
+ * nothing, because the card is deferred rather than sent late.
+ *
+ * The send keeps `sendDeadline - now` of slice whatever the wait costs: its
+ * deadline is shifted by the time actually waited (see the send gate). The old
+ * version clamped the wait to a fixed 1.2s, and that clamp is exactly what the
+ * three 2026-10-20 cards fell through.
  */
 export function organicCardGraceMs(
   now: number,
   sendDeadline: number,
-  hardTail: number,
+  holdWall: number,
 ): number {
   if (!(now < sendDeadline)) return 0;
-  const room = hardTail - sendDeadline;
-  if (!(room > 0)) return 0;
-  return Math.min(ORGANIC_CARD_READ_GRACE_MS, room);
+  if (!(holdWall > now)) return 0;
+  return holdWall - now;
 }
 
 /**
@@ -7340,6 +7420,13 @@ export class Scanner {
         // and that late arrival is what the card's line is appended from (see
         // appendLateOrganicLine). One call, unchanged: the thunk below hands
         // this same promise back to bestEffort.
+        // The card's OWN wall, computed once and used twice: it is handed to
+        // the read below (so its 429 wait is bounded by what the card can
+        // actually wait for) and to the send gate's hold (see
+        // organicCardReadWall). Same instant, so the two decisions cannot
+        // disagree — the 2026-10-20 cards were read against a 15s wall while
+        // the card held only 1.2s, and the reading landed between them.
+        const organicReadWall = organicCardReadWall(startedAt);
         const organicRead = jupiterOrganic
           ? jupiterOrganic.fetchOrganicScore(
               coin.stats.token,
@@ -7359,10 +7446,11 @@ export class Scanner {
                 if (note.waited) diag.organicWaited += 1;
                 if (!note.landed) diag.organicNoLine += 1;
               },
-              // The read's wall (see JUP_CARD_READ_WALL_MS): neither the
-              // chain's nor the tick's, because nothing waits on this read.
-              // The third argument is the only input to ONE decision — may a
-              // 429 pause be waited out for a second attempt (pause <=
+              // The read's wall: the card's own hold deadline (see
+              // organicCardReadWall), capped by JUP_CARD_READ_WALL_MS so the
+              // read never outlives the invocation it was opened in. The third
+              // argument is the only input to ONE decision — may a 429 pause
+              // be waited out for a second attempt (pause <=
               // JUP_RATE_LIMIT_WAIT_MAX_MS AND room > pause + 750ms) — and
               // since the line can now be appended AFTER the card, the wall
               // that decision reads may outlive the push path it used to
@@ -7370,7 +7458,12 @@ export class Scanner {
               // the 1-10s band, and the chain's wall (tick start + 6.5s)
               // refused everything past ~3.75s — every card in that day's
               // audit was `why:"backoff"`, `waited:false`.
-              Date.now() + JUP_CARD_READ_WALL_MS,
+              //
+              // BOUNDED BY THE HOLD (2026-10-20): a pause the card can no
+              // longer wait for must not be waited out either, or the reading
+              // resolves onto an already-sent card and the edit prints a score
+              // the gate should have blocked.
+              Math.min(Date.now() + JUP_CARD_READ_WALL_MS, organicReadWall),
             )
           : null;
         const organicSlot = this.bestEffort(
@@ -7568,12 +7661,18 @@ export class Scanner {
         // also block in front of the expensive legs. Awaited only when one of
         // the gates is on, so a configuration with all of them off still never
         // waits here (the slot stays purely display-bound, as it was).
-        const jupReading =
+        // Any of the three Jupiter gates armed? Both the early await and the
+        // send gate's hold key off this ONE value, so "a gate that must see the
+        // reading" and "a card that waits for it" can never disagree — the
+        // 2026-10-20 cards shipped because the card held 1.2s while the gate's
+        // only reading landed a beat later (see ORGANIC_CARD_GATE_HOLD_MS).
+        const jupGatesOn =
           this.config.jupSusBlock ||
           this.config.organicMinScore > 0 ||
-          this.config.organicMaxTradersH1 > 0
-            ? await this.bestEffort(() => organicSlot, chainDeadline, null)
-            : null;
+          this.config.organicMaxTradersH1 > 0;
+        const jupReading = jupGatesOn
+          ? await this.bestEffort(() => organicSlot, chainDeadline, null)
+          : null;
         // The LEG-SAVING pass of the two Jupiter gates (see
         // jupiterGatesBlocked — the same judgement runs again at the render,
         // because this wait is chain-clamped while the reading is late-bound
@@ -7830,23 +7929,50 @@ export class Scanner {
             cardReading = latestReading;
             message = renderCard(latestReading);
           }
-          // HOLD THE CARD FOR A READING THAT IS ALREADY ARRIVING (2026-10-19).
-          // The snapshot above is free (it reads a box), so a read that lands
-          // a few hundred ms after it — the common 429-window shape, see
-          // ORGANIC_CARD_READ_GRACE_MS — still misses the first message and is
-          // left to the post-push edit, which the notification never shows.
-          // This waits a bounded, one-shot grace on the RAW promise (not the
-          // slot, which resolves to null at the tick wall) and then does the
-          // same work as the snapshot above: judge the reading, render it, and
-          // release the claim instead of sending if it blocks. The send's own
-          // deadline is moved by the time actually waited, so the card keeps
-          // its slice; the hard tail caps the whole wait+send at 11s.
+          // HOLD THE CARD FOR A READING THAT IS ALREADY ARRIVING (2026-10-19,
+          // widened 2026-10-20). The snapshot above is free (it reads a box),
+          // so a read that lands a few hundred ms after it — the common
+          // 429-window shape, see ORGANIC_CARD_READ_GRACE_MS — still misses the
+          // first message and is left to the post-push edit, which the
+          // notification never shows. The first version of this wait stopped at
+          // a fixed 1.2s and three cards shipped with readings that arrived a
+          // beat later (packs 48.1, NS 44.6, ChatGBT 0 — all under the 55
+          // floor): the gate was never consulted, and the edit then printed a
+          // failing score on a card that could no longer be stopped. The hold
+          // now runs until `organicReadWall` — the very deadline the read was
+          // handed — so a reading that exists in time is ALWAYS judged before
+          // the first message, and a pause the read refuses is one the card
+          // would not have waited for anyway.
+          //
+          // It waits on the RAW promise (not the slot, which resolves to null
+          // at the tick wall) and then does the same work as the snapshot
+          // above: judge the reading, render it, and release the claim instead
+          // of sending if it blocks. The send's own deadline is moved by the
+          // time actually waited, so the card keeps its slice; the wait + send
+          // is capped at the read wall plus CARD_SEND_MIN_MS.
           let effectiveSendDeadline = sendDeadline;
           if (cardReading === null && organicRead !== null) {
+            // Gated: hold to the read's own wall, so any reading the read
+            // decided to wait for is judged before the first message. Display
+            // only: keep the short grace (a slow line is not worth seconds).
+            // The gate state is read HERE rather than reusing the flag the
+            // early await used: it is the moment the reading will be judged,
+            // and the two questions (`await the slot?`, `hold the card?`) must
+            // both answer to the config as it stands.
+            const holdGatesOn =
+              this.config.jupSusBlock ||
+              this.config.organicMinScore > 0 ||
+              this.config.organicMaxTradersH1 > 0;
+            const holdWall = holdGatesOn
+              ? organicReadWall
+              : Math.min(
+                  organicReadWall,
+                  Date.now() + ORGANIC_CARD_READ_GRACE_MS,
+                );
             const grace = organicCardGraceMs(
               Date.now(),
               sendDeadline,
-              startedAt + CARD_SEND_TAIL_MS + ORGANIC_CARD_READ_GRACE_MS,
+              holdWall,
             );
             if (grace > 0) {
               this.markPhase(diag, "send:organic-wait", startedAt);
@@ -7860,10 +7986,17 @@ export class Scanner {
               ]);
               if (graceTimer !== undefined) clearTimeout(graceTimer);
               // The send keeps what cardSendDeadline gave it: the wait moves
-              // its deadline, it does not eat the slice.
-              effectiveSendDeadline = Math.min(
-                startedAt + CARD_SEND_TAIL_MS + ORGANIC_CARD_READ_GRACE_MS,
-                sendDeadline + (Date.now() - waitStartedAt),
+              // its deadline, it does not eat the slice. The cap is the hold
+              // wall plus the same CARD_SEND_MIN_MS reserve that wall leaves
+              // (see organicCardReadWall), so a wait that runs to the wall
+              // still leaves the send its minimum slice. max() keeps an early
+              // card's original deadline when the display-only hold is short.
+              effectiveSendDeadline = Math.max(
+                sendDeadline,
+                Math.min(
+                  holdWall + CARD_SEND_MIN_MS,
+                  sendDeadline + (Date.now() - waitStartedAt),
+                ),
               );
               if (arrived !== null && arrived !== judgedReading) {
                 judgedReading = arrived;

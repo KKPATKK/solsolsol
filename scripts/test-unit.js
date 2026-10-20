@@ -12266,12 +12266,11 @@ async function main() {
       "if (note.retried) diag.organicRetried += 1;",
       "if (note.waited) diag.organicWaited += 1;",
       "if (!note.landed) diag.organicNoLine += 1;",
-      // The read's wall rides along, and it is the CARD READ's own
-      // (JUP_CARD_READ_WALL_MS, 2026-10-17): nothing waits on this read — the
-      // card renders from the box and the line is appended by an edit if the
-      // reading lands late — so its wall may outlive the tick it is created
-      // in, which is what lets it wait out the provider's 1-10s window.
-      "Date.now() + JUP_CARD_READ_WALL_MS,",
+      // The read's wall rides along: the card's own hold deadline caps the
+      // 2026-10-17 wall (JUP_CARD_READ_WALL_MS), so a 429 pause is only waited
+      // out when the answer can still make the FIRST message (2026-10-20 —
+      // both decisions now read organicCardReadWall's instant).
+      "Math.min(Date.now() + JUP_CARD_READ_WALL_MS, organicReadWall),",
       // The slot keeps its TICK wall: the EARLY gate await below reads this
       // same promise, so what the tick is OFFERED must stay bounded.
       "tickDeadline,",
@@ -12954,23 +12953,170 @@ async function main() {
     }
   });
 
-  await test("organicCardGraceMs: bounded by the hard tail, and never spent on a send whose deadline has passed", () => {
-    const { organicCardGraceMs, ORGANIC_CARD_READ_GRACE_MS } = require("../dist/scanner.js");
+  await test("organicCardGraceMs: waits up to the read's own wall, and never on a send whose deadline has passed", () => {
+    const {
+      organicCardGraceMs,
+      organicCardReadWall,
+      ORGANIC_CARD_GATE_HOLD_MS,
+    } = require("../dist/scanner.js");
+    // The two ends share one instant (2026-10-20): the read's wall and the
+    // gated card's hold are organicCardReadWall, and it must leave the send its
+    // minimum slice and still land inside the ~15.5s race window.
+    const t0 = 1_000_000;
+    assert.equal(
+      organicCardReadWall(t0),
+      t0 + 9_800 + ORGANIC_CARD_GATE_HOLD_MS - 250,
+      "the read wall is the send tail + the gate hold - the send's minimum slice",
+    );
+    assert.ok(
+      organicCardReadWall(t0) + 250 < t0 + 15_500,
+      `the gated hold plus its send slice (${organicCardReadWall(t0) + 250 - t0}ms) must fit the race window`,
+    );
     const now = 1_000_000;
     const sendDeadline = now + 700;
-    const hardTail = sendDeadline + 1_400;
-    // Full grace when the tail has room for it.
-    assert.equal(organicCardGraceMs(now, sendDeadline, hardTail), ORGANIC_CARD_READ_GRACE_MS);
-    // The tail is the bound when it is smaller than the constant.
-    assert.equal(organicCardGraceMs(now, sendDeadline, sendDeadline + 500), 500);
-    // The send's own slice is untouched by the wait (the deadline shifts with
-    // it), so only the shift room can clamp the grace.
-    assert.equal(organicCardGraceMs(now, sendDeadline, sendDeadline + 400), 400);
+    // 2026-10-20: the wait is everything left before the wall the READ was
+    // handed, not a fixed 1.2s. The three cards that fell through the old cap
+    // (`packs` 48.1, `NS` 44.6, `ChatGBT` 0) had readings land just past it.
+    assert.equal(organicCardGraceMs(now, sendDeadline, now + 3_050), 3_050);
+    // A wall sooner than the send deadline still bounds the wait.
+    assert.equal(organicCardGraceMs(now, sendDeadline, now + 400), 400);
     // A deadline that has already passed is a deferral, not a wait.
-    assert.equal(organicCardGraceMs(sendDeadline, sendDeadline, hardTail), 0);
-    assert.equal(organicCardGraceMs(sendDeadline + 1, sendDeadline, hardTail), 0);
-    // A tail behind the deadline can never produce a negative grace.
+    assert.equal(organicCardGraceMs(sendDeadline, sendDeadline, now + 3_050), 0);
+    assert.equal(organicCardGraceMs(sendDeadline + 1, sendDeadline, now + 3_050), 0);
+    // A wall behind the deadline can never produce a negative grace.
     assert.equal(organicCardGraceMs(now, sendDeadline, now - 1_000), 0);
+  });
+
+  await test("Scanner: a GATED card waits for its 有機度 reading past the old 1.2s cap, and the gate blocks it (2026-10-20)", async () => {
+    // The live shape: `/debug/push-audit` (200 entries to 2026-10-20 01:41Z)
+    // has five first-push cards whose edit-delivered reading is under the 55
+    // floor — `PACK` 46.0, `TA` 51.1, `packs` 48.1, `NS` 44.6, `ChatGBT` 0 —
+    // all shipped with `organic.score: null`. Their reads settled a beat AFTER
+    // the fixed 1.2s hold, so the gate never saw them. Here the read lands 1.5s
+    // after the claim and the card must NOT be sent: the old code would have
+    // shipped it (the hold was 1.2s) and the assertion below would fail.
+    //
+    // The fixture's chain is milliseconds, so the early (chain-clamped) gate
+    // await would otherwise consume the reading there; the floor is armed on
+    // the claim instead, which keeps the test on the send-gate hold — the path
+    // that actually failed. 1.5s is deliberately past the old constant.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const cfg = loadConfig({
+        JUP_SUS_BLOCK: "false",
+        ORGANIC_MIN_SCORE: "0",
+        ORGANIC_MAX_TRADERS_H1: "0",
+      });
+      await db.saveChatSettings({
+        chatId: "chat-on", minLiquidityUsd: 0, minVolume24hUsd: 0,
+        minMarketCapUsd: 0, maxMarketCapUsd: 10_000_000,
+        minAgeMinutes: 0, maxAgeMinutes: 100_000,
+        min5mVolUsd: 0, min1hVolUsd: 0, min5mChgPct: 0, min1hChgPct: 0,
+        enabled: true,
+      });
+      const MINT = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+      const dex = new DexScreenerClient(cfg);
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: MINT, symbol: "LATEGATE" }];
+      dex.fetchPairsForTokens = async () =>
+        new Map([[
+          MINT,
+          {
+            chainId: "solana",
+            dexId: "raydium",
+            pairAddress: `pair-${MINT}`,
+            baseToken: { address: MINT, symbol: "LATEGATE" },
+            quoteToken: {
+              address: "So11111111111111111111111111111111111111112",
+              symbol: "SOL",
+            },
+            priceUsd: "0.001",
+            marketCap: 150_000,
+            liquidity: { usd: 30_000 },
+            volume: { m5: 20_000, h1: 100_000, h24: 500_000 },
+            priceChange: { m5: 30, h1: 50, h24: 100 },
+            txns: { m5Buys: 30, m5Sells: 20, h1Buys: 200, h1Sells: 100 },
+            pairCreatedAt: Date.now() - 3_600_000,
+          },
+        ]]);
+      const reading = {
+        score: 44.6,
+        label: "low",
+        tradersH1: 1_058,
+        tradersWindow: "1h",
+        sus: false,
+        devBalancePct: null,
+      };
+      const jupiter = {
+        fetchRecentTokens: async () => [],
+        fetchTrendingTokens: async () => [],
+        fetchTokenDataBatch: async () => new Map(),
+        // The read settles 1.5s after it is dispatched — past the old 1.2s
+        // hold, inside the wall the card and the read now share.
+        fetchOrganicScore: (_mint, onNote) =>
+          new Promise((resolve) => {
+            setTimeout(() => {
+              onNote?.({
+                at: Date.now(),
+                ms: 1_500,
+                why: "ok",
+                status: 200,
+                retried: false,
+                waited: false,
+                landed: true,
+              });
+              resolve(reading);
+            }, 1_500);
+          }),
+      };
+      const texts = [];
+      const bot = {
+        api: {
+          sendMessage: async (_chat, text) => {
+            texts.push(text);
+            return { message_id: 9003 };
+          },
+        },
+      };
+      const scanner = new Scanner(
+        db, bot, dex, cfg,
+        null, null, null, null, null, null, jupiter,
+      );
+      const realClaim = db.claimTokenPush.bind(db);
+      db.claimTokenPush = async (chatId, token) => {
+        const won = await realClaim(chatId, token);
+        if (won) cfg.organicMinScore = 55;
+        return won;
+      };
+      await scanner.runOnce();
+      assert.equal(
+        texts.length,
+        0,
+        "a card whose 有機度 fails the floor must not be sent, even when the reading lands 1.5s in",
+      );
+      assert.equal(await db.isTokenSeen("chat-on", MINT), false, "and the claim is released for the next tick");
+      assert.equal(scanner.lastSummary.pushed, 0);
+      assert.equal(scanner.lastSummary.fails.organic, 1, "the block is counted as an organic rejection");
+      assert.equal(
+        scanner.lastSummary.organicLateEdits,
+        0,
+        "the card was blocked before the send, so there was nothing to edit",
+      );
+      const rejects = scanner.lastSummary.chainRejects ?? [];
+      assert.ok(
+        rejects.some((r) => /44\.6/.test(String(r.reason))),
+        "the chain-reject ring names the reading the gate blocked on",
+      );
+      assert.equal((await db.getPushAudit()).length, 0, "and no delivery audit row exists for a card that never left");
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
   });
 
   await test("429: the pause follows the provider's window, not the fixed five minutes", async () => {
@@ -13452,8 +13598,11 @@ async function main() {
     // reading). The pin reads the condition's own clauses instead of its line
     // breaks, and requires all three: a gate that is configured but never
     // given a reading is exactly the failure mode this file pins.
+    // 2026-10-20: the three clauses moved into `jupGatesOn`, which the early
+    // await AND the send gate's hold both read (the hold is what lets a gated
+    // card wait for the reading past the old 1.2s cap).
     const jupAwaitGuard = src.slice(
-      src.indexOf("const jupReading ="),
+      src.indexOf("const jupGatesOn ="),
       src.indexOf("? await this.bestEffort(() => organicSlot, chainDeadline, null)"),
     );
     assert.ok(
@@ -23200,7 +23349,7 @@ async function main() {
         scannerSrc.includes(
           "constorganicRead=jupiterOrganic?jupiterOrganic.fetchOrganicScore(coin.stats.token,(note)=>{",
         ) &&
-        scannerSrc.includes("},Date.now()+JUP_CARD_READ_WALL_MS,):null;") &&
+        scannerSrc.includes(          "},Math.min(Date.now()+JUP_CARD_READ_WALL_MS,organicReadWall),):null;") &&
         scannerSrc.includes(
           "constorganicSlot=this.bestEffort(organicRead?()=>organicRead:null,tickDeadline,null,);",
         ) &&

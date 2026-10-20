@@ -39,6 +39,11 @@ export const JUP_RATE_LIMIT_MIN_PAUSE_MS = 250;
  * `why:"backoff"` card in the 2026-10-17 audit was `waited:false`, and the
  * wait was the only lever there was.
  *
+ * 2026-10-20: the card DOES wait now, but only at its send gate and only until
+ * the wall this call was handed (Scanner.organicCardReadWall, ~12.55s into the
+ * tick) — the two ends read the same instant, so a pause is waited only when
+ * the answer can still reach the first message. The 10s ceiling is unchanged.
+ *
  * The true bound is still the caller's wall (room > pause + margin); this is
  * only the ceiling on what a wall may buy. Still far under
  * JUP_RATE_LIMIT_BACKOFF_MS, so an unusable header can never park the card.
@@ -912,10 +917,12 @@ export class JupTokensClient {
     onNote?: (note: JupCardReadNote) => void,
     /**
      * The caller's WALL for this read (epoch ms) — the scanner hands it
-     * `Date.now() + JUP_CARD_READ_WALL_MS` (the read is un-awaited: the card
-     * never waits on it, its line is appended by edit if it lands late — see
-     * Scanner.appendLateOrganicLine). Only one decision uses it: whether a 429
-     * pause is short enough to wait out before the second attempt (see below).
+     * `min(Date.now() + JUP_CARD_READ_WALL_MS, organicCardReadWall(startedAt))`:
+     * the card's own hold deadline, so a 429 pause this call waits out is one
+     * the send gate is still there for (2026-10-20 — before that the two waited
+     * on different clocks and a failing reading landed on an already-sent card,
+     * see Scanner.organicCardReadWall). Only one decision uses it: whether a
+     * 429 pause is short enough to wait out before the second attempt (below).
      * Optional, so every existing caller keeps its exact shape (no deadline =
      * never wait).
      */

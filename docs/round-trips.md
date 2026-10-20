@@ -4755,6 +4755,84 @@ Telegram 訊息本文（forward 讀完即刪）見到兩個形狀：
   ~10.3s，仍然離 15.5s race window 好遠。
 - 讀數真係要 > 1.2s 才返到嘅卡（更長嘅 429／index 未追到）仍然靠 §4.72 嘅 post-push edit；
   edit 唔會更新通知，所以呢批卡嘅第一眼仍然冇線 —— 呢個係 provider 嘅時間，唔係等待策略。
+  **2026-10-20 跟進：呢條界線同時係閘門嘅漏洞，見 §4.74。**
 - 未量到 live 比例：要 deploy 之後嘅一批 initial 卡先答得到「grace 令幾多 % 嘅卡第一張就有線」。
   audit 會直接分得清：`why:"ok"` + `late` absent = 第一張已有線；`late.outcome:"landed"` =
   仍然要靠 edit。
+
+## 4.74 有機度第九擊：閘門睇唔到遲到 1.2s 嘅讀數 —— 三張本應攔住嘅卡照推（2026-10-20）
+
+營運報告：「**收到幾張首次推送卡的有機度，但閘門沒有生效**」。
+
+### 一、對數：三張卡，三個都低過 55
+
+`/debug/push-audit` 200 條（2026-10-19 13:03Z – 2026-10-20 01:41Z）有 22 張 initial 卡：
+**15 張送出時 `organic.score: null`**，其中只有 6 張之後靠 edit 補到線（其餘 9 張連 `late` 都冇）。
+**6 張之中 5 張嘅讀數本身應該被攔** —— 五張全部低過 55 floor：
+
+| 卡 | 送出時 audit | 補上嘅讀數 | 閘門 |
+|---|---|---|---|
+| `PACK` 10-19 16:00:13Z | `score:null, why:null` | 45.99 / 659 | 55 floor → 應攔 |
+| `TA` 10-19 23:40:46Z | `score:null, why:"late", waited:true` | 51.07 / 1162 | 55 floor → 應攔 |
+| `packs` 10-20 01:28:40Z | `score:null, why:"late", waited:true` | 48.06 / 571 | 55 floor → 應攔 |
+| `NS` 10-20 01:39:22Z | `score:null, why:null` | 44.60 / 1058 | 55 floor → 應攔 |
+| `ChatGBT` 10-20 01:41:53Z | `score:null, why:"late", waited:true` | 0 / 848 | 55 floor → 應攔 |
+
+最後三張就係 1.2s grace 上線（10-19 00:23Z deploy）之後發生嘅；佢哋嘅 `late.lateMs` 係
+295–443ms（主要係 Telegram edit 嘅 round trip），`late.first` 全部 absent，即係
+**第一次讀數就返到**，只係返得遲。對應 tick 全部 10.0–10.5s：卡喺 `chainDeadline`（8.1s）
+之後就 ready，hold 1.2s 到 ~9.7s 就 send，讀數喺 9.8–10.1s 落地 —— 差幾百 ms。
+
+**所以閘門冇被 bypass** —— 佢從來冇見過個讀數。真正嘅 bug 係「張卡等幾久」同「個讀等幾久」
+係兩個唔同嘅鐘：讀嘅 429 等待決策用 `Date.now() + JUP_CARD_READ_WALL_MS`（15s），張卡只等 1.2s。
+結果係讀數一定可以喺卡送咗之後才落地，而 edit 就會喺聊天室印出一個「本應攔住」嘅分數。
+
+### 二、修正：同一個 wall，兩邊都用
+
+`src/scanner.ts`：
+
+- **新增 `organicCardReadWall(startedAt)`** = `startedAt + CARD_SEND_TAIL_MS + ORGANIC_CARD_GATE_HOLD_MS - CARD_SEND_MIN_MS`
+  （9_800 + 3_000 − 250 = **12_550**）。呢個係**同一個 instant**：
+  - 傳俾 `fetchOrganicScore` 做第三個參數（同 15s 取較早者），所以「等唔等 429 窗口」只會在
+    答案趕得及第一張卡時才 say yes；
+  - send gate 嘅 hold 就係等到呢個 instant（見下）。
+- **`ORGANIC_CARD_GATE_HOLD_MS = 3_000`**（新）＋ **`ORGANIC_CARD_READ_GRACE_MS = 1_200`**（保留）。
+  有閘開嘅卡 hold 到 read wall；三個閘全關（純顯示）就照舊只 hold 1.2s —— 唔會為咗一條裝飾線
+  拖住一個快 tick 十幾秒。
+- `organicCardGraceMs(now, sendDeadline, holdWall)` 唔再 clamp 死 1.2s，改為「等到 holdWall」。
+  冇 room（send deadline 已過）照樣回 0 = defer，唔會送遲卡。
+- 遲到嘅讀數照樣過 `jupiterGatesBlocked`：block 就 unclaim、唔 send、計 `fails.organic`，
+  唔會出現在聊天室。
+- `effectiveSendDeadline` 嘅上限改為 `holdWall + CARD_SEND_MIN_MS`，所以等到 wall 都用返
+  **同一個 250ms 最低 slice**；send 嘅 slice 由頭到尾冇縮。
+
+### 三、為何唔怕拖爆 tick
+
+- 有閘開嗰陣，卡片永遠唔會早過 `chainDeadline`（8.1s）ready —— 早期 gate 嘅
+  `await bestEffort(organicSlot, chainDeadline)` 本身就係嗰個下限。所以最長 hold = 12.55 − 8.1
+  ≈ **4.4s**，send 最遲 ~12.8s 完成，仍然喺 ~15.5s race window 之內，後面仲有 4.5s flush reserve。
+- 冇線嘅卡唔係無條件等：讀數 promise 已經 settle（例如 `no-entry`）就即刻返回，一秒都唔等。
+- **fail-open 不變**：真係冇讀數（Jupiter 冇呢隻幣／窗口等唔到）→ 照推，只係冇線。
+  呢個係原本嘅合約，今次冇改。
+
+### 四、驗證
+
+- `npx tsc --noEmit` exit 0；`npm run build` exit 0。
+- `node scripts/test-unit.js`：**579 passed, 0 failed**。新增／改咗：
+  - `Scanner: a GATED card waits for its 有機度 reading past the old 1.2s cap…`：讀數喺 claim 後
+    **1.5s** 才 land、score 44.6 < 55 → **0 個 sendMessage**、claim 已 release、
+    `fails.organic === 1`、chain-reject ring 有 `44.6`、audit 冇新 row。
+  - `organicCardGraceMs` 改為 pin「等到 read wall」同「send deadline 已過就 0」。
+  - 早期 gate 嘅 pin 改讀 `jupGatesOn`（三個 clause 移咗入去），語意不變。
+- **Mutation**：把 `dist/scanner.js` 嘅 `organicCardGraceMs` 改回 clamp 1_200，重跑 → 上面兩個
+  測試都紅（新測試係 `1 !== 0`，即係張卡真係送咗出去）。rebuild 後回綠。
+
+### 五、殘餘（照直講）
+
+- 遲到 > hold wall 嘅讀數（HTTP hang，或者只有 §4.72 嘅 second read 才拿到）仍然只可以 edit，
+  而如果嗰個讀數本應攔住，edit 會照舊加上「⚠️ 此讀數本應攔住」。呢個 shape 喺今次 200 條 ring
+  一次都冇出現 —— 6 張補線全部係 first read 就 land（`late.first` absent），冇一張用過 retry ——
+  但代碼路徑仍然存在。
+- 呢個 hold 只在「有閘開 + 讀數仲喺飛」時付出；deploy 之後要看 `/debug/push-audit`：
+  `why:"ok"` + 有 score = 第一張卡已被閘看過；`late.outcome:"landed"` 帶 failing score
+  應該唔再出現（除咗上面嘅殘餘）。
