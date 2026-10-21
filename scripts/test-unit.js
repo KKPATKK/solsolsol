@@ -9,7 +9,7 @@ const { createClient } = require("@libsql/client");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS, poolRotationSlot, SEEN_TOKENS_COUNT_KEY, TOKEN_STATS_COUNT_KEY, TELEMETRY_RECONCILE_INTERVAL_MS, TELEMETRY_RECONCILE_AT_KEY } = require("../dist/db.js");
+const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS, POOL_SLICE_CURSOR_KEY, poolRotationSlot, poolZoneOfLaunch, SEEN_TOKENS_COUNT_KEY, TOKEN_STATS_COUNT_KEY, TELEMETRY_RECONCILE_INTERVAL_MS, TELEMETRY_RECONCILE_AT_KEY } = require("../dist/db.js");
 const { DB_LATENCY_PROBE_KEY, DB_LATENCY_PROBE_COUNT_KEY, DB_LATENCY_SAMPLES, DB_LATENCY_SAMPLES_MAX, DB_LATENCY_OPS, clampLatencySamples, summarizeLatency, summarizeLatencyOps, claimShapeSavingMs, dbRegionFromUrl, changesVerdict, DB_LATENCY_EXPECTED_COUNTER_PER_SAMPLE } = require("../dist/dblatency.js");
 const { parseFilterArgs, tradeKeyboard } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin, parseSmartMoneyTypes, parseMutedCardSigs, loadConfig } = require("../dist/config.js");
@@ -30,7 +30,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, DRAINED_POOL_LIQUIDITY_USD, slicePoolRotation, slicePoolTwoLanes, RE_EVAL_FAST_LANE_SHARE, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, DRAINED_POOL_LIQUIDITY_USD, slicePoolRotation, slicePoolZones, POOL_SLICE_HOT_SHARE, parsePoolSliceCursors, serializePoolSliceCursors, poolZoneTicks, POOL_SLICE_MAX_CURSOR, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -9344,158 +9344,318 @@ async function main() {
     assert.equal(r3.nextCursor, 0);
   });
 
-  // ---------- the two-lane pool rotation (evidence vs filler) --------------
-  //
-  // The slice window is a per-tick SPLIT between the rows with mcap evidence
-  // (the only rows the sweep can act on) and the no-evidence in-grace fillers,
-  // each lane with its own cursor: the fast lane cycles in
-  // ~ceil(fast / (window x RE_EVAL_FAST_LANE_SHARE)) ticks while the filler
-  // lane stays fully covered, just slower. A budget, not extra work.
-  await test("slicePoolTwoLanes: fast lane takes its share, filler rides the rest", () => {
-    const fast = Array.from({ length: 409 }, (_, i) => `e${i}`);
-    const filler = Array.from({ length: 800 }, (_, i) => `n${i}`);
-    const share = Math.round(90 * RE_EVAL_FAST_LANE_SHARE);
-    const r = slicePoolTwoLanes(fast, filler, { fast: 0, slow: 0 }, 90);
-    assert.equal(r.slice.length, 90, "the window is fully spent");
-    assert.deepEqual(
-      r.slice.slice(0, share),
-      fast.slice(0, share),
-      "fast lane first, at its share",
-    );
-    assert.deepEqual(
-      r.slice.slice(share),
-      filler.slice(0, 90 - share),
-      "filler takes the remainder",
-    );
-    assert.equal(r.cursors.fast, share);
-    assert.equal(r.cursors.slow, 90 - share);
-  });
+  // ---------- the zone-aware pool rotation (hot / near / far / filler) -----
 
-  await test("slicePoolTwoLanes: each lane covers itself once per lane-sweep, no row starved", () => {
-    // The measured shape (2026-10-09): 305 evidenced rows + 836 fillers in a
-    // ~1.1K pool. The old single cursor took ceil(1141/90)=13 ticks per pass;
-    // the split puts every evidenced row through in 6 ticks (the measured
-    // win) while the filler lane still admits all 836 within its 24-tick run.
-    const fast = Array.from({ length: 305 }, (_, i) => `e${i}`);
-    const filler = Array.from({ length: 836 }, (_, i) => `n${i}`);
-    const fastSeen = new Set();
-    const fillerSeen = new Set();
-    let cursors = { fast: 0, slow: 0 };
-    for (let tick = 1; tick <= 24; tick++) {
-      const r = slicePoolTwoLanes(fast, filler, cursors, 90);
-      cursors = r.cursors;
-      for (const item of r.slice) (item[0] === "e" ? fastSeen : fillerSeen).add(item);
-      if (tick === 6) {
-        assert.equal(fastSeen.size, fast.length, "every evidenced row within 6 ticks");
-      }
-    }
+  await test("poolZoneOfLaunch: the slice tags rows with the query's own bands", () => {
+    const entry = 1_700_000_000_000;
+    const min = 60_000;
+    assert.equal(poolZoneOfLaunch(entry, entry), "hot");
+    assert.equal(poolZoneOfLaunch(entry - 30 * min, entry), "hot", "the hot band's older edge");
+    assert.equal(poolZoneOfLaunch(entry + 30 * min, entry), "hot", "its younger edge");
+    assert.equal(poolZoneOfLaunch(entry - 31 * min, entry), "near", "one minute past the edge is near");
+    assert.equal(poolZoneOfLaunch(entry + 31 * min, entry), "near", "pre-window coins rotate as near");
+    assert.equal(poolZoneOfLaunch(entry - 6 * 3600_000, entry), "near", "the near window's far edge");
+    assert.equal(poolZoneOfLaunch(entry - 6 * 3600_000 - 1, entry), "far");
     assert.equal(
-      fillerSeen.size,
-      filler.length,
-      "every filler row still covered in its own cycle",
+      SCAN_FRONT_GATE_KEYS.includes(POOL_SLICE_CURSOR_KEY),
+      true,
+      "the cursor rides the front's ONE read — it must be on the IN-list",
     );
   });
 
-  await test("slicePoolTwoLanes: a lane taken whole resets only its own cursor", () => {
-    const fast = ["e1", "e2"];
-    const filler = Array.from({ length: 300 }, (_, i) => `n${i}`);
-    const r = slicePoolTwoLanes(fast, filler, { fast: 7, slow: 100 }, 90);
-    assert.equal(r.slice.length, 90);
-    assert.deepEqual(r.slice.slice(0, 2), ["e1", "e2"], "small fast lane is taken whole");
-    assert.equal(r.cursors.fast, 0, "and only its cursor resets");
-    assert.equal(r.cursors.slow, 188, "the filler cursor advances by what the fast lane left");
+  //
+  // The window is allocated by each band's OWN cadence (see slicePoolZones):
+  // hot's evidenced rows every tick (capped), near's over its 6-tick
+  // recurrence, far's over its 24-tick recurrence, and the no-evidence filler
+  // lane takes what is left. A budget, not extra work.
+  await test("slicePoolZones: production cadences fund hot, the near/far sweeps and the filler lane", () => {
+    // The live shapes measured 2026-10-21: 25 evidenced hot rows returned, 403
+    // evidenced near, 136 evidenced far, ~550 fillers — and the 150-row window
+    // is exactly 25 + ceil(403/6) + ceil(136/24) + 51.
+    const zones = {
+      hot: Array.from({ length: 25 }, (_, i) => `h${i}`),
+      near: Array.from({ length: 403 }, (_, i) => `n${i}`),
+      far: Array.from({ length: 136 }, (_, i) => `f${i}`),
+      filler: Array.from({ length: 550 }, (_, i) => `x${i}`),
+    };
+    const r = slicePoolZones(
+      zones,
+      { hot: 0, near: 0, far: 0, filler: 0 },
+      150,
+      { nearTicks: 6, farTicks: 24 },
+    );
+    assert.equal(r.slice.length, 150, "the window is fully spent");
+    assert.deepEqual(r.served, { hot: 25, near: 68, far: 6, filler: 51 });
+    assert.deepEqual(r.slice.slice(0, 25), zones.hot, "hot is evaluated first");
+    assert.deepEqual(r.cursors, { hot: 0, near: 68, far: 6, filler: 51 });
   });
 
-  await test("slicePoolTwoLanes: empty fast lane hands the whole window to the filler", () => {
-    const filler = Array.from({ length: 300 }, (_, i) => `n${i}`);
-    const r = slicePoolTwoLanes([], filler, { fast: 0, slow: 0 }, 90);
+  await test("slicePoolZones: each zone's cohort is fully covered within its recurrence, once each", () => {
+    // The promise the cadence makes: the near band's 403 returned rows come
+    // round every 6 ticks and the far band's 136 every 24 (poolZoneTicks), and
+    // len/recurrence per tick covers each band inside that window without
+    // serving a row twice. The filler lane is present because it is what keeps
+    // the window spent — without it the spare pass would hand near's slack back
+    // to near and the loop would wrap before the recurrence.
+    const near = Array.from({ length: 403 }, (_, i) => `near-${i}`);
+    const far = Array.from({ length: 136 }, (_, i) => `far-${i}`);
+    const filler = Array.from({ length: 550 }, (_, i) => `x${i}`);
+    // Walk one zone's rotation until its whole cohort has been served, and
+    // return the order it was served in. A tick never wraps back inside its
+    // own slice (slicePoolRotation resets only after a tail), so "once each"
+    // is a property of the ORDER, not of a per-row counter.
+    const sweep = (prefix, size, maxTicks) => {
+      let cursors = { hot: 0, near: 0, far: 0, filler: 0 };
+      const order = [];
+      let ticks = 0;
+      while (order.length < size && ticks < maxTicks) {
+        const r = slicePoolZones(
+          { hot: [], near, far, filler },
+          cursors,
+          150,
+          { nearTicks: 6, farTicks: 24 },
+        );
+        cursors = r.cursors;
+        ticks++;
+        assert.ok(r.slice.length <= 150, "the window is a ceiling, never exceeded");
+        for (const item of r.slice) {
+          if (item.startsWith(prefix)) order.push(item);
+        }
+      }
+      return { order, ticks };
+    };
+    const nearSweep = sweep("near-", near.length, 6);
+    assert.equal(nearSweep.order.length, near.length, "near is fully covered in 6 ticks");
+    assert.equal(new Set(nearSweep.order).size, near.length, "…and every near row once");
+    const farSweep = sweep("far-", far.length, 24);
+    assert.equal(farSweep.order.length, far.length, "far is fully covered in 24 ticks");
+    assert.equal(new Set(farSweep.order).size, far.length, "…and every far row once");
+  });
+
+  await test("slicePoolZones: a zone taken whole resets only its own cursor", () => {
+    const near = ["n1", "n2"];
+    const far = Array.from({ length: 300 }, (_, i) => `f${i}`);
+    const r = slicePoolZones(
+      { hot: [], near, far, filler: [] },
+      { hot: 0, near: 7, far: 100, filler: 0 },
+      10,
+      { nearTicks: 1, farTicks: 24 },
+    );
+    assert.equal(r.slice.length, 10);
+    assert.deepEqual(r.slice.slice(0, 2), ["n1", "n2"], "small zone is taken whole");
+    assert.equal(r.cursors.near, 0, "and only its cursor resets");
+    assert.equal(r.cursors.far, 108, "far advances by what near left");
+  });
+
+  await test("slicePoolZones: empty zones hand their budget to the zones that still have rows", () => {
+    const filler = Array.from({ length: 300 }, (_, i) => `x${i}`);
+    const r = slicePoolZones(
+      { hot: [], near: [], far: [], filler },
+      { hot: 0, near: 0, far: 0, filler: 0 },
+      90,
+      { nearTicks: 6, farTicks: 24 },
+    );
     assert.equal(r.slice.length, 90);
     assert.deepEqual(r.slice, filler.slice(0, 90));
-    assert.equal(r.cursors.fast, 0);
-    assert.equal(r.cursors.slow, 90);
+    assert.deepEqual(r.cursors, { hot: 0, near: 0, far: 0, filler: 90 });
   });
 
-  await test("slicePoolTwoLanes: owed coins keep head priority inside their lane", () => {
-    // slicePoolRotation's make-up priority must survive the lane split: a
-    // deferred coin is placed ahead of its lane's rotating window.
+  await test("slicePoolZones: owed coins keep head priority inside their zone", () => {
+    // slicePoolRotation's make-up priority must survive zone separation: a
+    // deferred coin is placed ahead of ITS zone's rotating window.
     const ledger = new DeferredPushLedger();
-    ledger.defer("LANE_OWED", 1);
+    ledger.defer("ZONE_OWED", 1);
     try {
-      const r = slicePoolTwoLanes(
-        [],
-        [
-          { tokenAddress: "ordinary-1" },
-          { tokenAddress: "LANE_OWED" },
-          { tokenAddress: "ordinary-2" },
-        ],
-        { fast: 0, slow: 0 },
+      const r = slicePoolZones(
+        {
+          hot: [],
+          near: [],
+          far: [
+            { tokenAddress: "ordinary-1" },
+            { tokenAddress: "ZONE_OWED" },
+            { tokenAddress: "ordinary-2" },
+          ],
+          filler: [],
+        },
+        { hot: 0, near: 0, far: 0, filler: 0 },
         2,
+        { nearTicks: 1, farTicks: 1 },
       );
       assert.deepEqual(
         r.slice.map((i) => i.tokenAddress),
-        ["LANE_OWED", "ordinary-1"],
+        ["ZONE_OWED", "ordinary-1"],
       );
     } finally {
-      ledger.recover("LANE_OWED");
+      ledger.recover("ZONE_OWED");
     }
   });
 
-  await test("slicePoolTwoLanes: a lane at its end hands the rest to the other lane", () => {
-    // The inherited tail rule serves the remainder and resets the cursor, so
-    // the rows that lane could not spend are idle — unless the OTHER lane can
-    // take them, which it can here: fast (100 rows) sits at 78, so its 54-row
-    // window is a 22-row tail, and the filler covers the remaining 68.
-    const fast = Array.from({ length: 100 }, (_, i) => `e${i}`);
-    const filler = Array.from({ length: 500 }, (_, i) => `n${i}`);
-    const r = slicePoolTwoLanes(fast, filler, { fast: 78, slow: 0 }, 90);
-    assert.equal(r.slice.length, 90, "the window is spent, not left idle");
-    assert.deepEqual(r.slice, [...fast.slice(78), ...filler.slice(0, 68)]);
-    assert.equal(r.cursors.fast, 0, "the short lane still resets — no wrap-back");
-    assert.equal(r.cursors.slow, 68, "the other lane advances by what it served");
+  await test("slicePoolZones: a zone at its end leaves a genuinely short window, never a wrap-back", () => {
+    // Both zones sit at the end of their lists: each serves its tail and
+    // resets. Nothing wraps back to the head, so the window is legitimately
+    // short (10 + 5) rather than filled with rows already served.
+    const near = Array.from({ length: 100 }, (_, i) => `n${i}`);
+    const far = Array.from({ length: 50 }, (_, i) => `f${i}`);
+    const r = slicePoolZones(
+      { hot: [], near, far, filler: [] },
+      { hot: 0, near: 90, far: 45, filler: 0 },
+      90,
+      { nearTicks: 10, farTicks: 10 },
+    );
+    assert.equal(r.slice.length, 15, "near tail 10 + far tail 5");
+    assert.deepEqual(r.slice, [...near.slice(90), ...far.slice(45)]);
+    assert.equal(r.cursors.near, 0);
+    assert.equal(r.cursors.far, 0);
   });
 
-  await test("slicePoolTwoLanes: both lanes at their end leaves a genuinely short window", () => {
-    // Nothing to hand over: this is an exhausted rotation, not idle slots.
-    const fast = Array.from({ length: 100 }, (_, i) => `e${i}`);
-    const filler = Array.from({ length: 50 }, (_, i) => `n${i}`);
-    const r = slicePoolTwoLanes(fast, filler, { fast: 90, slow: 40 }, 90);
-    assert.equal(r.slice.length, 20, "fast tail 10 + filler tail 10");
-    assert.deepEqual(r.slice, [...fast.slice(90), ...filler.slice(40)]);
-    assert.equal(r.cursors.fast, 0);
-    assert.equal(r.cursors.slow, 0);
+  await test("slicePoolZones: the window is a ceiling, and a satisfied zone does not crowd out the next", () => {
+    // A cadence that asks for the whole list (nearTicks = 1) is truncated to
+    // the window — the slice can never exceed RE_EVAL_PER_TICK_MAX.
+    const nearBig = Array.from({ length: 400 }, (_, i) => `n${i}`);
+    const capped = slicePoolZones(
+      { hot: [], near: nearBig, far: [], filler: [] },
+      { hot: 0, near: 0, far: 0, filler: 0 },
+      150,
+      { nearTicks: 1, farTicks: 1 },
+    );
+    assert.equal(capped.slice.length, 150);
+    assert.equal(capped.served.near, 150);
+    // …and at the production cadence, far's whole 12-min take is granted
+    // before near's spare pass can spend the window on its own overflow.
+    const far = Array.from({ length: 40 }, (_, i) => `f${i}`);
+    const r = slicePoolZones(
+      { hot: [], near: nearBig, far, filler: [] },
+      { hot: 0, near: 0, far: 0, filler: 0 },
+      150,
+      { nearTicks: 6, farTicks: 1 },
+    );
+    assert.equal(r.slice.length, 150);
+    assert.equal(r.served.far, 40, "far's cadence is met in full");
+    assert.equal(r.served.near, 110, "near gets its 68 plus the spare");
   });
 
-  await test("slicePoolTwoLanes: recovery never serves a row twice in a lane sweep", () => {
-    // Recovery re-slices the other lane from its own cursor with a bigger take,
-    // so a grown run must stay a prefix-extension: every row of a lane is
-    // served exactly once per sweep, whatever the other lane's boundary does.
-    const fast = Array.from({ length: 108 }, (_, i) => `e${i}`);
-    const filler = Array.from({ length: 500 }, (_, i) => `n${i}`);
-    let cursors = { fast: 0, slow: 0 };
-    const seen = { fast: new Set(), slow: new Set() };
-    const closed = { fast: 0, slow: 0 };
-    for (let tick = 0; tick < 60; tick++) {
-      const before = { ...cursors };
-      const r = slicePoolTwoLanes(fast, filler, cursors, 90);
-      cursors = r.cursors;
-      for (const item of r.slice) {
-        const lane = item[0] === "e" ? "fast" : "slow";
-        assert.equal(seen[lane].has(item), false, `${item} served twice in one sweep`);
-        seen[lane].add(item);
-      }
-      for (const lane of ["fast", "slow"]) {
-        if (cursors[lane] < before[lane]) {
-          const items = lane === "fast" ? fast : filler;
-          assert.equal(seen[lane].size, items.length, `${lane} sweep missed rows`);
-          seen[lane].clear();
-          closed[lane] += 1;
-        }
-      }
-    }
-    assert.ok(closed.fast >= 5 && closed.slow >= 3, "both lanes completed sweeps");
+  await test("parsePoolSliceCursors: absent, junk and partial rows are zeros, never a throw", () => {
+    const zero = { hot: 0, near: 0, far: 0, filler: 0 };
+    assert.deepEqual(parsePoolSliceCursors(null), zero);
+    assert.deepEqual(parsePoolSliceCursors(undefined), zero);
+    assert.deepEqual(parsePoolSliceCursors(""), zero);
+    assert.deepEqual(parsePoolSliceCursors("not json"), zero);
+    assert.deepEqual(parsePoolSliceCursors("[1,2]"), zero);
+    assert.deepEqual(parsePoolSliceCursors("null"), zero);
+    assert.deepEqual(parsePoolSliceCursors('{"hot": 12, "near": "34"}'), {
+      hot: 12,
+      near: 34,
+      far: 0,
+      filler: 0,
+    });
+    assert.deepEqual(
+      parsePoolSliceCursors('{"hot": -5, "near": 1.9, "far": "x", "filler": null}'),
+      { hot: 0, near: 1, far: 0, filler: 0 },
+      "negative and junk entries do not become offsets",
+    );
+    assert.deepEqual(
+      parsePoolSliceCursors(JSON.stringify({ hot: POOL_SLICE_MAX_CURSOR + 99 })).hot,
+      POOL_SLICE_MAX_CURSOR,
+      "a stored cursor is clamped",
+    );
   });
 
-  await test("scanner: the pool slice splits evidence and filler lanes", () => {
+  await test("serializePoolSliceCursors: round-trips the four offsets and normalises them", () => {
+    const c = { hot: 25, near: 68, far: 6, filler: 51 };
+    assert.deepEqual(parsePoolSliceCursors(serializePoolSliceCursors(c)), c);
+    assert.deepEqual(
+      parsePoolSliceCursors(serializePoolSliceCursors({ hot: -1, near: 2.7, far: NaN, filler: 0 })),
+      { hot: 0, near: 2, far: 0, filler: 0 },
+    );
+  });
+
+  await test("poolZoneTicks: a zone's recurrence in ticks comes from slots x cache TTL", () => {
+    assert.equal(poolZoneTicks(2, 90_000), 6, "near: 3 min / 30s ticks");
+    assert.equal(poolZoneTicks(8, 90_000), 24, "far: 12 min / 30s ticks");
+    assert.equal(poolZoneTicks(1, 0), 1, "a junk cache never divides by zero");
+    assert.equal(poolZoneTicks(0, 90_000), 3, "a zero slot count is one slot");
+    assert.equal(poolZoneTicks(NaN, NaN), 1);
+  });
+
+  await test("matchCoins log budget: the hot cap silences hot rows only, never the near/far slice", () => {
+    // WHY (2026-10-21): the hot zone is evaluated first and is mostly liquidity
+    // dust, so an uncapped reject log fills with 70–110min hot rows and the
+    // near/far rows judged behind them are invisible on /health. The cap must
+    // therefore END at the hot SLICE — `served.hot` rows of the pool slice — not
+    // at the whole returned hot cohort (zoneLists.hot.length, 25 evidenced vs
+    // 403 near in production): a cohort-sized bound would cover the entire pool
+    // slice and silence near/far too, which is the starvation it exists to fix.
+    const { Scanner } = require("../dist/scanner.js");
+    const cfg = loadConfig({});
+    const scanner = new Scanner(
+      { setWorkerState: async () => {} },
+      { api: { sendMessage: async () => ({}) } },
+      null,
+      cfg,
+      null,
+      null,
+      null,
+    );
+    const now = Date.now();
+    const chats = [{ chatId: "c", minLiquidityUsd: 10_000 }];
+    const coin = (token) => ({
+      tokenAddress: token,
+      symbol: token,
+      pair: {
+        chainId: "solana",
+        url: "",
+        pairAddress: `p-${token}`,
+        baseToken: { address: token, name: token, symbol: token },
+        priceUsd: "0.001",
+        marketCap: 100_000,
+        fdv: 100_000,
+        volume: { m5: 2_000, h1: 50_000, h24: 1_000_000 },
+        priceChange: { m5: 6, h1: 8 },
+        txns: { m5Buys: 10, m5Sells: 8, h1Buys: 100, h1Sells: 80 },
+        // The first gate the evaluation reaches: every fixture is dust, so each
+        // coin is a logged rejection and the budget is the only thing deciding
+        // whether its row survives.
+        liquidity: { usd: 0 },
+        pairCreatedAt: now - 30 * 60_000,
+        contentAt: now - 30_000,
+      },
+    });
+    // The evaluated slice: 12 hot rows followed by the near rows — the hot
+    // cohort can be far wider than its slice (25 evidenced vs 403 near live),
+    // which is exactly the confusion the source pin below guards against.
+    const hot = Array.from({ length: 12 }, (_, i) => `HOT_${i}`);
+    const near = ["NEAR_0", "NEAR_1"];
+    const tokens = [...hot, ...near];
+    const fails = {
+      mcap: 0, chg: 0, age: 0, flow: 0, crime: 0, flurry: 0,
+      liqRatio: 0, sus: 0, organic: 0, other: 0,
+    };
+    const rejects = [];
+    const out = scanner.matchCoins(
+      tokens.map((t) => ({ tokenAddress: t, symbol: t })),
+      new Map(tokens.map((t) => [t, coin(t).pair])),
+      new Map(tokens.map((t) => [t, { token: t }])),
+      chats,
+      fails,
+      rejects,
+      { count: 0 },
+      { count: 0 },
+      // The call site's shape: the slice's hot rows are the first 12 profiles.
+      { feedBudgetStart: 0, poolStartIdx: 0, hotEndIdx: 12, hotLogMax: 8 },
+    );
+    assert.equal(out.length, 0, "nothing qualifies — every row is dust");
+    assert.deepEqual(
+      rejects.map((r) => r.token),
+      [...hot.slice(0, 8), ...near],
+      "8 hot rows log, the rest of the hot slice is capped, near still logs",
+    );
+    assert.ok(
+      rejects.slice(8).every((r) => r.token.startsWith("NEAR_")),
+      "the capped tail is hot only",
+    );
+  });
+
+  await test("scanner: the pool slice is allocated by zone and its cursors are durable", () => {
     const strip = (text) =>
       text
         .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -9505,24 +9665,43 @@ async function main() {
       fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
     );
     assert.ok(
-      src.includes("exportconstRE_EVAL_FAST_LANE_SHARE=0.6;"),
-      "the fast-lane share is exported and pinned",
+      src.includes("exportconstPOOL_SLICE_HOT_SHARE=0.2;"),
+      "the hot-zone share is exported and pinned",
     );
     assert.ok(
       src.includes(
-        "slicePoolTwoLanes(fastOnly,fillerOnly,this.poolSliceCursors,RE_EVAL_PER_TICK_MAX",
+        "slicePoolZones(zoneLists,sliceCursors,RE_EVAL_PER_TICK_MAX",
       ),
-      "the call site splits the tick window across the two lanes",
+      "the call site splits the tick window across zones",
     );
     assert.ok(
-      src.includes("maxMcapObserved!==null&&s.maxMcapObserved!==undefined"),
-      "the fast lane is keyed on mcap evidence, not on a second guess",
+      src.includes("zoneByToken.set(s.token,poolZoneOfLaunch(s.launchMs,poolWindowEntryMs))"),
+      "each returned row is tagged with the query's own band",
     );
     assert.ok(
-      src.includes(
-        "diag.poolSliceLanes={fast:fastOnly.length,filler:fillerOnly.length}",
-      ),
-      "the split is published on the tick summary for acceptance reads",
+      src.includes("gates.get(POOL_SLICE_CURSOR_KEY)") &&
+        src.includes("stampFront(POOL_SLICE_CURSOR_KEY,serializePoolSliceCursors("),
+      "the rotation's memory rides the front read and its ONE write",
+    );
+    assert.ok(
+      src.includes("diag.poolSliceLanes={hot:zoneLists.hot.length,near:zoneLists.near.length,far:zoneLists.far.length,filler:zoneLists.filler.length,}"),
+      "the zone populations are published for acceptance reads",
+    );
+    assert.ok(
+      src.includes("diag.poolServed=served"),
+      "…and so is what each zone actually served",
+    );
+    assert.ok(
+      src.includes("exportconstPOOL_HOT_REJECT_SLOTS=8;"),
+      "the hot zone's log share is exported and pinned",
+    );
+    assert.ok(
+      src.includes("hotEndIdx:feedOnly.length+served.hot,hotLogMax:POOL_HOT_REJECT_SLOTS,"),
+      "the hot SLICE (not the returned cohort) ends where the log budget's cap begins",
+    );
+    assert.ok(
+      src.includes("rejects.length>=logBudget.hotLogMax"),
+      "hot rejections stop logging at the cap so near/far can be named",
     );
   });
 
@@ -23738,8 +23917,10 @@ async function main() {
       "scanner (an owed coin's blocking gate always logs, with a reserved slot)":
         // The exemption that makes the log reachable for the make-up lane's
         // coins (its entries ride the END of the feed list)…
+        // 2026-10-21: the budget became a block so the HOT zone could get a
+        // cap of its own; the owed exemption is still the first branch.
         scannerSrc.includes(
-          "if(logBudget&&!owed&&pi<logBudget.poolStartIdx&&rejects.length>=logBudget.feedBudgetStart)return;",
+          "if(logBudget&&!owed){if(pi<logBudget.poolStartIdx&&rejects.length>=logBudget.feedBudgetStart)return;",
         ) &&
         // …the marker that makes the entry self-explanatory…
         scannerSrc.includes("...(owed?{owed:true}:{}),") &&

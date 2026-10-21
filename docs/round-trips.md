@@ -4836,3 +4836,72 @@ Telegram 訊息本文（forward 讀完即刪）見到兩個形狀：
 - 呢個 hold 只在「有閘開 + 讀數仲喺飛」時付出；deploy 之後要看 `/debug/push-audit`：
   `why:"ok"` + 有 score = 第一張卡已被閘看過；`late.outcome:"landed"` 帶 failing score
   應該唔再出現（除咗上面嘅殘餘）。
+
+## 4.75 pool near/far 覆蓋：slice 由「排隊頭」改成按 cadence 分 zone，cursor 跟 front 持久化（2026-10-21）
+
+### 一、量到乜
+
+`/health` + `/debug/pool` + durable tick ring，加一條同 `Db.getReevalPool` predicate
+一致、在 D1 直接跑的 band count（`460 + 518 + 136 = 1,114` 與 `poolQueryCount` 完全
+對上）：
+
+| band | prune 後 | per-slot LIMIT | 回傳 |
+|---|---|---|---|
+| hot 50–110min | 1,007 | 460 | 54% 被切 |
+| near slot 0/1 | 2,390 / 1,459 | 518 | 72–78% 被切 |
+| far slot 0–7 | 133–189 | 222 | ✅ |
+
+而 90 個 eval 位每個 tick 都填滿（`poolSliced 90`、`pairs 257–274`、
+`pairsMissing 0`）——但 5 個連續 tick 的 reject 年齡係 **cold tick 70–90min（全
+hot）／warm tick 276–438min（near/far）** 交替，5 分鐘後 14/20 個 token 一模一樣
+（年齡 +5）。near+far 5,139 行、暖 tick 90/min → ~57 分鐘一輪，設計係 3/12 分鐘。
+
+### 二、兩個根因
+
+1. **取的是 pool 回傳次序的頭**：`getReevalPool` 回傳 hot → near → far，而
+   `slicePoolTwoLanes` 只按 mcap evidence 分 lane 再取頭；hot evidenced 74（fast 取
+   54）＋ hot filler 939（filler 取 36），所以冷 isolate 的 90 個位 100% 係 hot。
+2. **cursor 只存在 isolate 內**：兩個 delivery 輪流落在暖／冷 isolate（`poolCache.memory`
+   0 / `misses 1` 對 `memory 2`），冷 isolate 每次由 0 開始，rotation 等於冇記憶。
+
+### 三、改咗乜
+
+- `scanner.slicePoolZones`（取代 `slicePoolTwoLanes`）：window 按 band 自己的 cadence
+  分配 —— hot `min(len, 0.2×window)` 每 tick、near `len/nearTicks`、
+  far `len/farTicks`、filler 拿剩餘。每個 zone 一個 cursor，經 `slicePoolRotation`
+  繼承 tail 規則與 deferred 優先；`RE_EVAL_PER_TICK_MAX` 90 → **150**
+  （25 + 68 + 6 fast，filler 51，舊 split 只有 36）。
+- `Db.POOL_SLICE_CURSOR_KEY = "pool_slice_cursor"`（JSON `{hot,near,far,filler}`），
+  加入 `SCAN_FRONT_GATE_KEYS`：讀搭 front 的 ONE read、寫搭 front 的 ONE write，
+  零額外 request。解析 absent/junk/負數 → 0，值 clamp。
+- `POOL_HOT_REJECT_SLOTS = 8`：eval 次序 hot 先行，唔 cap 就會再霸晒 20 個 reject
+  位、near/far 有掃都睇唔到；owed coin 照舊豁免。Cap 的界係今個 tick 實際 eval 的
+  hot slice（`feedOnly.length + served.hot`），唔係回傳 cohort 的 25 行 vs 403 near ——
+  用 cohort 做界會越過成條 pool slice、連 near/far 都封埋（有 `matchCoins log budget`
+  測試釘住）。
+- Summary 新增 `poolServed`（每個 zone 實際攞幾多）與 `poolSliceLanes` 改為
+  `{hot,near,far,filler}`；`poolSliceLanes ÷ poolServed` 就係一輪的 tick 數。
+
+### 四、驗證
+
+- `npx tsc --noEmit`、`npm run build` exit 0；`node scripts/test-unit.js`
+  **583 passed, 0 failed**。
+- 新增測試：生產人口（25/403/136/550，window 150）→ `served {25,68,6,51}`；
+  403 near 在 6 ticks、136 far 在 24 ticks 內全覆蓋；空 zone 交還 budget；zone 到尾
+  只服務 tail；window 係 ceiling（nearTicks=1 都截到 150）；cursor parse/serialize
+  與 clamp；`poolZoneTicks`；`poolZoneOfLaunch` 邊界；source pin（call site、
+  durable read/write、`diag.poolServed`、hot log cap）。
+- dist 模擬 24 ticks：tick 6 near 403/403、tick 19 far 136/136，每個 tick slice 150。
+  far 早過 24 係 spare budget 的功勞：near 在 tick 6、filler 在 tick 11/18 到尾，
+  剩餘位按 near → far → hot → filler 交落 far（24 ticks 係上界，唔係唯一結果）。
+
+### 五、殘餘（照直講）
+
+- near band 仍被 query clip（2,390/1,459 → 518）：evidenced 403 行全部在內，
+  被切的是 no-evidence filler，靠 8 個 tie bucket 在 ~24 分鐘內輪流抽樣。
+- filler lane 唔係 cadence promise：51/tick 對 ~550 行 = ~5.5 分鐘一輪；hot filler
+  第一次讀數由「每個冷 tick」變成 ~4–5 分鐘。
+- cadence 假設 30s tick（`POOL_SLICE_TICK_MS`）；clock 停只會等比例拉長，唔會漏掃。
+- 上線後要讀 `summary.poolServed` ≈ `{25,68,6,51}`、`poolSliceLanes` ≈
+  `{25,403,136,~550}`，以及 reject 年齡同時有 hot 與 near/far；tick `ms` 預期
+  由 1.2–2.2s 升到 ~2.5–3.5s。

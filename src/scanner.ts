@@ -12,9 +12,11 @@ import {
   DEX_BOOSTS_AT_KEY,
   DEX_PROFILES_LAST_KEY,
   GECKO_DISCOVERY_AT_KEY,
+  POOL_SLICE_CURSOR_KEY,
   SCAN_FRONT_GATE_KEYS,
   parseAuditOrganic,
   poolRotationSlot,
+  poolZoneOfLaunch,
   type Db,
   type PushAuditLate,
   type PushAuditLateAttempt,
@@ -1715,26 +1717,166 @@ export const RE_EVAL_AGE_MARGIN_MIN = 180;
  * limits and RE_EVAL_POOL_SIZE are the levers denominated in that gap — move
  * one of them with a measurement like this one, not this slice again.
  */
-export const RE_EVAL_PER_TICK_MAX = 90;
+/**
+ * WHY 90 → 150 (2026-10-21, measured): the window was NOT what bounded
+ * coverage — the ORDER was. getReevalPool returns hot → near → far, and the old
+ * two-lane split took the head of each lane off that list, so the hot band
+ * (1,007 rows after the prunes: 25 evidenced returned, 939 fillers) filled both
+ * heads and near/far were reached only once the WARM isolate's cursor had
+ * advanced. Live that day: cold ticks' reject logs read 70–91min (hot only),
+ * warm ticks' 276–438min, and near+far (5,139 rows after the prunes) worked out
+ * to ~57 min per pass at 90 rows/min, against a 3/12-minute design.
+ *
+ * With the zone-aware planner (slicePoolZones) the window is split by each
+ * band's OWN cadence, sized against the rows the query actually returned:
+ *
+ *   hot (evidenced)    25 returned                   → 25/tick, every tick (cap 30)
+ *   near (evidenced)   403 over its 6-tick recurrence → 68/tick  (3-min sweep)
+ *   far (evidenced)    136 over its 24-tick recurrence → 6/tick   (12-min sweep)
+ *   filler             ~550                          → 51/tick  (the rest)
+ *
+ * 150 is exactly 25 + 68 + 6 + 51: the smallest round window that funds the
+ * two band cadences the config promises and still leaves the no-evidence filler
+ * lane its old rate (the 90-row split gave it 36, and on the WARM delivery
+ * only).
+ *
+ * WHY NOT SIZE THE ZONE TAKES AGAINST ONE SUB-WINDOW'S APPEARANCE? Serving the
+ * whole returned near cohort inside the 3 ticks a slot stays visible would need
+ * ~135/tick for near alone (~172 if the band is clipped at its 518-row LIMIT),
+ * and the measured cost of the 90 → 180 experiment recorded above is ~1s of eval
+ * CPU plus ~1.2s of tick wall clock. 150 is the affordable step on that same
+ * evidence, and a recurrence-sized take still meets the 3-minute promise — it
+ * spreads the same rows over the 6 ticks the near band's 2 slots take to come
+ * round. The cost of that choice is stated in docs/pool-coverage-2026-10-21.md
+ * §六: a row that leaves the returned list before its zone's cursor reaches it
+ * is re-picked when its sub-window comes round again, not served that appearance.
+ *
+ * THE COST IS PAIR FETCH, and it was sized from the lane's own arithmetic
+ * (dexscreener's pair lane: 30 addresses per batch, 250ms spacing, 3 concurrent
+ * lanes → `batches × 250 / 3`). A 150-row slice plus the ~170-coin feed and the
+ * tracker head is ~340 addresses = 12 batches ≈ 1.0s of pacing inside the
+ * 2,000ms pairs cap; live pairs p50 was 257–274 addresses in 1.2–2.2s ticks
+ * before this, so the extra ~60 addresses are ~2 batches. The 2026-09-28
+ * experiment at 180 is not a counter-example: its extra rows were hot-band
+ * FILLERS (every one failed the liquidity gate), which is exactly what
+ * zone-aware allocation stops buying.
+ */
+export const RE_EVAL_PER_TICK_MAX = 150;
 
 /**
- * Share of the per-tick rotation window given to the pool's FAST lane — the
- * rows the sweep can still act on (see slicePoolTwoLanes).
+ * Share of the per-tick window the HOT zone's EVIDENCED rows may take.
  *
- * WHY LANES (2026-10-09, measured): the slice is 90 rows against a returned
- * pool of ~1,100-1,200, so the whole pool takes ~13 ticks (~6.5 min at the
- * 30s clock) — and ~2/3 of those turns went to no-evidence rows whose every
- * served reading was non-positive (hot 401 + near 326 + far 154 null fillers
- * in one slot), while every EVIDENCE-bearing row is already returned by the
- * bands (measured: hot 46/46, near 191/191, far 68/68 — zero clipped). A coin
- * with a positive mcap on record is the only kind the sweep can act on; the
- * fillers are inside the 6h grace and can also turn out alive, which is why
- * they keep a lane rather than being dropped. 0.6 = the evidenced cohort is
- * re-checked every ~5-7 ticks (~2.5-3.5 min) while the filler lane's cycle
- * stretches to ~20-25 ticks (~10-12 min) — the fillers' own catch path is the
- * discovery feeds plus the grace, not the pool slice.
+ * WHY A CAP RATHER THAN "ALL OF THEM" (2026-10-21): the hot band is the
+ * latency-critical cohort (coins crossing the age gate right now), so it must
+ * be served every tick — but it must not own the window. Its evidenced cohort
+ * is 25 rows at the live band size, which fits 0.2 × 150 = 30; the rest of the
+ * 1,007-row hot band is no-evidence fillers, and those go to the filler lane
+ * like every other zone's. Measured before the split: the hot head consumed
+ * the whole 90-row window on cold ticks, which is exactly what starved near/far.
  */
-export const RE_EVAL_FAST_LANE_SHARE = 0.6;
+export const POOL_SLICE_HOT_SHARE = 0.2;
+
+/**
+ * The tick interval the zone cadences are derived from, ms.
+ *
+ * CLOCK_TICK_SECONDS is 30 in production and the durable ring reads 2.0
+ * ticks/min. If the clock is off the cadence stretches with the cron delivery
+ * (1/min) — the takes are per-tick, so a slower fleet covers the same bands,
+ * just later; nothing is skipped.
+ */
+export const POOL_SLICE_TICK_MS = 30_000;
+
+/**
+ * A zone's RECURRENCE, in ticks: `slots × (pool-cache TTL ÷ tick)`.
+ *
+ * This is the denominator slicePoolZones divides a zone's returned cohort by,
+ * and it is the config's own sweep promise. Db.getReevalPool advances the
+ * rotation slot once per cache TTL, so a band with S slots returns each
+ * sub-window for S × (TTL ÷ tick) ticks and its whole set once per that many.
+ * At production (90s cache, 30s tick): near 2 × 3 = 6 ticks = the 3-minute
+ * REEVAL_NEAR_SWEEP_MIN, far 8 × 3 = 24 ticks = the 12-minute
+ * REEVAL_FAR_SWEEP_MIN.
+ *
+ * Deriving it from the SLOTS rather than re-deriving it from the sweep minutes
+ * matters: config.ts computes slots = sweep ÷ TTL, so the query's rotation and
+ * the slice's cadence move together and cannot disagree when a knob changes.
+ *
+ * Junk answers one slot on one tick (never a division by zero).
+ */
+export function poolZoneTicks(slots: number, cacheMs: number): number {
+  const s = Number.isFinite(slots) && slots > 0 ? Math.floor(slots) : 1;
+  const c = Number.isFinite(cacheMs) && cacheMs > 0 ? cacheMs : POOL_SLICE_TICK_MS;
+  return Math.max(1, Math.round((s * c) / POOL_SLICE_TICK_MS));
+}
+
+/**
+ * The per-zone slice cursors — the rotation's durable memory.
+ *
+ * One cursor per FAST zone (hot / near / far) plus one for the filler lane.
+ * Keeping them per zone is what makes a cadence expressible: the hot cursor
+ * must advance every tick, the near cursor every 6, the far one every 24, and
+ * a single cursor over a concatenated list can only do one of those. The
+ * filler lane stays one list (no-evidence rows from every zone) because its
+ * cadence is not a per-zone promise; it is a single slower sweep.
+ */
+export interface PoolSliceCursors {
+  hot: number;
+  near: number;
+  far: number;
+  filler: number;
+}
+
+/** Upper bound on a stored cursor, so a corrupt row cannot wrap for ever. */
+export const POOL_SLICE_MAX_CURSOR = 1_000_000;
+
+/**
+ * Parse the durable cursor row (Db.POOL_SLICE_CURSOR_KEY).
+ *
+ * Absent / junk / partially-written rows answer zeros — a rotation without
+ * memory is what the code did before the row existed, never a reason to skip a
+ * tick. Values are floored and clamped (negative and NaN are not offsets).
+ */
+export function parsePoolSliceCursors(
+  raw: string | null | undefined,
+): PoolSliceCursors {
+  const zero = { hot: 0, near: 0, far: 0, filler: 0 };
+  if (raw === null || raw === undefined || raw === "") return zero;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return zero;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return zero;
+  }
+  const obj = parsed as Record<string, unknown>;
+  const clamp = (value: unknown): number => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.min(POOL_SLICE_MAX_CURSOR, Math.floor(n));
+  };
+  return {
+    hot: clamp(obj.hot),
+    near: clamp(obj.near),
+    far: clamp(obj.far),
+    filler: clamp(obj.filler),
+  };
+}
+
+/** The row's write shape — a REPLACE, exactly like the parse. */
+export function serializePoolSliceCursors(cursors: PoolSliceCursors): string {
+  const clean = (value: number): number => {
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return Math.min(POOL_SLICE_MAX_CURSOR, Math.floor(value));
+  };
+  return JSON.stringify({
+    hot: clean(cursors.hot),
+    near: clean(cursors.near),
+    far: clean(cursors.far),
+    filler: clean(cursors.filler),
+  });
+}
 
 /**
  * The liquidity floor the re-eval pool prunes on, as a fraction of the widest
@@ -2157,40 +2299,9 @@ export function slicePoolRotation<T>(
 }
 
 /**
- * Two-lane variant of slicePoolRotation (exported for offline unit tests).
- *
- * The pool is split by evidence: the FAST lane holds rows with
- * `maxMcapObserved` set — the only rows that have ever been read alive — and
- * the FILLER lane holds no-evidence rows, which are kept in the pool (inside
- * Db.POOL_MCAP_EVIDENCE_GRACE_MS) but are unlikely to answer. Each lane keeps
- * its OWN cursor, so the fast lane cycles in ~⌈fast / (window × share)⌉ ticks
- * while the filler lane — still fully covered, never cut — cycles slower.
- *
- * The budget is a per-tick SPLIT of the SAME window, not extra work: the fast
- * lane takes RE_EVAL_FAST_LANE_SHARE of it, the filler gets the rest. Whatever
- * a lane cannot use this tick — it is smaller than its share, or (the
- * inherited tail rule, see slicePoolRotation) its window reached the end of
- * the lane — is offered to the lane that still has rows, which is re-sliced
- * from its OWN cursor with a bigger take: the longer run extends the first, so
- * no row is served twice and neither lane wraps back. The only case left that
- * leaves the window short is BOTH lanes reaching their end in the same tick,
- * which is a genuinely exhausted rotation, not idle slots.
- *
- * A lane taken whole resets its own cursor; each lane's tail tick serves the
- * remainder and resets. The cursors are independent, so one lane's sweep
- * boundary never advances the other — but a lane that absorbs the other's
- * unused slots does advance further on that tick, which is the point: the
- * recovered budget buys more evaluations instead of going idle. Measured at
- * the live lane sizes (2026-10-10, fast 392 / filler 775 over a 90-row
- * window): short ticks 14 in 88 (15.9%) before this pass and 0 in 200 with it
- * — the both-lanes-at-their-end case is still possible and has its own test,
- * but at these lane sizes the two lanes never reached their end together.
- */
-
-/**
- * One lane's slice for this tick, plus the ROOM it has left: how many more rows
- * it could serve from the same cursor without wrapping past the lane's end
- * (0 when the lane is taken whole or its window reached the end — the tail
+ * One zone's slice for this tick, plus the ROOM it has left: how many more rows
+ * it could serve from the same cursor without wrapping past the zone's end
+ * (0 when the zone is taken whole or its window reached the end — the tail
  * rule in slicePoolRotation, which this deliberately does not change).
  */
 function planLane<T>(
@@ -2210,41 +2321,140 @@ function planLane<T>(
   return { slice, nextCursor, room };
 }
 
-export function slicePoolTwoLanes<T>(
-  fast: T[],
-  filler: T[],
-  cursors: { fast: number; slow: number },
+/**
+ * The tick's pool window, allocated by ZONE and cadence (2026-10-21).
+ *
+ * WHY THIS REPLACES THE TWO-LANE (EVIDENCE/FILLER) SPLIT: that split answered
+ * "which rows can the sweep act on" but not "how often does each band come
+ * round". The row order it sliced was getReevalPool's hot → near → far, and
+ * the hot band's head is 25 evidenced rows + 939 fillers at the live size —
+ * wider than the whole window — so the near/far bands were reached only when a
+ * warm isolate's cursor had already advanced past it. Measured 2026-10-21:
+ * cold ticks scanned ages 70–91min, warm ticks 276–438min, and near+far (5,139
+ * rows after the prunes) worked out to ~57 min per pass against a 3/12-min
+ * design.
+ *
+ * THE ALLOCATION IS NOW DENOMINATED IN THE DESIGN'S OWN NUMBERS:
+ *
+ *   hot   (evidenced) : every tick, capped at POOL_SLICE_HOT_SHARE of the
+ *                       window — the coin about to cross the age gate must not
+ *                       wait for a rotation.
+ *   near  (evidenced) : len / nearTicks, where nearTicks is the near band's
+ *                       recurrence in ticks (poolZoneTicks: 2 slots × 90s ÷
+ *                       30s = 6). 403 returned / 6 ≈ 68 per tick, so the band
+ *                       is swept once per 3 minutes — the cadence
+ *                       REEVAL_NEAR_SWEEP_MIN promises.
+ *   far   (evidenced) : len / farTicks, the same derivation (8 × 90s ÷ 30s =
+ *                       24, from REEVAL_FAR_SWEEP_MIN): 136 / 24 ≈ 6 per tick,
+ *                       i.e. the 12-minute far sweep, on the same delivery as
+ *                       everything else.
+ *   filler            : whatever the three above leave. The no-evidence rows
+ *                       are not a cadence promise; they keep a single slower
+ *                       lane, and at 150 they get 51/tick — more than the old
+ *                       90-row split's 36, which it only got on warm ticks.
+ *
+ * THE WINDOW IS A BUDGET, NOT A QUOTA: a zone smaller than its computed take
+ * hands the remainder to the next zone (near → far → hot → filler), so an empty
+ * band never leaves slots idle. Each zone is served through slicePoolRotation
+ * with its OWN cursor, so the tail rule (serve the remainder, reset) and the
+ * deferred-coin priority are inherited unchanged, and no row is served twice
+ * within a zone's sweep.
+ *
+ * The takes are computed from the RETURNED list lengths, not from the database
+ * bands: the query has already applied its LIMITs, and the rotation's job is to
+ * cover what the tick actually can act on. A band the query clipped is not
+ * this function's to fix — see docs/pool-coverage-2026-10-21.md for that split.
+ */
+export function slicePoolZones<T>(
+  zones: { hot: T[]; near: T[]; far: T[]; filler: T[] },
+  cursors: PoolSliceCursors,
   maxPerTick: number,
-): { slice: T[]; cursors: { fast: number; slow: number } } {
+  opts: { nearTicks: number; farTicks: number },
+): {
+  slice: T[];
+  cursors: PoolSliceCursors;
+  served: PoolSliceCursors;
+} {
   const window = Math.max(0, Math.floor(maxPerTick));
-  if (window === 0) return { slice: [], cursors };
-  let fastTake = Math.min(fast.length, Math.round(window * RE_EVAL_FAST_LANE_SHARE));
-  let slowTake = Math.min(filler.length, window - fastTake);
-  let fastPlan = planLane(fast, cursors.fast, fastTake);
-  let slowPlan = planLane(filler, cursors.slow, slowTake);
-  // The window is a budget, not a quota. A lane that could not use its share —
-  // it is smaller than the share, or its window reached the end of the lane
-  // (slicePoolRotation serves the tail and resets) — hands the rest to the lane
-  // that still has rows. Fast lane first: its rows are the actionable ones. The
-  // re-slice uses the SAME cursor with a bigger take, so the longer run extends
-  // the first one; the grown lane advances by exactly what it served, and
-  // neither lane wraps back.
-  let idle = window - fastPlan.slice.length - slowPlan.slice.length;
-  if (idle > 0 && fastPlan.room > 0) {
-    const served = fastPlan.slice.length;
-    fastTake += Math.min(idle, fastPlan.room);
-    fastPlan = planLane(fast, cursors.fast, fastTake);
-    idle -= fastPlan.slice.length - served;
+  const empty = { hot: 0, near: 0, far: 0, filler: 0 };
+  if (window === 0) {
+    return { slice: [], cursors, served: empty };
   }
-  if (idle > 0 && slowPlan.room > 0) {
-    const served = slowPlan.slice.length;
-    slowTake += Math.min(idle, slowPlan.room);
-    slowPlan = planLane(filler, cursors.slow, slowTake);
-    idle -= slowPlan.slice.length - served;
+  const ticks = (value: number): number =>
+    Number.isFinite(value) && value > 0 ? Math.floor(value) : 1;
+  const takes = { hot: 0, near: 0, far: 0, filler: 0 };
+  // Wants are computed independently, then GRANTED in priority order against
+  // one shrinking budget: a zone's own cadence can ask for more than the
+  // window (nearTicks = 1 is the extreme), and the answer must be a truncation,
+  // never a slice longer than RE_EVAL_PER_TICK_MAX.
+  const wantHot = Math.min(
+    zones.hot.length,
+    Math.max(1, Math.round(window * POOL_SLICE_HOT_SHARE)),
+  );
+  const wantNear = Math.min(
+    zones.near.length,
+    Math.ceil(zones.near.length / ticks(opts.nearTicks)),
+  );
+  const wantFar = Math.min(
+    zones.far.length,
+    Math.ceil(zones.far.length / ticks(opts.farTicks)),
+  );
+  let budget = window;
+  takes.hot = Math.min(wantHot, budget);
+  budget -= takes.hot;
+  takes.near = Math.min(wantNear, budget);
+  budget -= takes.near;
+  takes.far = Math.min(wantFar, budget);
+  budget -= takes.far;
+  takes.filler = Math.min(zones.filler.length, budget);
+  const plans = {
+    hot: planLane(zones.hot, cursors.hot, takes.hot),
+    near: planLane(zones.near, cursors.near, takes.near),
+    far: planLane(zones.far, cursors.far, takes.far),
+    filler: planLane(zones.filler, cursors.filler, takes.filler),
+  };
+  // Spare budget: near first (the band most likely to hold a qualifier), then
+  // far, then hot, then the filler lane. A zone's ROOM — not its list length —
+  // is what is offered: a zone sitting at the end of its list serves a tail
+  // and resets (see slicePoolRotation), so it has nothing more to give this
+  // tick even though rows remain behind the cursor. Re-slicing with the SAME
+  // cursor only EXTENDS the run, so no zone wraps back and no row is served
+  // twice.
+  let idle =
+    window -
+    (plans.hot.slice.length +
+      plans.near.slice.length +
+      plans.far.slice.length +
+      plans.filler.slice.length);
+  for (const zone of ["near", "far", "hot", "filler"] as const) {
+    if (idle <= 0) break;
+    const room = plans[zone].room;
+    if (room <= 0) continue;
+    const add = Math.min(room, idle);
+    const servedBefore = plans[zone].slice.length;
+    plans[zone] = planLane(zones[zone], cursors[zone], takes[zone] + add);
+    takes[zone] += add;
+    idle -= plans[zone].slice.length - servedBefore;
   }
   return {
-    slice: [...fastPlan.slice, ...slowPlan.slice],
-    cursors: { fast: fastPlan.nextCursor, slow: slowPlan.nextCursor },
+    slice: [
+      ...plans.hot.slice,
+      ...plans.near.slice,
+      ...plans.far.slice,
+      ...plans.filler.slice,
+    ],
+    cursors: {
+      hot: plans.hot.nextCursor,
+      near: plans.near.nextCursor,
+      far: plans.far.nextCursor,
+      filler: plans.filler.nextCursor,
+    },
+    served: {
+      hot: plans.hot.slice.length,
+      near: plans.near.slice.length,
+      far: plans.far.slice.length,
+      filler: plans.filler.slice.length,
+    },
   };
 }
 
@@ -2722,14 +2932,25 @@ export interface ScanSummary {
    * see RE_EVAL_PER_TICK_MAX). Undefined on pre-fix summaries. */
   poolSliced?: number;
   /**
-   * Lane populations the tick's slice split saw (see slicePoolTwoLanes):
-   * `fast` = returned pool rows with mcap evidence, `filler` = the returned
-   * no-evidence (in-grace) rows. Read WITH `poolSliced`: the window is 90 and
-   * the split only decides which rows spend it — a short `poolSliced` means
-   * both lanes' windows reached the end of their lanes on the same tick (see
-   * slicePoolTwoLanes), not that a lane went idle with rows left over.
+   * Zone populations the tick's slice saw (see slicePoolZones): the returned
+   * evidenced rows split by band (hot / near / far) and the no-evidence
+   * filler lane. Read WITH `poolServed`: the lanes are what the window had to
+   * choose from, `poolServed` is what it actually took from each — a zone
+   * whose served count is 0 across ticks is starving, while a zone whose
+   * served count equals its size is being taken whole (and its cursor reset).
    */
-  poolSliceLanes?: { fast: number; filler: number };
+  poolSliceLanes?: {
+    hot: number;
+    near: number;
+    far: number;
+    filler: number;
+  };
+  /**
+   * Rows the tick actually took from each zone (see slicePoolZones). Divide
+   * `poolSliceLanes[zone]` by this to read the zone's sweep length in ticks;
+   * it is the acceptance reading for the 3-min near / 12-min far cadence.
+   */
+  poolServed?: { hot: number; near: number; far: number; filler: number };
   /**
    * Pool coins the sweep asked for and got NO reading back for (2026-10-08 —
    * see poolSweepMisses / db.DEAD_POOL_MISS_MAX). This is the freshness
@@ -2981,6 +3202,20 @@ export interface ScanSummary {
  * cap was chosen for.
  */
 const REJECT_LOG_MAX = 20;
+
+/**
+ * Slots the HOT zone may occupy in the eval reject ring.
+ *
+ * WHY A CAP (2026-10-21): with the zone-aware slice the eval order is hot →
+ * near → far → filler, and the hot band is mostly no-evidence dust whose first
+ * gate (liquidity) rejects it. The ring fills first-come-first-served at 20,
+ * so an uncapped hot zone would fill it before any near/far coin was judged —
+ * the same blindness that made the old cold-tick log read 70–91min forever.
+ * 8 slots leave 12 for near/far/filler, so one /health read shows every band's
+ * rejections and the coverage fix is verifiable, not just asserted. Owed coins
+ * remain exempt (see logBudget): an obligation is never the coin to hide.
+ */
+export const POOL_HOT_REJECT_SLOTS = 8;
 
 /**
  * Slots for the PUSH-STAGE rejections, in their OWN ring (ScanSummary.
@@ -3982,14 +4217,24 @@ export class Scanner {
    */
   private profileFeedStampedAt: number | null = null;
   /**
-   * Start offsets of the two per-tick pool rotation windows (see
-   * RE_EVAL_PER_TICK_MAX / slicePoolTwoLanes): `fast` walks the evidence-
-   * bearing rows, `slow` the no-evidence (in-grace) fillers. Each advances by
-   * its lane's slice length every tick and wraps, so every row of a lane is
-   * covered once per lane sweep. Cursors > lane length self-normalize via the
-   * modulo at use.
+   * Start offsets of the per-tick pool rotation windows (see
+   * RE_EVAL_PER_TICK_MAX / slicePoolZones): one per evidenced zone (hot / near
+   * / far) plus the no-evidence filler lane. Each advances by its own take
+   * every tick and wraps, so every row of a zone is covered once per zone
+   * sweep. Cursors > list length self-normalize via the modulo at use.
+   *
+   * THE DURABLE COPY IS THE ONE THAT COUNTS: this field is only the fallback
+   * for a Scanner with no front (offline/standalone). In the Worker the tick
+   * reads db.POOL_SLICE_CURSOR_KEY off the front and writes the next cursors
+   * back on the front's ONE write, because most ticks land on a cold isolate
+   * and an isolate-local cursor restarts every zone at 0.
    */
-  private poolSliceCursors = { fast: 0, slow: 0 };
+  private poolSliceCursors: PoolSliceCursors = {
+    hot: 0,
+    near: 0,
+    far: 0,
+    filler: 0,
+  };
   /**
    * Pool coins the LAST sweep asked for and got no reading back for (see
    * poolSweepMisses). CLEARED at the start of every scan and filled by its
@@ -6791,15 +7036,19 @@ export class Scanner {
       // Rotation slice: evaluate at most RE_EVAL_PER_TICK_MAX pool coins per
       // tick (the feed itself is always included). A pool larger than the
       // slice cycles through per-tick windows so every coin is still swept;
-      // a smaller pool is taken whole (cursor clamps). Stable order across
-      // ticks (the pool query sorts by band then mcap) keeps the window
-      // sweep deterministic.
+      // a smaller pool is taken whole (cursor clamps).
       //
-      // TWO LANES (2026-10-09, see slicePoolTwoLanes): the SAME window is
-      // split between the rows with mcap evidence (the only rows the sweep
-      // can act on — every evidenced row is already returned by the bands)
-      // and the no-evidence in-grace fillers, which keep a slower lane rather
-      // than being dropped. The window size itself is unchanged (90).
+      // ZONES (2026-10-21, see slicePoolZones): the window is allocated by the
+      // band's own cadence, not by the order getReevalPool happens to return.
+      // The query returns hot → near → far, and before this the head of that
+      // list (hot, 25 evidenced + 939 fillers at the live size) filled the
+      // whole window whenever the isolate was cold — measured: cold ticks'
+      // rejects 70–91min, warm ticks 276–438min, near+far ≈ 57 min/pass against
+      // the designed 3/12. Each zone now keeps its own cursor and gets
+      // len/ticks-in-its-recurrence rows per tick; the filler lane rides what
+      // is left. The cursors themselves are DURABLE (db.POOL_SLICE_CURSOR_KEY):
+      // half the deliveries run on a freshly recycled isolate, and an isolate-
+      // local cursor made those ticks start every zone at 0 again.
       const feedOnly = poolProfiles.slice(0, feedProfiles.length);
       const poolOnly = poolProfiles.slice(feedProfiles.length);
       const evidencedTokens = new Set(
@@ -6809,18 +7058,58 @@ export class Scanner {
           )
           .map((s) => s.token),
       );
-      const fastOnly = poolOnly.filter((p) => evidencedTokens.has(p.tokenAddress));
-      const fillerOnly = poolOnly.filter(
-        (p) => !evidencedTokens.has(p.tokenAddress),
-      );
-      const { slice: poolSlice, cursors: nextPoolSliceCursors } = slicePoolTwoLanes(
-        fastOnly,
-        fillerOnly,
-        this.poolSliceCursors,
-        RE_EVAL_PER_TICK_MAX,
-      );
+      // The zone tag comes from the row's launch time and the SAME window
+      // entry the pool query was built with (see db.poolZoneOfLaunch).
+      const poolWindowEntryMs = poolNow - poolMinAgeMin * 60_000;
+      const zoneByToken = new Map<string, "hot" | "near" | "far">();
+      for (const s of recentStats) {
+        zoneByToken.set(s.token, poolZoneOfLaunch(s.launchMs, poolWindowEntryMs));
+      }
+      const zoneLists: Record<
+        "hot" | "near" | "far" | "filler",
+        TokenProfile[]
+      > = { hot: [], near: [], far: [], filler: [] };
+      for (const p of poolOnly) {
+        if (!evidencedTokens.has(p.tokenAddress)) {
+          zoneLists.filler.push(p);
+          continue;
+        }
+        zoneLists[zoneByToken.get(p.tokenAddress) ?? "far"].push(p);
+      }
+      // The durable cursors (db.POOL_SLICE_CURSOR_KEY) are read off the front's
+      // ONE read — never an extra request — and written back on its ONE write.
+      // No front (a standalone Scanner) keeps the isolate-local copy, exactly
+      // the old behaviour.
+      const durableCursorRaw = this.scanFront?.gates.get(POOL_SLICE_CURSOR_KEY);
+      const sliceCursors =
+        durableCursorRaw !== undefined && durableCursorRaw !== null
+          ? parsePoolSliceCursors(durableCursorRaw)
+          : this.poolSliceCursors;
+      const { slice: poolSlice, cursors: nextPoolSliceCursors, served } =
+        slicePoolZones(zoneLists, sliceCursors, RE_EVAL_PER_TICK_MAX, {
+          nearTicks: poolZoneTicks(
+            this.config.reevalNearSlots,
+            this.config.reevalPoolCacheMs,
+          ),
+          farTicks: poolZoneTicks(
+            this.config.reevalFarSlots,
+            this.config.reevalPoolCacheMs,
+          ),
+        });
       this.poolSliceCursors = nextPoolSliceCursors;
-      diag.poolSliceLanes = { fast: fastOnly.length, filler: fillerOnly.length };
+      if (this.scanFront) {
+        await this.stampFront(
+          POOL_SLICE_CURSOR_KEY,
+          serializePoolSliceCursors(nextPoolSliceCursors),
+        );
+      }
+      diag.poolSliceLanes = {
+        hot: zoneLists.hot.length,
+        near: zoneLists.near.length,
+        far: zoneLists.far.length,
+        filler: zoneLists.filler.length,
+      };
+      diag.poolServed = served;
       diag.poolSliced = poolSlice.length;
       const evalStart = Date.now();
       const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
@@ -7169,7 +7458,20 @@ export class Scanner {
         // Feed coins log into the leftover slots only — the pool slice has a
         // guaranteed share of the reject list (see rejectBudgetBeforeEval).
         // scannedProfiles = [...feedOnly, ...poolSlice]: the tail is the pool.
-        { feedBudgetStart: rejectBudgetBeforeEval, poolStartIdx: feedOnly.length },
+        //
+        // `served.hot`, NOT zoneLists.hot.length (2026-10-21, caught before it
+        // shipped): the cap is about the rows this tick actually EVALUATES from
+        // the hot zone — poolSlice starts with served.hot of them — while
+        // zoneLists.hot is the whole returned hot cohort (25 evidenced against
+        // 403 near in production). Bounding the cap by the cohort would put
+        // hotEndIdx past the entire pool slice, so the cap would silence near
+        // and far as well, which is the starvation it exists to prevent.
+        {
+          feedBudgetStart: rejectBudgetBeforeEval,
+          poolStartIdx: feedOnly.length,
+          hotEndIdx: feedOnly.length + served.hot,
+          hotLogMax: POOL_HOT_REJECT_SLOTS,
+        },
       );
       diag.agedEval = agedEval.count;
       diag.staleReadings = staleReadings.count;
@@ -9844,8 +10146,19 @@ export class Scanner {
      * tail entries — are evaluated. An owed coin carries `owed: true` so the
      * reason it is still owed is readable at a glance instead of only
      * inferable from the counters.
+     *
+     * The HOT zone gets a cap of its own (2026-10-21, POOL_HOT_REJECT_SLOTS):
+     * it is evaluated first and is mostly liquidity dust, so without a cap it
+     * fills all 20 slots and the near/far bands being judged behind it are
+     * invisible on /health. `hotEndIdx` is the index just past the hot slice;
+     * pool coins before it may log only until `hotLogMax` entries exist.
      */
-    logBudget?: { feedBudgetStart: number; poolStartIdx: number },
+    logBudget?: {
+      feedBudgetStart: number;
+      poolStartIdx: number;
+      hotEndIdx?: number;
+      hotLogMax?: number;
+    },
   ): QualifyingCoin[] {
     const out: QualifyingCoin[] = [];
     // The widest age window across the enabled chats — the bound a deferred
@@ -9923,13 +10236,21 @@ export class Scanner {
         // was blind. A debt is also bounded by the make-up lane itself
         // (DEFERRED_MAKEUP_MAX coins injected per tick), so the worst case
         // here is 8 slots out of REJECT_LOG_MAX.
-        if (
-          logBudget &&
-          !owed &&
-          pi < logBudget.poolStartIdx &&
-          rejects.length >= logBudget.feedBudgetStart
-        )
-          return;
+        if (logBudget && !owed) {
+          if (
+            pi < logBudget.poolStartIdx &&
+            rejects.length >= logBudget.feedBudgetStart
+          )
+            return;
+          if (
+            logBudget.hotEndIdx !== undefined &&
+            logBudget.hotLogMax !== undefined &&
+            pi >= logBudget.poolStartIdx &&
+            pi < logBudget.hotEndIdx &&
+            rejects.length >= logBudget.hotLogMax
+          )
+            return;
+        }
         rejects.push({
           symbol: pair.baseToken.symbol || profile.symbol || "?",
           // The join key (see RejectionEntry.token): the pair's own base mint,

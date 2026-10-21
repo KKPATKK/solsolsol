@@ -396,6 +396,41 @@ const POOL_NEAR_LIMIT_SHARE = 0.7;
 const POOL_BAND_ROTATE_BUCKETS = 8;
 
 /**
+ * Which rotation zone a returned pool row belongs to, by its launch time and
+ * the same window entry the query was built with.
+ *
+ * WHY THE SCANNER NEEDS IT BACK (2026-10-21): getReevalPool returns hot → near
+ * → far in that order, and the per-tick slice used to take the HEAD of that
+ * list (split only by mcap evidence). Live measurement showed what that costs:
+ * the hot band alone held 1,007 rows (25 of them with evidence) and the window
+ * is 90–150, so on a cold isolate the whole window was spent on the hot head
+ * and the near/far bands were never reached — the reject log read 70–91min on
+ * every cold tick and 276–438min only on the warm one. The bands must be a
+ * ROTATION with a cadence, not a queue whose head is whatever sorts first, so
+ * the scanner tags each returned row with the zone this function names and
+ * slices each zone against its own cursor (see scanner.slicePoolZones).
+ *
+ * The boundaries are the query's own constants — hot = entry ± POOL_HOT_*,
+ * near = the next POOL_NEAR_WINDOW_MS older, far = the rest — so the two
+ * halves cannot drift. Rows YOUNGER than the hot band (the pre-window margin)
+ * are "near": the query puts them in the same rotation band as the rest of
+ * [entry-6h, entry-30min], and the slice must treat them that way.
+ */
+export function poolZoneOfLaunch(
+  launchMs: number,
+  windowEntryLaunchMs: number,
+): "hot" | "near" | "far" {
+  if (
+    launchMs >= windowEntryLaunchMs - POOL_HOT_BELOW_MS &&
+    launchMs <= windowEntryLaunchMs + POOL_HOT_ABOVE_MS
+  ) {
+    return "hot";
+  }
+  if (launchMs >= windowEntryLaunchMs - POOL_NEAR_WINDOW_MS) return "near";
+  return "far";
+}
+
+/**
  * The ORDER BY a re-eval band is read with, shared by Db.getReevalPool and
  * Db.getReevalPoolBatched so the two band splits cannot drift (the batched copy
  * builds its own SQL, and a unit test pins the two to the same tokens in the
@@ -1309,6 +1344,21 @@ export const GECKO_DISCOVERY_AT_KEY = "gecko_discovery_at";
  */
 export const DEX_BOOSTS_AT_KEY = "dex_boosts_at";
 
+/**
+ * The re-eval pool's per-tick slice cursors (see scanner.PoolSliceCursors).
+ *
+ * WHY THIS ROW EXISTS (measured 2026-10-21): the cursors were isolate-local,
+ * and half the ticks run on a freshly recycled isolate — the two deliveries
+ * alternate between a warm one and a cold one (live: `poolCache.memory` 0 /
+ * `misses 1` on the clock tick, `memory` 2 on the cron tick). A cold isolate
+ * started every zone at 0, so the hot head was re-scanned tick after tick and
+ * the near/far bands only advanced on the warm delivery. The row is the
+ * rotation's memory, and it has to outlive the isolate for the rotation to be
+ * a rotation: read on the front's ONE read and written on its ONE write, so it
+ * costs one row on an IN-list that is already paid for — never a request.
+ */
+export const POOL_SLICE_CURSOR_KEY = "pool_slice_cursor";
+
 export const SCAN_FRONT_GATE_KEYS = [
   "schema_alter_v2_done",
   "token_stats_last_prune",
@@ -1322,6 +1372,11 @@ export const SCAN_FRONT_GATE_KEYS = [
   // whether this tick may spend a /token-boosts fetch, written on the ticks
   // that do. One more row on the same IN-list, never a request of its own.
   DEX_BOOSTS_AT_KEY,
+  // The pool rotation's own memory (POOL_SLICE_CURSOR_KEY above): read to
+  // continue this tick's slice where the last one stopped instead of
+  // restarting at the head on a cold isolate, written with the next cursors.
+  // One more key on the same IN-list, never a request of its own.
+  POOL_SLICE_CURSOR_KEY,
   // The tracker pass's own row (pushwatch.TRACKER_PASS_STATE_KEY, spelled as
   // the literal because that module imports THIS one). It is READ, not gated
   // on: a tick's fallback pass asks it whether the pass's own cron delivery
