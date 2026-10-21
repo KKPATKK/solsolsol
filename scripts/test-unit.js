@@ -9380,14 +9380,16 @@ async function main() {
     };
     const r = slicePoolZones(
       zones,
-      { hot: 0, near: 0, far: 0, filler: 0 },
+      { hot: 0, near: [0], far: [0], filler: 0 },
       150,
       { nearTicks: 6, farTicks: 24 },
     );
     assert.equal(r.slice.length, 150, "the window is fully spent");
     assert.deepEqual(r.served, { hot: 25, near: 68, far: 6, filler: 51 });
     assert.deepEqual(r.slice.slice(0, 25), zones.hot, "hot is evaluated first");
-    assert.deepEqual(r.cursors, { hot: 0, near: 68, far: 6, filler: 51 });
+    // near/far keep ONE cursor per sub-window; production defaults are 2 near
+    // slots and 6 far slots, and this call names one sub-window.
+    assert.deepEqual(r.cursors, { hot: 0, near: [68], far: [6], filler: 51 });
   });
 
   await test("slicePoolZones: each zone's cohort is fully covered within its recurrence, once each", () => {
@@ -9405,7 +9407,7 @@ async function main() {
     // own slice (slicePoolRotation resets only after a tail), so "once each"
     // is a property of the ORDER, not of a per-row counter.
     const sweep = (prefix, size, maxTicks) => {
-      let cursors = { hot: 0, near: 0, far: 0, filler: 0 };
+      let cursors = { hot: 0, near: [0], far: [0], filler: 0 };
       const order = [];
       let ticks = 0;
       while (order.length < size && ticks < maxTicks) {
@@ -9432,32 +9434,172 @@ async function main() {
     assert.equal(new Set(farSweep.order).size, far.length, "…and every far row once");
   });
 
+  await test("slicePoolZones: a ROTATING cohort is swept inside each appearance", () => {
+    // The production shape the static test above cannot see: the pool query
+    // advances its rotation slot every cache TTL, returning ONE age sub-window
+    // per band (near 2, far 8) for `cache/tick` ticks at a time. Dividing the
+    // returned cohort by the band's recurrence left every sub-window 1/slots
+    // swept, while the shared cursor advanced on the ticks it was NOT on
+    // screen — so rows were re-served and others skipped (far starved: 60 of
+    // 1,240 never served in 600 ticks). The take must cover the cohort inside
+    // its appearance instead.
+    const hot = Array.from({ length: 46 }, (_, i) => `h${i}`);
+    const nearSubs = [0, 1].map((s) =>
+      Array.from({ length: 190 }, (_, i) => `n${s}-${i}`),
+    );
+    const farSubs = Array.from({ length: 8 }, (_, s) =>
+      Array.from({ length: 155 }, (_, i) => `f${s}-${i}`),
+    );
+    const filler = Array.from({ length: 745 }, (_, i) => `x${i}`);
+    let cursors = { hot: 0, near: [0], far: [0], filler: 0 };
+    const seen = new Set();
+    let firstServed = null;
+    // One appearance block = one sub-window on screen for 3 ticks. Accumulate
+    // across the block; a block ends on the third tick.
+    let block = new Set();
+    for (let t = 0; t < 24; t++) {
+      const slot = Math.floor(t / 3);
+      const near = nearSubs[slot % nearSubs.length];
+      const far = farSubs[slot % farSubs.length];
+      if (t % 3 === 0) block = new Set();
+      const r = slicePoolZones(
+        { hot, near, far, filler },
+        cursors,
+        150,
+        { nearTicks: 6, farTicks: 24, nearSlots: 2, farSlots: 8, slot },
+      );
+      cursors = r.cursors;
+      assert.ok(r.slice.length <= 150, "the window is a ceiling, never exceeded");
+      if (t === 0) firstServed = r.served;
+      for (const item of r.slice) {
+        if (item.startsWith("n") || item.startsWith("f")) {
+          assert.ok(!block.has(item), `row served twice inside one appearance: ${item}`);
+          block.add(item);
+          seen.add(item);
+        }
+      }
+      if (t % 3 === 2) {
+        const expected = [...near, ...far];
+        for (const item of expected) {
+          assert.ok(block.has(item), `appearance ended without serving ${item}`);
+        }
+      }
+    }
+    assert.deepEqual(
+      firstServed,
+      { hot: 30, near: 64, far: 52, filler: 4 },
+      "the live cohorts fund their appearance takes (190/3, 155/3) and leave filler the rest",
+    );
+    assert.equal(seen.size, nearSubs.flat().length + farSubs.flat().length, "every row served in one 24-tick band cycle");
+  });
+
+  await test("slicePoolZones: a shortened appearance never starves a row", () => {
+    // A delayed tick can leave a slot with 2 ticks instead of 3. The sub-window
+    // then cannot finish in that appearance; its cursor must CARRY to the next
+    // one and finish there, not skip its unswept tail forever.
+    const hot = Array.from({ length: 46 }, (_, i) => `h${i}`);
+    const nearSubs = [0, 1].map((s) =>
+      Array.from({ length: 190 }, (_, i) => `n${s}-${i}`),
+    );
+    const farSubs = Array.from({ length: 8 }, (_, s) =>
+      Array.from({ length: 155 }, (_, i) => `f${s}-${i}`),
+    );
+    const filler = Array.from({ length: 745 }, (_, i) => `x${i}`);
+    let cursors = { hot: 0, near: [0], far: [0], filler: 0 };
+    const seen = new Set();
+    for (let t = 0; t < 48; t++) {
+      const slot = Math.floor(t / 2);
+      const r = slicePoolZones(
+        {
+          hot,
+          near: nearSubs[slot % nearSubs.length],
+          far: farSubs[slot % farSubs.length],
+          filler,
+        },
+        cursors,
+        150,
+        { nearTicks: 6, farTicks: 24, nearSlots: 2, farSlots: 8, slot },
+      );
+      cursors = r.cursors;
+      for (const item of r.slice) {
+        if (item.startsWith("n") || item.startsWith("f")) seen.add(item);
+      }
+    }
+    assert.equal(
+      seen.size,
+      nearSubs.flat().length + farSubs.flat().length,
+      "every row is reached after a shortened appearance (no starvation)",
+    );
+  });
+
+  await test("slicePoolZones: a cohort larger than its share is slowed, never skipped", () => {
+    // The live bands already reach ~203 near / ~187 far; a busier market grows
+    // them past the share caps (64/52). A sub-window then cannot finish in one
+    // appearance, and the resume offset must still belong to THAT sub-window.
+    // With the old shared cursor it did not: 34–52 rows of every far
+    // sub-window were never served, even after 240 ticks.
+    const hot = Array.from({ length: 46 }, (_, i) => `h${i}`);
+    const nearSubs = [0, 1].map((s) =>
+      Array.from({ length: 260 }, (_, i) => `n${s}-${i}`),
+    );
+    const farSubs = Array.from({ length: 8 }, (_, s) =>
+      Array.from({ length: 190 }, (_, i) => `f${s}-${i}`),
+    );
+    const filler = Array.from({ length: 745 }, (_, i) => `x${i}`);
+    let cursors = { hot: 0, near: [0], far: [0], filler: 0 };
+    const seen = new Set();
+    for (let t = 0; t < 240; t++) {
+      const slot = Math.floor(t / 3);
+      const r = slicePoolZones(
+        {
+          hot,
+          near: nearSubs[slot % nearSubs.length],
+          far: farSubs[slot % farSubs.length],
+          filler,
+        },
+        cursors,
+        150,
+        { nearTicks: 6, farTicks: 24, nearSlots: 2, farSlots: 8, slot },
+      );
+      cursors = r.cursors;
+      assert.ok(r.slice.length <= 150, "the window is a ceiling, never exceeded");
+      for (const item of r.slice) {
+        if (item.startsWith("n") || item.startsWith("f")) seen.add(item);
+      }
+    }
+    assert.equal(
+      seen.size,
+      nearSubs.flat().length + farSubs.flat().length,
+      "a capped cohort is still fully covered — slower, not skipped",
+    );
+  });
+
   await test("slicePoolZones: a zone taken whole resets only its own cursor", () => {
     const near = ["n1", "n2"];
     const far = Array.from({ length: 300 }, (_, i) => `f${i}`);
     const r = slicePoolZones(
       { hot: [], near, far, filler: [] },
-      { hot: 0, near: 7, far: 100, filler: 0 },
+      { hot: 0, near: [7], far: [100], filler: 0 },
       10,
       { nearTicks: 1, farTicks: 24 },
     );
     assert.equal(r.slice.length, 10);
     assert.deepEqual(r.slice.slice(0, 2), ["n1", "n2"], "small zone is taken whole");
-    assert.equal(r.cursors.near, 0, "and only its cursor resets");
-    assert.equal(r.cursors.far, 108, "far advances by what near left");
+    assert.equal(r.cursors.near[0], 0, "and only its cursor resets");
+    assert.equal(r.cursors.far[0], 108, "far advances by what near left");
   });
 
   await test("slicePoolZones: empty zones hand their budget to the zones that still have rows", () => {
     const filler = Array.from({ length: 300 }, (_, i) => `x${i}`);
     const r = slicePoolZones(
       { hot: [], near: [], far: [], filler },
-      { hot: 0, near: 0, far: 0, filler: 0 },
+      { hot: 0, near: [0], far: [0], filler: 0 },
       90,
       { nearTicks: 6, farTicks: 24 },
     );
     assert.equal(r.slice.length, 90);
     assert.deepEqual(r.slice, filler.slice(0, 90));
-    assert.deepEqual(r.cursors, { hot: 0, near: 0, far: 0, filler: 90 });
+    assert.deepEqual(r.cursors, { hot: 0, near: [0], far: [0], filler: 90 });
   });
 
   await test("slicePoolZones: owed coins keep head priority inside their zone", () => {
@@ -9477,7 +9619,7 @@ async function main() {
           ],
           filler: [],
         },
-        { hot: 0, near: 0, far: 0, filler: 0 },
+        { hot: 0, near: [0], far: [0], filler: 0 },
         2,
         { nearTicks: 1, farTicks: 1 },
       );
@@ -9498,14 +9640,14 @@ async function main() {
     const far = Array.from({ length: 50 }, (_, i) => `f${i}`);
     const r = slicePoolZones(
       { hot: [], near, far, filler: [] },
-      { hot: 0, near: 90, far: 45, filler: 0 },
+      { hot: 0, near: [90], far: [45], filler: 0 },
       90,
       { nearTicks: 10, farTicks: 10 },
     );
     assert.equal(r.slice.length, 15, "near tail 10 + far tail 5");
     assert.deepEqual(r.slice, [...near.slice(90), ...far.slice(45)]);
-    assert.equal(r.cursors.near, 0);
-    assert.equal(r.cursors.far, 0);
+    assert.equal(r.cursors.near[0], 0);
+    assert.equal(r.cursors.far[0], 0);
   });
 
   await test("slicePoolZones: the window is a ceiling, and a satisfied zone does not crowd out the next", () => {
@@ -9514,7 +9656,7 @@ async function main() {
     const nearBig = Array.from({ length: 400 }, (_, i) => `n${i}`);
     const capped = slicePoolZones(
       { hot: [], near: nearBig, far: [], filler: [] },
-      { hot: 0, near: 0, far: 0, filler: 0 },
+      { hot: 0, near: [0], far: [0], filler: 0 },
       150,
       { nearTicks: 1, farTicks: 1 },
     );
@@ -9525,7 +9667,7 @@ async function main() {
     const far = Array.from({ length: 40 }, (_, i) => `f${i}`);
     const r = slicePoolZones(
       { hot: [], near: nearBig, far, filler: [] },
-      { hot: 0, near: 0, far: 0, filler: 0 },
+      { hot: 0, near: [0], far: [0], filler: 0 },
       150,
       { nearTicks: 6, farTicks: 1 },
     );
@@ -9535,23 +9677,30 @@ async function main() {
   });
 
   await test("parsePoolSliceCursors: absent, junk and partial rows are zeros, never a throw", () => {
-    const zero = { hot: 0, near: 0, far: 0, filler: 0 };
+    const zero = { hot: 0, near: [], far: [], filler: 0 };
     assert.deepEqual(parsePoolSliceCursors(null), zero);
     assert.deepEqual(parsePoolSliceCursors(undefined), zero);
     assert.deepEqual(parsePoolSliceCursors(""), zero);
     assert.deepEqual(parsePoolSliceCursors("not json"), zero);
     assert.deepEqual(parsePoolSliceCursors("[1,2]"), zero);
     assert.deepEqual(parsePoolSliceCursors("null"), zero);
+    // A row written before the per-sub-window split carries one number per
+    // band; it becomes that band's slot-0 cursor and the rest start at 0.
     assert.deepEqual(parsePoolSliceCursors('{"hot": 12, "near": "34"}'), {
       hot: 12,
-      near: 34,
-      far: 0,
+      near: [34],
+      far: [],
       filler: 0,
     });
     assert.deepEqual(
       parsePoolSliceCursors('{"hot": -5, "near": 1.9, "far": "x", "filler": null}'),
-      { hot: 0, near: 1, far: 0, filler: 0 },
+      { hot: 0, near: [1], far: [0], filler: 0 },
       "negative and junk entries do not become offsets",
+    );
+    assert.deepEqual(
+      parsePoolSliceCursors('{"hot":1,"near":[7,8],"far":[9,10,11],"filler":2}'),
+      { hot: 1, near: [7, 8], far: [9, 10, 11], filler: 2 },
+      "per-sub-window arrays survive the read",
     );
     assert.deepEqual(
       parsePoolSliceCursors(JSON.stringify({ hot: POOL_SLICE_MAX_CURSOR + 99 })).hot,
@@ -9560,12 +9709,14 @@ async function main() {
     );
   });
 
-  await test("serializePoolSliceCursors: round-trips the four offsets and normalises them", () => {
-    const c = { hot: 25, near: 68, far: 6, filler: 51 };
+  await test("serializePoolSliceCursors: round-trips the per-slot offsets and normalises them", () => {
+    const c = { hot: 25, near: [68, 70], far: [6, 0, 0, 0, 0, 0, 0, 12], filler: 51 };
     assert.deepEqual(parsePoolSliceCursors(serializePoolSliceCursors(c)), c);
     assert.deepEqual(
-      parsePoolSliceCursors(serializePoolSliceCursors({ hot: -1, near: 2.7, far: NaN, filler: 0 })),
-      { hot: 0, near: 2, far: 0, filler: 0 },
+      parsePoolSliceCursors(
+        serializePoolSliceCursors({ hot: -1, near: [2.7, -3], far: [NaN], filler: 0 }),
+      ),
+      { hot: 0, near: [2, 0], far: [0], filler: 0 },
     );
   });
 

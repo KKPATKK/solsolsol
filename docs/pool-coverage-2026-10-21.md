@@ -43,12 +43,21 @@ Window 由「排隊頭」改成**按 band 自己的 cadence 分配**：
 | zone | 每 tick take | 生產數字（window 150） |
 |---|---|---|
 | hot（evidenced） | `min(len, 0.2 × window)`，每個 tick | 25（cap 30） |
-| near（evidenced） | `len / nearTicks`，`nearTicks = nearSlots × poolTTL ÷ 30s` | `403 / 6 ≈ 68` → 3 分鐘掃完 |
-| far（evidenced） | `len / farTicks`，`farTicks = farSlots × poolTTL ÷ 30s` | `136 / 24 ≈ 6` → 12 分鐘掃完 |
+| near（evidenced） | `len / appearance`，`appearance = nearTicks ÷ nearSlots`，上限 `0.45 × window` | `190 / 3 ≈ 64`（實測職業 190/3） |
+| far（evidenced） | `len / appearance`，`appearance = farTicks ÷ farSlots`，上限 `0.35 × window` | `155 / 3 ≈ 52` |
 | filler | 剩餘 | 51（舊 90-row split 只有 36，**冇退步**） |
 
 - 每個 zone 有**自己一個 cursor**，經 `slicePoolRotation`（tail 規則、deferred 優先
   全部繼承），所以同一 zone 一輪內唔會重複、亦唔會 wrap back。
+- **near/far 係輪轉 cohort（每個 slot 一個 sub-window）**：pool query 每 `poolTTL`
+  換一個 slot，同一個 sub-window 只會出現 `appearance = recurrence ÷ slots` 個 tick
+  （near 2 slots → 3 ticks；far 8 slots → 3 ticks）。所以 take 係除以 **appearance**
+  （`len / 3`），唔係除以 recurrence（`len / 6`、`len / 24`）——後者只掃到 sub-window
+  的 1/slots，其餘行永遠等唔到。
+- **每個 sub-window 各自一個 cursor**（`near: number[]`、`far: number[]`，index =
+  slot）：sub-window 落畫時 cursor 跟住停，返嚟時由自己條尾續，唔會攞住別的 sub-window
+  的 offset 續掃（shared cursor 會令部分行永遠 skip）。Cohort 大過自己的 share cap 時
+  只會慢（cursor 跨 appearance 保留），唔會漏。
 - Window 係 budget 唔係 quota：zone 細過自己份額就交俾下一個（near → far → hot → filler）；
   zone 到 list 尾就只會服務 tail 並 reset，唔會借位重掃。`slice` 永遠 ≤
   `RE_EVAL_PER_TICK_MAX`。
@@ -59,7 +68,8 @@ Window 由「排隊頭」改成**按 band 自己的 cadence 分配**：
 
 ### 2. Cursor 持久化（`Db.POOL_SLICE_CURSOR_KEY`）
 
-- 新 row `pool_slice_cursor`（JSON `{hot,near,far,filler}`）加入
+- 新 row `pool_slice_cursor`（JSON `{hot,near:[…],far:[…],filler}`，near/far 係
+  每個 sub-window 一個 offset）加入
   `SCAN_FRONT_GATE_KEYS`：讀嘅時候搭 front 的 ONE read，寫嘅時候搭 front 的 ONE
   write（`stampFront`），**零額外 request**。
 - 冷 isolate 讀到上一 tick 寫落的 cursor，所以兩個 delivery 都會推進；無 front 的
@@ -93,11 +103,19 @@ Tick summary 新增：
 ## 四、驗證
 
 - `npx tsc --noEmit`、`npm run build` exit 0。
-- `node scripts/test-unit.js`：**583 passed, 0 failed**。新增：
-  - `slicePoolZones` 5 個測試：生產人口（25/403/136/550、window 150）得到
+- `node scripts/test-unit.js`：**586 passed, 0 failed**。新增：
+  - `slicePoolZones` 10 個測試：生產人口（25/403/136/550、window 150）得到
     `served {25,68,6,51}`、hot 排第一；403 near 在 6 ticks 內全覆蓋、136 far 在 24
     ticks 內全覆蓋；細 zone 被整個拿走時只 reset 自己 cursor；空 zone 交還 budget；
     zone 到尾只服務 tail；window 係 ceiling（nearTicks=1 都會截到 150）。
+  - **輪轉 cohort 回歸**（3 個）：2 near / 8 far sub-window、每個 appearance 3 ticks，
+    24 ticks 內每個 sub-window 的每一行只 served 一次且全部 served，而 `served` 的
+    first tick 係 `{hot:30, near:64, far:52, filler:4}`（take 除 appearance 唔係
+    recurrence）；appearance 縮短到 2 ticks 都唔會餓死（cursor 跨 appearance 續）；
+    cohort 260/190 大過 share cap（64/52）時 240 ticks 內仍然全覆蓋（慢，但唔 skip）。
+  - `parsePoolSliceCursors` 對新 shape 的測試：near/far array、缺 slot、junk slot、
+    clamp、round-trip；舊 row 的單一數字（`{"near":12}`）讀成 slot-0 cursor，
+    其餘 slot 由 0 起（會重掃，但唔會漏）。
   - `parsePoolSliceCursors` / `serializePoolSliceCursors`：absent、junk、partial、
     負數、clamp、round-trip。
   - `poolZoneTicks`：2×90s/30s = 6、8×90s/30s = 24、junk 唔會除零。
@@ -106,11 +124,10 @@ Tick summary 新增：
   - source pin：call site 係 `slicePoolZones(zoneLists, sliceCursors, ...)`、
     `zoneByToken.set(...poolZoneOfLaunch...)`、durable cursor 的 read/write、
     `diag.poolServed = served`、`hotEndIdx = feedOnly.length + served.hot`。
-- 模擬（dist）：24 ticks、生產人口 → tick 6 `near 403/403`、tick 19 `far 136/136`、
-  每個 tick slice 150。far 早過 24 係因為 spare budget 會交俾下一個 zone：near 在
-tick 6 到尾（63 行，5 個位剩）、filler 在 tick 11 同 18 到尾，呢啲位全部按
-near → far → hot → filler 次序落入 far，所以 far 唔止 6/tick。24 ticks 係上界，
-唔係唯一結果。
+- 模擬（dist）：24 ticks、輪轉 cohort 生產人口（near 2×190、far 8×155、hot 46）→
+  每個 appearance（3 ticks）完結時，該 sub-window 的 190 / 155 行全部 served 且
+  冇重複；24 ticks 內兩個 band 全部 sub-window 覆蓋。靜態（non-rotating）人口 403/136
+  仍然係 6 / 24 ticks 全覆蓋（appearance = recurrence）。
 
 ## 五、上線後要讀乜
 

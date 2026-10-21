@@ -1777,6 +1777,26 @@ export const RE_EVAL_PER_TICK_MAX = 150;
 export const POOL_SLICE_HOT_SHARE = 0.2;
 
 /**
+ * Share of the per-tick window the NEAR band's evidenced rows may take.
+ *
+ * WHY A CAP AND NOT JUST THE APPEARANCE TAKE (2026-10-21, later): the take is
+ * sized to the ticks the returned sub-window is actually on screen (see
+ * slicePoolZones), which is 190 / 3 ≈ 64 at the live cohort — the number the
+ * 3-minute promise needs. A busier market grows that cohort, and an uncapped
+ * take would then eat the far lane (the budget is granted in priority order).
+ * 0.43 × 150 = 64 is the live need with one row of headroom; a larger band
+ * degrades to a longer near sweep instead of starving far.
+ */
+export const POOL_SLICE_NEAR_SHARE = 0.43;
+
+/**
+ * Sibling of POOL_SLICE_NEAR_SHARE for the far band: 0.35 × 150 = 52, the
+ * appearance take of the live 155-row far cohort (155 / 3 ≈ 52) and therefore
+ * the 12-minute sweep. Same degradation rule as near.
+ */
+export const POOL_SLICE_FAR_SHARE = 0.35;
+
+/**
  * The tick interval the zone cadences are derived from, ms.
  *
  * CLOCK_TICK_SECONDS is 30 in production and the durable ring reads 2.0
@@ -1821,13 +1841,25 @@ export function poolZoneTicks(slots: number, cacheMs: number): number {
  */
 export interface PoolSliceCursors {
   hot: number;
-  near: number;
-  far: number;
+  /**
+   * One cursor per NEAR rotation sub-window (see Db.getReevalPoolBatched:
+   * `slot % nearSlots`). A single cursor cannot work: the query swaps the
+   * returned sub-window every cache TTL, so a shared cursor advances through
+   * the ticks a given sub-window is NOT on screen and resumes at an offset
+   * foreign to it — rows get re-served and others are skipped (measured
+   * 2026-10-21: 60 of 1,240 far rows never served in 600 ticks).
+   */
+  near: number[];
+  /** One cursor per FAR rotation sub-window (`slot % farSlots`). */
+  far: number[];
   filler: number;
 }
 
 /** Upper bound on a stored cursor, so a corrupt row cannot wrap for ever. */
 export const POOL_SLICE_MAX_CURSOR = 1_000_000;
+
+/** Cursors above this many sub-windows are junk, not a rotation (far caps at 48). */
+export const POOL_SLICE_MAX_SLOTS = 48;
 
 /**
  * Parse the durable cursor row (Db.POOL_SLICE_CURSOR_KEY).
@@ -1839,7 +1871,7 @@ export const POOL_SLICE_MAX_CURSOR = 1_000_000;
 export function parsePoolSliceCursors(
   raw: string | null | undefined,
 ): PoolSliceCursors {
-  const zero = { hot: 0, near: 0, far: 0, filler: 0 };
+  const zero: PoolSliceCursors = { hot: 0, near: [], far: [], filler: 0 };
   if (raw === null || raw === undefined || raw === "") return zero;
   let parsed: unknown;
   try {
@@ -1856,10 +1888,20 @@ export function parsePoolSliceCursors(
     if (!Number.isFinite(n) || n <= 0) return 0;
     return Math.min(POOL_SLICE_MAX_CURSOR, Math.floor(n));
   };
+  // A row written by the pre-sub-window build carries ONE number per band; it
+  // becomes that band's slot-0 cursor, and the other sub-windows start at 0.
+  // Junk / absent answers [] (cursorAt reads that as 0), never a throw.
+  const list = (value: unknown): number[] => {
+    if (Array.isArray(value)) {
+      return value.slice(0, POOL_SLICE_MAX_SLOTS).map(clamp);
+    }
+    if (value === undefined || value === null) return [];
+    return [clamp(value)];
+  };
   return {
     hot: clamp(obj.hot),
-    near: clamp(obj.near),
-    far: clamp(obj.far),
+    near: list(obj.near),
+    far: list(obj.far),
     filler: clamp(obj.filler),
   };
 }
@@ -1870,10 +1912,14 @@ export function serializePoolSliceCursors(cursors: PoolSliceCursors): string {
     if (!Number.isFinite(value) || value <= 0) return 0;
     return Math.min(POOL_SLICE_MAX_CURSOR, Math.floor(value));
   };
+  const list = (value: number[]): number[] =>
+    (Array.isArray(value) ? value : [])
+      .slice(0, POOL_SLICE_MAX_SLOTS)
+      .map(clean);
   return JSON.stringify({
     hot: clean(cursors.hot),
-    near: clean(cursors.near),
-    far: clean(cursors.far),
+    near: list(cursors.near),
+    far: list(cursors.far),
     filler: clean(cursors.filler),
   });
 }
@@ -2298,6 +2344,14 @@ export function slicePoolRotation<T>(
   return { slice: ordered.slice(start), nextCursor: 0 };
 }
 
+/** Write one sub-window's cursor back into its band's per-slot list. */
+function withSlot(list: number[], index: number, value: number): number[] {
+  const out = Array.isArray(list) ? list.slice() : [];
+  while (out.length <= index) out.push(0);
+  out[index] = value;
+  return out;
+}
+
 /**
  * One zone's slice for this tick, plus the ROOM it has left: how many more rows
  * it could serve from the same cursor without wrapping past the zone's end
@@ -2364,16 +2418,58 @@ function planLane<T>(
  * bands: the query has already applied its LIMITs, and the rotation's job is to
  * cover what the tick actually can act on. A band the query clipped is not
  * this function's to fix — see docs/pool-coverage-2026-10-21.md for that split.
+ *
+ * THE APPARENT COHORT IS ROTATING — DIVIDE BY ITS APPEARANCE, NOT THE
+ * RECURRENCE (2026-10-21, later the same day). Db.getReevalPoolBatched does not
+ * return a stable near/far list: it advances `poolRotationSlot` every cache TTL
+ * (90s here) and returns ONE age sub-window of each band (nearSlots 2, farSlots
+ * 8). A given sub-window is therefore on screen for `cache / tick` ticks (3) out
+ * of its recurrence (`slots × cache / tick`: 6 and 24). Dividing the returned
+ * cohort by the RECURRENCE left each sub-window only 1/slots swept, and — worse
+ * — the shared per-zone cursor kept advancing on the ticks the sub-window was
+ * NOT returned, so when it came back the cursor resumed at an offset foreign to
+ * it: rows were re-served and other rows were skipped. The live sizes make that
+ * concrete: far's 8 sub-windows were each served ~21 of 155 rows per cycle, and
+ * a simulation with the real function left 60 of 1,240 far rows unserved after
+ * 600 ticks (~5h). The static-cohort test could not see it because it fed the
+ * same array every tick.
+ *
+ * The take is therefore `ceil(len / appearance)` — the ticks the sub-window is
+ * actually shown — so 3 ticks fund a full sub-window and the third tick's tail
+ * resets the cursor to 0 (3 × ceil(190/3) = 192 ≥ 190). The recurrence constants
+ * still describe the promise (near 3 min, far 12 min), but they are no longer
+ * the divisor. `nearSlots`/`farSlots` default to 1, which keeps the old
+ * recurrence behaviour for a caller that has a stable cohort (and the tests
+ * that model one).
+ *
+ * THE SHARE CAPS are the safety valve the corrected divisor needs: at the live
+ * cohorts the cadence takes are 64 (near) + 52 (far) + 30 (hot) = 146 of 150,
+ * leaving the filler lane 4. A band that grows with market activity would ask
+ * for more than its share and eat the other lane, so each is capped at its live
+ * need plus a row of headroom (0.43 / 0.35 of the window) and degrades to a
+ * longer sweep instead. The filler lane is what is left, exactly as it was
+ * before this split; at the live size that is ~4/tick, i.e. a ~90-minute sweep
+ * for the no-evidence rows — they are not a cadence promise, and 90 minutes is
+ * still well inside POOL_MCAP_EVIDENCE_GRACE_MS (6h).
  */
 export function slicePoolZones<T>(
   zones: { hot: T[]; near: T[]; far: T[]; filler: T[] },
   cursors: PoolSliceCursors,
   maxPerTick: number,
-  opts: { nearTicks: number; farTicks: number },
+  opts: {
+    nearTicks: number;
+    farTicks: number;
+    /** Rotation sub-windows per band (see Db.getReevalPoolBatched). 1 = stable. */
+    nearSlots?: number;
+    farSlots?: number;
+    /** This tick's pool rotation slot (poolRotationSlot) — selects the sub-window cursor. */
+    slot?: number;
+  },
 ): {
   slice: T[];
   cursors: PoolSliceCursors;
-  served: PoolSliceCursors;
+  /** Rows served per zone THIS tick — counts, not offsets (unlike cursors). */
+  served: { hot: number; near: number; far: number; filler: number };
 } {
   const window = Math.max(0, Math.floor(maxPerTick));
   const empty = { hot: 0, near: 0, far: 0, filler: 0 };
@@ -2382,6 +2478,30 @@ export function slicePoolZones<T>(
   }
   const ticks = (value: number): number =>
     Number.isFinite(value) && value > 0 ? Math.floor(value) : 1;
+  const slotCount = (value: number | undefined): number =>
+    Number.isFinite(value) && (value as number) > 0
+      ? Math.floor(value as number)
+      : 1;
+  // The ticks a sub-window is on screen, from the same two numbers the pool
+  // query uses for its slot: recurrence ÷ slots. A junk/absent slot count is 1
+  // (a stable cohort), which reduces to the recurrence — the old behaviour.
+  const appearance = (recurrence: number, slots: number | undefined): number =>
+    Math.max(1, Math.round(recurrence / slotCount(slots)));
+  // Which sub-window this tick's query returned. The cursor MUST be that
+  // sub-window's own: the alternative (one shared cursor) advances through the
+  // ticks this sub-window is off screen and resumes at a foreign offset, which
+  // re-serves some rows and skips others — the starvation this fix removes.
+  const nearSlots = slotCount(opts.nearSlots);
+  const farSlots = slotCount(opts.farSlots);
+  const slot = Number.isFinite(opts.slot) ? Math.floor(opts.slot as number) : 0;
+  const nearIdx = nearSlots > 1 ? ((slot % nearSlots) + nearSlots) % nearSlots : 0;
+  const farIdx = farSlots > 1 ? ((slot % farSlots) + farSlots) % farSlots : 0;
+  const cursorOf = {
+    hot: cursors.hot,
+    near: cursors.near[nearIdx] ?? 0,
+    far: cursors.far[farIdx] ?? 0,
+    filler: cursors.filler,
+  };
   const takes = { hot: 0, near: 0, far: 0, filler: 0 };
   // Wants are computed independently, then GRANTED in priority order against
   // one shrinking budget: a zone's own cadence can ask for more than the
@@ -2391,13 +2511,30 @@ export function slicePoolZones<T>(
     zones.hot.length,
     Math.max(1, Math.round(window * POOL_SLICE_HOT_SHARE)),
   );
+  // The share caps arbitrate between the two ROTATING bands; a caller with a
+  // stable cohort (no slot counts) gets the recurrence take exactly, which is
+  // what the pre-rotation contract and its unit test describe.
+  const nearCap =
+    opts.nearSlots === undefined
+      ? zones.near.length
+      : Math.floor(window * POOL_SLICE_NEAR_SHARE);
+  const farCap =
+    opts.farSlots === undefined
+      ? zones.far.length
+      : Math.floor(window * POOL_SLICE_FAR_SHARE);
   const wantNear = Math.min(
     zones.near.length,
-    Math.ceil(zones.near.length / ticks(opts.nearTicks)),
+    Math.ceil(
+      zones.near.length / appearance(ticks(opts.nearTicks), opts.nearSlots),
+    ),
+    nearCap,
   );
   const wantFar = Math.min(
     zones.far.length,
-    Math.ceil(zones.far.length / ticks(opts.farTicks)),
+    Math.ceil(
+      zones.far.length / appearance(ticks(opts.farTicks), opts.farSlots),
+    ),
+    farCap,
   );
   let budget = window;
   takes.hot = Math.min(wantHot, budget);
@@ -2408,10 +2545,10 @@ export function slicePoolZones<T>(
   budget -= takes.far;
   takes.filler = Math.min(zones.filler.length, budget);
   const plans = {
-    hot: planLane(zones.hot, cursors.hot, takes.hot),
-    near: planLane(zones.near, cursors.near, takes.near),
-    far: planLane(zones.far, cursors.far, takes.far),
-    filler: planLane(zones.filler, cursors.filler, takes.filler),
+    hot: planLane(zones.hot, cursorOf.hot, takes.hot),
+    near: planLane(zones.near, cursorOf.near, takes.near),
+    far: planLane(zones.far, cursorOf.far, takes.far),
+    filler: planLane(zones.filler, cursorOf.filler, takes.filler),
   };
   // Spare budget: near first (the band most likely to hold a qualifier), then
   // far, then hot, then the filler lane. A zone's ROOM — not its list length —
@@ -2432,7 +2569,7 @@ export function slicePoolZones<T>(
     if (room <= 0) continue;
     const add = Math.min(room, idle);
     const servedBefore = plans[zone].slice.length;
-    plans[zone] = planLane(zones[zone], cursors[zone], takes[zone] + add);
+    plans[zone] = planLane(zones[zone], cursorOf[zone], takes[zone] + add);
     takes[zone] += add;
     idle -= plans[zone].slice.length - servedBefore;
   }
@@ -2445,8 +2582,8 @@ export function slicePoolZones<T>(
     ],
     cursors: {
       hot: plans.hot.nextCursor,
-      near: plans.near.nextCursor,
-      far: plans.far.nextCursor,
+      near: withSlot(cursors.near, nearIdx, plans.near.nextCursor),
+      far: withSlot(cursors.far, farIdx, plans.far.nextCursor),
       filler: plans.filler.nextCursor,
     },
     served: {
@@ -4231,8 +4368,8 @@ export class Scanner {
    */
   private poolSliceCursors: PoolSliceCursors = {
     hot: 0,
-    near: 0,
-    far: 0,
+    near: [],
+    far: [],
     filler: 0,
   };
   /**
@@ -7095,6 +7232,18 @@ export class Scanner {
             this.config.reevalFarSlots,
             this.config.reevalPoolCacheMs,
           ),
+          // The pool query returns ONE age sub-window per rotation slot, so
+          // the take has to cover the sub-window inside its appearance (see
+          // slicePoolZones). Passing the slot counts here is what turns the
+          // recurrence constants into appearance ticks — 6/2 = 3 for near and
+          // 24/8 = 3 for far — instead of dividing the returned cohort by the
+          // whole band's recurrence and skipping rows while it is off screen.
+          nearSlots: this.config.reevalNearSlots,
+          farSlots: this.config.reevalFarSlots,
+          // The same clock and period the pool query used for its slot, so the
+          // slice advances the cursor of the sub-window it was actually handed
+          // (see slicePoolZones) instead of a shared one that drifts.
+          slot: poolRotationSlot(poolNow, this.config.reevalPoolCacheMs),
         });
       this.poolSliceCursors = nextPoolSliceCursors;
       if (this.scanFront) {
