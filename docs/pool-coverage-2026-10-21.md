@@ -42,10 +42,10 @@ Window 由「排隊頭」改成**按 band 自己的 cadence 分配**：
 
 | zone | 每 tick take | 生產數字（window 150） |
 |---|---|---|
-| hot（evidenced） | `min(len, 0.2 × window)`，每個 tick | 25（cap 30） |
-| near（evidenced） | `len / appearance`，`appearance = nearTicks ÷ nearSlots`，上限 `0.45 × window` | `190 / 3 ≈ 64`（實測職業 190/3） |
-| far（evidenced） | `len / appearance`，`appearance = farTicks ÷ farSlots`，上限 `0.35 × window` | `155 / 3 ≈ 52` |
-| filler | 剩餘 | 51（舊 90-row split 只有 36，**冇退步**） |
+| hot（evidenced） | `min(len, 0.18 × window)`，每個 tick | 25（cap 27） |
+| near（evidenced） | `len / appearance`，`appearance = nearTicks ÷ nearSlots`，上限 `0.43 × window` | `190 / 3 ≈ 64` |
+| far（evidenced） | `len / appearance`，`appearance = farTicks ÷ farSlots`，上限 `0.27 × window` | `155 / 3 ≈ 52`，cap 40（4 ticks，仍遠在 24-tick recurrence 內） |
+| filler | **預留** `0.12 × window`，再食剩餘 | 18（之前係「剩幾多食幾多」，繁忙時跌到 4） |
 
 - 每個 zone 有**自己一個 cursor**，經 `slicePoolRotation`（tail 規則、deferred 優先
   全部繼承），所以同一 zone 一輪內唔會重複、亦唔會 wrap back。
@@ -61,7 +61,10 @@ Window 由「排隊頭」改成**按 band 自己的 cadence 分配**：
 - Window 係 budget 唔係 quota：zone 細過自己份額就交俾下一個（near → far → hot → filler）；
   zone 到 list 尾就只會服務 tail 並 reset，唔會借位重掃。`slice` 永遠 ≤
   `RE_EVAL_PER_TICK_MAX`。
-- `RE_EVAL_PER_TICK_MAX` 90 → **150**：25 + 68 + 6 = 99 行 fast，留 51 行俾 filler。
+- **Filler 係預留 lane**：`0.12 × window` 先扣起，再分 hot/near/far；三者有剩餘才
+  按上面的次序回流（filler 排最後）。所以 filler 的 cadence 唔再係「其他 lane 食淨幾多」
+  的函數 — 18/tick 係保證值，返到 query 每 phase 的 page（~45 行 / 3 ticks）就夠食。
+- `RE_EVAL_PER_TICK_MAX` 90 → **150**：hot 27 + near 64 + far 40 + filler 18 = 149。
   Pair fetch 成本用 lane 自己的算式計：30 addresses/batch、250ms spacing、3 條並行
   → `batches × 250 / 3`；150 + feed ~170 + tracker head ≈ 340 addresses = 12 batches
   ≈ 1.0s pacing，仍然遠低過 `PAIRS_FETCH_BUDGET_MS 2,000`。
@@ -77,7 +80,30 @@ Window 由「排隊頭」改成**按 band 自己的 cadence 分配**：
 - 解析 fail-safe：absent / junk / 負數 / NaN → 0（等於未改之前），值 clamp 到
   `POOL_SLICE_MAX_CURSOR`。
 
-### 3. Reject log 的 hot cap（`POOL_HOT_REJECT_SLOTS = 8`）
+### 3. Query 的 band page（`POOL_BAND_ROTATE_BUCKETS = 64`）
+
+2026-10-21 實測（D1，predicate 與 query 逐句一致）：hot band **730** 行（81 evidenced）、
+near 兩個 slot **1,451 / 2,034** 行（146 / 168 evidenced）、far band 1,179 行（~1,177
+evidenced）。hot limit 460、near 518、far 222，所以 clip 只發生在 no-evidence 行。
+
+舊做法係「signal 排序 + tie-break bucket」：tie-break 只會輪轉同一個 signal key 的
+**tie group**，group 下面的行永遠唔會入 LIMIT（實測覆蓋率停在 ~77%）。現在改成：
+
+- `poolBandPageSql()` 係 WHERE clause：`max_mcap_observed IS NOT NULL OR bucket = phase`。
+  **Evidenced 行永遠唔 page**（佢哋係 actionable cohort，每次都要返）；no-evidence 行
+  每個 phase 只返一個 bucket，而且**整個 bucket 一定入 LIMIT**（K=64：near page ~32、
+hot ~11、far ~2，遠低過各自的殘餘額）。
+- Phase：hot = 每個 slot（90s）、near = `floor(slot / nearSlots)`、far =
+  `floor(slot / farSlots)`。所以每一行 no-evidence 的週期係 **K × recurrence**：
+near 64 × 3 min = 3.2h、hot 64 × 1.5 min = 96 min、far 64 × 12 min = 12.8h，
+  而且係**保證一次**，唔係抽樣。
+- K=64 的兩個 sizing 條件（寫在 `db.ts` 的註釋）：page 要細過 band 的殘餘 LIMIT，
+  亦要細過 filler lane 在一個 page 週期內食得落的分量。實測 page ~45 行 / 3 ticks
+  ≈ 15/tick，filler 預留 18/tick 蓋得住。
+- 副作用：`poolQueryCount` 會由 ~1,329 跌到 ~460–520（回傳行少咗，slice 仍然填滿
+  150）；`poolSliceLanes.filler` 會由 731 跌到 ~45。呢兩個都係預期，唔係漏 data。
+
+### 4. Reject log 的 hot cap（`POOL_HOT_REJECT_SLOTS = 8`）
 
 Slice 的 eval 次序係 hot → near → far → filler，而 hot 多數係流動性 $0 的塵，
 第一個閘就死。若果照舊 first-come-first-served 填 20 個位，hot 會再霸晒個 log，
@@ -90,7 +116,7 @@ Cap 的範圍係 **今個 tick 實際 eval 的 hot slice**（`feedOnly.length + 
 救的那個 starvation。呢個細節由 `matchCoins log budget` 測試釘住（12 行 hot slice
 → 8 行 log、4 行靜音、near 照 log）。
 
-### 4. 驗收讀數
+### 5. 驗收讀數
 
 Tick summary 新增：
 
@@ -105,14 +131,20 @@ Tick summary 新增：
 - `npx tsc --noEmit`、`npm run build` exit 0。
 - `node scripts/test-unit.js`：**586 passed, 0 failed**。新增：
   - `slicePoolZones` 10 個測試：生產人口（25/403/136/550、window 150）得到
-    `served {25,68,6,51}`、hot 排第一；403 near 在 6 ticks 內全覆蓋、136 far 在 24
-    ticks 內全覆蓋；細 zone 被整個拿走時只 reset 自己 cursor；空 zone 交還 budget；
-    zone 到尾只服務 tail；window 係 ceiling（nearTicks=1 都會截到 150）。
+    `served {25,101,6,18}`（near 拿到 cap 64 再加上 spare 37；far 只需 6；filler 保留
+    18）、hot 排第一；403 near 在 6 ticks 內全覆蓋、136 far 在 24 ticks 內全覆蓋；
+    細 zone 被整個拿走時只 reset 自己 cursor；空 zone 交還 budget；zone 到尾只服務
+    tail；window 係 ceiling（nearTicks=1 都會截到 150）。
   - **輪轉 cohort 回歸**（3 個）：2 near / 8 far sub-window、每個 appearance 3 ticks，
-    24 ticks 內每個 sub-window 的每一行只 served 一次且全部 served，而 `served` 的
-    first tick 係 `{hot:30, near:64, far:52, filler:4}`（take 除 appearance 唔係
-    recurrence）；appearance 縮短到 2 ticks 都唔會餓死（cursor 跨 appearance 續）；
-    cohort 260/190 大過 share cap（64/52）時 240 ticks 內仍然全覆蓋（慢，但唔 skip）。
+    `served` first tick 係 `{hot:27, near:65, far:40, filler:18}`；near 的 190 行在
+    一個 appearance 內全 served（65 × 3 ≥ 190），far 的 155 行跨兩次 appearance
+    （cursor 保留）仍然全 served；appearance 縮短到 2 ticks 都唔會餓死；cohort
+    260/190 大過 share cap 時 240 ticks 內仍然全覆蓋（慢，但唔 skip）。
+  - **query band page 回歸**（`getReevalPool: the overflow is PAGED by bucket`）：30 行
+    no-evidence + 1 行 evidenced，64 個 phase 內 30 行**每行只返一次**、冇頁面重疊，
+    而 evidenced 行**每個 phase 都返**；page 大小 ≤ 3（唔係 30 行的 head）。
+  - grace / pre-filter / seen-exclusion 三個舊測試的 no-evidence 種子改用
+    `pagedName(base, phase)`：確保測試觀察的是被測規則，唔係 page filter。
   - `parsePoolSliceCursors` 對新 shape 的測試：near/far array、缺 slot、junk slot、
     clamp、round-trip；舊 row 的單一數字（`{"near":12}`）讀成 slot-0 cursor，
     其餘 slot 由 0 起（會重掃，但唔會漏）。
@@ -131,30 +163,33 @@ Tick summary 新增：
 
 ## 五、上線後要讀乜
 
-1. `/health`：`summary.poolServed` 應該每個 tick 都 ≈ `{25, 68, 6, 51}`；
-   `poolSliceLanes` 應該 ≈ `{25, 403, 136, ~550}`。
-2. 隔 5 分鐘抓 `/health`：`hot` cursor 應該已經轉過（`poolServed.hot` 25），
+1. `/health`：`summary.poolServed` 應該每個 tick 都 ≈ `{27, 64, 40, 18}`（near 有時
+   多過 64 係 spare 回流）；`poolSliceLanes` 應該 ≈ `{81, 188, 147, ~45}` ——
+   filler 由 731 跌到 ~45 係 page filter 的正常結果，唔係 pool 變空。
+2. 隔 5 分鐘抓 `/health`：`hot` cursor 應該已經轉過（`poolServed.hot` ≈ 27），
    而且 reject log 應該**同時**出現 hot（70–110m）同 near/far（>110m）的年齡，
-   唔再係冷 tick 全 hot（hot 最多 8 個位，見 §三.3）。
+   唔再係冷 tick 全 hot（hot 最多 8 個位，見 §三.4）。
 3. `/debug/tick-legs`：`ms` 應由 1.2–2.2s 升到 ~2.5–3.5s（150 + 12 pair batches）；
    如果 `pairs` 明顯低過 `pairsMissing` 或 tick 反覆撞 `PAIRS_FETCH_BUDGET_MS`，
-   window 要退回 120 並重讀 cadence（near `403/6` 仍然 ≈ 68，filler 會變 21）。
-4. `/debug/pool`：`poolQueryCount` 仍會 ≈ 1,114（hot 460 + near 518 + far 136）。
-   呢個數字唔會因為今次改動而變 —— **band 的 LIMIT 係 query 的事**，今次修的是
-   slice 的分配。
+   window 要退回 120 並重讀 cadence（near 仍然係 `188/3 ≈ 63`，filler 保留 ~14）。
+4. `/debug/pool`：`poolQueryCount` 會由 ~1,329 跌到 ~460–520（evidenced 全返，
+   no-evidence 只返一個 page）。唔好當佢係載入失敗；`poolSliceLanes` 仍然有
+   ~460 行可以填滿 150-row slice。
 
 ## 六、殘餘（照直講）
 
-- **near band 仍然被 query clip**：2,390 / 1,459 行只有 518 回傳。evidenced 的 403
-  行全部在 518 之內，所以 actionable cohort 冇被切；被切的是 no-evidence filler，
-  它們靠 `POOL_BAND_ROTATE_BUCKETS` 的 8 個 tie bucket 在 8 個 recurrence（~24 分鐘）
-  輪流被抽樣，唔係逐隻掃。要把全部 3,845 行逐隻掃，要改 slot 數（near 8 slots →
-  12 分鐘一輪）或者加 `RE_EVAL_POOL_SIZE`，兩者都係另一個 measurement。
-- **filler lane 唔係 cadence promise**：51/tick 對 ~550 行 = ~11 ticks（5.5 分鐘）
-  一輪；hot filler（約 435 行）約 4–5 分鐘先拿到第一次讀數，比舊「每個冷 tick 都掃
-  hot 頭」慢。代價換來 near/far 的 actionable cohort 3/12 分鐘，亦令 filler lane
-  由 36/tick 升到 51/tick（overall 快咗）。
+- **no-evidence 的 cadence 係「保證一次」而唔係「快」**：K=64 下 near 3.2h、hot 96 min、
+  far 12.8h 一輪。呢個係 bandwidth 的物理下限（near 兩個 slot 共 3,485 行、filler lane
+  18/tick），唔係漏掃；想快就要加 window（會壓低 near/far 或 pair fetch 預算）或減
+  行數（prune / 收窄 age window），兩者都係另一個 measurement。
+- **Evidenced 行仍然受 band LIMIT 約束**：page filter 只輪轉 no-evidence 行；如果某 band
+  的 evidenced 多過自己的 LIMIT（hot 460 / near 518 / far 222），超出部分會永遠被切。
+  2026-10-21 實測 hot 81 / near 168 / far ~147，全部在限額內，所以唔係當前問題；
+  要重讀時看 `poolSliceLanes` 與 evidenced count。
 - **cadence 假設 30s tick**（`POOL_SLICE_TICK_MS`）。clock 停咗只剩 cron 1/min 的話，
   near/far 會等比例拉長一倍，但唔會漏掃。
-- 今次只改 slice 分配與 cursor；`Db.getReevalPool` 的 band LIMIT（hot 460 / near 518
-  / far 222）冇改。
+- `Db.getReevalPool` 的 band LIMIT（hot 460 / near 518 / far 222）冇改：今次是將
+  **超出 LIMIT 的部分變成有界 page**，唔係加大 LIMIT。
+- **Snapshot key 已 bump**：`POOL_QUERY_SHAPE_VERSION` 由 `v3-2026-10-09-mcap-evidence`
+  升到 `v4-2026-10-21-band-page`，所以舊 predicate 寫落的 edge snapshot 唔會被新查詢
+  當成同一個 key 讀（deploy 後第一個 slot 會 miss 重建，最多一個 TTL）。

@@ -119,6 +119,7 @@ function bandSql(orderSql) {
               AND first_seen_at > ?
               AND ${DEAD_POOL_CLAUSE}
               AND ${POOL_MCAP_EVIDENCE_CLAUSE}
+              AND (max_mcap_observed IS NOT NULL OR ((UNICODE(SUBSTR(token, 1)) + UNICODE(SUBSTR(token, -1)) * 17 + ?) % 64) = 0)
               AND (max_mcap_observed IS NULL OR max_mcap_observed >= ?)
               AND (max_mcap_observed IS NULL OR max_mcap_observed <= ?)
               AND (max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)
@@ -359,7 +360,7 @@ async function main() {
   });
 
   const plan = await client.execute({
-    sql: `EXPLAIN QUERY PLAN ${bandSql("ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC, ((UNICODE(SUBSTR(token, -1)) + ?) % 8)")}`,
+    sql: `EXPLAIN QUERY PLAN ${bandSql("ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC, token")}`,
     // pruneArgs[0] is the dead-liquidity floor this statement no longer binds
     // (see DEAD_POOL_CLAUSE): the clause is literal text, so the arg list skips
     // it rather than shifting every floor behind it by one.
@@ -581,7 +582,7 @@ async function indexMode(floorArg) {
   const lo = now - 440 * 60_000;
   const hi = now - 275 * 60_000;
   const spanLo = now - 30 * 3600_000;
-  const order = `ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC, ((UNICODE(SUBSTR(token, -1)) + 0) % 8)`;
+  const order = `ORDER BY COALESCE(max_mcap_observed, 0) DESC, COALESCE(first_m5_vol, 0) DESC, token`;
   const shape = (floorText) =>
     `SELECT * FROM token_stats
       WHERE launch_ms BETWEEN ${lo} AND ${hi}
@@ -589,6 +590,7 @@ async function indexMode(floorArg) {
         AND (max_mcap_observed IS NULL OR max_mcap_observed >= ${floorText})
         AND ${DEAD_POOL_CLAUSE}
         AND (max_mcap_observed IS NOT NULL OR first_seen_at > ${now - POOL_MCAP_EVIDENCE_GRACE_MS})
+        AND (max_mcap_observed IS NOT NULL OR ((UNICODE(SUBSTR(token, 1)) + UNICODE(SUBSTR(token, -1)) * 17 + 0) % 64) = 0)
         ${order} LIMIT 518`;
   const show = async (tag, sql, args) => {
     const plan = await client.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args: args ?? [] });

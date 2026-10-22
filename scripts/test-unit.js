@@ -66,6 +66,32 @@ function tmpDb() {
   return { p, client, cleanup: async () => { await client.close(); try { fs.unlinkSync(p); } catch {} } };
 }
 
+/**
+ * A token name whose no-evidence page bucket matches a pool rotation phase.
+ *
+ * The pool's overflow is a bucket FILTER, not a signal tie-break (see
+ * Db.poolBandPageSql / POOL_BAND_ROTATE_BUCKETS): a row with no mcap evidence
+ * is only returned in the phase its bucket names. Tests about something else
+ * (the grace, the seen exclusion) pin their seeded NULL-history names to the
+ * phase they query, so a passing assertion can only mean the rule under test
+ * admitted the row.
+ */
+function pagedName(base, phase) {
+  const target = ((-phase % 64) + 64) % 64;
+  // 17 is coprime with 64, so varying the LAST character over the base58
+  // alphabet reaches every bucket. (Varying a decimal suffix reaches only ten.)
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  for (const first of alphabet) {
+    for (const last of alphabet) {
+      const token = `${first}${base}_${last}`;
+      const bucket =
+        (token.charCodeAt(0) + token.charCodeAt(token.length - 1) * 17) % 64;
+      if (bucket === target) return token;
+    }
+  }
+  throw new Error(`no pageable name for ${base} at phase ${phase}`);
+}
+
 async function main() {
   // ---------- cross-isolate deferral counters (src/deferrallog.ts) ----------
   //
@@ -4814,20 +4840,25 @@ async function main() {
       "the clause and the histogram's counter must read the SAME mark expression",
     );
     assert.ok(
-      (dbSrc.match(/\[DEAD_POOL_CLAUSE,POOL_MCAP_EVIDENCE_CLAUSE\]/g) || []).length === 2,
-      "both pool builders must carry the dead AND no-evidence clauses (the drift guard)",
+      (dbSrc.match(/\[DEAD_POOL_CLAUSE,POOL_MCAP_EVIDENCE_CLAUSE,poolBandPageSql\(\),\]/g) || [])
+        .length === 2,
+      "both pool builders must carry the dead, no-evidence and page clauses (the drift guard)",
     );
     assert.ok(
       (dbSrc.match(/POOL_MCAP_EVIDENCE_CLAUSE/g) || []).length === 3,
       "the no-evidence clause is defined once and carried by both builders",
     );
     assert.ok(
-      dbSrc.includes("[b.lo,b.hi,opts.sinceMs,mcapEvidenceSinceMs]") &&
-        dbSrc.includes("[lo,hi,opts.sinceMs,opts.mcapEvidenceSinceMs]"),
-      "both builders bind the cutoff where the clause's placeholder sits, before every floor's",
+      (dbSrc.match(/poolBandPageSql\(\)/g) || []).length === 3,
+      "the page clause is defined once and carried by both builders",
     );
     assert.ok(
-      scannerSrc.includes('POOL_QUERY_SHAPE_VERSION="v3-2026-10-09-mcap-evidence"') &&
+      dbSrc.includes("[b.lo,b.hi,opts.sinceMs,mcapEvidenceSinceMs,b.rotatePhase??0") &&
+        dbSrc.includes("[lo,hi,opts.sinceMs,opts.mcapEvidenceSinceMs,opts.rotatePhase??0"),
+      "both builders bind the page phase where its placeholder sits, before every floor's",
+    );
+    assert.ok(
+      scannerSrc.includes('POOL_QUERY_SHAPE_VERSION="v4-2026-10-21-band-page"') &&
         scannerSrc.includes("poolKeyHash(POOL_QUERY_SHAPE_VERSION+"),
       "the pool snapshot key must carry the SQL's own shape version, or a snapshot taken with the OLD predicate answers the new one",
     );
@@ -9367,11 +9398,14 @@ async function main() {
   // The window is allocated by each band's OWN cadence (see slicePoolZones):
   // hot's evidenced rows every tick (capped), near's over its 6-tick
   // recurrence, far's over its 24-tick recurrence, and the no-evidence filler
-  // lane takes what is left. A budget, not extra work.
+  // lane has a RESERVED share (it is a promise, not a remainder). A budget,
+  // not extra work.
   await test("slicePoolZones: production cadences fund hot, the near/far sweeps and the filler lane", () => {
     // The live shapes measured 2026-10-21: 25 evidenced hot rows returned, 403
-    // evidenced near, 136 evidenced far, ~550 fillers — and the 150-row window
-    // is exactly 25 + ceil(403/6) + ceil(136/24) + 51.
+    // evidenced near, 136 evidenced far, ~550 fillers. The caps grant hot 25,
+    // near 61 (its 6-tick cadence) and far 6; 18 rows are held back for filler
+    // (0.12 × 150, the rate the query's bucket pages need) and the spare 40
+    // goes back to near, whose cohort still has room.
     const zones = {
       hot: Array.from({ length: 25 }, (_, i) => `h${i}`),
       near: Array.from({ length: 403 }, (_, i) => `n${i}`),
@@ -9385,11 +9419,11 @@ async function main() {
       { nearTicks: 6, farTicks: 24 },
     );
     assert.equal(r.slice.length, 150, "the window is fully spent");
-    assert.deepEqual(r.served, { hot: 25, near: 68, far: 6, filler: 51 });
+    assert.deepEqual(r.served, { hot: 25, near: 101, far: 6, filler: 18 });
     assert.deepEqual(r.slice.slice(0, 25), zones.hot, "hot is evaluated first");
     // near/far keep ONE cursor per sub-window; production defaults are 2 near
     // slots and 6 far slots, and this call names one sub-window.
-    assert.deepEqual(r.cursors, { hot: 0, near: [68], far: [6], filler: 51 });
+    assert.deepEqual(r.cursors, { hot: 0, near: [101], far: [6], filler: 18 });
   });
 
   await test("slicePoolZones: each zone's cohort is fully covered within its recurrence, once each", () => {
@@ -9434,15 +9468,17 @@ async function main() {
     assert.equal(new Set(farSweep.order).size, far.length, "…and every far row once");
   });
 
-  await test("slicePoolZones: a ROTATING cohort is swept inside each appearance", () => {
+  await test("slicePoolZones: a ROTATING cohort is swept inside each recurrence", () => {
     // The production shape the static test above cannot see: the pool query
     // advances its rotation slot every cache TTL, returning ONE age sub-window
     // per band (near 2, far 8) for `cache/tick` ticks at a time. Dividing the
     // returned cohort by the band's recurrence left every sub-window 1/slots
     // swept, while the shared cursor advanced on the ticks it was NOT on
     // screen — so rows were re-served and others skipped (far starved: 60 of
-    // 1,240 never served in 600 ticks). The take must cover the cohort inside
-    // its appearance instead.
+    // 1,240 never served in 600 ticks). The take must cover the sub-window
+    // inside its appearance (near: 65 × 3 ≥ 190) or carry its cursor to the
+    // next one and finish there (far: 40 × 6 over two appearances) — never
+    // skip the tail.
     const hot = Array.from({ length: 46 }, (_, i) => `h${i}`);
     const nearSubs = [0, 1].map((s) =>
       Array.from({ length: 190 }, (_, i) => `n${s}-${i}`),
@@ -9454,10 +9490,9 @@ async function main() {
     let cursors = { hot: 0, near: [0], far: [0], filler: 0 };
     const seen = new Set();
     let firstServed = null;
-    // One appearance block = one sub-window on screen for 3 ticks. Accumulate
-    // across the block; a block ends on the third tick.
+    // One appearance block = one sub-window on screen for 3 ticks.
     let block = new Set();
-    for (let t = 0; t < 24; t++) {
+    for (let t = 0; t < 48; t++) {
       const slot = Math.floor(t / 3);
       const near = nearSubs[slot % nearSubs.length];
       const far = farSubs[slot % farSubs.length];
@@ -9479,18 +9514,26 @@ async function main() {
         }
       }
       if (t % 3 === 2) {
-        const expected = [...near, ...far];
-        for (const item of expected) {
-          assert.ok(block.has(item), `appearance ended without serving ${item}`);
+        // The NEAR page fits its appearance (65 × 3 = 195 ≥ 190), so a full
+        // near sub-window must be in hand when the block ends. FAR's 40/tick
+        // does not fit one appearance by design; its cursor carries to the
+        // slot's next turn (24 ticks later) and the 48-tick union below
+        // proves that tail is still reached.
+        for (const item of near) {
+          assert.ok(block.has(item), `near appearance ended without serving ${item}`);
         }
       }
     }
     assert.deepEqual(
       firstServed,
-      { hot: 30, near: 64, far: 52, filler: 4 },
-      "the live cohorts fund their appearance takes (190/3, 155/3) and leave filler the rest",
+      { hot: 27, near: 65, far: 40, filler: 18 },
+      "the live cohorts fund hot + near + far, and the filler lane keeps its reserved share",
     );
-    assert.equal(seen.size, nearSubs.flat().length + farSubs.flat().length, "every row served in one 24-tick band cycle");
+    assert.equal(
+      seen.size,
+      nearSubs.flat().length + farSubs.flat().length,
+      "every near and far row is reached within the band cycle (no skipped tail)",
+    );
   });
 
   await test("slicePoolZones: a shortened appearance never starves a row", () => {
@@ -9816,7 +9859,7 @@ async function main() {
       fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
     );
     assert.ok(
-      src.includes("exportconstPOOL_SLICE_HOT_SHARE=0.2;"),
+      src.includes("exportconstPOOL_SLICE_HOT_SHARE=0.18;"),
       "the hot-zone share is exported and pinned",
     );
     assert.ok(
@@ -10828,37 +10871,41 @@ async function main() {
   // (all identical signal key). The tie break now rotates once per recurrence,
   // and this test pins both halves of that promise: the overflow moves, and a
   // row that HAS signal is never displaced by it.
-  await test("getReevalPool: a saturated band's overflow rotates, signal order does not", async () => {
+  await test("getReevalPool: the overflow is PAGED by bucket, and evidence is never paged", async () => {
     const t = tmpDb();
     try {
       const db = new Db(t.p, undefined, t.client);
       await db.init();
       const M = 60e3;
       const now = 50 * 300e3;
-      const seed = async (token, ageMin, mcap, vol) => {
+      const seed = async (token, ageMin, mcap, firstSeenAt) => {
         const launch = now - ageMin * M;
         await t.client.execute({
           sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed, max_liquidity_observed)
                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          args: [token, launch, vol, ageMin, launch, mcap, 40_000],
+          args: [token, firstSeenAt, 0, ageMin, launch, mcap, 40_000],
         });
       };
-      // 30 far rows sharing the IDENTICAL signal key (peak + first_m5_vol) —
-      // the tie group the live far band was measured to hold — plus one row
-      // that outranks them all and must never lose its slot to the rotation.
-      for (let i = 0; i < 30; i += 1) await seed(`R${i}`, 1000, 200_000, 0);
-      await seed("HIGH", 1000, 400_000, 0);
+      // 30 far rows with NO mcap evidence (the population the page filter
+      // exists for) — first seen inside the grace, launch deep in the far
+      // zone — plus one evidenced row that must come back in EVERY phase.
+      const NOEV = [];
+      for (let i = 0; i < 30; i += 1) {
+        NOEV.push(`R${i}`);
+        await seed(`R${i}`, 1000, null, now - 3600e3);
+      }
+      await seed("HIGH", 1000, 400_000, now - 3600e3);
       const opts = (nn) => ({
         sinceMs: now - 30 * 3600e3,
         minLaunchMs: now - 2580 * M,
         maxLaunchMs: now - 180 * M,
         windowEntryLaunchMs: now - 360 * M,
         // hot takes its 460-row budget first, leaving 40 for rotation →
-        // near 28 + far 12, so these 31 far rows are well over the limit.
+        // near 28 + far 12, so the 30 no-evidence far rows are over the limit.
         limit: 500,
         nearSlots: 1,
         // ONE far sub-window (= the whole far zone) so every call reads the
-        // same band and the phase advances with the slot, one per recurrence.
+        // same band and the page phase advances with the slot.
         farSlots: 1,
         rotationPeriodMs: 300e3,
         minQualifyMcap: 30_000,
@@ -10866,29 +10913,33 @@ async function main() {
         minQualifyLiquidity: 5_000,
         now: nn,
       });
-      const first = (await db.getReevalPool(opts(now))).map((r) => r.token);
-      assert.ok(first.includes("HIGH"), "the signal head is read");
-      const firstR = first.filter((x) => x.startsWith("R"));
-      assert.ok(
-        firstR.length > 0 && firstR.length < 30,
-        `the band must be over its LIMIT (read ${firstR.length} of 30)`,
-      );
-      const union = new Set(firstR);
-      for (let k = 1; k <= 7; k += 1) {
+      // One full page cycle = one phase per slot.
+      const seen = new Set();
+      for (let k = 0; k < 64; k += 1) {
         const rows = (await db.getReevalPool(opts(now + k * 300e3))).map((r) => r.token);
-        assert.ok(rows.includes("HIGH"), `the signal head is read on recurrence ${k}`);
-        const r = rows.filter((x) => x.startsWith("R"));
-        assert.equal(
-          r.length,
-          firstR.length,
-          `the LIMIT stays full on recurrence ${k}`,
+        assert.ok(rows.includes("HIGH"), `the evidenced row is still returned in phase ${k}`);
+        const page = rows.filter((x) => x.startsWith("R"));
+        assert.ok(
+          page.length <= 3,
+          `one bucket page, never the 30-row head (phase ${k} read ${page.length})`,
         );
-        for (const x of r) union.add(x);
+        for (const x of page) {
+          assert.ok(!seen.has(x), `a row was served twice inside one page cycle: ${x} (phase ${k})`);
+          seen.add(x);
+        }
       }
-      assert.ok(
-        union.size > firstR.length,
-        `the overflow must rotate: ${union.size} distinct rows over 8 recurrences vs ${firstR.length} for a fixed head`,
+      assert.equal(
+        seen.size,
+        NOEV.length,
+        `every no-evidence row is paged in exactly once per cycle (got ${seen.size}/${NOEV.length})`,
       );
+      // The batched builder (production path) must page the SAME bucket with
+      // the same phase bound in the same place — a mis-ordered argument would
+      // silently page a different band's rows.
+      const sameNow = now + 7 * 300e3;
+      const perBand = (await db.getReevalPool(opts(sameNow))).map((r) => r.token).sort();
+      const batched = (await db.getReevalPoolBatched(opts(sameNow))).map((r) => r.token).sort();
+      assert.deepEqual(batched, perBand, "both builders page the same bucket");
     } finally {
       await t.cleanup();
     }
@@ -10928,10 +10979,16 @@ async function main() {
       // Their launch stays where the band comments say it is (seed derives
       // launch from first-seen minus the coin's age at first sight).
       const now = 50 * 300e3;
-      await seed("HOT", now - 2 * H, 240, null);
+      // Both NULL-history rows must sit in their band's page for THIS slot:
+      // hot advances with the slot itself (50), far with one step per
+      // recurrence (floor(50 / 6) = 8). The test's subject is the filters, so
+      // the page must not be what hides a row.
+      const HOT = pagedName("HOT", 50);
+      const FAR_NULL = pagedName("FAR_NULL", 8);
+      await seed(HOT, now - 2 * H, 240, null);
       await seed("FAR_HIGH", now - 25 * H, 0, 35000);
       await seed("FAR_LOW", now - 25 * H, 0, 3000);
-      await seed("FAR_NULL", now - 2 * H, 1380, null);
+      await seed(FAR_NULL, now - 2 * H, 1380, null);
       await seed("FAR_CORPSE", now - 25 * H, 0, 5_000_000);
 
       const pool = await db.getReevalPool({
@@ -10945,13 +11002,13 @@ async function main() {
         now,
       });
       const tokens = pool.map((x) => x.token);
-      assert.ok(tokens.includes("HOT"), "hot zone coin with NULL history is kept");
+      assert.ok(tokens.includes(HOT), "hot zone coin with NULL history is kept");
       assert.ok(
         tokens.includes("FAR_HIGH"),
         "coin above the pre-qualification floor is kept",
       );
       assert.ok(
-        tokens.includes("FAR_NULL"),
+        tokens.includes(FAR_NULL),
         "coin with no mcap history yet (NULL) is kept — not yet seen with pair data",
       );
       assert.ok(
@@ -10966,7 +11023,7 @@ async function main() {
       // coin is ranked before the unknown (NULL) one, so a dense band's
       // LIMIT picks it instead of an arbitrary band-edge coin.
       assert.ok(
-        tokens.indexOf("FAR_HIGH") < tokens.indexOf("FAR_NULL"),
+        tokens.indexOf("FAR_HIGH") < tokens.indexOf(FAR_NULL),
         "signal ordering: known high-mcap coin before unknown (NULL)",
       );
     } finally {
@@ -11002,10 +11059,19 @@ async function main() {
           args: [token, firstSeenAt, 80, now - 80 * M, maxMcap],
         });
       };
-      await seed("OLD_EVID", cutoff - 1, null); // past the grace, no reading → out
-      await seed("EDGE_OLD", cutoff, null); // the boundary itself: not > → out
-      await seed("EDGE_LIVE", cutoff + 1, null); // one ms inside → kept
-      await seed("FRESH_EVID", now - H, null); // within the grace → kept
+      // rotationPeriodMs 1e12 pins the slot (and therefore the page phase) to
+      // floor(now / 1e12) = 1 for the whole test, so every NULL-history name
+      // must sit in bucket 63 — otherwise this test would be observing the
+      // page filter instead of the grace cutoff.
+      const HOT_PHASE = 1;
+      const OLD_EVID = pagedName("OLD_EVID", HOT_PHASE);
+      const EDGE_OLD = pagedName("EDGE_OLD", HOT_PHASE);
+      const EDGE_LIVE = pagedName("EDGE_LIVE", HOT_PHASE);
+      const FRESH_EVID = pagedName("FRESH_EVID", HOT_PHASE);
+      await seed(OLD_EVID, cutoff - 1, null); // past the grace, no reading → out
+      await seed(EDGE_OLD, cutoff, null); // the boundary itself: not > → out
+      await seed(EDGE_LIVE, cutoff + 1, null); // one ms inside → kept
+      await seed(FRESH_EVID, now - H, null); // within the grace → kept
       await seed("OLD_MCAP", cutoff - 1, 120_000); // old but measured → kept
       const opts = {
         sinceMs: now - 30 * H,
@@ -11025,7 +11091,7 @@ async function main() {
       const perBand = (await db.getReevalPool(opts)).map((r) => r.token).sort();
       assert.deepEqual(
         perBand,
-        ["EDGE_LIVE", "FRESH_EVID", "OLD_MCAP"],
+        [EDGE_LIVE, FRESH_EVID, "OLD_MCAP"].sort(),
         "the pool carries no-evidence rows only inside the grace",
       );
       const batched = (await db.getReevalPoolBatched(opts)).map((r) => r.token).sort();
@@ -11037,16 +11103,16 @@ async function main() {
         .map((r) => r.token)
         .sort();
       assert.ok(
-        earlier.length === 5 && earlier.includes("OLD_EVID"),
+        earlier.length === 5 && earlier.includes(OLD_EVID),
         `an earlier clock must re-admit the rows the grace hid (got ${JSON.stringify(earlier)})`,
       );
       // RECOVERY: one positive reading clears the exclusion — this is the same
       // raise the tick's own updateTokenMaxMcaps writes from a served leg.
-      await db.updateTokenMaxMcaps([{ token: "OLD_EVID", mcapUsd: 150_000 }]);
+      await db.updateTokenMaxMcaps([{ token: OLD_EVID, mcapUsd: 150_000 }]);
       const after = (await db.getReevalPoolBatched(opts)).map((r) => r.token).sort();
       assert.deepEqual(
         after,
-        ["EDGE_LIVE", "FRESH_EVID", "OLD_EVID", "OLD_MCAP"],
+        [EDGE_LIVE, FRESH_EVID, OLD_EVID, "OLD_MCAP"].sort(),
         "a served reading brings the coin back into the rotation",
       );
     } finally {
@@ -11259,10 +11325,15 @@ async function main() {
       };
       // Same hot zone (age 6h — evaluated every scan): one coin no chat has
       // seen, one pushed to chat-a only (chat-b's delivery failed — the
-      // cross-chat inconsistency), one seen by every chat.
-      await seed("NONE", []);
-      await seed("PARTIAL", ["chat-a"]);
-      await seed("FULL", ["chat-a", "chat-b"]);
+      // cross-chat inconsistency), one seen by every chat. All three carry no
+      // mcap evidence, so their names must sit in the hot band's page for this
+      // slot (50) or the page would answer instead of the seen rule.
+      const NONE = pagedName("NONE", 50);
+      const PARTIAL = pagedName("PARTIAL", 50);
+      const FULL = pagedName("FULL", 50);
+      await seed(NONE, []);
+      await seed(PARTIAL, ["chat-a"]);
+      await seed(FULL, ["chat-a", "chat-b"]);
 
       const opts = {
         sinceMs: now - 42 * H,
@@ -11279,25 +11350,25 @@ async function main() {
       const chatAware = (
         await db.getReevalPool({ ...opts, seenChatIds: ["chat-a", "chat-b"] })
       ).map((x) => x.token);
-      assert.ok(chatAware.includes("NONE"), "unseen coin stays in the pool");
+      assert.ok(chatAware.includes(NONE), "unseen coin stays in the pool");
       assert.ok(
-        chatAware.includes("PARTIAL"),
+        chatAware.includes(PARTIAL),
         "coin pushed to one chat but missed by another stays in the pool for a retry",
       );
       assert.ok(
-        !chatAware.includes("FULL"),
+        !chatAware.includes(FULL),
         "coin seen by every enabled chat is excluded",
       );
 
       // Legacy (no seenChatIds): any seen row removes the coin — the old
       // token-level behavior that permanently starved the missed chat.
       const legacy = (await db.getReevalPool(opts)).map((x) => x.token);
-      assert.ok(legacy.includes("NONE"), "legacy: unseen coin stays");
+      assert.ok(legacy.includes(NONE), "legacy: unseen coin stays");
       assert.ok(
-        !legacy.includes("PARTIAL"),
+        !legacy.includes(PARTIAL),
         "legacy: partial push excludes the coin everywhere (the old bug)",
       );
-      assert.ok(!legacy.includes("FULL"), "legacy: fully-seen coin excluded");
+      assert.ok(!legacy.includes(FULL), "legacy: fully-seen coin excluded");
     } finally {
       await t.cleanup();
     }

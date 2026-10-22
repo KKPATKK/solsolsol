@@ -1403,7 +1403,7 @@ export function poolKeyHash(text: string): string {
  * entry holds exactly the rows (no mcap reading, past the grace) the new
  * predicate drops.
  */
-export const POOL_QUERY_SHAPE_VERSION = "v3-2026-10-09-mcap-evidence";
+export const POOL_QUERY_SHAPE_VERSION = "v4-2026-10-21-band-page";
 
 /**
  * The STABLE half of a pool query, as a key fragment.
@@ -1769,12 +1769,14 @@ export const RE_EVAL_PER_TICK_MAX = 150;
  * WHY A CAP RATHER THAN "ALL OF THEM" (2026-10-21): the hot band is the
  * latency-critical cohort (coins crossing the age gate right now), so it must
  * be served every tick — but it must not own the window. Its evidenced cohort
- * is 25 rows at the live band size, which fits 0.2 × 150 = 30; the rest of the
- * 1,007-row hot band is no-evidence fillers, and those go to the filler lane
- * like every other zone's. Measured before the split: the hot head consumed
- * the whole 90-row window on cold ticks, which is exactly what starved near/far.
+ * is 25-81 rows at the live band size, which fits 0.18 × 150 = 27 (a 3-tick
+ * cycle, the same as 30); the rest of the 730-row hot band is no-evidence
+ * fillers, paged by the query and served by the filler lane like every other
+ * zone's. Measured before the split: the hot head consumed the whole 90-row
+ * window on cold ticks, which is exactly what starved near/far. The 3 rows
+ * this gives up versus 0.2 are what funds the filler reservation.
  */
-export const POOL_SLICE_HOT_SHARE = 0.2;
+export const POOL_SLICE_HOT_SHARE = 0.18;
 
 /**
  * Share of the per-tick window the NEAR band's evidenced rows may take.
@@ -1784,17 +1786,38 @@ export const POOL_SLICE_HOT_SHARE = 0.2;
  * slicePoolZones), which is 190 / 3 ≈ 64 at the live cohort — the number the
  * 3-minute promise needs. A busier market grows that cohort, and an uncapped
  * take would then eat the far lane (the budget is granted in priority order).
- * 0.43 × 150 = 64 is the live need with one row of headroom; a larger band
- * degrades to a longer near sweep instead of starving far.
+ * 0.43 × 150 = 64 covers the live 188-row cohort in its 3-tick appearance
+ * (188 / 3 ≈ 63, and a 203-row peak still finishes inside the 6-tick
+ * recurrence); a larger band degrades to a longer near sweep instead of
+ * starving far.
  */
 export const POOL_SLICE_NEAR_SHARE = 0.43;
 
 /**
- * Sibling of POOL_SLICE_NEAR_SHARE for the far band: 0.35 × 150 = 52, the
- * appearance take of the live 155-row far cohort (155 / 3 ≈ 52) and therefore
- * the 12-minute sweep. Same degradation rule as near.
+ * Sibling of POOL_SLICE_NEAR_SHARE for the far band: 0.27 × 150 = 40, the
+ * appearance take of the live 155-row far cohort (155 / 3 ≈ 52) with room for
+ * the 212-row peak (212 / 40 = 6 ticks, far inside the 24-tick recurrence).
+ * Same degradation rule as near.
  */
-export const POOL_SLICE_FAR_SHARE = 0.35;
+export const POOL_SLICE_FAR_SHARE = 0.27;
+
+/**
+ * Share of the per-tick window the FILLER lane is GUARANTEED, not merely
+ * offered as the remainder.
+ *
+ * WHY A RESERVATION (2026-10-21): filler was "what is left after hot/near/far",
+ * which made its cadence a function of the other lanes' appetite. When near and
+ * far were correctly sized to their appearance takes they took 146 of the 150
+ * rows and filler got 4 — ~100 ticks (~50 min) for the returned cohort, and
+ * unbounded when a band grew. 0.12 × 150 = 18 rows/tick is the rate the
+ * query's paging needs: the page filter (Db.POOL_BAND_ROTATE_BUCKETS) returns
+ * one 64th of each band's no-evidence rows — near's two slots carry ~32 each
+ * and hot ~11 per slot, so ~84 rows per 3 min ≈ 14/tick — and the lane must at
+ * least match that or a bucket would be replaced before it is read (the
+ * starvation the page filter exists to remove). Leftover budget still cascades
+ * to the better lanes first (see slicePoolZones).
+ */
+export const POOL_SLICE_FILLER_SHARE = 0.12;
 
 /**
  * The tick interval the zone cadences are derived from, ms.
@@ -2511,6 +2534,16 @@ export function slicePoolZones<T>(
     zones.hot.length,
     Math.max(1, Math.round(window * POOL_SLICE_HOT_SHARE)),
   );
+  // Filler is a RESERVED lane, not the remainder (see
+  // POOL_SLICE_FILLER_SHARE): its share is held back before near/far are
+  // granted, so a busy evidenced cohort can never squeeze it to zero. An empty
+  // filler lane reserves nothing and the budget goes to the other zones as it
+  // always did. Any budget the reservation does not use still cascades through
+  // the priority order below (filler comes last, as before).
+  const fillerReserve = Math.min(
+    zones.filler.length,
+    Math.max(0, Math.round(window * POOL_SLICE_FILLER_SHARE)),
+  );
   // The share caps arbitrate between the two ROTATING bands; a caller with a
   // stable cohort (no slot counts) gets the recurrence take exactly, which is
   // what the pre-rotation contract and its unit test describe.
@@ -2536,14 +2569,13 @@ export function slicePoolZones<T>(
     ),
     farCap,
   );
-  let budget = window;
+  let budget = window - fillerReserve;
   takes.hot = Math.min(wantHot, budget);
   budget -= takes.hot;
   takes.near = Math.min(wantNear, budget);
   budget -= takes.near;
   takes.far = Math.min(wantFar, budget);
-  budget -= takes.far;
-  takes.filler = Math.min(zones.filler.length, budget);
+  takes.filler = fillerReserve;
   const plans = {
     hot: planLane(zones.hot, cursorOf.hot, takes.hot),
     near: planLane(zones.near, cursorOf.near, takes.near),
@@ -7182,10 +7214,12 @@ export class Scanner {
       // whole window whenever the isolate was cold — measured: cold ticks'
       // rejects 70–91min, warm ticks 276–438min, near+far ≈ 57 min/pass against
       // the designed 3/12. Each zone now keeps its own cursor and gets
-      // len/ticks-in-its-recurrence rows per tick; the filler lane rides what
-      // is left. The cursors themselves are DURABLE (db.POOL_SLICE_CURSOR_KEY):
-      // half the deliveries run on a freshly recycled isolate, and an isolate-
-      // local cursor made those ticks start every zone at 0 again.
+      // len/ticks-in-its-recurrence rows per tick; the filler lane has its own
+      // reserved share (POOL_SLICE_FILLER_SHARE) and then eats any leftover,
+      // because the query's bucket page is sized to that rate. The cursors
+      // themselves are DURABLE (db.POOL_SLICE_CURSOR_KEY): half the deliveries
+      // run on a freshly recycled isolate, and an isolate-local cursor made
+      // those ticks start every zone at 0 again.
       const feedOnly = poolProfiles.slice(0, feedProfiles.length);
       const poolOnly = poolProfiles.slice(feedProfiles.length);
       const evidencedTokens = new Set(

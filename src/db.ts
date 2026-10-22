@@ -373,27 +373,43 @@ const POOL_FAR_SLOTS = 6;
 /** Share of the rotation budget given to the near zone (rest → far zone). */
 const POOL_NEAR_LIMIT_SHARE = 0.7;
 /**
- * Buckets a near/far band's overflow rotates through (see poolBandOrder).
+ * Buckets a band's NO-EVIDENCE rows are paged through (see poolBandPageSql).
  *
- * WHY: a rotation band is read in signal order (max_mcap_observed, then
- * first_m5_vol) and capped at its per-slot LIMIT, so a sub-window holding more
- * rows than its LIMIT is truncated to the same signal-ordered head on every
- * visit — the rest is never read, "however often its slot comes around" (the
- * 2026-09-15 sizing note in wrangler.toml). Resizing the slots fixed that once;
- * by 2026-09-29 growth had undone it, and the overflow had collapsed into a
- * single TIE GROUP: the live worst far sub-window held 400 rows against a
- * 210-row LIMIT, of which 256 shared the identical key (no peak, zero
- * first_m5_vol) and only 66 of that group fitted — 190 rows readable only if
- * something rotated the choice. Those rows carry no signal to lose, so a tie
- * break appended AFTER both signal keys cannot demote a row that has signal:
- * it only decides WHICH of the indistinguishable rows the LIMIT takes, and
- * advances that choice once per recurrence of the band. Measured on that
- * sub-window: K=8 serves 76.8% of the band over 8 recurrences (2.4h) where the
- * fixed ordering serves the same 52.5% forever; K=16 reaches 100% over 16.
- * The key is the token's last character (base58 ⇒ evenly spread), which keeps
- * the rotation deterministic and cacheable — unlike RANDOM().
+ * WHY A FILTER AND NOT A TIE-BREAK (2026-10-21, measured): a rotation band is
+ * read in signal order and capped at its per-slot LIMIT, so a sub-window
+ * holding more rows than its LIMIT is truncated to the same signal-ordered
+ * head on every visit — the rest is never read, "however often its slot comes
+ * around". Resizing the slots fixed that once; by 2026-09-29 growth had undone
+ * it, and a tie-break bucket was added AFTER both signal keys so the overflow
+ * of one tie group would rotate. That only ever paged the TIE GROUP: live
+ * 2026-10-21 the near slots held 1,451 / 2,034 rows against a 518-row LIMIT,
+ * their 2,233 / 1,866 no-evidence rows sharing almost the same key, so the
+ * choice inside that group rotated while the rows below it stayed invisible;
+ * measured coverage of the overflow stalled around 77% over 8 recurrences.
+ *
+ * The bucket is therefore a WHERE filter on rows with no mcap evidence (an
+ * evidenced row is never paged — it is the actionable cohort and must come
+ * back every visit). Each phase returns ONE bucket's no-evidence page in full,
+ * so every such row is returned exactly once per K recurrences (near K × 3 min
+ * = 3.2h, far K × 12 min, hot K × 90s) instead of a rotating head that repeats
+ * and starves the tail.
+ *
+ * K=64 is sized from two live numbers, not taste:
+ *   - the page must fit the band's residual LIMIT after its evidenced rows
+ *     (near: 64 + 188 evidenced = 252 of 518; hot: 11 + 81 = 92 of 460; far:
+ *     2 + 147 = 149 of 222) — otherwise the page itself would be clipped and
+ *     the guarantee would be false again;
+ *   - the page must fit what the slice's filler lane can evaluate between one
+ *     page and its next turn (12% of the 150-row window = 18 rows/tick; the
+ *     near page of ~32 across two slots plus hot's ~11 = ~84 rows per 3 min
+ *     ≈ 14/tick). Returning more than the lane can eat is what makes a
+ *     "cadence" unobservable in practice.
+ * The key mixes the token's first and last character: base58 gives both ends
+ * an even spread, and one character alone would leave empty buckets once K is
+ * large (UNICODE range 49-122 against mod 64). Deterministic and cacheable —
+ * unlike RANDOM().
  */
-const POOL_BAND_ROTATE_BUCKETS = 8;
+const POOL_BAND_ROTATE_BUCKETS = 64;
 
 /**
  * Which rotation zone a returned pool row belongs to, by its launch time and
@@ -440,20 +456,29 @@ export function poolZoneOfLaunch(
  * next argument after the seen-clause args and BEFORE `center`/`LIMIT` — the
  * fragment carries exactly one `?`.
  */
-function poolBandOrder(orderBy: "entry" | "signal"): {
-  sql: string;
-  rotate: boolean;
-} {
-  if (orderBy === "entry") {
-    return { sql: "ORDER BY ABS(launch_ms - ?)", rotate: false };
-  }
-  return {
-    sql:
-      "ORDER BY COALESCE(max_mcap_observed, 0) DESC, " +
-      "COALESCE(first_m5_vol, 0) DESC, " +
-      `((UNICODE(SUBSTR(token, -1)) + ?) % ${POOL_BAND_ROTATE_BUCKETS})`,
-    rotate: true,
-  };
+function poolBandOrder(orderBy: "entry" | "signal"): string {
+  if (orderBy === "entry") return "ORDER BY ABS(launch_ms - ?)";
+  // `token` is the final tie-break so the order is total and repeatable (the
+  // bucket filter already pins the no-evidence rows to one page).
+  return (
+    "ORDER BY COALESCE(max_mcap_observed, 0) DESC, " +
+    "COALESCE(first_m5_vol, 0) DESC, token"
+  );
+}
+
+/**
+ * WHERE fragment that pages a band's no-evidence rows (see
+ * POOL_BAND_ROTATE_BUCKETS). Carries ONE `?` — the rotation phase — bound
+ * immediately after the evidence cutoff, before the floor arguments.
+ *
+ * `max_mcap_observed IS NOT NULL` is the evidence test: rows WITH a reading
+ * are never paged, so a coin that can act is returned on every visit.
+ */
+function poolBandPageSql(): string {
+  return (
+    "(max_mcap_observed IS NOT NULL OR " +
+    `((UNICODE(SUBSTR(token, 1)) + UNICODE(SUBSTR(token, -1)) * 17 + ?) % ${POOL_BAND_ROTATE_BUCKETS}) = 0)`
+  );
 }
 /**
  * Rotation cadence default — must match the caller's pool cache TTL so
@@ -2602,11 +2627,22 @@ export class Db {
       center: number;
       limit: number;
       orderBy: "entry" | "signal";
-      /** See queryReevalBand / POOL_BAND_ROTATE_BUCKETS ("signal" only). */
+      /** See queryReevalBand / POOL_BAND_ROTATE_BUCKETS (every band). */
       rotatePhase?: number;
     }> = [];
+    // One page phase per band (see poolBandPageSql). The hot band advances with
+    // the rotation slot itself: it is on screen on every visit, so its page
+    // must move on every slot or its un-evidenced tail would never be read.
+    const hotPhase = poolRotationSlot(now, opts.rotationPeriodMs);
     if (hotHi > hotLo) {
-      bands.push({ lo: hotLo, hi: hotHi, center, limit: hotLimit, orderBy: "entry" });
+      bands.push({
+        lo: hotLo,
+        hi: hotHi,
+        center,
+        limit: hotLimit,
+        orderBy: "entry",
+        rotatePhase: hotPhase,
+      });
     }
     const rotLimit = Math.max(0, opts.limit - hotLimit);
     const rotLo = spanLo; // oldest launch in the window
@@ -2657,8 +2693,18 @@ export class Db {
     if (bands.length === 0) return [];
     const seen = this.seenExclusion(opts.seenChatIds);
     const statements = bands.map((b) => {
-      const clauses: string[] = [DEAD_POOL_CLAUSE, POOL_MCAP_EVIDENCE_CLAUSE];
-      const args: Array<string | number> = [b.lo, b.hi, opts.sinceMs, mcapEvidenceSinceMs];
+      const clauses: string[] = [
+        DEAD_POOL_CLAUSE,
+        POOL_MCAP_EVIDENCE_CLAUSE,
+        poolBandPageSql(),
+      ];
+      const args: Array<string | number> = [
+        b.lo,
+        b.hi,
+        opts.sinceMs,
+        mcapEvidenceSinceMs,
+        b.rotatePhase ?? 0,
+      ];
       // Literal floor, no argument — see mcapFloorLiteral. Both builders must
       // carry the SAME shape or the drift guard pins them apart.
       if (opts.minQualifyMcap !== undefined) {
@@ -2678,10 +2724,8 @@ export class Db {
       }
       args.push(...seen.args);
       // The ORDER BY comes from the SAME helper the per-band path uses (see
-      // poolBandOrder), so a change to the signal ordering or its rotation tie
-      // break cannot land on one path only.
+      // poolBandOrder), so the two paths cannot drift.
       const order = poolBandOrder(b.orderBy);
-      if (order.rotate) args.push(b.rotatePhase ?? 0);
       if (b.orderBy === "signal") {
         args.push(b.limit);
         return {
@@ -2689,7 +2733,7 @@ export class Db {
                 WHERE launch_ms BETWEEN ? AND ?
                   AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
                   ${seen.clause}
-                ${order.sql}
+                ${order}
                 LIMIT ?`,
           args,
         };
@@ -2700,7 +2744,7 @@ export class Db {
               WHERE launch_ms BETWEEN ? AND ?
                 AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
                 ${seen.clause}
-              ${order.sql}
+              ${order}
               LIMIT ?`,
         args,
       };
@@ -5664,8 +5708,12 @@ export class Db {
     const hotHi = Math.min(spanHi, center + POOL_HOT_ABOVE_MS);
     const hotLimit = Math.min(opts.limit, POOL_HOT_MAX);
     const out: TokenStats[] = [];
+    const hotPhase = poolRotationSlot(now, opts.rotationPeriodMs);
     if (hotHi > hotLo) {
       // Hot zone: every scan, nearest to the entry first (latency-critical).
+      // Its no-evidence rows are paged too (see POOL_BAND_ROTATE_BUCKETS): the
+      // band outgrew its 460-row limit (730 live on 2026-10-21), and without a
+      // page the rows beyond the head would never be read.
       out.push(
         ...(await this.queryReevalBand(hotLo, hotHi, center, {
           sinceMs: opts.sinceMs,
@@ -5676,6 +5724,7 @@ export class Db {
           minQualifyLiquidity: opts.minQualifyLiquidity,
           seenChatIds: opts.seenChatIds,
           orderBy: "entry",
+          rotatePhase: hotPhase,
         })),
       );
     }
@@ -5775,8 +5824,9 @@ export class Db {
       seenChatIds?: string[];
       orderBy: "entry" | "signal";
       /**
-       * Rotation phase for the "signal" ordering's tie break. Callers pass the
-       * band's own recurrence index (see getReevalPool); "entry" ignores it.
+       * Rotation phase for the NO-EVIDENCE page (see poolBandPageSql). Callers
+       * pass the band's own recurrence index (see getReevalPool); every band,
+       * the hot one included, has one.
        */
       rotatePhase?: number;
     },
@@ -5793,7 +5843,13 @@ export class Db {
     // The no-evidence clause rides both builders the same way: a row that has
     // never recorded a positive mcap is carried only inside its grace (see
     // POOL_MCAP_EVIDENCE_GRACE_MS) — the fail-open kept, its clock bounded.
-    const clauses: string[] = [DEAD_POOL_CLAUSE, POOL_MCAP_EVIDENCE_CLAUSE];
+    // The page clause follows it and filters that same population to one
+    // bucket per phase (see POOL_BAND_ROTATE_BUCKETS); its `?` binds next.
+    const clauses: string[] = [
+      DEAD_POOL_CLAUSE,
+      POOL_MCAP_EVIDENCE_CLAUSE,
+      poolBandPageSql(),
+    ];
     // A LITERAL, not a bound argument — see mcapFloorLiteral: this is what lets
     // Db.ensurePoolBandIndex's partial index cover the band's range.
     if (opts.minQualifyMcap !== undefined)
@@ -5809,8 +5865,15 @@ export class Db {
     const qualifyClause = clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : "";
     const seen = this.seenExclusion(opts.seenChatIds);
     // The evidence cutoff binds first — the clause's placeholder sits right
-    // after `first_seen_at > ?`, before every floor's (order is binding order).
-    const args: Array<string | number> = [lo, hi, opts.sinceMs, opts.mcapEvidenceSinceMs];
+    // after `first_seen_at > ?`, before the page's phase and every floor's
+    // (order is binding order, and the batched builder must match it exactly).
+    const args: Array<string | number> = [
+      lo,
+      hi,
+      opts.sinceMs,
+      opts.mcapEvidenceSinceMs,
+      opts.rotatePhase ?? 0,
+    ];
     // No argument for minQualifyMcap: it rides the SQL as a literal (see
     // mcapFloorLiteral) so the partial index can cover this range.
     if (opts.maxQualifyMcap !== undefined) args.push(opts.maxQualifyMcap);
@@ -5818,7 +5881,6 @@ export class Db {
       args.push(opts.minQualifyLiquidity);
     args.push(...seen.args);
     const order = poolBandOrder(opts.orderBy);
-    if (order.rotate) args.push(opts.rotatePhase ?? 0);
     if (opts.orderBy === "entry") args.push(center);
     args.push(opts.limit);
     const res = await this.get().execute({
@@ -5827,7 +5889,7 @@ export class Db {
               AND first_seen_at > ?
               ${qualifyClause}
               ${seen.clause}
-            ${order.sql}
+            ${order}
             LIMIT ?`,
       args,
     });

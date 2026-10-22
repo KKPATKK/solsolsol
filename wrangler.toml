@@ -503,10 +503,12 @@ RE_EVAL_POOL_SIZE = "1200"
 # measurement showed why it never needs to be: the 190 overflow rows of that
 # far sub-window sat in ONE tie group — 256 rows carrying the identical signal
 # key (no mcap peak, zero first_m5_vol), of which the LIMIT could take 66. The
-# bands now resolve those ties with a rotating bucket (src/db.ts
-# POOL_BAND_ROTATE_BUCKETS / poolBandOrder), so the overflow is served over
-# successive sweeps instead of never, and the slot counts below are a cadence
-# choice again rather than a starvation lever.
+# overflow is now PAGED by a bucket filter (src/db.ts POOL_BAND_ROTATE_BUCKETS
+# / poolBandPageSql): rows WITHOUT mcap evidence return one page per phase, so
+# every such row is read exactly once per 64 recurrences (near 3.2h, far 12.8h,
+# hot 96 min), while an evidenced row is never paged — it comes back on every
+# visit because it is the actionable cohort. The slot counts below are a
+# cadence choice again rather than a starvation lever.
 #
 # 2026-10-09 — FAR SWEEP 18 → 12 MIN, measured: the no-evidence prune cut the
 # far band's candidate set (1,107 → 127 in one slot; every one of the 127
