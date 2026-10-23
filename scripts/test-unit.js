@@ -22519,10 +22519,14 @@ async function main() {
         workerSrc.includes(
           'awaitscanner.runTrackerPass(Date.now()+TRACKER_PASS_BUDGET_MS,hold?(p:Promise<unknown>)=>hold(p):undefined,subreqRemaining,{via:"cron-pass",relay:relayTag??undefined},);',
         ),
+      // The branch is named by the DELIVERY, not by the cron string (2026-10-23):
+      // the merged every-minute trigger relays the pass too, so a tracker replay
+      // may carry the scan expression.
       "worker (the scheduled handler routes that delivery before any scan bookkeeping)":
-        workerSrc.indexOf("if(isTrackerCron(event.cron)){") >= 0 &&
+        workerSrc.indexOf("consttrackerDelivery=") >= 0 &&
+        workerSrc.indexOf("if(trackerDelivery){") >= 0 &&
         workerSrc.indexOf("awaitrunTrackerInvocation(env,relayTag);") >
-          workerSrc.indexOf("if(isTrackerCron(event.cron)){") &&
+          workerSrc.indexOf("if(trackerDelivery){") &&
         workerSrc.indexOf("awaitrunTrackerInvocation(env,relayTag);") <
           workerSrc.indexOf("scheduledTicks++;"),
     };
@@ -24274,9 +24278,11 @@ async function main() {
     );
     assert.equal(isTrackerCron(undefined), false);
     assert.equal(isTrackerCron(null), false);
-    // The expression has to be configured, too: the platform hands over the
-    // string it was given, so a constant wrangler.toml does not carry is a
-    // delivery that never fires (survivable through the fallback, not correct).
+    // Since 2026-10-23 the pass has NO platform expression of its own: the
+    // merged every-minute trigger relays it (see worker.scheduled). What has to
+    // be pinned is the ABSENCE — two equivalent every-minute expressions are
+    // what stopped being delivered on 2026-10-23 — plus the fact that the
+    // constant still exists for the relay's synthetic cron string.
     const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
     const block = /^\[triggers\][\s\S]*?^crons\s*=\s*\[([^\]]*)\]/m.exec(toml);
     assert.ok(block, "wrangler.toml must carry a [triggers].crons list");
@@ -24284,16 +24290,18 @@ async function main() {
       .split(",")
       .map((s) => s.trim().replace(/^"|"$/g, ""))
       .filter((s) => s.length > 0);
-    assert.ok(list.includes("* * * * *"), "the scan tick keeps its own expression");
-    assert.ok(
+    assert.ok(list.includes("* * * * *"), "the merged every-minute trigger must stay configured");
+    assert.equal(
       list.includes(TRACKER_CRON),
-      `the pass's delivery must be configured: ${TRACKER_CRON}`,
+      false,
+      "the pass must NOT have an every-minute expression of its own — the merged trigger dispatches it",
     );
     assert.equal(
-      isTrackerCron(list[0]),
-      false,
-      "the FIRST expression stays the scan tick — the tick's fallback assumes the pass expression is the new one",
+      list.filter((e) => e === "* * * * *").length,
+      1,
+      "exactly ONE every-minute expression: duplicates are the failure mode this change removes",
     );
+    assert.equal(list[0], "* * * * *", "the FIRST expression stays the scan tick");
     assert.equal(TRACKER_PASS_FALLBACK_FRESH_MS, 120_000);
   });
 
@@ -24421,7 +24429,9 @@ async function main() {
     );
     // The routing returns BEFORE the scan's arrival bookkeeping — the arrival
     // counters and the cadence gate both compare SCAN arrivals.
-    const route = workerSrc.indexOf("isMaintenanceCron(event.cron)) {");
+    // Named by the delivery, not the expression (2026-10-23): see the merged
+    // every-minute trigger.
+    const route = workerSrc.indexOf("if (maintenanceDelivery) {");
     const arrivals = workerSrc.indexOf("scheduledTicks++;");
     assert.ok(route > 0, "the scheduled handler must route the maintenance delivery");
     assert.ok(arrivals > 0, "the scan bookkeeping anchor must exist");
@@ -26268,13 +26278,43 @@ async function main() {
       src.includes("if (opts?.relay !== false)"),
       "only the platform's own delivery may relay",
     );
+    // THE MERGED EVERY-MINUTE TRIGGER (2026-10-23): one platform delivery
+    // dispatches BOTH relays, in parallel, and the scan answer is the one that
+    // gates the local tick. A relayed invocation names its leg and never
+    // reaches this block.
     assert.ok(
-      src.includes('const relay = await relayCronDelivery(env, "scan");'),
+      stripped.includes(
+        "if(mergedCron){const[scanResult,trackerResult]=awaitPromise.all([relayCronDelivery(env,\"scan\"),relayCronDelivery(env,\"tracker\"),]);scanRelay=scanResult;",
+      ),
+      "the merged delivery must relay the scan AND the pass",
+    );
+    assert.ok(
+      stripped.includes(
+        "constmergedCron=leg===null&&!clockDelivery&&opts?.relay!==false&&event.cron===SCAN_CRON;",
+      ),
+      "the merged dispatch is for the platform's own every-minute delivery, never a replay or the clock",
+    );
+    assert.ok(
+      src.includes('scanRelay ?? (await relayCronDelivery(env, "scan"))'),
       "the scan relay answer gates the return",
+    );
+    // A replay is routed by its LEG, which outranks the cron string: the merged
+    // trigger's tracker replay carries SCAN_CRON (DELIVERY_CRONS.scan is what
+    // the relay route replays for every delivery), so a string comparison
+    // would run a second scan and never the pass.
+    assert.ok(
+      stripped.includes("constleg=opts?.leg??null;") &&
+        stripped.includes(
+          'consttrackerDelivery=leg==="tracker"||(leg===null&&isTrackerCron(event.cron));',
+        ) &&
+        stripped.includes(
+          'constmaintenanceDelivery=leg==="maintenance"||(leg===null&&isMaintenanceCron(event.cron));',
+        ),
+      "the handler must route a replayed delivery by its leg, not by its expression",
     );
     // The tracker and maintenance branches relay BEFORE they run their own
     // body, and fall through to it when the relay says false.
-    const trackerAt = src.indexOf("if (isTrackerCron(event.cron)) {");
+    const trackerAt = src.indexOf("if (trackerDelivery) {");
     assert.ok(trackerAt > 0, "the tracker delivery must be routed");
     const trackerRelayAt = src.indexOf(
       'await relayCronDelivery(env, "tracker")',
@@ -26288,7 +26328,7 @@ async function main() {
       trackerRelayAt > trackerAt && trackerLocalAt > trackerRelayAt,
       "a failed tracker relay must fall through to the local pass",
     );
-    const maintAt = src.indexOf("if (isMaintenanceCron(event.cron)) {");
+    const maintAt = src.indexOf("if (maintenanceDelivery) {");
     assert.ok(maintAt > 0, "the maintenance delivery must be routed");
     const maintRelayAt = src.indexOf(
       'await relayCronDelivery(env, "maintenance")',
@@ -26327,9 +26367,9 @@ async function main() {
     );
     assert.ok(
       stripped.includes(
-        'awaitworker.scheduled({cron:DELIVERY_CRONS[delivery]},env,ctx,{relay:false,relayTag:"inner",...(source===null?{}:{via:source}),});',
+        'awaitworker.scheduled({cron:DELIVERY_CRONS[delivery]},env,ctx,{relay:false,relayTag:"inner",leg:delivery,...(source===null?{}:{via:source}),});',
       ),
-      "the placed half replays the platform's own scheduled entry, through the delivery map — and names the clock as the caller when the clock asked",
+      "the placed half replays the platform's own scheduled entry, through the delivery map — names its LEG (the merged trigger relays both) and the clock as the caller when the clock asked",
     );
     // The durable markers the post-deploy check reads: the scan heartbeat and
     // the two special deliveries' own rows must name the path that ran them.

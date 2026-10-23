@@ -4905,3 +4905,45 @@ hot）／warm tick 276–438min（near/far）** 交替，5 分鐘後 14/20 個 t
 - 上線後要讀 `summary.poolServed` ≈ `{25,68,6,51}`、`poolSliceLanes` ≈
   `{25,403,136,~550}`，以及 reject 年齡同時有 hot 與 near/far；tick `ms` 預期
   由 1.2–2.2s 升到 ~2.5–3.5s。
+
+## 4.76 兩條等價 every-minute cron 合併成一句：scan 同 tracker 共用同一個投遞（2026-10-23）
+
+### 一、量到乜
+
+2026-10-23 17:38Z 起，**scan 嘅 every-minute 表達式停止投遞**，而同一個 Worker 嘅另外兩條
+（`*/1 * * * *` tracker、`*/5 * * * *` maintenance）照樣 fire：durable tick ring 同
+`scheduled_tick_total` 唔再動，scan 只剩 sub-minute clock 喺度推。Cloudflare 對「同一
+Worker 上多條等價 schedule」嘅投遞冇任何保證，呢個就係嗰個失敗模式 —— 兩條都係每分鐘，
+平台揀邊條投遞（或者漏邊條）都唔可以靠。
+
+### 二、改咗乜
+
+- `wrangler.toml` `[triggers].crons` 由三條變兩條：`["* * * * *", "*/5 * * * *"]`。
+  `"*/1 * * * *"` 掍走；`worker.TRACKER_CRON` 保留做 relay 重播用嘅**合成** cron 字串。
+- `worker.scheduled`：平台嘅 `"* * * * *"` delivery（唔係 replay、唔係 clock）用
+  `Promise.all` 同時 relay `scan` 同 `tracker` —— 同 `TickClock.alarm()` 一直做嘅形狀一樣。
+  tracker relay 係 best-effort：失敗只 log，pass 嘅 durable row 係 ownership clock，
+  stale 過 `TRACKER_PASS_FALLBACK_FRESH_MS`（2 分鐘）就由下一個 scan tick 自己跑。
+- relay 由 `opts.leg` 決定分支，**唔再靠 cron 字串**：合併之後 tracker replay 帶住
+  `SCAN_CRON`（`DELIVERY_CRONS.scan`），用字串比對會再跑一次 scan、而永遠唔跑 pass。
+  `handleCronRelay` 每次 replay 都寫 `leg: delivery`；`opts.leg` 未傳時仍然 fallback 去
+  `isTrackerCron` / `isMaintenanceCron`（部署傳播期間未消失嘅舊 `"*/1"` delivery 照樣路由）。
+- branch 條件由 `isTrackerCron(event.cron)` / `isMaintenanceCron(event.cron)` 改成
+  `trackerDelivery` / `maintenanceDelivery`，兩者都在 `beginPreTick` 之前算好，
+  `preTick` 標籤跟同一組布林。
+
+### 三、為何唔怕 relay 死
+
+pass 嘅獨立 invocation 仍然存在（只係由合併嘅 cron 派出去），所以 50/1000-subrequest
+預算照舊分開；relay 死 = pass 跌落 scan tick 嘅 fallback（2 分鐘 stale window），
+代價係 cadence，唔係卡片。scan 自己照舊 relay 失敗就跑 local tick。
+
+### 四、驗證
+
+- `npx tsc --noEmit` exit 0；`npm run test:unit` 全綠（`test-unit` **586 passed, 0 failed**，
+  其餘 suite 全 exit 0）。
+- 測試更新：`TRACKER_CRON` 由「wrangler.toml 必須有」反轉成「**唔准**有自己一條
+  every-minute 表達式」，並釘住 every-minute 表達式只有一條；relay 測試釘住
+  `leg` 優先於字串、合併派送係 `Promise.all`、且只對平台自己嘅 delivery 生效。
+- `npx wrangler deploy --dry-run` 打包成功（config 合法）；真正生效要等下一個
+  `deploy.yml` run（`wrangler deploy` 會用新嘅 crons list 覆蓋 trigger）。

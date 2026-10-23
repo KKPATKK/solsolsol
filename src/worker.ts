@@ -654,8 +654,8 @@ async function stampFlowDebugRun(
 // cadence is bounded, and the cost of firing early is the loop above.
 const SCAN_TRIGGER_INTERVAL_MS = 60_000;
 /**
- * The cron period both trigger expressions share (see TRACKER_CRON and
- * wrangler.toml). Named because the cadence gate's margin
+ * The every-minute platform period (see SCAN_CRON and wrangler.toml). Named
+ * because the cadence gate's margin
  * must leave the gate strictly above ONE period for any interval larger than
  * it — that is what keeps 90/120 skipping alternate ticks.
  */
@@ -2376,9 +2376,9 @@ const MAINTENANCE_BUDGET_MS = 6_000;
  */
 export const TRACKER_PASS_SUBREQ_RESERVE = 12;
 /**
- * The tracker pass's OWN cron delivery — the second `[triggers].crons`
- * expression in wrangler.toml, and the one thing that gives the pass a
- * 50-subrequest invocation of its own.
+ * The tracker pass's OWN delivery — since 2026-10-23 dispatched by the merged
+ * every-minute `[triggers].crons` expression (see wrangler.toml), and the one
+ * thing that gives the pass a 50-subrequest invocation of its own.
  *
  * WHY A SEPARATE INVOCATION (live 2026-09-27T01:31-01:57Z, measured against
  * the deployed claim+reservation merge): the pass shares the scan tick's
@@ -2404,9 +2404,11 @@ export const TRACKER_PASS_SUBREQ_RESERVE = 12;
  *
  * `event.cron` carries the trigger's expression CHARACTER FOR CHARACTER (see
  * Cloudflare's scheduled-handler docs), so the comparison below is exact — and
- * with two triggers configured, a string this constant does not match is a
- * scan tick, never a silently dropped delivery (see runTrackerInvocation's
- * fallback note).
+ * since 2026-10-23 this is NOT a platform trigger any more: the every-minute
+ * scan expression dispatches the pass's relay, which replays this constant as
+ * its synthetic cron string. `opts.leg` is what routes that replay (see
+ * worker.scheduled); the comparison stays for back-compat with a still-live
+ * legacy every-minute pass delivery during propagation.
  */
 export const TRACKER_CRON = "*/1 * * * *";
 /**
@@ -2448,8 +2450,8 @@ export function isTrackerCron(cron: string | null | undefined): boolean {
  *
  * `event.cron` carries the trigger's expression CHARACTER FOR CHARACTER (see
  * Cloudflare's scheduled-handler docs), so the comparison below is exact — and
- * with three triggers configured, a string neither predicate matches is a scan
- * tick, never a silently dropped delivery.
+ * with two platform triggers configured, a string neither predicate matches is
+ * the merged scan tick, never a silently dropped delivery.
  */
 export const MAINTENANCE_CRON = "*/5 * * * *";
 /**
@@ -6814,8 +6816,9 @@ export const CRON_RELAY_PATH = "/internal/cron-relay";
 /**
  * The scan tick's own expression (wrangler.toml [triggers].crons, FIRST
  * entry). Replayed into the relayed invocation so it routes to the SCAN
- * branch: the two special deliveries compare their own expressions and answer
- * false for this one (see isTrackerCron / isMaintenanceCron).
+ * branch: since 2026-10-23 the relay also names its delivery in `opts.leg`,
+ * because the merged every-minute trigger dispatches the pass too and a
+ * tracker replay therefore carries THIS expression.
  */
 export const SCAN_CRON = "* * * * *";
 /**
@@ -6823,7 +6826,9 @@ export const SCAN_CRON = "* * * * *";
  * one replays. A delivery is NAMED on the wire (CRON_RELAY_DELIVERY_HEADER)
  * and mapped here, so the placed route never replays a caller-supplied cron
  * string: an authenticated caller can only ask for one of these three, and a
- * scan tick keeps arriving as SCAN_CRON.
+ * scan tick keeps arriving as SCAN_CRON. Since 2026-10-23 the tracker's
+ * expression is synthetic (its platform trigger is gone, see wrangler.toml),
+ * which is why the relay ALSO names the delivery in `opts.leg`.
  */
 export type CronRelayDelivery = "scan" | "tracker" | "maintenance";
 export const DELIVERY_CRONS: Record<CronRelayDelivery, string> = {
@@ -6994,6 +6999,12 @@ async function handleCronRelay(
     await worker.scheduled({ cron: DELIVERY_CRONS[delivery] }, env, ctx, {
       relay: false,
       relayTag: "inner",
+      // THE LEG, NOT THE EXPRESSION, names the branch (2026-10-23): the
+      // merged every-minute trigger relays both scan and tracker, so both
+      // replays now carry SCAN_CRON (or the tracker's legacy expression) and
+      // a string comparison could not tell them apart. An authenticated
+      // caller can only name one of DELIVERY_CRONS, exactly as before.
+      leg: delivery,
       ...(source === null ? {} : { via: source }),
     });
     return Response.json({ ok: true, delivery, ms: Date.now() - startedAt });
@@ -7025,9 +7036,10 @@ async function handleCronRelay(
  * relay every cron delivery uses (see the relay block above).
  *
  * WHAT ONE TICK DOES: one relay POST per delivery — `scan` and `tracker`, in
- * PARALLEL (they are independent invocations of this Worker; the platform
- * already delivers those two crons on the same minute, so nothing about their
- * concurrency is new) — and then it re-arms. It holds no state a tick needs,
+ * PARALLEL (they are independent invocations of this Worker; the merged
+ * every-minute trigger already dispatches those same two relays, so nothing
+ * about their concurrency is new) — and then it re-arms. It holds no state a
+ * tick needs,
  * writes no rows of its own, and its work is visible exactly where the cron's
  * is: the scan heartbeat (`via: "clock"`, `relay: "inner"`), the durable
  * per-trigger counter (`scan_trigger_clock`) and the pass row's own timestamps.
@@ -9901,13 +9913,20 @@ const worker = {
      * handleCronRelay): `relay: false` says this invocation IS the placed
      * half of a relay and must not relay again, `relayTag` is the region
      * reading that run must publish (always "inner" — the route runs on the
-     * placed fetch path), and `via: "clock"` says the caller is the
-     * sub-minute clock's alarm rather than a cron delivery (see TickClock) —
-     * the one difference the scan branch below acts on. The platform calls
-     * this method with three arguments; the relay route is the only
-     * four-argument call site.
+     * placed fetch path), `leg` names which delivery this replay is for (the
+     * merged every-minute cron relays both scan and tracker, so the cron
+     * string alone is no longer enough to route the replay), and
+     * `via: "clock"` says the caller is the sub-minute clock's alarm rather
+     * than a cron delivery (see TickClock) — the one difference the scan
+     * branch below acts on. The platform calls this method with three
+     * arguments; the relay route is the only four-argument call site.
      */
-    opts?: { relay?: boolean; relayTag?: PassRelayTag; via?: "clock" },
+    opts?: {
+      relay?: boolean;
+      relayTag?: PassRelayTag;
+      leg?: CronRelayDelivery;
+      via?: "clock";
+    },
   ): Promise<void> {
     // Keep the invocation open for the tick's deferred writes (see
     // tickWaitUntil): a fire-and-forget drain is cancelled when the handler
@@ -9920,13 +9939,18 @@ const worker = {
     // so the tag cannot change the routing it describes): the pass's own
     // delivery is a window of its own, and everything a reader concludes about
     // "the tick front's spend" depends on the two not being mixed.
+    // WHICH DELIVERY (2026-10-23): the relay's `leg` wins over the cron
+    // string. The merged every-minute trigger dispatches BOTH scan and
+    // tracker, so a tracker replay may carry SCAN_CRON; routing it by string
+    // would run a second scan and never the pass.
+    const leg = opts?.leg ?? null;
+    const trackerDelivery =
+      leg === "tracker" || (leg === null && isTrackerCron(event.cron));
+    const maintenanceDelivery =
+      leg === "maintenance" || (leg === null && isMaintenanceCron(event.cron));
     beginPreTick(
       Date.now(),
-      isTrackerCron(event.cron)
-        ? "pass"
-        : isMaintenanceCron(event.cron)
-          ? "maint"
-          : "scan",
+      trackerDelivery ? "pass" : maintenanceDelivery ? "maint" : "scan",
     );
     tickWaitUntil = (promise) => ctx.waitUntil(promise);
     // THE TRACKER'S OWN DELIVERY (see TRACKER_CRON): the pass, and nothing
@@ -9942,7 +9966,7 @@ const worker = {
     // cadence gate and the outage check both compare them, so a delivery that
     // never scans must not move them. This delivery's own liveness is the pass
     // row it writes (see runTrackerInvocation, and the tick's fallback).
-    if (isTrackerCron(event.cron)) {
+    if (trackerDelivery) {
       // The region reading this run publishes (see THE MARKER): the placed
       // replay's own `opts.relayTag`, or the failed/skipped tag of the relay
       // attempt this delivery is about to make. A parameter, never module
@@ -9962,7 +9986,7 @@ const worker = {
     // cadence gate, because all three count SCAN arrivals. Its own liveness is
     // the row it writes, and the tick's fallback is what makes a missed
     // delivery cost freshness instead of a leg.
-    if (isMaintenanceCron(event.cron)) {
+    if (maintenanceDelivery) {
       let relayTag: PassRelayTag | null = opts?.relayTag ?? null;
       if (opts?.relay !== false) {
         const relay = await relayCronDelivery(env, "maintenance");
@@ -9997,9 +10021,38 @@ const worker = {
     // still answer "how much of the scanning is actually cron". Everything
     // else — the gate, the scan lock, runScan — is deliberately identical.
     const clockDelivery = opts?.via === "clock";
+    // THE MERGED EVERY-MINUTE DELIVERY (2026-10-23): the platform now carries
+    // ONE every-minute trigger. A platform scan delivery therefore dispatches
+    // BOTH relays, in parallel — exactly what the clock's alarm already does —
+    // and a relayed invocation (which names its `leg`) skips this block. The
+    // tracker relay is best-effort here: if it fails, the pass's durable row
+    // is the ownership clock, so the next scan tick runs the pass itself once
+    // stale (see runTrackerInvocation). Running the pass locally inside this
+    // scan-shaped invocation would mix the two deliveries' preTick readings.
+    const mergedCron =
+      leg === null &&
+      !clockDelivery &&
+      opts?.relay !== false &&
+      event.cron === SCAN_CRON;
+    let scanRelay: Awaited<ReturnType<typeof relayCronDelivery>> | null = null;
+    if (mergedCron) {
+      const [scanResult, trackerResult] = await Promise.all([
+        relayCronDelivery(env, "scan"),
+        relayCronDelivery(env, "tracker"),
+      ]);
+      scanRelay = scanResult;
+      // "skipped" is a deployment without the relay configured (no URL or no
+      // secret): the scan falls back to a local tick below and the pass's row
+      // fallback covers the pass, so only a real failure is worth an error.
+      if (trackerResult === "failed") {
+        console.error(
+          "[worker] merged tracker relay failed; the pass row's fallback will cover it",
+        );
+      }
+    }
     let scanRelayTag: PassRelayTag | null = opts?.relayTag ?? null;
     if (opts?.relay !== false) {
-      const relay = await relayCronDelivery(env, "scan");
+      const relay = scanRelay ?? (await relayCronDelivery(env, "scan"));
       if (relay === "relayed") {
         // The placed invocation ran the whole tick — its own arrival stamp,
         // cadence gate, scan and completion flush — so this delivery is DONE.

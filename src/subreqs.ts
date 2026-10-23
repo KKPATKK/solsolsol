@@ -193,11 +193,12 @@ export interface SubreqHostCount {
 /**
  * WHO opened a window (see beginSubreqWindow).
  *
- * WHY IT IS NEEDED (2026-09-27): since the tracker pass got its own cron
- * delivery, TWO invocations share most isolates — Cloudflare dispatches both
- * triggers at the same minute, and the isolate that served the scan tick is
- * the one the pass's delivery lands on — while this counter is per MODULE, not
- * per invocation. A window therefore mixes the two: a scan front and a pass
+ * WHY IT IS NEEDED (2026-09-27): since the tracker pass got its own
+ * invocation, TWO deliveries share most isolates — both fire at the same
+ * minute (from ONE merged every-minute trigger since 2026-10-23, see
+ * worker.scheduled), and the isolate that served the scan tick is the one the
+ * pass's delivery lands on — while this counter is per MODULE, not per
+ * invocation. A window therefore mixes the two: a scan front and a pass
  * rotation both read as one `turso: N`, and the reader cannot say which owner
  * to fix. Tagging the window is what makes "the tick's front spent X" a
  * question with an answer.

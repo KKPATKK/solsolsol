@@ -63,18 +63,30 @@ compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 enabled = true
 head_sampling_rate = 1
 
-# Both expressions fire every minute (the free-tier minimum), and each one is
-# a SEPARATE invocation with its own 50-subrequest budget — which is the
-# whole point of the second string (2026-09-27):
+# ONE every-minute expression (2026-10-23): the scan tick and the tracker
+# pass share the platform delivery. Two equivalent every-minute expressions
+# used to be configured ("* * * * *" for the scan tick and "*/1 * * * *" for
+# the pass); on 2026-10-23 Cloudflare stopped delivering the scan expression
+# while the other two still fired, and the clock was left as the only scan
+# trigger. A single expression removes that duplicate-schedule failure mode.
+# The pass still gets its own INVOCATION — the merged handler relays it to the
+# placed path separately, so it keeps its own subrequest budget — but it no
+# longer has a platform trigger of its own (worker.TRACKER_CRON is now only the
+# synthetic expression the relay replays).
 #
-#   "* * * * *"     the scan tick, exactly as before.
-#   "*/1 * * * *"   the tracker pass's OWN invocation (worker.TRACKER_CRON).
+#   "* * * * *"     the merged scan tick + tracker relay.
+#   "*/5 * * * *"   the MAINTENANCE delivery's OWN invocation (worker.
+#                   MAINTENANCE_CRON, 2026-09-29): the interval-gated,
+#                   side-effect-only legs — the Birdeye periodic backfill and
+#                   the crime-wallet list refresh — which used to run inside
+#                   the scan tick's front phase.
 #
-# WHY THE SPLIT (live 2026-09-27 01:31-01:57Z, after the claim+reservation
-# merge): the pass is the LAST stage of the scan tick, so it spends what the
-# tick has left of Workers Free's 50 subrequests — and the tick's own front
-# reads 18-39 of them BEFORE the pass is offered one (`heartbeat.subreqs`,
-# `tickProgress.postscan`). Measured: `postscan subreqs 39` with the pass then
+# WHY THE PASS STILL HAS ITS OWN INVOCATION (live 2026-09-27 01:31-01:57Z,
+# after the claim+reservation merge): the pass is the LAST stage of the scan
+# tick, so it spends what the tick has left of Workers Free's 50 subrequests —
+# and the tick's own front reads 18-39 of them BEFORE the pass is offered one
+# (`heartbeat.subreqs`, `tickProgress.postscan`). Measured: `postscan subreqs 39`
+# with the pass then
 # reading `ok:0/0 deferred:subreq-budget trips 0` (its entry gate, no row
 # touched), and passes carrying `defer-send 6 subreq-cut 6` — every alerting
 # row refused at TRACKER_SUBREQ_RESERVE while the fast-DB and slow-DB passes
@@ -85,13 +97,17 @@ head_sampling_rate = 1
 #
 # `event.cron` must match these strings CHARACTER FOR CHARACTER (see
 # Cloudflare's scheduled-handler docs), which is why worker.isTrackerCron
-# compares exactly and scripts/test-unit.js pins the pair against this file.
+# compares exactly and scripts/test-unit.js pins the expressions against this
+# file. The tracker replay no longer relies on that comparison: the relay names
+# its delivery with the `leg` option, so a merged replay cannot be mistaken for
+# a scan (see worker.scheduled).
 #
-# SAFETY: if this second expression ever stops being delivered — the platform
-# has done that to this Worker before (see docs/uptime-monitor.md) — the scan
-# tick runs the pass itself again as a FALLBACK the moment the durable pass row
-# is older than worker.TRACKER_PASS_FALLBACK_FRESH_MS, so a dead trigger costs
-# the pass cadence, never the cards.
+# SAFETY: if the merged delivery's tracker relay fails — the platform has
+# stopped delivering cron events to this Worker before (see
+# docs/uptime-monitor.md) — the scan tick runs the pass itself as a FALLBACK
+# the moment the durable pass row is older than
+# worker.TRACKER_PASS_FALLBACK_FRESH_MS, so a failed relay costs the pass
+# cadence, never the cards.
 #
 # The scan itself is still gated by SCAN_INTERVAL_SECONDS below (60s → every
 # tick runs a scan, the fastest cadence the 1-min cron can drive). If the
@@ -106,20 +122,16 @@ head_sampling_rate = 1
 # they are — they are the BACKSTOP that keeps a 60s cadence whenever the clock
 # is off or its alarm is not armed. The clock retires no cron: the scan tick is
 # still what re-arms it (worker.armTickClock), the tracker pass's fallback row
-# still guards a dead pass trigger, and the maintenance legs still ride "*/5".
+# still guards a failed tracker relay, and the maintenance legs still ride
+# "*/5".
 #
-# "*/5 * * * *"  the MAINTENANCE delivery's OWN invocation (worker.
-#                MAINTENANCE_CRON, 2026-09-29): the interval-gated,
-#                side-effect-only legs — the Birdeye periodic backfill and the
-#                crime-wallet list refresh — which used to run inside the scan
-#                tick's front phase.
-#
-# WHY THE SPLIT (measured 2026-09-29): the account is on Workers Paid now
-# (subrequest budget 1000, live `heartbeat.subreqs` = 38 used), so neither leg
-# was being DROPPED any more — they were being PAID FOR in the wrong place.
-# The backfill walks up to ~4 six-hour Birdeye chunks on the hour it is due and
-# then writes a batch of token rows, all inside the front phase the pair fetch
-# and the gates share; the crime refresh downloads ~4.8K addresses on the first
+# WHY THE MAINTENANCE SPLIT (measured 2026-09-29): the account is on Workers
+# Paid now (subrequest budget 1000, live `heartbeat.subreqs` = 38 used), so
+# neither leg was being DROPPED any more — they were being PAID FOR in the
+# wrong place. The backfill walks up to ~4 six-hour Birdeye chunks on the hour
+# it is due and then writes a batch of token rows, all inside the front phase
+# the pair fetch and the gates share; the crime refresh downloads ~4.8K
+# addresses on the first
 # tick after a recycle (it used to be `crime-refresh` in the old subreqSkip
 # list for the same reason). Neither result is read by the invocation that
 # produces it — the backfill seeds token_stats, the crime list persists for the
@@ -137,7 +149,7 @@ head_sampling_rate = 1
 # plus jitter, the same arithmetic the pass's fallback uses), and the leg's own
 # interval gate still decides whether it actually does anything.
 [triggers]
-crons = ["* * * * *", "*/1 * * * *", "*/5 * * * *"]
+crons = ["* * * * *", "*/5 * * * *"]
 
 # ---------------------------------------------------------------------------
 # PLACEMENT (2026-10-02 experiment, KEPT): the fetch path now runs next to the
