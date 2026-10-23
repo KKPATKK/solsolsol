@@ -2938,6 +2938,28 @@ export interface TickLegRow {
    * evaluated its own read's rows.
    */
   poolStale: number | null;
+  /**
+   * WHICH candidate-chain step the tick was inside when its summary was
+   * published (see ScanSummary.pushPhase), and the chain's own readings
+   * (2026-10-22). These are the fields that answer "what made this tick
+   * slow" AFTER the fact: the heartbeat only keeps the LATEST tick's summary
+   * and `tick_legs` is a fixed 17-column projection whose columns each cost a
+   * migration, so a slow tick's chain split was unrecoverable once it rotated
+   * out of /health. This row IS what persistSlowTickLeg (TICK_LEG_SLOW_KEY)
+   * stamps durably, so carrying the readings here is what makes them survive
+   * the isolate — no schema change, the same JSON the ring already writes.
+   * Null on a tick with no summary (cut/shed/early return) = "no reading",
+   * never "0ms".
+   */
+  pushPhase: string | null;
+  organicMs: number | null;
+  organicWaited: number | null;
+  organicRetried: number | null;
+  organicStatus: number | null;
+  walletAnalysis: number | null;
+  flurryRpcCalls: number | null;
+  /** Per-gate reject counters (see ScanSummary.fails) — copied, not aliased. */
+  fails: ScanSummary["fails"] | null;
 }
 
 /**
@@ -2996,6 +3018,14 @@ export function buildTickLegRow(input: {
     evalMs: s?.evalMs ?? null,
     dbMs: s?.dbMs ?? null,
     poolStale: s?.poolStale ?? null,
+    pushPhase: s?.pushPhase ?? null,
+    organicMs: s?.organicMs ?? null,
+    organicWaited: s?.organicWaited ?? null,
+    organicRetried: s?.organicRetried ?? null,
+    organicStatus: s?.organicStatus ?? null,
+    walletAnalysis: s?.walletAnalysis ?? null,
+    flurryRpcCalls: s?.flurryRpcCalls ?? null,
+    fails: s?.fails ? { ...s.fails } : null,
   };
 }
 

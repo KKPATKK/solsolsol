@@ -13990,7 +13990,7 @@ async function main() {
     assert.equal(src.split("fails.organic++").length - 1, 1, "one writer for the counter");
     assert.equal(src.split("fails.sus++").length - 1, 1, "one writer for the suspicion counter");
     assert.equal(
-      src.split("await this.bestEffort(() => organicSlot, chainDeadline, null)").length - 1,
+      src.split("await this.bestEffort(() => organicSlot, organicGateDeadline, null)").length - 1,
       1,
       "exactly one await of the organic slot — the two gates share it",
     );
@@ -14004,7 +14004,7 @@ async function main() {
     // card wait for the reading past the old 1.2s cap).
     const jupAwaitGuard = src.slice(
       src.indexOf("const jupGatesOn ="),
-      src.indexOf("? await this.bestEffort(() => organicSlot, chainDeadline, null)"),
+      src.indexOf("? await this.bestEffort(() => organicSlot, organicGateDeadline, null)"),
     );
     assert.ok(
       jupAwaitGuard.includes("this.config.jupSusBlock") &&

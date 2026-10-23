@@ -401,6 +401,36 @@ const FRONT_PHASE_WINDOW_MS = SCAN_TICK_DEADLINE_MS - SCAN_GATE_RESERVE_MS;
  */
 export const CANDIDATE_PUSH_RESERVE_MS = 1_500;
 /**
+ * Wall-clock budget for ONE candidate's serial chain (2026-10-22).
+ *
+ * WHY (measured, 20 slow ticks on 2026-10-22): a tick with ONE candidate spent
+ * `evalMs` 7,098–7,286ms, and 2–3 candidates 8,265–9,422ms — i.e. the chain ran
+ * to `chainDeadline` on every candidate tick and deferred whatever came after
+ * the first coin. Nothing in the chain had a budget of its own: RugCheck's
+ * 2s+4s retry ladder, the Jupiter organic wait and the 8s Helius wallet walk
+ * were each clamped only to the SHARED `chainDeadline`. One cold walk could
+ * therefore spend the whole window, and the second/third candidate were
+ * deferred (`candidates 2, pushed 0`) although the window had room for them.
+ *
+ * WHY 3.5s: two candidates fit inside the 8.1s chain window with the seen-check
+ * and render overhead, while one candidate still leaves the send its full
+ * 1.5s reserve. The steps behind it fail OPEN exactly as they did when
+ * `chainDeadline` cut them (the card loses a decoration, the gate is not
+ * judged, the organic reading is still judged at the send gate's hold) — the
+ * only thing that changes is WHICH coin pays.
+ */
+export const CANDIDATE_CHAIN_BUDGET_MS = 3_500;
+/**
+ * How long the early Jupiter gate may wait for this card's organic reading
+ * (2026-10-22). The read is dispatched at the head of the chain; by the time
+ * the gates reach it, anything still unsettled is a 429-window wait. A missed
+ * reading fails OPEN (as documented), so waiting past 1.5s only delays the
+ * coin — it cannot change the verdict here. The send gate still holds for the
+ * same promise before the first message (see ORGANIC_CARD_GATE_HOLD_MS), which
+ * is where a late reading is actually judged.
+ */
+export const ORGANIC_GATE_WAIT_MS = 1_500;
+/**
  * The wall the 🌱 有機度 card read is given, in ms from its own dispatch.
  *
  * WHY IT OUTLIVES THE TICK (2026-10-17, third round of "the line is missing
@@ -7763,6 +7793,15 @@ export class Scanner {
         }
         if (unseen.length === 0) continue;
         const coin = unseen[0];
+        // PER-CANDIDATE WALL (2026-10-22, see CANDIDATE_CHAIN_BUDGET_MS): the
+        // chain's live waits are clamped to this instead of the shared
+        // `chainDeadline`, so one slow upstream can only cost ITS candidate —
+        // the next coin in the group still gets a window instead of being
+        // deferred by a deadline the first coin already spent.
+        const candidateDeadline = Math.min(
+          chainDeadline,
+          Date.now() + CANDIDATE_CHAIN_BUDGET_MS,
+        );
         // MCAP/LP LOW-SIDE GATE (MCAP_LIQ_RATIO_MIN): a pool still holding most
         // of the supply is an exit one or two wallets can take (see the
         // helper's calibration notes). It is the FIRST thing the chain does
@@ -8006,8 +8045,8 @@ export class Scanner {
         // never the push. See bestEffort().
         this.markPhase(diag, "rugcheck", startedAt);
         const rugcheck = await this.bestEffort(
-          () => this.resolveRugcheckData(coin),
-          chainDeadline,
+          () => this.resolveRugcheckData(coin, candidateDeadline),
+          candidateDeadline,
           {
             // The resolver's own cache, so a deadline miss still renders
             // whatever RugCheck already told us about this coin.
@@ -8036,7 +8075,7 @@ export class Scanner {
                   },
                 )
             : null,
-          chainDeadline,
+          candidateDeadline,
           {
             // A deadline miss fails OPEN — the same stance this check already
             // ships with (a missing/stale blocklist must never silence the
@@ -8078,7 +8117,7 @@ export class Scanner {
           axiom && axiomPair
             ? () => this.resolveAxiomTokenInfo(axiomPair)
             : null,
-          chainDeadline,
+          candidateDeadline,
           null,
         );
         if (this.config.axiomMinBotUsers > 0) {
@@ -8155,8 +8194,15 @@ export class Scanner {
           this.config.jupSusBlock ||
           this.config.organicMinScore > 0 ||
           this.config.organicMaxTradersH1 > 0;
+        // The gate's own wait is shorter than the candidate wall: a reading
+        // that has not landed by here is waiting out a free-tier window, and
+        // the send gate's hold is the place that judgement can still land.
+        const organicGateDeadline = Math.min(
+          candidateDeadline,
+          Date.now() + ORGANIC_GATE_WAIT_MS,
+        );
         const jupReading = jupGatesOn
-          ? await this.bestEffort(() => organicSlot, chainDeadline, null)
+          ? await this.bestEffort(() => organicSlot, organicGateDeadline, null)
           : null;
         // The LEG-SAVING pass of the two Jupiter gates (see
         // jupiterGatesBlocked — the same judgement runs again at the render,
@@ -8183,16 +8229,17 @@ export class Scanner {
                   creator: rugcheck.creator,
                   holders: crime.holders,
                   crime,
-                  // Clamp the analyzer's serial-RPC budget to the CHAIN
-                  // deadline (not the tick deadline): an unclamped 8s wallet
-                  // walk could outlive the tick race on heavy ticks, pushing
-                  // the completion flush past Cloudflare's invocation kill
-                  // (the dead-tick shape) — and, with the push reserve
-                  // subtracted, it would spend the seconds the send needs.
-                  deadline: chainDeadline,
+                  // Clamp the analyzer's serial-RPC budget to THIS
+                  // candidate's wall (not the shared chain deadline): an
+                  // unclamped 8s wallet walk could outlive the tick race on
+                  // heavy ticks, pushing the completion flush past
+                  // Cloudflare's invocation kill (the dead-tick shape) — and,
+                  // with only the shared deadline to race, the first coin's
+                  // walk could spend the window the next candidate needed.
+                  deadline: candidateDeadline,
                 })
             : null,
-          chainDeadline,
+          candidateDeadline,
           null,
         );
         if (wallet?.ok) diag.walletAnalysis++;
@@ -8250,10 +8297,10 @@ export class Scanner {
             ? () =>
                 flurryClient.analyze(
                   coin.stats.token,
-                  Math.min(chainDeadline, Date.now() + FLURRY_ANALYZE_CAP_MS),
+                  Math.min(candidateDeadline, Date.now() + FLURRY_ANALYZE_CAP_MS),
                 )
             : null,
-          chainDeadline,
+          candidateDeadline,
           { status: "skip" },
         );
         const flurryReport =
@@ -9024,8 +9071,17 @@ export class Scanner {
    * removed; Birdeye is also deliberately NOT consulted (its OHLCV endpoint
    * was the main free-tier budget burner).
    */
-  /** Bundler + top-10 holder share + creator: cached → single RugCheck fetch → unknown. */
-  private async resolveRugcheckData(coin: QualifyingCoin): Promise<{
+  /**
+   * Bundler + top-10 holder share + creator: cached → single RugCheck fetch →
+   * unknown. `deadline` is the candidate's own chain wall (2026-10-22): the
+   * client's 2s+4s retry ladder must not outlive the coin that pays for it —
+   * a 429 ladder is 6s of sleeps, which used to be charged to the WHOLE chain
+   * window (see CANDIDATE_CHAIN_BUDGET_MS).
+   */
+  private async resolveRugcheckData(
+    coin: QualifyingCoin,
+    deadline?: number,
+  ): Promise<{
     bundlerPct: number | null;
     top10Pct: number | null;
     creator: string | null;
@@ -9052,6 +9108,7 @@ export class Scanner {
         const report = await this.rugcheck.getReport(
           stats.token,
           coin.pair.pairAddress,
+          { deadline },
         );
         this.rugcheckFetchedAt.set(stats.token, Date.now());
         if (report.creator) this.rugcheckCreator.set(stats.token, report.creator);

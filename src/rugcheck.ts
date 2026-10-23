@@ -2,16 +2,31 @@ import type { AppConfig } from "./config";
 
 const BASE_URL = "https://api.rugcheck.xyz";
 
+/** One attempt's ceiling. The chain passes a shorter deadline; see getJson. */
+const REQUEST_TIMEOUT_MS = 15_000;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Spaces out HTTP requests so we stay well under RugCheck's rate limits. */
+/**
+ * Spaces out HTTP requests so we stay well under RugCheck's rate limits.
+ *
+ * `deadline` (2026-10-22) is the candidate's chain wall: a throttle wait that
+ * would cross it is refused BEFORE sleeping, because the caller's caller
+ * (`bestEffort`) only stops waiting — the sleep itself would still run and the
+ * coin's window would still be spent (see CANDIDATE_CHAIN_BUDGET_MS).
+ */
 class Throttle {
   private lastCallAt = 0;
   constructor(private readonly intervalMs: number) {}
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
+  async run<T>(fn: () => Promise<T>, deadline?: number): Promise<T> {
     const wait = Math.max(0, this.lastCallAt + this.intervalMs - Date.now());
-    if (wait > 0) await sleep(wait);
+    if (wait > 0) {
+      if (deadline !== undefined && Date.now() + wait >= deadline) {
+        throw new Error("RugCheck deadline reached while waiting for the throttle");
+      }
+      await sleep(wait);
+    }
     this.lastCallAt = Date.now();
     return fn();
   }
@@ -65,16 +80,35 @@ export class RugcheckClient {
     this.throttle = new Throttle(config.rugcheckRequestIntervalMs);
   }
 
-  private async getJson(path: string): Promise<unknown> {
+  /**
+   * One report fetch, retried at most twice.
+   *
+   * `deadline` (2026-10-22) bounds BOTH halves of the ladder: an attempt is
+   * aborted at the remaining wall (`AbortSignal.timeout`), and a retry's 2s/4s
+   * backoff is skipped when it would cross the deadline. The ladder used to be
+   * 6s of sleeps with a 15s abort per attempt, i.e. LONGER than the ~6.5s the
+   * candidate chain has left (measured: 7,098–7,286ms evalMs for one
+   * candidate); `bestEffort` only stops WAITING, so the ladder kept running in
+   * the background and the coin's window was already gone. Without a deadline
+   * the old behaviour is unchanged.
+   */
+  private async getJson(path: string, deadline?: number): Promise<unknown> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
+      if (deadline !== undefined && Date.now() >= deadline) break;
       try {
-        const res = await this.throttle.run(() =>
-          fetch(`${BASE_URL}${path}`, {
+        const res = await this.throttle.run(() => {
+          const remaining =
+            deadline === undefined
+              ? REQUEST_TIMEOUT_MS
+              : Math.max(1, deadline - Date.now());
+          return fetch(`${BASE_URL}${path}`, {
             headers: { Accept: "application/json" },
-            signal: AbortSignal.timeout(15_000),
-          }),
-        );
+            signal: AbortSignal.timeout(
+              Math.min(REQUEST_TIMEOUT_MS, remaining),
+            ),
+          });
+        }, deadline);
         if (res.status === 429 || res.status >= 500) {
           throw new Error(`RugCheck HTTP ${res.status}`);
         }
@@ -84,7 +118,11 @@ export class RugcheckClient {
         return await res.json();
       } catch (err) {
         lastError = err;
-        if (attempt < 3) await sleep(attempt * 2000);
+        if (attempt < 3) {
+          const backoff = attempt * 2000;
+          if (deadline !== undefined && Date.now() + backoff >= deadline) break;
+          await sleep(backoff);
+        }
       }
     }
     throw lastError instanceof Error
@@ -94,15 +132,21 @@ export class RugcheckClient {
 
   /**
    * Fetches the token report once and derives both percentages.
-   *
    * @param address token mint address
    * @param pairAddress the trading-pool address, used to exclude the LP from
    *   the top-10 holder ranking (its holding is locked liquidity, not
    *   concentration risk).
+   * @param opts.deadline the caller's wall (epoch ms). Omitted = the old
+   *   unbounded-ladder behaviour; the scanner always passes its candidate wall.
    */
-  async getReport(address: string, pairAddress?: string): Promise<RugcheckReport> {
+  async getReport(
+    address: string,
+    pairAddress?: string,
+    opts: { deadline?: number } = {},
+  ): Promise<RugcheckReport> {
     const data = (await this.getJson(
       `/v1/tokens/${encodeURIComponent(address)}/report`,
+      opts.deadline,
     )) as {
       token?: { supply?: number };
       insiderNetworks?: InsiderNetwork[];

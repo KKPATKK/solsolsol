@@ -8,8 +8,11 @@
  * (src/worker.ts, TICK_LEG_RING_SIZE ticks, this isolate, zero round trips)
  * is the fix; these tests pin its contract:
  *
- *   1. `buildTickLegRow` maps the summary's legs and the front split into the
- *      row, and COPIES the maps/steps (a later mutation of scanner state must
+ *   1. `buildTickLegRow` maps the summary's legs, the front split and the
+ *      candidate chain's own readings (the last phase, the organic wait and
+ *      the per-gate reject counters — 2026-10-22, the layer that lets a slow
+ *      tick be attributed AFTER it rotated out of /health) into the row, and
+ *      COPIES the maps/steps/counters (a later mutation of scanner state must
  *      not rewrite a recorded tick).
  *   2. A tick with no summary — a cut, a shed, an early return — records
  *      `null` legs, never fabricated zeros: "no reading" and "spent 0ms" are
@@ -116,6 +119,28 @@ test("a full tick maps every leg and the front split", () => {
         evalMs: 1624,
         dbMs: 1200,
         poolStale: 1259,
+        // The chain's own readings (2026-10-22): which step the tick was in
+        // and what the expensive waits cost — the half that survives a slow
+        // tick in the ring instead of only in the latest heartbeat.
+        pushPhase: "send:organic-wait",
+        organicMs: 3400,
+        organicWaited: 1,
+        organicRetried: 0,
+        organicStatus: 429,
+        walletAnalysis: 1,
+        flurryRpcCalls: 7,
+        fails: {
+          mcap: 3,
+          chg: 0,
+          age: 0,
+          flow: 0,
+          crime: 0,
+          flurry: 0,
+          liqRatio: 0,
+          sus: 0,
+          organic: 0,
+          other: 9,
+        },
       },
     }),
   );
@@ -148,24 +173,47 @@ test("a full tick maps every leg and the front split", () => {
   assert.equal(row.evalMs, 1624);
   assert.equal(row.dbMs, 1200);
   assert.equal(row.poolStale, 1259);
+  assert.equal(row.pushPhase, "send:organic-wait");
+  assert.equal(row.organicMs, 3400);
+  assert.equal(row.organicWaited, 1);
+  assert.equal(row.organicRetried, 0);
+  assert.equal(row.organicStatus, 429);
+  assert.equal(row.walletAnalysis, 1);
+  assert.equal(row.flurryRpcCalls, 7);
+  assert.equal(row.fails.mcap, 3);
+  assert.equal(row.fails.other, 9);
 });
 
 test("the row copies its maps — later mutation must not rewrite a tick", () => {
   const steps = { ...STEP_ZERO, init: 1 };
   const legMap = { pairs: 5 };
   const feedMap = { pump: 6 };
+  const failsMap = {
+    mcap: 2,
+    chg: 0,
+    age: 0,
+    flow: 0,
+    crime: 0,
+    flurry: 0,
+    liqRatio: 0,
+    sus: 0,
+    organic: 0,
+    other: 4,
+  };
   const row = buildTickLegRow(
     input({
       preTick: { at: 1, steps, preStartMs: 1, preRaceMs: 2, raceMs: 3 },
-      summary: { poolLegMs: legMap, feedLegMs: feedMap },
+      summary: { poolLegMs: legMap, feedLegMs: feedMap, fails: failsMap },
     }),
   );
   steps.init = 99;
   legMap.pairs = 99;
   feedMap.pump = 99;
+  failsMap.mcap = 99;
   assert.equal(row.steps.init, 1);
   assert.equal(row.poolLegMs.pairs, 5);
   assert.equal(row.feedLegMs.pump, 6);
+  assert.equal(row.fails.mcap, 2, "the counters are copied, not aliased");
 });
 
 test("a cut tick with no summary records null legs, not zeros", () => {
@@ -190,6 +238,9 @@ test("a cut tick with no summary records null legs, not zeros", () => {
   assert.equal(row.poolStale, null);
   assert.equal(row.preStartMs, null);
   assert.equal(row.steps, null);
+  assert.equal(row.pushPhase, null);
+  assert.equal(row.organicMs, null);
+  assert.equal(row.fails, null, "no summary = no counters, not zeros");
 });
 
 test("the ring trims to capacity, keeping the newest", () => {
