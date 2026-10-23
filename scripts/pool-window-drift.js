@@ -1,6 +1,8 @@
 /*
  * How much pool does a window change actually admit? Read-only, against the
- * live Turso database.
+ * LIVE D1 database (since 2026-10-22 — on the frozen Turso copy these rows stop
+ * at the cutover, so the answer would be a month-old pool; `source:` is
+ * printed before the report and `--archive` reads the frozen copy on purpose).
  *
  *   node scripts/pool-window-drift.js [windowHours] [marginMin]
  *
@@ -16,14 +18,15 @@
  * 2.5h tighter than the tick's. That is a composition difference, so this
  * prints set differences, not counts.
  *
- * Usage needs the .env.local Turso creds.
+ * Usage needs CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN (or
+ * D1_DATABASE_ID); `--archive` needs the Turso creds instead.
  */
 "use strict";
 
 const fs = require("fs");
 const path = require("path");
 const { loadConfig } = require("../dist/config.js");
-const { Db } = require("../dist/db.js");
+const { openDb } = require("./open-store.js");
 const {
   RE_EVAL_WINDOW_MS,
   RE_EVAL_AGE_MARGIN_MIN,
@@ -32,7 +35,10 @@ const {
 } = require("../dist/scanner.js");
 const { fmtUsd } = require("../dist/format.js");
 
-const ALT_WINDOW_MS = (Number(process.argv[2]) || 43) * 3600_000;
+// A flag in argv[2] (`--archive`) is not an hour count: NaN would fall back
+// to the 43h default while looking like a deliberate argument.
+const arg2 = Number(process.argv[2]);
+const ALT_WINDOW_MS = (Number.isFinite(arg2) && arg2 > 0 ? arg2 : 43) * 3600_000;
 const ALT_MARGIN_MIN = Number.isFinite(Number(process.argv[3]))
   ? Number(process.argv[3])
   : 30;
@@ -81,8 +87,8 @@ function poolArgs(now, chats, windowMs, marginMin) {
 const hours = (ms) => (ms / 3600_000).toFixed(1) + "h";
 
 async function main() {
-  const db = new Db(cfg.tursoUrl, cfg.tursoAuthToken);
-  await db.init();
+  const { db, kind } = await openDb(process.argv.slice(2));
+  console.log(`source: ${kind}`);
 
   const chats = await db.listEnabledChats();
   if (chats.length === 0) {

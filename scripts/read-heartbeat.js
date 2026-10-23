@@ -20,11 +20,12 @@
  * so nobody could tell. Run live 2026-10-22 01:47:53Z it printed
  * `@ 2026-10-22T01:20:45Z ageS=88097` while /health's D1 row read
  * `at 2026-10-23T01:41:40Z`: the probe was a day behind production and looked
- * healthy. Now D1 by default — the same REST binding + src/d1.ts transport the
- * migration and scripts/raydium-attribution.js use, so the SQL runs through the
- * pair production runs — `source:` printed on EVERY run, and no silent
- * fallback: if D1 cannot be reached the script fails instead of answering from
- * an older store. `--archive` asks for the frozen copy on purpose.
+ * healthy. The store is now decided in ONE place — scripts/open-store.js, the
+ * seam every off-body tool reads through (the same REST binding + src/d1.ts
+ * transport the migration uses, so the SQL runs through the pair production
+ * runs) — `source:` is printed on EVERY run, and there is no silent fallback:
+ * if D1 cannot be reached the script fails instead of answering from an older
+ * store. `--archive` asks for the frozen copy on purpose.
  *
  * READ-ONLY BY CONSTRUCTION: SELECTs only — no `Db.init()` (that is a DDL
  * batch), no DDL, no worker_state write, no counter, no rotation slot, no
@@ -48,15 +49,8 @@
  */
 "use strict";
 
-const { createClient } = require("@libsql/client");
-
-const { loadConfig } = require("../dist/config.js");
 const { SCHEMA_DDL_FINGERPRINT_KEY } = require("../dist/db.js");
-const d1 = require("../dist/d1.js");
-const d1Rest = require("./d1-rest.js");
-
-/** The database the Worker writes, resolved by name when no id is exported. */
-const D1_DATABASE_NAME_FALLBACK = "solana-meme-bot";
+const { openTarget } = require("./open-store.js");
 
 /** worker_state is (key TEXT PRIMARY KEY, value TEXT) — see Db.getWorkerState. */
 const ROW_SQL = "SELECT value FROM worker_state WHERE key = ?";
@@ -80,57 +74,6 @@ function rowValue(res) {
   return v === null || v === undefined ? null : String(v);
 }
 
-/**
- * WHERE THE ROWS COME FROM — named on every run (see the header): D1 live by
- * default, the frozen archive only when `--archive` asks for it. No fallback
- * between the two stores: a probe that quietly switches source is the bug this
- * function exists to fix.
- */
-async function openReadTarget(argv) {
-  if (argv.includes("--archive")) {
-    const config = loadConfig(process.env);
-    if (!config.tursoUrl) {
-      throw new Error("--archive needs TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN)");
-    }
-    const client = createClient({
-      url: config.tursoUrl,
-      authToken: config.tursoAuthToken,
-    });
-    return {
-      kind:
-        "Turso archive (READ-ONLY — NOT live; the pre-2026-10-15-cutover copy)",
-      select: (sql, args) => client.execute({ sql, args }),
-    };
-  }
-  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
-  const apiToken = process.env.CLOUDFLARE_API_TOKEN;
-  if (!process.env.D1_DATABASE_ID && !(accountId && apiToken)) {
-    throw new Error(
-      "no live store: D1 needs CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN " +
-        "(or an explicit D1_DATABASE_ID). Pass --archive only to read the " +
-        "frozen Turso copy on purpose.",
-    );
-  }
-  const api = d1Rest.createD1Rest({ accountId, apiToken });
-  // By id when given, else BY NAME with one read-only list call (no create:
-  // `scripts/d1-copy.js ensure` is the only thing allowed to make databases).
-  const named = process.env.D1_DATABASE_NAME || D1_DATABASE_NAME_FALLBACK;
-  const id =
-    process.env.D1_DATABASE_ID ||
-    (await api.listDatabases()).find((db) => db.name === named)?.uuid ||
-    null;
-  if (!id) {
-    throw new Error(
-      `D1_DATABASE_ID is unset and the account has no database named "${named}"`,
-    );
-  }
-  const transport = d1.createD1Transport(d1Rest.createRestBinding(api, id));
-  return {
-    kind: `D1 ${id}${process.env.D1_DATABASE_ID ? "" : ` (named "${named}")`} — LIVE`,
-    select: (sql, args = []) => transport.execute({ sql, args }),
-  };
-}
-
 async function main() {
   // The first two positional args are the sample count / gap — but a flag
   // (`--archive`, `--keys ...`) in argv[2] is not a number, and NaN would
@@ -139,7 +82,8 @@ async function main() {
   const n3 = Number(process.argv[3]);
   const samples = Number.isFinite(n2) && n2 >= 1 ? Math.floor(n2) : 1;
   const gapSeconds = Number.isFinite(n3) && n3 > 0 ? n3 : 70;
-  const target = await openReadTarget(process.argv.slice(2));
+
+  const target = await openTarget(process.argv.slice(2));
   console.log(`source: ${target.kind}`);
 
   const keyArg = process.argv.indexOf("--keys");

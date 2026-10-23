@@ -34,7 +34,20 @@
  * exactly this reason: it would have made a write attempt part of a script
  * whose value is that it can run against production.
  *
+ * WHICH STORE (2026-10-22): the Turso ARCHIVE, on purpose — and now printed
+ * on every run. Two things this instrument measures ARE that path: the column
+ * probe below deliberately goes over Turso's raw `/v2/pipeline` ("does libsql's
+ * encoder plus Turso accept it"), and the CPU being counted is the CLIENT's on
+ * the libsql/HTTP transport. Against D1 neither question exists, so running it
+ * there would report a different transport under the same table. The data
+ * questions' siblings (pool-mcap-floor, pool-window-drift, scan-history-daily)
+ * moved to LIVE D1 through scripts/open-store.js on 2026-10-22; this one stays
+ * on the copy whose path it profiles and names itself, so its numbers cannot be
+ * read as "today".
+ *
  * Run: node scripts/cpu-profile.js      (needs the .env.local Turso creds)
+ *      node scripts/cpu-profile.js --archive  (same thing, said explicitly —
+ *        it is the only store this instrument has)
  */
 "use strict";
 
@@ -173,6 +186,13 @@ async function parsePhase(label, text, fn) {
 
 async function main() {
   const config = loadConfig(process.env);
+  // Printed before the first reading, like every other tool that reads the
+  // store (see scripts/open-store.js): this one is archive-only on purpose,
+  // and a header nobody reads is not a substitute for a line that travels with
+  // the output.
+  console.log(
+    "source: Turso archive — NOT live (profiles the libsql/HTTP path against the frozen copy; live rows are on D1)",
+  );
   const db = new Db(config.tursoUrl, config.tursoAuthToken);
   // `init()` is the same idempotent-DDL batch a cold isolate runs on its first
   // request (18 `CREATE ... IF NOT EXISTS`, one round trip, no data change) and

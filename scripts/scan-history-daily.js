@@ -9,18 +9,24 @@
  * newest 500 rows (~4.5h at a 1-minute tick), while the drop spans weeks —
  * scan_history is retained for 30 days (see the prune in Db.writeHeartbeat).
  *
- * No writes at all: one SELECT each, through the same libsql client the
- * Worker uses, with credentials taken from the process environment.
+ * No writes at all: one SELECT each, through scripts/open-store.js — the seam
+ * every off-body tool reads the store through — so this report now reads the
+ * LIVE D1 rows (the rows it aggregates are the Worker's own completions, and
+ * on the frozen Turso copy they stop at the 2026-10-15 cutover, which makes a
+ * "daily" report over recent days answer from a month-old snapshot). `source:`
+ * is printed before the first line, and `--archive` asks for the frozen copy on
+ * purpose.
  *
  * Run: node scripts/scan-history-daily.js
  *      node scripts/scan-history-daily.js 14   (hourly rows covering N days)
  *      node scripts/scan-history-daily.js --since 2026-10-12T04:00:00Z \
  *          --until 2026-10-12T04:30:00Z        (one window's totals + ticks —
  *          the A/B reading: same database, same columns, a bounded interval)
+ *      node scripts/scan-history-daily.js --archive  (the pre-cutover copy)
  */
 "use strict";
 
-const { createClient } = require("@libsql/client");
+const { openTarget } = require("./open-store.js");
 
 const QUERIES = {
   coverage: `SELECT COUNT(*) AS rows_total,
@@ -76,7 +82,7 @@ const WINDOW_SEEN_ROWS = `SELECT datetime(first_seen_at/1000,'unixepoch') AS t, 
 FROM seen_tokens WHERE first_seen_at >= ? AND first_seen_at <= ? ORDER BY first_seen_at`;
 
 /** --since/--until: one bounded window, the shape an A/B compares. */
-async function window(client, since, until) {
+async function window(target, since, until) {
   const args = [since, until];
   for (const [name, sql] of [
     ["window-totals", WINDOW_TOTALS],
@@ -84,7 +90,7 @@ async function window(client, since, until) {
     ["window-claim-rows", WINDOW_SEEN_ROWS],
     ["window-ticks", WINDOW_TICKS],
   ]) {
-    const res = await client.execute({ sql, args });
+    const res = await target.select(sql, args);
     console.log(`### ${name}`);
     for (const row of res.rows) console.log(JSON.stringify(row));
     console.log("");
@@ -94,6 +100,11 @@ async function window(client, since, until) {
 async function main() {
   const sinceArg = process.argv.indexOf("--since");
   const untilArg = process.argv.indexOf("--until");
+  // The store is decided ONCE, before any reading — `source:` is what makes a
+  // frozen row impossible to mistake for a fresh one (see open-store.js).
+  const target = await openTarget(process.argv.slice(2));
+  console.log(`source: ${target.kind}`);
+
   if (sinceArg !== -1) {
     const since = Date.parse(String(process.argv[sinceArg + 1] ?? ""));
     const until = untilArg !== -1 ? Date.parse(String(process.argv[untilArg + 1] ?? "")) : Date.now();
@@ -101,40 +112,19 @@ async function main() {
       console.error("--since/--until need ISO timestamps");
       process.exit(1);
     }
-    const url = process.env.TURSO_DATABASE_URL;
-    const authToken = process.env.TURSO_AUTH_TOKEN;
-    if (!url) {
-      console.error("TURSO_DATABASE_URL is not set in this shell's environment");
-      process.exit(1);
-    }
-    const client = createClient({ url, authToken });
-    try {
-      await window(client, since, until);
-    } finally {
-      client.close();
-    }
+    await window(target, since, until);
     return;
   }
 
-  const days = Number(process.argv[2] ?? 10);
-  const url = process.env.TURSO_DATABASE_URL;
-  const authToken = process.env.TURSO_AUTH_TOKEN;
-  if (!url) {
-    console.error("TURSO_DATABASE_URL is not set in this shell's environment");
-    process.exit(1);
-  }
-  const client = createClient({ url, authToken });
-  try {
-    for (const [name, sql] of Object.entries(QUERIES)) {
-      const res = await client.execute(
-        name === "hourly" ? { sql, args: [days] } : sql,
-      );
-      console.log(`### ${name}`);
-      for (const row of res.rows) console.log(JSON.stringify(row));
-      console.log("");
-    }
-  } finally {
-    client.close();
+  const n2 = Number(process.argv[2]);
+  // A flag in argv[2] (`--archive`) is not a day count: NaN would bind a
+  // non-number into the hourly window instead of defaulting to ten days.
+  const days = Number.isFinite(n2) && n2 > 0 ? Math.floor(n2) : 10;
+  for (const [name, sql] of Object.entries(QUERIES)) {
+    const res = await target.select(sql, name === "hourly" ? [days] : []);
+    console.log(`### ${name}`);
+    for (const row of res.rows) console.log(JSON.stringify(row));
+    console.log("");
   }
 }
 

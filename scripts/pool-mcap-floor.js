@@ -10,8 +10,11 @@
  * have crossed the gate later. That cost is only knowable by counting rows.
  *
  * WHAT IT RUNS: the scanner's own pool read (Db.getReevalPool — the same call
- * cpu-profile.js and /debug/pool make), against the production Turso database,
- * at a LADDER of ratios. The difference between two rungs IS the slice the
+ * cpu-profile.js and /debug/pool make), against the LIVE D1 database (since
+ * 2026-10-22; on the frozen Turso copy these rows stop at the cutover, so the
+ * "cost of the floor" was being answered from a month-old pool), at a LADDER
+ * of ratios. `source:` is printed before the report; `--archive` reads the
+ * frozen copy on purpose. The difference between two rungs IS the slice the
  * raise removed from every band's sweep.
  *
  * SLOT SAMPLING: the pool query reads ONE near sub-window and ONE far
@@ -38,14 +41,15 @@
  * Run it deliberately, not in a loop.
  *
  * Run: node scripts/pool-mcap-floor.js [slots] [ratio,ratio,...]
- *      (needs the .env.local Turso creds)
+ *      (live D1: CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN, or
+ *       D1_DATABASE_ID; `--archive` needs the Turso creds instead)
  */
 "use strict";
 
 const fs = require("fs");
 const path = require("path");
 const { loadConfig } = require("../dist/config.js");
-const { Db } = require("../dist/db.js");
+const { openDb } = require("./open-store.js");
 const {
   POOL_MCAP_PRUNE_RATIO,
   POOL_LIQUIDITY_PRUNE_RATIO,
@@ -63,7 +67,10 @@ const LADDER = (process.argv[3] || "0.5,0.6,0.7,0.8,0.9")
   .split(",")
   .map(Number)
   .filter((r) => Number.isFinite(r) && r > 0);
-const SLOTS = Number(process.argv[2]) > 0 ? Number(process.argv[2]) : 3;
+// A flag in argv[2] (`--archive`) is not a slot count: NaN would sample zero
+// slots and print an empty ladder.
+const arg2 = Number(process.argv[2]);
+const SLOTS = Number.isFinite(arg2) && arg2 > 0 ? Math.floor(arg2) : 3;
 
 /** wrangler.toml's [vars] — the deployed knobs, which beat the code defaults. */
 function wranglerVars() {
@@ -129,8 +136,8 @@ function composition(rows, gate) {
 }
 
 async function main() {
-  const db = new Db(cfg.tursoUrl, cfg.tursoAuthToken);
-  await db.init();
+  const { db, kind } = await openDb(process.argv.slice(2));
+  console.log(`source: ${kind}`);
 
   const chats = await db.listEnabledChats();
   if (chats.length === 0) {

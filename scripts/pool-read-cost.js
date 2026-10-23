@@ -26,6 +26,17 @@
  * quota per run; `burst n` costs n × rows/sweep and is a measurement, not a
  * free look.
  *
+ * WHICH STORE (2026-10-22): the Turso ARCHIVE, on purpose — and printed on
+ * every run. The question this instrument answers is "rows read per sweep",
+ * i.e. what TURSO CHARGES: its rate argument comes from Turso's own usage
+ * endpoint and its `index` mode would mint the index Turso needs. D1 has
+ * neither property (different billing, and the Worker mints its own
+ * idx_pool_band_* on D1 — see Db.ensurePoolBandIndex), so a D1 run would print
+ * the same columns while the arithmetic meant something else. The data
+ * questions' siblings (pool-mcap-floor, pool-window-drift, scan-history-daily)
+ * moved to LIVE D1 through scripts/open-store.js on 2026-10-22; this one stays
+ * on the store it prices and names itself.
+ *
  * Run: node scripts/pool-read-cost.js [rowsReadPerHour]
  *      node scripts/pool-read-cost.js burst [n]
  *      The rate argument is the MEASURED Turso rate — GET
@@ -101,6 +112,12 @@ function wranglerVars() {
 
 const cfg = loadConfig({ ...process.env, ...wranglerVars() });
 const client = createClient({ url: cfg.tursoUrl, authToken: cfg.tursoAuthToken });
+// Named before the first reading (see scripts/open-store.js for the rule): the
+// rate this report multiplies by is TURSO's, so the store it prices has to
+// travel with the numbers.
+console.log(
+  "source: Turso archive — NOT live (prices Turso's rows-read billing; live rows are on D1)",
+);
 
 /** One scalar COUNT(*) — the only thing this instrument asks for. */
 async function count(sql, args = []) {

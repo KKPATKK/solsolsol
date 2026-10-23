@@ -12,15 +12,14 @@
  * `ok=true`. A lying instrument is worse than no instrument, so the pins here
  * are about WHERE THE ROWS COME FROM:
  *
- *   1. D1 is the default (REST binding + src/d1.ts transport — the same pair
- *      the migration and scripts/raydium-attribution.js use) and the run names
- *      its source before it prints a single reading.
- *   2. The Turso copy exists only behind `--archive` and is labelled NOT live.
- *   3. No `Db.init()`: that is a DDL batch, and a read-only probe must not run
- *      DDL against production (which is also why the SQL is copied instead of
- *      going through Db.getWorkerState — pin the copy against the source).
- *   4. No silent fallback: an unreachable D1 fails the run rather than
- *      answering from the older store.
+ *   1. The probe delegates the store decision to scripts/open-store.js (the
+ *      seam every off-body tool reads through — D1 live by default, the frozen
+ *      archive only behind `--archive`, `source:` printed, no silent fallback).
+ *   2. It still runs no `Db.init()`: that is a DDL batch, and a read-only probe
+ *      must not run DDL against production — which is also why its statements
+ *      are copies of Db.getWorkerState's / getWorkerStates' SQL (pinned here
+ *      against src/db.ts).
+ *   3. It still prints the readings it exists for.
  *
  * Run: node scripts/test-heartbeat-read.js (npm run test:unit runs it after the
  * build, beside the other standalone suites).
@@ -43,64 +42,88 @@ function test(name, fn) {
   }
 }
 
-const probeSrc = fs.readFileSync(
-  path.join(__dirname, "..", "scripts", "read-heartbeat.js"),
-  "utf8",
-);
-const dbSrc = fs.readFileSync(path.join(__dirname, "..", "src", "db.ts"), "utf8");
+const read = (p) =>
+  fs.readFileSync(path.join(__dirname, "..", ...p.split("/")), "utf8");
 
-// ---------- 1. D1 by default, and the source is named on every run ----------
+const probeSrc = read("scripts/read-heartbeat.js");
+const storeSrc = read("scripts/open-store.js");
+const dbSrc = read("src/db.ts");
 
-test("the probe defaults to D1 and names its source before its first reading", () => {
+/** Code without comments — a sentence in a header is not a call in the body. */
+const stripComments = (text) =>
+  text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+const probeCode = stripComments(probeSrc);
+
+// ---------- 1. one seam decides the store, and names it on every run --------
+
+test("the probe delegates to open-store.js instead of picking a store itself", () => {
   assert.ok(
-    probeSrc.includes('const id =\n    process.env.D1_DATABASE_ID ||') &&
-      probeSrc.includes('db.name === named)?.uuid'),
+    probeSrc.includes('const { openTarget } = require("./open-store.js");'),
+    "the store comes from the shared seam",
+  );
+  for (const leftover of ["new Db(", "createClient(", "d1Rest.", "loadConfig("]) {
+    assert.equal(
+      probeCode.includes(leftover),
+      false,
+      `the probe must not build its own client (${leftover})`,
+    );
+  }
+  assert.ok(
+    probeSrc.includes("console.log(`source: ${target.kind}`);") &&
+      probeSrc.includes('await target.select(ROW_SQL, ["scan_heartbeat"])'),
+    "the source is printed before the first reading, and the rows come through it",
+  );
+});
+
+test("the seam defaults to D1 and reaches it through the transport the Worker uses", () => {
+  assert.ok(
+    storeSrc.includes("process.env.D1_DATABASE_ID ||") &&
+      storeSrc.includes("db.name === named)?.uuid"),
     "the database is an explicit id or the account's named one",
   );
   assert.ok(
-    probeSrc.includes("d1.createD1Transport(d1Rest.createRestBinding(api, id))"),
+    storeSrc.includes("binding: d1Rest.createRestBinding(api, id)") &&
+      storeSrc.includes("d1.createD1Transport(target.binding)"),
     "the rows come over the REST binding + src/d1.ts transport",
   );
   assert.ok(
-    probeSrc.includes("console.log(`source: ${target.kind}`);") &&
-      probeSrc.includes("— LIVE"),
-    "the store that answered is printed, so a stale reading cannot hide",
+    storeSrc.includes("— LIVE"),
+    "the live label exists, so a stale reading cannot hide behind a bare id",
   );
 });
 
 test("the Turso copy only exists behind --archive and is labelled NOT live", () => {
   assert.ok(
-    probeSrc.includes('if (argv.includes("--archive")) {'),
+    storeSrc.includes('argv.includes("--archive")'),
     "the archive is an explicit choice, never the default",
   );
   assert.ok(
-    probeSrc.includes("NOT live; the pre-2026-10-15-cutover copy"),
+    storeSrc.includes("NOT live; the pre-2026-10-15-cutover copy"),
     "and the label says what it is",
   );
 });
 
 test("an unreachable D1 fails the run instead of falling back", () => {
   assert.ok(
-    probeSrc.includes("throw new Error(") &&
-      probeSrc.includes("Pass --archive only to read the"),
+    storeSrc.includes("throw new Error(") &&
+      storeSrc.includes("Pass --archive to read the frozen"),
     "a missing credential is an error naming both ways to proceed",
   );
   assert.equal(
-    /falling back to the frozen Turso archive/.test(probeSrc),
+    /falling back to the frozen Turso archive/.test(storeSrc + probeSrc),
     false,
-    "no silent store switch (that is the bug this test guards)",
+    "no silent store switch (that is the bug this suite guards)",
   );
 });
 
-// ---------- 2. read-only: SELECTs, and the SQL matches the Db's own ----------
+// ---------- 2. read-only: SELECTs, and the SQL matches the Db's own --------
 
 test("the probe never runs Db.init() (the DDL batch) against production", () => {
-  const calls = probeSrc.split("await db.init()").length - 1;
-  assert.equal(calls, 0, "no init() call");
-  assert.equal(
-    probeSrc.includes('require("../dist/db.js")') &&
-      probeSrc.includes("SCHEMA_DDL_FINGERPRINT_KEY"),
-    true,
+  assert.equal(probeSrc.split("await db.init()").length - 1, 0, "no init() call");
+  assert.ok(
+    probeSrc.includes("SCHEMA_DDL_FINGERPRINT_KEY"),
     "the fingerprint constant still comes from src/db.ts",
   );
 });
@@ -111,9 +134,7 @@ test("the copied statements are Db.getWorkerState's / getWorkerStates' own SQL",
     "src/db.ts reads one row with this statement",
   );
   assert.ok(
-    dbSrc.includes(
-      "`SELECT key, value FROM worker_state WHERE key IN (${keys",
-    ),
+    dbSrc.includes("`SELECT key, value FROM worker_state WHERE key IN (${keys"),
     "and many rows with this one",
   );
   assert.ok(
@@ -124,6 +145,17 @@ test("the copied statements are Db.getWorkerState's / getWorkerStates' own SQL",
     probeSrc.includes("`SELECT key, value FROM worker_state WHERE key IN (${Array(n)") &&
       probeSrc.includes('.join(",")})`;'),
     "and the probe's batch statement matches (same IN list, same columns)",
+  );
+});
+
+test("openDb() runs init() once, on the chosen store, and says which", () => {
+  assert.ok(
+    storeSrc.includes("await db.init();"),
+    "Db.get() refuses an uninitialised client, so the seam does it once",
+  );
+  assert.ok(
+    storeSrc.includes('new Db("", undefined, undefined, target.binding)'),
+    "the live Db rides the binding (the url/authToken are unused on that path)",
   );
 });
 
