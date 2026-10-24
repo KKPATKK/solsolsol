@@ -1197,6 +1197,88 @@ async function main() {
     }
   });
 
+  await test("Db.calibratePushWatchSeries: an unpinned row is re-based on the first DexScreener reading, exactly once", async () => {
+    // WHY (2026-10-24): a row enrolled during a pair-lane refusal (a push or
+    // heal whose pair came from Jupiter/Gecko) carries that leg's valuation as
+    // its baseline, and it has NO pool pin. The tracker now refuses to judge it
+    // until a DexScreener reading exists (src/pushwatch.ts rule 6); this is the
+    // write that turns that reading into the series' base. Live ELON quoted
+    // $10.12M on a pool trading $14.7K — one bad reading had re-based the row
+    // through the revival path.
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "JUPROW", chatId: "c", symbol: "JUPROW",
+        pushedAt: Date.now() - 60_000, mcapAtPush: 400_000, liquidityUsd: 0.5,
+      });
+      // The damage the old path could do: an up-move mark, a death and a trough
+      // all derived from the fallback leg's 400K base.
+      await db.updatePushWatchCheck("JUPROW", {
+        peakMcap: 900_000, lastLiquidity: 0.5, lastVol5m: 1_000,
+        upStages: "up100,base:900000", lastState: "dead",
+        deadTroughMcap: 12_000, lastAlertAt: Date.now() - 1_000,
+        lastMcap: 12_000, sellDomStreak: 4,
+      });
+      const before = (await db.listPushWatch(10)).find((r) => r.token === "JUPROW");
+      assert.equal(before.poolAddress, null, "the row was never pinned");
+      assert.equal(before.mcapAtPush, 400_000, "and its denominator is the fallback leg's");
+
+      assert.equal(
+        await db.calibratePushWatchSeries("JUPROW", before.lastChecked, {
+          mcap: 30_000, liquidity: 20_000, vol5m: 1_000, poolAddress: "POOLX",
+        }),
+        true,
+      );
+      const after = (await db.listPushWatch(10)).find((r) => r.token === "JUPROW");
+      assert.equal(after.mcapAtPush, 30_000, "the pool reading becomes the baseline");
+      assert.equal(after.peakMcap, 30_000, "and the peak starts where the base does");
+      assert.equal(after.lastMcap, 30_000);
+      assert.equal(after.poolAddress, "POOLX", "the row is pinned by the same write");
+      assert.equal(after.lastState, null, "a death derived from the old base does not survive");
+      assert.equal(after.upStages, null, "nor its marks / cut marks");
+      assert.equal(after.deadTroughMcap, null, "nor a trough in the old currency");
+      assert.equal(after.sellDomStreak, 0);
+      assert.equal(after.lastAlertAt, 0, "the cooldown restarts with the series");
+      assert.ok(after.lastChecked > before.lastChecked, "the calibration is the row's latest check");
+
+      // ONCE: the pin is the guard, so a second pass cannot walk the base
+      // around (the revival rule would otherwise re-base a live row).
+      assert.equal(
+        await db.calibratePushWatchSeries("JUPROW", after.lastChecked, {
+          mcap: 10, liquidity: 1, vol5m: 1, poolAddress: "OTHER",
+        }),
+        false,
+      );
+      assert.equal(
+        (await db.listPushWatch(10)).find((r) => r.token === "JUPROW").mcapAtPush,
+        30_000,
+        "the pinned row keeps its calibrated base",
+      );
+
+      // The other half of the CAS: a caller that read an OLDER check stamp (a
+      // concurrent pass already judged the row) loses while it is unpinned.
+      await db.upsertPushWatch({
+        token: "STALE1", chatId: "c", symbol: "STALE1",
+        pushedAt: Date.now() - 60_000, mcapAtPush: 400_000, liquidityUsd: 0.5,
+      });
+      assert.equal(
+        await db.calibratePushWatchSeries("STALE1", 999, {
+          mcap: 30_000, liquidity: 20_000, vol5m: 1, poolAddress: "POOLY",
+        }),
+        false,
+      );
+      assert.equal(
+        (await db.listPushWatch(10)).find((r) => r.token === "STALE1").poolAddress,
+        null,
+        "a stale claim cannot pin the row",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   // ---------- the tracker's terminal (💧 drain) card ----------
   //
   // The live bug these close (2026-09-20, Lobby): the 💧 流動性枯竭 …停止追蹤 card
@@ -1210,20 +1292,28 @@ async function main() {
   // pass is driven through its public seam here
   // (docs/patches/terminal-send-and-liq-prune.patch).
 
-  const termRow = (over = {}) => ({
-    token: "LOBBY", chatId: "c", symbol: "LOBBY",
-    pushedAt: Date.now() - 30 * 60_000,
-    mcapAtPush: 100_000, peakMcap: 100_000, lastLiquidity: 50_000,
-    lastVol5m: 1_000, deadTroughMcap: null, holdersAtPush: null,
-    holdersLast: null, holdersCheckedAt: null, sellDomStreak: 0,
-    lastMcap: null, lastChecked: 0, lastAlertAt: 0,
-    followupsSent: 0, lastState: null,
-    // ALREADY ARMED: this row has been seen below the floor once, so the drain
-    // rule is at its terminal step and the 💧 card is the alert in play. With a
-    // single reading it would only warn (see DRAIN_CONFIRM_MARK).
-    upStages: DRAIN_CONFIRM_MARK,
-    ...over,
-  });
+  const termRow = (over = {}) => {
+    const token = over.token ?? "LOBBY";
+    return {
+      token, chatId: "c", symbol: token,
+      pushedAt: Date.now() - 30 * 60_000,
+      mcapAtPush: 100_000, peakMcap: 100_000, lastLiquidity: 50_000,
+      lastVol5m: 1_000, deadTroughMcap: null, holdersAtPush: null,
+      holdersLast: null, holdersCheckedAt: null, sellDomStreak: 0,
+      lastMcap: null, lastChecked: 0, lastAlertAt: 0,
+      followupsSent: 0, lastState: null,
+      // PINNED by default, and to the address `termPair` gives the pair: the
+      // tracker's pool pin (src/pushwatch.ts) judges a pinned row ONLY on that
+      // pool, so an unpinned harness row would take the calibration path
+      // instead (and is what the rule-6 test below constructs explicitly).
+      poolAddress: `p-${token}`,
+      // ALREADY ARMED: this row has been seen below the floor once, so the drain
+      // rule is at its terminal step and the 💧 card is the alert in play. With a
+      // single reading it would only warn (see DRAIN_CONFIRM_MARK).
+      upStages: DRAIN_CONFIRM_MARK,
+      ...over,
+    };
+  };
   // Flat mcap and flat volume: the ONLY alert in play is the 💧 drain card, and
   // that is the only one evaluateWatch marks terminal (stopTracking).
   const termPair = (token, liquidityUsd) => ({
@@ -1238,9 +1328,11 @@ async function main() {
   const termDb = (rows, opts = {}) => {
     const state = new Map(Object.entries(opts.state ?? {}));
     const updated = [];
+    const calibrated = [];
     const rearmed = [];
     return {
       updated,
+      calibrated,
       rearmed,
       state,
       listPushWatch: async () => rows,
@@ -1258,6 +1350,10 @@ async function main() {
       },
       claimPushWatchCheck: async (token, _expected, _now, v) => { updated.push([token, v]); return true; },
       updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
+      calibratePushWatchSeries: async (token, _expected, v) => {
+        calibrated.push([token, v]);
+        return true;
+      },
       deletePushWatch: async () => {},
       setPushWatchHolders: async () => {},
       setPushWatchHoldersMany: async () => {},
@@ -1278,6 +1374,98 @@ async function main() {
       async (addrs) => new Map(addrs.map((a) => [a, termPair(a, liquidityUsd)])),
       null,
     );
+
+  await test("PushWatcher: a row with no pin is never judged on a fallback leg — the first DexScreener reading calibrates it", async () => {
+    // RULE 6 (src/pushwatch.ts's pool-pinning note). A row enrolled from a
+    // Jupiter/Gecko pair — the normal shape while the pair lane is refused —
+    // has no pin and a baseline in that leg's valuation. Judging it from the
+    // pinless token lane mixes two bases: live 2026-10-24 ELON ran a "revival"
+    // at $10.12M on a pool that then traded $14.7K, and every later card
+    // quoted the $10.12M base. So a fallback reading neither judges nor writes
+    // the row; the first DexScreener answer CALIBRATES it (one write, no card)
+    // and pins the pool, and only the pass after that judges the series.
+    const texts = [];
+    const bot = { api: { sendMessage: async (_c, text) => { texts.push(text); return { message_id: 9 }; } } };
+    let row = termRow({
+      token: "UNCAL",
+      poolAddress: null,
+      // The fallback leg's valuation, 13× the pool's own reading below — the
+      // exact shape that made a follow-up quote the wrong coin price.
+      mcapAtPush: 400_000,
+      peakMcap: 400_000,
+      lastMcap: null,
+      lastState: null,
+      upStages: null,
+    });
+    const db = termDb([row]);
+    db.listPushWatch = async () => [row];
+    db.calibratePushWatchSeries = async (token, _expected, v) => {
+      db.calibrated.push([token, v]);
+      row = {
+        ...row,
+        poolAddress: v.poolAddress,
+        mcapAtPush: v.mcap,
+        peakMcap: v.mcap,
+        lastMcap: v.mcap,
+        lastChecked: Date.now(),
+        // The calibration clears what the uncalibrated reading left behind.
+        lastState: null,
+        upStages: null,
+        deadTroughMcap: null,
+        lastAlertAt: 0,
+      };
+      return true;
+    };
+    let pair = {
+      ...termPair("UNCAL", 20_000),
+      pairAddress: "UNCAL",
+      marketCap: 400_000,
+      feedSource: "jupiter",
+    };
+    const watcher = () =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        loadConfig({}),
+        async (addrs) => new Map(addrs.map((a) => [a, pair])),
+        null,
+      );
+
+    // (1) The fallback reading: no eval, no write, no card.
+    const pass1 = await watcher().runTick(Date.now() + 1_500);
+    assert.equal(db.calibrated.length, 0, "a Jupiter mcap cannot calibrate the series");
+    assert.equal(db.updated.length, 0, "and it cannot judge/write the row either");
+    assert.equal(texts.length, 0, "nothing is announced off it");
+    assert.match(String(pass1.note), /unpin 1/, "the skip is named, not silent");
+
+    // Same rule for a DexScreener pair with NO valuation: no calibration (a 0
+    // base would poison the resurrection floor exactly as it did in 2026-09-24).
+    pair = { ...pair, feedSource: "dexscreener", pairAddress: "POOL-UNCAL", marketCap: 0 };
+    const pass2 = await watcher().runTick(Date.now() + 1_500);
+    assert.equal(db.calibrated.length, 0, "a valueless reading is not a calibration");
+    assert.equal(texts.length, 0);
+    assert.match(String(pass2.note), /unpin 1/);
+
+    // (2) The first real DexScreener reading: ONE calibration write, no card.
+    pair = { ...pair, marketCap: 30_000 };
+    const pass3 = await watcher().runTick(Date.now() + 1_500);
+    assert.equal(db.calibrated.length, 1, "the pool reading calibrates the row");
+    assert.equal(db.calibrated[0][1].mcap, 30_000);
+    assert.equal(db.calibrated[0][1].poolAddress, "POOL-UNCAL", "and pins the pool it came from");
+    assert.equal(db.updated.length, 0, "calibration is not a check write");
+    assert.equal(texts.length, 0, "and it announces nothing");
+    assert.match(String(pass3.note), /calib 1/);
+
+    // (3) The next pass judges the CALIBRATED series: -50% off the $30K base is
+    // a 💀 whose 現價 is the pool's own $15K, not the fallback's $400K.
+    pair = { ...pair, marketCap: 15_000 };
+    await watcher().runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "the calibrated series is judged normally");
+    assert.match(String(texts[0]), /💀 走死 <code>UNCAL<\/code>/);
+    assert.match(String(texts[0]), /峰值 \$30\.00K/);
+    assert.match(String(texts[0]), /現 \$15\.00K/, "the card quotes the pool's reading, not the old base");
+  });
 
   await test("PushWatcher: an ABANDONED terminal card KEEPS the transition and records the unknown delivery", async () => {
     const db = termDb([termRow()]);
@@ -14344,6 +14532,11 @@ async function main() {
       holdersLast: null, holdersCheckedAt: null, sellDomStreak: 0,
       lastMcap: null, lastChecked: pushedAt, lastAlertAt: 0,
       followupsSent: 0, lastState: null, upStages: null,
+      // PINNED by default, to the address `watchPair` gives the pair: a pinned
+      // row is judged only on its own pool (src/pushwatch.ts), so a harness row
+      // without one would take the calibration path instead (rule 6) — the
+      // tests that exercise that path pass `poolAddress: null` explicitly.
+      poolAddress: `p-${token}`,
       ...over,
     };
   };
@@ -14358,7 +14551,10 @@ async function main() {
     txns: { m5Buys: 10, m5Sells: 8, h1Buys: 100, h1Sells: 80 },
     liquidity: { usd: 50_000 }, pairCreatedAt: Date.now() - 3 * 3_600_000,
   });
-  const watchDb = (rows, updated) => ({
+  const watchDb = (rows, updated) => {
+    const calibrated = [];
+    return {
+    calibrated,
     listPushWatch: async () => rows,
     prunePushWatch: async () => 0,
     findUntrackedPushes: async () => [],
@@ -14380,9 +14576,23 @@ async function main() {
     },
     claimPushWatchCheck: async (token, _expected, _now, v) => { updated.push([token, v]); return true; },
     updatePushWatchCheck: async (token, v) => { updated.push([token, v]); },
+    // Rule 6 (src/pushwatch.ts): the first DexScreener reading of an unpinned
+    // row re-bases it instead of judging it. The fake mutates its own row so a
+    // multi-pass test sees the pin the write would have landed.
+    calibratePushWatchSeries: async (token, _expected, v) => {
+      const r = rows.find((x) => x.token === token);
+      if (!r || r.poolAddress) return false;
+      calibrated.push([token, v]);
+      r.poolAddress = v.poolAddress;
+      r.mcapAtPush = v.mcap;
+      r.peakMcap = v.mcap;
+      r.lastMcap = v.mcap;
+      return true;
+    },
     deletePushWatch: async () => {},
     setPushWatchHolders: async () => {},
-  });
+    };
+  };
   const watchBot = { api: { sendMessage: async () => ({ message_id: 1 }) } };
 
   await test("PushWatcher: a late pass still queues the WHOLE pool in one trip", async () => {
@@ -14621,7 +14831,10 @@ async function main() {
     // pass and re-pins the row to the pool the token batch now names.
     const rows = [
       watchRow("AAA", { poolAddress: "pool-A" }),
-      watchRow("BBB"), // legacy: no pin, judged from the token batch, pinned on first write
+      // Legacy: no pin at all. It cannot be judged from the token batch any
+      // more (rule 6): the first DexScreener reading CALIBRATES and pins it,
+      // and the pass after that judges it — see the assertions below.
+      watchRow("BBB", { poolAddress: null }),
     ];
     const updated = [];
     const repins = [];
@@ -14693,9 +14906,15 @@ async function main() {
     assert.match(String(second.note), /pin-skip 1/);
     assert.match(String(second.note), /repin 1/);
     assert.deepEqual(repins, [{ token: "AAA", from: "pool-A", to: "p-AAA" }]);
+    // The legacy row was CALIBRATED on pass 1 (rule 6) — one write, no card —
+    // and is judged normally from the pass after that.
+    assert.ok(
+      db.calibrated.some(([t, v]) => t === "BBB" && v.poolAddress === "p-BBB"),
+      `the legacy row is calibrated on its first pool reading: ${second.note}`,
+    );
     const bbb2 = updated.find(([t]) => t === "BBB")?.[1];
-    assert.ok(bbb2, "the legacy row keeps the token-batch path");
-    assert.equal(bbb2.poolAddress, "p-BBB", "a legacy row is pinned on its first check write");
+    assert.ok(bbb2, "and the calibrated row keeps the token-batch path from then on");
+    assert.equal(bbb2.poolAddress, "p-BBB", "its pin is the pool the calibration read");
 
     // Pass 3 — the next pass judges from the NEW pin (the token batch's own
     // pair IS the pin now), even with the by-address lookup answering nothing.
@@ -15008,8 +15227,10 @@ async function main() {
     db.deletePushWatch = async (token) => { deleted.push(token); };
     const stalePush = Date.now() - 6 * 3_600_000;
     db.listPushWatch = async () => [
-      watchRow("REARMED", { pushedAt: stalePush, lastChecked: 0, lastLiquidity: 9_000 }),
-      watchRow("STALE", { pushedAt: stalePush, lastChecked: stalePush, lastLiquidity: 9_000 }),
+      // Unpinned so the miss path is the one under test (a pinned row whose
+      // pool is not confirmed skips as `pin-skip` before the delete guard).
+      watchRow("REARMED", { pushedAt: stalePush, lastChecked: 0, lastLiquidity: 9_000, poolAddress: null }),
+      watchRow("STALE", { pushedAt: stalePush, lastChecked: stalePush, lastLiquidity: 9_000, poolAddress: null }),
       // The batch must answer for SOMETHING: an empty one is now reported as
       // `pairs-empty` and nothing at all is judged (see the test above).
       watchRow("LIVE", { pushedAt: Date.now() - 40 * 60_000 }),
@@ -15092,9 +15313,12 @@ async function main() {
     assert.equal(out.checked, 1, "the row that did resolve a pair is evaluated");
     assert.match(String(out.note), /rows 1\/40/);
     assert.match(String(out.note), new RegExp(`pairs 1\\/${asked[0]}`));
-    // Only the rows the batch COVERED may be counted as misses — a coin can
-    // never be judged delisted off a request it was not part of.
-    assert.match(String(out.note), new RegExp(`miss ${asked[0] - 1}\\b`));
+    // Only the rows the batch COVERED may be blamed — a coin can never be
+    // judged delisted off a request it was not part of. With every row pinned
+    // (the production shape), an unresolved row stops at the pin gate as
+    // `pin-skip`; the delete path is behind `miss` and therefore even further
+    // out of reach for a row the pass never asked about.
+    assert.match(String(out.note), new RegExp(`pin-skip ${asked[0] - 1}\\b`));
     assert.ok(
       !new RegExp(`miss ${rows.length}\\b`).test(String(out.note)),
       `rows outside the batch must not be reported as misses: ${out.note}`,
@@ -15125,7 +15349,9 @@ async function main() {
     assert.equal(asked[0], rows.length, `asked for ${asked[0]} of ${rows.length}`);
     assert.match(String(out.note), /rows 1\/29/);
     assert.match(String(out.note), /pairs 1\/29/);
-    assert.match(String(out.note), /miss 28\b/);
+    // See the sibling test: the 28 unresolved rows are pinned, so they stop at
+    // the pin gate (`pin-skip`) rather than the unpinned `miss` path.
+    assert.match(String(out.note), /pin-skip 28\b/);
   });
 
   await test("PushWatcher: a row that starts after the deadline sends inside the pass tail", async () => {

@@ -1604,6 +1604,16 @@ export function notePeerPassYield(at: number, ageMs: number): void {
  *     or two, not skip the whole pin set. Snapshots are memory, never
  *     evidence: an ANSWERED absence still re-pins (and drops the snapshot),
  *     and a snapshot-served row can never re-pin anything itself.
+ *  6. A row with NO pin has never been read on a DexScreener pool: it was
+ *     enrolled by a push (or heal) whose pair came from the Jupiter/Gecko
+ *     fallback, and its stored baseline is on that leg's valuation. It is
+ *     therefore NOT judged until the token lane hands over a DexScreener
+ *     reading — that reading CALIBRATES the series (one write, no card; see
+ *     Db.calibratePushWatchSeries) and pins the pool. A non-DexScreener or
+ *     valueless reading cannot calibrate anything and is skipped (`unpin N`
+ *     in the note): mixing the two valuations in one row is exactly how a
+ *     follow-up card came to quote $10.12M for a coin trading near $14.7K
+ *     (2026-10-24, ELON).
  *
  * DELIBERATE CONSEQUENCES (not bugs): nothing about the stored series is
  * reset on a re-pin, so the one skipped pass is the entire switch protection;
@@ -4377,6 +4387,22 @@ export class PushWatcher {
      */
     let pinSkip = 0;
     /**
+     * Rows with NO pin (see the pool-pinning note's rule 6) that this pass
+     * could NOT calibrate: the token lane answered from a Jupiter/Gecko pair
+     * or with no valuation, neither of which can be the base of a
+     * DexScreener-calibrated series. Counted apart from `pin-skip` (that row
+     * HAS a pin) and from `miss` (the token batch answered — it just answered
+     * in a different currency).
+     */
+    let unpinnedSkip = 0;
+    /**
+     * Rows re-based by this pass (rule 6): the first DexScreener reading of a
+     * row that never had one. One write each, no card — the next pass judges
+     * the calibrated series. Named in the note so a new push made during an
+     * outage is visibly being calibrated rather than silently unjudged.
+     */
+    let calibrated = 0;
+    /**
      * Rows this pass REFUSED to judge because their reading was too old (see
      * PUSH_WATCH_MAX_READING_AGE_MS): the card that would have come off it is
      * withheld and the row is left COMPLETELY untouched — not even the
@@ -4735,6 +4761,49 @@ export class PushWatcher {
         if (!overBudget && row.lastChecked > 0 && now - lastSeen > 2 * 3_600_000) {
           trips += 1;
           await this.db.deletePushWatch(row.token);
+        }
+        continue;
+      }
+      // RULE 6 (see the pool-pinning note): a row with no pin has never been
+      // judged on a DexScreener pool, so its baseline and peak are on the
+      // valuation of whichever fallback leg enrolled it. The token lane is the
+      // only place such a row can get its first calibrated reading (the pin
+      // lane has no address to ask for yet).
+      //
+      // A non-DexScreener reading is NOT a calibration: it is the same coin in
+      // another currency, with no content clock the stale gate can read (see
+      // PairInfo.contentAt), and the factor is routinely 2×-5×. Judging the row
+      // from it is how a follow-up card quoted $10.12M for a coin whose pool
+      // then traded $14.7K (live 2026-10-24, ELON) — and because a revival
+      // re-bases the whole series on the reading, ONE such tick is enough to
+      // make every later card quote the wrong number. So skip instead, exactly
+      // like every other "missing data never judges" path here.
+      if (pin === null) {
+        const calibratedSource =
+          pair.feedSource === undefined || pair.feedSource === "dexscreener";
+        const mcap = Number(pair.marketCap);
+        const pool = pinnablePoolAddress(pair);
+        if (!calibratedSource || !Number.isFinite(mcap) || mcap <= 0 || pool === null) {
+          unpinnedSkip += 1;
+          continue;
+        }
+        // THE CALIBRATION ITSELF: one compare-and-swap write, no card. It
+        // clears the marks and the peak the uncalibrated readings left behind
+        // (see Db.calibratePushWatchSeries), so the next pass starts a clean,
+        // single-basis series from this pool reading.
+        trips += 1;
+        try {
+          if (await this.db.calibratePushWatchSeries(row.token, row.lastChecked, {
+            mcap,
+            liquidity: comparableLiquidity(pair),
+            vol5m: pair.volume.m5,
+            poolAddress: pool,
+          })) {
+            calibrated += 1;
+          }
+        } catch {
+          // Best-effort like every other tracker write: a failed calibration
+          // leaves the row unpinned, and the next pass retries it unchanged.
         }
         continue;
       }
@@ -5384,7 +5453,10 @@ export class PushWatcher {
     // a healthy `ok:0/0` in /health — the exact shape that hid the 2026-09-17
     // stop for hours. One line names every skip reason: tokens the batch did
     // not return (miss), rows the pool pin skipped (pin-skip — their pinned
-    // pool was not in an ANSWERED lookup; see the pool-pinning note) and the
+    // pool was not in an ANSWERED lookup; see the pool-pinning note), rows
+    // with NO pin that the token lane could not calibrate (unpin — a
+    // Jupiter/Gecko or valueless reading; see rule 6), rows the first
+    // DexScreener reading re-based (calib) and the
     // confirmed switches re-pinned (repin), rows judged from a pin's
     // last-answered snapshot instead of skipping (pin-snap — the lookup was
     // refused; see rule 5; the parenthesised `oldest Xs` is the age of the
@@ -5407,6 +5479,8 @@ export class PushWatcher {
       `${staleSkipped > 0 ? ` stale ${staleSkipped}` : ""}` +
       ` miss ${pairMiss} lost ${claimLost}` +
       `${pinSkip > 0 ? ` pin-skip ${pinSkip}` : ""}` +
+      `${unpinnedSkip > 0 ? ` unpin ${unpinnedSkip}` : ""}` +
+      `${calibrated > 0 ? ` calib ${calibrated}` : ""}` +
       `${repins.length > 0 ? ` repin ${repins.length}` : ""}` +
       `${backfilled > 0 ? ` backfill ${backfilled}` : ""}` +
       `${sendDeferred > 0 ? ` defer-send ${sendDeferred}` : ""}` +

@@ -6418,6 +6418,79 @@ export class Db {
     return Number(res.rowsAffected ?? 0);
   }
 
+  /**
+   * Re-base an UNPINNED row's series on its first DexScreener reading.
+   *
+   * WHY (2026-10-24, operator: "sometimes the mcap in a follow-up card is
+   * wrong"). `pool_address` is NULL exactly when the row was enrolled from a
+   * NON-DexScreener pair — a push (or a self-heal) that happened while the pair
+   * lane was refused, which is the normal shape of a 429 episode (`pairs 199
+   * pairsJup 199`). Such a row's stored baseline and peak are on THAT leg's
+   * valuation of the coin, and the two valuations are not interchangeable:
+   * Jupiter's `mcap` can be several times the pool's (docs/mcap-basis-and-
+   * pool-pick-2026-10-02.md's Agency incident was 0.50×; the 2026-09-19 audit
+   * found an FDV-shaped 4.6×), and neither fallback leg carries a content
+   * clock the stale gate could refuse. Judging the row from the pinless token
+   * lane therefore compares two bases, and a single bad reading is enough to
+   * fire a false 💀 and then RE-BASE the whole row on it — live 2026-10-24
+   * ELON: a "revival" at $10.12M on a coin whose pinned pool then traded
+   * $14.7K with $9.9K of liquidity, and every later card quoted the $10.12M
+   * base.
+   *
+   * So the first DexScreener answer is not judged: it becomes the series'
+   * base. That is ONE write and ONE pass of grace (the same shape as the
+   * re-pin policy), and it is why the caller passes `last_checked` — the
+   * compare-and-swap is the only exclusion needed, exactly like the silent
+   * check's.
+   *
+   * What is cleared is everything derived from the uncalibrated readings: the
+   * peak and the dead trough (both can be off by the basis factor), the marks
+   * (a false 🚀/💀/cut mark must not survive into the calibrated series) and
+   * the cooldown. `followups_sent` stays — it is a delivery count, not a
+   * valuation, and the 🏁 recap reports it. The PUSH-TIME value is still kept
+   * by the ledger (src/pushledger.ts), which is where band audits read it; this
+   * method only fixes the denominator of the row's LIVE series.
+   *
+   * Returns false when the row was already calibrated (or pinned by another
+   * isolate) — a live row is never re-based twice.
+   */
+  async calibratePushWatchSeries(
+    token: string,
+    expectedLastChecked: number,
+    v: {
+      mcap: number;
+      liquidity: number | null;
+      vol5m: number | null;
+      poolAddress: string;
+    },
+  ): Promise<boolean> {
+    const now = Date.now();
+    const res = await this.get().execute({
+      sql: `UPDATE push_watch
+              SET mcap_at_push = ?, peak_mcap = ?, last_mcap = ?,
+                  last_liquidity = ?, last_vol_5m = COALESCE(?, last_vol_5m),
+                  last_checked = ?, pool_address = ?,
+                  dead_trough_mcap = NULL, last_state = NULL,
+                  up_stages = NULL, revives_since_up = 0,
+                  sell_dom_streak = 0, last_alert_at = 0
+            WHERE token = ?
+              AND pool_address IS NULL
+              AND last_checked = ?`,
+      args: [
+        v.mcap,
+        v.mcap,
+        v.mcap,
+        v.liquidity,
+        v.vol5m,
+        now,
+        v.poolAddress,
+        token,
+        expectedLastChecked,
+      ],
+    });
+    return Number(res.rowsAffected ?? 0) > 0;
+  }
+
   async claimPushWatchCheck(
     token: string,
     expectedLastChecked: number,
