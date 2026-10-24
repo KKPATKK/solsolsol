@@ -12030,6 +12030,78 @@ async function main() {
     );
   });
 
+  await test("fetchTokenDataBatch: pair chunks ride the shared edge cache — a HIT frees the provider slot", async () => {
+    // WHY (2026-10-24): the per-isolate map above cannot survive the fleet's
+    // isolate churn (measured: 10 of 12 sampled ticks ran as a fresh isolate,
+    // so `hits` stayed 0 and the 90s TTL bought nothing). The colo entry is the
+    // reuse that survives a tick. Three claims are pinned here: the request
+    // asks for an entry bounded by the SAME staleness window the gates accept,
+    // only a plain HIT counts as free, and a HIT is refunded from the
+    // provider's window ledger so the slot it saved is usable in this tick.
+    const mintA = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
+    const mintB = "So11111111111111111111111111111111111111112";
+    const originalFetch = globalThis.fetch;
+    const inits = [];
+    let cacheStatus = "HIT";
+    globalThis.fetch = async (_url, init) => {
+      inits.push(init);
+      return new Response(JSON.stringify([{ id: mintA, mcap: 7 }]), {
+        status: 200,
+        headers:
+          cacheStatus === null
+            ? {}
+            : // `Age` at the very end of the window: the reading is already as
+              // old as the bound, so the local map must NOT extend it.
+              { "cf-cache-status": cacheStatus, age: "60" },
+      });
+    };
+    try {
+      const client = new JupTokensClient({
+        jupiterRequestIntervalMs: 0,
+        jupPairCacheMs: 60_000,
+        jupReserveCardSlot: false,
+      });
+      assert.equal((await client.fetchTokenDataBatch([mintA])).size, 1);
+      assert.equal(inits.length, 1);
+      assert.equal(inits[0].cf.cacheEverything, true);
+      assert.equal(inits[0].cf.cacheTtl, 60, "the edge window is the SAME bound, in seconds");
+      assert.equal(inits[0].cf.cacheTtlByStatus["200-299"], 60);
+      assert.equal(
+        inits[0].cf.cacheTtlByStatus["400-599"],
+        0,
+        "a refusal must never be stored as fresh readings",
+      );
+      let stats = client.pairCacheStats();
+      assert.equal(stats.edgeHits, 1);
+      assert.equal(stats.edgeMisses, 0);
+      assert.equal(
+        client.windowDispatches(),
+        0,
+        "a HIT never reached Jupiter, so the window slot stays free",
+      );
+
+      // THE TWO LAYERS MUST NOT STACK (see get's edgeContentAt): this HIT is
+      // already 60s old, so re-stamping it as "now" would serve a 60s reading
+      // for another 60s. The local map refuses it and the chunk is asked again
+      // — from the edge, which costs no provider slot.
+      assert.equal((await client.fetchTokenDataBatch([mintA])).size, 1);
+      assert.equal(inits.length, 2, "an edge reading at the window's end is not re-cached locally");
+      assert.equal(client.pairCacheStats().hits, 0, "no local hit: the age, not the arrival, is stamped");
+      assert.equal(client.pairCacheStats().edgeHits, 2);
+
+      // A response with no cf-cache-status at all is a MISS (a hit is the one
+      // outcome that needs evidence), and it DOES spend a window slot.
+      cacheStatus = null;
+      await client.fetchTokenDataBatch([mintB]);
+      stats = client.pairCacheStats();
+      assert.equal(stats.edgeHits, 2);
+      assert.equal(stats.edgeMisses, 1);
+      assert.equal(client.windowDispatches(), 1, "a miss is a real ask against the provider");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   await test("JupTokensClient: the caller's abort reaches the batch leg — never queued in, never left in flight", async () => {
     // WHY (2026-10-10, the §22.8 remaining bullet): the tracker's bounded()
     // cap aborts the pair lookup, but this leg's own fetch never carried the

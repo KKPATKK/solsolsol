@@ -94,6 +94,8 @@ function tickRow(health) {
           fetched: num(sm.jupPairCache.fetched),
           size: num(sm.jupPairCache.size),
           ttlMs: num(sm.jupPairCache.ttlMs),
+          edgeHits: num(sm.jupPairCache.edgeHits),
+          edgeMisses: num(sm.jupPairCache.edgeMisses),
         }
       : null,
     candidates: num(sm.candidates),
@@ -261,6 +263,15 @@ function report() {
       hitSum + fetchedSum > 0 ? `${((hitSum / (hitSum + fetchedSum)) * 100).toFixed(1)}%` : "n/a",
     );
     line("jupPairCache ttlMs / size p50", `${cache[0].ttlMs} / ${stats(cache.map((c) => c.size)).p50}`);
+    // The SHARED layer (see jupfeeds.pairEdgeCacheTtlS): a fresh isolate reads
+    // 0 local hits, so the edge counters are the only place the reuse shows.
+    const edgeHits = sum(cache.map((c) => Number(c.edgeHits ?? 0)));
+    const edgeMisses = sum(cache.map((c) => Number(c.edgeMisses ?? 0)));
+    line("jupPairCache edge hits / misses (sum)", `${edgeHits} / ${edgeMisses}`);
+    line(
+      "jupPairCache edge chunk share",
+      edgeHits + edgeMisses > 0 ? `${((edgeHits / (edgeHits + edgeMisses)) * 100).toFixed(1)}%` : "n/a",
+    );
   }
   const reserved = ticks.map((t) => t.jupReserved).filter((v) => typeof v === "number");
   if (reserved.length) {

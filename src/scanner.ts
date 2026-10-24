@@ -2924,6 +2924,15 @@ export interface ScanSummary {
     fetched: number;
     size: number;
     ttlMs: number;
+    /**
+     * Pair chunks the colo EDGE cache served / that reached Jupiter this tick
+     * (see jupfeeds.pairEdgeCacheTtlS). The per-isolate `hits` above is the
+     * local map; these two are the shared layer, i.e. the reading that can
+     * stay alive across a recycled isolate — which is why the "did the reuse
+     * work" question is answered here and not by `hits`.
+     */
+    edgeHits?: number;
+    edgeMisses?: number;
   } | null;
   /**
    * The last card read's reason (see JupCardReadNote): `ok` | `backoff` (a 429
@@ -8912,6 +8921,9 @@ export class Scanner {
                 fetched: jupPairCacheAfter.fetched - jupPairCacheBefore.fetched,
                 size: jupPairCacheAfter.size,
                 ttlMs: jupPairCacheAfter.ttlMs,
+                edgeHits: (jupPairCacheAfter.edgeHits ?? 0) - (jupPairCacheBefore.edgeHits ?? 0),
+                edgeMisses:
+                  (jupPairCacheAfter.edgeMisses ?? 0) - (jupPairCacheBefore.edgeMisses ?? 0),
               }
             : null;
         // Flurry RPC spend is cumulative across ticks (isolate lifetime) —
