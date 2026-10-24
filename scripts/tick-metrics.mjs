@@ -269,7 +269,7 @@ function report() {
     const edgeMisses = sum(cache.map((c) => Number(c.edgeMisses ?? 0)));
     line("jupPairCache edge hits / misses (sum)", `${edgeHits} / ${edgeMisses}`);
     line(
-      "jupPairCache edge chunk share",
+      "jupPairCache edge reading share",
       edgeHits + edgeMisses > 0 ? `${((edgeHits / (edgeHits + edgeMisses)) * 100).toFixed(1)}%` : "n/a",
     );
   }

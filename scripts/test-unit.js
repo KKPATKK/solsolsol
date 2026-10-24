@@ -12030,76 +12030,97 @@ async function main() {
     );
   });
 
-  await test("fetchTokenDataBatch: pair chunks ride the shared edge cache — a HIT frees the provider slot", async () => {
-    // WHY (2026-10-24): the per-isolate map above cannot survive the fleet's
-    // isolate churn (measured: 10 of 12 sampled ticks ran as a fresh isolate,
-    // so `hits` stayed 0 and the 90s TTL bought nothing). The colo entry is the
-    // reuse that survives a tick. Three claims are pinned here: the request
-    // asks for an entry bounded by the SAME staleness window the gates accept,
-    // only a plain HIT counts as free, and a HIT is refunded from the
-    // provider's window ledger so the slot it saved is usable in this tick.
-    const mintA = "5BoYu1xSzX68h8p6HCJzgvggSCcM7JovP3J1ZLPJpump";
-    const mintB = "So11111111111111111111111111111111111111112";
-    const originalFetch = globalThis.fetch;
-    const inits = [];
-    let cacheStatus = "HIT";
-    globalThis.fetch = async (_url, init) => {
-      inits.push(init);
-      return new Response(JSON.stringify([{ id: mintA, mcap: 7 }]), {
-        status: 200,
-        headers:
-          cacheStatus === null
-            ? {}
-            : // `Age` at the very end of the window: the reading is already as
-              // old as the bound, so the local map must NOT extend it.
-              { "cf-cache-status": cacheStatus, age: "60" },
-      });
+  await test("fetchTokenDataBatch: the colo cache is keyed by MINT, so a fresh isolate reuses readings", async () => {
+    // WHY (2026-10-24, second design): keying the colo entry by the chunk URL
+    // measured 0 hits / 27 chunks in production — the ordered address slice
+    // changes every tick, so the key never repeated. A mint is stable, so each
+    // reading is stored under its own mint inside a fixed bucket; this test
+    // pins the three claims that make the redesign worth anything: (a) a
+    // DIFFERENT isolate reuses the readings even with the list reordered,
+    // (b) only the missing readings reach the wire (150 cached + 20 new = one
+    // chunk, not two), and (c) the age is the reading's, so an expired colo
+    // entry is asked again instead of being re-stamped for another TTL.
+    const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    const mintAt = (i) => {
+      let s = "";
+      for (let n = i; n > 0; n = Math.floor(n / 58)) s = B58[n % 58] + s;
+      return "1".repeat(3 - s.length) + s + "9".repeat(41);
     };
-    try {
-      const client = new JupTokensClient({
-        jupiterRequestIntervalMs: 0,
-        jupPairCacheMs: 60_000,
-        jupReserveCardSlot: false,
-      });
-      assert.equal((await client.fetchTokenDataBatch([mintA])).size, 1);
-      assert.equal(inits.length, 1);
-      assert.equal(inits[0].cf.cacheEverything, true);
-      assert.equal(inits[0].cf.cacheTtl, 60, "the edge window is the SAME bound, in seconds");
-      assert.equal(inits[0].cf.cacheTtlByStatus["200-299"], 60);
-      assert.equal(
-        inits[0].cf.cacheTtlByStatus["400-599"],
-        0,
-        "a refusal must never be stored as fresh readings",
-      );
-      let stats = client.pairCacheStats();
-      assert.equal(stats.edgeHits, 1);
-      assert.equal(stats.edgeMisses, 0);
-      assert.equal(
-        client.windowDispatches(),
-        0,
-        "a HIT never reached Jupiter, so the window slot stays free",
-      );
+    const store = new Map();
+    const colo = {
+      async match(req) {
+        const body = store.get(req.url);
+        return body === undefined
+          ? null
+          : new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+      async put(req, res) {
+        store.set(req.url, await res.text());
+      },
+    };
+    const makeFetcher = () => {
+      const requests = [];
+      const fetcher = async (url) => {
+        requests.push(url);
+        const ids = url.split("query=")[1].split(",");
+        return new Response(JSON.stringify(ids.map((id) => ({ id, mcap: 5 }))), { status: 200 });
+      };
+      return { requests, fetcher };
+    };
+    const config = {
+      jupiterRequestIntervalMs: 0,
+      jupPairCacheMs: 60_000,
+      jupReserveCardSlot: false,
+    };
+    const flushPuts = () => new Promise((r) => setTimeout(r, 5));
+    const list = Array.from({ length: 150 }, (_, i) => mintAt(i));
 
-      // THE TWO LAYERS MUST NOT STACK (see get's edgeContentAt): this HIT is
-      // already 60s old, so re-stamping it as "now" would serve a 60s reading
-      // for another 60s. The local map refuses it and the chunk is asked again
-      // — from the edge, which costs no provider slot.
-      assert.equal((await client.fetchTokenDataBatch([mintA])).size, 1);
-      assert.equal(inits.length, 2, "an edge reading at the window's end is not re-cached locally");
-      assert.equal(client.pairCacheStats().hits, 0, "no local hit: the age, not the arrival, is stamped");
-      assert.equal(client.pairCacheStats().edgeHits, 2);
+    const a = makeFetcher();
+    const isolateA = new JupTokensClient(config, a.fetcher, colo);
+    assert.equal((await isolateA.fetchTokenDataBatch(list)).size, 150);
+    assert.equal(a.requests.length, 2, "a cold colo asks for every address (two chunks)");
+    assert.equal(isolateA.pairCacheStats().edgeHits, 0);
+    assert.equal(isolateA.pairCacheStats().edgeMisses, 150);
+    await flushPuts(); // the colo writes are fire-and-forget, like the pool snapshot's
 
-      // A response with no cf-cache-status at all is a MISS (a hit is the one
-      // outcome that needs evidence), and it DOES spend a window slot.
-      cacheStatus = null;
-      await client.fetchTokenDataBatch([mintB]);
-      stats = client.pairCacheStats();
-      assert.equal(stats.edgeHits, 2);
-      assert.equal(stats.edgeMisses, 1);
-      assert.equal(client.windowDispatches(), 1, "a miss is a real ask against the provider");
-    } finally {
-      globalThis.fetch = originalFetch;
+    // (a) A DIFFERENT isolate — the production case — with the SAME mints in
+    // REVERSE order. The key is the mint, so the reorder cannot break the hit,
+    // and the wire must not be touched at all.
+    const b = makeFetcher();
+    const isolateB = new JupTokensClient(config, b.fetcher, colo);
+    const warmed = await isolateB.fetchTokenDataBatch([...list].reverse());
+    assert.equal(warmed.size, 150, "every cached reading still reaches the gates");
+    assert.equal(warmed.get(list[0]).marketCap, 5);
+    assert.equal(b.requests.length, 0, "a fresh isolate must ask Jupiter for NOTHING");
+    const bStats = isolateB.pairCacheStats();
+    assert.equal(bStats.edgeHits, 150);
+    assert.equal(bStats.edgeMisses, 0);
+    assert.equal(bStats.hits, 0, "the local map started empty: this is the shared layer");
+
+    // (b) Only what the colo lacks reaches the wire: 20 new mints = ONE chunk,
+    // where a cold start of the same 170 would have sent two.
+    const extra = Array.from({ length: 20 }, (_, i) => mintAt(2000 + i));
+    const c = makeFetcher();
+    const isolateC = new JupTokensClient(config, c.fetcher, colo);
+    assert.equal((await isolateC.fetchTokenDataBatch([...list, ...extra])).size, 170);
+    assert.equal(c.requests.length, 1, "the wire carries only the missing readings");
+    assert.equal(isolateC.pairCacheStats().edgeHits, 150);
+    assert.equal(isolateC.pairCacheStats().edgeMisses, 20);
+    await flushPuts();
+
+    // (c) AGE IS THE READING'S, NOT THE ARRIVAL'S: age every colo entry past
+    // the TTL and the next isolate must ask again rather than re-stamp it.
+    for (const [key, body] of store) {
+      const parsed = JSON.parse(body);
+      for (const reading of Object.values(parsed.readings)) reading.at = Date.now() - 120_000;
+      store.set(key, JSON.stringify(parsed));
     }
+    const d = makeFetcher();
+    const isolateD = new JupTokensClient(config, d.fetcher, colo);
+    assert.equal((await isolateD.fetchTokenDataBatch([list[0]])).size, 1);
+    assert.equal(d.requests.length, 1, "an expired colo reading is never served");
+    assert.equal(isolateD.pairCacheStats().edgeMisses, 1);
+    assert.equal(isolateD.pairCacheStats().edgeHits, 0);
   });
 
   await test("JupTokensClient: the caller's abort reaches the batch leg — never queued in, never left in flight", async () => {

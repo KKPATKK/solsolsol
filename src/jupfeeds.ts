@@ -211,28 +211,60 @@ export const JUP_WINDOW_BULK_MAX = 4;
 export const JUP_PAIR_CACHE_MAX = 1_500;
 
 /**
- * The Cloudflare-specific fetch options this client asks for (see
- * `pairEdgeCacheTtlS`). Declared locally, exactly like DexScreenerClient's and
- * GeckoTerminalClient's identical copies, because `RequestInit` does not carry
- * `cf` and this repo compiles without workers-types.
+ * The colo cache key for ONE pair READING (2026-10-24, second design).
+ *
+ * The first design keyed the colo entry by the chunk's URL, mirroring the Dex
+ * pair lane. It measured **0 hits over 27 chunks in 9 production ticks** —
+ * including two ticks 30s apart inside a 90s TTL — because the URL carries the
+ * tick's ORDERED address slice, and the feeds plus the tracker head are
+ * re-derived every tick, so the key never repeated. The Dex lane's own hour of
+ * measurement says the same thing: 4.4% hit share, MISS dominated by new keys.
+ *
+ * A mint, unlike a slice, IS stable. Each reading is therefore stored under
+ * its own mint inside one of a fixed number of buckets (see
+ * JUP_PAIR_EDGE_BUCKETS), which lets a cold isolate on the next tick serve
+ * most of the slice from the colo and ask Jupiter only for what it lacks —
+ * the request saving the URL-keyed design could not deliver.
  */
-interface CloudflareFetchInit extends RequestInit {
-  cf?: {
-    cacheEverything?: boolean;
-    cacheTtl?: number;
-    cacheTtlByStatus?: Record<string, number>;
-  };
+export const JUP_PAIR_EDGE_URL = "https://jup-pair-readings.internal/";
+/**
+ * Buckets per colo read. 16 keeps the cache traffic at ≤16 reads + ≤16 writes
+ * per tick (a per-mint key would need ~300 of each) while keeping every
+ * payload at a few KB. A reading's bucket is decided by the MINT alone, never
+ * by its position in the tick's list — that is the whole point of the key.
+ */
+export const JUP_PAIR_EDGE_BUCKETS = 16;
+
+/** The colo-cache surface this client needs (the Node entry has none). */
+export interface JupPairEdgeCache {
+  match(request: Request): Promise<Response | null>;
+  put(request: Request, response: Response): Promise<void>;
+}
+
+/** The colo cache, or null where the runtime has none (the Node entry). */
+export function jupPairEdgeCache(): JupPairEdgeCache | null {
+  const runtime = globalThis as { caches?: { default?: JupPairEdgeCache } };
+  return runtime.caches?.default ?? null;
 }
 
 /**
- * The ONE `cf-cache-status` that means the request never reached Jupiter.
- *
- * Narrower than the Dex lane's rule (HIT|REVALIDATED) on purpose: a
- * REVALIDATED entry still asked the origin, so counting it as free would make
- * the window ledger (see `unmarkDispatch`) under-count a real ask. This
- * endpoint carries no ETag anyway, which is why the value should not occur.
+ * The bucket key for a mint — FNV-1a of the address, so the same mint always
+ * lands in the same colo entry whichever tick, list position or isolate asks.
  */
-const EDGE_CACHE_HIT_RE = /^HIT$/;
+export function jupPairEdgeKey(mint: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < mint.length; i++) {
+    h ^= mint.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${JUP_PAIR_EDGE_URL}${h % JUP_PAIR_EDGE_BUCKETS}`;
+}
+
+/** One bucket's payload. `at` is when the READING was produced, not cached. */
+export interface JupPairEdgeEntry {
+  v: 1;
+  readings: Record<string, { pair: PairInfo; at: number }>;
+}
 
 /** Spaces out HTTP requests so we stay well under Jupiter's rate limit. */
 class Throttle {
@@ -669,13 +701,16 @@ export class JupTokensClient {
   private pairCacheHits = 0;
   private pairCacheFetched = 0;
   /**
-   * Pair chunks served from the colo EDGE cache / chunks that reached Jupiter
-   * (see `pairEdgeCacheTtlS`). Per isolate, like the map above, but the whole
-   * point of the edge layer is that the entry outlives the isolate — so a
-   * reader measures it on the TICK's own delta (see ScanSummary.jupPairCache).
+   * Pair READINGS served from the colo cache / readings it did not have (and
+   * which therefore went to the wire) — see `pairEdgeCacheTtlS`. Per isolate,
+   * like the map above, but the whole point of the colo layer is that the entry
+   * outlives the isolate, so a reader measures it on the TICK's own delta (see
+   * ScanSummary.jupPairCache).
    */
   private pairEdgeHits = 0;
   private pairEdgeMisses = 0;
+  /** The colo cache this client shares with every other isolate (see the key). */
+  private readonly pairEdgeCache: JupPairEdgeCache | null;
 
   constructor(
     config: AppConfig,
@@ -686,7 +721,14 @@ export class JupTokensClient {
      * sees it.
      */
     private readonly fetcher?: (url: string, signal?: AbortSignal) => Promise<Response>,
+    /**
+     * Injectable colo cache for tests (defaults to the runtime's, which is
+     * null outside workerd). Optional, so every existing call site and test
+     * double keeps its shape.
+     */
+    edgeCache: JupPairEdgeCache | null = jupPairEdgeCache(),
   ) {
+    this.pairEdgeCache = edgeCache;
     this.throttle = new Throttle(config.jupiterRequestIntervalMs);
     // JUP_RESERVE_CARD_SLOT=0 turns the reservation off (default on, see
     // JUP_WINDOW_BULK_MAX). Kept on the instance so the dispatch check below
@@ -701,12 +743,11 @@ export class JupTokensClient {
     // THE SAME BOUND, SHARED ACROSS ISOLATES (2026-10-24). The map above is
     // per isolate and measured dead in production: in 12 sampled ticks, 10 ran
     // on a fresh isolate, so `hits` stayed 0 and the 90s TTL bought nothing.
-    // A Cloudflare edge entry is keyed by the chunk's URL and survives the
-    // isolate, so the next tick's identical chunk is served from the colo
-    // instead of costing one of Jupiter's five window slots. Its TTL is
-    // DERIVED, not a second knob: a reading may never be reused longer than
-    // the staleness bound the gates already accept, and JUP_PAIR_CACHE_SECONDS
-    // = 0 therefore turns BOTH layers off.
+    // The colo entry survives the isolate; its key is the MINT (see
+    // jupPairEdgeKey), not the tick's churning slice, which is what lets the
+    // next tick reuse the readings. Its TTL is DERIVED, not a second knob: a
+    // reading may never be reused longer than the staleness bound the gates
+    // already accept, and JUP_PAIR_CACHE_SECONDS = 0 turns BOTH layers off.
     this.pairEdgeCacheTtlS =
       this.pairCacheTtlMs > 0 ? Math.ceil(this.pairCacheTtlMs / 1000) : 0;
   }
@@ -717,10 +758,11 @@ export class JupTokensClient {
   private readonly pairEdgeCacheTtlS: number;
 
   /**
-   * Batch readings served from the reuse cache / asked of the wire, per client
-   * (isolate). A climbing hit share is the TTL doing its job; a hit share that
-   * stays 0 with a non-zero TTL means the tick's slice never repeats and the
-   * cache is dead weight.
+   * Batch readings served from the LOCAL map / asked of the wire, per client
+   * (isolate), plus the colo layer's own two counters (`edgeHits` reused, 
+   * `edgeMisses` asked of the wire). A climbing LOCAL hit share is the TTL
+   * doing its job; a local share that stays 0 with a non-zero TTL means this
+   * isolate never saw the slice twice — the case `edgeHits` exists to answer.
    */
   pairCacheStats(): {
     hits: number;
@@ -786,24 +828,6 @@ export class JupTokensClient {
   }
 
   /**
-   * Take back ONE dispatch the edge cache served instead of Jupiter (see the
-   * pair chunk's HIT branch). The ledger answers "how many asks are inside the
-   * provider's window", and a cache hit is not an ask — without this, the
-   * chunks the edge just made free would still stand later bulk calls down in
-   * the same window, so the freed slot would buy nothing.
-   *
-   * Matched by TIMESTAMP, not index: the two lanes push while this call's
-   * await is in flight, so the entry is no longer guaranteed to be last. An
-   * identical-ms sibling is equivalent — the ledger is a count, and both are
-   * inside the same window.
-   */
-  private unmarkDispatch(at: number): void {
-    if (at <= 0) return;
-    const i = this.windowDispatchesAt.indexOf(at);
-    if (i >= 0) this.windowDispatchesAt.splice(i, 1);
-  }
-
-  /**
    * Bulk calls stood down to leave the card read its slot (cumulative for this
    * isolate's client). A non-zero reading on a tick is the reservation doing
    * work, and its size is the coverage that tick traded for the card's line.
@@ -859,57 +883,25 @@ export class JupTokensClient {
    * card's line and its three gates are the only calls that cannot be redone
    * next tick. Bulk lanes keep the pause.
    *
-   * `edgeCacheTtlS` (optional, seconds) asks for the Cloudflare EDGE CACHE on
-   * this request — passed by the pair chunks alone (see pairEdgeCacheTtlS).
-   * Same discipline as DexScreener's pair lane: only 2xx may be stored, so a
-   * 429 can never be served to the next tick as fresh readings.
-   *
-   * `edgeContentAt` is filled when the edge served the answer: the epoch ms of
-   * the READING (now minus the entry's `Age`), not of this call. The caller
-   * stamps its own cache with it so the two layers cannot stack — a HIT from
-   * the end of the edge window re-stamped as "now" would otherwise live a
-   * second full TTL locally (same reason DexScreener's pairs carry
-   * `contentAt`). Optional, so every other caller keeps its exact shape.
    */
   private async get(
     path: string,
     signal?: AbortSignal,
     priority = false,
     allowPaused = false,
-    edgeCacheTtlS = 0,
-    edgeContentAt?: { at: number | null },
   ): Promise<unknown> {
     if (this.rateLimited() && !allowPaused) return null;
     this.lastStatus = 0;
-    // The dispatch this call counts at the wire, so a cache HIT can take it
-    // back (see unmarkDispatch). 0 = nothing counted.
-    let dispatchedAt = 0;
     try {
       const doFetch =
         this.fetcher ??
-        ((u: string, s?: AbortSignal) => {
-          const init: CloudflareFetchInit = {
+        ((u: string, s?: AbortSignal) =>
+          fetch(u, {
             headers: { Accept: "application/json" },
             // The caller's abort OR this attempt's own window, whichever
             // comes first (see combineAbortSignals).
             signal: combineAbortSignals(s, AbortSignal.timeout(10_000)),
-          };
-          if (edgeCacheTtlS > 0) {
-            // See pairEdgeCacheTtlS. An injected `fetcher` (the tests) never
-            // gets this init, which is why the ledger counts the RESPONSE's
-            // header instead of assuming the entry was asked for.
-            init.cf = {
-              cacheEverything: true,
-              cacheTtl: edgeCacheTtlS,
-              cacheTtlByStatus: {
-                "200-299": edgeCacheTtlS,
-                "300-399": 0,
-                "400-599": 0,
-              },
-            };
-          }
-          return fetch(u, init);
-        });
+          }));
       const res = await this.throttle.run<Response | null>(
         () => {
           // The card's reserved slot (see JUP_WINDOW_BULK_MAX). Checked at
@@ -926,8 +918,7 @@ export class JupTokensClient {
               return Promise.resolve(null);
             }
           }
-          dispatchedAt = Date.now();
-          this.windowDispatchesAt.push(dispatchedAt);
+          this.windowDispatchesAt.push(Date.now());
           return doFetch(`${BASE_URL}${path}`, signal);
         },
         signal,
@@ -939,29 +930,6 @@ export class JupTokensClient {
       // Recorded BEFORE the status checks so a caller reading a null answer
       // can name what happened (see lastStatus / JupCardReadNote).
       this.lastStatus = res.status;
-      if (res.ok && edgeCacheTtlS > 0) {
-        // 2xx ONLY, the same rule as the Dex pair lane: cacheTtlByStatus gives
-        // an entry a TTL for 200-299 alone, so a refusal was never a candidate
-        // and cannot read as an entry that had expired.
-        const cacheStatus = res.headers.get("cf-cache-status");
-        if (cacheStatus !== null && EDGE_CACHE_HIT_RE.test(cacheStatus)) {
-          this.pairEdgeHits += 1;
-          this.unmarkDispatch(dispatchedAt);
-          if (edgeContentAt !== undefined) {
-            // Cloudflare stamps an edge HIT with `Age` (seconds since it was
-            // stored). Absent/unparseable means the age is UNKNOWN — take the
-            // whole window, the conservative end, so the local map can never
-            // serve the reading past the bound the gates accept.
-            const ageS = Number(res.headers.get("age"));
-            edgeContentAt.at =
-              Number.isFinite(ageS) && ageS >= 0
-                ? Date.now() - Math.min(ageS, edgeCacheTtlS) * 1000
-                : Date.now() - edgeCacheTtlS * 1000;
-          }
-        } else {
-          this.pairEdgeMisses += 1;
-        }
-      }
       if (res.status === 429) {
         const now = Date.now();
         // What the provider advertises, clamped — see rateLimitPauseMs for the
@@ -1322,6 +1290,66 @@ export class JupTokensClient {
         }
       }
     }
+    // THE COLO CACHE, NEXT (2026-10-24, see jupPairEdgeKey). This is the layer
+    // that survives the isolate churn: the key is the mint, so a reading
+    // repeats even when the tick's ordered slice does not. One match per
+    // BUCKET (16, not 300), then only readings inside the TTL are served — an
+    // older one is asked of the wire exactly as the local map's is.
+    const edgeBuckets = new Map<string, JupPairEdgeEntry | null>();
+    if (asked.length > 0 && this.pairCacheTtlMs > 0 && this.pairEdgeCache) {
+      const keys = new Set(asked.map((m) => jupPairEdgeKey(m)));
+      const cache = this.pairEdgeCache;
+      await Promise.all(
+        [...keys].map(async (key) => {
+          try {
+            const res = await cache.match(new Request(key));
+            if (!res) {
+              edgeBuckets.set(key, null);
+              return;
+            }
+            const body = (await res.json()) as JupPairEdgeEntry | null;
+            if (
+              !body ||
+              body.v !== 1 ||
+              typeof body.readings !== "object" ||
+              body.readings === null
+            ) {
+              edgeBuckets.set(key, null);
+              return;
+            }
+            edgeBuckets.set(key, body);
+          } catch {
+            // A miss, a torn body and a runtime without the cache are all the
+            // same answer: ask the wire, which is the behavior this layer is
+            // an optimization of. Never throws to the caller.
+            edgeBuckets.set(key, null);
+          }
+        }),
+      );
+      const now = Date.now();
+      const stillAsked: string[] = [];
+      for (const mint of asked) {
+        const reading = edgeBuckets.get(jupPairEdgeKey(mint))?.readings?.[mint];
+        if (
+          reading &&
+          Number.isFinite(reading.at) &&
+          now - reading.at < this.pairCacheTtlMs &&
+          reading.pair?.baseToken?.address === mint
+        ) {
+          out.set(mint, reading.pair);
+          this.pairEdgeHits += 1;
+          // Seed the LOCAL map with the reading's own instant, never "now":
+          // the colo entry may already be 89s old, and a fresh stamp would
+          // let this second layer serve it for another full TTL. The two
+          // bounds must not stack.
+          this.pairCache.set(mint, { pair: reading.pair, at: reading.at });
+        } else {
+          stillAsked.push(mint);
+          this.pairEdgeMisses += 1;
+        }
+      }
+      asked = stillAsked;
+    }
     const deadline = Math.min(
       Date.now() + JUP_FALLBACK_BUDGET_MS,
       typeof callerDeadlineMs === "number"
@@ -1334,6 +1362,12 @@ export class JupTokensClient {
     // shared deadline. See JUP_FALLBACK_CONCURRENCY for why the lanes exist.
     const chunkCount = Math.ceil(asked.length / JUP_BATCH_SIZE);
     let nextChunk = 0;
+    // Readings this tick fetched from the wire, grouped by their bucket so the
+    // colo entries can be merged (read-modify-write) once the lanes settle.
+    const freshByBucket = new Map<
+      string,
+      Map<string, { pair: PairInfo; at: number }>
+    >();
     const lane = async (): Promise<void> => {
       while (nextChunk < chunkCount) {
         // The serial loop's own rules, kept per lane: once the client is
@@ -1370,21 +1404,10 @@ export class JupTokensClient {
         // the wire is cancelled by the fetch itself.
         const chunkAbort = new AbortController();
         let chunkTimer: ReturnType<typeof setTimeout> | undefined;
-        // Where the READING for this chunk came from (see get's edgeContentAt).
-        const edgeContentAt: { at: number | null } = { at: null };
         const data = await Promise.race([
           this.get(
             `/search?query=${chunk.join(",")}`,
             combineAbortSignals(signal, chunkAbort.signal),
-            false,
-            false,
-            // THE SHARED EDGE ENTRY (see pairEdgeCacheTtlS): the chunk's URL is
-            // stable across ticks because its address set comes from the
-            // edge-cached pool snapshot, so a cold isolate reads the previous
-            // tick's answer instead of spending one of Jupiter's five window
-            // slots on it. That is what turns three chunks into one or two.
-            this.pairEdgeCacheTtlS,
-            edgeContentAt,
           ),
           new Promise<null>((resolve) => {
             chunkTimer = setTimeout(() => {
@@ -1396,9 +1419,6 @@ export class JupTokensClient {
         // Cleared either way: a pending timer would abort a LATER chunk's
         // signal (the lanes share this client) and hold the isolate open.
         if (chunkTimer !== undefined) clearTimeout(chunkTimer);
-        // The instant the reading belongs to: an edge HIT carries the entry's
-        // age, everything else is this fetch (see get's edgeContentAt).
-        const contentAt = edgeContentAt.at ?? Date.now();
         for (const [k, v] of jupToPairInfos(data)) {
           out.set(k, v);
           // Stored even when the value came back, never when it did not: a
@@ -1406,7 +1426,17 @@ export class JupTokensClient {
           // not remembered as empty.
           this.pairCacheFetched += 1;
           if (this.pairCacheTtlMs > 0) {
-            this.pairCache.set(k, { pair: v, at: contentAt });
+            const at = Date.now();
+            this.pairCache.set(k, { pair: v, at });
+            if (this.pairEdgeCache) {
+              const key = jupPairEdgeKey(k);
+              let bucket = freshByBucket.get(key);
+              if (!bucket) {
+                bucket = new Map();
+                freshByBucket.set(key, bucket);
+              }
+              bucket.set(k, { pair: v, at });
+            }
           }
         }
       }
@@ -1417,6 +1447,42 @@ export class JupTokensClient {
         () => lane(),
       ),
     );
+    // PUBLISH TO THE COLO, merged over what each bucket already held (and
+    // re-pruned by age, so an entry cannot grow unbounded). Not awaited, like
+    // the pool snapshot's put: a lost write costs the next tick one wire chunk,
+    // and the gate/push phase is waiting. Only readings that actually came back
+    // are written — a 429 or a missing mint is left absent so it is re-asked.
+    if (freshByBucket.size > 0 && this.pairEdgeCache) {
+      const cache = this.pairEdgeCache;
+      const ttlMs = this.pairCacheTtlMs;
+      for (const [key, fresh] of freshByBucket) {
+        const base = edgeBuckets.get(key)?.readings ?? {};
+        const merged: JupPairEdgeEntry["readings"] = {};
+        const now = Date.now();
+        for (const [mint, reading] of Object.entries(base)) {
+          if (now - reading.at < ttlMs) merged[mint] = reading;
+        }
+        for (const [mint, reading] of fresh) merged[mint] = reading;
+        const body: JupPairEdgeEntry = { v: 1, readings: merged };
+        try {
+          cache
+            .put(
+              new Request(key),
+              new Response(JSON.stringify(body), {
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `max-age=${this.pairEdgeCacheTtlS}`,
+                },
+              }),
+            )
+            .catch(() => {
+              /* a lost put costs one wire chunk next tick */
+            });
+        } catch {
+          /* same: the wire path is unaffected */
+        }
+      }
+    }
     return out;
   }
 }

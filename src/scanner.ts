@@ -2925,11 +2925,11 @@ export interface ScanSummary {
     size: number;
     ttlMs: number;
     /**
-     * Pair chunks the colo EDGE cache served / that reached Jupiter this tick
-     * (see jupfeeds.pairEdgeCacheTtlS). The per-isolate `hits` above is the
-     * local map; these two are the shared layer, i.e. the reading that can
-     * stay alive across a recycled isolate — which is why the "did the reuse
-     * work" question is answered here and not by `hits`.
+     * Pair READINGS the colo cache served / did not have (so they went to the
+     * wire) this tick — see jupfeeds.jupPairEdgeKey. The per-isolate `hits`
+     * above is the local map; these two are the shared layer, i.e. the reading
+     * that can stay alive across a recycled isolate — which is why the "did
+     * the reuse work" question is answered here and not by `hits`.
      */
     edgeHits?: number;
     edgeMisses?: number;
