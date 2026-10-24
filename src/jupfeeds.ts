@@ -1447,26 +1447,52 @@ export class JupTokensClient {
         () => lane(),
       ),
     );
-    // PUBLISH TO THE COLO, merged over what each bucket already held (and
-    // re-pruned by age, so an entry cannot grow unbounded). Not awaited, like
-    // the pool snapshot's put: a lost write costs the next tick one wire chunk,
-    // and the gate/push phase is waiting. Only readings that actually came back
-    // are written — a 429 or a missing mint is left absent so it is re-asked.
+    // PUBLISH TO THE COLO, merged at WRITE time and awaited.
+    //
+    // WHY THE RE-READ (2026-10-24, first measurement of this design): the
+    // tracker pass asks for its ~30-row head every minute, and the pair lane is
+    // refused, so that small call ALSO writes. Merging over the snapshot this
+    // call read at its START let it replace a bucket the scan had filled
+    // between the two — buckets fell from ~20 readings to 1-2 and the next
+    // tick's hit share collapsed (measured 6/271 and 10/173 between 47% ticks).
+    // Re-reading the bucket right before the merge keeps a concurrent writer's
+    // readings, which is what the shared layer is for.
+    //
+    // WHY AWAITED: a put that is still pending when the invocation ends is a
+    // put that never lands — the same collapse from the other side. Cache ops
+    // are local to the colo, and only the buckets that actually received a
+    // reading are written (≤16). Only readings that came back are published: a
+    // 429 or a missing mint is left absent so the next tick re-asks it.
     if (freshByBucket.size > 0 && this.pairEdgeCache) {
       const cache = this.pairEdgeCache;
       const ttlMs = this.pairCacheTtlMs;
+      const writes: Array<Promise<void>> = [];
       for (const [key, fresh] of freshByBucket) {
-        const base = edgeBuckets.get(key)?.readings ?? {};
-        const merged: JupPairEdgeEntry["readings"] = {};
-        const now = Date.now();
-        for (const [mint, reading] of Object.entries(base)) {
-          if (now - reading.at < ttlMs) merged[mint] = reading;
-        }
-        for (const [mint, reading] of fresh) merged[mint] = reading;
-        const body: JupPairEdgeEntry = { v: 1, readings: merged };
-        try {
-          cache
-            .put(
+        writes.push(
+          (async () => {
+            let base: JupPairEdgeEntry["readings"] = {};
+            try {
+              const res = await cache.match(new Request(key));
+              const body = res ? ((await res.json()) as JupPairEdgeEntry | null) : null;
+              if (
+                body &&
+                body.v === 1 &&
+                typeof body.readings === "object" &&
+                body.readings !== null
+              ) {
+                base = body.readings;
+              }
+            } catch {
+              /* merge over nothing: a lost write costs one wire chunk */
+            }
+            const merged: JupPairEdgeEntry["readings"] = {};
+            const now = Date.now();
+            for (const [mint, reading] of Object.entries(base)) {
+              if (now - reading.at < ttlMs) merged[mint] = reading;
+            }
+            for (const [mint, reading] of fresh) merged[mint] = reading;
+            const body: JupPairEdgeEntry = { v: 1, readings: merged };
+            await cache.put(
               new Request(key),
               new Response(JSON.stringify(body), {
                 headers: {
@@ -1474,14 +1500,13 @@ export class JupTokensClient {
                   "Cache-Control": `max-age=${this.pairEdgeCacheTtlS}`,
                 },
               }),
-            )
-            .catch(() => {
-              /* a lost put costs one wire chunk next tick */
-            });
-        } catch {
-          /* same: the wire path is unaffected */
-        }
+            );
+          })().catch(() => {
+            /* a lost put costs one wire chunk next tick */
+          }),
+        );
       }
+      await Promise.all(writes);
     }
     return out;
   }
