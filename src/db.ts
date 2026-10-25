@@ -3577,7 +3577,21 @@ export class Db {
    * size (the caller ignores it; the unit tests read it).
    */
   async recordObservedLiquidity(
-    rows: Array<{ token: string; liquidityUsd: number }>,
+    rows: Array<{
+      token: string;
+      liquidityUsd: number;
+      /**
+       * `true` for the certainly-drained reading a NON-comparable leg may report
+       * (see worker.observedLiquidityUsd's 2026-10-25 exception). It is a
+       * verdict about an EMPTY pool, not a level, so it may only judge a row the
+       * band admits ON EVIDENCE — `max_mcap_observed IS NOT NULL`. A coin still
+       * inside its never-measured grace is a launch curve with no buys yet (the
+       * feed's fresh coins all read "流动性 ~$0"), and evicting it there would
+       * be the permanent missed push the provenance guard exists to prevent;
+       * one sweep later it has its own peak and this reading can judge it.
+       */
+      requireEvidence?: boolean;
+    }>,
     /**
      * Rows per statement, capped by the transport's own ceiling: FIVE bindings
      * a row — the SET's CASE pair, the IN list, and the WHERE's second copy of
@@ -3591,25 +3605,34 @@ export class Db {
   ): Promise<number> {
     if (rows.length === 0) return 0;
     const stmts: SqlStatement[] = [];
-    for (const slice of chunkForParamLimit(rows, 5, this.paramLimit(), chunk)) {
-      const cases = slice.map(() => "WHEN ? THEN ?").join(" ");
-      const args: Array<string | number> = [];
-      // The CASE is bound TWICE (the SET's value and the WHERE's own crossing
-      // test re-derives it), in statement order: its pairs, the IN list, then
-      // its pairs again.
-      for (const r of slice) args.push(r.token, r.liquidityUsd);
-      for (const r of slice) args.push(r.token);
-      for (const r of slice) args.push(r.token, r.liquidityUsd);
-      stmts.push({
-        sql: `UPDATE token_stats SET last_liquidity_usd = CASE token ${cases} END,
-              sweeps_since_reading = 0
-              WHERE token IN (${slice.map(() => "?").join(",")})
-                AND (sweeps_since_reading > 0
-                     OR last_liquidity_usd IS NULL
-                     OR ((last_liquidity_usd < ${DEAD_LIQUIDITY_USD})
-                         IS NOT ((CASE token ${cases} END) < ${DEAD_LIQUIDITY_USD})))`,
-        args,
-      });
+    // Two populations, one statement shape each (see `requireEvidence` above),
+    // in the SAME batch — the split must not cost a round trip.
+    for (const required of [false, true]) {
+      const group = rows.filter((r) => Boolean(r.requireEvidence) === required);
+      for (const slice of chunkForParamLimit(group, 5, this.paramLimit(), chunk)) {
+        const cases = slice.map(() => "WHEN ? THEN ?").join(" ");
+        const args: Array<string | number> = [];
+        // The CASE is bound TWICE (the SET's value and the WHERE's own crossing
+        // test re-derives it), in statement order: its pairs, the IN list, then
+        // its pairs again.
+        for (const r of slice) args.push(r.token, r.liquidityUsd);
+        for (const r of slice) args.push(r.token);
+        for (const r of slice) args.push(r.token, r.liquidityUsd);
+        stmts.push({
+          sql: `UPDATE token_stats SET last_liquidity_usd = CASE token ${cases} END,
+                sweeps_since_reading = 0
+                WHERE token IN (${slice.map(() => "?").join(",")})
+                  AND (sweeps_since_reading > 0
+                       OR last_liquidity_usd IS NULL
+                       OR ((last_liquidity_usd < ${DEAD_LIQUIDITY_USD})
+                           IS NOT ((CASE token ${cases} END) < ${DEAD_LIQUIDITY_USD})))` +
+            // The evidence gate (see `requireEvidence`): appended AFTER the
+            // rule's own parenthesised OR group, so it narrows the statement
+            // without touching which crossing admits a row.
+            (required ? "\n                  AND max_mcap_observed IS NOT NULL" : ""),
+          args,
+        });
+      }
     }
     // One request for the whole flush, however many chunks the store's ceiling
     // forced (see runChunked).

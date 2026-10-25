@@ -4698,6 +4698,64 @@ async function main() {
     await t.cleanup();
   });
 
+  // THE CERTAINLY-DRAINED EVIDENCE GATE (2026-10-25). The Jupiter leg may now
+  // name an empty pool (worker.observedLiquidityUsd), but that verdict may only
+  // judge a row the band already admitted ON A PEAK: a row with no mcap history
+  // is a launch curve with no buys yet, and marking it dead there would lose the
+  // coin for good — the feed never re-offers it and its age gate had not even
+  // opened (the permanent missed push the provenance guard exists to prevent).
+  await test("pool: a certainly-drained reading evicts an evidenced row, never an unmeasured one", async () => {
+    const t = tmpDb();
+    const db = new Db("file:injected", undefined, t.client);
+    await db.init();
+    const now = Date.now();
+    const seed = async (token, peak) => {
+      const launch = now - 200 * 60_000;
+      await t.client.execute({
+        sql: `INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed)
+              VALUES (?, ?, ?, ?, ?, ?)`,
+        args: [token, launch, 10_000, 200, launch, peak],
+      });
+    };
+    await seed("PEAKED", 250_000);
+    await seed("LAUNCH", null);
+    const written = await db.recordObservedLiquidity([
+      { token: "PEAKED", liquidityUsd: 12, requireEvidence: true },
+      { token: "LAUNCH", liquidityUsd: 12, requireEvidence: true },
+    ]);
+    const read = async (token) =>
+      (
+        await t.client.execute({
+          sql: "SELECT last_liquidity_usd FROM token_stats WHERE token = ?",
+          args: [token],
+        })
+      ).rows[0].last_liquidity_usd;
+    assert.equal(
+      written,
+      1,
+      "the evidence gate admits exactly the row the band admitted on a peak",
+    );
+    assert.equal(
+      await read("PEAKED"),
+      12,
+      "an evidenced corpse takes the verdict (DEAD_POOL_CLAUSE evicts it)",
+    );
+    assert.equal(
+      await read("LAUNCH"),
+      null,
+      "an unmeasured launch keeps its grace — the verdict is withheld",
+    );
+    // ...and a CALIBRATED reading still judges either row: the gate belongs to
+    // the non-comparable exception, not to the writer.
+    await db.recordObservedLiquidity([{ token: "LAUNCH", liquidityUsd: 12_000 }]);
+    assert.equal(
+      await read("LAUNCH"),
+      12_000,
+      "a comparable reading still lands on a never-measured row",
+    );
+    await t.cleanup();
+  });
+
   // The freshness mark (2026-10-08, db.DEAD_POOL_MISS_MAX). The floor above
   // only judges a reading the scan can still SEE; a coin whose pair VANISHES
   // never gets a new reading, so its last live one kept vouching for it in
@@ -4929,6 +4987,31 @@ async function main() {
       undefined,
       "Gecko's reserve is a third metric, not a smaller pool",
     );
+    // THE CERTAINLY-DRAINED EXCEPTION (2026-10-25): while the DexScreener lane
+    // is 429-refusing, the Jupiter leg is the only witness there is — and a
+    // reading at/below DRAINED_POOL_LIQUIDITY_USD is a verdict, not a level. It
+    // must reach the column, or DEAD_POOL_CLAUSE can never evict the corpse and
+    // the pool fills with them (live: 63,725/65,423 NULL, deadMarked 314).
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 12 }, feedSource: "jupiter" }),
+      12,
+      "a certainly-drained pool on the Jupiter leg is the corpse signal the pool needs",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 500 }, feedSource: "jupiter" }),
+      500,
+      "the exception's boundary is inclusive (500 x ~2.2 << the $10K chat floor)",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 501 }, feedSource: "jupiter" }),
+      undefined,
+      "just over the threshold is a level again — unjudgeable on this leg",
+    );
+    assert.equal(
+      observedLiquidityUsd({ liquidity: { usd: 3 }, feedSource: "gecko" }),
+      3,
+      "any non-calibrated leg may name an empty pool; only LEVELS are leg-bound",
+    );
     assert.equal(
       observedLiquidityUsd({ liquidity: { usd: null }, feedSource: "dexscreener" }),
       undefined,
@@ -4949,8 +5032,10 @@ async function main() {
       .replace(/\s+/g, "");
     assert.ok(
       workerSrc.includes("constliq=observedLiquidityUsd(pair);") &&
-        workerSrc.includes("if(liq!==undefined)observedLiquidity.set(token,liq);"),
-      "the flush's producer must read the guarded helper",
+        workerSrc.includes(
+          "if(liq!==undefined)observedLiquidity.set(token,{usd:liq,drainedOnly:!liquidityIsComparable(pair),});",
+        ),
+      "the flush's producer must read the guarded helper and tag the reading's provenance",
     );
     assert.equal(
       (workerSrc.match(/pair\.liquidity\?\.usd/g) || []).length,

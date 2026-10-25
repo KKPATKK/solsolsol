@@ -78,6 +78,7 @@ import {
   forgetDeferredTokens,
   POOL_MCAP_PRUNE_RATIO,
   POOL_LIQUIDITY_PRUNE_RATIO,
+  DRAINED_POOL_LIQUIDITY_USD,
 } from "./scanner";
 import { deferralRegistryView, deferredPushTokens, feedMakeupView } from "./deferredmakeup";
 import { PUSH_OUTBOX_DRAIN_BUDGET_MS, PUSH_OUTBOX_STATE_KEY } from "./pushoutbox";
@@ -293,7 +294,10 @@ let dex: DexScreenerClient | null = null;
  * metric of the same pool, ~half or less, and would push a live coin under the
  * floor).
  */
-let observedLiquidity = new Map<string, number>();
+let observedLiquidity = new Map<
+  string,
+  { usd: number; drainedOnly: boolean }
+>();
 
 /**
  * The liquidity a fetched pair may put in `last_liquidity_usd`, or undefined
@@ -328,16 +332,42 @@ let observedLiquidity = new Map<string, number>();
  * advances nor clears its mark — the correct fail-safe direction, since no
  * unjudgeable evidence may prune a coin, and the next DexScreener-served sweep
  * of the same token records it and resets the mark normally.
+ *
+ * THE CERTAINLY-DRAINED EXCEPTION (2026-10-25 — the reason the pool stopped
+ * evicting anything). The guard above is about LEVELS: "half of DexScreener's"
+ * only means something while there is a pool to halve. A reading at or under
+ * scanner.DRAINED_POOL_LIQUIDITY_USD is the same fact on any leg — that pool
+ * holds nothing — and the same threshold the push gate already trusts on the
+ * Jupiter lane (see gateLiquidityUsd's note). Withholding it was free while
+ * the DexScreener lane answered most pairs; it is not free now. Live
+ * 2026-10-25: that lane has been 429-refusing for weeks (`dex_429_total`
+ * 40,394), so ~98% of every pair map came from the Jupiter fallback
+ * (`pairs 324 pairsJup 318`), 63,725 of 65,423 token_stats rows carried a NULL
+ * `last_liquidity_usd`, and `deadMarked` read 314 — while a single tick's
+ * reject counters read `other 206` (every one a `流动性 $0.3–$49 < $10K`)
+ * against `mcap 114`, and its `agedEval` was 1.
+ * DEAD_POOL_CLAUSE cannot evict what it cannot see, so the corpse cohort — the
+ * same one DEAD_LIQUIDITY_USD was written for on 2026-09-19 — accumulated
+ * again and crowded the 150-row slice: pushes fell from ~27/day to ~12/day.
+ *
+ * WHY THE THRESHOLD CANNOT BITE A LIVE COIN: Jupiter reads 0.46–0.58x of
+ * DexScreener's reserve, so $500 here is at most ~$1,100 there — an order of
+ * magnitude under the narrowest chat floor ($10K) and under the pool's own
+ * prune (0.8 × $8,000 = $6,400). A coin that reads this small on the Jupiter
+ * leg cannot be a coin the calibrated leg would have kept.
  */
 export function observedLiquidityUsd(pair: {
   liquidity?: { usd: number | null } | null;
   feedSource?: "dexscreener" | "jupiter" | "gecko";
 }): number | undefined {
-  if (!liquidityIsComparable(pair)) return undefined;
   const liq = pair.liquidity?.usd;
   // A finite reading including 0: a drained pool's $0 IS its identifying
   // signal, and it is what the floor drops the coin on.
-  return typeof liq === "number" && Number.isFinite(liq) ? liq : undefined;
+  if (typeof liq !== "number" || !Number.isFinite(liq)) return undefined;
+  if (liquidityIsComparable(pair)) return liq;
+  // Another leg's LEVEL is unjudgeable, but its "this pool is empty" verdict is
+  // not: see THE CERTAINLY-DRAINED EXCEPTION above.
+  return liq <= DRAINED_POOL_LIQUIDITY_USD ? liq : undefined;
 }
 let helius: HeliusClient | null = null;
 let birdeye: BirdeyeClient | null = null;
@@ -1436,9 +1466,12 @@ async function flushObservedLiquidity(source: Scanner | null): Promise<void> {
       );
     }
   }
-  const rows = [...observedLiquidity].map(([token, liquidityUsd]) => ({
+  const rows = [...observedLiquidity].map(([token, reading]) => ({
     token,
-    liquidityUsd,
+    liquidityUsd: reading.usd,
+    // Spread, so a comparable reading keeps the exact row shape (and the
+    // exact statement) it always had.
+    ...(reading.drainedOnly ? { requireEvidence: true } : {}),
   }));
   observedLiquidity = new Map();
   if (rows.length > 0) {
@@ -4723,13 +4756,22 @@ async function ensureInitialized(env: Env): Promise<void> {
     // end-of-tick write — has to see the map as it goes by. Cheap: one Map
     // insert per coin per tick, no extra request. The reading is filtered
     // through observedLiquidityUsd, so a leg the pool's USD floors are not
-    // calibrated on can never reach the column.
+    // calibrated on can only reach the column with an EMPTY-pool verdict, and
+    // only for a row the band admitted on a peak (the drained-only tag below).
     const fetchPairs = dex.fetchPairsForTokens.bind(dex);
     dex.fetchPairsForTokens = async (addresses, deadline) => {
       const pairs = await fetchPairs(addresses, deadline);
       for (const [token, pair] of pairs) {
         const liq = observedLiquidityUsd(pair);
-        if (liq !== undefined) observedLiquidity.set(token, liq);
+        // `drainedOnly` marks the certainly-drained reading a non-calibrated
+        // leg may name (see observedLiquidityUsd): it may judge a row the pool band
+        // already admitted on evidence, never a coin still inside its
+        // never-measured grace (db.recordObservedLiquidity's evidence gate).
+        if (liq !== undefined)
+          observedLiquidity.set(token, {
+            usd: liq,
+            drainedOnly: !liquidityIsComparable(pair),
+          });
       }
       return pairs;
     };
