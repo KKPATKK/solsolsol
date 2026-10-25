@@ -66,6 +66,7 @@ import {
 } from "./dblatency";
 import {
   DexScreenerClient,
+  type PairInfo,
   DEX_LIST_CACHE_HITS_KEY,
   DEX_LIST_CACHE_LAST_KEY,
   DEX_LIST_CACHE_MISSES_KEY,
@@ -368,6 +369,35 @@ export function observedLiquidityUsd(pair: {
   // Another leg's LEVEL is unjudgeable, but its "this pool is empty" verdict is
   // not: see THE CERTAINLY-DRAINED EXCEPTION above.
   return liq <= DRAINED_POOL_LIQUIDITY_USD ? liq : undefined;
+}
+
+/**
+ * Record what a pass's pair map ACTUALLY returned (see observedLiquidity): the
+ * scanner keeps only in-memory state, so the worker — which owns the end-of-tick
+ * write — has to see the map as it goes by. Cheap: one Map insert per coin per
+ * pass, no extra request.
+ *
+ * The map handed over is the SCANNER'S MERGED one (Scanner.onPairs), not the
+ * DexScreener client's: on the 429 episodes this column exists for, ~98% of the
+ * pairs come from the Jupiter fallback, which is merged in the scanner. Reading
+ * the client's map meant observing almost nothing for weeks (live 2026-10-25:
+ * 62,138 of 63,821 rows NULL, deadMarked 314 while `fails.other` rejected ~200
+ * drained pools a tick).
+ *
+ * `drainedOnly` marks the certainly-drained reading a non-calibrated leg may
+ * name (see observedLiquidityUsd): it may judge a row the pool band already
+ * admitted on evidence, never a coin still inside its never-measured grace
+ * (db.recordObservedLiquidity's evidence gate).
+ */
+function notePairReadings(pairs: Map<string, PairInfo>): void {
+  for (const [token, pair] of pairs) {
+    const liq = observedLiquidityUsd(pair);
+    if (liq !== undefined)
+      observedLiquidity.set(token, {
+        usd: liq,
+        drainedOnly: !liquidityIsComparable(pair),
+      });
+  }
 }
 let helius: HeliusClient | null = null;
 let birdeye: BirdeyeClient | null = null;
@@ -4751,31 +4781,6 @@ async function ensureInitialized(env: Env): Promise<void> {
         void promise;
       },
     });
-    // Record what each pair fetch ACTUALLY returned (see observedLiquidity):
-    // the scanner keeps only in-memory state, so the worker — which owns the
-    // end-of-tick write — has to see the map as it goes by. Cheap: one Map
-    // insert per coin per tick, no extra request. The reading is filtered
-    // through observedLiquidityUsd, so a leg the pool's USD floors are not
-    // calibrated on can only reach the column with an EMPTY-pool verdict, and
-    // only for a row the band admitted on a peak (the drained-only tag below).
-    const fetchPairs = dex.fetchPairsForTokens.bind(dex);
-    dex.fetchPairsForTokens = async (addresses, deadline) => {
-      const pairs = await fetchPairs(addresses, deadline);
-      for (const [token, pair] of pairs) {
-        const liq = observedLiquidityUsd(pair);
-        // `drainedOnly` marks the certainly-drained reading a non-calibrated
-        // leg may name (see observedLiquidityUsd): it may judge a row the pool band
-        // already admitted on evidence, never a coin still inside its
-        // never-measured grace (db.recordObservedLiquidity's evidence gate).
-        if (liq !== undefined)
-          observedLiquidity.set(token, {
-            usd: liq,
-            drainedOnly: !liquidityIsComparable(pair),
-          });
-      }
-      return pairs;
-    };
-
     if (config.telegramBotToken) {
       birdeye = null;
       if (config.birdeyeApiKey) {
@@ -4962,6 +4967,10 @@ async function ensureInitialized(env: Env): Promise<void> {
         // lastSkip back to null in runOnce's finally within the same tick, so
         // without this the reason never reaches a reader (src/skipcapture.ts).
         installSkipCapture(scanner);
+        // The observed-liquidity seam (see notePairReadings): the MERGED map,
+        // so the Jupiter fallback's reading — the one that answers during a
+        // DexScreener 429 episode — reaches `last_liquidity_usd` too.
+        scanner.onPairs = notePairReadings;
         // Tick probe (src/tickprobe.ts): keeps every phase stamp of the tick
         // (the scanner keeps only the last one, and the completion path
         // overwrites even that with `done`), and hangs the worker's own

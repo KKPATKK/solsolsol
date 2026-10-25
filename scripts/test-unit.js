@@ -5037,6 +5037,25 @@ async function main() {
         ),
       "the flush's producer must read the guarded helper and tag the reading's provenance",
     );
+    // ...and the map it reads must be the SCANNER'S MERGED one, never the
+    // DexScreener client's: on a 429 episode the Jupiter fallback is ~98% of the
+    // pairs, so observing the Dex lane alone recorded almost nothing — live
+    // 2026-10-25, 62,138 of 63,821 rows were NULL and deadMarked sat at 314
+    // while the band filled with drained pools.
+    assert.ok(
+      workerSrc.includes("scanner.onPairs=notePairReadings;"),
+      "the worker must observe the scanner's merged pair map",
+    );
+    const scannerSrc = fs
+      .readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "")
+      .replace(/\s+/g, "");
+    assert.ok(
+      scannerSrc.includes("this.observePairs(pairsByToken);") &&
+        scannerSrc.includes("this.observePairs(out);"),
+      "the front phase and the tracker pass must both hand over their merged maps",
+    );
     assert.equal(
       (workerSrc.match(/pair\.liquidity\?\.usd/g) || []).length,
       1,

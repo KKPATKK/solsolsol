@@ -4189,6 +4189,38 @@ export class Scanner {
   }
 
   /**
+   * Every pair map a pass RESOLVED, after its Jupiter/Gecko fallbacks have been
+   * merged in — i.e. exactly the map the gates judge.
+   *
+   * WHY THE MERGED MAP, NOT THE CLIENT'S (2026-10-25). The worker owns the only
+   * durable copy of a pair's liquidity (`last_liquidity_usd`, the column
+   * db.DEAD_POOL_CLAUSE evicts corpses on), and it used to observe the pair map
+   * by wrapping DexScreenerClient.fetchPairsForTokens. That map is only one
+   * leg: the Jupiter fallback lives HERE (the front phase's
+   * `pairsByToken.set` loop and pairsForTracker's own Jup/Gecko legs), so on a
+   * 429 episode — when `pairsJup` is ~98% of the map — the observed map was
+   * nearly empty. Live 2026-10-25 it was empty enough that 62k of 64k rows kept
+   * a NULL reading, deadMarked stayed at 314 and the band filled with corpses.
+   * Handing over the merged map is what makes the reading cover the legs that
+   * actually answered.
+   *
+   * null = nobody is observing (a standalone Scanner, the Node container).
+   * Telemetry only: an observation may never cost or break a pass.
+   */
+  onPairs: ((pairs: Map<string, PairInfo>) => void) | null = null;
+
+  /** One pair-map hand-off, never thrown into the pass (see onPairs). */
+  private observePairs(pairs: Map<string, PairInfo>): void {
+    const hook = this.onPairs;
+    if (!hook) return;
+    try {
+      hook(pairs);
+    } catch {
+      /* an observation is telemetry */
+    }
+  }
+
+  /**
    * Land the front's queued bookkeeping in ONE write request (see
    * Db.writeScanFront). Idempotent: an empty buffer is a no-op, so the normal
    * path (after the pool phase) and the scan's `finally` (every early return)
@@ -5498,6 +5530,10 @@ export class Scanner {
         });
       }
     }
+    // The tracker pass's resolved map, all three legs merged (see onPairs):
+    // these are pool coins the tick's re-eval band reads next, so their
+    // `last_liquidity_usd` is the reading DEAD_POOL_CLAUSE evicts them on.
+    this.observePairs(out);
     return out;
   }
 
@@ -7483,6 +7519,10 @@ export class Scanner {
       diag.dex = this.dex.getStats();
       // Kept for the post-push tracker pass (see lastPairs).
       this.lastPairs = pairsByToken;
+      // The front's resolved map, Jupiter fallback included (see onPairs):
+      // this is the tick's ONE chance to durably record what each pool holds,
+      // and the fallback is the leg that answers on a 429 episode.
+      this.observePairs(pairsByToken);
 
       // Capture each token's opening stats the first time we ever see it.
       // One batched lookup for the whole feed, then one batched insert for

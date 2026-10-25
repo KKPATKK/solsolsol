@@ -108,8 +108,25 @@ re-offers it and its age gate has not even opened. One sweep later the row has
 its own peak and the verdict can judge it. The gate is one extra `AND` in
 `Db.recordObservedLiquidity`, and it costs no extra round trip (same batch).
 
+### Where the reading is taken from (the second half of the fix)
+
+The fix above is only as good as the map it sees, and the original seam saw the
+wrong one. It wrapped `DexScreenerClient.fetchPairsForTokens`; the Jupiter
+fallback is merged **after** that call — in the scanner's front phase
+(`pairsByToken.set`) and again in `pairsForTracker`. So on a 429 episode the
+observed map was nearly empty: the first deploy (02:52Z) changed nothing —
+`drained` stayed at 224 and `NULL` fell only by the prune (495 rows).
+
+The seam is now `Scanner.onPairs`, invoked with each pass's MERGED map (Dex +
+Jupiter + Gecko), in both the front phase and the tracker pass. That is the map
+the gates judge, so it is the map the pool's eviction column must be written
+from.
+
 ## What to watch after the deploy
 
+- `token_stats` `SUM(last_liquidity_usd <= 500)` should climb by roughly the
+  tick's drained rejects (~180-200) every minute; that is the reading the first
+  deploy lacked entirely.
 - `/debug/pool` `deadMarked` should climb from 314 into the thousands within a
   rotation, and `poolQueryCount` should settle at the *live* cohort.
 - `/debug/tick` `agedEval` should move off 1, and `fails.other` (liquidity)
