@@ -2036,16 +2036,17 @@ export const POOL_MCAP_PRUNE_RATIO = 0.8;
  * a missing token may be counted as a pool coin swept with no reading (see
  * poolSweepMisses).
  *
- * 0.5 is not a new number: it is the threshold the Jupiter fallback itself
- * fires at (`pairsByToken.size < addresses.length * 0.5`, see the pair phase),
- * so it names the same event from the other side — "the Dex lane answered for
- * less than half of what was asked" is exactly where a missing token stops
- * being evidence about that coin and becomes evidence about the transport.
- * Measured on this pool: a refused Dex batch reads `pairs 0-96` against
- * ~150-180 asked (docs/round-trips.md §4.36-4.38, docs/gecko-429.md), i.e.
- * coverage far under half, while a healthy tick reads `pairs 155 pairsJup 120
- * pairsMissing 0`. Below this floor NOTHING is marked, so a 429 window moves
- * no coin's freshness mark.
+ * 0.5 is the transport line the pair phase has always read: below it the
+ * whole batch is a refusal, not a per-coin answer. It remains ONE of the
+ * Jupiter fallback's two triggers (see pairFallbackPlan); the other is a
+ * single unanswered rotation-slice coin, so a pool hole is covered even when
+ * the Dex lane answered more than half. This guard is deliberately narrower
+ * than that second trigger: only a batch at or above half can advance a
+ * freshness mark. Measured on this pool: a refused Dex batch reads `pairs
+ * 0-96` against ~150-180 asked (docs/round-trips.md §4.36-4.38,
+ * docs/gecko-429.md), i.e. coverage far under half, while a healthy tick reads
+ * `pairs 155 pairsJup 120 pairsMissing 0`. Below this floor NOTHING is
+ * marked, so a 429 window moves no coin's freshness mark.
  */
 export const POOL_SWEEP_HEALTHY_COVERAGE = 0.5;
 
@@ -2081,6 +2082,49 @@ export function poolSweepMisses(
   if (poolTokens.length === 0 || requested <= 0) return [];
   if (answered < requested * POOL_SWEEP_HEALTHY_COVERAGE) return [];
   return poolTokens.filter((token) => !answers.has(token));
+}
+
+/**
+ * The Jupiter pair fallback's entry rule and ask order (2026-10-26).
+ *
+ * WHY (measured over 240 ticks): `pairsMissing` summed to 1,476 coin-ticks,
+ * and the fallback's old entry rule could not address most of them. It fired
+ * only when the Dex lane answered for LESS THAN HALF the addresses. A tick
+ * where Dex returns 55-90% (some batches succeed, some 429) therefore never
+ * asked Jupiter for the rest, even though those coins had a pair and the
+ * gates needed it. The live shape is documented from 2026-10-01: `pairs
+ * 137-157`, `pairsJup` ABSENT, `pairsMissing 46-68` on every "recovered"
+ * tick.
+ *
+ * The rule is now: enter on the old transport reading (coverage under half)
+ * OR when ANY rotation-slice coin is unanswered. A pool coin is the one class
+ * that provably HAD a pair — the feed's fresh bonding-curve launches often
+ * have none, which is why they are not allowed to trigger the leg on their
+ * own.
+ *
+ * The ask order is POOL FIRST. This lane is capped (100 mints per request,
+ * four bulk requests per provider window) and `missing` used to preserve the
+ * address list's feed-first order, so a scarce chunk went to coins that often
+ * have no pair while the rotation slice starved at the tail. The tracker head
+ * stays last for the same reason it always did: its own pass owns those rows.
+ */
+export function pairFallbackPlan(
+  addresses: readonly string[],
+  poolTokens: ReadonlySet<string>,
+  answers: { has(token: string): boolean; size: number },
+): { missing: string[]; poolMissing: number; underHalfCoverage: boolean } {
+  const poolMissing: string[] = [];
+  const rest: string[] = [];
+  for (const address of addresses) {
+    if (answers.has(address)) continue;
+    if (poolTokens.has(address)) poolMissing.push(address);
+    else rest.push(address);
+  }
+  return {
+    missing: [...poolMissing, ...rest],
+    poolMissing: poolMissing.length,
+    underHalfCoverage: answers.size < addresses.length * 0.5,
+  };
 }
 
 /**
@@ -3291,6 +3335,20 @@ export interface ScanSummary {
    * everything it needed to, whatever it cost.
    */
   pairsMissing?: number;
+  /**
+   * Of `pairsMissing`, the FEED coins. A fresh pump.fun launch has no DEX pair
+   * until it graduates, so this number is expected to be non-zero on a healthy
+   * tick and is NOT by itself a scanning gap. Read it against the pool half
+   * below before treating `pairsMissing` as lost coverage.
+   */
+  pairsMissingFeed?: number;
+  /**
+   * Of `pairsMissing`, the ROTATION-SLICE coins — coins that had a pair when
+   * the pool admitted them and therefore SHOULD have one now. This is the
+   * actionable half: a non-zero reading means the pair lanes left a coin the
+   * gates could have judged unanswered (see pairFallbackPlan).
+   */
+  pairsMissingPool?: number;
   fails: {
     mcap: number;
     chg: number;
@@ -7449,17 +7507,26 @@ export class Scanner {
       // and it is not entered at all when the window has less than one chunk's
       // worth of room (JUP_FALLBACK_MIN_ROOM_MS) — the Dex pair lane's own
       // rule for a batch that cannot START inside the phase.
+      // THE ENTRY RULE (2026-10-26): the old `size < addresses.length * 0.5`
+      // alone left every partially-answered tick unpatched — Dex can return
+      // 60% (some batches 429) and the remaining 40% never reached Jupiter.
+      // A missing ROTATION-SLICE coin is now its own trigger, because that is
+      // the class the gates can actually judge (see pairFallbackPlan). The
+      // ask order is pool-first for the same reason: this lane's chunks are
+      // capped, and feed-first order spent them on bonding-curve coins with no
+      // pair while the pool tail starved.
+      const poolTokens = new Set(poolSlice.map((p) => p.tokenAddress));
+      const fallback = pairFallbackPlan(addresses, poolTokens, pairsByToken);
       if (
-        pairsByToken.size < addresses.length * 0.5 &&
+        (fallback.underHalfCoverage || fallback.poolMissing > 0) &&
         this.jupiter &&
         frontDeadline - Date.now() > JUP_FALLBACK_MIN_ROOM_MS
       ) {
         this.enterStage("pairs-jup", seq);
         const beforeJup = pairsByToken.size;
         try {
-          const missing = addresses.filter((a) => !pairsByToken.has(a));
           for (const [k, v] of await this.jupiter.fetchTokenDataBatch(
-            missing,
+            fallback.missing,
             frontDeadline,
           ))
             pairsByToken.set(k, v);
@@ -7488,9 +7555,20 @@ export class Scanner {
       // `addresses` too but is deliberately not counted here: those rows gate
       // nothing on this tick, and their own pass fetches them (see
       // pairsForTracker).
-      diag.pairsMissing = scannedProfiles.filter(
+      // SPLIT THE READING (2026-10-26). The old single number mixed two
+      // populations with opposite meanings: a feed coin with no pair is a
+      // bonding curve doing its normal thing, while a rotation-slice coin with
+      // no pair is a real gap in the gates' input. The 240-tick audit could
+      // only say "1,476 coin-ticks were skipped", not which half to fix.
+      const missingFeed = feedOnly.filter(
         (p) => !pairsByToken.has(p.tokenAddress),
       ).length;
+      const missingPool = poolSlice.filter(
+        (p) => !pairsByToken.has(p.tokenAddress),
+      ).length;
+      diag.pairsMissing = missingFeed + missingPool;
+      diag.pairsMissingFeed = missingFeed;
+      diag.pairsMissingPool = missingPool;
       // The freshness mark's input (2026-10-08 — see poolSweepMisses). Two
       // deliberate narrowings: the list is built from the ROTATION SLICE, not
       // from scannedProfiles, because a feed coin's missing pair is its normal

@@ -2995,6 +2995,10 @@ export interface TickLegRow {
   pairs: number | null;
   pairsJup: number | null;
   pairsMissing: number | null;
+  /** Feed half of `pairsMissing` — fresh launches, often no pair by design. */
+  pairsMissingFeed: number | null;
+  /** Rotation-slice half — coins that had a pair and were left unanswered. */
+  pairsMissingPool: number | null;
   evalMs: number | null;
   dbMs: number | null;
   /**
@@ -3080,6 +3084,8 @@ export function buildTickLegRow(input: {
     pairs: s?.pairs ?? null,
     pairsJup: s?.pairsJup ?? null,
     pairsMissing: s?.pairsMissing ?? null,
+    pairsMissingFeed: s?.pairsMissingFeed ?? null,
+    pairsMissingPool: s?.pairsMissingPool ?? null,
     evalMs: s?.evalMs ?? null,
     dbMs: s?.dbMs ?? null,
     poolStale: s?.poolStale ?? null,

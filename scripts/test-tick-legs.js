@@ -115,7 +115,9 @@ test("a full tick maps every leg and the front split", () => {
         feedJoinMs: 505,
         pairs: 98,
         pairsJup: 98,
-        pairsMissing: 0,
+        pairsMissing: 3,
+        pairsMissingFeed: 2,
+        pairsMissingPool: 1,
         evalMs: 1624,
         dbMs: 1200,
         poolStale: 1259,
@@ -170,6 +172,9 @@ test("a full tick maps every leg and the front split", () => {
   assert.equal(row.feedJoinMs, 505);
   assert.equal(row.pairs, 98);
   assert.equal(row.pairsJup, 98);
+  assert.equal(row.pairsMissing, 3);
+  assert.equal(row.pairsMissingFeed, 2, "the feed half is carried into the ring");
+  assert.equal(row.pairsMissingPool, 1, "the actionable pool half is carried too");
   assert.equal(row.evalMs, 1624);
   assert.equal(row.dbMs, 1200);
   assert.equal(row.poolStale, 1259);
@@ -232,6 +237,9 @@ test("a cut tick with no summary records null legs, not zeros", () => {
   assert.equal(row.feedsMs, null);
   assert.equal(row.poolMs, null);
   assert.equal(row.poolLegMs, null);
+  assert.equal(row.pairsMissing, null);
+  assert.equal(row.pairsMissingFeed, null);
+  assert.equal(row.pairsMissingPool, null);
   assert.equal(row.feedLegMs, null, "no summary = no feed legs, not empty maps");
   assert.equal(row.feedJoinMs, null);
   assert.equal(row.evalMs, null);

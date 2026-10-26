@@ -5096,6 +5096,69 @@ async function main() {
     );
   });
 
+  await test("Scanner.pairFallbackPlan: a partially-answered tick still asks Jupiter, pool coins first", () => {
+    // The 2026-10-26 gap: the fallback used to fire only below 50% coverage,
+    // so a Dex tick that answered 3/5 never asked Jupiter for the other 2 —
+    // and `pairsMissing` counted both as coins every gate had to skip. The
+    // plan must also spend a scarce chunk on the pool coins, not the feed's
+    // (often pairless) fresh launches at the head of the address list.
+    const { pairFallbackPlan } = require("../dist/scanner.js");
+    const pool = new Set(["P1", "P2"]);
+    const addresses = ["F1", "P1", "F2", "P2", "HEAD"];
+    const answers = new Map([
+      ["F1", {}],
+      ["F2", {}],
+      ["HEAD", {}],
+    ]);
+    const plan = pairFallbackPlan(addresses, pool, answers);
+    assert.deepEqual(plan.missing, ["P1", "P2"], "pool holes are asked first");
+    assert.equal(plan.poolMissing, 2);
+    assert.equal(
+      plan.underHalfCoverage,
+      false,
+      "3/5 is above half — the OLD entry rule alone would not have run the leg",
+    );
+    // The old transport reading still fires on a refused batch, with the pool
+    // coins first and the tracker head last.
+    const refused = pairFallbackPlan(addresses, pool, new Map());
+    assert.equal(refused.underHalfCoverage, true);
+    assert.deepEqual(refused.missing, ["P1", "P2", "F1", "F2", "HEAD"]);
+    // A tick with only FEED misses is not a fallback trigger by itself: those
+    // coins may legitimately be bonding curves with no pair yet.
+    const feedOnly = pairFallbackPlan(["F1", "F2"], new Set(), new Map([["F1", {}]]));
+    assert.equal(feedOnly.poolMissing, 0);
+    assert.equal(feedOnly.underHalfCoverage, false, "1/2 is exactly half, not under it");
+    assert.equal(pairFallbackPlan(["F1"], new Set(), new Map()).underHalfCoverage, true);
+    // Wiring: the summary's total is the split's sum, and the leg asks the
+    // plan's ordered list (the source pins are stripped of comments/space).
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const scannerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+    );
+    assert.ok(
+      scannerSrc.includes("constfallback=pairFallbackPlan(addresses,poolTokens,pairsByToken)"),
+      "the scanner must build the plan from the address list, the pool slice and the answers",
+    );
+    assert.ok(
+      scannerSrc.includes("fallback.underHalfCoverage||fallback.poolMissing>0"),
+      "the leg must fire on EITHER the transport reading or a pool hole",
+    );
+    assert.ok(
+      scannerSrc.includes("fetchTokenDataBatch(fallback.missing,frontDeadline,)"),
+      "the leg must ask the plan's ordered missing list",
+    );
+    assert.ok(
+      scannerSrc.includes("diag.pairsMissing=missingFeed+missingPool;") &&
+        scannerSrc.includes("diag.pairsMissingFeed=missingFeed;") &&
+        scannerSrc.includes("diag.pairsMissingPool=missingPool;"),
+      "the published total must be the feed/pool split, never a third count",
+    );
+  });
+
   // The wiring, pinned where the rule cannot pin it: the list must be built
   // from the ROTATION SLICE (never from the feed's coins, whose missing pair is
   // their normal state), drained ONCE by the tick's tail, and the pool query's
@@ -8302,7 +8365,7 @@ async function main() {
         fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
       );
       assert.ok(
-        scannerSrc.includes("fetchTokenDataBatch(missing,frontDeadline,)"),
+        scannerSrc.includes("fetchTokenDataBatch(fallback.missing,frontDeadline,)"),
         "the Jupiter fallback must be handed the front deadline too (no caller passed one before)",
       );
       assert.ok(
@@ -8357,8 +8420,8 @@ async function main() {
         const cfg = loadConfig({});
         const dex = new DexScreenerClient(cfg);
         dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: "FEEDCOIN1" }];
-        // A hit makes the pair phase succeed; an empty map drops it under half,
-        // which is the only path that runs the Jupiter fallback.
+        // A hit makes the pair phase succeed; an empty map is under half, so
+        // the transport trigger runs the Jupiter fallback.
         dex.fetchPairsForTokens = async () =>
           pairHit ? new Map([["FEEDCOIN1", {}]]) : new Map();
         // The fallback stub records the deadline it was HANDED (2026-10-01

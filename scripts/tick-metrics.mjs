@@ -80,6 +80,10 @@ function tickRow(health) {
     pairs: num(sm.pairs),
     pairsJup: num(sm.pairsJup),
     pairsMissing: num(sm.pairsMissing),
+    // The split (2026-10-26): feed coins have no pair by design, pool coins
+    // do not. Absent before this deploy, so an old window reads n/a.
+    pairsMissingFeed: num(sm.pairsMissingFeed),
+    pairsMissingPool: num(sm.pairsMissingPool),
     organicNoLine: num(sm.organicNoLine),
     organicWaited: num(sm.organicWaited),
     organicRetried: num(sm.organicRetried),
@@ -248,6 +252,15 @@ function report() {
   const pairSum = sum(ticks.map((t) => t.pairs));
   const missingSum = sum(ticks.map((t) => t.pairsMissing));
   if (pairSum > 0) line("pairsMissing share", `${((missingSum / pairSum) * 100).toFixed(1)}%`);
+  const missingFeedSum = sum(ticks.map((t) => t.pairsMissingFeed));
+  const missingPoolSum = sum(ticks.map((t) => t.pairsMissingPool));
+  if (ticks.some((t) => typeof t.pairsMissingPool === "number")) {
+    line("pairsMissing feed / pool (sum)", `${missingFeedSum} / ${missingPoolSum}`);
+    line(
+      "pairsMissing pool share",
+      missingSum > 0 ? `${((missingPoolSum / missingSum) * 100).toFixed(1)}%` : "n/a",
+    );
+  }
   line("organicNoLine total", sum(ticks.map((t) => t.organicNoLine)));
   line("organicWaited total", sum(ticks.map((t) => t.organicWaited)));
   line("organicRetried total", sum(ticks.map((t) => t.organicRetried)));
