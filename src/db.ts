@@ -609,14 +609,34 @@ const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR NOT (${DEAD_POOL_MARK})
  * into whether those readings happened at all. The grace exists only so a coin
  * the pair lane has not REACHED yet is not mistaken for one it has repeatedly
  * judged: the worst rotation recurrence measured on this pool is 8 far-band
- * recurrences (≈2.4h, docs/round-trips.md §4.48), and this bound is 2.5x that
- * worst case.
+ * recurrences (≈2.4h, docs/round-trips.md §4.48); the original 6h bound was
+ * 2.5x that worst case (the 2026-10-27 revision below is 1.25x).
  *
- * WHY SIX HOURS: 3h would sit barely above the measured worst-case coverage
- * (1.25x — no room for a 429 window or a sweep's tail cut by the deadline) and
- * 12h leaves half the population seated (5,552 of 10,394 in-window rows) for
- * no extra signal; 6h cuts 8,124 of the 10,394 (78%) while every coin the
- * pool was still plausibly going to measure keeps its seat.
+ * WHY SIX HOURS (2026-10-09), AND WHY IT IS THREE NOW (2026-10-27). The
+ * original bound was sized against the SWEEP, not the population: 3h sits
+ * 1.25x above the measured worst rotation recurrence (8 far-band recurrences
+ * ≈2.4h, docs/round-trips.md §4.48), so a 429 window or a sweep tail cut by
+ * the deadline could evict a row the pair lane had not reached yet. Six hours
+ * bought that margin, and at the time it cut 8,124 of 10,394 in-window
+ * no-evidence rows (78%) while every coin the pool was plausibly going to
+ * measure kept its seat.
+ *
+ * The live 2026-10-27 audit says the 3-6h third is NOT that population. The
+ * 30h pool window held 5,511 eligible rows, 5,378 of them with no mcap
+ * reading at all (evidenced: 133). Their grace bands were 548 (<1h), 2,008
+ * (1-3h) and 3,066 (3-6h) — and across ALL 18,634 no-evidence rows only 8
+ * had ever produced a liquidity reading, with `sweeps_since_reading` 0 on
+ * every one. The 3-6h third is therefore rows the pair lane has already
+ * refused to describe for hours, not rows it has not reached yet: the old
+ * note's failure mode (a sweep tail cut before the row's turn) lives inside
+ * 3h, where the rotation recurrence is, not after it. The cut removes those
+ * 3,066 rows from the filler lane while keeping the measured 2.4h worst case
+ * inside the grace with the same 1.25x margin the old note rejected —
+ * accepted now because the eviction is not one-way (a first positive mcap
+ * returns the row, and the discovery feed still evaluates it every tick).
+ * Watch `filler served / tick` and `agedEval` with
+ * scripts/pool-grace-240.mjs: a 3h bound that starts evicting reachable rows
+ * shows up as a falling evidenced cohort, not as a faster tick.
  *
  * WHAT IT COSTS, AND WHY THAT IS THE ACCEPTED SIDE: a row evicted here is out
  * of the sweep pool until a discovery feed finds the coin again — the feed's
@@ -627,7 +647,7 @@ const DEAD_POOL_CLAUSE = `(last_liquidity_usd IS NULL OR NOT (${DEAD_POOL_MARK})
  * the trade off the fresh tail — a coin first seen inside the window is never
  * judged on evidence nobody had time to collect.
  */
-export const POOL_MCAP_EVIDENCE_GRACE_MS = 6 * 3600_000;
+export const POOL_MCAP_EVIDENCE_GRACE_MS = 3 * 3600_000;
 
 /**
  * The no-evidence pre-filter's SQL half. A BOUND argument — the cutoff moves

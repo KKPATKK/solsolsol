@@ -2547,7 +2547,7 @@ function planLane<T>(
  * longer sweep instead. The filler lane is what is left, exactly as it was
  * before this split; at the live size that is ~4/tick, i.e. a ~90-minute sweep
  * for the no-evidence rows — they are not a cadence promise, and 90 minutes is
- * still well inside POOL_MCAP_EVIDENCE_GRACE_MS (6h).
+ * still well inside POOL_MCAP_EVIDENCE_GRACE_MS (3h since 2026-10-27).
  */
 export function slicePoolZones<T>(
   zones: { hot: T[]; near: T[]; far: T[]; filler: T[] },

@@ -11262,7 +11262,12 @@ async function main() {
         // ONE far sub-window (= the whole far zone) so every call reads the
         // same band and the page phase advances with the slot.
         farSlots: 1,
-        rotationPeriodMs: 300e3,
+        // ONE MINUTE, not five: a 64-phase cycle has to fit inside the 3h
+        // no-evidence grace (2026-10-27, was 6h) or the fixture ages its own
+        // rows out mid-cycle and the paging promise is tested against the
+        // grace instead. 64 phases at 1 min = 64 min, inside the bound; the
+        // paging (this test's subject) is unchanged — one bucket per phase.
+        rotationPeriodMs: 60e3,
         minQualifyMcap: 30_000,
         maxQualifyMcap: 500_000,
         minQualifyLiquidity: 5_000,
@@ -11271,7 +11276,7 @@ async function main() {
       // One full page cycle = one phase per slot.
       const seen = new Set();
       for (let k = 0; k < 64; k += 1) {
-        const rows = (await db.getReevalPool(opts(now + k * 300e3))).map((r) => r.token);
+        const rows = (await db.getReevalPool(opts(now + k * 60e3))).map((r) => r.token);
         assert.ok(rows.includes("HIGH"), `the evidenced row is still returned in phase ${k}`);
         const page = rows.filter((x) => x.startsWith("R"));
         assert.ok(
@@ -11291,7 +11296,7 @@ async function main() {
       // The batched builder (production path) must page the SAME bucket with
       // the same phase bound in the same place — a mis-ordered argument would
       // silently page a different band's rows.
-      const sameNow = now + 7 * 300e3;
+      const sameNow = now + 7 * 60e3;
       const perBand = (await db.getReevalPool(opts(sameNow))).map((r) => r.token).sort();
       const batched = (await db.getReevalPoolBatched(opts(sameNow))).map((r) => r.token).sort();
       assert.deepEqual(batched, perBand, "both builders page the same bucket");
@@ -11469,6 +11474,81 @@ async function main() {
         after,
         [EDGE_LIVE, FRESH_EVID, OLD_EVID, "OLD_MCAP"].sort(),
         "a served reading brings the coin back into the rotation",
+      );
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  // The 6h → 3h cut (2026-10-27). The live pool read that decided it: 5,511
+  // eligible rows in the 30h window, 5,378 of them with no mcap reading (only
+  // 133 evidenced); the grace bands were 548 (<1h), 2,008 (1-3h) and 3,066
+  // (3-6h), while across all 18,634 no-evidence rows only 8 had ever produced a
+  // liquidity reading. The 3-6h third is rows the pair lane has refused to
+  // describe for hours, not rows it has not reached. This test pins BOTH the
+  // chosen value and the cohort it moves, so a later widening has to restate
+  // the measurement instead of drifting back.
+  await test("pool: the no-evidence grace is 3h — a 4h-old unmeasured row is out, a 2h-old one is kept", async () => {
+    const { POOL_MCAP_EVIDENCE_GRACE_MS } = require("../dist/db.js");
+    assert.equal(
+      POOL_MCAP_EVIDENCE_GRACE_MS,
+      3 * 3600_000,
+      "the 2026-10-27 cut is 3h; the 6h reading it replaced is in db.ts's note",
+    );
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      const H = 3600e3;
+      const M = 60e3;
+      // Hot zone for every row (launch == the window entry) and the page phase
+      // pinned, so only the grace cutoff can hide one of them — the same
+      // fixture discipline as the clause test above.
+      const seed = async (token, firstSeenAt) => {
+        await t.client.execute({
+          sql: "INSERT INTO token_stats (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms, max_mcap_observed) VALUES (?, ?, 0, ?, ?, NULL)",
+          args: [token, firstSeenAt, 80, now - 80 * M],
+        });
+      };
+      const HOT_PHASE = 1;
+      const FOUR_H = pagedName("GRACE_FOUR_H", HOT_PHASE);
+      const TWO_H = pagedName("GRACE_TWO_H", HOT_PHASE);
+      await seed(FOUR_H, now - 4 * H); // inside the old 6h, outside the new 3h
+      await seed(TWO_H, now - 2 * H); // inside both
+      const opts = {
+        sinceMs: now - 30 * H,
+        minLaunchMs: now - (1560 + 180) * M,
+        maxLaunchMs: now - (80 - 180) * M,
+        windowEntryLaunchMs: now - 80 * M,
+        limit: 1000,
+        nearSlots: 2,
+        farSlots: 12,
+        rotationPeriodMs: 1e12, // slot 1 for the whole test (see HOT_PHASE)
+        minQualifyMcap: 30_000,
+        maxQualifyMcap: 500_000,
+        now,
+      };
+      for (const [name, read] of [
+        ["per-band", () => db.getReevalPool(opts)],
+        ["batched", () => db.getReevalPoolBatched(opts)],
+      ]) {
+        assert.deepEqual(
+          (await read()).map((r) => r.token).sort(),
+          [TWO_H],
+          `${name}: the 4h-old no-evidence row left with the 3h bound, the 2h-old one stayed`,
+        );
+      }
+      // NEGATIVE CONTROL: the same fixture on a clock 2h EARLIER puts FOUR_H
+      // inside its 3h grace (2h old) and it reappears — so the shorter cutoff,
+      // not any other prune, is what excluded it above.
+      const earlier = (await db.getReevalPoolBatched({ ...opts, now: now - 2 * H }))
+        .map((r) => r.token)
+        .sort();
+      assert.deepEqual(
+        earlier,
+        [FOUR_H, TWO_H].sort(),
+        "the shorter bound is the only difference",
       );
     } finally {
       await t.cleanup();
