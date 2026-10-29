@@ -1474,12 +1474,24 @@ async function recordDex429(at: number): Promise<void> {
  * empty sweeps that ADVANCE it are produced by one sweep, so writing them
  * together is what makes an overlap impossible. The advance runs first on
  * purpose — if a coin were ever in both lists (the construction forbids it: a
- * coin with a pair cannot be a miss), it must land on 0, alive. A prune that
- * can never be undone may only fail toward serving a coin.
+ * coin with a reading cannot be a miss), it must land on 0, alive. A prune
+ * that can never be undone may only fail toward serving a coin.
+ *
+ * TWO ADVANCING LISTS SINCE 2026-10-29, one write: "the answer left the coin
+ * out" (poolSweepMisses, the transport half) and "the answer named the token
+ * with no liquidity level" (poolSweepNoReading, the data half). They are
+ * disjoint by construction and neither can also appear in `observedLiquidity`
+ * (that map only holds a coin a leg gave a NUMBER to, and its write resets the
+ * mark in the same flush), so the union is the mark's exact input. The scanner
+ * publishes the two counts apart (`poolMisses` / `poolUnreadable`) so an
+ * operator can still tell a failing lane from an undescribed coin.
  */
 async function flushObservedLiquidity(source: Scanner | null): Promise<void> {
   if (!db) return;
-  const missed = source?.takePoolSweepMisses() ?? [];
+  const missed = [
+    ...(source?.takePoolSweepMisses() ?? []),
+    ...(source?.takePoolUnreadable() ?? []),
+  ];
   // Taken BEFORE the empty-map return below: a tick whose pair batch came back
   // refused is exactly a tick with no readings and no misses (the scanner's
   // coverage guard empties the list), and a tick whose pool coins got nothing

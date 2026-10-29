@@ -1326,6 +1326,33 @@ export function comparableLiquidity(pair: {
 }
 
 /**
+ * Whether this pair NAMES a liquidity level at all, whatever its scale — the
+ * question `comparableLiquidity` deliberately does not answer.
+ *
+ * WHY A SEPARATE PREDICATE (2026-10-29). The pool's freshness mark
+ * (db.DEAD_POOL_MISS_MAX) is fed by "the sweep got no reading for this coin",
+ * and the scanner used to answer that with `answers.has(token)` — i.e. "did any
+ * leg return an ENTRY". An entry is not a reading: Jupiter's `/search` answers
+ * a pre-graduation coin with `liquidity: null`, and a DexScreener entry can
+ * carry no reserve either. Those coins therefore never advanced the mark, so a
+ * row that already held a reading (from a tick when a leg DID answer with one)
+ * could never age out. Measured live 2026-10-29: `sweeps_since_reading >= 3`
+ * on 0 of 50,755 eligible rows — DEAD_POOL_MISS_MAX had never fired.
+ *
+ * WHAT COUNTS: any finite number, INCLUDING one from a leg whose scale may not
+ * judge it. A Jupiter $600 proves the pool is not empty even though only
+ * DexScreener's number may be compared to a floor, so naming a level is enough
+ * to keep a coin out of the miss list; only a missing/null number is "no
+ * reading".
+ */
+export function namesLiquidityLevel(pair: {
+  liquidity?: { usd: number | null } | null;
+}): boolean {
+  const liq = pair.liquidity?.usd;
+  return typeof liq === "number" && Number.isFinite(liq);
+}
+
+/**
  * Whether this pair's `liquidity` came from the one leg every USD-level rule
  * is calibrated on (see comparableLiquidity).
  *

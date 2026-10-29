@@ -532,13 +532,24 @@ const DEAD_LIQUIDITY_USD = 1_000;
  *
  * WHY SWEEPS AND NOT A WALL-CLOCK TTL: the mark counts sweeps that came back
  * EMPTY, so it advances only when the pool actually asked AND the transport
- * answered for everything else (see scanner.poolSweepMisses). A stalled scan —
- * cron outage, degraded database — advances nothing, so a quiet period can
- * never mass-evict live coins; a wall-clock bound would instead have to guess
- * an interval longer than the worst rotation recurrence and would still age
- * out every coin that window failed to reach. Sweeps are also the unit the
- * pool is denominated in: the rotation, not the clock, decides how often a
- * coin is looked at.
+ * answered for everything else (see scanner.poolSweepMisses /
+ * scanner.poolSweepNoReading). A stalled scan — cron outage, degraded
+ * database — advances nothing, so a quiet period can never mass-evict live
+ * coins; a wall-clock bound would instead have to guess an interval longer
+ * than the worst rotation recurrence and would still age out every coin that
+ * window failed to reach. Sweeps are also the unit the pool is denominated in:
+ * the rotation, not the clock, decides how often a coin is looked at.
+ *
+ * WHAT COUNTS AS NO READING (2026-10-29): two shapes, both under the same
+ * healthy-batch guard — the answer left the coin OUT (poolSweepMisses), and
+ * the answer NAMED the coin with no liquidity level at all
+ * (poolSweepNoReading). The second was the seam: an ENTRY is not a READING,
+ * and Jupiter answers a pre-graduation coin with `liquidity: null`, so those
+ * rows never advanced the mark while a stored reading kept vouching for them.
+ * Measured live that day: `sweeps_since_reading >= 3` on 0 of 50,755
+ * eligible rows. A coin whose entry NAMES a level is never in either list,
+ * whatever that level's scale (pushwatch.namesLiquidityLevel): a
+ * non-comparable $600 proves the pool is not empty, it just may not judge it.
  *
  * WHY THREE: the healthy-batch guard means one bad batch (a 429 window, the
  * deadline cutting the tail) can never mark anything. What is left is a

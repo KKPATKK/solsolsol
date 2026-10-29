@@ -5096,6 +5096,45 @@ async function main() {
     );
   });
 
+  // The mark's OTHER input (2026-10-29): an ENTRY is not a READING. A coin the
+  // lane answered for with `liquidity: null` is a sweep without a level, and
+  // without it the mark could never fire on a row whose stored reading is
+  // stale — measured live 2026-10-29: 0 of 50,755 rows had ever reached 3.
+  // A coin whose entry NAMES a number stays out, whatever that number's scale:
+  // a non-comparable $600 proves the pool is not empty, it just may not judge
+  // it (see pushwatch.namesLiquidityLevel).
+  await test("Scanner.poolSweepNoReading: an answer without a level is a sweep without a reading", () => {
+    const { poolSweepNoReading, POOL_SWEEP_HEALTHY_COVERAGE } = require("../dist/scanner.js");
+    const answers = new Map([
+      ["LEVEL", { liquidity: { usd: 25_000 } }],
+      ["DRAINED", { liquidity: { usd: 0 } }],
+      ["FOREIGN", { liquidity: { usd: 600 }, feedSource: "jupiter" }],
+      ["NOLIQ", { liquidity: { usd: null } }],
+      ["NOFIELD", {}],
+    ]);
+    assert.deepEqual(
+      poolSweepNoReading(
+        ["LEVEL", "DRAINED", "FOREIGN", "NOLIQ", "NOFIELD", "ABSENT"],
+        answers,
+        10,
+        10,
+      ),
+      ["NOLIQ", "NOFIELD"],
+      "only an entry with no NUMBER is unreadable — an absent entry is poolSweepMisses' half",
+    );
+    assert.deepEqual(
+      poolSweepNoReading(["NOLIQ"], answers, POOL_SWEEP_HEALTHY_COVERAGE * 10 - 0.001, 10),
+      [],
+      "below the coverage floor the whole list is dropped: a refusal is a transport fact",
+    );
+    assert.deepEqual(poolSweepNoReading([], answers, 10, 10), [], "an empty slice asks nothing");
+    assert.deepEqual(
+      poolSweepNoReading(["NOLIQ"], answers, 0, 0),
+      [],
+      "a sweep that asked for nothing produced no unreadable coin",
+    );
+  });
+
   await test("Scanner.pairFallbackPlan: a partially-answered tick still asks Jupiter, pool coins first", () => {
     // The 2026-10-26 gap: the fallback used to fire only below 50% coverage,
     // so a Dex tick that answered 3/5 never asked Jupiter for the other 2 —
@@ -5235,6 +5274,27 @@ async function main() {
       dbSrc.includes("sweeps_since_reading=sweeps_since_reading+1") &&
         dbSrc.includes("sweeps_since_reading=0"),
       "advance and reset must live in the SQL, not in the caller",
+    );
+    // The mark's input is TWO lists (2026-10-29): the transport half (the
+    // answer left the coin out) and the data half (the answer named the token
+    // with no liquidity level). The flush advances on BOTH in one write, and
+    // each take clears ONLY its own list — a take that cleared both would
+    // silently disable the newer half, because the flush takes the miss list
+    // first.
+    assert.ok(
+      workerSrc.includes(
+        "...(source?.takePoolSweepMisses()??[]),...(source?.takePoolUnreadable()??[])",
+      ),
+      "the flush must advance the mark on both halves of the same sweep",
+    );
+    const takeMisses = scannerSrc.slice(
+      scannerSrc.indexOf("takePoolSweepMisses()"),
+      scannerSrc.indexOf("takePoolUnreadable()"),
+    );
+    assert.ok(
+      takeMisses.includes("this.pendingPoolSweepMisses=[];") &&
+        !takeMisses.includes("pendingPoolUnreadable"),
+      "taking the miss list must NOT clear the level-less list",
     );
   });
 

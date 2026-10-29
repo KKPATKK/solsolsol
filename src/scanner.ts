@@ -73,6 +73,7 @@ import {
   PushWatcher,
   TRACKER_PASS_STATE_KEY,
   liquidityIsComparable,
+  namesLiquidityLevel,
   notePeerPassYield,
   passRowAgeMs,
   pinnablePoolAddress,
@@ -2085,6 +2086,48 @@ export function poolSweepMisses(
 }
 
 /**
+ * The OTHER half of the freshness mark's input (2026-10-29): pool coins the
+ * sweep ASKED for and got an ENTRY back for, but no liquidity level.
+ *
+ * WHY IT EXISTS. poolSweepMisses above counts coins the answer left out — a
+ * fact about the TRANSPORT. The mark's unit, though, is a READ, and a pair
+ * entry with `liquidity: null` is not one: Jupiter answers a pre-graduation
+ * coin exactly that way, and any leg may know a token without knowing a
+ * reserve. Feeding the mark only `!answers.has(token)` meant those coins never
+ * advanced it, so a row that already held a reading (from a tick when a leg
+ * DID answer with one) could never age out of the sweep. Measured live
+ * 2026-10-29: `sweeps_since_reading >= 3` on 0 of 50,755 eligible rows, i.e.
+ * db.DEAD_POOL_MISS_MAX had never fired once.
+ *
+ * WHAT IT DOES NOT COUNT: a coin whose entry NAMES a level, whatever that
+ * level's scale (pushwatch.namesLiquidityLevel). A non-comparable $600 is
+ * proof the pool is not empty — it simply may not JUDGE it — so it keeps the
+ * coin out of this list. Only an absent/null number is a sweep without a
+ * reading.
+ *
+ * The SAME coverage guard as the miss list (see POOL_SWEEP_HEALTHY_COVERAGE):
+ * a refused batch answered for nobody, and a transport failure may never
+ * advance the mark. Pure and exported for the same reason.
+ */
+export function poolSweepNoReading(
+  poolTokens: readonly string[],
+  answers: {
+    get(token: string):
+      | { liquidity?: { usd: number | null } | null }
+      | undefined;
+  },
+  answered: number,
+  requested: number,
+): string[] {
+  if (poolTokens.length === 0 || requested <= 0) return [];
+  if (answered < requested * POOL_SWEEP_HEALTHY_COVERAGE) return [];
+  return poolTokens.filter((token) => {
+    const pair = answers.get(token);
+    return pair !== undefined && !namesLiquidityLevel(pair);
+  });
+}
+
+/**
  * The Jupiter pair fallback's entry rule and ask order (2026-10-26).
  *
  * WHY (measured over 240 ticks): `pairsMissing` summed to 1,476 coin-ticks,
@@ -3212,6 +3255,18 @@ export interface ScanSummary {
    * refused 429 tick reports 0 however many pairs it lost.
    */
   poolMisses?: number;
+  /**
+   * Pool coins the sweep ASKED for and got an ENTRY for, but no liquidity
+   * level at all (2026-10-29 — see poolSweepNoReading / db.DEAD_POOL_MISS_MAX).
+   *
+   * Read it as "data the lane could not describe", NOT as a transport fault:
+   * `poolMisses` above is the transport half (the answer left the coin out),
+   * this is the data half (the answer named the token and no reserve — a
+   * pre-graduation coin's normal state). Both advance the same freshness mark
+   * under the same coverage guard, which is why a tick can report misses 0 and
+   * this number non-zero without anything being wrong with the pair lane.
+   */
+  poolUnreadable?: number;
   /** Evaluations that passed the age gate (age ≥ min) this scan — proves
    * in-window coins are actually being evaluated, not silently skipped. */
   agedEval: number;
@@ -4548,6 +4603,13 @@ export class Scanner {
    * second time would count one empty sweep as two.
    */
   private pendingPoolSweepMisses: string[] = [];
+  /**
+   * Pool coins the LAST sweep answered WITHOUT a liquidity level (see
+   * poolSweepNoReading). Same lifetime as the miss list: set by the pair
+   * phase, taken ONCE by the tick's tail, and cleared at the start of every
+   * scan so a scan that returns early reports nothing.
+   */
+  private pendingPoolUnreadable: string[] = [];
   /** Post-push tracker (null when disabled or no bot/db — see pushwatch.ts). */
   private readonly pushWatcher: import("./pushwatch").PushWatcher | null;
 
@@ -5445,6 +5507,17 @@ export class Scanner {
   }
 
   /**
+   * Take the pool coins the last sweep answered without a liquidity level (see
+   * poolSweepNoReading), clearing the list. Same take-once contract as
+   * takePoolSweepMisses: a failed flush costs one sweep, never a double count.
+   */
+  takePoolUnreadable(): string[] {
+    const out = this.pendingPoolUnreadable;
+    this.pendingPoolUnreadable = [];
+    return out;
+  }
+
+  /**
    * Pair lookup for the post-push tracker pass (see lastPairs): serve what
    * this tick already fetched, ask DexScreener for the rest, then fall back
    * to Jupiter exactly like the front pair phase does — the same rescue for
@@ -6100,6 +6173,7 @@ export class Scanner {
       agedEval: 0,
       staleReadings: 0,
       poolMisses: 0,
+      poolUnreadable: 0,
       candidates: 0,
       pushed: 0,
       fails: {
@@ -6138,6 +6212,7 @@ export class Scanner {
     // pair phase must report NO sweep misses, not the previous scan's (see
     // pendingPoolSweepMisses).
     this.pendingPoolSweepMisses = [];
+    this.pendingPoolUnreadable = [];
     // LOW-WATER GATE (see SCAN_SUBREQ_FLOOR). The invocation's allowance is
     // shared with the tick's tail, and the scan is the only phase whose work is
     // optional — so the optional legs below ask this first. A dropped leg is
@@ -7584,6 +7659,19 @@ export class Scanner {
         addresses.length,
       );
       diag.poolMisses = this.pendingPoolSweepMisses.length;
+      // ...and the level-less half (2026-10-29 — see poolSweepNoReading): an
+      // ENTRY is not a READING, so a coin the lane answered with
+      // `liquidity: null` is a sweep without a level for the mark. Kept apart
+      // from `diag.poolMisses` above on purpose: that number stays the pure
+      // transport reading ("the answer left this coin out") operators use to
+      // judge the lane, while this one is data the lane could not describe.
+      this.pendingPoolUnreadable = poolSweepNoReading(
+        poolSlice.map((p) => p.tokenAddress),
+        pairsByToken,
+        pairsByToken.size,
+        addresses.length,
+      );
+      diag.poolUnreadable = this.pendingPoolUnreadable.length;
       // The `dex` block is refreshed a SECOND time here (see the front refresh
       // above): the pair phase that just finished is the tick's last
       // DexScreener wire, and the pair lane's edge-cache counters
