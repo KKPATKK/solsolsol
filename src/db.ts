@@ -6382,16 +6382,65 @@ export class Db {
    * second switch); losing the race is free — the row still carries a pin the
    * next pass can resolve, and a row whose pin stays stale simply re-detects
    * on the next tick.
+   *
+   * AND RE-BASE IT ON THE NEW POOL (2026-10-31). A row's series belongs to ONE
+   * pool, so a switch that carries the new pool's reading (`mcap`, see the
+   * re-pin site in src/pushwatch.ts) also re-bases the row on it — the same
+   * write the calibration makes, for the same reason: a fresh pool's numbers
+   * cannot be quoted as percentages of the old pool's base.
+   *
+   * WHY (MINECAT): the switch used to move `pool_address` alone.
+   * A row that had been calibrated on a bot-created pool with ~$0.5 of reserve
+   * kept that pool's frozen price as its base and peak (606,974 — the main
+   * pumpswap pool never traded above 211,575 in its life, and the coin sat
+   * near 25K), so every follow-up card quoted `峰值 $606.97K` / `復活基準
+   * $606.97K` after the row had already moved to the real pool. Re-pinning
+   * without re-basing splits the row: it is JUDGED on the new pool and PRICED
+   * off the old one.
+   *
+   * The new base is a revival-shaped base, so it leaves the same `base:` mark
+   * every revival leaves (pushwatch.BASE_MARK_PREFIX): a card quoting it must
+   * not call it 推送時. `followups_sent` stays — it is a delivery count, not a
+   * valuation — and `last_checked` stays, because a switch pass is not a check
+   * (the next pass claims the row through its normal CAS).
+   *
+   * A switch WITHOUT `mcap` (a thin/unpriced pool, or a caller that has no
+   * reading) moves the pin alone, exactly as before.
    */
   async repinPushWatchPools(
-    updates: Array<{ token: string; from: string; to: string }>,
+    updates: Array<{ token: string; from: string; to: string; mcap?: number }>,
   ): Promise<void> {
     if (updates.length === 0) return;
     await this.get().batch(
-      updates.map((u) => ({
-        sql: "UPDATE push_watch SET pool_address = ? WHERE token = ? AND pool_address = ?",
-        args: [u.to, u.token, u.from],
-      })),
+      updates.map((u) => {
+        const mcap = Number(u.mcap ?? NaN);
+        if (!Number.isFinite(mcap) || mcap <= 0) {
+          return {
+            sql: "UPDATE push_watch SET pool_address = ? WHERE token = ? AND pool_address = ?",
+            args: [u.to, u.token, u.from],
+          };
+        }
+        return {
+          sql: `UPDATE push_watch
+                   SET pool_address = ?, mcap_at_push = ?, peak_mcap = ?,
+                       last_mcap = ?, dead_trough_mcap = NULL, last_state = NULL,
+                       up_stages = ?, revives_since_up = 0, sell_dom_streak = 0,
+                       last_alert_at = 0
+                 WHERE token = ? AND pool_address = ?`,
+          // `base:` is pushwatch's BASE_MARK_PREFIX; spelled here because
+          // db.ts does not import the tracker (the dependency runs the other
+          // way) and the format is one token.
+          args: [
+            u.to,
+            mcap,
+            mcap,
+            mcap,
+            `base:${Math.round(mcap)}`,
+            u.token,
+            u.from,
+          ],
+        };
+      }),
       "write",
     );
   }

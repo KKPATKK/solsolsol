@@ -1279,6 +1279,85 @@ async function main() {
     }
   });
 
+  await test("Db.repinPushWatchPools: a confirmed switch re-bases the row on the new pool, a bare switch only moves the pin", async () => {
+    // WHY (2026-10-31, MINECAT): a confirmed switch used to rewrite
+    // `pool_address` and nothing else, so a row that had been calibrated on a
+    // bot-created pool (~$0.5 reserve, a frozen quote) kept that pool's price
+    // as its base AND peak while being judged on the real pool. Every card
+    // then quoted `峰值 $606.97K` for a coin trading near $25K (the real pool
+    // never traded above $211.6K). A row's series belongs to ONE pool, so the
+    // switch has to re-base it exactly like the calibration does.
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.upsertPushWatch({
+        token: "SWITCH1", chatId: "c", symbol: "SWITCH1",
+        pushedAt: Date.now() - 60_000, mcapAtPush: 98_859, liquidityUsd: 15_000,
+        poolAddress: "dead-pool",
+      });
+      // The shape a revival leaves: the baseline AND the peak moved to the
+      // dead pool's frozen quote, a `base:` mark with the same number, and a
+      // death derived from it.
+      await db.updatePushWatchCheck("SWITCH1", {
+        mcapAtPush: 606_974, peakMcap: 606_974, lastLiquidity: 0.72,
+        lastVol5m: 10, upStages: "base:606974", lastState: "dead",
+        deadTroughMcap: 24_219, lastAlertAt: Date.now() - 1_000,
+        lastMcap: 606_974, sellDomStreak: 3, revivesSinceUp: 1,
+        followupsSent: 24,
+      });
+      const before = (await db.listPushWatch(10)).find((r) => r.token === "SWITCH1");
+      assert.equal(before.mcapAtPush, 606_974, "the row starts poisoned");
+
+      await db.repinPushWatchPools([
+        { token: "SWITCH1", from: "dead-pool", to: "live-pool", mcap: 25_115 },
+      ]);
+      const after = (await db.listPushWatch(10)).find((r) => r.token === "SWITCH1");
+      assert.equal(after.poolAddress, "live-pool", "the pin moves");
+      assert.equal(after.mcapAtPush, 25_115, "and the base is the NEW pool's reading");
+      assert.equal(after.peakMcap, 25_115, "the peak restarts where the base does");
+      assert.equal(after.lastMcap, 25_115);
+      assert.equal(after.deadTroughMcap, null, "a trough in the old pool's currency does not survive");
+      assert.equal(after.lastState, null);
+      assert.equal(
+        after.upStages,
+        `base:${25_115}`,
+        "the new base is revival-shaped, so no card can call it 推送時",
+      );
+      assert.equal(after.revivesSinceUp, 0);
+      assert.equal(after.sellDomStreak, 0);
+      assert.equal(after.lastAlertAt, 0, "the cooldown restarts with the series");
+      assert.equal(after.lastChecked, before.lastChecked, "a switch pass is not a check");
+      assert.equal(after.followupsSent, 24, "a delivery count is not a valuation");
+
+      // A switch that carries NO reading (a thin/unpriced pool) still moves
+      // the pin — the row must not be left judging the dead pool — but it
+      // leaves the series untouched rather than inventing a base.
+      await db.upsertPushWatch({
+        token: "SWITCH2", chatId: "c", symbol: "SWITCH2",
+        pushedAt: Date.now() - 60_000, mcapAtPush: 80_000, liquidityUsd: 12_000,
+        poolAddress: "old-2",
+      });
+      await db.repinPushWatchPools([
+        { token: "SWITCH2", from: "old-2", to: "new-2" },
+      ]);
+      const bare = (await db.listPushWatch(10)).find((r) => r.token === "SWITCH2");
+      assert.equal(bare.poolAddress, "new-2");
+      assert.equal(bare.mcapAtPush, 80_000, "no reading, no re-base");
+
+      // The CAS is the old pin: a stale pass cannot move a row that already
+      // switched, and cannot inject a base while doing it.
+      await db.repinPushWatchPools([
+        { token: "SWITCH2", from: "old-2", to: "third", mcap: 5_000 },
+      ]);
+      const stale = (await db.listPushWatch(10)).find((r) => r.token === "SWITCH2");
+      assert.equal(stale.poolAddress, "new-2");
+      assert.equal(stale.mcapAtPush, 80_000);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   // ---------- the tracker's terminal (💧 drain) card ----------
   //
   // The live bug these close (2026-09-20, Lobby): the 💧 流動性枯竭 …停止追蹤 card
@@ -15212,7 +15291,12 @@ async function main() {
     );
     assert.match(String(second.note), /pin-skip 1/);
     assert.match(String(second.note), /repin 1/);
-    assert.deepEqual(repins, [{ token: "AAA", from: "pool-A", to: "p-AAA" }]);
+    // The re-pin carries the NEW pool's reading: a switch is a basis change,
+    // so the row is re-based on the pool it is now judged from (2026-10-31 —
+    // MINECAT quoted a dead pool's frozen $606.97K after moving pools).
+    assert.deepEqual(repins, [
+      { token: "AAA", from: "pool-A", to: "p-AAA", mcap: 111_000 },
+    ]);
     // The legacy row was CALIBRATED on pass 1 (rule 6) — one write, no card —
     // and is judged normally from the pass after that.
     assert.ok(
@@ -15275,6 +15359,58 @@ async function main() {
       1,
       "a cadence-deferred snapshot is still not repin evidence",
     );
+  });
+
+  await test("PushWatcher: a pool with no real liquidity cannot calibrate a row's series", async () => {
+    // WHY (2026-10-31, MINECAT): bots create pools at an arbitrary initial
+    // price and never trade them, so their quote never moves. Calibrating an
+    // unpinned row on one is not a one-pass error — the reading becomes the
+    // denominator (and the peak) of every later card. Live: 606,974 from a
+    // ~$0.5 pool on a coin whose real pool traded $87K that minute.
+    const rows = [watchRow("THIN", { poolAddress: null })];
+    const updated = [];
+    const db = watchDb(rows, updated);
+    const pairsFor = async (addrs) =>
+      new Map(
+        addrs.map((a) => [
+          a,
+          { ...watchPair(a), marketCap: 606_974, liquidity: { usd: 0.72 } },
+        ]),
+      );
+    const pw = new PushWatcher(
+      db, watchBot, null, loadConfig({}), pairsFor, null, null,
+    );
+    const out = await pw.runTick();
+    assert.equal(
+      db.calibrated.length,
+      0,
+      `a $0.72 pool is not a valuation: ${out.note}`,
+    );
+    assert.equal(
+      updated.some(([t]) => t === "THIN"),
+      false,
+      "and the row is not judged off it either",
+    );
+    assert.match(String(out.note), /unpin 1/, `the note must name the skip: ${out.note}`);
+
+    // The same reading WITH a real reserve calibrates as before (the gate is
+    // the pool, not the number's size).
+    const rows2 = [watchRow("THICK", { poolAddress: null })];
+    const updated2 = [];
+    const db2 = watchDb(rows2, updated2);
+    const pairsFor2 = async (addrs) =>
+      new Map(
+        addrs.map((a) => [
+          a,
+          { ...watchPair(a), marketCap: 30_000, liquidity: { usd: 9_900 } },
+        ]),
+      );
+    const pw2 = new PushWatcher(
+      db2, watchBot, null, loadConfig({}), pairsFor2, null, null,
+    );
+    const out2 = await pw2.runTick();
+    assert.equal(db2.calibrated.length, 1, `a real pool calibrates: ${out2.note}`);
+    assert.equal(db2.calibrated[0][1].mcap, 30_000);
   });
 
   await test("Db.push_watch pool pin: stored at enrollment, write-once by checks, re-pinned by CAS", async () => {

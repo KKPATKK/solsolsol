@@ -1200,6 +1200,25 @@ const LIQ_CRASH_MIN_LAST_USD = 5_000;
  */
 export const LIQ_FLOOR_USD = 10_000;
 /**
+ * The liquidity a pool must carry before its price may RE-BASE a row's series
+ * (the calibration write, and the same reading a confirmed pool switch lands).
+ *
+ * WHY (2026-10-31, MINECAT): an unpinned row is calibrated on its first
+ * DexScreener answer, and that answer need not be the coin's market. Pools
+ * with a fraction of a dollar of reserve are CREATED by bots at an arbitrary
+ * initial price and never trade, so their quoted price never moves: MINECAT's
+ * row took 606,974 from one of them (the main pumpswap pool traded $87K in the
+ * same minute and never exceeded $211.6K in its whole life), then quoted it on
+ * every card — `峰值 $606.97K`, `復活基準 $606.97K` — while the coin sat near
+ * $25K. The drain rule already refuses to JUDGE a pool under LIQ_FLOOR_USD;
+ * this is the same rule one step earlier, where the damage is permanent
+ * because the reading becomes the denominator of every later card.
+ *
+ * Set well under the narrowest chat floor (LIQ_FLOOR_USD) on purpose: this is
+ * not a tradeability gate, only "is there a market at this address at all".
+ */
+export const CALIBRATION_MIN_LIQUIDITY_USD = 1_000;
+/**
  * The persistent mark that records "one sub-floor reading has been seen" — the
  * first half of the drain rule's two-reading confirmation.
  *
@@ -4448,7 +4467,17 @@ export class PushWatcher {
      * batch names a new pool. Written as ONE batched CAS after the loop (see
      * Db.repinPushWatchPools) — a lookup that merely failed queues nothing.
      */
-    const repins: Array<{ token: string; from: string; to: string }> = [];
+    const repins: Array<{
+      token: string;
+      from: string;
+      to: string;
+      /**
+       * The new pool's reading, when it is a usable one. Present = the re-pin
+       * also RE-BASES the row's series on it (see Db.repinPushWatchPools);
+       * absent = the pin moves alone, the pre-2026-10-31 behaviour.
+       */
+      mcap?: number;
+    }> = [];
     let claimLost = 0;
     let budgetCut = false;
     /**
@@ -4758,7 +4787,31 @@ export class PushWatcher {
           const cand = pairs.get(row.token);
           const next = pinnablePoolAddress(cand);
           if (pinGone && next !== null && next !== pin) {
-            repins.push({ token: row.token, from: pin, to: next });
+            // THE RE-PIN IS A BASIS CHANGE (2026-10-31, MINECAT): a row's
+            // whole series — baseline, peak, trough, marks — belongs to ONE
+            // pool, and moving the pin while keeping those numbers is how a
+            // card ends up quoting a pool the coin left (a $0.5 pool's frozen
+            // price read $606.97K on a coin trading near $25K). So the new
+            // pool's own reading rides the re-pin and Db.repinPushWatchPools
+            // re-bases the row on it — one write, and the ladder restarts
+            // from the new market, exactly as the calibration does.
+            //
+            // Only a REAL reading qualifies: a thin pool's quote is not a
+            // valuation (CALIBRATION_MIN_LIQUIDITY_USD), and without one the
+            // pin moves alone so the row is not left judging the dead pool.
+            const repinMcap = Number(cand?.marketCap ?? NaN);
+            const repinLiquidity = cand?.liquidity?.usd ?? null;
+            const usable =
+              Number.isFinite(repinMcap) &&
+              repinMcap > 0 &&
+              repinLiquidity !== null &&
+              repinLiquidity >= CALIBRATION_MIN_LIQUIDITY_USD;
+            repins.push({
+              token: row.token,
+              from: pin,
+              to: next,
+              mcap: usable ? repinMcap : undefined,
+            });
           }
           continue;
         }
@@ -4811,6 +4864,20 @@ export class PushWatcher {
         const mcap = Number(pair.marketCap);
         const pool = pinnablePoolAddress(pair);
         if (!calibratedSource || !Number.isFinite(mcap) || mcap <= 0 || pool === null) {
+          unpinnedSkip += 1;
+          continue;
+        }
+        // A pool with no real reserve is not a valuation (see
+        // CALIBRATION_MIN_LIQUIDITY_USD): its price is whatever the bot that
+        // created it wrote, it never trades, and it never moves — so a
+        // calibration on it is not a bug for one pass, it is a permanent
+        // denominator. The row stays unpinned and is re-tried next pass
+        // (the standard "missing data never judges" direction).
+        const calibratingLiquidity = pair.liquidity?.usd ?? null;
+        if (
+          calibratingLiquidity === null ||
+          !(calibratingLiquidity >= CALIBRATION_MIN_LIQUIDITY_USD)
+        ) {
           unpinnedSkip += 1;
           continue;
         }
