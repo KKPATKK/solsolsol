@@ -1,6 +1,14 @@
 name = "solana-meme-bot"
 main = "src/worker.ts"
 compatibility_date = "2026-08-09"
+# NO [[d1_databases]] BLOCK HERE, ON PURPOSE (2026-10-31). The `database_id` is
+# an account resource, so CI injects the binding into the runner's own checkout
+# (scripts/d1-bind.js) right before it deploys. `env.DB` IS the store switch: a
+# deploy without it keeps running the same code against the frozen Turso
+# archive — silently, and re-pushing coins it already pushed. `npm run
+# deploy:worker` therefore refuses to run from a checkout without the binding
+# (scripts/deploy-guard.js); ship with a push to main or `gh workflow run
+# deploy.yml`, then check /health answers "dbStore": "d1".
 # global_fetch_strictly_public (2026-10-02): the cron deliveries (scan tick,
 # tracker pass, maintenance legs) now reach the placed fetch path through a
 # global fetch() to this Worker's OWN public URL (see [vars].CRON_RELAY_URL and

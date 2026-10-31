@@ -313,6 +313,98 @@ async function main() {
     );
   });
 
+  // ---- the deploy guard (a checkout without the binding cannot ship) -------
+  // WHY: on 2026-10-31 03:28Z `npm run deploy:worker` shipped a Worker with no
+  // `[[d1_databases]]` because this repo never commits the block — production
+  // silently dropped from D1 to the frozen Turso archive and looked fine in the
+  // terminal. The scripts now go through scripts/deploy-guard.js.
+  await test("deploy-guard: only a real `binding = \"DB\"` inside `[[d1_databases]]` passes", () => {
+    const guard = require("../scripts/deploy-guard.js");
+    const committed = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    assert.equal(
+      guard.hasD1Binding(committed),
+      false,
+      "the committed config has no binding — which is exactly why a plain deploy is unsafe",
+    );
+    const options = { binding: "DB", name: "solana-meme-bot", databaseId: "uuid-1" };
+    assert.equal(
+      guard.hasD1Binding(bind.applyBinding(committed, options)),
+      true,
+      "the shape CI injects must pass",
+    );
+    // The Worker reads `env.DB`; the table existing is not enough.
+    assert.equal(
+      guard.hasD1Binding(bind.applyBinding(committed, { ...options, binding: "OTHER" })),
+      false,
+      "a differently named binding is not the store switch",
+    );
+    // A commented-out table is a note, not a binding.
+    assert.equal(
+      guard.hasD1Binding(`${committed}\n# [[d1_databases]]\n# binding = "DB"\n`),
+      false,
+    );
+    // Nor does a `binding = \"DB\"` line from some OTHER table count.
+    assert.equal(
+      guard.hasD1Binding(`${committed}\n[[r2_buckets]]\nbinding = "DB"\n`),
+      false,
+    );
+  });
+
+  await test("deploy-guard: refuses by name (exit 1), and --print names the deploy instead", () => {
+    const { spawnSync } = require("node:child_process");
+    const guard = path.join(__dirname, "deploy-guard.js");
+    const run = (args) =>
+      spawnSync(process.execPath, [guard, ...args], { encoding: "utf8" });
+
+    // A config with no binding: the process must refuse BEFORE wrangler can run
+    // (a temp file, so the answer does not depend on this checkout's state).
+    const bare = path.join(os.tmpdir(), `guard-bare-${process.pid}-${Date.now()}.toml`);
+    const injected = path.join(os.tmpdir(), `guard-bound-${process.pid}-${Date.now()}.toml`);
+    const committed = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    fs.writeFileSync(bare, committed);
+    fs.writeFileSync(
+      injected,
+      bind.applyBinding(committed, {
+        binding: "DB",
+        name: "solana-meme-bot",
+        databaseId: "uuid-1",
+      }),
+    );
+    try {
+      const refused = run(["--file", bare]);
+      assert.equal(refused.status, 1, "a checkout without the binding must not deploy");
+      assert.match(refused.stderr, /\[\[d1_databases\]\]/);
+      assert.match(refused.stderr, /deploy\.yml/, "the refusal names the documented path");
+      assert.match(refused.stderr, /dbStore/, "and the reading that proves the store");
+      assert.equal(refused.stdout, "", "nothing was launched — the refusal is before wrangler");
+
+      const shown = run(["--file", injected, "--print"]);
+      assert.equal(shown.status, 0, `the injected config must pass: ${shown.stderr}`);
+      assert.match(shown.stdout, /wrangler[/\\]bin[/\\]wrangler\.js deploy --config/);
+    } finally {
+      fs.unlinkSync(bare);
+      fs.unlinkSync(injected);
+    }
+  });
+
+  await test("deploy-guard: the package scripts cannot reach wrangler deploy directly", () => {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"),
+    );
+    for (const name of ["deploy:worker", "deploy:env"]) {
+      assert.match(
+        pkg.scripts[name],
+        /scripts\/deploy-guard\.js/,
+        `${name} must run through the guard`,
+      );
+      assert.equal(
+        /wrangler/.test(pkg.scripts[name]),
+        false,
+        `${name} must not call wrangler itself — that is the deployment that lost env.DB`,
+      );
+    }
+  });
+
   // ---- the SQL the copy builds ---------------------------------------------
   await test("insertStatement: upsert names the key; ignore never overwrites", async () => {
     const tables = await introspect();
@@ -882,8 +974,16 @@ async function main() {
     // repository (see scripts/d1-bind.js), and a committed one would bind every
     // local deploy to someone else's database.
     assert.equal(/^\s*database_id\s*=/m.test(readWorkflow("deploy.yml")), false);
-    assert.equal(/d1_databases/.test(fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8")), false,
-      "wrangler.toml must not carry a committed D1 binding — CI injects it");
+    // Parsed, not text-matched: the config's own header now explains the
+    // missing block by name (2026-10-31), and a note about a binding is not a
+    // binding. What must be absent is `env.DB` in the deployed Worker.
+    assert.equal(
+      require("../scripts/deploy-guard.js").hasD1Binding(
+        fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8"),
+      ),
+      false,
+      "wrangler.toml must not carry a committed D1 binding — CI injects it",
+    );
   });
 
   await test("the CI writers target D1, and archive credentials reach only the read-only copy", () => {
