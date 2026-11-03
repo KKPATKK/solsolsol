@@ -331,6 +331,76 @@ class_name = "TickClock"
 tag = "v1"
 new_sqlite_classes = ["TickClock"]
 
+# ---------------------------------------------------------------------------
+# DEX EGRESS RELAY (2026-11-03) — a SECOND egress for pair batches the direct
+# one was refused on. The class is a place to stand, not a state machine: no
+# storage, no alarm, no cron. Its whole value is WHERE Cloudflare runs it.
+#
+# WHY. /debug/dex429 carried 56K refusals with ~50/hour live, all charged to
+# the shared egress IP behind this Worker's placement. A zero-cost probe
+# (experiments/dex-egress) measured the refusal to be PER COLO, not per host,
+# cache-busted so every reading was a real origin MISS (2026-11-03
+# 00:53-00:56Z):
+#
+#   DFW (this Worker's placement)      0/10  200, 5ms, Retry-After 44
+#   LAX (unplaced probe)              10/10  200, 619ms
+#   CDG (weur hint)                   10/10  200, 680ms
+#   ICN (apac hint)                   10/10  200, 718ms
+#   MRS (weur hint, sustained 30s)    30/30  200, 622ms
+#   SJC (wnam hint)                    0/10  200, 5ms, Retry-After 34
+#
+# Same minute, same endpoint, same URLs. A Durable Object's `locationHint` is
+# the one Cloudflare lever that moves a SUBREQUEST's egress without a new host,
+# an API key or a paid plan — `cf-placement` is a response diagnostic, regional
+# services explicitly do not cover subrequests, and no fetch option can pin an
+# egress colo.
+#
+# WHAT IT DOES: src/dexscreener.ts asks its `relayPairBatch` hook (built in
+# src/worker.ts dexEgressRelay) ONCE when a pair batch comes back 429. The hook
+# tries `weur`, then `apac`, and a 2xx is served exactly like a direct one (the
+# pair cache learns the rows; the 90s block is NOT armed, because the lane was
+# not left without an answer). A failed arm is cooled for a minute or its own
+# Retry-After. The list lanes are deliberately NOT relayed: their ledger and
+# backoff rules are separate and their bodies are edge-cached anyway.
+#
+# WHAT IT IS NOT: `locationHint` is BEST EFFORT (the probe watched a wnam
+# object answer from SJC once and LAX the next time), and the pool on the other
+# side is shared with the rest of the fleet and moves minute to minute. This
+# turns "this tick has no Dex data at all" into "this tick probably has it" —
+# it is a lottery ticket, not the deterministic fix (a relay on an IP the bot
+# owns). Its business case is the liquidity floor: gateLiquidityUsd fails OPEN
+# on a Jupiter pair, so a refused Dex lane silently disables the $10K floor.
+#
+# COST: one Durable Object request per RELAYED batch — i.e. per pair batch the
+# direct egress refused, so the price moves with the episode, not with the
+# clock. Sizing it from the live pair lane: ~200 addresses a tick against a
+# 180s pair cache means only the rotation's misses reach the wire (~130
+# batches/hour), so even a month in which EVERY batch was refused and relayed
+# is ~100K Durable Object requests against the free plan's 1M — plus the Dex
+# request the direct path was going to make anyway. Included on Free and Paid;
+# REACTIONS to an absorbed refusal are skipped on purpose (no 90s block, no
+# widened spacing), which is what lets the lane keep moving at that rate.
+#
+# READ IT: /health.dex.relayAttempts (direct pair refusals while the relay is
+# bound), relayServed (share absorbed), relayFailed, relayServedByArm (which
+# hint actually landed) and lastRelayArm.
+#
+# SWITCH: DEX_EGRESS_FALLBACK in [vars] — "0" turns the path off with no code
+# change. Deleting the binding from an older deployment is the same "absent"
+# read, but do NOT delete this block from THIS file: a migration tag cannot be
+# reused, and removing a class needs its own `deleted_classes` migration.
+[[durable_objects.bindings]]
+name = "DEX_EGRESS"
+class_name = "DexEgressRelay"
+
+# The relay's class migration. `new_sqlite_classes` for the same reason v1 used
+# it (SQLite-backed is the current default and the cheaper storage billing);
+# the class stores nothing, so this entry costs nothing by itself. Tags are
+# append-only: never edit or re-tag v1/v2, a future class adds v3.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["DexEgressRelay"]
+
 # Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
 # TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY, COINGECKO_API_KEY) must NOT
 # live here — set them in the Cloudflare dashboard (Workers > solana-meme-bot >
@@ -365,6 +435,13 @@ new_sqlite_classes = ["TickClock"]
 # one. The relay is also what makes the fetch path's placement buy anything
 # for the CRON WORK (before it, placement only accelerated HTTP reads).
 CRON_RELAY_URL = "https://solana-meme-bot.cool1999k.workers.dev"
+# The pair lane's SECOND EGRESS (see the DEX_EGRESS block above): "1" (or any
+# value other than "0"/"false") enables the 429 fallback, "0" disables it with
+# no code change (the value rides the next deploy like any other var). It only
+# fires when a pair batch is refused, so a healthy tick
+# never touches it; with the binding absent the switch is moot and the client
+# behaves exactly as it did before 2026-11-03.
+DEX_EGRESS_FALLBACK = "1"
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one COMPLETED less
 # than `scanGateMs(this)` ago — this value minus a jitter budget, cross-isolate

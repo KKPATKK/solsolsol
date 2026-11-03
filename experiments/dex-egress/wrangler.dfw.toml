@@ -1,0 +1,22 @@
+# The SAME probe, placed like production: `[placement] region = "gcp:us-south1"`
+# is the pointer wrangler.toml uses for the real Worker (it lands the fetch path
+# in DFW, next to the D1 primary). Deploying this second script is the only way
+# to compare production's actual egress pool against the DO-hinted regions in
+# the same minute — a probe started from the sandbox otherwise runs at LAX.
+#
+# Everything else is identical to wrangler.toml; `main` and the DO class are
+# shared. Free plan: separate script, same source.
+name = "dex-egress-probe-dfw"
+main = "worker.mjs"
+compatibility_date = "2026-08-09"
+
+[placement]
+region = "gcp:us-south1"
+
+[[durable_objects.bindings]]
+name = "EGRESS"
+class_name = "EgressProbe"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["EgressProbe"]

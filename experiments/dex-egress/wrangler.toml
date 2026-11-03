@@ -1,0 +1,25 @@
+# A THROWAWAY Worker, not part of the bot: it measures which Cloudflare egress
+# a DexScreener request leaves from, and whether that egress is 429-bucketed.
+# It has its own name and its own config, so deploying it can never touch
+# `solana-meme-bot` (always pass --config experiments/dex-egress/wrangler.toml).
+#
+# WHY IT EXISTS. `cf-placement` is an OUTPUT header (remote-LHR / local-EWR),
+# not a request option, and Cloudflare documents no way to pin a Worker's
+# subrequest egress to a colo. Regional Services explicitly excludes
+# subrequests. The only lever left is a Durable Object's locationHint, which
+# is best-effort and lands the object "in a data center selected to minimize
+# latency from the hinted location" — so the probe creates one object per
+# hinted region and reads back the egress IP + colo, plus the Dex status.
+name = "dex-egress-probe"
+main = "worker.mjs"
+compatibility_date = "2026-08-09"
+
+# One class, used only for its locationHint. SQLite-backed because that is
+# the only backend available on the Workers Free plan (error 10097 otherwise).
+[[durable_objects.bindings]]
+name = "EGRESS"
+class_name = "EgressProbe"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["EgressProbe"]

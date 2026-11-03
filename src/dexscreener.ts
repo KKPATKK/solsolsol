@@ -4,6 +4,10 @@ import {
   noteProfileCadenceSkip,
   noteProfileFeed,
 } from "./deferredmakeup";
+import {
+  DEX_EGRESS_MAX_TIMEOUT_MS,
+  DEX_EGRESS_MIN_TIMEOUT_MS,
+} from "./dexegress";
 
 const BASE_URL = "https://api.dexscreener.com";
 
@@ -1564,6 +1568,16 @@ export const DEX_429_RECORD_MIN_GAP_MS = PAIR_BATCH_BACKOFF_MS;
 const PAIR_BATCH_CONCURRENCY = 3;
 
 /**
+ * How much of the caller's window a RELAYED retry must have left to be worth
+ * starting (see relayPairBatch). The relay is a Durable Object hop plus a real
+ * origin round trip — 512-737ms measured for the origin leg alone on
+ * 2026-11-03 — so a window under a second is a window the request cannot land
+ * in. The caller's own fallback (Jupiter) is the better answer there, and it
+ * costs nothing to let the 429 branch run.
+ */
+const DEX_RELAY_MIN_HEADROOM_MS = 1_000;
+
+/**
  * Telemetry hooks so the worker can persist rate-limit events cross-isolate:
  * the client itself has no DB handle, and a 429 arms a 90s cache-only backoff
  * that must be visible from any isolate serving /health, not just the one
@@ -1595,6 +1609,27 @@ export interface DexScreenerHooks {
    * is the deferral's own switch.
    */
   holdForTick?: (promise: Promise<unknown>) => void;
+  /**
+   * A SECOND EGRESS for a pair batch the direct egress just refused (429).
+   *
+   * WHY A HOOK, NOT A CLIENT FEATURE (2026-11-03): the one lever that moves a
+   * Worker's subrequest egress is a Durable Object's `locationHint`, and the
+   * binding that reaches it lives in the WORKER — the client has no env, by
+   * design (the Node container and the offline tests construct it standalone).
+   * The hook is therefore the seam: the worker owns the object, the client owns
+   * the decision and the accounting. A caller without one (tests, the Node
+   * container, a deployment without the binding) behaves exactly as before.
+   *
+   * CONTRACT: return the relayed response (2xx only — a refused or failed
+   * relay is `null`), the arm that answered (for /health), and never throw.
+   * The client hands in the ABSOLUTE url to fetch and the millisecond budget
+   * the relay must stay inside, already clamped to the caller's own window.
+   */
+  relayPairBatch?: (
+    url: string,
+    timeoutMs: number,
+    signal: AbortSignal,
+  ) => Promise<{ response: Response; arm: string } | null>;
 }
 
 /**
@@ -1827,6 +1862,21 @@ export class DexScreenerClient {
    */
   private pairCacheHits = 0;
   private pairCacheMisses = 0;
+  /**
+   * THE SECOND EGRESS's ledger (see relayPairBatch / src/dexegress.ts).
+   * `relayAttempts` is also the direct egress's pair-refusal count while the
+   * relay is bound — every attempt exists because a 429 came back — and
+   * `relayServed` against it is the share of the pair lane running on another
+   * data center. `relayFailed` is the reading that says the fallback is not
+   * earning its keep (each arm is cooled after a failure, so a dead relay
+   * costs one attempt per minute, not one per batch).
+   */
+  private relayAttempts = 0;
+  private relayServed = 0;
+  private relayFailed = 0;
+  private relayServedByArm: Record<string, number> = {};
+  private lastRelayArm: string | null = null;
+  private lastRelayAt: number | null = null;
   private pairCacheRefused = 0;
   private lastPairCacheStatus: string | null = null;
   // The list-feed edge-cache ledger is MODULE state (see the ledger beside
@@ -2054,6 +2104,28 @@ export class DexScreenerClient {
      * a 2xx, `HTTP-<code>` when the origin refused, null while no pair fetch
      * has run in this isolate. */
     lastPairCacheStatus: string | null;
+    /** Pair batches the DIRECT egress refused and the SECOND one was asked to
+     * answer (see relayPairBatch). With the relay bound this IS the pair
+     * lane's direct-refusal count: every attempt is one 429 by construction.
+     * Compare it with `relayServed`: equal = every refusal was absorbed. */
+    relayAttempts: number;
+    /** Those the relay DID answer (2xx) — the share of the pair lane running
+     * on another data center. A relayed batch is served normally: the pair
+     * cache learns the rows and the 90s block is not armed. */
+    relayServed: number;
+    /** Relayed attempts that came back refused, failed or out of time (every
+     * arm failed). A rising count beside a flat `relayServed` is a fallback
+     * that is not earning its keep; the arms are cooled after each failure. */
+    relayFailed: number;
+    /** `relayServed` split by the object that answered (`weur` / `apac`) — the
+     * reading that says WHICH second egress is actually live, because the
+     * location hint is best effort. */
+    relayServedByArm: Record<string, number>;
+    /** The arm that served the most recent relayed batch, or null while none
+     * has served in this isolate. */
+    lastRelayArm: string | null;
+    /** When that was, or null while none has. */
+    lastRelayAt: number | null;
     /** Attempts never SENT because the caller's window was already spent (the
      * throttle queue ate it) — the reading that separates "refused" from
      * "never asked". */
@@ -2126,6 +2198,12 @@ export class DexScreenerClient {
       pairCacheMisses: this.pairCacheMisses,
       pairCacheRefused: this.pairCacheRefused,
       lastPairCacheStatus: this.lastPairCacheStatus,
+      relayAttempts: this.relayAttempts,
+      relayServed: this.relayServed,
+      relayFailed: this.relayFailed,
+      relayServedByArm: { ...this.relayServedByArm },
+      lastRelayArm: this.lastRelayArm,
+      lastRelayAt: this.lastRelayAt,
       budgetDrops: this.budgetDrops,
       lastDroppedAt: this.lastDroppedAt,
       dropsByLeg: { ...this.dropsByLeg },
@@ -2178,6 +2256,104 @@ export class DexScreenerClient {
     this.dropsByLeg[leg] += 1;
     this.lastDropLeg = leg;
     this.lastDroppedAt = Date.now();
+  }
+
+  /**
+   * Retry ONE refused pair batch through the second egress (see
+   * DexScreenerHooks.relayPairBatch and src/dexegress.ts).
+   *
+   * NULL IS THE ORDINARY PATH. It means the relay could not help — unbound,
+   * disabled, no headroom left in the caller's window, or every arm failed —
+   * and the caller then runs the 429 branch it always ran. That is deliberate:
+   * a missing binding, a switched-off relay and a dead relay are ONE shape, so
+   * the pre-2026-11-03 behaviour is never more than a var away.
+   *
+   * THE HEADROOM RULE (see DEX_RELAY_MIN_HEADROOM_MS): a relayed attempt costs
+   * a Durable Object hop plus a real origin round trip, so it is only started
+   * when the caller's window can still hold one. The timeout handed to the
+   * relay is the remaining window minus a margin, so the object's own abort
+   * cannot outlive the invocation waiting on it.
+   *
+   * THE LOCAL THROTTLE IS DELIBERATELY NOT USED: its spacing prices THIS
+   * colo's shared bucket (see AdaptiveSpacing), and the relayed request never
+   * touches that bucket — charging the queue for it would slow the direct
+   * attempts that are still the healthy path's only path. The batch loop's own
+   * concurrency (PAIR_BATCH_CONCURRENCY) and the caller's deadline are what
+   * bound it.
+   *
+   * A RELAYED 2xx IS A SERVED BATCH — `relayAttempts` still counts the direct
+   * egress's refusal (every attempt is one by construction), but the caller
+   * sees data, so no block is armed and the next batch is not discouraged.
+   */
+  private async relayPairBatch(
+    url: string,
+    deadline: number | undefined,
+    callerSignal: AbortSignal | undefined,
+  ): Promise<Response | null> {
+    const relay = this.hooks.relayPairBatch;
+    if (!relay) return null;
+    const remaining =
+      deadline === undefined ? DEX_EGRESS_MAX_TIMEOUT_MS : deadline - Date.now();
+    if (remaining < DEX_RELAY_MIN_HEADROOM_MS) return null;
+    const timeoutMs = Math.max(
+      DEX_EGRESS_MIN_TIMEOUT_MS,
+      Math.min(DEX_EGRESS_MAX_TIMEOUT_MS, remaining - 150),
+    );
+    this.relayAttempts += 1;
+    try {
+      const served = await relay(
+        url,
+        timeoutMs,
+        combineAbortSignals(callerSignal, AbortSignal.timeout(timeoutMs)),
+      );
+      if (served === null || !served.response.ok) {
+        this.relayFailed += 1;
+        return null;
+      }
+      this.relayServed += 1;
+      this.noteRelayedRefusal();
+      this.relayServedByArm[served.arm] =
+        (this.relayServedByArm[served.arm] ?? 0) + 1;
+      this.lastRelayArm = served.arm;
+      this.lastRelayAt = Date.now();
+      return served.response;
+    } catch {
+      // The worker's factory already turns its own failures into null; this is
+      // the last line of defence for a hook that throws anyway. A relayed
+      // batch must never be able to fail the caller's fetch.
+      this.relayFailed += 1;
+      return null;
+    }
+  }
+
+  /**
+   * Record a refusal the SECOND egress absorbed (see relayPairBatch).
+   *
+   * WHY THIS EXISTS: `/debug/dex429` is the one cross-isolate record of "this
+   * Worker's egress IP is being refused", and it must keep saying so while the
+   * relay is carrying the lane — a ring that quietly went flat would read as
+   * "DFW recovered" at exactly the moment it stopped answering. So the
+   * counter, the timestamp and the fleet ring move here.
+   *
+   * WHY IT IS NOT note429: that method also arms the 90s cache-only block and
+   * widens the spacing. Those are REACTIONS to a batch that was left without
+   * an answer, and this one was not left without one — it was served by
+   * another colo. Arming the block would then throw away the very path that
+   * just worked for the next 90s (the pair lane returns cache-only while it is
+   * armed). The ring is a reading; the block is a decision, and they part
+   * company exactly here.
+   */
+  private noteRelayedRefusal(): void {
+    const now = Date.now();
+    this.http429Total += 1;
+    this.last429At = now;
+    if (now - this.last429RecordedAt < DEX_429_RECORD_MIN_GAP_MS) return;
+    this.last429RecordedAt = now;
+    try {
+      this.hooks.onBatch429?.(now);
+    } catch {
+      // telemetry only — never fail a request over a counter write
+    }
   }
 
   /**
@@ -2344,6 +2520,16 @@ export class DexScreenerClient {
    * 400/500 is kept out of the cache by `cacheTtlByStatus`, so nothing bad can
    * be served as if it were fresh. The outcome is counted on the LANE's own
    * ledger (see the `pairLane` split below).
+   *
+   * THE SECOND EGRESS (2026-11-03): a PAIR batch answered 429 is retried ONCE
+   * through `relayPairBatch` (see src/dexegress.ts) before the refusal branch
+   * runs. A 2xx from the relay is treated as the served response — the batch
+   * did get its data, the pair cache learns it, and the 90s block is not armed
+   * (the lane was not left without an answer). A null from the relay changes
+   * nothing: the 429 branch below runs exactly as it always did, so a missing
+   * binding, a disabled relay and a dead arm are all the pre-2026-11-03 shape.
+   * Only the pair lane is relayed; the list lanes keep their own ledger and
+   * backoff rules untouched.
    */
   private async getJson(
     path: string,
@@ -2367,6 +2553,7 @@ export class DexScreenerClient {
     callerSignal?: AbortSignal,
   ): Promise<unknown> {
     let lastError: unknown;
+    const fullUrl = `${BASE_URL}${path}`;
     for (let attempt = 1; attempt <= 3; attempt++) {
       // Nobody is waiting any more: this attempt was never sent, and it must
       // not spend the caller's window retrying a read that has been abandoned.
@@ -2399,7 +2586,7 @@ export class DexScreenerClient {
         // Throttle.run): the throttle WAIT is raced against it, so an attempt
         // the queue cannot reach in time comes back `null` without ever being
         // dispatched, however deep the backlog behind it is.
-        const res = await this.throttle.run(async () => {
+        let res = await this.throttle.run(async () => {
           // COUNT THE THROTTLE WAIT AGAINST THE CALLER'S DEADLINE (2026-09-25).
           // `remaining` above was computed BEFORE the queue, and the throttle
           // can hold this attempt far longer than that — the request was then
@@ -2453,7 +2640,7 @@ export class DexScreenerClient {
               },
             };
           }
-          return fetch(`${BASE_URL}${path}`, init);
+          return fetch(fullUrl, init);
         }, deadline, callerSignal);
         // A throttled-away attempt (the window closed while it queued, or the
         // queue could not reach it in time — see Throttle.run) is a budget
@@ -2473,7 +2660,30 @@ export class DexScreenerClient {
         // edge-cache branch rather than inside it.
         const lane = dexFeedLeg(path);
         const pairLane = lane === "pairs";
-        if (edgeCacheTtlS !== undefined) {
+        // THE SECOND EGRESS (see relayPairBatch and src/dexegress.ts): the
+        // refusal is this COLO's pool, not DexScreener's answer — the probe
+        // measured 0/10 at DFW while LAX/CDG/ICN/MRS answered 100% in the same
+        // minute. One hop to another data center can therefore turn a refusal
+        // into the batch's data. A null answer means the relay could not help
+        // (unbound, disabled, no headroom, every arm failed) and the ordinary
+        // 429 handling below runs untouched.
+        let viaRelay = false;
+        if (pairLane && res.status === 429 && this.hooks.relayPairBatch) {
+          const relayed = await this.relayPairBatch(
+            fullUrl,
+            deadline,
+            callerSignal,
+          );
+          if (relayed !== null) {
+            res = relayed;
+            viaRelay = true;
+          }
+        }
+        // A relayed response carries no `cf-cache-status` of OUR colo's cache
+        // (it was served by another one), so it stays out of the edge-cache
+        // ratio: counting it as a miss would move the very reading that
+        // decides PAIR_BATCH_CACHE_TTL_S. The relay has its own counters.
+        if (edgeCacheTtlS !== undefined && !viaRelay) {
           if (res.ok) {
             // ONE place counts a list outcome and one place decides what a hit
             // is (see the ledger): a second inline regex here is how the durable

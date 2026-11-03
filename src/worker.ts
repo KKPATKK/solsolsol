@@ -66,12 +66,26 @@ import {
 } from "./dblatency";
 import {
   DexScreenerClient,
+  type DexScreenerHooks,
   type PairInfo,
   DEX_LIST_CACHE_HITS_KEY,
   DEX_LIST_CACHE_LAST_KEY,
   DEX_LIST_CACHE_MISSES_KEY,
   DEX_LIST_CACHE_REFUSED_KEY,
 } from "./dexscreener";
+import {
+  DEX_EGRESS_ARMS,
+  DEX_EGRESS_ORIGIN,
+  DEX_EGRESS_PATH,
+  DEX_EGRESS_TIMEOUT_HEADER,
+  DEX_EGRESS_URL_HEADER,
+  DexEgressRelay,
+} from "./dexegress";
+// wrangler.toml's `[[durable_objects.bindings]] class_name` is a contract on
+// the ENTRY module's exports, so the class imported above is re-exported here.
+// (esbuild bundles the class body from src/dexegress.ts; only the name matters
+// to the runtime and to the migration that created it.)
+export { DexEgressRelay };
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import {
@@ -4798,6 +4812,12 @@ async function ensureInitialized(env: Env): Promise<void> {
         }
         void promise;
       },
+      // THE SECOND EGRESS (2026-11-03): a pair batch this egress was refused
+      // on is retried from a Durable Object placed in weur/apac — the probe's
+      // 0/10 at DFW versus 100% elsewhere, turned into a production fallback.
+      // `undefined` whenever the binding is absent or DEX_EGRESS_FALLBACK is
+      // "0", which leaves the client byte-identical to its previous shape.
+      relayPairBatch: dexEgressRelay(env),
     });
     if (config.telegramBotToken) {
       birdeye = null;
@@ -7178,7 +7198,13 @@ interface DurableObjectStubLike {
 }
 interface DurableObjectNamespaceLike {
   idFromName(name: string): unknown;
-  get(id: unknown): DurableObjectStubLike;
+  /**
+   * `locationHint` is the ONE lever that moves a Durable Object — and with it
+   * its subrequests' egress — to another data center (see src/dexegress.ts).
+   * Best effort, and only honoured when the object is first created; the
+   * optional argument keeps TickClock's existing call shape valid.
+   */
+  get(id: unknown, options?: { locationHint?: string }): DurableObjectStubLike;
 }
 
 /** The clock's single instance: one alarm loop, one cadence. */
@@ -7252,6 +7278,119 @@ function tickClockBinding(env: Env): DurableObjectNamespaceLike | null {
   return ns && typeof ns.idFromName === "function" && typeof ns.get === "function"
     ? ns
     : null;
+}
+
+/**
+ * The relay's binding out of the env — the same cast, for the same reason as
+ * tickClockBinding above: Env's index signature is what keeps it assignable to
+ * NodeJS.ProcessEnv, and a DurableObjectNamespace is not a string. A deploy
+ * without the binding (an older version, a local run) reads as null and the
+ * fallback is simply off.
+ */
+function dexEgressBinding(env: Env): DurableObjectNamespaceLike | null {
+  const ns = (env as unknown as { DEX_EGRESS?: DurableObjectNamespaceLike })
+    .DEX_EGRESS;
+  return ns && typeof ns.idFromName === "function" && typeof ns.get === "function"
+    ? ns
+    : null;
+}
+
+/**
+ * How long an arm that just failed is skipped, ms — the fallback's own circuit
+ * breaker (see the factory below). Without it a dead or refused arm would be
+ * asked once per batch (the pair lane dispatches up to three at a time), and
+ * every ask is a Durable Object request the tick waits on.
+ */
+const DEX_RELAY_ARM_COOLDOWN_MS = 60_000;
+/**
+ * The ceiling for an arm's cool-down when DexScreener names its own: the
+ * refusal carries `Retry-After`, measured 34-44s on 2026-11-03, and a pool
+ * that says 120 means 120. Capped so a nonsense header cannot park an arm for
+ * a day.
+ */
+const DEX_RELAY_ARM_MAX_COOLDOWN_MS = 300_000;
+/** Per-isolate arm cool-downs. Isolates churn (~30s), which is the right
+ * lifetime for this reading: a new isolate SHOULD re-probe both arms, because
+ * the pool on the other side moves on a minute scale. */
+const dexRelayCooldownUntil = new Map<string, number>();
+
+/**
+ * THE SECOND EGRESS (2026-11-03). Builds the client's `relayPairBatch` hook on
+ * top of the `DEX_EGRESS` Durable Object namespace: a pair batch refused by
+ * THIS Worker's egress is fetched again from a Durable Object placed (best
+ * effort) in `weur`, then `apac`.
+ *
+ * WHY THIS SHAPE: the Durable Object is the only Cloudflare primitive that
+ * moves a subrequest's egress to another data center without a new host, and
+ * the probe measured the refusal to be per-colo rather than per-host (DFW
+ * 0/10 while LAX/CDG/ICN/MRS answered 100% in the same minute — see
+ * src/dexegress.ts). It is a LOTTERY TICKET, not a guarantee: `locationHint`
+ * is best effort and the pool is shared with the rest of the fleet.
+ *
+ * THE COOL-DOWN IS THE COST CONTROL FOR A DEAD ARM. A refused or failed arm is
+ * skipped for a minute (or its own `Retry-After`), so a fallen-over arm cannot
+ * be asked once per batch — it costs one probe per minute. A WORKING arm is
+ * not cooled: every refused batch is relayed, which is the point (~130
+ * batches/hour at the live pair lane's rotation and 180s cache, i.e. ~100K
+ * Durable Object requests in a month where every batch was refused). The
+ * client's own headroom rule (DEX_RELAY_MIN_HEADROOM_MS) stops either shape
+ * from spending a tick's last moments on a hop that cannot land.
+ *
+ * SWITCH: `DEX_EGRESS_FALLBACK = "0"` turns the whole path off without a CODE
+ * change (the value still ships with the next deploy — the client then behaves
+ * exactly as it did before this entry); deleting the binding does the same
+ * from the other side, and the code reads both as `undefined`.
+ */
+function dexEgressRelay(env: Env): DexScreenerHooks["relayPairBatch"] {
+  if (env.DEX_EGRESS_FALLBACK === "0" || env.DEX_EGRESS_FALLBACK === "false") {
+    return undefined;
+  }
+  const ns = dexEgressBinding(env);
+  if (!ns) return undefined;
+  return async (url, timeoutMs, signal) => {
+    for (const arm of DEX_EGRESS_ARMS) {
+      if ((dexRelayCooldownUntil.get(arm) ?? 0) > Date.now()) continue;
+      try {
+        // One object per arm, named — NOT a fresh name per attempt: the hint
+        // only lands when the object is created, so a rotating name would
+        // re-roll the location on every retry instead of pinning the second
+        // egress this arm exists to provide.
+        const stub = ns.get(ns.idFromName(`dex-egress-${arm}`), {
+          locationHint: arm,
+        });
+        const response = await stub.fetch(`${DEX_EGRESS_ORIGIN}${DEX_EGRESS_PATH}`, {
+          method: "GET",
+          headers: {
+            [DEX_EGRESS_URL_HEADER]: url,
+            [DEX_EGRESS_TIMEOUT_HEADER]: String(timeoutMs),
+          },
+          signal,
+        });
+        if (response.ok) return { response, arm };
+        // A refusal here is THIS ARM's pool refusing, not the direct egress's:
+        // honour the upstream's own window when it names one. The body is not
+        // read, so it is cancelled rather than left for the runtime to clean
+        // up after the invocation.
+        void response.body?.cancel().catch(() => undefined);
+        const retryAfterS = Number(response.headers.get("retry-after"));
+        dexRelayCooldownUntil.set(
+          arm,
+          Date.now() +
+            (Number.isFinite(retryAfterS) && retryAfterS > 0
+              ? Math.min(
+                  DEX_RELAY_ARM_MAX_COOLDOWN_MS,
+                  Math.round(retryAfterS * 1000),
+                )
+              : DEX_RELAY_ARM_COOLDOWN_MS),
+        );
+      } catch {
+        // A transport error or an aborted hop says nothing about DexScreener;
+        // cool the arm briefly and let the next one answer.
+        dexRelayCooldownUntil.set(arm, Date.now() + DEX_RELAY_ARM_COOLDOWN_MS);
+      }
+    }
+    return null;
+  };
 }
 
 /**
