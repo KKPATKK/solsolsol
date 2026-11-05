@@ -78,6 +78,7 @@ import {
   DEX_EGRESS_ORIGIN,
   DEX_EGRESS_PATH,
   DEX_EGRESS_TIMEOUT_HEADER,
+  DEX_EGRESS_UA_HEADER,
   DEX_EGRESS_URL_HEADER,
   DexEgressRelay,
 } from "./dexegress";
@@ -86,6 +87,16 @@ import {
 // (esbuild bundles the class body from src/dexegress.ts; only the name matters
 // to the runtime and to the migration that created it.)
 export { DexEgressRelay };
+import {
+  PUMPPORTAL_FEED_NAME,
+  PUMPPORTAL_ORIGIN,
+  PUMPPORTAL_STATUS_PATH,
+  PumpPortalFeed,
+  pumpPortalReader,
+} from "./pumpportal";
+// Same contract as DexEgressRelay above: wrangler.toml's v3 migration names
+// this class, and the runtime resolves it from the ENTRY module's exports.
+export { PumpPortalFeed };
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import {
@@ -145,6 +156,7 @@ import { MeteoraClient } from "./meteora";
 import { RaydiumLaunchClient } from "./raydiumlaunch";
 import {
   GeckoTerminalClient,
+  type GeckoTerminalHooks,
   GECKO_ALT_BASE_URL,
   GECKO_CACHE_TTL_S,
   GECKO_USER_AGENT,
@@ -4956,13 +4968,13 @@ async function ensureInitialized(env: Env): Promise<void> {
           // 2026-09-28 (PUMPFUN_PROFILE_LIMIT=50 since 2026-10-18), on every
           // tick; best-effort,
           // a blocked/degraded feed returns [].
-          new PumpFunClient(config),
+          new PumpFunClient(config, pumpPortalReader(env)),
           // GeckoTerminal new-pools discovery — keyed (COINGECKO_API_KEY) and
           // therefore a 5-MINUTE leg, covers every Solana DEX incl. pump.fun
           // graduates; best-effort — blocked or degraded feeds return [] and
           // the scan continues on the others (see the cadence gate + the
           // launch-slot chain in src/scanner.ts).
-          new GeckoTerminalClient(config),
+          new GeckoTerminalClient(config, { relayFetch: geckoEgressRelay(env) }),
           // Jupiter Token v2 discovery — recent launchpad launches (the
           // pump.fun frontend-api replacement) + 24h trending (null when
           // both feed limits are 0).
@@ -7394,6 +7406,81 @@ function dexEgressRelay(env: Env): DexScreenerHooks["relayPairBatch"] {
 }
 
 /**
+ * Gecko's own cool-down map. SEPARATE from the pair lane's on purpose: the two
+ * services share the relay's arms but not their refusals, so a dead arm for
+ * DexScreener must not park gecko behind it (and vice versa).
+ */
+const geckoRelayCooldownUntil = new Map<string, number>();
+
+/**
+ * THE SECOND EGRESS FOR GECKO (2026-11-05). The same object, the same arms and
+ * the same contract as dexEgressRelay above; the difference is the caller and
+ * the refusal being absorbed. `/debug/gecko-key` measured every variant —
+ * configured demo key, keyless, pro parameter — answering 429 on all three
+ * hosts from this Worker's egress, which is the per-colo shape the relay was
+ * built for, not a key problem (a key cannot fix an IP the origin refuses).
+ *
+ * WHAT IT CHANGES ON A TICK: a 429/403/5xx from the primary is retried once
+ * through `weur`, then `apac`; a 200 there is served exactly like a direct one
+ * and the 429 pause is NOT armed (src/geckoterminal.ts attempt). The old
+ * all-429 shape therefore stops costing a 5-minute pause per attempt — it
+ * costs one relay hop and a success.
+ *
+ * COST: one DO request per refused gecko call. The discovery leg is capped at
+ * one call per 5 minutes (GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS), so even a
+ * wall in which every call was refused is ~8.6K DO requests/month. Token
+ * snapshots for the tracker pass through the same client and are the larger
+ * caller, but only their refusals reach the relay.
+ *
+ * SWITCH: `GECKO_EGRESS_RELAY = "0"` turns it off with no code change; a
+ * deployment without the binding reads as undefined and stays direct.
+ */
+function geckoEgressRelay(env: Env): GeckoTerminalHooks["relayFetch"] {
+  if (env.GECKO_EGRESS_RELAY === "0" || env.GECKO_EGRESS_RELAY === "false") {
+    return undefined;
+  }
+  const ns = dexEgressBinding(env);
+  if (!ns) return undefined;
+  return async (url, timeoutMs, signal) => {
+    for (const arm of DEX_EGRESS_ARMS) {
+      if ((geckoRelayCooldownUntil.get(arm) ?? 0) > Date.now()) continue;
+      try {
+        const stub = ns.get(ns.idFromName(`dex-egress-${arm}`), {
+          locationHint: arm,
+        });
+        const response = await stub.fetch(`${DEX_EGRESS_ORIGIN}${DEX_EGRESS_PATH}`, {
+          method: "GET",
+          headers: {
+            [DEX_EGRESS_URL_HEADER]: url,
+            [DEX_EGRESS_TIMEOUT_HEADER]: String(timeoutMs),
+            // CoinGecko 403s a subrequest without a descriptive UA — the
+            // relayed call has to look like the direct one it replaces.
+            [DEX_EGRESS_UA_HEADER]: GECKO_USER_AGENT,
+          },
+          signal,
+        });
+        if (response.ok) return { response, arm };
+        void response.body?.cancel().catch(() => undefined);
+        const retryAfterS = Number(response.headers.get("retry-after"));
+        geckoRelayCooldownUntil.set(
+          arm,
+          Date.now() +
+            (Number.isFinite(retryAfterS) && retryAfterS > 0
+              ? Math.min(
+                  DEX_RELAY_ARM_MAX_COOLDOWN_MS,
+                  Math.round(retryAfterS * 1000),
+                )
+              : DEX_RELAY_ARM_COOLDOWN_MS),
+        );
+      } catch {
+        geckoRelayCooldownUntil.set(arm, Date.now() + DEX_RELAY_ARM_COOLDOWN_MS);
+      }
+    }
+    return null;
+  };
+}
+
+/**
  * Keep the clock armed: called by every CRON scan delivery (never by the
  * clock's own), so a clock whose alarm was somehow lost comes back on the next
  * minute. Fire-and-forget through ctx.waitUntil — the tick must never wait on
@@ -8525,6 +8612,35 @@ const worker = {
         count: Array.isArray(items) ? items.length : 0,
         bodyPreview: text.slice(0, 200),
       });
+    }
+
+    // PumpPortal stream probe — the launch feed that replaced the pump.fun
+    // frontend API (403 on both hosts from this Worker's egress). The object
+    // holds the WebSocket; this route reports whether it is connected, how
+    // many creates it has seen, and the newest ring contents. Read it after a
+    // deploy: `connected: false` with rising `failures` is the portal or the
+    // egress refusing the socket; `connected: true, ring: 0` is a quiet or
+    // just-booted object, not a blocked one.
+    if (url.pathname === "/debug/pumpportal") {
+      const ns = (env as unknown as { PUMPPORTAL?: DurableObjectNamespaceLike })
+        .PUMPPORTAL;
+      if (!ns) {
+        return Response.json({ ok: false, error: "PUMPPORTAL binding absent" });
+      }
+      try {
+        const stub = ns.get(ns.idFromName(PUMPPORTAL_FEED_NAME));
+        const res = await stub.fetch(
+          `${PUMPPORTAL_ORIGIN}${PUMPPORTAL_STATUS_PATH}`,
+          { signal: AbortSignal.timeout(5_000) },
+        );
+        const body = (await res.json()) as Record<string, unknown>;
+        return Response.json({ ok: res.ok, status: res.status, ...body });
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     // Raydium LaunchLab probe — calls the REAL client from the Worker's own

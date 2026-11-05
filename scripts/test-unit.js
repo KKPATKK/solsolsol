@@ -16,6 +16,7 @@ const { parseAdminIds, isAdmin, parseSmartMoneyTypes, parseMutedCardSigs, loadCo
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
+const { parsePumpPortalCreate } = require("../dist/pumpportal.js");
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseRaydiumLaunches, RaydiumLaunchClient, RAYDIUM_LAUNCH_BASE_URL, RAYDIUM_LAUNCH_MAX_LIMIT, RAYDIUM_LAUNCH_BACKOFF_MS } = require("../dist/raydiumlaunch.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
@@ -12073,6 +12074,78 @@ async function main() {
     assert.equal(loadConfig({ PUMPFUN_PROFILE_LIMIT: "9000" }).pumpfunProfileLimit, 300, "clamped");
     assert.equal(loadConfig({ PUMPFUN_PROFILE_LIMIT: "-5" }).pumpfunProfileLimit, 0, "below zero is OFF too");
     assert.equal(loadConfig({ PUMPFUN_PROFILE_LIMIT: "nope" }).pumpfunProfileLimit, 0, "junk fails closed");
+  });
+
+  await test("PumpPortal: only create frames with a mint become tokens", () => {
+    const now = Date.now();
+    const created = parsePumpPortalCreate(
+      JSON.stringify({ txType: "create", mint: "Mint111", name: "Name", symbol: "SYM" }),
+    );
+    assert.ok(created);
+    assert.equal(created.tokenAddress, "Mint111");
+    assert.equal(created.name, "Name");
+    assert.equal(created.symbol, "SYM");
+    assert.ok(created.at >= now, "receipt time stands in for the missing created stamp");
+    // Trade frames and acks are not creates.
+    assert.equal(parsePumpPortalCreate({ txType: "buy", mint: "Mint111" }), null);
+    assert.equal(parsePumpPortalCreate({ message: "Subscribed to new token events" }), null);
+    // Junk bodies degrade to null instead of throwing.
+    assert.equal(parsePumpPortalCreate("not json"), null);
+    assert.equal(parsePumpPortalCreate(null), null);
+    assert.equal(parsePumpPortalCreate({ txType: "create", mint: "  " }), null);
+    // LetsBonk frames on the same stream omit txType; a mint is enough.
+    const bonk = parsePumpPortalCreate({ mint: "BonkMint" });
+    assert.equal(bonk && bonk.tokenAddress, "BonkMint");
+  });
+
+  await test("PumpFunClient serves the PumpPortal stream before the 403ed HTTP host", async () => {
+    let httpCalls = 0;
+    const origFetch = global.fetch;
+    global.fetch = async () => {
+      httpCalls++;
+      return new Response("blocked", { status: 403 });
+    };
+    try {
+      const client = new PumpFunClient(
+        { pumpfunRequestIntervalMs: 0 },
+        {
+          fetchRecent: async (limit) => [
+            { tokenAddress: "PortalMint", openTimestamp: Date.now() },
+          ].slice(0, limit),
+        },
+      );
+      const out = await client.fetchNewestCoins(50);
+      assert.equal(out.length, 1);
+      assert.equal(out[0].tokenAddress, "PortalMint");
+      assert.equal(httpCalls, 0, "a stream answer must not also spend the HTTP feed");
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await test("PumpFunClient falls back to HTTP when the stream has nothing", async () => {
+    let httpCalls = 0;
+    const origFetch = global.fetch;
+    global.fetch = async (url) => {
+      httpCalls++;
+      assert.ok(String(url).startsWith("https://frontend-api-v3.pump.fun/coins?"));
+      return new Response(JSON.stringify([{ mint: "HttpMint" }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    try {
+      const client = new PumpFunClient(
+        { pumpfunRequestIntervalMs: 0 },
+        { fetchRecent: async () => [] },
+      );
+      const out = await client.fetchNewestCoins(5);
+      assert.equal(out.length, 1);
+      assert.equal(out[0].tokenAddress, "HttpMint");
+      assert.equal(httpCalls, 1);
+    } finally {
+      global.fetch = origFetch;
+    }
   });
 
   await test("PumpFunClient asks the v3 host with created_timestamp and identifies itself", async () => {

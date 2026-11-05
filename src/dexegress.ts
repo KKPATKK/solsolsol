@@ -48,7 +48,8 @@
  * The caller only ever reaches this class through the `DEX_EGRESS` binding
  * (see worker.ts dexEgressRelay), so the fetch surface is internal. It still
  * validates its target: an object that will fetch any URL handed to it in a
- * header is an SSRF gadget, and the allowlist is one host.
+ * header is an SSRF gadget, and the allowlist is four exact hosts (two
+ * services) rather than a pattern.
  */
 
 /**
@@ -70,10 +71,31 @@ export const DEX_EGRESS_PATH = "/fetch";
 export const DEX_EGRESS_URL_HEADER = "x-dex-url";
 /** What the caller can afford to wait, ms (clamped by dexEgressTimeoutMs). */
 export const DEX_EGRESS_TIMEOUT_HEADER = "x-dex-timeout-ms";
+/**
+ * The caller's own User-Agent, forwarded verbatim. CoinGecko answers 403 to a
+ * subrequest without a descriptive one (see GECKO_USER_AGENT in
+ * src/geckoterminal.ts), so a relayed gecko call has to carry the same
+ * identity as a direct one — a hard-coded relay UA would just move the refusal.
+ */
+export const DEX_EGRESS_UA_HEADER = "x-dex-ua";
 /** Echoed on the response: the colo that actually answered (diagnostic). */
 export const DEX_EGRESS_COLO_HEADER = "x-dex-relay-colo";
-/** The ONE host this object may fetch. See the SSRF note above. */
-export const DEX_EGRESS_TARGET_HOST = "api.dexscreener.com";
+/**
+ * The hosts this object may fetch. See the SSRF note above.
+ *
+ * TWO SERVICES SINCE 2026-11-05: DexScreener was the first (pair batches
+ * refused by this Worker's colo, ~50/hour), and GeckoTerminal/CoinGecko joined
+ * with the same measured shape — `/debug/gecko-key` showed EVERY variant
+ * (configured demo key, keyless, pro parameter) answering 429 from the
+ * Worker's egress while the mirror hosts answered 200 from a clean one. The
+ * allowlist stays exact-host: this is the security boundary, not a suggestion.
+ */
+export const DEX_EGRESS_TARGET_HOSTS = [
+  "api.dexscreener.com",
+  "api.geckoterminal.com",
+  "api.coingecko.com",
+  "pro-api.coingecko.com",
+] as const;
 /**
  * Ceiling for one relay attempt. The probe measured 512-737ms per real MISS
  * through a relayed object, so this is ~3x headroom: a colo slow enough to
@@ -86,8 +108,9 @@ export const DEX_EGRESS_MIN_TIMEOUT_MS = 500;
 /**
  * The one URL this object will fetch, or null. Pure and exported for the unit
  * test: the allowlist is the security boundary, so it is asserted rather than
- * assumed. Rejects anything that is not exactly `https://api.dexscreener.com/…`
- * — another scheme, another host, a port, or embedded credentials.
+ * assumed. Rejects anything that is not exactly one of
+ * DEX_EGRESS_TARGET_HOSTS over https — another scheme, another host, a port,
+ * or embedded credentials.
  */
 export function dexEgressTarget(raw: string | null | undefined): string | null {
   if (typeof raw !== "string" || raw === "") return null;
@@ -98,7 +121,9 @@ export function dexEgressTarget(raw: string | null | undefined): string | null {
     return null;
   }
   if (url.protocol !== "https:") return null;
-  if (url.host !== DEX_EGRESS_TARGET_HOST) return null;
+  if (!(DEX_EGRESS_TARGET_HOSTS as readonly string[]).includes(url.host)) {
+    return null;
+  }
   if (url.username !== "" || url.password !== "") return null;
   return url.toString();
 }
@@ -137,9 +162,17 @@ export class DexEgressRelay {
     // says whether the location hint actually landed where it was asked to.
     const colo =
       (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "";
+    // Forwarded, not invented: an upstream that gates on identity sees the
+    // same one it would have seen on a direct call (see DEX_EGRESS_UA_HEADER).
+    const userAgent = request.headers.get(DEX_EGRESS_UA_HEADER);
     try {
       const upstream = await fetch(target, {
-        headers: { accept: "application/json" },
+        headers: {
+          accept: "application/json",
+          ...(userAgent !== null && userAgent !== ""
+            ? { "user-agent": userAgent.slice(0, 200) }
+            : {}),
+        },
         signal: AbortSignal.timeout(timeoutMs),
       });
       // Only the headers the caller's own accounting reads travel back:

@@ -1,5 +1,6 @@
 import type { AppConfig } from "./config";
 import type { TokenProfile } from "./dexscreener";
+import type { PumpPortalReader } from "./pumpportal";
 
 /**
  * pump.fun's public launch API.
@@ -129,7 +130,18 @@ export function pumpfunDiscoveryLimit(
 export class PumpFunClient {
   private readonly throttle: Throttle;
 
-  constructor(config: AppConfig) {
+  /**
+   * `portal` is the PumpPortal stream (see src/pumpportal.ts), and it is the
+   * PRIMARY source when present: the frontend API below answers 403 from this
+   * Worker's egress on both hosts, so the HTTP path is kept only as the cold
+   * fallback for the ticks before the object's stream has produced its first
+   * token. Null (the Node entry, unit tests, a deployment without the binding)
+   * keeps the old behaviour exactly.
+   */
+  constructor(
+    config: AppConfig,
+    private readonly portal: PumpPortalReader | null = null,
+  ) {
     this.throttle = new Throttle(config.pumpfunRequestIntervalMs);
   }
 
@@ -170,6 +182,18 @@ export class PumpFunClient {
    */
   async fetchNewestCoins(limit: number): Promise<TokenProfile[]> {
     const wanted = Math.max(1, Math.min(Math.floor(limit), 300));
+    // THE STREAM FIRST. A connected object answers with the newest creates in
+    // one Durable Object hop; the HTTP feed is only asked when the object has
+    // nothing to give (cold start, portal outage), which is the one case where
+    // its 403 costs a subrequest anyway. An EMPTY live feed is not treated as
+    // a failure of the portal — but it is also indistinguishable from a cold
+    // ring, and the HTTP answer on a cold ring is cheap, so the fallback runs.
+    if (this.portal !== null) {
+      const streamed = await this.portal.fetchRecent(wanted);
+      if (streamed !== null && streamed.length > 0) {
+        return streamed.slice(0, wanted);
+      }
+    }
     const out: TokenProfile[] = [];
     const seen = new Set<string>();
     for (let page = 0; page < MAX_PAGES && out.length < wanted; page++) {
