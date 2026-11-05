@@ -35,8 +35,16 @@ import type { TokenProfile } from "./dexscreener";
  * emits continuously and would miss essentially every token.
  */
 
-/** The stream endpoint. `api-key` is optional for `subscribeNewToken`. */
-export const PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data";
+/**
+ * The stream endpoint. `api-key` is optional for `subscribeNewToken`.
+ *
+ * HTTPS, NOT `wss:` — Workers' `fetch()` rejects the `wss:` scheme outright
+ * (live 2026-11-05: "Fetch API cannot load: wss://pumpportal.fun/api/data",
+ * zero connects), and the upgrade is carried by the `Upgrade: websocket`
+ * header instead. Same host, same path, same endpoint; only the scheme the
+ * runtime accepts differs.
+ */
+export const PUMPPORTAL_WS_URL = "https://pumpportal.fun/api/data";
 /** The object's own origin/paths (any origin works — it routes on the path). */
 export const PUMPPORTAL_ORIGIN = "https://pumpportal";
 export const PUMPPORTAL_TOKENS_PATH = "/tokens";
