@@ -477,16 +477,6 @@ CRON_RELAY_URL = "https://solana-meme-bot.cool1999k.workers.dev"
 # never touches it; with the binding absent the switch is moot and the client
 # behaves exactly as it did before 2026-11-03.
 DEX_EGRESS_FALLBACK = "1"
-# GeckoTerminal's SECOND EGRESS (2026-11-05), on the SAME relay objects as the
-# pair lane above: "1" (or any value other than "0"/"false") retries a 429/403
-# gecko call through `weur` then `apac`, "0" leaves it direct. Measured reason:
-# /debug/gecko-key answered 429 on every host for EVERY variant — configured
-# demo key, keyless, pro parameter — i.e. the refusal is this Worker's shared
-# egress IP, not the key's quota, and a key cannot fix an IP. A relayed 200 is
-# served like a direct one and does NOT arm the 5-minute 429 pause. One DO
-# request per refused call; the discovery leg is capped at one call per 5
-# minutes, and token snapshots only reach it when they are refused.
-GECKO_EGRESS_RELAY = "1"
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one COMPLETED less
 # than `scanGateMs(this)` ago — this value minus a jitter budget, cross-isolate

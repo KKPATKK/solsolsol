@@ -89,20 +89,10 @@ function relayedClient(hook) {
 async function main() {
   console.log("\nDex egress relay (second egress for refused pair batches)\n");
 
-  await test("the relay object fetches ONLY its exact allowlist hosts", async () => {
+  await test("the relay object fetches ONLY https://api.dexscreener.com", async () => {
     assert.equal(
       dexEgressTarget("https://api.dexscreener.com/latest/dex/tokens/A,B"),
       "https://api.dexscreener.com/latest/dex/tokens/A,B",
-    );
-    // The gecko lane joined 2026-11-05 (see GECKO_EGRESS_RELAY); these are the
-    // two hosts that lane asks, and they are allowed by EXACT host.
-    assert.equal(
-      dexEgressTarget("https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"),
-      "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
-    );
-    assert.equal(
-      dexEgressTarget("https://api.coingecko.com/api/v3/onchain/networks/solana/new_pools"),
-      "https://api.coingecko.com/api/v3/onchain/networks/solana/new_pools",
     );
     for (const bad of [
       null,
@@ -110,7 +100,6 @@ async function main() {
       "http://api.dexscreener.com/latest/dex/tokens/A",
       "https://evil.example/latest/dex/tokens/A",
       "https://api.dexscreener.com.evil.example/x",
-      "https://api.geckoterminal.com.evil.example/x",
       "https://user:pw@api.dexscreener.com/x",
       "file:///etc/passwd",
     ]) {

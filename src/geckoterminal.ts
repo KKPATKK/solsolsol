@@ -1,41 +1,5 @@
 import type { AppConfig } from "./config";
 
-/**
- * THE SECOND EGRESS (2026-11-05). `/debug/gecko-key` measured every variant of
- * the key probe — the configured demo key, keyless, and the pro parameter —
- * answering 429 on `api.geckoterminal.com`, `api.coingecko.com` and
- * `pro-api.coingecko.com` from this Worker's egress in the same minute. A key
- * cannot fix that: the refusal is the shared Cloudflare egress IP, not the
- * key's quota (the keyless variant was refused too). The DexScreener relay had
- * already proved the ONLY lever that moves a subrequest's egress without a new
- * host or a paid plan: a Durable Object placed (best effort) in another colo.
- * A relayed 200 is served exactly like a direct one and the 429 pause is NOT
- * armed, because the lane was not left without an answer.
- *
- * The hook is optional and the client stays fully usable without it (the Node
- * entry and every unit test construct it with no hooks), so an old deployment
- * without the binding behaves exactly as it did before this entry.
- */
-export interface GeckoRelayServed {
-  response: Response;
-  /** Which relay arm answered (`weur` / `apac`), for /health. */
-  arm: string;
-}
-export interface GeckoTerminalHooks {
-  relayFetch?: (
-    url: string,
-    timeoutMs: number,
-    signal?: AbortSignal,
-  ) => Promise<GeckoRelayServed | null>;
-}
-/**
- * Ceiling for one relayed gecko call. The relay probe measured 512-737ms per
- * real origin MISS through a placed object; 2.5s is ~3x headroom and stays
- * inside the client's own 10s transport cap, so a slow arm is skipped rather
- * than allowed to spend the tick's budget.
- */
-export const GECKO_RELAY_TIMEOUT_MS = 2_500;
-
 const BASE_URL = "https://api.geckoterminal.com/api/v2";
 /**
  * Back off ALL GeckoTerminal calls for this long after the FIRST 429 in a row.
@@ -395,11 +359,8 @@ export interface GeckoFeedStats {
   backoffMs: number;
   /** Epoch the current backoff expires at (0 = not backing off). */
   backoffUntil: number;
-  /**
-   * Which path answered last: the primary, the alternate fallback, or the
-   * relay (a placed Durable Object's egress — see GECKO_RELAY_TIMEOUT_MS).
-   */
-  lastHost: "primary" | "alt" | "relay" | null;
+  /** Which path answered last: the primary or the alternate fallback. */
+  lastHost: "primary" | "alt" | null;
   /** Attempts against the alternate host while the primary is paused. */
   altAttempts: number;
   /** Alternate-host responses that parsed as OK. */
@@ -412,19 +373,6 @@ export interface GeckoFeedStats {
   altLastStatus: number;
   /** Epoch the alternate host's pause expires at (0 = not paused). */
   altBackoffUntil: number;
-  /**
-   * Direct refusals that were handed to the relay (403/429/5xx). A COUNT OF
-   * REFUSALS, not of relay calls: it is only meaningful beside relayServed.
-   */
-  relayAttempts: number;
-  /** Refusals the relay answered with 2xx (the share absorbed). */
-  relayServed: number;
-  /** Relay hops that failed (transport or another 4xx/5xx). */
-  relayFailed: number;
-  /** The arm that served last (`weur` / `apac`; null = none yet). */
-  relayLastArm: string | null;
-  /** Epoch of the last relayed success (0 = none yet). */
-  relayLastAt: number;
 }
 
 /** Spaces out HTTP requests so we stay well under GeckoTerminal's rate limit. */
@@ -610,11 +558,6 @@ export function geckoFeedStats(): GeckoFeedStats {
       altFailures: 0,
       altLastStatus: 0,
       altBackoffUntil: 0,
-      relayAttempts: 0,
-      relayServed: 0,
-      relayFailed: 0,
-      relayLastArm: null,
-      relayLastAt: 0,
     };
   }
   return lastClient.stats();
@@ -655,7 +598,7 @@ export class GeckoTerminalClient {
   /** The mirror host this deployment's plan uses (see geckoAltBaseUrl). */
   private readonly altBaseUrl: string;
   /** See GeckoFeedStats.lastHost / alt* — the fallback host's own state. */
-  private lastHost: "primary" | "alt" | "relay" | null = null;
+  private lastHost: "primary" | "alt" | null = null;
   private altAttempts = 0;
   private altOk = 0;
   private alt429 = 0;
@@ -663,16 +606,8 @@ export class GeckoTerminalClient {
   private altFailures = 0;
   private altLastStatus = 0;
   private altRateLimitedUntil = 0;
-  /** The relay's own readings — see GeckoFeedStats.relay*. */
-  private relayAttempts = 0;
-  private relayServed = 0;
-  private relayFailed = 0;
-  private relayLastArm: string | null = null;
-  private relayLastAt = 0;
-  /** The second egress, when this deployment binds one (see GeckoTerminalHooks). */
-  private readonly hooks: GeckoTerminalHooks;
 
-  constructor(config: AppConfig, hooks: GeckoTerminalHooks = {}) {
+  constructor(config: AppConfig) {
     this.throttle = new Throttle(config.geckoterminalRequestIntervalMs);
     // A key moves the rate limit from the caller's shared egress IP onto the
     // key itself — the only lever that survives a poisoned IP pool.
@@ -681,7 +616,6 @@ export class GeckoTerminalClient {
       config.coingeckoApiPlan === "pro" ? COINGECKO_PRO_HEADER : COINGECKO_DEMO_HEADER;
     // The header and the mirror host move together (see geckoAltBaseUrl).
     this.altBaseUrl = geckoAltBaseUrl(config.coingeckoApiPlan);
-    this.hooks = hooks;
     // Publish this client's feed state (see geckoFeedStats).
     lastClient = this;
   }
@@ -717,11 +651,6 @@ export class GeckoTerminalClient {
       altFailures: this.altFailures,
       altLastStatus: this.altLastStatus,
       altBackoffUntil: this.altRateLimitedUntil,
-      relayAttempts: this.relayAttempts,
-      relayServed: this.relayServed,
-      relayFailed: this.relayFailed,
-      relayLastArm: this.relayLastArm,
-      relayLastAt: this.relayLastAt,
     };
   }
 
@@ -862,40 +791,6 @@ export class GeckoTerminalClient {
   }
 
   /**
-   * One hop through the second egress (see GeckoTerminalHooks). Returns the
-   * relayed 2xx response, or null — and null is ALWAYS a "carry on with the
-   * direct refusal", never an answer of its own: a failed hop must land in the
-   * same 429 pause / alternate fallback the direct attempt would have.
-   *
-   * The counters are telemetry and are never read by a decision. Keeping the
-   * failed body unread is the same rule the DexScreener hook follows: the
-   * caller would otherwise pay to stream a body it is about to discard.
-   */
-  private async relay(
-    url: string,
-    signal?: AbortSignal,
-  ): Promise<Response | null> {
-    const relayFetch = this.hooks.relayFetch;
-    if (relayFetch === undefined) return null;
-    this.relayAttempts += 1;
-    try {
-      const served = await relayFetch(url, GECKO_RELAY_TIMEOUT_MS, signal);
-      if (served === null || !served.response.ok) {
-        this.relayFailed += 1;
-        void served?.response.body?.cancel().catch(() => undefined);
-        return null;
-      }
-      this.relayServed += 1;
-      this.relayLastArm = served.arm;
-      this.relayLastAt = Date.now();
-      return served.response;
-    } catch {
-      this.relayFailed += 1;
-      return null;
-    }
-  }
-
-  /**
    * Arm the fallback's own pause. A 429 and a hard refusal share ONE
    * escalation: both mean "the alternate is not usable right now", and the
    * only difference is what the log says. What matters is that the fallback
@@ -945,35 +840,6 @@ export class GeckoTerminalClient {
       this.lastCacheStatus = cacheStatus;
       if (cacheStatus !== null && /^(HIT|REVALIDATED)$/i.test(cacheStatus)) {
         this.cacheHits += 1;
-      }
-      // A DIRECT REFUSAL IS RETRIED THROUGH THE SECOND EGRESS (2026-11-05).
-      // The refusal shapes measured live are 429 (quota charged to this
-      // Worker's shared egress IP) and 403 (hard host block); a 5xx is the
-      // same "ask again from somewhere else" bet. A relayed 2xx skips ALL of
-      // the refusal bookkeeping below: arming the 429 pause would throw away
-      // the path that just answered for the next window.
-      if (
-        !res.ok &&
-        this.hooks.relayFetch !== undefined &&
-        (res.status === 403 || res.status === 429 || res.status >= 500) &&
-        signal?.aborted !== true
-      ) {
-        const relayed = await this.relay(`${baseUrl}${path}`, signal);
-        if (relayed !== null) {
-          this.lastStatus = relayed.status;
-          this.lastCacheStatus = relayed.headers.get("cf-cache-status");
-          if (this.consecutive429 > 0) {
-            console.log(
-              `[gecko] feed recovered through the relay after ${this.consecutive429} consecutive 429(s)`,
-            );
-            this.consecutive429 = 0;
-            this.backoffMs = 0;
-          }
-          this.ok += 1;
-          this.lastOkAt = Date.now();
-          this.lastHost = "relay";
-          return relayed.json();
-        }
       }
       if (res.status === 429) {
         const now = Date.now();

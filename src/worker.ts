@@ -78,7 +78,6 @@ import {
   DEX_EGRESS_ORIGIN,
   DEX_EGRESS_PATH,
   DEX_EGRESS_TIMEOUT_HEADER,
-  DEX_EGRESS_UA_HEADER,
   DEX_EGRESS_URL_HEADER,
   DexEgressRelay,
 } from "./dexegress";
@@ -156,7 +155,6 @@ import { MeteoraClient } from "./meteora";
 import { RaydiumLaunchClient } from "./raydiumlaunch";
 import {
   GeckoTerminalClient,
-  type GeckoTerminalHooks,
   GECKO_ALT_BASE_URL,
   GECKO_CACHE_TTL_S,
   GECKO_USER_AGENT,
@@ -4974,7 +4972,7 @@ async function ensureInitialized(env: Env): Promise<void> {
           // graduates; best-effort — blocked or degraded feeds return [] and
           // the scan continues on the others (see the cadence gate + the
           // launch-slot chain in src/scanner.ts).
-          new GeckoTerminalClient(config, { relayFetch: geckoEgressRelay(env) }),
+          new GeckoTerminalClient(config),
           // Jupiter Token v2 discovery — recent launchpad launches (the
           // pump.fun frontend-api replacement) + 24h trending (null when
           // both feed limits are 0).
@@ -7399,81 +7397,6 @@ function dexEgressRelay(env: Env): DexScreenerHooks["relayPairBatch"] {
         // A transport error or an aborted hop says nothing about DexScreener;
         // cool the arm briefly and let the next one answer.
         dexRelayCooldownUntil.set(arm, Date.now() + DEX_RELAY_ARM_COOLDOWN_MS);
-      }
-    }
-    return null;
-  };
-}
-
-/**
- * Gecko's own cool-down map. SEPARATE from the pair lane's on purpose: the two
- * services share the relay's arms but not their refusals, so a dead arm for
- * DexScreener must not park gecko behind it (and vice versa).
- */
-const geckoRelayCooldownUntil = new Map<string, number>();
-
-/**
- * THE SECOND EGRESS FOR GECKO (2026-11-05). The same object, the same arms and
- * the same contract as dexEgressRelay above; the difference is the caller and
- * the refusal being absorbed. `/debug/gecko-key` measured every variant —
- * configured demo key, keyless, pro parameter — answering 429 on all three
- * hosts from this Worker's egress, which is the per-colo shape the relay was
- * built for, not a key problem (a key cannot fix an IP the origin refuses).
- *
- * WHAT IT CHANGES ON A TICK: a 429/403/5xx from the primary is retried once
- * through `weur`, then `apac`; a 200 there is served exactly like a direct one
- * and the 429 pause is NOT armed (src/geckoterminal.ts attempt). The old
- * all-429 shape therefore stops costing a 5-minute pause per attempt — it
- * costs one relay hop and a success.
- *
- * COST: one DO request per refused gecko call. The discovery leg is capped at
- * one call per 5 minutes (GECKOTERMINAL_DISCOVERY_INTERVAL_SECONDS), so even a
- * wall in which every call was refused is ~8.6K DO requests/month. Token
- * snapshots for the tracker pass through the same client and are the larger
- * caller, but only their refusals reach the relay.
- *
- * SWITCH: `GECKO_EGRESS_RELAY = "0"` turns it off with no code change; a
- * deployment without the binding reads as undefined and stays direct.
- */
-function geckoEgressRelay(env: Env): GeckoTerminalHooks["relayFetch"] {
-  if (env.GECKO_EGRESS_RELAY === "0" || env.GECKO_EGRESS_RELAY === "false") {
-    return undefined;
-  }
-  const ns = dexEgressBinding(env);
-  if (!ns) return undefined;
-  return async (url, timeoutMs, signal) => {
-    for (const arm of DEX_EGRESS_ARMS) {
-      if ((geckoRelayCooldownUntil.get(arm) ?? 0) > Date.now()) continue;
-      try {
-        const stub = ns.get(ns.idFromName(`dex-egress-${arm}`), {
-          locationHint: arm,
-        });
-        const response = await stub.fetch(`${DEX_EGRESS_ORIGIN}${DEX_EGRESS_PATH}`, {
-          method: "GET",
-          headers: {
-            [DEX_EGRESS_URL_HEADER]: url,
-            [DEX_EGRESS_TIMEOUT_HEADER]: String(timeoutMs),
-            // CoinGecko 403s a subrequest without a descriptive UA — the
-            // relayed call has to look like the direct one it replaces.
-            [DEX_EGRESS_UA_HEADER]: GECKO_USER_AGENT,
-          },
-          signal,
-        });
-        if (response.ok) return { response, arm };
-        void response.body?.cancel().catch(() => undefined);
-        const retryAfterS = Number(response.headers.get("retry-after"));
-        geckoRelayCooldownUntil.set(
-          arm,
-          Date.now() +
-            (Number.isFinite(retryAfterS) && retryAfterS > 0
-              ? Math.min(
-                  DEX_RELAY_ARM_MAX_COOLDOWN_MS,
-                  Math.round(retryAfterS * 1000),
-                )
-              : DEX_RELAY_ARM_COOLDOWN_MS),
-        );
-      } catch {
-        geckoRelayCooldownUntil.set(arm, Date.now() + DEX_RELAY_ARM_COOLDOWN_MS);
       }
     }
     return null;
