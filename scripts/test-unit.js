@@ -16,7 +16,7 @@ const { parseAdminIds, isAdmin, parseSmartMoneyTypes, parseMutedCardSigs, loadCo
 const { detectSupplyFlow, selectTopAccounts, summarizeSignatures } = require("../dist/helius.js");
 const { tradeDecision, resolveTradeMode, parseQuote, parseSendResponse, buyAmountLamports, parseSellCallback, sellAmountRaw, parseModeCallback, nextTradeMode } = require("../dist/jupiter.js");
 const { parsePumpCoins, PumpFunClient, pumpfunDiscoveryLimit } = require("../dist/pumpfun.js");
-const { parsePumpPortalCreate } = require("../dist/pumpportal.js");
+const { parsePumpPortalCreate, PumpPortalStore, collectPumpPortal, pumpPortalFeedEnabled, PUMPPORTAL_COLLECT_MS, PUMPPORTAL_LEASE_MS, PUMPPORTAL_FRESH_MS } = require("../dist/pumpportal.js");
 const { parseMeteoraPools, MeteoraClient, METEORA_BASE_URL } = require("../dist/meteora.js");
 const { parseRaydiumLaunches, RaydiumLaunchClient, RAYDIUM_LAUNCH_BASE_URL, RAYDIUM_LAUNCH_MAX_LIMIT, RAYDIUM_LAUNCH_BACKOFF_MS } = require("../dist/raydiumlaunch.js");
 const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterMs, geckoBackoffMs, geckoFeedStats, geckoAltEligible, geckoAltBaseUrl, geckoCacheTtlS, COINGECKO_DEMO_HEADER, GECKO_CACHE_TTL_S, GECKO_SNAPSHOT_CACHE_TTL_S, GECKO_RATE_LIMIT_BACKOFF_MS, GECKO_BACKOFF_MAX_MS, GECKO_KEYED_429_BACKOFF_MS, GECKO_BACKOFF_HARD_MAX_MS, GECKO_ALT_BASE_URL, GECKO_PRO_ALT_BASE_URL } = require("../dist/geckoterminal.js");
@@ -65,6 +65,40 @@ function tmpDb() {
   const p = path.join(os.tmpdir(), `unit-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
   const client = createClient({ url: `file:${p}` });
   return { p, client, cleanup: async () => { await client.close(); try { fs.unlinkSync(p); } catch {} } };
+}
+
+/**
+ * The smallest D1 binding shape `createD1Transport` drives, backed by the same
+ * local libsql client the rest of the suite uses. This lets the PumpPortal
+ * store's real SQL — the INSERT OR IGNORE dedupe, the lease's conditional
+ * upsert, the prune — run against SQLite instead of a hand-written mock.
+ */
+function fakeD1(client) {
+  const make = (sql, args = []) => ({
+    sql,
+    args,
+    bind(...values) { return make(sql, values); },
+    async all() {
+      const r = await client.execute({ sql, args });
+      return { results: r.rows, meta: { changes: r.rowsAffected } };
+    },
+    async run() {
+      const r = await client.execute({ sql, args });
+      return { results: [], meta: { changes: r.rowsAffected } };
+    },
+  });
+  return {
+    prepare(sql) { return make(sql); },
+    async batch(statements) {
+      const results = await client.batch(
+        statements.map((s) => ({ sql: s.sql, args: s.args })),
+      );
+      return results.map((r) => ({
+        results: r.rows,
+        meta: { changes: r.rowsAffected },
+      }));
+    },
+  };
 }
 
 /**
@@ -12096,6 +12130,134 @@ async function main() {
     // LetsBonk frames on the same stream omit txType; a mint is enough.
     const bonk = parsePumpPortalCreate({ mint: "BonkMint" });
     assert.equal(bonk && bonk.tokenAddress, "BonkMint");
+  });
+
+  await test("PumpPortalStore: dedupes, serves only fresh rows, prunes, and leases one collector", async () => {
+    const { client, cleanup } = tmpDb();
+    try {
+      const store = new PumpPortalStore(fakeD1(client));
+      const now = Date.now();
+      const empty = await store.pumpPortalDebug();
+      assert.equal(empty.tokens.rows, 0);
+      assert.equal(empty.tokens.newestAt, null, "an empty MAX() is null, not the epoch");
+      assert.equal(empty.collector, null);
+      assert.equal(
+        await store.insertPumpPortalTokens([
+          { tokenAddress: "MintA", name: "A", symbol: "AAA", at: now },
+          { tokenAddress: "MintA", name: "A again", at: now },
+          { tokenAddress: "MintB", at: now - 60_000 },
+        ]),
+        2,
+        "the primary key drops the repeated mint",
+      );
+      const fresh = await store.fetchRecent(10);
+      assert.deepEqual(fresh.map((t) => t.tokenAddress), ["MintA", "MintB"]);
+      assert.equal(fresh[0].symbol, "AAA");
+      assert.equal(fresh[0].openTimestamp, now);
+
+      // Outside the freshness window: written, visible to the prune, never to
+      // a scan that could act on it.
+      await store.insertPumpPortalTokens([
+        { tokenAddress: "MintOld", at: now - PUMPPORTAL_FRESH_MS - 60_000 },
+      ]);
+      const stillFresh = await store.fetchRecent(10);
+      assert.ok(!stillFresh.some((t) => t.tokenAddress === "MintOld"));
+      assert.equal(
+        await store.prunePumpPortalTokens(now - PUMPPORTAL_FRESH_MS),
+        1,
+        "only the expired row is deleted",
+      );
+
+      // One collector at a time: a live lease refuses, an expired one is
+      // taken over, and finish() releases it immediately.
+      assert.equal(await store.claimPumpPortalCollector("one", now, now + 1_000), true);
+      assert.equal(await store.claimPumpPortalCollector("two", now, now + 1_000), false);
+      assert.equal(await store.claimPumpPortalCollector("three", now + 2_000, now + 3_000), true);
+      await store.finishPumpPortalCollector(
+        "three",
+        { ok: true, connects: 1, messages: 2, ignored: 0, written: 2, pruned: 1, failures: 0, lastError: "", ms: 12 },
+        now + 2_000,
+      );
+      assert.equal(await store.claimPumpPortalCollector("four", now + 2_001, now + 5_000), true);
+      const debug = await store.pumpPortalDebug();
+      assert.equal(debug.tokens.rows, 2);
+      assert.equal(debug.tokens.newestAt, now);
+      assert.equal(debug.tokens.oldestAt, now - 60_000);
+      assert.equal(debug.collector.owner, "four");
+      assert.equal(debug.collector.messages, 2);
+      assert.equal(debug.collector.written, 2);
+      assert.equal(debug.windowMs, PUMPPORTAL_COLLECT_MS);
+      assert.equal(debug.leaseMs, PUMPPORTAL_LEASE_MS);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  await test("PumpPortal collector: buffers, dedupes, flushes and releases at the deadline", async () => {
+    const inserted = [];
+    let prunedBefore = 0;
+    const sink = {
+      insertPumpPortalTokens: async (tokens) => {
+        inserted.push(...tokens);
+        return tokens.length;
+      },
+      prunePumpPortalTokens: async (before) => {
+        prunedBefore = before;
+        return 3;
+      },
+    };
+    const fakeFetch = async () => {
+      const listeners = {};
+      const socket = {
+        accept() {},
+        send() {
+          queueMicrotask(() => {
+            listeners.message({ data: JSON.stringify({ txType: "create", mint: "MintOne", name: "One" }) });
+            listeners.message({ data: JSON.stringify({ mint: "MintTwo" }) });
+            listeners.message({ data: JSON.stringify({ mint: "MintOne" }) });
+            listeners.message({ data: JSON.stringify({ txType: "buy", mint: "MintThree" }) });
+          });
+        },
+        close() { listeners.close?.(); },
+        addEventListener(type, fn) { listeners[type] = fn; },
+      };
+      return { status: 101, webSocket: socket };
+    };
+    const result = await collectPumpPortal({
+      sink,
+      deadlineMs: Date.now() + 80,
+      flushMs: 5,
+      fetchImpl: fakeFetch,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.connects, 1);
+    assert.equal(result.messages, 3, "two creates plus the repeated mint");
+    assert.equal(result.ignored, 1, "the buy frame is not a create");
+    assert.equal(result.written, 2, "the repeated mint is written once");
+    assert.equal(inserted.length, 2);
+    assert.equal(result.pruned, 3);
+    assert.ok(prunedBefore > 0);
+    assert.equal(result.lastError, "");
+  });
+
+  await test("PumpPortal feed switch: only 0/false disables collection", () => {
+    assert.equal(pumpPortalFeedEnabled({}), true);
+    assert.equal(pumpPortalFeedEnabled({ PUMPPORTAL_FEED: "1" }), true);
+    assert.equal(pumpPortalFeedEnabled({ PUMPPORTAL_FEED: "0" }), false);
+    assert.equal(pumpPortalFeedEnabled({ PUMPPORTAL_FEED: "false" }), false);
+  });
+
+  await test("wrangler: PumpPortal is a cron/D1 buffer, not a resident Durable Object", () => {
+    const toml = fs.readFileSync(path.join(__dirname, "..", "wrangler.toml"), "utf8");
+    assert.ok(
+      !/^name\s*=\s*"PUMPPORTAL"/m.test(toml),
+      "the resident object's binding must be gone",
+    );
+    assert.ok(/^tag\s*=\s*"v3"/m.test(toml), "v3 stays: migration tags are append-only");
+    const deleted = /^\[\[migrations\]\][\s\S]*?^tag\s*=\s*"v4"[\s\S]*?^deleted_classes\s*=\s*\[([^\]]*)\]/m.exec(toml);
+    assert.ok(deleted, "v4 must delete the class the v3 migration created");
+    assert.ok(deleted[1].includes("PumpPortalFeed"));
+    assert.ok(/^PUMPPORTAL_FEED\s*=\s*"1"/m.test(toml), "the collector ships on");
   });
 
   await test("PumpFunClient serves the PumpPortal stream before the 403ed HTTP host", async () => {
@@ -27169,13 +27331,23 @@ async function main() {
       'await relayCronDelivery(env, "maintenance")',
       maintAt,
     );
+    // The local legs run BESIDE the PumpPortal window (2026-11-06): the
+    // collector is the long-lived half, so the maintenance body is one arm of
+    // a Promise.all rather than an awaited call on its own. The ordering that
+    // matters — relay decision first, local work only after a non-relayed
+    // answer — is unchanged.
     const maintLocalAt = src.indexOf(
-      "await runMaintenanceInvocation(env, relayTag);",
+      "runMaintenanceInvocation(env, relayTag)",
       maintAt,
     );
     assert.ok(
       maintRelayAt > maintAt && maintLocalAt > maintRelayAt,
       "a failed maintenance relay must fall through to the local legs",
+    );
+    assert.ok(
+      src.includes("runPumpPortalCollector(env)") &&
+        src.includes("[\n        runMaintenanceInvocation(env, relayTag),\n        collector,\n      ]"),
+      "the portal window and the maintenance legs must run together",
     );
     // The local scan tick must stay reachable below the scan relay, and the
     // relay reading must be THREADED (parameters), never module state: the

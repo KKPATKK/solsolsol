@@ -87,15 +87,13 @@ import {
 // to the runtime and to the migration that created it.)
 export { DexEgressRelay };
 import {
-  PUMPPORTAL_FEED_NAME,
-  PUMPPORTAL_ORIGIN,
-  PUMPPORTAL_STATUS_PATH,
-  PumpPortalFeed,
-  pumpPortalReader,
+  collectPumpPortal,
+  pumpPortalFeedEnabled,
+  PumpPortalStore,
+  PUMPPORTAL_COLLECT_MS,
+  PUMPPORTAL_LEASE_MS,
+  type PumpPortalCollectResult,
 } from "./pumpportal";
-// Same contract as DexEgressRelay above: wrangler.toml's v3 migration names
-// this class, and the runtime resolves it from the ENTRY module's exports.
-export { PumpPortalFeed };
 import { HeliusClient, type SupplyFlowResult } from "./helius";
 import { RugcheckClient } from "./rugcheck";
 import {
@@ -4966,7 +4964,7 @@ async function ensureInitialized(env: Env): Promise<void> {
           // 2026-09-28 (PUMPFUN_PROFILE_LIMIT=50 since 2026-10-18), on every
           // tick; best-effort,
           // a blocked/degraded feed returns [].
-          new PumpFunClient(config, pumpPortalReader(env)),
+          new PumpFunClient(config, pumpPortalStoreFor(env)),
           // GeckoTerminal new-pools discovery — keyed (COINGECKO_API_KEY) and
           // therefore a 5-MINUTE leg, covers every Solana DEX incl. pump.fun
           // graduates; best-effort — blocked or degraded feeds return [] and
@@ -5271,6 +5269,91 @@ async function runTrackerInvocation(
       err instanceof Error ? err.message : err,
     );
   }
+}
+
+/**
+ * THE PUMPPORTAL BUFFER (2026-11-06). One store per isolate: the scanner's
+ * reader and the cron collector share it, and its schema cache means the DDL
+ * is paid once rather than on every tick.
+ *
+ * Deliberately independent of `db`: the collector runs in the maintenance cron
+ * isolate, which must not construct the scanner, Telegram or the rest of the
+ * application just to hold a WebSocket. `env.DB` is the only requirement, so a
+ * deployment without the D1 binding simply keeps the old HTTP fallback.
+ */
+let pumpPortalStore: PumpPortalStore | null = null;
+
+function pumpPortalStoreFor(env: Env): PumpPortalStore | null {
+  if (!env.DB) return null;
+  if (pumpPortalStore === null) pumpPortalStore = new PumpPortalStore(env.DB);
+  return pumpPortalStore;
+}
+
+/**
+ * One collection window, driven by the 5-minute maintenance cron (see
+ * wrangler.toml and src/pumpportal.ts).
+ *
+ * The lease is the only concurrency control: the cron is at-least-once, and a
+ * duplicate delivery must not open a second PumpPortal socket (the portal asks
+ * for one connection at a time). The lease is shorter than the gap to the next
+ * delivery, so a dead invocation is taken over automatically.
+ *
+ * This function never rejects: the scheduled handler awaits it beside the
+ * maintenance legs, and a portal outage must cost freshness, not the
+ * delivery.
+ */
+async function runPumpPortalCollector(env: Env): Promise<void> {
+  if (!pumpPortalFeedEnabled(env)) return;
+  const store = pumpPortalStoreFor(env);
+  if (!store) return;
+  const startedAt = Date.now();
+  const owner = `${startedAt}-${Math.random().toString(36).slice(2)}`;
+  let claimed = false;
+  try {
+    claimed = await store.claimPumpPortalCollector(
+      owner,
+      startedAt,
+      startedAt + PUMPPORTAL_LEASE_MS,
+    );
+  } catch (err) {
+    console.error(
+      "[worker] pumpportal collector claim failed:",
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+  if (!claimed) return;
+
+  let result: PumpPortalCollectResult;
+  try {
+    result = await collectPumpPortal({
+      sink: store,
+      deadlineMs: startedAt + PUMPPORTAL_COLLECT_MS,
+    });
+  } catch (err) {
+    result = {
+      ok: false,
+      connects: 0,
+      messages: 0,
+      ignored: 0,
+      written: 0,
+      pruned: 0,
+      failures: 1,
+      lastError: err instanceof Error ? err.message : String(err),
+      ms: Date.now() - startedAt,
+    };
+  }
+  try {
+    await store.finishPumpPortalCollector(owner, result, Date.now());
+  } catch (err) {
+    console.error(
+      "[worker] pumpportal collector finish failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  console.log(
+    `[worker] pumpportal collector: connects=${result.connects} messages=${result.messages} written=${result.written} pruned=${result.pruned} failures=${result.failures} ${result.ms}ms${result.lastError ? ` lastError=${result.lastError}` : ""}`,
+  );
 }
 
 /**
@@ -8537,27 +8620,24 @@ const worker = {
       });
     }
 
-    // PumpPortal stream probe — the launch feed that replaced the pump.fun
-    // frontend API (403 on both hosts from this Worker's egress). The object
-    // holds the WebSocket; this route reports whether it is connected, how
-    // many creates it has seen, and the newest ring contents. Read it after a
-    // deploy: `connected: false` with rising `failures` is the portal or the
-    // egress refusing the socket; `connected: true, ring: 0` is a quiet or
-    // just-booted object, not a blocked one.
+    // PumpPortal buffer probe (see src/pumpportal.ts). The stream is collected
+    // by the 5-minute maintenance cron and buffered in D1; this route reports
+    // the buffer's size/freshness and the last collector window. Read it after
+    // a deploy: `tokens.rows: 0` with `collector: null` or an old `lastEndAt`
+    // means the collector has not run yet; a non-zero `failures`/`lastError`
+    // with a stale `newestAt` is the portal or the egress refusing the socket.
     if (url.pathname === "/debug/pumpportal") {
-      const ns = (env as unknown as { PUMPPORTAL?: DurableObjectNamespaceLike })
-        .PUMPPORTAL;
-      if (!ns) {
-        return Response.json({ ok: false, error: "PUMPPORTAL binding absent" });
+      const store = pumpPortalStoreFor(env);
+      if (!store) {
+        return Response.json({ ok: false, error: "D1 binding absent" });
       }
       try {
-        const stub = ns.get(ns.idFromName(PUMPPORTAL_FEED_NAME));
-        const res = await stub.fetch(
-          `${PUMPPORTAL_ORIGIN}${PUMPPORTAL_STATUS_PATH}`,
-          { signal: AbortSignal.timeout(5_000) },
-        );
-        const body = (await res.json()) as Record<string, unknown>;
-        return Response.json({ ok: res.ok, status: res.status, ...body });
+        const body = await store.pumpPortalDebug();
+        return Response.json({
+          ok: true,
+          enabled: pumpPortalFeedEnabled(env),
+          ...body,
+        });
       } catch (err) {
         return Response.json({
           ok: false,
@@ -10235,12 +10315,27 @@ const worker = {
     // delivery cost freshness instead of a leg.
     if (maintenanceDelivery) {
       let relayTag: PassRelayTag | null = opts?.relayTag ?? null;
+      // THE PUMPPORTAL WINDOW RIDES THE OUTER DELIVERY, not the relayed
+      // maintenance replay: the relay's fetch is bounded at 26s, so a socket
+      // inside the replay would be cut long before its 4m45s window. The
+      // outer invocation owns the 15-minute Cron wall clock and starts the
+      // collector beside the relay; the replay (`relay: false`) must never
+      // start a second one. The store's lease is the final guard against an
+      // at-least-once duplicate delivery.
+      const collector =
+        opts?.relay === false ? null : runPumpPortalCollector(env);
       if (opts?.relay !== false) {
         const relay = await relayCronDelivery(env, "maintenance");
-        if (relay === "relayed") return;
+        if (relay === "relayed") {
+          await collector;
+          return;
+        }
         relayTag = relay;
       }
-      await runMaintenanceInvocation(env, relayTag);
+      await Promise.all([
+        runMaintenanceInvocation(env, relayTag),
+        collector,
+      ]);
       return;
     }
     // RELAY THE SCAN TO THE PLACED FETCH PATH (see the relay block at the

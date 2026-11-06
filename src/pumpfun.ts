@@ -131,12 +131,12 @@ export class PumpFunClient {
   private readonly throttle: Throttle;
 
   /**
-   * `portal` is the PumpPortal stream (see src/pumpportal.ts), and it is the
-   * PRIMARY source when present: the frontend API below answers 403 from this
-   * Worker's egress on both hosts, so the HTTP path is kept only as the cold
-   * fallback for the ticks before the object's stream has produced its first
-   * token. Null (the Node entry, unit tests, a deployment without the binding)
-   * keeps the old behaviour exactly.
+   * `portal` is the D1-backed PumpPortal buffer (see src/pumpportal.ts), and it
+   * is the PRIMARY source when present: the frontend API below answers 403
+   * from this Worker's egress on both hosts, so the HTTP path is kept only as
+   * the cold fallback for a deployment without the D1 binding or for the first
+   * ticks before a collection window has filled. Null (the Node entry, unit
+   * tests, a deployment without the binding) keeps the old behaviour exactly.
    */
   constructor(
     config: AppConfig,

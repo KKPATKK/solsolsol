@@ -402,39 +402,45 @@ tag = "v2"
 new_sqlite_classes = ["DexEgressRelay"]
 
 # ---------------------------------------------------------------------------
-# PUMPPORTAL LAUNCH FEED (2026-11-05) — the replacement for pump.fun's frontend
-# API, which answers 403 (Cloudflare managed challenge) on BOTH hosts from this
-# Worker's egress. The block is below the request: headers, Origin/Referer, a
-# proxy and the relayed egress were all measured, and the challenge follows the
-# TLS fingerprint — no header can fix it.
+# PUMPPORTAL LAUNCH FEED (2026-11-06) — D1-BUFFERED, NO RESIDENT DO.
 #
-# PumpPortal publishes the same creates over a free WebSocket
-# (`subscribeNewToken`, no key) but has NO HTTP recent-tokens endpoint and no
-# history, so the socket must be held open BETWEEN ticks. A Worker invocation
-# cannot hold it; a Durable Object can, and that is the whole object: one
-# outbound WebSocket, one bounded in-memory ring, one `/tokens` read per tick
-# (see src/pumpportal.ts). The scan's HTTP path is kept as the cold fallback.
+# pump.fun's frontend API is 403ed on both hosts from this Worker's egress
+# (the block is below the request: headers, Origin/Referer, a proxy and a
+# relayed Durable Object were all measured). PumpPortal publishes the same
+# creates over a free WebSocket (`subscribeNewToken`, no key) but has no HTTP
+# recent-tokens endpoint and no history.
 #
-# COST: a resident object is billed duration at 128MB — ~331,776 GB-s/month
-# against the Paid plan's included 400,000. That is the price of continuous
-# coverage; connecting only during a tick would see ~2 seconds of a stream that
-# emits continuously and would miss essentially everything.
+# The FIRST cut (v3, 2026-11-05) held that socket in a Durable Object between
+# ticks. That object was resident 24/7: ~331,776 GB-s/month at 128MB, ~83% of
+# the Paid plan's 400,000 GB-s duration allowance. This cut replaces it with a
+# bounded cron window and a D1 buffer:
+#   - the every-5-minute maintenance cron opens the stream for 4m45s and
+#     INSERTs every create into `pump_portal_tokens` (src/pumpportal.ts);
+#   - the scan reads the newest 15 minutes from D1 in one SELECT per tick;
+#   - the 15s gap between windows is the coverage cost (~95% of the stream),
+#     and the resident duration charge is gone.
 #
-# READ IT: /debug/pumpportal (connected, connects, messages, ignored, failures,
-# ring, lastMessageAt). `connected: false` with rising failures is the portal
-# or egress refusing the socket; `connected: true, ring: 0` is quiet, not
-# blocked.
+# The buffer's DDL and its one-row lease/status table live in src/pumpportal.ts
+# and are bootstrapped by `CREATE TABLE IF NOT EXISTS`; they deliberately do
+# not run through Db.init(), so the cron isolate never constructs the scanner
+# or the Telegram bot just to hold a socket. Rows are pruned to 1 hour, so the
+# table stays at ~660 rows and costs ~1.9% of the D1 rows-written allowance.
 #
-# SWITCH: deleting the binding returns the scanner to the HTTP path (which is
-# 403ed today) with no code change; do NOT delete this block without a
-# `deleted_classes` migration — a migration tag cannot be reused.
-[[durable_objects.bindings]]
-name = "PUMPPORTAL"
-class_name = "PumpPortalFeed"
-
+# READ IT: /debug/pumpportal (tokens.rows, tokens.newestAt, the last collector's
+# connects/messages/written/failures/lastError). A non-zero `failures` with a
+# stale `newestAt` is the portal or the egress refusing the socket.
+#
+# SWITCH: `PUMPPORTAL_FEED = "0"` stops new collection windows; the reader then
+# goes stale after 15 minutes and the scanner falls back to the 403ed HTTP
+# path. The v3 class is deleted by v4 below — tags are append-only, so the v3
+# entry stays even though the class no longer exists.
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["PumpPortalFeed"]
+
+[[migrations]]
+tag = "v4"
+deleted_classes = ["PumpPortalFeed"]
 
 # Non-secret tuning knobs. Secrets (TELEGRAM_BOT_TOKEN, TURSO_DATABASE_URL,
 # TURSO_AUTH_TOKEN, BIRDEYE_API_KEY, HELIUS_API_KEY, COINGECKO_API_KEY) must NOT
@@ -477,6 +483,10 @@ CRON_RELAY_URL = "https://solana-meme-bot.cool1999k.workers.dev"
 # never touches it; with the binding absent the switch is moot and the client
 # behaves exactly as it did before 2026-11-03.
 DEX_EGRESS_FALLBACK = "1"
+# PumpPortal launch buffer (src/pumpportal.ts): "0"/"false" stops the 5-minute
+# collection windows. The D1 rows already collected remain readable for 15
+# minutes, after which the scanner falls back to pump.fun's 403ed HTTP path.
+PUMPPORTAL_FEED = "1"
 # Minimum gap between scans, in seconds. The cron trigger still fires every
 # minute, but the worker skips the scan when the previous one COMPLETED less
 # than `scanGateMs(this)` ago — this value minus a jitter budget, cross-isolate
