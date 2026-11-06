@@ -13858,7 +13858,11 @@ async function main() {
       // one more call is spent a few seconds later. The audit keeps BOTH
       // sweeps, because "the read was slow" and "the index had nothing yet"
       // are different operational facts.
-      const settleMore = () => new Promise((r) => setTimeout(r, 150));
+      // Wait for the append's own task instead of a fixed 150ms: the retry
+      // records its outcome only after a delay, a second read and a DB write.
+      // A loaded runner outran that budget and read the FIRST sweep's
+      // "no-reading" before the timeout landed (the 2026-11-06 deploy flake).
+      const waitHeld = () => held[held.length - 1].catch(() => {});
       edits.length = 0;
       scanner.appendLateOrganicLine({
         chatId: "c",
@@ -13870,7 +13874,7 @@ async function main() {
         render,
         replyMarkup: { inline_keyboard: [] },
       });
-      await settleMore();
+      await waitHeld();
       assert.equal(edits.length, 1, "the second read's number must reach the card");
       assert.match(String(edits[0][2]), /🌱 有機度: 61\.5/);
       assert.match(String(edits[0][2]), /第 2 次讀數/, "a retried line says which read it is");
@@ -13901,7 +13905,7 @@ async function main() {
         render,
         replyMarkup: null,
       });
-      await settleMore();
+      await waitHeld();
       assert.equal(edits.length, 0, "still no number, still no edit");
       const stillEmpty = await lateOf(50);
       assert.equal(stillEmpty.outcome, "no-numbers");
@@ -13921,7 +13925,7 @@ async function main() {
         render,
         replyMarkup: null,
       });
-      await settleMore();
+      await waitHeld();
       const twiceFailed = await lateOf(51);
       assert.equal(twiceFailed.outcome, "read-failed");
       assert.equal(twiceFailed.first.outcome, "read-failed");
@@ -13940,7 +13944,7 @@ async function main() {
         render,
         replyMarkup: null,
       });
-      await settleMore();
+      await waitHeld();
       const retryTimedOut = await lateOf(53);
       assert.equal(retryTimedOut.outcome, "timeout");
       assert.equal(retryTimedOut.first.outcome, "no-reading");
@@ -13961,7 +13965,7 @@ async function main() {
         render,
         replyMarkup: null,
       });
-      await settleMore();
+      await waitHeld();
       assert.equal(retryCalls, 0, "a card with its line must not pay a second read");
       assert.equal((await lateOf(52)).outcome, "landed");
 
