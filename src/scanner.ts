@@ -4723,8 +4723,12 @@ export class Scanner {
           this.trade,
           // The pinned-pool lookup (see pushwatch's pool-pinning note): the
           // rows' own pools, answered by address — same signal, same rule.
-          (addresses: string[], deadlineMs?: number, signal?: AbortSignal) =>
-            this.poolPairsForTracker(addresses, deadlineMs, signal),
+          (
+            addresses: string[],
+            deadlineMs?: number,
+            signal?: AbortSignal,
+            opts?: { fresh?: boolean },
+          ) => this.poolPairsForTracker(addresses, deadlineMs, signal, opts),
         )
       : null;
   }
@@ -5714,6 +5718,13 @@ export class Scanner {
      * cancelled instead of held in the queue.
      */
     signal?: AbortSignal,
+    /**
+     * A card is about to quote this pool's 現價. Bypass lastPairs, the pin
+     * cadence and the snapshot chain, and ask the wire for a cache-busted
+     * reading instead (see DexScreenerClient.fetchPairsByAddresses `fresh`).
+     * Ordinary passes leave this absent and keep every cache in the chain.
+     */
+    opts?: { fresh?: boolean },
   ): Promise<{
     pairs: Map<string, PairInfo | null>;
     snapshots: number;
@@ -5729,6 +5740,40 @@ export class Scanner {
     deferred: boolean;
   }> {
     const out = new Map<string, PairInfo | null>();
+    // THE CARD REFRESH (see pushwatch PUSH_WATCH_CARD_FRESH_MS): nothing from
+    // lastPairs, the cadence or the snapshot chain may answer this read — a
+    // card about to be sent needs the market as it is now, not the copy that
+    // made it a minute late. The query is cache-busted in the client. No
+    // absence is recorded here: a pool missing from a one-pool refresh is not
+    // evidence of a switch, so only hits are returned.
+    if (opts?.fresh) {
+      try {
+        const res = await this.dex.fetchPairsByAddresses(
+          addresses,
+          deadlineMs,
+          signal,
+          true,
+        );
+        for (const a of addresses) {
+          const hit = res.pairs.get(a);
+          if (hit) {
+            out.set(a, hit);
+            // Keep this isolate's snapshot warm for the next ordinary pass;
+            // deliberately not the colo carrier (no extra write on a card).
+            this.rememberPinAnswer(a, hit);
+          }
+        }
+      } catch {
+        /* unresolved — the caller defers rather than quoting a stale card */
+      }
+      this.trimPinSnapshots();
+      return {
+        pairs: out,
+        snapshots: 0,
+        snapshotOldestMs: 0,
+        deferred: false,
+      };
+    }
     const missing: string[] = [];
     const byPool = new Map<string, PairInfo>();
     for (const p of this.lastPairs.values()) {

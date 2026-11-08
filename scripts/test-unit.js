@@ -9306,10 +9306,12 @@ async function main() {
       pairCreatedAt: 1,
     });
     const urls = [];
+    const inits = [];
     const origFetch = globalThis.fetch;
     try {
-      globalThis.fetch = async (url) => {
+      globalThis.fetch = async (url, init) => {
         urls.push(String(url));
+        inits.push(init);
         // The endpoint answers only what it knows: the requested GONE pool is
         // simply absent from the body.
         return new Response(
@@ -9332,6 +9334,13 @@ async function main() {
         "pairs",
         "the by-address lane must be a pairs lane (429 block + counters key on the leg)",
       );
+      // The CARD refresh must bypass the colo edge entry, not re-serve it: a
+      // cache-busting query is the only thing that makes this a different key.
+      const fresh = await dex.fetchPairsByAddresses(["PINNED"], undefined, undefined, true);
+      assert.equal(fresh.answered, true);
+      assert.match(urls[1], /\/latest\/dex\/pairs\/solana\/PINNED\?fresh=/, `the card read is cache-busted: ${urls[1]}`);
+      assert.equal(inits[1].cf, undefined, "and it asks for no edge cache entry");
+      assert.ok(inits[0].cf, "the ordinary read keeps its edge cache");
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -18593,6 +18602,81 @@ async function main() {
     assert.equal(freshSends, 1, "a fresh reading fires the 💀 card");
     assert.equal(freshOut.checked, 1);
     assert.doesNotMatch(String(freshOut.note), / stale /, `and nothing claims a refusal: ${freshOut.note}`);
+  });
+
+  await test("PushWatcher: a stale card reading is refreshed before send; if it cannot be, the card waits (never quotes it)", async () => {
+    // PI 2026-11-07: the 💀 at 23:19:36 quoted the 23:18 low ($399.77K) after
+    // the pinned pool had recovered to $444.86K. The reading was inside the
+    // 180s judgement window, so the old rule let it through; the card simply
+    // called a minute-old low 現價. The fix is a CARD-path refresh, not a wider
+    // stale gate: quiet rows and the initial push are untouched, and a failed
+    // refresh leaves the row for the next pass rather than printing it.
+    const { PUSH_WATCH_CARD_FRESH_MS } = require("../dist/pushwatch.js");
+    const oldAt = Date.now() - PUSH_WATCH_CARD_FRESH_MS - 15_000;
+    const stalePair = {
+      ...termPair("PI", 30_000),
+      marketCap: 121_023,
+      contentAt: oldAt,
+    };
+    const freshPair = {
+      ...termPair("PI", 30_000),
+      // -24% off the peak: no 💀 and no ⚠️ weak (that starts at -35%), so the
+      // stale death has genuinely disappeared rather than turned into another
+      // card the old reading would not have produced.
+      marketCap: 250_000,
+      contentAt: Date.now() - 1_000,
+    };
+    const row = termRow({
+      token: "PI",
+      peakMcap: 330_340,
+      mcapAtPush: 177_869,
+      lastMcap: 121_023,
+      lastAlertAt: 0,
+      upStages: null,
+      lastLiquidity: 30_000,
+    });
+    const make = (db, fresh, onSend) =>
+      new PushWatcher(
+        db,
+        { api: { sendMessage: onSend } },
+        null,
+        loadConfig({}),
+        async (addrs) => new Map(addrs.map((a) => [a, stalePair])),
+        null,
+        async (addrs) => ({
+          pairs: new Map(addrs.map((a) => [a, fresh])),
+          snapshots: 0,
+          snapshotOldestMs: 0,
+          deferred: false,
+        }),
+      );
+
+    // The refresh answers: the stale 💀 is not sent, the fresh -24% reading is
+    // written, and the next pass can announce whatever is true then.
+    let refreshedSends = 0;
+    const refreshedDb = termDb([row]);
+    const refreshedOut = await make(refreshedDb, freshPair, async () => {
+      refreshedSends += 1;
+      return { message_id: 1 };
+    }).runTick(Date.now() + 1_500);
+    assert.equal(refreshedSends, 0, "the stale card is not printed");
+    assert.equal(refreshedOut.checked, 1, "the fresh reading is still measured");
+    assert.equal(refreshedOut.alerted, 0);
+    assert.equal(refreshedDb.updated[0][1].lastMcap, 250_000, "the fresh price lands");
+    assert.doesNotMatch(String(refreshedOut.note), /card-stale/, "the refresh succeeded");
+
+    // The refresh cannot answer: nothing is claimed, written or sent; the row
+    // stays put and the card is re-derived next pass (delay, never loss).
+    let staleSends = 0;
+    const staleDb = termDb([row]);
+    const staleOut = await make(staleDb, undefined, async () => {
+      staleSends += 1;
+      return { message_id: 1 };
+    }).runTick(Date.now() + 1_500);
+    assert.equal(staleSends, 0, "no card off the stale reading");
+    assert.equal(staleOut.checked, 0);
+    assert.equal(staleDb.updated.length, 0, "the row is left untouched");
+    assert.match(String(staleOut.note), /card-stale 1/, `the note names it: ${staleOut.note}`);
   });
 
   await test("parseNewPools maps the real GeckoTerminal new_pools shape", () => {

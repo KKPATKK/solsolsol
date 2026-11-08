@@ -3420,6 +3420,15 @@ export class DexScreenerClient {
      * are gone"): the caller's rows keep their snapshots. Optional.
      */
     callerSignal?: AbortSignal,
+    /**
+     * Force the wire instead of the colo edge entry. A cache-busting query
+     * makes this a DIFFERENT cache key, so a follow-up card that is about to
+     * quote 現價 cannot be served the same ≤120s-old edge entry that made it
+     * stale in the first place (2026-11-07, PI: a 💀 quoted the 23:18 low at
+     * 23:19:36, after the pool had already recovered ~11%). Only the card path
+     * asks for this; the ordinary tracker rotation keeps the edge cache.
+     */
+    fresh?: boolean,
   ): Promise<{ pairs: Map<string, PairInfo>; answered: boolean }> {
     const pairs = new Map<string, PairInfo>();
     const uniq: string[] = [];
@@ -3466,10 +3475,13 @@ export class DexScreenerClient {
       const contentAt: { at: number | null } = { at: null };
       try {
         data = await this.getJson(
-          `/latest/dex/pairs/solana/${batch.join(",")}`,
+          `/latest/dex/pairs/solana/${batch.join(",")}${
+            fresh ? `?fresh=${Date.now()}-${batch[0]}` : ""
+          }`,
           deadline,
-          // See PAIR_BATCH_CACHE_TTL_S / the note above.
-          PAIR_BATCH_CACHE_TTL_S,
+          // See PAIR_BATCH_CACHE_TTL_S / the note above. A FRESH read skips
+          // that entry entirely (the query already makes it a distinct key).
+          fresh ? undefined : PAIR_BATCH_CACHE_TTL_S,
           contentAt,
           callerSignal,
         );

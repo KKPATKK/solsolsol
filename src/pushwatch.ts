@@ -1160,6 +1160,31 @@ const DEAD_DRAWDOWN_PCT = 48;
  */
 export const PUSH_WATCH_MAX_READING_AGE_MS = PAIR_CONTENT_MAX_AGE_MS;
 /**
+ * How old a reading may be when a FOLLOW-UP CARD is about to quote it before
+ * the pass spends one extra request to refresh it, in ms.
+ *
+ * The 180s judgement ceiling above answers "is this reading real enough to
+ * judge?" — it is deliberately generous because the cache chain can hand over
+ * ~150s-old content at a legitimate edge HIT. A card answers a different
+ * question: "is this still the price?" On a fast memecoin a minute is enough
+ * to be visibly wrong. Live 2026-11-07 (PI): the 💀 card at 23:19:36 quoted
+ * $399.77K — the 23:18 low — while the pinned pool had already recovered to
+ * $444.86K (≈11% higher), and the row's later trough ($353.65K) was quoted by
+ * nobody. The reading was inside the 180s judgement window, so nothing refused
+ * it; the card simply called a minute-old low 現價.
+ *
+ * The refresh is scoped to the CARD path (a row whose evaluation produced an
+ * alert), targets the row's OWN pinned pool, and bypasses the edge cache with
+ * a cache-busted by-address read. It never touches the initial push, the scan
+ * gates, or a quiet row. If no fresh reading can be obtained inside this
+ * ceiling, the row is left COMPLETELY untouched and re-derived next pass — the
+ * same delay-never-loss contract as the stale gate; persistent stage marks mean
+ * nothing crossed is forgotten. 45s is one scan tick plus jitter: ordinary
+ * fresh readings pass without a request, while a snapshot that survived the
+ * tracker's 60s cadence is refreshed before it can be printed as 現價.
+ */
+export const PUSH_WATCH_CARD_FRESH_MS = 45_000;
+/**
  * The ceiling the 💀 ALONE is still judged at, when the reading is older than
  * PUSH_WATCH_MAX_READING_AGE_MS (2 × = 360s).
  *
@@ -3183,6 +3208,12 @@ export class PushWatcher {
       deadlineMs?: number,
       /** See pairsFor's signal — the same bounded() cap, same abort. */
       signal?: AbortSignal,
+      /**
+       * `fresh` bypasses lastPairs/cadence/snapshots for a card about to be
+       * sent (see PUSH_WATCH_CARD_FRESH_MS). Optional so existing callers and
+       * test doubles keep their shape.
+       */
+      opts?: { fresh?: boolean },
     ) => Promise<{
       pairs: Map<string, import("./dexscreener").PairInfo | null>;
       /**
@@ -4462,6 +4493,15 @@ export class PushWatcher {
      */
     let staleSkipped = 0;
     /**
+     * Rows whose alert was withheld because the card's reading was older than
+     * PUSH_WATCH_CARD_FRESH_MS and the on-demand pinned-pool refresh could not
+     * replace it with fresh content. The row is left untouched (no claim, no
+     * write), so the same transition is re-derived next pass — a delayed card,
+     * never a lost one. Named separately from `stale` (the 180s judgement
+     * refusal) so a card-freshness episode is visible in /health.
+     */
+    let cardStaleSkipped = 0;
+    /**
      * Confirmed switches whose re-pin write this pass lands (`repin N` in the
      * note): rows whose pinned pool left an ANSWERED response AND whose token
      * batch names a new pool. Written as ONE batched CAS after the loop (see
@@ -4728,6 +4768,23 @@ export class PushWatcher {
      * `defer-send N`) and re-derived next tick from the front of the
      * rotation.
      */
+    /**
+     * The exact live shape `evaluateWatch` takes, from ONE pair. Kept in one
+     * place because the card-freshness refresh below may re-run the evaluation
+     * on a second reading — the two passes must not disagree about which
+     * fields are "live" (e.g. a Jupiter liquidity reading is NOT comparable).
+     */
+    const liveFrom = (p: import("./dexscreener").PairInfo) => ({
+      mcap: p.marketCap,
+      // Comparable-only: a Jupiter/Gecko-sourced number is ~half of
+      // DexScreener's for the same pool (see comparableLiquidity) and
+      // must not be judged against the $10K floor.
+      liquidity: comparableLiquidity(p),
+      chg5m: p.priceChange.m5,
+      vol5m: p.volume.m5,
+      buysH1: p.txns.h1Buys,
+      sellsH1: p.txns.h1Sells,
+    });
     for (const row of head) {
       const subreqShort = subreqsLeft() <= TRACKER_SUBREQ_RESERVE;
       // Budget check BETWEEN rows — but it gates the SPENDS, not the rows. A
@@ -4909,20 +4966,10 @@ export class PushWatcher {
       // DROPS its card forever. A refused row is left completely untouched —
       // last_checked included — so the next tick claims it with a fresh
       // budget and its place at the front of the rotation is preserved.
-      const evalResult = evaluateWatch(
+      let evalResult = evaluateWatch(
         row,
         now,
-        {
-          mcap: pair.marketCap,
-          // Comparable-only: a Jupiter/Gecko-sourced number is ~half of
-          // DexScreener's for the same pool (see comparableLiquidity) and
-          // must not be judged against the $10K floor.
-          liquidity: comparableLiquidity(pair),
-          chg5m: pair.priceChange.m5,
-          vol5m: pair.volume.m5,
-          buysH1: pair.txns.h1Buys,
-          sellsH1: pair.txns.h1Sells,
-        },
+        liveFrom(pair),
         {
           cooldownMs: cfg.cooldownMin * 60_000,
           followupProofAt,
@@ -4956,6 +5003,64 @@ export class PushWatcher {
       // watching, and 30 such cards at once is noise, not signal.
       const backfill =
         row.lastMcap === null && now - row.pushedAt > STALE_BACKFILL_MS;
+      // THE CARD'S OWN FRESHNESS (2026-11-07, PI — see
+      // PUSH_WATCH_CARD_FRESH_MS). The tracker's pin lane can answer this pass
+      // from a snapshot or an edge entry older than the judgement ceiling, and
+      // that is fine for bookkeeping but NOT for a card that calls the number
+      // 現價. Before a card is claimed/sent, a stale reading gets ONE targeted
+      // by-address refresh of the row's OWN pool. If that cannot produce a
+      // reading inside the card ceiling, the row is left untouched and the next
+      // pass re-derives it; every stage mark is persistent, so this delays a
+      // card and never loses it. Quiet rows and the initial push never enter
+      // this branch.
+      if (!backfill && evalResult.alerts.length > 0 && pin !== null) {
+        const cardAgeMs = pairContentAgeMs(pair, now);
+        if (
+          cardAgeMs !== null &&
+          cardAgeMs > PUSH_WATCH_CARD_FRESH_MS &&
+          typeof this.poolPairsFor === "function" &&
+          !subreqShort
+        ) {
+          const refreshed = await this.bounded(
+            (signal) =>
+              this.poolPairsFor!(
+                [pin],
+                Date.now() + TRACKER_PAIRS_BUDGET_MS,
+                signal,
+                { fresh: true },
+              ),
+            TRACKER_PAIRS_BUDGET_MS,
+            {
+              pairs: new Map<
+                string,
+                import("./dexscreener").PairInfo | null
+              >(),
+              snapshots: 0,
+              snapshotOldestMs: 0,
+              deferred: false,
+            },
+          );
+          const fresh = refreshed.pairs.get(pin);
+          const freshAgeMs = fresh ? pairContentAgeMs(fresh, now) : null;
+          if (
+            !fresh ||
+            (freshAgeMs !== null && freshAgeMs > PUSH_WATCH_CARD_FRESH_MS)
+          ) {
+            cardStaleSkipped += 1;
+            continue;
+          }
+          pair = fresh;
+          evalResult = evaluateWatch(row, now, liveFrom(pair), {
+            cooldownMs: cfg.cooldownMin * 60_000,
+            followupProofAt,
+            readingAgeMs: freshAgeMs,
+          });
+          if (evalResult.readingStale) {
+            staleSkipped += 1;
+            continue;
+          }
+        }
+      }
       // Send slice this row would get, computed before it is claimed (see
       // TRACKER_SEND_FLOOR_MS / TRACKER_SEND_MIN_MS).
       const sendBudgetEnd = Math.min(
@@ -5571,6 +5676,7 @@ export class PushWatcher {
       `${pinSnapshots > 0 ? ` pin-snap ${pinSnapshots} (oldest ${Math.round(pinOldestMs / 1000)}s)` : ""}` +
       `${pinDeferred > 0 ? ` pin-defer ${pinDeferred}` : ""}` +
       `${staleSkipped > 0 ? ` stale ${staleSkipped}` : ""}` +
+      `${cardStaleSkipped > 0 ? ` card-stale ${cardStaleSkipped}` : ""}` +
       ` miss ${pairMiss} lost ${claimLost}` +
       `${pinSkip > 0 ? ` pin-skip ${pinSkip}` : ""}` +
       `${unpinnedSkip > 0 ? ` unpin ${unpinnedSkip}` : ""}` +
