@@ -5312,6 +5312,78 @@ async function main() {
     );
   });
 
+  await test("Scanner.fillPairGapsFromPriorCache: bridge one tick, honour content age, never chain", () => {
+    // The 16:05 shape: both pair lanes answer nothing for a slice this isolate
+    // resolved one tick earlier. The previous resolved map is the last cache
+    // layer; it must fill only what both lanes missed, must refuse a Dex
+    // reading whose CONTENT is over the scan's 180s gate, and must not bridge
+    // its own bridged entries again on the next tick.
+    const {
+      fillPairGapsFromPriorCache,
+      PAIR_CACHE_FALLBACK_MAX_AGE_MS,
+    } = require("../dist/scanner.js");
+    const now = 1_000_000;
+    const answers = new Map([["CURRENT", {}]]);
+    const prior = {
+      pairs: new Map([
+        ["FRESH", { contentAt: now - 60_000 }],
+        ["TOO_OLD", { contentAt: now - 181_000 }],
+        ["BRIDGED", {}],
+        ["UNDATED", {}],
+      ]),
+      at: now - 30_000,
+      fallback: new Set(["BRIDGED"]),
+    };
+    const reused = fillPairGapsFromPriorCache(
+      ["CURRENT", "FRESH", "TOO_OLD", "BRIDGED", "UNDATED", "ABSENT"],
+      answers,
+      prior,
+      now,
+    );
+    assert.deepEqual(
+      [...reused].sort(),
+      ["FRESH", "UNDATED"],
+      "only a lane-missed, non-bridged, in-bound prior reading is reused",
+    );
+    assert.equal(answers.get("CURRENT") !== undefined, true, "a current answer is never overwritten");
+    assert.equal(answers.has("TOO_OLD"), false, "an over-age dated reading stays missing");
+    assert.equal(answers.has("BRIDGED"), false, "a bridged reading is never reused twice");
+    assert.equal(answers.has("ABSENT"), false, "absence is never invented");
+    // The whole-map age bound is the other half of no-chain: even a safe entry
+    // is not reused when the previous phase is older than the bridge window.
+    assert.equal(
+      fillPairGapsFromPriorCache(
+        ["FRESH"],
+        new Map(),
+        { pairs: prior.pairs, at: now - PAIR_CACHE_FALLBACK_MAX_AGE_MS - 1, fallback: new Set() },
+        now,
+      ).size,
+      0,
+      "an old map contributes nothing",
+    );
+    // Wiring: the bridge runs before the Jupiter plan, and its final count is
+    // published only after Jupiter has had a chance to replace a bridged coin.
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const scannerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+    );
+    assert.ok(
+      scannerSrc.indexOf("constreusedPairs=bridgeDue?fillPairGapsFromPriorCache(") >
+        scannerSrc.indexOf("constpairsByToken=awaitthis.dex.fetchPairsForTokens(") &&
+        scannerSrc.indexOf("constreusedPairs=bridgeDue?fillPairGapsFromPriorCache(") <
+          scannerSrc.indexOf("constfallback=pairFallbackPlan("),
+      "the cache bridge must run after Dex and before the Jupiter plan",
+    );
+    assert.ok(
+      scannerSrc.includes("diag.pairsReused=reusedPairs.size;"),
+      "the bridge's final contribution must be published",
+    );
+  });
+
   // The wiring, pinned where the rule cannot pin it: the list must be built
   // from the ROTATION SLICE (never from the feed's coins, whose missing pair is
   // their normal state), drained ONCE by the tick's tail, and the pool query's
@@ -7108,6 +7180,82 @@ async function main() {
       assert.ok(
         asked.includes("TRACKEDTOKEN"),
         `the tracker's rotation head must ride along (got ${JSON.stringify(asked)})`,
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: a blind pair tick is bridged from the previous tick's resolved map", async () => {
+    // The 16:05 shape: both pair lanes answer nothing, but this isolate
+    // resolved the same pool/feed coins one tick earlier. The next tick must
+    // keep the gates fed from that map and publish `pairsReused`, without a
+    // second Jupiter request or a new pair lane retry.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({
+        chatId: "chat-bridge",
+        minLiquidityUsd: 0,
+        minVolume24hUsd: 0,
+        minMarketCapUsd: 10_000_000,
+        maxMarketCapUsd: 1_000_000_000,
+        minAgeMinutes: 0,
+        maxAgeMinutes: 100_000,
+        min5mVolUsd: 0,
+        min1hVolUsd: 0,
+        min5mChgPct: 0,
+        min1hChgPct: 0,
+        enabled: true,
+      });
+      const cfg = loadConfig({});
+      const dex = new DexScreenerClient(cfg);
+      let calls = 0;
+      const pair = {
+        chainId: "solana",
+        url: "https://dexscreener.com/solana/pair-FEEDCOIN1",
+        pairAddress: "pair-FEEDCOIN1",
+        baseToken: { address: "FEEDCOIN1", name: "Feed", symbol: "FEED" },
+        priceUsd: "0.001",
+        marketCap: 100_000,
+        volume: { h24: 100_000, h1: 10_000, m5: 1_000 },
+        priceChange: { m5: 1, h1: 2 },
+        txns: { m5Buys: 1, m5Sells: 1, h1Buys: 1, h1Sells: 1 },
+        liquidity: { usd: 50_000 },
+        pairCreatedAt: Date.now() - 3_600_000,
+        contentAt: Date.now(),
+      };
+      dex.fetchLatestSolanaProfiles = async () => [{ tokenAddress: "FEEDCOIN1" }];
+      dex.fetchPairsForTokens = async () => {
+        calls += 1;
+        return calls === 1 ? new Map([["FEEDCOIN1", pair]]) : new Map();
+      };
+      const scanner = new Scanner(
+        db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+        null, null, null, null, null, null, null,
+      );
+      await scanner.runOnce();
+      assert.equal(scanner.lastSummary?.pairsReused, 0, "a healthy first tick reuses nothing");
+      await scanner.runOnce();
+      assert.equal(calls, 2, "the blind tick still asks the pair lane once");
+      assert.equal(
+        scanner.lastSummary?.pairsReused,
+        1,
+        "the previous tick's resolved pair bridges the blind tick",
+      );
+      assert.equal(
+        scanner.lastSummary?.pairsMissingPool,
+        0,
+        "the rotation-slice coin is not reported missing when the bridge answered it",
       );
     } finally {
       globalThis.fetch = origFetch;

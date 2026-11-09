@@ -2171,6 +2171,66 @@ export function pairFallbackPlan(
 }
 
 /**
+ * How long the previous tick's resolved pair map may bridge a gap in this
+ * tick's two pair lanes, ms.
+ *
+ * WHY ONE TICK, NOT A NEW STALENESS POLICY. The client caches already have
+ * their own bounds (DexScreener 180s, Jupiter 90s, plus the colo layer), and
+ * every reading they hand over still has to pass the scan's content-age gate
+ * (`PAIR_CONTENT_MAX_AGE_MS`). This map is the LAST layer: when both lanes
+ * answer nothing for an address that this isolate resolved last tick, the
+ * previous map can keep the gates fed for one tick instead of marking the coin
+ * as a pair blind spot. 90s covers two normal 30s ticks plus jitter, while a
+ * Jupiter reading may itself be up to 90s old; 90 + 90 = 180, the same bound
+ * the gates already accept. Dex readings carry their own `contentAt`, which
+ * this helper checks individually.
+ *
+ * It is deliberately NOT a chain: addresses filled from this cache are marked
+ * in `lastPairsFallback`, and the next tick refuses to reuse them. A persistent
+ * outage therefore still surfaces as missing coverage after the bridge, rather
+ * than resurrecting the same numbers forever.
+ */
+export const PAIR_CACHE_FALLBACK_MAX_AGE_MS = 90_000;
+
+/**
+ * Fill this tick's unanswered addresses from the previous tick's resolved pair
+ * map (see PAIR_CACHE_FALLBACK_MAX_AGE_MS).
+ *
+ * Pure and exported so the safety rules are unit-tested: an entry is reused
+ * only when (1) the previous map is young enough, (2) it was not itself a
+ * bridged entry, (3) the current lane did not answer it, and (4) — when the
+ * source dated its content — the content is still inside the scan gate's bound.
+ * Undated readings (the Jupiter leg) are allowed: the map-age bound above is
+ * what dates those. Returns the addresses actually filled, so the caller can
+ * publish the bridge as its own reading and never let don't-know read as zero.
+ */
+export function fillPairGapsFromPriorCache(
+  addresses: readonly string[],
+  answers: Map<string, PairInfo>,
+  prior: {
+    pairs: ReadonlyMap<string, PairInfo>;
+    at: number;
+    fallback: ReadonlySet<string>;
+  },
+  now: number,
+  maxCacheAgeMs: number = PAIR_CACHE_FALLBACK_MAX_AGE_MS,
+  maxContentAgeMs: number = PAIR_CONTENT_MAX_AGE_MS,
+): Set<string> {
+  const reused = new Set<string>();
+  if (prior.at <= 0 || now - prior.at > maxCacheAgeMs) return reused;
+  for (const address of addresses) {
+    if (answers.has(address) || prior.fallback.has(address)) continue;
+    const pair = prior.pairs.get(address);
+    if (pair === undefined) continue;
+    const contentAge = pairContentAgeMs(pair, now);
+    if (contentAge !== null && contentAge > maxContentAgeMs) continue;
+    answers.set(address, pair);
+    reused.add(address);
+  }
+  return reused;
+}
+
+/**
  * `worker_state` row: the stamp the MAINTENANCE invocation leaves (see
  * worker.MAINTENANCE_CRON and Scanner.runMaintenanceJobs), as JSON.
  *
@@ -3376,6 +3436,17 @@ export interface ScanSummary {
    */
   pairsJup?: number;
   /**
+   * Pair readings this tick filled from the PREVIOUS tick's resolved map
+   * because both pair lanes left them unanswered (see
+   * fillPairGapsFromPriorCache). Read beside `pairs` / `pairsMissingPool`: a
+   * non-zero value means the tick's coverage was preserved by the bridge, not
+   * by a fresh Dex/Jupiter answer. The value counts addresses the bridge
+   * actually filled after the Jupiter fallback, so a coin Jupiter refreshed is
+   * not double-counted. 0/absent on a healthy tick and on a cold isolate with
+   * no previous map.
+   */
+  pairsReused?: number;
+  /**
    * The scan's OWN coins (feed + rotation slice, i.e. `scannedProfiles`) that
    * reached the gates with NO pair data at all — the coins every gate must skip
    * (a coin without a pair cannot be judged on mcap/liquidity/volume). The
@@ -4215,6 +4286,18 @@ export class Scanner {
    * pairs 0/6 miss 6 trips 5` in 36ms). Reusing this map costs nothing.
    */
   private lastPairs = new Map<string, PairInfo>();
+  /**
+   * When `lastPairs` was replaced by a completed pair phase, epoch ms. 0 means
+   * this isolate has never completed one. Read only by the cache bridge (see
+   * PAIR_CACHE_FALLBACK_MAX_AGE_MS), never by a gate.
+   */
+  private lastPairsAt = 0;
+  /**
+   * Addresses in `lastPairs` that were filled by the cache bridge rather than
+   * answered by a lane this tick. The next tick refuses to reuse them, which is
+   * what stops one stale bridge from becoming an indefinite cache.
+   */
+  private lastPairsFallback = new Set<string>();
   /**
    * The pin lane's last-ANSWERED memory (see poolPairsForTracker): each
    * pinned pool mapped to the pair info of the last BY-ADDRESS answer that
@@ -7595,6 +7678,15 @@ export class Scanner {
       ];
       if (this.shouldStopEarly()) return;
       this.enterStage("pairs", seq);
+      // THE LAST CACHE LAYER (see fillPairGapsFromPriorCache): snapshot the
+      // previous completed pair phase BEFORE this one replaces it. The client
+      // caches have already had their turn inside fetchPairsForTokens; this is
+      // what remains when both lanes answer nothing for a coin this isolate
+      // resolved one tick ago. Not fed back into itself: `lastPairsFallback`
+      // names the addresses that must not be reused twice.
+      const priorPairs = this.lastPairs;
+      const priorPairsAt = this.lastPairsAt;
+      const priorPairsFallback = this.lastPairsFallback;
       // The caller deadline this fetch was BUILT to take (see
       // fetchPairsForTokens' own note: "the scanner's front-phase window"). It
       // used to be omitted, on the claim that "the scanner's front-phase caps
@@ -7606,6 +7698,32 @@ export class Scanner {
         addresses,
         frontDeadline,
       );
+      // CACHE BEFORE THE SECOND LANE, deliberately: a gap the previous map
+      // can cover should not spend a Jupiter chunk. It runs only on the two
+      // shapes the fallback itself exists for — coverage under half, or a
+      // missing ROTATION-SLICE coin — so a healthy tick whose only misses are
+      // fresh feed launches (often pairless by design) never serves old data.
+      // The bridge is bounded by PAIR_CACHE_FALLBACK_MAX_AGE_MS and by each
+      // Dex reading's contentAt; the returned set is the summary's
+      // `pairsReused` and the next tick's no-chain guard.
+      const poolTokens = new Set(poolSlice.map((p) => p.tokenAddress));
+      const poolGap = addresses.some(
+        (address) => poolTokens.has(address) && !pairsByToken.has(address),
+      );
+      const bridgeDue =
+        pairsByToken.size < addresses.length * 0.5 || poolGap;
+      const reusedPairs = bridgeDue
+        ? fillPairGapsFromPriorCache(
+            addresses,
+            pairsByToken,
+            {
+              pairs: priorPairs,
+              at: priorPairsAt,
+              fallback: priorPairsFallback,
+            },
+            Date.now(),
+          )
+        : new Set<string>();
       // Fallback: when DexScreener's batched endpoint is blocked (shared
       // egress 429s — observed 2026-08-22, pairs: 0/550), source the gate
       // data from Jupiter's token API instead. It carries every input the
@@ -7635,7 +7753,6 @@ export class Scanner {
       // ask order is pool-first for the same reason: this lane's chunks are
       // capped, and feed-first order spent them on bonding-curve coins with no
       // pair while the pool tail starved.
-      const poolTokens = new Set(poolSlice.map((p) => p.tokenAddress));
       const fallback = pairFallbackPlan(addresses, poolTokens, pairsByToken);
       if (
         (fallback.underHalfCoverage || fallback.poolMissing > 0) &&
@@ -7648,8 +7765,13 @@ export class Scanner {
           for (const [k, v] of await this.jupiter.fetchTokenDataBatch(
             fallback.missing,
             frontDeadline,
-          ))
+          )) {
             pairsByToken.set(k, v);
+            // Jupiter answered it after all: the bridge did not fill this
+            // address in the final map, so it must not be counted as reused
+            // (nor be blocked from reuse next tick).
+            reusedPairs.delete(k);
+          }
         } catch (err) {
           console.error(
             "[scanner] jupiter pair fallback failed:",
@@ -7658,6 +7780,9 @@ export class Scanner {
         }
         diag.pairsJup = pairsByToken.size - beforeJup;
       }
+      // The bridge's final contribution (see fillPairGapsFromPriorCache). Set
+      // after the Jupiter merge so a lane-refreshed coin is not counted twice.
+      diag.pairsReused = reusedPairs.size;
       // The pool read AND the pair fetch are behind us (Jupiter fallback
       // included): the front window is closed.
       this.stampPhase("pair");
@@ -7728,8 +7853,13 @@ export class Scanner {
       // working. getStats() is a read of local state, so the refresh costs
       // nothing.
       diag.dex = this.dex.getStats();
-      // Kept for the post-push tracker pass (see lastPairs).
+      // Kept for the post-push tracker pass (see lastPairs), plus the metadata
+      // that bounds the NEXT tick's cache bridge: only entries answered by a
+      // lane this tick may be reused then, and the whole map expires after
+      // PAIR_CACHE_FALLBACK_MAX_AGE_MS.
       this.lastPairs = pairsByToken;
+      this.lastPairsAt = Date.now();
+      this.lastPairsFallback = reusedPairs;
       // The front's resolved map, Jupiter fallback included (see onPairs):
       // this is the tick's ONE chance to durably record what each pool holds,
       // and the fallback is the leg that answers on a 429 episode.

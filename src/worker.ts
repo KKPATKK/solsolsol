@@ -3028,6 +3028,8 @@ export interface TickLegRow {
   feedJoinMs: number | null;
   pairs: number | null;
   pairsJup: number | null;
+  /** Pair readings bridged from the previous tick's map (see scanner). */
+  pairsReused: number | null;
   pairsMissing: number | null;
   /** Feed half of `pairsMissing` — fresh launches, often no pair by design. */
   pairsMissingFeed: number | null;
@@ -3117,6 +3119,7 @@ export function buildTickLegRow(input: {
     feedJoinMs: s?.feedJoinMs ?? null,
     pairs: s?.pairs ?? null,
     pairsJup: s?.pairsJup ?? null,
+    pairsReused: s?.pairsReused ?? null,
     pairsMissing: s?.pairsMissing ?? null,
     pairsMissingFeed: s?.pairsMissingFeed ?? null,
     pairsMissingPool: s?.pairsMissingPool ?? null,
