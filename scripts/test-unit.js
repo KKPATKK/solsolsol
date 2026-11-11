@@ -5371,10 +5371,11 @@ async function main() {
     const scannerSrc = strip(
       fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
     );
+    const bridgeCall = "constreusedPairs=bridgeDue&&priorBridge?fillPairGapsFromPriorCache(";
     assert.ok(
-      scannerSrc.indexOf("constreusedPairs=bridgeDue?fillPairGapsFromPriorCache(") >
+      scannerSrc.indexOf(bridgeCall) >
         scannerSrc.indexOf("constpairsByToken=awaitthis.dex.fetchPairsForTokens(") &&
-        scannerSrc.indexOf("constreusedPairs=bridgeDue?fillPairGapsFromPriorCache(") <
+        scannerSrc.indexOf(bridgeCall) <
           scannerSrc.indexOf("constfallback=pairFallbackPlan("),
       "the cache bridge must run after Dex and before the Jupiter plan",
     );
@@ -7259,6 +7260,114 @@ async function main() {
       );
     } finally {
       globalThis.fetch = origFetch;
+      await t.cleanup();
+    }
+  });
+
+  await test("Scanner: the pair bridge reads a colo snapshot written by another isolate", async () => {
+    // The bridge's prior map used to live only in Scanner.lastPairs. Cron ticks
+    // often land on a fresh isolate, so this pins the cross-isolate carrier:
+    // the first scanner writes the resolved map, the SECOND scanner (no local
+    // prior map) reads it, and the THIRD must refuse the entry it bridged.
+    const { Scanner } = require("../dist/scanner.js");
+    const t = tmpDb();
+    const origFetch = globalThis.fetch;
+    const origCaches = globalThis.caches;
+    const store = new Map();
+    globalThis.caches = {
+      default: {
+        async match(request) {
+          const hit = store.get(request.url);
+          return hit
+            ? new Response(hit.body, { headers: hit.headers })
+            : null;
+        },
+        async put(request, response) {
+          store.set(request.url, {
+            body: await response.text(),
+            headers: response.headers,
+          });
+        },
+      },
+    };
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      await db.saveChatSettings({
+        chatId: "chat-edge-bridge",
+        minLiquidityUsd: 0,
+        minVolume24hUsd: 0,
+        minMarketCapUsd: 10_000_000,
+        maxMarketCapUsd: 1_000_000_000,
+        minAgeMinutes: 0,
+        maxAgeMinutes: 100_000,
+        min5mVolUsd: 0,
+        min1hVolUsd: 0,
+        min5mChgPct: 0,
+        min1hChgPct: 0,
+        enabled: true,
+      });
+      const cfg = loadConfig({});
+      const pair = {
+        chainId: "solana",
+        url: "https://dexscreener.com/solana/pair-EDGECOIN",
+        pairAddress: "pair-EDGECOIN",
+        baseToken: { address: "EDGECOIN", name: "Edge", symbol: "EDGE" },
+        priceUsd: "0.001",
+        marketCap: 100_000,
+        volume: { h24: 100_000, h1: 10_000, m5: 1_000 },
+        priceChange: { m5: 1, h1: 2 },
+        txns: { m5Buys: 1, m5Sells: 1, h1Buys: 1, h1Sells: 1 },
+        liquidity: { usd: 50_000 },
+        pairCreatedAt: Date.now() - 3_600_000,
+        contentAt: Date.now(),
+      };
+      const makeScanner = (pairsForTick) => {
+        const dex = new DexScreenerClient(cfg);
+        dex.fetchLatestSolanaProfiles = async () => [
+          { tokenAddress: "EDGECOIN" },
+        ];
+        dex.fetchPairsForTokens = async () => pairsForTick();
+        return new Scanner(
+          db, { api: { sendMessage: async () => ({}) } }, dex, cfg,
+          null, null, null, null, null, null, null,
+        );
+      };
+
+      // This scanner's local map is empty; only the colo carrier can answer.
+      const first = makeScanner(() => new Map([["EDGECOIN", pair]]));
+      await first.runOnce();
+      assert.equal(first.lastSummary?.pairsReused, 0, "a healthy first tick reuses nothing");
+
+      const second = makeScanner(() => new Map());
+      await second.runOnce();
+      assert.equal(
+        second.lastSummary?.pairsReused,
+        1,
+        "a different isolate reads the previous isolate's pair snapshot",
+      );
+
+      const third = makeScanner(() => new Map());
+      await third.runOnce();
+      assert.equal(
+        third.lastSummary?.pairsReused,
+        0,
+        "a bridged entry is not reused again by the next isolate",
+      );
+      assert.equal(
+        third.lastSummary?.pairsMissingFeed,
+        1,
+        "the untouched feed coin is reported missing rather than resurrected",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+      if (origCaches === undefined) delete globalThis.caches;
+      else globalThis.caches = origCaches;
       await t.cleanup();
     }
   });

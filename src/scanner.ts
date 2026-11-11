@@ -2193,8 +2193,147 @@ export function pairFallbackPlan(
 export const PAIR_CACHE_FALLBACK_MAX_AGE_MS = 90_000;
 
 /**
- * Fill this tick's unanswered addresses from the previous tick's resolved pair
- * map (see PAIR_CACHE_FALLBACK_MAX_AGE_MS).
+ * The cross-isolate carrier for the pair bridge (Cloudflare's Cache API).
+ *
+ * WHY THIS EXISTS: the bridge above originally lived only in
+ * `Scanner.lastPairs`, i.e. inside one isolate. Cron ticks are routinely
+ * served by a fresh isolate, so the map needed by the very next tick was
+ * often not there at all — the bridge could only help a warm isolate. This
+ * carrier publishes the last fully-resolved pair map for the colo, so a cold
+ * isolate can fill the same gaps without a second Dex/Jupiter request.
+ *
+ * The carrier is deliberately per-colo, like the re-eval pool and pin
+ * snapshots: the Cache API is not a global store. A different colo still
+ * starts cold, but any isolate in this colo can answer. Entries are bounded
+ * by PAIR_CACHE_FALLBACK_MAX_AGE_MS and by each reading's own content age; the
+ * carrier never weakens either guard.
+ */
+export const PAIR_SNAPSHOT_CACHE_URL = "https://pair-snapshot.internal/v1";
+/**
+ * Cap on the carrier. The scan's own address list is at most a few hundred
+ * (feed + rotation slice + tracker head); 512 is headroom, not a target.
+ */
+export const PAIR_SNAPSHOT_EDGE_MAX = 512;
+
+/** A resolved pair map plus the age/no-chain metadata the bridge needs. */
+export interface PairBridgeSnapshot {
+  at: number;
+  pairs: Map<string, PairInfo>;
+  fallback: Set<string>;
+}
+
+/** Shape check for a cached PairInfo; a malformed entry is simply skipped. */
+function isPairInfo(value: unknown): value is PairInfo {
+  if (!value || typeof value !== "object") return false;
+  const pair = value as Partial<PairInfo>;
+  return (
+    typeof pair.pairAddress === "string" &&
+    pair.pairAddress.length > 0 &&
+    !!pair.baseToken &&
+    typeof pair.baseToken.address === "string"
+  );
+}
+
+/**
+ * Parse a carrier body without trusting it. The cache is an optimization, not
+ * an authority: a malformed entry, an old map or an empty map is a miss, and
+ * the caller falls back to the lanes. `at` is the time the RESOLVED MAP was
+ * captured, not the time this isolate read the cache entry.
+ */
+export function parsePairBridgeSnapshot(
+  raw: unknown,
+  now: number,
+  maxAgeMs: number = PAIR_CACHE_FALLBACK_MAX_AGE_MS,
+): PairBridgeSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const body = raw as {
+    v?: unknown;
+    at?: unknown;
+    pairs?: unknown;
+    fallback?: unknown;
+  };
+  if (body.v !== 1) return null;
+  if (
+    typeof body.at !== "number" ||
+    !Number.isFinite(body.at) ||
+    body.at <= 0 ||
+    now - body.at > maxAgeMs
+  ) {
+    return null;
+  }
+  const pairs = new Map<string, PairInfo>();
+  if (body.pairs && typeof body.pairs === "object") {
+    for (const [token, value] of Object.entries(
+      body.pairs as Record<string, unknown>,
+    )) {
+      if (pairs.size >= PAIR_SNAPSHOT_EDGE_MAX) break;
+      if (!isPairInfo(value)) continue;
+      pairs.set(token, value);
+    }
+  }
+  if (pairs.size === 0) return null;
+  const fallback = new Set<string>();
+  if (Array.isArray(body.fallback)) {
+    for (const token of body.fallback) {
+      if (fallback.size >= PAIR_SNAPSHOT_EDGE_MAX) break;
+      if (typeof token === "string" && token.length > 0) fallback.add(token);
+    }
+  }
+  return { at: body.at, pairs, fallback };
+}
+
+/**
+ * Merge the local previous-tick map with the colo carrier. The local map wins
+ * when both name an address; the older `at` wins so an undated Jupiter reading
+ * from the carrier cannot be made to look younger by a newer local map. If the
+ * local map is stale, it is ignored entirely and the carrier stands alone.
+ */
+export function mergePairBridgeSnapshots(
+  local: {
+    pairs: ReadonlyMap<string, PairInfo>;
+    at: number;
+    fallback: ReadonlySet<string>;
+  } | null,
+  edge: PairBridgeSnapshot | null,
+  now: number,
+  maxAgeMs: number = PAIR_CACHE_FALLBACK_MAX_AGE_MS,
+): PairBridgeSnapshot | null {
+  let merged: PairBridgeSnapshot | null = null;
+  if (
+    local &&
+    local.at > 0 &&
+    now - local.at <= maxAgeMs &&
+    local.pairs.size > 0
+  ) {
+    merged = {
+      at: local.at,
+      pairs: new Map(local.pairs),
+      fallback: new Set(local.fallback),
+    };
+  }
+  if (!edge) return merged;
+  if (!merged) {
+    return {
+      at: edge.at,
+      pairs: new Map(edge.pairs),
+      fallback: new Set(edge.fallback),
+    };
+  }
+  const pairs = new Map(merged.pairs);
+  for (const [token, pair] of edge.pairs) {
+    if (!pairs.has(token)) pairs.set(token, pair);
+  }
+  return {
+    at: Math.min(merged.at, edge.at),
+    pairs,
+    fallback: new Set([...merged.fallback, ...edge.fallback]),
+  };
+}
+
+/**
+ * Fill this tick's unanswered addresses from the previous resolved pair map
+ * (the isolate-local map, or the colo carrier — see
+ * PAIR_SNAPSHOT_CACHE_URL).
  *
  * Pure and exported so the safety rules are unit-tested: an entry is reused
  * only when (1) the previous map is young enough, (2) it was not itself a
@@ -7712,18 +7851,36 @@ export class Scanner {
       );
       const bridgeDue =
         pairsByToken.size < addresses.length * 0.5 || poolGap;
-      const reusedPairs = bridgeDue
-        ? fillPairGapsFromPriorCache(
-            addresses,
-            pairsByToken,
-            {
-              pairs: priorPairs,
-              at: priorPairsAt,
-              fallback: priorPairsFallback,
-            },
-            Date.now(),
+      const bridgeNow = Date.now();
+      // The local map is the first source; the colo carrier is the second.
+      // Reading it only when the bridge is actually due keeps a healthy tick
+      // free of the extra cache lookup, while a cold isolate gets the map a
+      // previous isolate resolved one tick ago.
+      const edgePrior = bridgeDue
+        ? await this.pairBridgeSnapshotFromEdge(bridgeNow)
+        : null;
+      const priorBridge = bridgeDue
+        ? mergePairBridgeSnapshots(
+            priorPairsAt > 0
+              ? {
+                  pairs: priorPairs,
+                  at: priorPairsAt,
+                  fallback: priorPairsFallback,
+                }
+              : null,
+            edgePrior,
+            bridgeNow,
           )
-        : new Set<string>();
+        : null;
+      const reusedPairs =
+        bridgeDue && priorBridge
+          ? fillPairGapsFromPriorCache(
+              addresses,
+              pairsByToken,
+              priorBridge,
+              bridgeNow,
+            )
+          : new Set<string>();
       // Fallback: when DexScreener's batched endpoint is blocked (shared
       // egress 429s — observed 2026-08-22, pairs: 0/550), source the gate
       // data from Jupiter's token API instead. It carries every input the
@@ -7858,8 +8015,18 @@ export class Scanner {
       // lane this tick may be reused then, and the whole map expires after
       // PAIR_CACHE_FALLBACK_MAX_AGE_MS.
       this.lastPairs = pairsByToken;
-      this.lastPairsAt = Date.now();
+      const snapshotAt = Date.now();
+      this.lastPairsAt = snapshotAt;
       this.lastPairsFallback = reusedPairs;
+      // The carrier is what lets the NEXT tick — often a different isolate —
+      // use this map. A low-coverage tick is refused by the writer so it cannot
+      // replace a healthy snapshot with a sparse one.
+      await this.pairBridgeSnapshotToEdge(
+        pairsByToken,
+        reusedPairs,
+        snapshotAt,
+        addresses,
+      );
       // The front's resolved map, Jupiter fallback included (see onPairs):
       // this is the tick's ONE chance to durably record what each pool holds,
       // and the fallback is the leg that answers on a 429 episode.
@@ -10537,6 +10704,89 @@ export class Scanner {
         .catch(fail);
     } catch (err) {
       fail(err);
+    }
+  }
+
+  /**
+   * Read the colo carrier for the pair bridge (see
+   * PAIR_SNAPSHOT_CACHE_URL). Never throws: a runtime without the Cache API,
+   * a malformed body and a failed cache call are all a miss, which leaves the
+   * bridge on the isolate-local map (or with no prior map at all), exactly as
+   * it behaved before this carrier existed.
+   */
+  private async pairBridgeSnapshotFromEdge(
+    now: number,
+  ): Promise<PairBridgeSnapshot | null> {
+    const cache = poolEdgeCache();
+    if (!cache) return null;
+    try {
+      const hit = await cache.match(new Request(PAIR_SNAPSHOT_CACHE_URL));
+      if (!hit) return null;
+      return parsePairBridgeSnapshot(await hit.json(), now);
+    } catch (err) {
+      console.error(
+        "[scanner] pair bridge snapshot cache read failed:",
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Publish the current resolved map for the next isolate. The write is
+   * AWAITED: this sits in the pair phase, where the tick still has its own
+   * stats/gates to run, and a local colo put costs milliseconds — letting it
+   * race the invocation is what makes the carrier randomly miss on a cold
+   * isolate.
+   *
+   * A LOW-COVERAGE TICK DOES NOT OVERWRITE A HEALTHY SNAPSHOT. If this tick
+   * answered under half of the addresses it asked for, its map is not a good
+   * bridge source; keeping the previous entry is strictly better than replacing
+   * 200 readings with 45. The 90s TTL still forces the entry to expire.
+   */
+  private async pairBridgeSnapshotToEdge(
+    pairs: ReadonlyMap<string, PairInfo>,
+    fallback: ReadonlySet<string>,
+    at: number,
+    addresses: readonly string[],
+  ): Promise<void> {
+    const cache = poolEdgeCache();
+    if (!cache || pairs.size === 0 || addresses.length === 0) return;
+    if (pairs.size < addresses.length * 0.5) return;
+    const bodyPairs: Record<string, PairInfo> = {};
+    let count = 0;
+    for (const [token, pair] of pairs) {
+      if (count >= PAIR_SNAPSHOT_EDGE_MAX) break;
+      bodyPairs[token] = pair;
+      count += 1;
+    }
+    const body = {
+      v: 1,
+      at,
+      pairs: bodyPairs,
+      fallback: [...fallback]
+        .filter((token) => pairs.has(token))
+        .slice(0, PAIR_SNAPSHOT_EDGE_MAX),
+    };
+    const ttlS = Math.max(
+      POOL_EDGE_CACHE_MIN_TTL_S,
+      Math.round(PAIR_CACHE_FALLBACK_MAX_AGE_MS / 1000),
+    );
+    try {
+      await cache.put(
+        new Request(PAIR_SNAPSHOT_CACHE_URL),
+        new Response(JSON.stringify(body), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "max-age=" + ttlS,
+          },
+        }),
+      );
+    } catch (err) {
+      console.error(
+        "[scanner] pair bridge snapshot cache write failed:",
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 
