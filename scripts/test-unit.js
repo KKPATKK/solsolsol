@@ -7372,6 +7372,110 @@ async function main() {
     }
   });
 
+  await test("Scanner: the pair bridge expires and never becomes a permanent stale cache", async () => {
+    const {
+      fillPairGapsFromPriorCache,
+      mergePairBridgeSnapshots,
+      parsePairBridgeSnapshot,
+      PAIR_CACHE_FALLBACK_MAX_AGE_MS,
+    } = require("../dist/scanner.js");
+    const { PAIR_CONTENT_MAX_AGE_MS } = require("../dist/dexscreener.js");
+    const now = 1_800_000_000_000;
+    const pair = {
+      chainId: "solana",
+      url: "https://dexscreener.com/solana/pair-STALE",
+      pairAddress: "pair-STALE",
+      baseToken: { address: "STALE", name: "Stale", symbol: "STALE" },
+      priceUsd: "0.001",
+      marketCap: 100_000,
+      volume: { h24: 100_000, h1: 10_000, m5: 1_000 },
+      priceChange: { m5: 1, h1: 2 },
+      txns: { m5Buys: 1, m5Sells: 1, h1Buys: 1, h1Sells: 1 },
+      liquidity: { usd: 50_000 },
+      pairCreatedAt: now - 3_600_000,
+      contentAt: now,
+    };
+    const withContentAt = (contentAt) => ({ ...pair, contentAt });
+
+    // The carrier's own map age is the first bound. An old entry is a MISS,
+    // not a source a later isolate can keep refreshing.
+    assert.equal(
+      parsePairBridgeSnapshot(
+        {
+          v: 1,
+          at: now - PAIR_CACHE_FALLBACK_MAX_AGE_MS - 1,
+          pairs: { STALE: pair },
+          fallback: [],
+        },
+        now,
+      ),
+      null,
+      "an over-age carrier snapshot is not readable",
+    );
+
+    // A young snapshot does not make old CONTENT young: the individual
+    // reading still has to pass PAIR_CONTENT_MAX_AGE_MS.
+    const staleContent = parsePairBridgeSnapshot(
+      {
+        v: 1,
+        at: now - 1_000,
+        pairs: {
+          STALE: withContentAt(now - PAIR_CONTENT_MAX_AGE_MS - 1),
+        },
+        fallback: [],
+      },
+      now,
+    );
+    assert.ok(staleContent, "the carrier itself is young");
+    assert.equal(
+      fillPairGapsFromPriorCache(["STALE"], new Map(), staleContent, now).size,
+      0,
+      "an over-age reading is never bridged from a young snapshot",
+    );
+
+    // Consecutive ticks/isolates: the first bridge may fill the gap, but the
+    // address is then in fallback; every later generation must reuse zero.
+    let prior = parsePairBridgeSnapshot(
+      { v: 1, at: now, pairs: { STALE: pair }, fallback: [] },
+      now,
+    );
+    assert.ok(prior);
+    let bridged = 0;
+    for (let tick = 1; tick <= 4; tick += 1) {
+      const at = now + tick * 30_000;
+      const reused = fillPairGapsFromPriorCache(["STALE"], new Map(), prior, at);
+      bridged += reused.size;
+      prior = {
+        pairs: prior.pairs,
+        at,
+        fallback: new Set([...prior.fallback, ...reused]),
+      };
+    }
+    assert.equal(
+      bridged,
+      1,
+      "a stale reading may bridge exactly one generation, not four",
+    );
+
+    // Merge must keep the older age: a fresh local map cannot make an old
+    // carrier entry look young again.
+    const merged = mergePairBridgeSnapshots(
+      {
+        pairs: new Map([["LOCAL", pair]]),
+        at: now + 30_000,
+        fallback: new Set(),
+      },
+      {
+        at: now,
+        pairs: new Map([["CARRIER", pair]]),
+        fallback: new Set(),
+      },
+      now + 30_000,
+    );
+    assert.ok(merged);
+    assert.equal(merged.at, now, "the older carrier age survives the merge");
+  });
+
   await test("Scanner: an owed coin's blocking gate survives the reject-log budget", async () => {
     // WHY (2026-09-27): one deferred obligation sat pending for 95 minutes with
     // every counter healthy — `deferObserved 1` on every tick, no prune, and
