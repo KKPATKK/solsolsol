@@ -4952,7 +4952,49 @@ async function main() {
     const hist = await db.getPoolHistogram(now, ["chat-1"]);
     assert.equal(hist.deadPending, 1, "one row is one empty sweep into the mark");
     assert.equal(hist.deadMarked, 1, "one row is held out of the sweep");
+    // The eligible window is 3-43h, so these 100-106m fixtures are outside
+    // its age buckets; the evidence matrix itself has a dedicated test below.
+    assert.equal(hist.eligibleByAge["0-3h"].total, 0);
+    assert.equal(hist.eligibleByAge["12-24h"].total, 0, "the bucket matrix is complete, not sparse");
     await t.cleanup();
+  });
+
+  await test("getPoolHistogram: eligible rows are split by age and evidence, not just one headline", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      const seed = async (token, ageH, mcap, liq, lastLiq, streak = 0) => {
+        await t.client.execute({
+          sql: `INSERT INTO token_stats
+                  (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms,
+                   max_mcap_observed, max_liquidity_observed, last_liquidity_usd,
+                   sweeps_since_reading)
+                VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)`,
+          args: [token, now - ageH * 3600_000, ageH * 60, now - ageH * 3600_000, mcap, liq, lastLiq, streak],
+        });
+      };
+      await seed("FULL", 4, 120_000, 40_000, 25_000, 0);
+      await seed("MCAP_ONLY", 7, 120_000, null, null, 0);
+      await seed("NONE", 13, null, null, null, 0);
+      const hist = await db.getPoolHistogram(now, ["chat-1"]);
+      assert.deepEqual(
+        hist.eligibleByAge["3-6h"],
+        { total: 1, mcapEvidenced: 1, liquidityEvidenced: 1, recentLiquidity: 1 },
+      );
+      assert.deepEqual(
+        hist.eligibleByAge["6-12h"],
+        { total: 1, mcapEvidenced: 1, liquidityEvidenced: 0, recentLiquidity: 0 },
+      );
+      assert.deepEqual(
+        hist.eligibleByAge["12-24h"],
+        { total: 1, mcapEvidenced: 0, liquidityEvidenced: 0, recentLiquidity: 0 },
+      );
+      assert.equal(hist.eligibleInWindow, 3, "the headline still counts the whole window");
+    } finally {
+      await t.cleanup();
+    }
   });
 
   // The write itself is EDGE-TRIGGERED (2026-10-14). Re-writing every reading
@@ -10293,6 +10335,73 @@ async function main() {
     );
   });
 
+  await test("pool far evidence gate: liquidity evidence or a recent reading, with a deterministic exploration lane", () => {
+    const {
+      poolFarEvidenceOk,
+      poolFarExplorationBucket,
+      POOL_FAR_NO_EVIDENCE_DIVISOR,
+    } = require("../dist/scanner.js");
+    const base = {
+      maxMcapObserved: 120_000,
+      maxLiquidityObserved: null,
+      lastLiquidityUsd: null,
+      sweepsSinceReading: 0,
+    };
+    assert.equal(poolFarEvidenceOk(base), false, "a market-cap peak with no liquidity evidence is not enough");
+    assert.equal(
+      poolFarEvidenceOk({ ...base, maxLiquidityObserved: 40_000 }),
+      true,
+      "a lifetime liquidity reading is evidence the pool existed",
+    );
+    assert.equal(
+      poolFarEvidenceOk({ ...base, lastLiquidityUsd: 25_000 }),
+      true,
+      "a recent reading admits a row even without the lifetime column",
+    );
+    assert.equal(
+      poolFarEvidenceOk({ ...base, lastLiquidityUsd: 25_000, sweepsSinceReading: 3 }),
+      false,
+      "a stale reading is not recent — the same freshness bound as the dead-pool mark",
+    );
+    assert.equal(
+      poolFarEvidenceOk({ ...base, maxMcapObserved: null, maxLiquidityObserved: 40_000 }),
+      false,
+      "no market-cap evidence is still out, whatever liquidity says",
+    );
+    const tokens = Array.from({ length: 64 }, (_, i) => `FAR_${i}`);
+    const buckets = tokens.map(poolFarExplorationBucket);
+    assert.equal(POOL_FAR_NO_EVIDENCE_DIVISOR, 8);
+    assert.equal(new Set(buckets).size, 8, "the exploration hash covers every bucket");
+    assert.ok(buckets.includes(0), "at least one sampled lane exists");
+    assert.equal(
+      new Set(tokens.map(poolFarExplorationBucket)).size,
+      8,
+      "the sample is stable across calls (no per-tick random starvation)",
+    );
+    const strip = (text) =>
+      text
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const scannerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+    );
+    assert.ok(
+      scannerSrc.includes("if(zone===\"far\"){conststats=recentStatsByToken.get(p.tokenAddress);if(!stats||!poolFarEvidenceOk(stats)){if(poolFarExplorationBucket(p.tokenAddress)!==0)") ,
+      "the far gate must run before the slice, keeping only sampled no-evidence rows",
+    );
+    assert.ok(
+      scannerSrc.indexOf("poolFarEvidenceOk(stats)") <
+        scannerSrc.indexOf("slicePoolZones(zoneLists,sliceCursors"),
+      "the gate must save the pair fetch, not only the gate CPU",
+    );
+    assert.ok(
+      scannerSrc.includes("diag.poolFarFiltered=farGate.filtered;") &&
+        scannerSrc.includes("diag.poolFarExplored=farGate.explored;"),
+      "the gate's removed/explored counts must be published",
+    );
+  });
+
   //
   // The window is allocated by each band's OWN cadence (see slicePoolZones):
   // hot's evidenced rows every tick (capped), near's over its 6-tick
@@ -11178,6 +11287,18 @@ async function main() {
         candidates: 1,
         pushed: 0,
         organicWhy: "backoff",
+        pairsReused: 12,
+        pairsMissing: 2,
+        poolSliced: 140,
+        poolStale: 0,
+        poolLanes: { hot: 20, near: 70, far: 40, filler: 10 },
+        poolServed: { hot: 18, near: 60, far: 30, filler: 10 },
+        poolZoneCandidates: { hot: 1, near: 0, far: 0, filler: 0 },
+        poolZonePushed: { hot: 0, near: 0, far: 0, filler: 0 },
+        poolFarFiltered: 3,
+        poolFarExplored: 1,
+        poolMisses: 0,
+        poolUnreadable: 0,
         ...over,
       });
       const history = {
@@ -11198,6 +11319,21 @@ async function main() {
       assert.equal(rows[0].pairsJup, 184, "the Jupiter share is what tells a refused pair lane");
       assert.equal(rows[0].pushed, 0);
       assert.equal(rows[0].organicWhy, "backoff", "the card-read reason survives the tick");
+      assert.equal(rows[0].pairsReused, 12, "the cache-bridge reading is durable, not only in /health");
+      assert.equal(rows[0].pairsMissing, 2);
+      assert.equal(rows[0].poolSliced, 140);
+      assert.deepEqual(
+        rows[0].poolLanes,
+        { hot: 20, near: 70, far: 40, filler: 10 },
+        "the lane cohort round-trips as JSON",
+      );
+      assert.deepEqual(
+        rows[0].poolZoneCandidates,
+        { hot: 1, near: 0, far: 0, filler: 0 },
+        "candidate yield is attributable to the pool lane",
+      );
+      assert.equal(rows[0].poolFarFiltered, 3, "the far gate's removed rows survive the tick");
+      assert.equal(rows[0].poolFarExplored, 1, "and so does its exploration lane");
       assert.deepEqual(
         rows[0].feedLegs,
         { profiles: 6, jup: 132, pump: 204, meteora: 259, raydium: 343 },

@@ -9,6 +9,7 @@ import {
   removeUnconfirmedCardSend,
 } from "./deferrallog";
 import {
+  DEAD_POOL_MISS_MAX,
   DEX_BOOSTS_AT_KEY,
   DEX_PROFILES_LAST_KEY,
   GECKO_DISCOVERY_AT_KEY,
@@ -1884,6 +1885,56 @@ export function poolZoneTicks(slots: number, cacheMs: number): number {
 }
 
 /**
+ * Far-tier evidence gate (2026-11-12).
+ *
+ * The pool query already drops rows with no market-cap evidence after the
+ * 3h grace, but a far row can still have a market-cap high-water and NO
+ * liquidity evidence: `max_liquidity_observed IS NULL` is deliberately
+ * fail-open in the query, and the dead-liquidity mark can only judge a row it
+ * has actually read. Those rows are old enough that another pair/eval slot is
+ * unlikely to turn them into a candidate; the 240-tick audit's far lane was
+ * the largest age cohort and the smallest candidate yield.
+ *
+ * The gate is applied in the scanner BEFORE the slice and pair fetch, so it
+ * saves the expensive half of the tick, not just the gate CPU. It is not a
+ * hard drop: 1/8 of the no-evidence rows are kept deterministically as the
+ * exploration lane, preserving the chance that a late pool appears. The hash
+ * is stable across isolates (unlike a per-tick random sample), so a row's
+ * exploration turn cannot move just because the request landed on a cold
+ * isolate.
+ *
+ * A row with either a lifetime liquidity reading or a recent one is allowed:
+ * the former is evidence the pool existed; the latter is the stronger signal
+ * and is bounded by the same freshness mark the query uses.
+ */
+export const POOL_FAR_NO_EVIDENCE_DIVISOR = 8;
+
+export function poolFarExplorationBucket(token: string): number {
+  if (token.length === 0) return 0;
+  const first = token.charCodeAt(0);
+  const last = token.charCodeAt(token.length - 1);
+  return (first + last * 17) % POOL_FAR_NO_EVIDENCE_DIVISOR;
+}
+
+export function poolFarEvidenceOk(
+  stats: Pick<
+    TokenStats,
+    "maxMcapObserved" | "maxLiquidityObserved" | "lastLiquidityUsd" | "sweepsSinceReading"
+  >,
+): boolean {
+  if (stats.maxMcapObserved === null || stats.maxMcapObserved === undefined)
+    return false;
+  if (
+    stats.maxLiquidityObserved !== null &&
+    stats.maxLiquidityObserved !== undefined
+  )
+    return true;
+  if (stats.lastLiquidityUsd === null || stats.lastLiquidityUsd === undefined)
+    return false;
+  return (stats.sweepsSinceReading ?? 0) < DEAD_POOL_MISS_MAX;
+}
+
+/**
  * The per-zone slice cursors — the rotation's durable memory.
  *
  * One cursor per FAST zone (hot / near / far) plus one for the filler lane.
@@ -3426,12 +3477,15 @@ export interface ScanSummary {
    * see RE_EVAL_PER_TICK_MAX). Undefined on pre-fix summaries. */
   poolSliced?: number;
   /**
-   * Zone populations the tick's slice saw (see slicePoolZones): the returned
-   * evidenced rows split by band (hot / near / far) and the no-evidence
-   * filler lane. Read WITH `poolServed`: the lanes are what the window had to
-   * choose from, `poolServed` is what it actually took from each — a zone
-   * whose served count is 0 across ticks is starving, while a zone whose
-   * served count equals its size is being taken whole (and its cursor reset).
+   * Zone populations the tick's slice saw (see slicePoolZones): the evidenced
+   * rows that survived the far-tier gate, split by band (hot / near / far),
+   * plus the no-evidence filler lane. Read WITH `poolServed`: the lanes are
+   * what the window had to choose from, `poolServed` is what it actually took
+   * from each — a zone whose served count is 0 across ticks is starving,
+   * while a zone whose served count equals its size is being taken whole (and
+   * its cursor reset). The RAW query's zone/evidence composition is on
+   * /debug/pool.poolQueryBreakdown; `poolFarFiltered` / `poolFarExplored`
+   * account for the difference.
    */
   poolSliceLanes?: {
     hot: number;
@@ -3445,6 +3499,18 @@ export interface ScanSummary {
    * it is the acceptance reading for the 3-min near / 12-min far cadence.
    */
   poolServed?: { hot: number; near: number; far: number; filler: number };
+  /**
+   * Candidates and pushes attributable to each POOL lane. Feed coins are
+   * excluded: the feed has no zone, and mixing the two would make the far
+   * lane's yield unreadable. Multiple chats can contribute more than one row
+   * per coin, exactly like the existing `candidates` / `pushed` totals.
+   */
+  poolZoneCandidates?: { hot: number; near: number; far: number; filler: number };
+  poolZonePushed?: { hot: number; near: number; far: number; filler: number };
+  /** Far-tier rows removed by the liquidity-evidence gate before pair/eval. */
+  poolFarFiltered?: number;
+  /** Far-tier rows kept by the deterministic exploration lane. */
+  poolFarExplored?: number;
   /**
    * Pool coins the sweep asked for and got NO reading back for (2026-10-08 —
    * see poolSweepMisses / db.DEAD_POOL_MISS_MAX). This is the freshness
@@ -7704,6 +7770,9 @@ export class Scanner {
           )
           .map((s) => s.token),
       );
+      const recentStatsByToken = new Map(
+        recentStats.map((s) => [s.token, s] as const),
+      );
       // The zone tag comes from the row's launch time and the SAME window
       // entry the pool query was built with (see db.poolZoneOfLaunch).
       const poolWindowEntryMs = poolNow - poolMinAgeMin * 60_000;
@@ -7715,13 +7784,35 @@ export class Scanner {
         "hot" | "near" | "far" | "filler",
         TokenProfile[]
       > = { hot: [], near: [], far: [], filler: [] };
+      // P1 (2026-11-12): the far lane is the old tail with the lowest
+      // candidate yield. A far row with a market-cap reading but no
+      // liquidity evidence has never been shown to hold a pool; the query's
+      // liquidity floor deliberately fails open on NULL, so this is the lane
+      // that keeps paying for it. Keep 1/8 deterministic as exploration so a
+      // late pool can still be found — the gate must never be a one-way
+      // verdict. It runs BEFORE the slice and pair fetch, which is where the
+      // saving is earned.
+      const farGate = { filtered: 0, explored: 0 };
       for (const p of poolOnly) {
         if (!evidencedTokens.has(p.tokenAddress)) {
           zoneLists.filler.push(p);
           continue;
         }
-        zoneLists[zoneByToken.get(p.tokenAddress) ?? "far"].push(p);
+        const zone = zoneByToken.get(p.tokenAddress) ?? "far";
+        if (zone === "far") {
+          const stats = recentStatsByToken.get(p.tokenAddress);
+          if (!stats || !poolFarEvidenceOk(stats)) {
+            if (poolFarExplorationBucket(p.tokenAddress) !== 0) {
+              farGate.filtered += 1;
+              continue;
+            }
+            farGate.explored += 1;
+          }
+        }
+        zoneLists[zone].push(p);
       }
+      diag.poolFarFiltered = farGate.filtered;
+      diag.poolFarExplored = farGate.explored;
       // The durable cursors (db.POOL_SLICE_CURSOR_KEY) are read off the front's
       // ONE read — never an extra request — and written back on its ONE write.
       // No front (a standalone Scanner) keeps the isolate-local copy, exactly
@@ -7769,6 +7860,21 @@ export class Scanner {
       };
       diag.poolServed = served;
       diag.poolSliced = poolSlice.length;
+      // The pool slice's own zone map, used to attribute candidates and
+      // pushes to a lane without counting feed coins. It is built from the
+      // SLICE, not the returned cohort, so a row the gate removed can never
+      // appear in a yield denominator.
+      const poolSliceZoneByToken = new Map<
+        string,
+        "hot" | "near" | "far" | "filler"
+      >();
+      for (const zone of ["hot", "near", "far", "filler"] as const) {
+        for (const p of zoneLists[zone]) {
+          poolSliceZoneByToken.set(p.tokenAddress, zone);
+        }
+      }
+      const poolZoneCandidates = { hot: 0, near: 0, far: 0, filler: 0 };
+      const poolZonePushed = { hot: 0, near: 0, far: 0, filler: 0 };
       const evalStart = Date.now();
       const scannedProfiles: TokenProfile[] = [...feedOnly, ...poolSlice];
       // REJECT_LOG_MAX (20) is smaller than feed+slice (~90+ coins/tick), so
@@ -8246,6 +8352,11 @@ export class Scanner {
       diag.agedEval = agedEval.count;
       diag.staleReadings = staleReadings.count;
       diag.candidates = candidates.length;
+      for (const coin of candidates) {
+        const zone = poolSliceZoneByToken.get(coin.profile.tokenAddress);
+        if (zone) poolZoneCandidates[zone] += 1;
+      }
+      diag.poolZoneCandidates = poolZoneCandidates;
       // The prune's counters belong to THIS tick, so they are refreshed
       // here — the same pattern the recovery path uses for
       // deferRecovered/deferPending at its send site. The diag object is
@@ -9324,6 +9435,10 @@ export class Scanner {
             diag.deferPending = this.deferredPushes.pendingCount;
           }
           pushed++;
+          {
+            const zone = poolSliceZoneByToken.get(c.profile.tokenAddress);
+            if (zone) poolZonePushed[zone] += 1;
+          }
           // Start post-push tracking (🚀/⚠️/💀 follow-ups). Best-effort and
           // deduped by the table's PK — never affects the push itself.
           this.markPhase(diag, "send:track", startedAt);
@@ -9412,6 +9527,7 @@ export class Scanner {
         }
       }
       diag.pushed = pushed;
+      diag.poolZonePushed = poolZonePushed;
       diag.evalMs = Date.now() - evalStart;
       // The post-push tracker pass USED to run here, last, on whatever the
       // tick had left. It now runs in the worker's tick tail instead (see

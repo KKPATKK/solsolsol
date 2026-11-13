@@ -122,6 +122,15 @@ test("a full tick maps every leg and the front split", () => {
         evalMs: 1624,
         dbMs: 1200,
         poolStale: 1259,
+        poolSliced: 140,
+        poolSliceLanes: { hot: 20, near: 70, far: 40, filler: 10 },
+        poolServed: { hot: 18, near: 60, far: 30, filler: 10 },
+        poolZoneCandidates: { hot: 1, near: 0, far: 0, filler: 0 },
+        poolZonePushed: { hot: 0, near: 0, far: 0, filler: 0 },
+        poolFarFiltered: 3,
+        poolFarExplored: 1,
+        poolMisses: 1,
+        poolUnreadable: 2,
         // The chain's own readings (2026-10-22): which step the tick was in
         // and what the expensive waits cost — the half that survives a slow
         // tick in the ring instead of only in the latest heartbeat.
@@ -180,6 +189,15 @@ test("a full tick maps every leg and the front split", () => {
   assert.equal(row.evalMs, 1624);
   assert.equal(row.dbMs, 1200);
   assert.equal(row.poolStale, 1259);
+  assert.equal(row.poolSliced, 140);
+  assert.deepEqual(row.poolLanes, { hot: 20, near: 70, far: 40, filler: 10 });
+  assert.deepEqual(row.poolServed, { hot: 18, near: 60, far: 30, filler: 10 });
+  assert.deepEqual(row.poolZoneCandidates, { hot: 1, near: 0, far: 0, filler: 0 });
+  assert.deepEqual(row.poolZonePushed, { hot: 0, near: 0, far: 0, filler: 0 });
+  assert.equal(row.poolFarFiltered, 3, "the far lane's removed rows survive the ring");
+  assert.equal(row.poolFarExplored, 1, "and its exploration lane is visible");
+  assert.equal(row.poolMisses, 1);
+  assert.equal(row.poolUnreadable, 2);
   assert.equal(row.pushPhase, "send:organic-wait");
   assert.equal(row.organicMs, 3400);
   assert.equal(row.organicWaited, 1);
@@ -247,6 +265,11 @@ test("a cut tick with no summary records null legs, not zeros", () => {
   assert.equal(row.feedJoinMs, null);
   assert.equal(row.evalMs, null);
   assert.equal(row.poolStale, null);
+  assert.equal(row.poolSliced, null);
+  assert.equal(row.poolLanes, null, "no summary = no fabricated lane cohort");
+  assert.equal(row.poolZoneCandidates, null);
+  assert.equal(row.poolFarFiltered, null);
+  assert.equal(row.poolMisses, null);
   assert.equal(row.preStartMs, null);
   assert.equal(row.steps, null);
   assert.equal(row.pushPhase, null);

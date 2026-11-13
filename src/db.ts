@@ -756,6 +756,15 @@ export interface TokenStats {
    * seen with pair data → kept.
    */
   maxLiquidityObserved?: number | null;
+  /**
+   * Liquidity from the most recent pair reading (null = none since the column
+   * existed). The pool's dead-liquidity predicate reads it; the scanner's
+   * far-tier evidence gate also uses it as the "recent reading" half so a row
+   * with only a stale lifetime peak is not mistaken for a live pool.
+   */
+  lastLiquidityUsd?: number | null;
+  /** Consecutive sweeps with no liquidity reading (see DEAD_POOL_MISS_MAX). */
+  sweepsSinceReading?: number;
   /** Cached supply-flow detector result (JSON of SupplyFlowResult), null = not analyzed. */
   supplyFlowJson: string | null;
   /** When the cached supply-flow result was produced (epoch ms). */
@@ -1515,7 +1524,12 @@ export const SCHEMA_DDL_FINGERPRINT_KEY = "schema_ddl_fingerprint";
  * — a table missing from this list is not broken, it just keeps paying
  * the old one-round-trip-per-column path.
  */
-export const COLUMN_PROBE_TABLES = ["chat_settings", "token_stats", "push_watch"] as const;
+export const COLUMN_PROBE_TABLES = [
+  "chat_settings",
+  "token_stats",
+  "push_watch",
+  "tick_legs",
+] as const;
 
 /**
  * Cache key for one column: `table\0column`. The separator is a NUL
@@ -1757,6 +1771,14 @@ export function parsePushAuditRing(
   }
 }
 
+/** Four pool lanes, used by the durable slice observability. */
+export interface PoolZoneCounts {
+  hot: number;
+  near: number;
+  far: number;
+  filler: number;
+}
+
 /**
  * One tick's per-leg row, as `tick_legs` stores it (2026-10-17).
  *
@@ -1791,6 +1813,25 @@ export interface TickLegInsert {
   pushed: number | null;
   /** Jupiter card read's reason for THIS tick's last card (see ScanSummary). */
   organicWhy: string | null;
+  /** Pair cache bridge contribution and uncovered pool coins. */
+  pairsReused: number | null;
+  pairsMissing: number | null;
+  /** Pool rows evaluated this tick and rows reused from a stale snapshot. */
+  poolSliced: number | null;
+  poolStale: number | null;
+  /** Returned pool cohort by lane (before the slice). */
+  poolLanes: PoolZoneCounts | null;
+  /** Rows the slice actually took from each lane. */
+  poolServed: PoolZoneCounts | null;
+  /** Candidates / pushes attributable to each pool lane (feed coins excluded). */
+  poolZoneCandidates: PoolZoneCounts | null;
+  poolZonePushed: PoolZoneCounts | null;
+  /** Far-tier rows the liquidity-evidence gate removed / kept as exploration. */
+  poolFarFiltered: number | null;
+  poolFarExplored: number | null;
+  /** Pool freshness-mark inputs (see ScanSummary.poolMisses / poolUnreadable). */
+  poolMisses: number | null;
+  poolUnreadable: number | null;
 }
 
 function numOrNull(v: unknown): number | null {
@@ -1818,6 +1859,22 @@ export function parseFeedLegs(raw: unknown): Record<string, number> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * `tick_legs.pool_lanes` (or served/candidates/pushed) → the four lane counts.
+ * A malformed or partial row answers null or zero for the missing lane, never a
+ * throw: a telemetry read must not be able to fail the request carrying it.
+ */
+export function parsePoolZoneCounts(raw: unknown): PoolZoneCounts | null {
+  const map = parseFeedLegs(raw);
+  if (!map) return null;
+  return {
+    hot: map.hot ?? 0,
+    near: map.near ?? 0,
+    far: map.far ?? 0,
+    filler: map.filler ?? 0,
+  };
 }
 
 /**
@@ -3028,7 +3085,19 @@ export class Db {
           feed_legs TEXT,
           candidates INTEGER,
           pushed INTEGER,
-          organic_why TEXT
+          organic_why TEXT,
+          pairs_reused INTEGER,
+          pairs_missing INTEGER,
+          pool_sliced INTEGER,
+          pool_stale INTEGER,
+          pool_lanes TEXT,
+          pool_served TEXT,
+          pool_zone_candidates TEXT,
+          pool_zone_pushed TEXT,
+          pool_far_filtered INTEGER,
+          pool_far_explored INTEGER,
+          pool_misses INTEGER,
+          pool_unreadable INTEGER
         );`,
         // The re-eval pool query filters token_stats by first_seen_at and
         // anti-joins seen_tokens every tick; these indexes keep it fast as
@@ -3442,6 +3511,22 @@ export class Db {
     // still there?" — this column can, and it is what the pool's dead-pool
     // prune reads. Unconditional because addColumnIfMissing is idempotent.
     await this.addColumnIfMissing("token_stats", "last_liquidity_usd", "REAL");
+    // Per-tick pool observability (2026-11-12). These ride tick_legs instead
+    // of the latest-only heartbeat: the 240-tick audit could not tell a pool
+    // slice's zone mix from its pair/eval outcome because the durable row kept
+    // only totals. Unconditional — addColumnIfMissing is idempotent.
+    await this.addColumnIfMissing("tick_legs", "pairs_reused", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pairs_missing", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pool_sliced", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pool_stale", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pool_lanes", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "pool_served", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "pool_zone_candidates", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "pool_zone_pushed", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "pool_far_filtered", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pool_far_explored", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pool_misses", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pool_unreadable", "INTEGER");
     // Freshness OF that reading (2026-10-08): how many consecutive pool sweeps
     // have come back with NO reading for this coin (see DEAD_POOL_MISS_MAX).
     // The column above judges what a reading SAID; this one judges whether the
@@ -4630,7 +4715,10 @@ export class Db {
     const res = await this.get().execute({
       sql: `SELECT at, via, ms, profiles, pool, pairs, pairs_jup, jup, pump,
                    meteora, raydium, geo, boosts, feed_legs, candidates,
-                   pushed, organic_why
+                   pushed, organic_why, pairs_reused, pairs_missing, pool_sliced,
+                   pool_stale, pool_lanes, pool_served, pool_zone_candidates,
+                   pool_zone_pushed, pool_far_filtered, pool_far_explored,
+                   pool_misses, pool_unreadable
             FROM tick_legs WHERE at >= ? ORDER BY at DESC LIMIT ?`,
       args: [since, limit],
     });
@@ -4652,6 +4740,18 @@ export class Db {
       candidates: numOrNull(r.candidates),
       pushed: numOrNull(r.pushed),
       organicWhy: r.organic_why === null ? null : String(r.organic_why),
+      pairsReused: numOrNull(r.pairs_reused),
+      pairsMissing: numOrNull(r.pairs_missing),
+      poolSliced: numOrNull(r.pool_sliced),
+      poolStale: numOrNull(r.pool_stale),
+      poolLanes: parsePoolZoneCounts(r.pool_lanes),
+      poolServed: parsePoolZoneCounts(r.pool_served),
+      poolZoneCandidates: parsePoolZoneCounts(r.pool_zone_candidates),
+      poolZonePushed: parsePoolZoneCounts(r.pool_zone_pushed),
+      poolFarFiltered: numOrNull(r.pool_far_filtered),
+      poolFarExplored: numOrNull(r.pool_far_explored),
+      poolMisses: numOrNull(r.pool_misses),
+      poolUnreadable: numOrNull(r.pool_unreadable),
     }));
   }
 
@@ -4824,8 +4924,11 @@ export class Db {
         sql: `INSERT OR REPLACE INTO tick_legs
                 (at, via, ms, profiles, pool, pairs, pairs_jup, jup, pump,
                  meteora, raydium, geo, boosts, feed_legs, candidates, pushed,
-                 organic_why)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 organic_why, pairs_reused, pairs_missing, pool_sliced,
+                 pool_stale, pool_lanes, pool_served, pool_zone_candidates,
+                 pool_zone_pushed, pool_far_filtered, pool_far_explored,
+                 pool_misses, pool_unreadable)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           leg.at,
           leg.via,
@@ -4844,6 +4947,22 @@ export class Db {
           leg.candidates,
           leg.pushed,
           leg.organicWhy,
+          leg.pairsReused,
+          leg.pairsMissing,
+          leg.poolSliced,
+          leg.poolStale,
+          leg.poolLanes === null ? null : JSON.stringify(leg.poolLanes),
+          leg.poolServed === null ? null : JSON.stringify(leg.poolServed),
+          leg.poolZoneCandidates === null
+            ? null
+            : JSON.stringify(leg.poolZoneCandidates),
+          leg.poolZonePushed === null
+            ? null
+            : JSON.stringify(leg.poolZonePushed),
+          leg.poolFarFiltered,
+          leg.poolFarExplored,
+          leg.poolMisses,
+          leg.poolUnreadable,
         ],
       });
     }
@@ -5538,6 +5657,15 @@ export class Db {
         row.max_liquidity_observed === undefined
           ? null
           : Number(row.max_liquidity_observed),
+      lastLiquidityUsd:
+        row.last_liquidity_usd === null || row.last_liquidity_usd === undefined
+          ? null
+          : Number(row.last_liquidity_usd),
+      sweepsSinceReading:
+        row.sweeps_since_reading === null ||
+        row.sweeps_since_reading === undefined
+          ? 0
+          : Number(row.sweeps_since_reading),
       supplyFlowJson:
         flowJson === null || flowJson === undefined ? null : String(flowJson),
       supplyFlowAt:
@@ -7138,6 +7266,22 @@ export class Db {
      */
     deadMarked: number;
     deadPending: number;
+    /**
+     * The gross age cohort split by the evidence the pool gates read next.
+     * `eligibleInWindow` is deliberately unfiltered (age + seen only); these
+     * counters are what let an operator see how much of that headline is rows
+     * the pool can actually act on, instead of inferring it from the query's
+     * returned count.
+     */
+    eligibleByAge: Record<
+      string,
+      {
+        total: number;
+        mcapEvidenced: number;
+        liquidityEvidenced: number;
+        recentLiquidity: number;
+      }
+    >;
   }> {
     const H = 3600_000;
     const res = await this.get().execute({
@@ -7178,6 +7322,69 @@ export class Db {
               ${seen.clause}`,
       args: [now - 43 * H, now - 3 * H, now - 42 * H, ...seen.args],
     });
+    // The evidence breakdown rides the same window and seen exclusion as
+    // eligibleInWindow. Grouping by the age bucket (rather than issuing six
+    // counts) keeps this one scan on the debug path; a row with a liquidity
+    // reading is not necessarily RECENT, so the last column applies the same
+    // freshness bound the dead-pool mark uses.
+    const ageRows = await this.get().execute({
+      sql: `SELECT
+              CASE
+                WHEN launch_ms > ? THEN '0-3h'
+                WHEN launch_ms > ? THEN '3-6h'
+                WHEN launch_ms > ? THEN '6-12h'
+                WHEN launch_ms > ? THEN '12-24h'
+                ELSE '24-43h'
+              END AS bucket,
+              COUNT(*) AS n,
+              SUM(CASE WHEN max_mcap_observed IS NOT NULL THEN 1 ELSE 0 END) AS mcap_evidenced,
+              SUM(CASE WHEN max_liquidity_observed IS NOT NULL THEN 1 ELSE 0 END) AS liquidity_evidenced,
+              SUM(CASE WHEN last_liquidity_usd IS NOT NULL
+                        AND sweeps_since_reading < ${DEAD_POOL_MISS_MAX}
+                       THEN 1 ELSE 0 END) AS recent_liquidity
+            FROM token_stats
+            WHERE launch_ms BETWEEN ? AND ?
+              AND first_seen_at > ?
+              ${seen.clause}
+            GROUP BY bucket`,
+      args: [
+        now - 3 * H,
+        now - 6 * H,
+        now - 12 * H,
+        now - 24 * H,
+        now - 43 * H,
+        now - 3 * H,
+        now - 42 * H,
+        ...seen.args,
+      ],
+    });
+    const eligibleByAge: Record<
+      string,
+      {
+        total: number;
+        mcapEvidenced: number;
+        liquidityEvidenced: number;
+        recentLiquidity: number;
+      }
+    > = {};
+    for (const key of ["0-3h", "3-6h", "6-12h", "12-24h", "24-43h"]) {
+      eligibleByAge[key] = {
+        total: 0,
+        mcapEvidenced: 0,
+        liquidityEvidenced: 0,
+        recentLiquidity: 0,
+      };
+    }
+    for (const row of ageRows.rows) {
+      const key = String(row.bucket);
+      if (!eligibleByAge[key]) continue;
+      eligibleByAge[key] = {
+        total: Number(row.n ?? 0),
+        mcapEvidenced: Number(row.mcap_evidenced ?? 0),
+        liquidityEvidenced: Number(row.liquidity_evidenced ?? 0),
+        recentLiquidity: Number(row.recent_liquidity ?? 0),
+      };
+    }
     return {
       total: Number(r.total ?? 0),
       neverPushed: Number(r.never_pushed ?? 0),
@@ -7192,6 +7399,7 @@ export class Db {
       eligibleInWindow: Number(elig.rows[0]?.n ?? 0),
       deadMarked: Number(r.dead_marked ?? 0),
       deadPending: Number(r.dead_pending ?? 0),
+      eligibleByAge,
     };
   }
 

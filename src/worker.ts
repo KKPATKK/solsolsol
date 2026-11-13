@@ -14,8 +14,10 @@ import { createBot, tradeKeyboard, type FlowCheckResult } from "./bot";
 import { loadConfig, type AppConfig } from "./config";
 import {
   Db,
+  DEAD_POOL_MISS_MAX,
   SCAN_TRIGGER_STATE_KEYS,
   parseScanTriggerCounts,
+  poolZoneOfLaunch,
   parseScheduledTickRing,
   parseTelemetryCounter,
   parseTradeModeOverride,
@@ -102,6 +104,8 @@ import {
   POOL_MCAP_PRUNE_RATIO,
   POOL_LIQUIDITY_PRUNE_RATIO,
   DRAINED_POOL_LIQUIDITY_USD,
+  poolFarEvidenceOk,
+  poolFarExplorationBucket,
 } from "./scanner";
 import { deferralRegistryView, deferredPushTokens, feedMakeupView } from "./deferredmakeup";
 import { PUSH_OUTBOX_DRAIN_BUDGET_MS, PUSH_OUTBOX_STATE_KEY } from "./pushoutbox";
@@ -3043,12 +3047,24 @@ export interface TickLegRow {
    * evaluated its own read's rows.
    */
   poolStale: number | null;
+  /** Pool rows actually evaluated, and the returned/served lane split. */
+  poolSliced: number | null;
+  poolLanes: { hot: number; near: number; far: number; filler: number } | null;
+  poolServed: { hot: number; near: number; far: number; filler: number } | null;
+  /** Candidates / pushes attributable to each pool lane (feed excluded). */
+  poolZoneCandidates: { hot: number; near: number; far: number; filler: number } | null;
+  poolZonePushed: { hot: number; near: number; far: number; filler: number } | null;
+  /** Far-tier gate readings: removed rows and explored no-evidence rows. */
+  poolFarFiltered: number | null;
+  poolFarExplored: number | null;
+  poolMisses: number | null;
+  poolUnreadable: number | null;
   /**
    * WHICH candidate-chain step the tick was inside when its summary was
    * published (see ScanSummary.pushPhase), and the chain's own readings
    * (2026-10-22). These are the fields that answer "what made this tick
    * slow" AFTER the fact: the heartbeat only keeps the LATEST tick's summary
-   * and `tick_legs` is a fixed 17-column projection whose columns each cost a
+   * and `tick_legs` is a fixed projection whose columns each cost a
    * migration, so a slow tick's chain split was unrecoverable once it rotated
    * out of /health. This row IS what persistSlowTickLeg (TICK_LEG_SLOW_KEY)
    * stamps durably, so carrying the readings here is what makes them survive
@@ -3126,6 +3142,17 @@ export function buildTickLegRow(input: {
     evalMs: s?.evalMs ?? null,
     dbMs: s?.dbMs ?? null,
     poolStale: s?.poolStale ?? null,
+    poolSliced: s?.poolSliced ?? null,
+    poolLanes: s?.poolSliceLanes ? { ...s.poolSliceLanes } : null,
+    poolServed: s?.poolServed ? { ...s.poolServed } : null,
+    poolZoneCandidates: s?.poolZoneCandidates
+      ? { ...s.poolZoneCandidates }
+      : null,
+    poolZonePushed: s?.poolZonePushed ? { ...s.poolZonePushed } : null,
+    poolFarFiltered: s?.poolFarFiltered ?? null,
+    poolFarExplored: s?.poolFarExplored ?? null,
+    poolMisses: s?.poolMisses ?? null,
+    poolUnreadable: s?.poolUnreadable ?? null,
     pushPhase: s?.pushPhase ?? null,
     organicMs: s?.organicMs ?? null,
     organicWaited: s?.organicWaited ?? null,
@@ -6289,6 +6316,18 @@ async function runScan(
                 candidates: summary.candidates ?? null,
                 pushed: summary.pushed ?? null,
                 organicWhy: summary.organicWhy ?? null,
+                pairsReused: summary.pairsReused ?? null,
+                pairsMissing: summary.pairsMissing ?? null,
+                poolSliced: summary.poolSliced ?? null,
+                poolStale: summary.poolStale ?? null,
+                poolLanes: summary.poolSliceLanes ?? null,
+                poolServed: summary.poolServed ?? null,
+                poolZoneCandidates: summary.poolZoneCandidates ?? null,
+                poolZonePushed: summary.poolZonePushed ?? null,
+                poolFarFiltered: summary.poolFarFiltered ?? null,
+                poolFarExplored: summary.poolFarExplored ?? null,
+                poolMisses: summary.poolMisses ?? null,
+                poolUnreadable: summary.poolUnreadable ?? null,
               }
             : null,
         ) ?? Promise.resolve();
@@ -10093,6 +10132,19 @@ const worker = {
       const hist = await probe.getPoolHistogram(now, seenChatIds);
       let poolQueryBuckets: Record<string, number> | null = null;
       let poolQueryCount = 0;
+      let poolQueryBreakdown: {
+        zones: Record<
+          "hot" | "near" | "far",
+          {
+            rows: number;
+            mcapEvidenced: number;
+            liquidityEvidenced: number;
+            recentLiquidity: number;
+          }
+        >;
+        farNoEvidence: number;
+        farExploration: number;
+      } | null = null;
       // The floors this probe applies — computed once, ECHOED in the response
       // (2026-09-28). Until then the probe pruned at minMcap / 2 (half the
       // scanner's ratio) with no liquidity floor and no ceiling, so its
@@ -10155,6 +10207,18 @@ const worker = {
           ">43h": 0,
         };
         const H = 3600_000;
+        const poolWindowEntryMs = now - minAge * 60_000;
+        const lane = () => ({
+          rows: 0,
+          mcapEvidenced: 0,
+          liquidityEvidenced: 0,
+          recentLiquidity: 0,
+        });
+        const breakdown = {
+          zones: { hot: lane(), near: lane(), far: lane() },
+          farNoEvidence: 0,
+          farExploration: 0,
+        };
         for (const s of pool) {
           const age = now - s.launchMs;
           const key =
@@ -10170,7 +10234,29 @@ const worker = {
                       ? "24-43h"
                       : ">43h";
           poolQueryBuckets[key]++;
+          const zone = poolZoneOfLaunch(s.launchMs, poolWindowEntryMs);
+          const z = breakdown.zones[zone];
+          z.rows++;
+          if (s.maxMcapObserved !== null && s.maxMcapObserved !== undefined)
+            z.mcapEvidenced++;
+          if (
+            s.maxLiquidityObserved !== null &&
+            s.maxLiquidityObserved !== undefined
+          )
+            z.liquidityEvidenced++;
+          if (
+            s.lastLiquidityUsd !== null &&
+            s.lastLiquidityUsd !== undefined &&
+            (s.sweepsSinceReading ?? 0) < DEAD_POOL_MISS_MAX
+          )
+            z.recentLiquidity++;
+          if (zone === "far" && !poolFarEvidenceOk(s)) {
+            breakdown.farNoEvidence++;
+            if (poolFarExplorationBucket(s.token) === 0)
+              breakdown.farExploration++;
+          }
         }
+        poolQueryBreakdown = breakdown;
       } catch (err) {
         console.error(
           "[worker] /debug/pool pool-query probe failed:",
@@ -10184,6 +10270,7 @@ const worker = {
         neverPushed: hist.neverPushed,
         buckets: hist.buckets,
         eligibleInWindow: hist.eligibleInWindow,
+        eligibleByAge: hist.eligibleByAge,
         // The pool's dead predicate, counted (2026-10-08 — see
         // db.DEAD_POOL_MARK): rows the sweep holds out (the $1K floor, which
         // has always pruned, PLUS the freshness bound) and rows one empty
@@ -10197,6 +10284,7 @@ const worker = {
         poolLimit: cfg?.reevalPoolSize ?? 1000,
         poolQueryCount,
         poolQueryBuckets,
+        poolQueryBreakdown,
         // Which floors produced poolQueryCount (see the comment above them):
         // a live reading shows the ratios the DEPLOYED code is pruning at.
         mcapPruneRatio: POOL_MCAP_PRUNE_RATIO,
