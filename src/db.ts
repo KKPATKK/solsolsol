@@ -1826,6 +1826,8 @@ export interface TickLegInsert {
   /** Candidates / pushes attributable to each pool lane (feed coins excluded). */
   poolZoneCandidates: PoolZoneCounts | null;
   poolZonePushed: PoolZoneCounts | null;
+  /** Feed-half candidates by discovery source (see ScanSummary.feedCandidates). */
+  feedCandidates: Record<string, number> | null;
   /** Far-tier rows the liquidity-evidence gate removed / kept as exploration. */
   poolFarFiltered: number | null;
   poolFarExplored: number | null;
@@ -1859,6 +1861,17 @@ export function parseFeedLegs(raw: unknown): Record<string, number> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * `tick_legs.feed_candidates` → {<discovery source>: candidate count}. Same
+ * tolerant JSON read as feed_legs: a malformed value is "no reading", never a
+ * fabricated zero.
+ */
+export function parseFeedCandidates(
+  raw: unknown,
+): Record<string, number> | null {
+  return parseFeedLegs(raw);
 }
 
 /**
@@ -3115,6 +3128,7 @@ export class Db {
           pool_served TEXT,
           pool_zone_candidates TEXT,
           pool_zone_pushed TEXT,
+          feed_candidates TEXT,
           pool_far_filtered INTEGER,
           pool_far_explored INTEGER,
           pool_misses INTEGER,
@@ -3544,6 +3558,7 @@ export class Db {
     await this.addColumnIfMissing("tick_legs", "pool_served", "TEXT");
     await this.addColumnIfMissing("tick_legs", "pool_zone_candidates", "TEXT");
     await this.addColumnIfMissing("tick_legs", "pool_zone_pushed", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "feed_candidates", "TEXT");
     await this.addColumnIfMissing("tick_legs", "pool_far_filtered", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_far_explored", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_misses", "INTEGER");
@@ -4738,8 +4753,8 @@ export class Db {
                    meteora, raydium, geo, boosts, feed_legs, candidates,
                    pushed, organic_why, pairs_reused, pairs_missing, pool_sliced,
                    pool_stale, pool_lanes, pool_served, pool_zone_candidates,
-                   pool_zone_pushed, pool_far_filtered, pool_far_explored,
-                   pool_misses, pool_unreadable
+                   pool_zone_pushed, feed_candidates, pool_far_filtered,
+                   pool_far_explored, pool_misses, pool_unreadable
             FROM tick_legs WHERE at >= ? ORDER BY at DESC LIMIT ?`,
       args: [since, limit],
     });
@@ -4769,6 +4784,7 @@ export class Db {
       poolServed: parsePoolZoneCounts(r.pool_served),
       poolZoneCandidates: parsePoolZoneCounts(r.pool_zone_candidates),
       poolZonePushed: parsePoolZoneCounts(r.pool_zone_pushed),
+      feedCandidates: parseFeedCandidates(r.feed_candidates),
       poolFarFiltered: numOrNull(r.pool_far_filtered),
       poolFarExplored: numOrNull(r.pool_far_explored),
       poolMisses: numOrNull(r.pool_misses),
@@ -4947,9 +4963,9 @@ export class Db {
                  meteora, raydium, geo, boosts, feed_legs, candidates, pushed,
                  organic_why, pairs_reused, pairs_missing, pool_sliced,
                  pool_stale, pool_lanes, pool_served, pool_zone_candidates,
-                 pool_zone_pushed, pool_far_filtered, pool_far_explored,
-                 pool_misses, pool_unreadable)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 pool_zone_pushed, feed_candidates, pool_far_filtered,
+                 pool_far_explored, pool_misses, pool_unreadable)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           leg.at,
           leg.via,
@@ -4980,6 +4996,9 @@ export class Db {
           leg.poolZonePushed === null
             ? null
             : JSON.stringify(leg.poolZonePushed),
+          leg.feedCandidates === null || leg.feedCandidates === undefined
+            ? null
+            : JSON.stringify(leg.feedCandidates),
           leg.poolFarFiltered,
           leg.poolFarExplored,
           leg.poolMisses,

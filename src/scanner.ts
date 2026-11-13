@@ -2766,6 +2766,31 @@ function planLane<T>(
 }
 
 /**
+ * Per-feed candidate attribution for the feed half of a tick.
+ *
+ * Pure so the accounting is testable without a scanner: every candidate
+ * whose token is in `feedTokens` is counted under its `discoveredVia`
+ * (null/empty → "legacy"), and candidates from the pool slice are ignored.
+ * The caller passes the feed half explicitly because the pool slice's
+ * discovered source is not the lane that evaluated it.
+ */
+export function countFeedCandidates(
+  candidates: ReadonlyArray<{
+    tokenAddress: string;
+    discoveredVia?: string | null;
+  }>,
+  feedTokens: ReadonlySet<string>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const c of candidates) {
+    if (!feedTokens.has(c.tokenAddress)) continue;
+    const feed = c.discoveredVia || "legacy";
+    out[feed] = (out[feed] ?? 0) + 1;
+  }
+  return out;
+}
+
+/**
  * The tick's pool window, allocated by ZONE and cadence (2026-10-21).
  *
  * WHY THIS REPLACES THE TWO-LANE (EVIDENCE/FILLER) SPLIT: that split answered
@@ -3507,6 +3532,20 @@ export interface ScanSummary {
    */
   poolZoneCandidates?: { hot: number; near: number; far: number; filler: number };
   poolZonePushed?: { hot: number; near: number; far: number; filler: number };
+  /**
+   * Candidates this tick whose row came from the FEED half of the scan,
+   * grouped by the mint's discovery source (`discovered_via`, "legacy" for
+   * an unattributed row). Pool candidates are deliberately excluded — they
+   * already have poolZoneCandidates — so the two maps add up to `candidates`
+   * and a feed's yield can be read without pool noise.
+   *
+   * WHY (2026-11-13): the feed is ~90% of evaluated rows and the only
+   * per-feed reading was a LIFETIME push count on /debug/feed-stats, which
+   * cannot say which source produced this window's candidates. The next
+   * 240-tick audit needs this map to decide whether a quota cut (Raydium
+   * 50→10, Jupiter 30→70) moved yield or just volume.
+   */
+  feedCandidates?: Record<string, number>;
   /** Far-tier rows removed by the liquidity-evidence gate before pair/eval. */
   poolFarFiltered?: number;
   /** Far-tier rows kept by the deterministic exploration lane. */
@@ -6503,6 +6542,7 @@ export class Scanner {
       walletAnalysis: 0,
       backfill: 0,
       pool: 0,
+      feedCandidates: {},
       agedEval: 0,
       staleReadings: 0,
       poolMisses: 0,
@@ -8357,6 +8397,13 @@ export class Scanner {
         if (zone) poolZoneCandidates[zone] += 1;
       }
       diag.poolZoneCandidates = poolZoneCandidates;
+      diag.feedCandidates = countFeedCandidates(
+        candidates.map((coin) => ({
+          tokenAddress: coin.profile.tokenAddress,
+          discoveredVia: coin.stats.discoveredVia,
+        })),
+        new Set(feedOnly.map((p) => p.tokenAddress)),
+      );
       // The prune's counters belong to THIS tick, so they are refreshed
       // here — the same pattern the recovery path uses for
       // deferRecovered/deferPending at its send site. The diag object is

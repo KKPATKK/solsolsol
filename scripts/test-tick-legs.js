@@ -127,6 +127,7 @@ test("a full tick maps every leg and the front split", () => {
         poolServed: { hot: 18, near: 60, far: 30, filler: 10 },
         poolZoneCandidates: { hot: 1, near: 0, far: 0, filler: 0 },
         poolZonePushed: { hot: 0, near: 0, far: 0, filler: 0 },
+        feedCandidates: { jup: 2, pump: 1 },
         poolFarFiltered: 3,
         poolFarExplored: 1,
         poolMisses: 1,
@@ -194,6 +195,7 @@ test("a full tick maps every leg and the front split", () => {
   assert.deepEqual(row.poolServed, { hot: 18, near: 60, far: 30, filler: 10 });
   assert.deepEqual(row.poolZoneCandidates, { hot: 1, near: 0, far: 0, filler: 0 });
   assert.deepEqual(row.poolZonePushed, { hot: 0, near: 0, far: 0, filler: 0 });
+  assert.deepEqual(row.feedCandidates, { jup: 2, pump: 1 }, "feed candidates are attributed by source");
   assert.equal(row.poolFarFiltered, 3, "the far lane's removed rows survive the ring");
   assert.equal(row.poolFarExplored, 1, "and its exploration lane is visible");
   assert.equal(row.poolMisses, 1);
@@ -213,6 +215,7 @@ test("the row copies its maps — later mutation must not rewrite a tick", () =>
   const steps = { ...STEP_ZERO, init: 1 };
   const legMap = { pairs: 5 };
   const feedMap = { pump: 6 };
+  const candidateMap = { jup: 2 };
   const failsMap = {
     mcap: 2,
     chg: 0,
@@ -228,16 +231,23 @@ test("the row copies its maps — later mutation must not rewrite a tick", () =>
   const row = buildTickLegRow(
     input({
       preTick: { at: 1, steps, preStartMs: 1, preRaceMs: 2, raceMs: 3 },
-      summary: { poolLegMs: legMap, feedLegMs: feedMap, fails: failsMap },
+      summary: {
+        poolLegMs: legMap,
+        feedLegMs: feedMap,
+        feedCandidates: candidateMap,
+        fails: failsMap,
+      },
     }),
   );
   steps.init = 99;
   legMap.pairs = 99;
   feedMap.pump = 99;
+  candidateMap.jup = 99;
   failsMap.mcap = 99;
   assert.equal(row.steps.init, 1);
   assert.equal(row.poolLegMs.pairs, 5);
   assert.equal(row.feedLegMs.pump, 6);
+  assert.equal(row.feedCandidates.jup, 2, "per-feed candidate counts are copied too");
   assert.equal(row.fails.mcap, 2, "the counters are copied, not aliased");
 });
 
@@ -268,6 +278,7 @@ test("a cut tick with no summary records null legs, not zeros", () => {
   assert.equal(row.poolSliced, null);
   assert.equal(row.poolLanes, null, "no summary = no fabricated lane cohort");
   assert.equal(row.poolZoneCandidates, null);
+  assert.equal(row.feedCandidates, null);
   assert.equal(row.poolFarFiltered, null);
   assert.equal(row.poolMisses, null);
   assert.equal(row.preStartMs, null);

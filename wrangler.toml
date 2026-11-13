@@ -764,9 +764,15 @@ METEORA_FALLBACK_LIMIT = "50"
 #
 # 2026-10-18: 20 → 50 — the same dashboard edit as PUMPFUN_PROFILE_LIMIT. The
 # API page is FIXED at 100 rows and the client slices it
-# (RAYDIUM_LAUNCH_MAX_LIMIT), so this keeps more of the SAME one request per
-# tick: zero extra subrequests.
-RAYDIUM_LAUNCH_LIMIT = "50"
+# (RAYDIUM_LAUNCH_MAX_LIMIT), so 50 kept more of the SAME one request per tick:
+# zero extra subrequests.
+#
+# 2026-11-13: 50 → 10. The 50 slots were 27% of feed evaluated and returned 66
+# unique coins / 4h, 0 with mcap ≥ $60K, and 3 pushes / 7d. The newest 10 still
+# cover the live launch window; the 40 freed slots go to JUPITER_RECENT_LIMIT
+# (see above), whose per-slot evidence rate was ~5.3/1K. The request count is
+# unchanged (the client still fetches the same fixed 100-row page).
+RAYDIUM_LAUNCH_LIMIT = "10"
 # Minimum spacing between GeckoTerminal new-pools FETCHES, in seconds (code
 # default 300 = one fetch per 5 min; 0 = no gate, one per tick). This is the
 # cadence the KEYED leg is spent at: the demo plan is 10K calls/month, one call
@@ -872,6 +878,17 @@ CRIME_WALLETS_ENABLED = "false"
 # Coverage unchanged: the feed cap still bounds the phase, it just fits more
 # coins inside it before the cap trips.
 JUPITER_REQUEST_INTERVAL_MS = "500"
+# Jupiter Token v2 recent-launches feed size per scan (code default 30, max
+# 100). 2026-11-13: 30 → 70, the intended destination for the 40 slots removed
+# from Raydium. LIVE PROBE (2026-11-13): `/recent?limit=70` still answers only
+# 30 rows, and `offset`/`page` are ignored, so the transfer is BLOCKED AT THE
+# UPSTREAM until Jupiter lifts that cap. The ceiling is set anyway so the
+# reallocation needs no code change when it does; TODAY the actual effect is
+# the 40-slot Raydium reduction, not 40 extra Jupiter rows. Live 4h evidence:
+# Jupiter returned 76 coins with mcap ≥ $60K per 14.4K slots (5.3/1K); Raydium
+# returned 0 per 24K slots. Watch feedCandidates.jup per tick after deploy —
+# the yield, not the raw count, is the acceptance reading.
+JUPITER_RECENT_LIMIT = "70"
 # Jupiter Token v2 trending feed size per scan. 2026-09-21: 15 → 100. The page
 # is ranked by 24h organic score, so its HEAD is blue chips and blue chips never
 # qualify: measured with the live window ($60K–$230K / 80min–26h) exactly 0 of

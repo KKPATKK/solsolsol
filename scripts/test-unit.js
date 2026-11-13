@@ -31,7 +31,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, DRAINED_POOL_LIQUIDITY_USD, slicePoolRotation, slicePoolZones, POOL_SLICE_HOT_SHARE, parsePoolSliceCursors, serializePoolSliceCursors, poolZoneTicks, POOL_SLICE_MAX_CURSOR, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, DRAINED_POOL_LIQUIDITY_USD, slicePoolRotation, slicePoolZones, countFeedCandidates, POOL_SLICE_HOT_SHARE, parsePoolSliceCursors, serializePoolSliceCursors, poolZoneTicks, POOL_SLICE_MAX_CURSOR, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -10492,6 +10492,38 @@ async function main() {
     );
   });
 
+  await test("countFeedCandidates: only feed rows, grouped by discovery source", () => {
+    const out = countFeedCandidates(
+      [
+        { tokenAddress: "A", discoveredVia: "jup" },
+        { tokenAddress: "A", discoveredVia: "jup" }, // second chat, same coin
+        { tokenAddress: "B", discoveredVia: null },
+        { tokenAddress: "C", discoveredVia: "" },
+        { tokenAddress: "POOL", discoveredVia: "pump" }, // not in the feed half
+      ],
+      new Set(["A", "B", "C"]),
+    );
+    assert.deepEqual(
+      out,
+      { jup: 2, legacy: 2 },
+      "pool candidates are excluded; null/empty attribution falls back to legacy",
+    );
+    const scannerSrc = fs
+      .readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8")
+      .replace(/\s+/g, "");
+    assert.ok(
+      scannerSrc.includes("diag.feedCandidates=countFeedCandidates("),
+      "the candidate loop must publish the per-feed map",
+    );
+    const workerSrc = fs
+      .readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8")
+      .replace(/\s+/g, "");
+    assert.ok(
+      workerSrc.includes("feedCandidates:summary.feedCandidates??null"),
+      "the flush must carry the per-feed map into tick_legs",
+    );
+  });
+
   //
   // The window is allocated by each band's OWN cadence (see slicePoolZones):
   // hot's evidenced rows every tick (capped), near's over its 6-tick
@@ -11385,6 +11417,7 @@ async function main() {
         poolServed: { hot: 18, near: 60, far: 30, filler: 10 },
         poolZoneCandidates: { hot: 1, near: 0, far: 0, filler: 0 },
         poolZonePushed: { hot: 0, near: 0, far: 0, filler: 0 },
+        feedCandidates: { jup: 2, pump: 1 },
         poolFarFiltered: 3,
         poolFarExplored: 1,
         poolMisses: 0,
@@ -11421,6 +11454,11 @@ async function main() {
         rows[0].poolZoneCandidates,
         { hot: 1, near: 0, far: 0, filler: 0 },
         "candidate yield is attributable to the pool lane",
+      );
+      assert.deepEqual(
+        rows[0].feedCandidates,
+        { jup: 2, pump: 1 },
+        "feed candidate yield is attributable to its discovery source",
       );
       assert.equal(rows[0].poolFarFiltered, 3, "the far gate's removed rows survive the tick");
       assert.equal(rows[0].poolFarExplored, 1, "and so does its exploration lane");
@@ -22565,8 +22603,12 @@ async function main() {
     }
     assert.equal(missing.length, 0, `client/config/probe wiring missing: ${missing.join(", ")}`);
     assert.ok(
-      wranglerSrc.includes('RAYDIUM_LAUNCH_LIMIT="50"'),
-      "the deployed knob must enable the feed (or explicitly document 0)",
+      wranglerSrc.includes('RAYDIUM_LAUNCH_LIMIT="10"'),
+      "the deployed knob must keep the newest Raydium launches enabled (10, not 0)",
+    );
+    assert.ok(
+      wranglerSrc.includes('JUPITER_RECENT_LIMIT="70"'),
+      "the 40 freed slots must be assigned to Jupiter's ceiling (upstream currently caps the response at 30)",
     );
   });
 

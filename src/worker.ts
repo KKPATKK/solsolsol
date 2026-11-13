@@ -3054,6 +3054,8 @@ export interface TickLegRow {
   /** Candidates / pushes attributable to each pool lane (feed excluded). */
   poolZoneCandidates: { hot: number; near: number; far: number; filler: number } | null;
   poolZonePushed: { hot: number; near: number; far: number; filler: number } | null;
+  /** Candidate counts from the feed half, by discovery source (see ScanSummary). */
+  feedCandidates: Record<string, number> | null;
   /** Far-tier gate readings: removed rows and explored no-evidence rows. */
   poolFarFiltered: number | null;
   poolFarExplored: number | null;
@@ -3149,6 +3151,7 @@ export function buildTickLegRow(input: {
       ? { ...s.poolZoneCandidates }
       : null,
     poolZonePushed: s?.poolZonePushed ? { ...s.poolZonePushed } : null,
+    feedCandidates: s?.feedCandidates ? { ...s.feedCandidates } : null,
     poolFarFiltered: s?.poolFarFiltered ?? null,
     poolFarExplored: s?.poolFarExplored ?? null,
     poolMisses: s?.poolMisses ?? null,
@@ -6324,6 +6327,7 @@ async function runScan(
                 poolServed: summary.poolServed ?? null,
                 poolZoneCandidates: summary.poolZoneCandidates ?? null,
                 poolZonePushed: summary.poolZonePushed ?? null,
+                feedCandidates: summary.feedCandidates ?? null,
                 poolFarFiltered: summary.poolFarFiltered ?? null,
                 poolFarExplored: summary.poolFarExplored ?? null,
                 poolMisses: summary.poolMisses ?? null,
