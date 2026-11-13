@@ -1435,7 +1435,7 @@ export function poolKeyHash(text: string): string {
  * entry holds exactly the rows (no mcap reading, past the grace) the new
  * predicate drops.
  */
-export const POOL_QUERY_SHAPE_VERSION = "v4-2026-10-21-band-page";
+export const POOL_QUERY_SHAPE_VERSION = "v5-2026-11-13-near-evidenced";
 
 /**
  * The STABLE half of a pool query, as a key fragment.

@@ -2717,6 +2717,9 @@ export class Db {
       orderBy: "entry" | "signal";
       /** See queryReevalBand / POOL_BAND_ROTATE_BUCKETS (every band). */
       rotatePhase?: number;
+      /** Full band for the near band's EVIDENCED overflow (see queryReevalBand). */
+      fullLo?: number;
+      fullHi?: number;
     }> = [];
     // One page phase per band (see poolBandPageSql). The hot band advances with
     // the rotation slot itself: it is on screen on every visit, so its page
@@ -2761,6 +2764,16 @@ export class Db {
           limit: nearLimit,
           orderBy: "signal",
           rotatePhase: nearPhase,
+          // The near band's page clause exempts EVIDENCED rows, but the slot
+          // range still clipped them to the active half. Live 240-tick
+          // measurement (2026-11-13): the active half held 10 evidenced rows,
+          // the other half 12; only ~20 pool rows/tick were reachable while
+          // the slice cap sat at 150. Return the whole near band's evidenced
+          // rows in this same statement; no-evidence rows stay on the active
+          // slot's page. This is the precision lane (9.1 candidates/1,000 vs
+          // feed 2.8); far is deliberately unchanged (0 candidates/240).
+          fullLo: nearSlots > 1 ? nearLo : undefined,
+          fullHi: nearSlots > 1 ? rotHi : undefined,
         });
       }
       if (nearLo > rotLo && farLimit > 0) {
@@ -2786,13 +2799,21 @@ export class Db {
         POOL_MCAP_EVIDENCE_CLAUSE,
         poolBandPageSql(),
       ];
-      const args: Array<string | number> = [
-        b.lo,
-        b.hi,
-        opts.sinceMs,
-        mcapEvidenceSinceMs,
-        b.rotatePhase ?? 0,
-      ];
+      const fullRange = b.fullLo !== undefined && b.fullHi !== undefined;
+      const rangeSql = fullRange
+        ? "(launch_ms BETWEEN ? AND ? OR (max_mcap_observed IS NOT NULL AND launch_ms BETWEEN ? AND ?))"
+        : "launch_ms BETWEEN ? AND ?";
+      const args: Array<string | number> = fullRange
+        ? [
+            b.lo,
+            b.hi,
+            b.fullLo as number,
+            b.fullHi as number,
+            opts.sinceMs,
+            mcapEvidenceSinceMs,
+            b.rotatePhase ?? 0,
+          ]
+        : [b.lo, b.hi, opts.sinceMs, mcapEvidenceSinceMs, b.rotatePhase ?? 0];
       // Literal floor, no argument — see mcapFloorLiteral. Both builders must
       // carry the SAME shape or the drift guard pins them apart.
       if (opts.minQualifyMcap !== undefined) {
@@ -2818,7 +2839,7 @@ export class Db {
         args.push(b.limit);
         return {
           sql: `SELECT * FROM token_stats
-                WHERE launch_ms BETWEEN ? AND ?
+                WHERE ${rangeSql}
                   AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
                   ${seen.clause}
                 ${order}
@@ -2829,7 +2850,7 @@ export class Db {
       args.push(b.center, b.limit);
       return {
         sql: `SELECT * FROM token_stats
-              WHERE launch_ms BETWEEN ? AND ?
+              WHERE ${rangeSql}
                 AND first_seen_at > ?${clauses.length ? ` AND ${clauses.join(" AND ")}` : ""}
                 ${seen.clause}
               ${order}
@@ -5949,6 +5970,12 @@ export class Db {
           seenChatIds: opts.seenChatIds,
           orderBy: "signal",
           rotatePhase: nearPhase,
+          // The near page exempts evidenced rows, but the slot range would
+          // still clip them to this half; return the whole near band's
+          // evidenced rows as well (see getReevalPoolBatched's note). The
+          // no-evidence page stays on this slot.
+          fullLo: nearSlots > 1 ? nearLo : undefined,
+          fullHi: nearSlots > 1 ? rotHi : undefined,
         })),
       );
     }
@@ -6011,6 +6038,15 @@ export class Db {
        * the hot one included, has one.
        */
       rotatePhase?: number;
+      /**
+       * Full band for the EVIDENCED overflow (see the near-band note in
+       * getReevalPool). When set, evidenced rows anywhere in this range are
+       * returned in addition to the active slot's page. No-evidence rows stay
+       * on the active slot, so the page cadence and its bucket guarantee are
+       * unchanged.
+       */
+      fullLo?: number;
+      fullHi?: number;
     },
   ): Promise<TokenStats[]> {
     // The dead-pool pre-filter rides BOTH builders (see DEAD_POOL_CLAUSE).
@@ -6049,13 +6085,27 @@ export class Db {
     // The evidence cutoff binds first — the clause's placeholder sits right
     // after `first_seen_at > ?`, before the page's phase and every floor's
     // (order is binding order, and the batched builder must match it exactly).
-    const args: Array<string | number> = [
-      lo,
-      hi,
-      opts.sinceMs,
-      opts.mcapEvidenceSinceMs,
-      opts.rotatePhase ?? 0,
-    ];
+    // The near band's EVIDENCED rows are returned from the whole band, not
+    // just this slot (see the near-band note in getReevalPool). The OR is
+    // row-level, so an evidenced row in the active slot is not duplicated;
+    // the page clause below still applies to the active slot's no-evidence
+    // rows only.
+    const fullRange =
+      opts.fullLo !== undefined && opts.fullHi !== undefined;
+    const rangeSql = fullRange
+      ? "(launch_ms BETWEEN ? AND ? OR (max_mcap_observed IS NOT NULL AND launch_ms BETWEEN ? AND ?))"
+      : "launch_ms BETWEEN ? AND ?";
+    const args: Array<string | number> = fullRange
+      ? [
+          lo,
+          hi,
+          opts.fullLo as number,
+          opts.fullHi as number,
+          opts.sinceMs,
+          opts.mcapEvidenceSinceMs,
+          opts.rotatePhase ?? 0,
+        ]
+      : [lo, hi, opts.sinceMs, opts.mcapEvidenceSinceMs, opts.rotatePhase ?? 0];
     // No argument for minQualifyMcap: it rides the SQL as a literal (see
     // mcapFloorLiteral) so the partial index can cover this range.
     if (opts.maxQualifyMcap !== undefined) args.push(opts.maxQualifyMcap);
@@ -6067,7 +6117,7 @@ export class Db {
     args.push(opts.limit);
     const res = await this.get().execute({
       sql: `SELECT * FROM token_stats
-            WHERE launch_ms BETWEEN ? AND ?
+            WHERE ${rangeSql}
               AND first_seen_at > ?
               ${qualifyClause}
               ${seen.clause}

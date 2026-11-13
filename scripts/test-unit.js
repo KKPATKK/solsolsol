@@ -4735,6 +4735,90 @@ async function main() {
     await t.cleanup();
   });
 
+  // The near evidenced overflow (2026-11-13). The page clause exempts an
+  // evidenced row, but the near band's slot range still clipped it to the
+  // active half: live 240 ticks held 10 evidenced rows in the active half and
+  // 12 in the other, so half the precision lane was unreachable on a given
+  // tick. The query now returns evidenced rows from the whole near band while
+  // the no-evidence page remains on the active slot — this test pins both
+  // halves, and pins that the page was NOT widened to the off-half's filler.
+  await test("pool: near evidenced rows come from both rotation halves, off-half no-evidence stays paged", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = 50 * 300e3;
+      const M = 60e3;
+      const seed = async (token, ageMin, firstSeenAgeMin, mcap, maxLiq, lastLiq) => {
+        const launch = now - ageMin * M;
+        await t.client.execute({
+          sql: `INSERT INTO token_stats
+                  (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms,
+                   max_mcap_observed, max_liquidity_observed, last_liquidity_usd)
+                VALUES (?, ?, 10000, ?, ?, ?, ?, ?)`,
+          args: [
+            token,
+            now - firstSeenAgeMin * M,
+            firstSeenAgeMin,
+            launch,
+            mcap,
+            maxLiq,
+            lastLiq,
+          ],
+        });
+      };
+      // entry age = 80min; hot is ages 50–110; near is 110–440 and is split
+      // into two slots. Slot 50 with nearSlots 2 puts the active half at ages
+      // 110–275 and the other half at 275–440. The no-evidence name is paged
+      // for the near phase (25) so the page can only be what hides it.
+      const ACTIVE_EV = "ACTIVE_EV";
+      const OFF_EV = "OFF_EV";
+      const OFF_NOEV = pagedName("OFF_NOEV", 25);
+      await seed(ACTIVE_EV, 150, 150, 120_000, 40_000, 25_000);
+      await seed(OFF_EV, 350, 350, 120_000, 40_000, 25_000);
+      await seed(OFF_NOEV, 360, 60, null, null, null);
+      const opts = {
+        sinceMs: now - 30 * 3600_000,
+        minLaunchMs: now - (1560 + 180) * M,
+        maxLaunchMs: now - (80 - 180) * M,
+        windowEntryLaunchMs: now - 80 * M,
+        limit: 1000,
+        nearSlots: 2,
+        farSlots: 12,
+        rotationPeriodMs: 300e3,
+        minQualifyMcap: 30_000,
+        maxQualifyMcap: 500_000,
+        minQualifyLiquidity: 5_000,
+        now,
+      };
+      for (const [name, read] of [
+        ["per-band", () => db.getReevalPool(opts)],
+        ["batched", () => db.getReevalPoolBatched(opts)],
+      ]) {
+        const tokens = (await read()).map((r) => r.token);
+        assert.ok(tokens.includes(ACTIVE_EV), `${name}: the active half's evidenced row is returned`);
+        assert.ok(
+          tokens.includes(OFF_EV),
+          `${name}: the other half's evidenced row must be returned too (was unreachable before the overflow)`,
+        );
+        assert.equal(
+          tokens.filter((x) => x === OFF_EV).length,
+          1,
+          `${name}: the full-band branch must not duplicate the active half's row`,
+        );
+        assert.ok(
+          !tokens.includes(OFF_NOEV),
+          `${name}: the off-half no-evidence row must stay hidden — only the active slot is paged`,
+        );
+      }
+      const perBand = (await db.getReevalPool(opts)).map((r) => r.token).sort();
+      const batched = (await db.getReevalPoolBatched(opts)).map((r) => r.token).sort();
+      assert.deepEqual(batched, perBand, "both builders return the same near overflow");
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   // The dead-pool prune (2026-09-19). The pool's liquidity filter used to read
   // `max_liquidity_observed`, a lifetime high-water, so a coin that HAD a pool
   // and lost it stayed in the sweep forever: live, 48 of 49 logged rejects were
@@ -5476,12 +5560,18 @@ async function main() {
       "the page clause is defined once and carried by both builders",
     );
     assert.ok(
-      dbSrc.includes("[b.lo,b.hi,opts.sinceMs,mcapEvidenceSinceMs,b.rotatePhase??0") &&
-        dbSrc.includes("[lo,hi,opts.sinceMs,opts.mcapEvidenceSinceMs,opts.rotatePhase??0"),
+      dbSrc.includes("[b.lo,b.hi,opts.sinceMs,mcapEvidenceSinceMs,b.rotatePhase??0]") &&
+        dbSrc.includes("[lo,hi,opts.sinceMs,opts.mcapEvidenceSinceMs,opts.rotatePhase??0]"),
       "both builders bind the page phase where its placeholder sits, before every floor's",
     );
     assert.ok(
-      scannerSrc.includes('POOL_QUERY_SHAPE_VERSION="v4-2026-10-21-band-page"') &&
+      dbSrc.includes("b.fullLoasnumber") &&
+        dbSrc.includes("opts.fullLoasnumber") &&
+        dbSrc.includes("fullLo:nearSlots>1?nearLo:undefined"),
+      "the near evidenced overflow must bind its full-band range before first_seen_at in both builders",
+    );
+    assert.ok(
+      scannerSrc.includes('POOL_QUERY_SHAPE_VERSION="v5-2026-11-13-near-evidenced"') &&
         scannerSrc.includes("poolKeyHash(POOL_QUERY_SHAPE_VERSION+"),
       "the pool snapshot key must carry the SQL's own shape version, or a snapshot taken with the OLD predicate answers the new one",
     );
@@ -11832,7 +11922,9 @@ async function main() {
       const now = 50 * 300e3;
       // HOT: age 6h — hot zone, evaluated every scan
       await seed("HOT", now - 6 * H, 0);
-      // NEAR0 / NEAR1: ages 8h / 11h — near slots 0 / 1
+      // NEAR0 / NEAR1: ages 8h / 11h — near slots 0 / 1. Both are evidenced,
+      // so the overflow returns both every scan; the page still rotates the
+      // no-evidence rows (see the overflow test below).
       await seed("NEAR0", now - 8 * H, 0);
       await seed("NEAR1", now - 11 * H, 0);
       // FAR: age 25h — far slot 2 (50 % 6 = 2)
@@ -11858,7 +11950,9 @@ async function main() {
       assert.equal(t0[0], "HOT", "hot zone is evaluated first (band order)");
       assert.ok(t0.includes("HOT"), "hot zone coin present");
       assert.ok(t0.includes("NEAR0"), "near slot 0 active at scan 0");
-      assert.ok(!t0.includes("NEAR1"), "near slot 1 not active at scan 0");
+      // Evidenced rows are returned from BOTH near halves (the 2026-11-13
+      // overflow), so the other half's evidenced row is present too.
+      assert.ok(t0.includes("NEAR1"), "near slot 1's evidenced row is returned too");
       assert.ok(t0.includes("FAR"), "far slot 2 active at scan 0");
       assert.ok(!t0.includes("YOUNG"), "too-young coin must not be evaluated");
       assert.ok(!t0.includes("SEEN"), "already-pushed coin excluded");
@@ -11868,11 +11962,11 @@ async function main() {
       const t1 = (await db.getReevalPool(opts(now + 300e3))).map((x) => x.token);
       assert.ok(t1.includes("HOT"), "hot zone every scan");
       assert.ok(t1.includes("NEAR1"), "near slot 1 active at scan 1");
-      assert.ok(!t1.includes("NEAR0"), "near slot 0 not active at scan 1");
+      assert.ok(t1.includes("NEAR0"), "near slot 0's evidenced row is returned too");
       assert.ok(!t1.includes("FAR"), "far slot 3 active at scan 1, not slot 2");
 
-      // Full-sweep properties: NEAR fully covered within 2 scans (10 min),
-      // FAR within 6 scans (30 min), hot every scan.
+      // Full-sweep properties: near EVIDENCED rows every scan (the overflow),
+      // far within 6 scans (30 min), hot every scan.
       let hotSeen = 0;
       let near0 = 0;
       let near1 = 0;
@@ -11887,8 +11981,8 @@ async function main() {
       }
       assert.equal(hotSeen, 18, "hot zone evaluated every scan");
       assert.ok(
-        near0 >= 8 && near1 >= 8,
-        `near zone fully swept every 2 scans (near0=${near0}, near1=${near1})`,
+        near0 >= 18 && near1 >= 18,
+        `near evidenced rows are seen every scan (near0=${near0}, near1=${near1})`,
       );
       assert.deepEqual(
         farScans,
