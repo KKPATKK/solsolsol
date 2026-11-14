@@ -3056,6 +3056,12 @@ export interface TickLegRow {
   poolZonePushed: { hot: number; near: number; far: number; filler: number } | null;
   /** Candidate counts from the feed half, by discovery source (see ScanSummary). */
   feedCandidates: Record<string, number> | null;
+  /** Feed-half candidates deduped by mint for this tick. */
+  feedCandidatesUnique: Record<string, number> | null;
+  /** Successful feed-half pushes by discovery source. */
+  feedPushes: Record<string, number> | null;
+  /** Candidate-chain stage counters (see ScanSummary.candidateFunnel). */
+  candidateFunnel: Record<string, number> | null;
   /** Far-tier gate readings: removed rows and explored no-evidence rows. */
   poolFarFiltered: number | null;
   poolFarExplored: number | null;
@@ -3152,6 +3158,11 @@ export function buildTickLegRow(input: {
       : null,
     poolZonePushed: s?.poolZonePushed ? { ...s.poolZonePushed } : null,
     feedCandidates: s?.feedCandidates ? { ...s.feedCandidates } : null,
+    feedCandidatesUnique: s?.feedCandidatesUnique
+      ? { ...s.feedCandidatesUnique }
+      : null,
+    feedPushes: s?.feedPushes ? { ...s.feedPushes } : null,
+    candidateFunnel: s?.candidateFunnel ? { ...s.candidateFunnel } : null,
     poolFarFiltered: s?.poolFarFiltered ?? null,
     poolFarExplored: s?.poolFarExplored ?? null,
     poolMisses: s?.poolMisses ?? null,
@@ -6328,6 +6339,9 @@ async function runScan(
                 poolZoneCandidates: summary.poolZoneCandidates ?? null,
                 poolZonePushed: summary.poolZonePushed ?? null,
                 feedCandidates: summary.feedCandidates ?? null,
+                feedCandidatesUnique: summary.feedCandidatesUnique ?? null,
+                feedPushes: summary.feedPushes ?? null,
+                candidateFunnel: summary.candidateFunnel ?? null,
                 poolFarFiltered: summary.poolFarFiltered ?? null,
                 poolFarExplored: summary.poolFarExplored ?? null,
                 poolMisses: summary.poolMisses ?? null,

@@ -2791,6 +2791,31 @@ export function countFeedCandidates(
 }
 
 /**
+ * The same attribution as countFeedCandidates, deduped by MINT rather than by
+ * (mint, chat) row. `feedCandidates` answers "how many delivery chances did
+ * this feed produce this tick"; this answers "how many distinct coins". Both
+ * are needed: a multi-chat coin is one discovery but several evaluations, and
+ * only the pair can tell candidate inflation from real feed yield.
+ */
+export function countFeedCandidatesUnique(
+  candidates: ReadonlyArray<{
+    tokenAddress: string;
+    discoveredVia?: string | null;
+  }>,
+  feedTokens: ReadonlySet<string>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  const seen = new Set<string>();
+  for (const c of candidates) {
+    if (!feedTokens.has(c.tokenAddress) || seen.has(c.tokenAddress)) continue;
+    seen.add(c.tokenAddress);
+    const feed = c.discoveredVia || "legacy";
+    out[feed] = (out[feed] ?? 0) + 1;
+  }
+  return out;
+}
+
+/**
  * The tick's pool window, allocated by ZONE and cadence (2026-10-21).
  *
  * WHY THIS REPLACES THE TWO-LANE (EVIDENCE/FILLER) SPLIT: that split answered
@@ -3546,6 +3571,28 @@ export interface ScanSummary {
    * 50→10, Jupiter 30→70) moved yield or just volume.
    */
   feedCandidates?: Record<string, number>;
+  /**
+   * The same feed-half attribution, deduped by mint for THIS tick. A coin
+   * sent to two chats contributes two rows to `feedCandidates` and one here;
+   * compare the two when a feed's raw candidate count looks inflated.
+   */
+  feedCandidatesUnique?: Record<string, number>;
+  /**
+   * Successful feed-half pushes by discovery source, same keys as
+   * `feedCandidates`. Pool pushes are excluded (they already have
+   * poolZonePushed), so candidate-to-push conversion can be read per feed
+   * instead of inferred from a token_stats join.
+   */
+  feedPushes?: Record<string, number>;
+  /**
+   * Candidate-chain drop counters for this tick. Keys are stable stage names:
+   * `tokens` (distinct mints), `seen`, `deferred`, `gate`, `sendDeferred`,
+   * `claimLost`, `sendFailed`, `outboxed`, `sendAbandoned`, `pushed`, plus
+   * `gate.<reason>` for the gate that rejected a candidate group. A zero-push
+   * tick with candidates can be localised without guessing from the latest
+   * heartbeat's reject sample.
+   */
+  candidateFunnel?: Record<string, number>;
   /** Far-tier rows removed by the liquidity-evidence gate before pair/eval. */
   poolFarFiltered?: number;
   /** Far-tier rows kept by the deterministic exploration lane. */
@@ -6543,6 +6590,20 @@ export class Scanner {
       backfill: 0,
       pool: 0,
       feedCandidates: {},
+      feedCandidatesUnique: {},
+      feedPushes: {},
+      candidateFunnel: {
+        tokens: 0,
+        seen: 0,
+        deferred: 0,
+        gate: 0,
+        sendDeferred: 0,
+        claimLost: 0,
+        sendFailed: 0,
+        outboxed: 0,
+        sendAbandoned: 0,
+        pushed: 0,
+      },
       agedEval: 0,
       staleReadings: 0,
       poolMisses: 0,
@@ -8397,12 +8458,20 @@ export class Scanner {
         if (zone) poolZoneCandidates[zone] += 1;
       }
       diag.poolZoneCandidates = poolZoneCandidates;
+      const feedTokenSet = new Set(feedOnly.map((p) => p.tokenAddress));
       diag.feedCandidates = countFeedCandidates(
         candidates.map((coin) => ({
           tokenAddress: coin.profile.tokenAddress,
           discoveredVia: coin.stats.discoveredVia,
         })),
-        new Set(feedOnly.map((p) => p.tokenAddress)),
+        feedTokenSet,
+      );
+      diag.feedCandidatesUnique = countFeedCandidatesUnique(
+        candidates.map((coin) => ({
+          tokenAddress: coin.profile.tokenAddress,
+          discoveredVia: coin.stats.discoveredVia,
+        })),
+        feedTokenSet,
       );
       // The prune's counters belong to THIS tick, so they are refreshed
       // here — the same pattern the recovery path uses for
@@ -8435,6 +8504,15 @@ export class Scanner {
         if (group) group.push(coin);
         else groups.set(key, [coin]);
       }
+      const candidateFunnel = diag.candidateFunnel!;
+      candidateFunnel.tokens = groups.size;
+      const bumpFunnel = (key: string): void => {
+        candidateFunnel[key] = (candidateFunnel[key] ?? 0) + 1;
+      };
+      const dropCandidateGate = (reason: string): void => {
+        bumpFunnel("gate");
+        bumpFunnel(`gate.${reason}`);
+      };
       let processedCandidates = 0;
       // Two deadlines for the candidate chain, both derived from the tick's
       // own deadline. `chainDeadline` is the hard wall for EVERYTHING that
@@ -8492,6 +8570,7 @@ export class Scanner {
         for (const coin of group) {
           try {
             if (await this.db.isTokenSeen(coin.chatId, coin.profile.tokenAddress)) {
+              bumpFunnel("seen");
               continue;
             }
           } catch (err) {
@@ -8540,6 +8619,7 @@ export class Scanner {
           this.config.mcapLiqRatioMin,
         );
         if (liqRatioLow) {
+          dropCandidateGate("liqRatio");
           diag.fails.liqRatio++;
           this.addReject(diag, coin, liqRatioLow);
           console.log(
@@ -8562,6 +8642,7 @@ export class Scanner {
         this.markPhase(diag, "flow", startedAt);
         const flow = await this.resolveSupplyFlow(coin, chainDeadline);
         if (flow.status === "flagged") {
+          dropCandidateGate("flow");
           diag.fails.flow++;
           this.addReject(
             diag,
@@ -8806,6 +8887,7 @@ export class Scanner {
         );
         if (crime.hit) diag.crime++;
         if (this.config.crimeWallets.block && crime.hit) {
+          dropCandidateGate("crime");
           diag.fails.crime++;
           this.addReject(
             diag,
@@ -8841,6 +8923,7 @@ export class Scanner {
             this.config.axiomMinBotUsers,
           );
           if (botReason) {
+            dropCandidateGate("botUsers");
             diag.fails.other++;
             this.addReject(diag, coin, botReason);
             console.log(
@@ -8869,6 +8952,7 @@ export class Scanner {
           this.config.gmgnBlockWashTrading &&
           gmgn?.isWashTrading === true
         ) {
+          dropCandidateGate("gmgn");
           diag.fails.other++;
           this.addReject(diag, coin, "GMGN 標記為 wash trading");
           console.log(
@@ -8925,7 +9009,10 @@ export class Scanner {
         // and the card reads it seconds later). A null reading here — the
         // slot had not landed when the window ran out, or both gates are off
         // — fails open, as documented.
-        if (this.jupiterGatesBlocked(diag, coin, jupReading)) continue;
+        if (this.jupiterGatesBlocked(diag, coin, jupReading)) {
+          dropCandidateGate("jupiter");
+          continue;
+        }
         // Wallet analysis — creator profile (age + serial-launcher create
         // count), top-holder wallet ages and cross-coin holder clustering.
         // Runs only for coins that pass every block gate (its pushed_holders
@@ -8968,6 +9055,7 @@ export class Scanner {
           this.config.walletNewMinChecked,
         );
         if (newWalletReason) {
+          dropCandidateGate("newWallet");
           diag.fails.other++;
           this.addReject(diag, coin, newWalletReason);
           console.log(
@@ -8987,6 +9075,7 @@ export class Scanner {
           this.config.top10PctMax,
         );
         if (top10Reason) {
+          dropCandidateGate("top10");
           diag.fails.other++;
           this.addReject(diag, coin, top10Reason);
           console.log(
@@ -9022,6 +9111,7 @@ export class Scanner {
           flurryOut.status === "report" ? flurryOut.report : null;
         if (flurryReport) diag.flurryAnalyzed++;
         if (flurryReport?.bundled && this.config.flurry.blockBundles) {
+          dropCandidateGate("flurry");
           diag.fails.flurry++;
           this.addReject(diag, coin, flurryBlockReason(flurryReport)!);
           console.log(
@@ -9048,7 +9138,10 @@ export class Scanner {
         // that judgement never saw. One snapshot, one verdict, one card — and
         // a box still holding null keeps the documented fail-open.
         const organicReading = organicBox.value;
-        if (this.jupiterGatesBlocked(diag, coin, organicReading)) continue;
+        if (this.jupiterGatesBlocked(diag, coin, organicReading)) {
+          dropCandidateGate("jupiter");
+          continue;
+        }
         const tokenAddress = coin.pair.baseToken.address;
         /**
          * The card's own render, as a function of its 有機度 reading — ONE
@@ -9134,6 +9227,7 @@ export class Scanner {
             return;
           }
           if (!claimed) {
+            bumpFunnel("claimLost");
             return;
           }
           // The claim's round trip comes out of the same slice, so the
@@ -9165,6 +9259,7 @@ export class Scanner {
           if (latestReading !== null && latestReading !== judgedReading) {
             judgedReading = latestReading;
             if (this.jupiterGatesBlocked(diag, coin, latestReading)) {
+              dropCandidateGate("jupiterLate");
               cardBlocked = true;
               try {
                 await this.db.unclaimTokenPush(c.chatId, c.profile.tokenAddress);
@@ -9248,6 +9343,7 @@ export class Scanner {
               if (arrived !== null && arrived !== judgedReading) {
                 judgedReading = arrived;
                 if (this.jupiterGatesBlocked(diag, coin, arrived)) {
+                  dropCandidateGate("jupiterLate");
                   cardBlocked = true;
                   try {
                     await this.db.unclaimTokenPush(
@@ -9486,6 +9582,11 @@ export class Scanner {
             const zone = poolSliceZoneByToken.get(c.profile.tokenAddress);
             if (zone) poolZonePushed[zone] += 1;
           }
+          if (feedTokenSet.has(c.profile.tokenAddress)) {
+            const source = c.stats.discoveredVia || "legacy";
+            const feedPushes = diag.feedPushes!;
+            feedPushes[source] = (feedPushes[source] ?? 0) + 1;
+          }
           // Start post-push tracking (🚀/⚠️/💀 follow-ups). Best-effort and
           // deduped by the table's PK — never affects the push itself.
           this.markPhase(diag, "send:track", startedAt);
@@ -9509,6 +9610,7 @@ export class Scanner {
           // actually prevents a duplicate card.
           try {
             if (await this.db.isTokenSeen(c.chatId, c.profile.tokenAddress)) {
+              bumpFunnel("seen");
               continue;
             }
           } catch (err) {
@@ -9527,6 +9629,7 @@ export class Scanner {
             // chat-aware re-eval pool re-pushes the coin to this chat on a
             // later scan either way — never mark it seen on failure.
             const info = describePushError(err);
+            bumpFunnel("sendFailed");
             await this.recordPushFailure(c.chatId, c.profile.tokenAddress, info);
             console.error(
               `[scanner] failed to push ${symbol} to ${c.chatId}: ${info.line}`,
@@ -9560,6 +9663,7 @@ export class Scanner {
                   organic: cardOrganicAudit(cardReading, organicNote),
                   error: info.line,
                 });
+                bumpFunnel("outboxed");
               } catch (enqueueErr) {
                 // Fail-open and named: the insert failing means the database
                 // is already in trouble (every other path in this tick reads
@@ -9574,6 +9678,10 @@ export class Scanner {
         }
       }
       diag.pushed = pushed;
+      candidateFunnel.deferred = diag.chainDeferred ?? 0;
+      candidateFunnel.sendDeferred = diag.cardSendDeferred ?? 0;
+      candidateFunnel.sendAbandoned = diag.cardSendAbandoned ?? 0;
+      candidateFunnel.pushed = pushed;
       diag.poolZonePushed = poolZonePushed;
       diag.evalMs = Date.now() - evalStart;
       // The post-push tracker pass USED to run here, last, on whatever the

@@ -128,6 +128,21 @@ test("a full tick maps every leg and the front split", () => {
         poolZoneCandidates: { hot: 1, near: 0, far: 0, filler: 0 },
         poolZonePushed: { hot: 0, near: 0, far: 0, filler: 0 },
         feedCandidates: { jup: 2, pump: 1 },
+        feedCandidatesUnique: { jup: 1, pump: 1 },
+        feedPushes: { jup: 1 },
+        candidateFunnel: {
+          tokens: 2,
+          seen: 1,
+          deferred: 0,
+          gate: 1,
+          "gate.jupiter": 1,
+          sendDeferred: 0,
+          claimLost: 0,
+          sendFailed: 0,
+          outboxed: 0,
+          sendAbandoned: 0,
+          pushed: 1,
+        },
         poolFarFiltered: 3,
         poolFarExplored: 1,
         poolMisses: 1,
@@ -196,6 +211,14 @@ test("a full tick maps every leg and the front split", () => {
   assert.deepEqual(row.poolZoneCandidates, { hot: 1, near: 0, far: 0, filler: 0 });
   assert.deepEqual(row.poolZonePushed, { hot: 0, near: 0, far: 0, filler: 0 });
   assert.deepEqual(row.feedCandidates, { jup: 2, pump: 1 }, "feed candidates are attributed by source");
+  assert.deepEqual(
+    row.feedCandidatesUnique,
+    { jup: 1, pump: 1 },
+    "unique feed candidates are attributed separately",
+  );
+  assert.deepEqual(row.feedPushes, { jup: 1 }, "successful feed pushes are attributed by source");
+  assert.equal(row.candidateFunnel.gate, 1, "candidate gate drops survive the ring");
+  assert.equal(row.candidateFunnel["gate.jupiter"], 1, "the gate reason is named");
   assert.equal(row.poolFarFiltered, 3, "the far lane's removed rows survive the ring");
   assert.equal(row.poolFarExplored, 1, "and its exploration lane is visible");
   assert.equal(row.poolMisses, 1);
@@ -216,6 +239,9 @@ test("the row copies its maps — later mutation must not rewrite a tick", () =>
   const legMap = { pairs: 5 };
   const feedMap = { pump: 6 };
   const candidateMap = { jup: 2 };
+  const uniqueCandidateMap = { jup: 1 };
+  const pushMap = { jup: 1 };
+  const funnelMap = { tokens: 1, pushed: 1 };
   const failsMap = {
     mcap: 2,
     chg: 0,
@@ -235,6 +261,9 @@ test("the row copies its maps — later mutation must not rewrite a tick", () =>
         poolLegMs: legMap,
         feedLegMs: feedMap,
         feedCandidates: candidateMap,
+        feedCandidatesUnique: uniqueCandidateMap,
+        feedPushes: pushMap,
+        candidateFunnel: funnelMap,
         fails: failsMap,
       },
     }),
@@ -243,11 +272,17 @@ test("the row copies its maps — later mutation must not rewrite a tick", () =>
   legMap.pairs = 99;
   feedMap.pump = 99;
   candidateMap.jup = 99;
+  uniqueCandidateMap.jup = 99;
+  pushMap.jup = 99;
+  funnelMap.pushed = 99;
   failsMap.mcap = 99;
   assert.equal(row.steps.init, 1);
   assert.equal(row.poolLegMs.pairs, 5);
   assert.equal(row.feedLegMs.pump, 6);
   assert.equal(row.feedCandidates.jup, 2, "per-feed candidate counts are copied too");
+  assert.equal(row.feedCandidatesUnique.jup, 1, "unique candidate counts are copied too");
+  assert.equal(row.feedPushes.jup, 1, "feed pushes are copied too");
+  assert.equal(row.candidateFunnel.pushed, 1, "the candidate funnel is copied, not aliased");
   assert.equal(row.fails.mcap, 2, "the counters are copied, not aliased");
 });
 
@@ -279,6 +314,9 @@ test("a cut tick with no summary records null legs, not zeros", () => {
   assert.equal(row.poolLanes, null, "no summary = no fabricated lane cohort");
   assert.equal(row.poolZoneCandidates, null);
   assert.equal(row.feedCandidates, null);
+  assert.equal(row.feedCandidatesUnique, null);
+  assert.equal(row.feedPushes, null);
+  assert.equal(row.candidateFunnel, null);
   assert.equal(row.poolFarFiltered, null);
   assert.equal(row.poolMisses, null);
   assert.equal(row.preStartMs, null);

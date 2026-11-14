@@ -502,8 +502,10 @@ export interface AppConfig {
   geckoterminalTrendingLimit: number;
   /**
    * Jupiter Token v2 recent-launches feed size per scan (JUPITER_RECENT_LIMIT,
-   * default 30, max 100, 0 = disabled). Seconds-old launchpad launches — the
-   * free no-key replacement for the blocked pump.fun frontend-api feed.
+   * default 30, 0 = disabled). Seconds-old launchpad launches — the free
+   * no-key replacement for the blocked pump.fun frontend-api feed. The
+   * upstream `/recent` endpoint currently hard-caps the response at 30 and
+   * ignores limit/offset/page, so values above 30 do not add rows.
    *
    * 2026-09-28: default 20 → 30, and the reason is that the 20 was FREE to
    * raise. /recent answers ≥30 rows in ONE request whatever limit is asked for

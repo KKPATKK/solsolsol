@@ -31,7 +31,7 @@ const { scanRaceWindowMs, buildPreTickSplit, preTickView, PRE_TICK_ZERO_STEPS, S
 const { cachedInitVerdict, trackInitBoot, INIT_UNSETTLED_MAX_MS } = require("../dist/worker.js");
 const { installSkipCapture, noteSkipReason, skipCaptureSnapshot, takeSkipCaptureDelta, markSkipCaptureSynced, emptySkipCaptureState, mergeSkipCaptureState, parseSkipCaptureState, pruneSkipCounts, resetSkipCapture, SKIP_CAPTURE_MAX_REASONS } = require("../dist/skipcapture.js");
 const { beginSubreqWindow, countSubreq, markSubreqPhase, subreqRemaining, subreqView, resetSubreqWindows, SUBREQ_BUDGET, SUBREQ_BUDGET_FREE, SUBREQ_PHASE_RING, SUBREQ_RECENT_WINDOWS, SUBREQ_HOST_RING, SUBREQ_OTHER_HOST } = require("../dist/subreqs.js");
-const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, DRAINED_POOL_LIQUIDITY_USD, slicePoolRotation, slicePoolZones, countFeedCandidates, POOL_SLICE_HOT_SHARE, parsePoolSliceCursors, serializePoolSliceCursors, poolZoneTicks, POOL_SLICE_MAX_CURSOR, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
+const { mcapRatioBlockReason, jupSusBlockReason, organicMinBlockReason, organicTradersBlockReason, jupiterGateVerdict, cardOrganicAudit, newWalletBlockReason, top10MinBlockReason, botUsersBlockReason, flurryBlockReason, gateLiquidityUsd, DRAINED_POOL_LIQUIDITY_USD, slicePoolRotation, slicePoolZones, countFeedCandidates, countFeedCandidatesUnique, POOL_SLICE_HOT_SHARE, parsePoolSliceCursors, serializePoolSliceCursors, poolZoneTicks, POOL_SLICE_MAX_CURSOR, cardSendDeadline, cardClaimDeadline, boundClaim, DeferredPushLedger, SCAN_TICK_DEADLINE_MS, CANDIDATE_PUSH_RESERVE_MS, poolKeyHash, poolQueryFingerprint, poolCacheView, poolEdgeCache, POOL_EDGE_CACHE_URL, POOL_EDGE_CACHE_MIN_TTL_S, Scanner, RE_EVAL_WINDOW_MS, RE_EVAL_AGE_MARGIN_MIN } = require("../dist/scanner.js");
 const { hydrateDeferredTokens } = require("../dist/deferredmakeup.js");
 const { parseTrending, parseTokenInfo } = require("../dist/gmgn.js");
 const { renderAxiomSummaryLine } = require("../dist/render.js");
@@ -10508,12 +10508,31 @@ async function main() {
       { jup: 2, legacy: 2 },
       "pool candidates are excluded; null/empty attribution falls back to legacy",
     );
+    const unique = countFeedCandidatesUnique(
+      [
+        { tokenAddress: "A", discoveredVia: "jup" },
+        { tokenAddress: "A", discoveredVia: "jup" }, // second chat, same coin
+        { tokenAddress: "B", discoveredVia: null },
+        { tokenAddress: "C", discoveredVia: "" },
+        { tokenAddress: "POOL", discoveredVia: "pump" },
+      ],
+      new Set(["A", "B", "C"]),
+    );
+    assert.deepEqual(
+      unique,
+      { jup: 1, legacy: 2 },
+      "the unique map dedupes the same mint across chats, not across sources",
+    );
     const scannerSrc = fs
       .readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8")
       .replace(/\s+/g, "");
     assert.ok(
       scannerSrc.includes("diag.feedCandidates=countFeedCandidates("),
       "the candidate loop must publish the per-feed map",
+    );
+    assert.ok(
+      scannerSrc.includes("diag.feedCandidatesUnique=countFeedCandidatesUnique("),
+      "the candidate loop must publish the deduped map too",
     );
     const workerSrc = fs
       .readFileSync(path.join(__dirname, "..", "src", "worker.ts"), "utf8")
@@ -11418,6 +11437,20 @@ async function main() {
         poolZoneCandidates: { hot: 1, near: 0, far: 0, filler: 0 },
         poolZonePushed: { hot: 0, near: 0, far: 0, filler: 0 },
         feedCandidates: { jup: 2, pump: 1 },
+        feedCandidatesUnique: { jup: 1, pump: 1 },
+        feedPushes: { jup: 1 },
+        candidateFunnel: {
+          tokens: 2,
+          seen: 0,
+          gate: 0,
+          deferred: 0,
+          sendDeferred: 0,
+          claimLost: 0,
+          sendFailed: 0,
+          outboxed: 0,
+          sendAbandoned: 0,
+          pushed: 0,
+        },
         poolFarFiltered: 3,
         poolFarExplored: 1,
         poolMisses: 0,
@@ -11459,6 +11492,21 @@ async function main() {
         rows[0].feedCandidates,
         { jup: 2, pump: 1 },
         "feed candidate yield is attributable to its discovery source",
+      );
+      assert.deepEqual(
+        rows[0].feedCandidatesUnique,
+        { jup: 1, pump: 1 },
+        "the deduped candidate map round-trips",
+      );
+      assert.deepEqual(
+        rows[0].feedPushes,
+        { jup: 1 },
+        "successful pushes are attributable to their feed",
+      );
+      assert.equal(
+        rows[0].candidateFunnel["gate"],
+        0,
+        "the candidate funnel round-trips",
       );
       assert.equal(rows[0].poolFarFiltered, 3, "the far gate's removed rows survive the tick");
       assert.equal(rows[0].poolFarExplored, 1, "and so does its exploration lane");
@@ -22607,8 +22655,8 @@ async function main() {
       "the deployed knob must keep the newest Raydium launches enabled (10, not 0)",
     );
     assert.ok(
-      wranglerSrc.includes('JUPITER_RECENT_LIMIT="70"'),
-      "the 40 freed slots must be assigned to Jupiter's ceiling (upstream currently caps the response at 30)",
+      wranglerSrc.includes('JUPITER_RECENT_LIMIT="30"'),
+      "the Jupiter feed must name the upstream hard cap (30; /recent ignores limit and pagination)",
     );
   });
 

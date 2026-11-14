@@ -1828,6 +1828,12 @@ export interface TickLegInsert {
   poolZonePushed: PoolZoneCounts | null;
   /** Feed-half candidates by discovery source (see ScanSummary.feedCandidates). */
   feedCandidates: Record<string, number> | null;
+  /** Feed-half candidates deduped by mint for this tick. */
+  feedCandidatesUnique: Record<string, number> | null;
+  /** Successful feed-half pushes by discovery source. */
+  feedPushes: Record<string, number> | null;
+  /** Candidate-chain stage counters (see ScanSummary.candidateFunnel). */
+  candidateFunnel: Record<string, number> | null;
   /** Far-tier rows the liquidity-evidence gate removed / kept as exploration. */
   poolFarFiltered: number | null;
   poolFarExplored: number | null;
@@ -3129,6 +3135,9 @@ export class Db {
           pool_zone_candidates TEXT,
           pool_zone_pushed TEXT,
           feed_candidates TEXT,
+          feed_candidates_unique TEXT,
+          feed_pushes TEXT,
+          candidate_funnel TEXT,
           pool_far_filtered INTEGER,
           pool_far_explored INTEGER,
           pool_misses INTEGER,
@@ -3559,6 +3568,9 @@ export class Db {
     await this.addColumnIfMissing("tick_legs", "pool_zone_candidates", "TEXT");
     await this.addColumnIfMissing("tick_legs", "pool_zone_pushed", "TEXT");
     await this.addColumnIfMissing("tick_legs", "feed_candidates", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "feed_candidates_unique", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "feed_pushes", "TEXT");
+    await this.addColumnIfMissing("tick_legs", "candidate_funnel", "TEXT");
     await this.addColumnIfMissing("tick_legs", "pool_far_filtered", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_far_explored", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_misses", "INTEGER");
@@ -4753,7 +4765,8 @@ export class Db {
                    meteora, raydium, geo, boosts, feed_legs, candidates,
                    pushed, organic_why, pairs_reused, pairs_missing, pool_sliced,
                    pool_stale, pool_lanes, pool_served, pool_zone_candidates,
-                   pool_zone_pushed, feed_candidates, pool_far_filtered,
+                   pool_zone_pushed, feed_candidates, feed_candidates_unique,
+                   feed_pushes, candidate_funnel, pool_far_filtered,
                    pool_far_explored, pool_misses, pool_unreadable
             FROM tick_legs WHERE at >= ? ORDER BY at DESC LIMIT ?`,
       args: [since, limit],
@@ -4785,6 +4798,9 @@ export class Db {
       poolZoneCandidates: parsePoolZoneCounts(r.pool_zone_candidates),
       poolZonePushed: parsePoolZoneCounts(r.pool_zone_pushed),
       feedCandidates: parseFeedCandidates(r.feed_candidates),
+      feedCandidatesUnique: parseFeedCandidates(r.feed_candidates_unique),
+      feedPushes: parseFeedCandidates(r.feed_pushes),
+      candidateFunnel: parseFeedCandidates(r.candidate_funnel),
       poolFarFiltered: numOrNull(r.pool_far_filtered),
       poolFarExplored: numOrNull(r.pool_far_explored),
       poolMisses: numOrNull(r.pool_misses),
@@ -4963,9 +4979,10 @@ export class Db {
                  meteora, raydium, geo, boosts, feed_legs, candidates, pushed,
                  organic_why, pairs_reused, pairs_missing, pool_sliced,
                  pool_stale, pool_lanes, pool_served, pool_zone_candidates,
-                 pool_zone_pushed, feed_candidates, pool_far_filtered,
+                 pool_zone_pushed, feed_candidates, feed_candidates_unique,
+                 feed_pushes, candidate_funnel, pool_far_filtered,
                  pool_far_explored, pool_misses, pool_unreadable)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           leg.at,
           leg.via,
@@ -4999,6 +5016,16 @@ export class Db {
           leg.feedCandidates === null || leg.feedCandidates === undefined
             ? null
             : JSON.stringify(leg.feedCandidates),
+          leg.feedCandidatesUnique === null ||
+          leg.feedCandidatesUnique === undefined
+            ? null
+            : JSON.stringify(leg.feedCandidatesUnique),
+          leg.feedPushes === null || leg.feedPushes === undefined
+            ? null
+            : JSON.stringify(leg.feedPushes),
+          leg.candidateFunnel === null || leg.candidateFunnel === undefined
+            ? null
+            : JSON.stringify(leg.candidateFunnel),
           leg.poolFarFiltered,
           leg.poolFarExplored,
           leg.poolMisses,
