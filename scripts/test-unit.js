@@ -23,7 +23,7 @@ const { parseNewPools, parseTokenSnapshot, GeckoTerminalClient, parseRetryAfterM
 const { parseJupTokens, parseJupTrendTokens, trendBandFromChats, JupTokensClient, JUP_FALLBACK_MIN_ROOM_MS, JUP_PRIORITY_GAP_MS, rateLimitPauseMs, JUP_RATE_LIMIT_MIN_PAUSE_MS, JUP_RATE_LIMIT_WAIT_MAX_MS, JUP_RATE_LIMIT_BACKOFF_MS } = require("../dist/jupfeeds.js");
 const { passesChgGate, DexScreenerClient, PAIR_BATCH_CACHE_TTL_S, PAIR_CACHE_TTL_MS, BOOSTS_429_BACKOFF_MS, BOOSTS_BACKOFF_MAX_MS, boostsBackoffMs } = require("../dist/dexscreener.js");
 const { evaluateWatch, recapVerdict, recapMessage, PushWatcher, comparableLiquidity, liquidityIsComparable, terminalRowIssues, terminalRowRepair, TRACKER_ROW_SPAN_HOLD_MS, TRACKER_PAIR_HEAD, TRACKER_PAIRS_HARD_CAP_MS, risingCardTail, newlyCrossedStages, blindWindowPoint, BLIND_WINDOW_MS, baseMarkFor, revivedBaseline, trackerPassPulse, trackerLaneStatus, TRACKER_LANE_STALE_MS, runningPassStamp } = require("../dist/pushwatch.js");
-const { DRAIN_CONFIRM_MARK, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
+const { DRAIN_CONFIRM_MARK, DRAIN_WATCH_STATE, resumeTrackingKeyboard, withCopyableTicker } = require("../dist/pushwatch.js");
 const { cutMarkFor, parseCutMarks, addCutMark, addCutMarks, CUT_MARK_BUCKET_MS, CARRIED_ATTEMPT_SIGS } = require("../dist/pushwatch.js");
 const { parsePushLedger, mergePushLedger, pushLedgerStats, PUSH_LEDGER_MAX_ENTRIES, ledgerDeliveredTokens } = require("../dist/pushledger.js");
 const { syncPushLedger, syncSkipCaptureState, syncBirdeyeCu, parseBirdeyeCuLedger, mergeBirdeyeCuLedger, birdeyeCuStats, parseBirdeyeCuByLedger, mergeBirdeyeCuByLedger, birdeyeCuByStats, birdeyeCuRecentDays, BIRDEYE_MONTHLY_CU_DEFAULT, SCAN_FLUSH_RESERVE_MS, FLUSH_ATTEMPT_BOUND_MS } = require("../dist/worker.js");
@@ -1591,10 +1591,10 @@ async function main() {
     assert.equal(out.undelivered, 0, "abandoned is not a failure — it must not roll back");
     assert.equal(db.updated.length, 1);
     const [, written] = db.updated[0];
-    // The card said 停止追蹤, so the DB has to agree: terminal + cooldown armed
-    // (the old rollback left last_state NULL and last_alert_at 0 — a card that
-    // contradicts the row it describes, and a card free to fire again).
-    assert.equal(written.lastState, "rug");
+    // The card's one-way transition has to land even when the send is unknown:
+    // the row enters the silent watch with its clock armed, instead of rolling
+    // back to an active row that would re-announce the same card.
+    assert.equal(written.lastState, DRAIN_WATCH_STATE);
     assert.ok(written.lastAlertAt > 0, "the terminal transition and its clock both land");
     assert.equal(written.followupsSent, 1);
     // Durable: the settle's input, keyed per coin, in the tracker's own ring.
@@ -1643,8 +1643,8 @@ async function main() {
     assert.equal(w1.lastState, null, "the row keeps watching");
     assert.equal(w1.followupsSent, 1, "the announcement still counts as one");
 
-    // (b) SECOND reading: the 💧 drain is muted too and its TERMINAL
-    // transition still lands — lastState rug, no durable unconfirmed record
+    // (b) SECOND reading: the 💧 drain is muted too and its silent-watch
+    // transition still lands — lastState drained, no durable unconfirmed record
     // (nothing was in flight), no abandoned accounting.
     const db2 = termDb([termRow({ upStages: "liq1" })]);
     const out2 = await muted(db2, bot).runTick(Date.now() + 1_500);
@@ -1657,7 +1657,7 @@ async function main() {
       "nothing in flight → nothing recorded for the settle",
     );
     const [, w2] = db2.updated[0];
-    assert.equal(w2.lastState, "rug", "the row still terminalizes");
+    assert.equal(w2.lastState, DRAIN_WATCH_STATE, "the row still enters silent monitoring");
     assert.ok(w2.lastAlertAt > 0, "and its clock still lands");
 
     // (c) UNMUTED control: the same row shape still sends — the suppression
@@ -18593,7 +18593,7 @@ async function main() {
     assert.ok(!e4.alerts.some((a) => a.kind === "holders"));
   });
 
-  await test("evaluateWatch: absolute liquidity floor (drained LP) wins and stops tracking", () => {
+  await test("evaluateWatch: absolute liquidity floor (drained LP) wins and enters silent monitoring", () => {
     const row = (over = {}) => ({
       token: "T", chatId: "c", symbol: "CatGPT", pushedAt: 0,
       mcapAtPush: 50_000, peakMcap: 126_000, lastLiquidity: 12_000,
@@ -18614,7 +18614,7 @@ async function main() {
     assert.equal(r.alerts.length, 1);
     assert.equal(r.alerts[0].kind, "liquidity");
     assert.match(r.alerts[0].text, /跌穿地板 CatGPT/);
-    assert.match(r.alerts[0].text, /下一次檢查仍低於地板就會停止追蹤/);
+    assert.match(r.alerts[0].text, /下一次檢查仍低於地板就會轉入靜默監控/);
     assert.equal(r.lastState, "up100", "a warning is not a state change");
     assert.equal(r.stopTracking, false);
     // The arm writes the confirm mark TOGETHER with the row's stage marks —
@@ -18624,15 +18624,16 @@ async function main() {
     // column held nothing else.
     assert.equal(r.announcedUpStages, "liq1,up100,up200,up50");
 
-    // The SAME row one reading later, still under the floor → terminal, with
-    // no rising card even though mcap shows +300% (that number is the zombie).
+    // The SAME row one reading later, still under the floor → silent watch,
+    // with no rising card even though mcap shows +300% (that number is the
+    // zombie). The row itself stays active; only the card transition is one-way.
     const r2 = evaluateWatch(row({ upStages: DRAIN_CONFIRM_MARK }), 2000, { mcap: 200_000, liquidity: 9_999, chg5m: 30, buysH1: 500, sellsH1: 10 }, cfg);
     assert.equal(r2.alerts[0].kind, "liquidity");
     assert.match(r2.alerts[0].text, /流動性枯竭 CatGPT/);
-    assert.equal(r2.lastState, "rug");
+    assert.equal(r2.lastState, DRAIN_WATCH_STATE);
     assert.equal(r2.stopTracking, true);
-    // The arm is the FIRST reading's business: a terminal tick that rewrote the
-    // column would be writing marks onto a row nothing will ever read again.
+    // The arm is the FIRST reading's business: the drain tick leaves the column
+    // alone; the silent branch never needs to rewrite it.
     assert.equal(r2.announcedUpStages, undefined);
 
     // Unarmed, that same just-below-floor reading only warns.
@@ -18662,7 +18663,7 @@ async function main() {
     // The live shape this closes (ARGUS, 2026-09-21 10:05Z): a 💧 card reading
     // `LP 僅剩 —（< $10K）` ended a row whose own stored measurement was
     // $65,179.55 — and DexScreener answers `liquidity.usd: 0` (not a missing
-    // field) for a pool it has not (re)indexed. A 'rug' row is never
+    // field) for a pool it has not (re)indexed. A terminal row is never
     // re-evaluated and the re-arm path only ever covered an UNPROVEN CARD SEND,
     // so one transient zero used to drop a live coin for good.
     const row = (over = {}) => ({
@@ -18679,7 +18680,7 @@ async function main() {
     assert.equal(first.alerts.length, 1);
     assert.equal(first.alerts[0].kind, "liquidity");
     assert.match(first.alerts[0].text, /跌穿地板 ARGUS/);
-    assert.match(first.alerts[0].text, /下一次檢查仍低於地板就會停止追蹤/);
+    assert.match(first.alerts[0].text, /下一次檢查仍低於地板就會轉入靜默監控/);
     assert.equal(first.stopTracking, false, "one reading must not end tracking");
     assert.equal(first.lastState, null, "and must not move the state machine");
     assert.equal(first.announcedUpStages, DRAIN_CONFIRM_MARK, "the arm rides the persistent column");
@@ -18687,9 +18688,9 @@ async function main() {
     const second = evaluateWatch(row({ upStages: DRAIN_CONFIRM_MARK }), 2000, subFloor, cfg);
     assert.match(second.alerts[0].text, /流動性枯竭 ARGUS/);
     assert.match(second.alerts[0].text, /連續 2 次檢查/);
-    assert.equal(second.lastState, "rug");
+    assert.equal(second.lastState, DRAIN_WATCH_STATE);
     assert.equal(second.stopTracking, true);
-    assert.equal(second.announcedUpStages, undefined, "the terminal tick leaves the column alone");
+    assert.equal(second.announcedUpStages, undefined, "the drain tick leaves the column alone");
 
     // A comparable reading back above the floor disarms the count, so a later
     // dip has to earn its own pair. (Stored 20K → live 21K, so the crash ratio
@@ -18727,11 +18728,72 @@ async function main() {
     assert.equal(unknown.announcedUpStages, undefined, "null must not touch the column");
   });
 
-  await test("resumeTrackingKeyboard: the 💧 card carries its own way back", () => {
-    // The drain card is the only card that ENDS tracking, and its evidence is
-    // one provider's liquidity number — so the card itself has to offer the
-    // undo. The callback is `resume:<token>`, handled next to 🔕 in src/bot.ts
-    // through the guarded re-arm (Db.rearmPushWatchAlert).
+  await test("evaluateWatch: a drained row watches silently and revives only on LP + mcap recovery", () => {
+    const row = (over = {}) => ({
+      token: "HOGE", chatId: "c", symbol: "HOGE", pushedAt: 0,
+      mcapAtPush: 100_000, peakMcap: 100_000, lastLiquidity: 0,
+      holdersAtPush: null, holdersLast: null, holdersCheckedAt: null,
+      lastChecked: 0, lastAlertAt: -3_600_000, followupsSent: 0,
+      lastState: DRAIN_WATCH_STATE, deadTroughMcap: 12_000,
+      upStages: `${DRAIN_CONFIRM_MARK},up50`,
+      ...over,
+    });
+    const cfg = { cooldownMs: 0 };
+
+    // Still dry: a fake mcap pump off the dead pool must not produce ANY card,
+    // and the stored trough must stay the real low rather than the zombie high.
+    const dry = evaluateWatch(
+      row(), 1000,
+      { mcap: 300_000, liquidity: 2_000, chg5m: 80, buysH1: 500, sellsH1: 10 },
+      cfg,
+    );
+    assert.deepEqual(dry.alerts, []);
+    assert.equal(dry.lastState, DRAIN_WATCH_STATE);
+    assert.equal(dry.deadTroughMcap, 12_000);
+    assert.equal(dry.stopTracking, false, "silent monitoring is not stopped tracking");
+
+    // LP recovered, but the mcap has not cleared trough ×1.5: keep waiting.
+    const early = evaluateWatch(
+      row(), 2000,
+      { mcap: 15_000, liquidity: 20_000, chg5m: 10, buysH1: 50, sellsH1: 20 },
+      cfg,
+    );
+    assert.deepEqual(early.alerts, []);
+    assert.equal(early.lastState, DRAIN_WATCH_STATE);
+
+    // Clean recovery: BOTH conditions met → one revival card, a clean
+    // baseline at the observed price, and the stage ladder restarts there.
+    const revived = evaluateWatch(
+      row(), 3000,
+      { mcap: 18_000, liquidity: 20_000, chg5m: 10, buysH1: 50, sellsH1: 20 },
+      cfg,
+    );
+    assert.equal(revived.alerts.length, 1);
+    assert.equal(revived.alerts[0].kind, "rising");
+    assert.match(revived.alerts[0].text, /🟢 流動性恢復 HOGE/);
+    assert.match(revived.alerts[0].text, /18\.00K/);
+    assert.equal(revived.lastState, null);
+    assert.equal(revived.stopTracking, false);
+    assert.equal(revived.resetBaselineMcap, 18_000);
+    assert.equal(revived.deadTroughMcap, null);
+    assert.equal(revived.peakMcap, 18_000);
+    assert.equal(revived.announcedUpStages, baseMarkFor(18_000));
+
+    // An UNKNOWN LP is not a recovery: the mcap alone may not revive a row.
+    const unknownLp = evaluateWatch(
+      row(), 4000,
+      { mcap: 300_000, liquidity: null, chg5m: 80, buysH1: 500, sellsH1: 10 },
+      cfg,
+    );
+    assert.deepEqual(unknownLp.alerts, []);
+    assert.equal(unknownLp.lastState, DRAIN_WATCH_STATE);
+  });
+
+  await test("resumeTrackingKeyboard: the legacy 💧 card carries its own way back", () => {
+    // Legacy terminal rug cards keep this undo; new `drained` cards stay
+    // active, so they are sent without it. The callback is `resume:<token>`,
+    // handled next to 🔕 in src/bot.ts through the guarded re-arm
+    // (Db.rearmPushWatchAlert).
     const kb = resumeTrackingKeyboard("MINT111");
     assert.equal(kb.inline_keyboard.length, 1);
     const [btn] = kb.inline_keyboard[0];
@@ -20959,6 +21021,7 @@ async function main() {
 
   await test("recapVerdict: rug wins, then dead floor, then peak grades", () => {
     assert.match(recapVerdict(50_000, 90_000, 10_000, "rug"), /rug/);
+    assert.match(recapVerdict(50_000, 90_000, 10_000, DRAIN_WATCH_STATE), /靜默監控/);
     assert.match(recapVerdict(50_000, 90_000, 20_000, null), /走死/); // final 40% <= 45%
     assert.match(recapVerdict(50_000, 250_000, 60_000, null), /金狗/); // peak x5
     assert.match(recapVerdict(50_000, 120_000, 55_000, "weak"), /強勢/); // peak x2.4

@@ -1217,7 +1217,8 @@ const LIQ_CRASH_MIN_LAST_USD = 5_000;
  * Absolute liquidity floor: below this the pool is considered drained.
  * DexScreener keeps reporting "marketCap" from the last traded price even
  * with zero liquidity, so every mcap-derived signal (rising stages, weak,
- * dead) becomes noise — stop tracking instead of acting on fake numbers.
+ * dead) becomes noise — the row enters silent monitoring instead of acting
+ * on fake numbers.
  *
  * ONE sub-floor reading no longer terminalizes: the rule requires TWO in a
  * row (see DRAIN_CONFIRM_MARK), because the same reading that means "drained"
@@ -1249,7 +1250,7 @@ export const CALIBRATION_MIN_LIQUIDITY_USD = 1_000;
  *
  * WHY A READING IS NOT ENOUGH (2026-09-21). The rule used to terminalize on a
  * single sub-floor reading, and DexScreener answers `liquidity.usd: 0` — not a
- * missing field — for pools it has not (re)indexed. Because a 'rug' row is
+ * missing field — for pools it has not (re)indexed. Because a terminal row is
  * never re-evaluated and the re-arm path only covers an UNPROVEN CARD SEND
  * (never a wrong reading), one transient zero permanently dropped a live coin.
  * Live shape (ARGUS, 2026-09-21 10:05Z): the card read `LP 僅剩 —（< $10K）`
@@ -1261,21 +1262,36 @@ export const CALIBRATION_MIN_LIQUIDITY_USD = 1_000;
  * The mark rides the PERSISTENT up_stages column, because the tracker rotates
  * rows across isolates and ticks — no per-process state can count two readings.
  * A reading back above the floor DISARMS it, so an oscillating pool cannot
- * accumulate its way to terminal, and the first sighting announces a ⚠️ card
- * instead of the terminal one, so the 💧 card that follows is never a surprise.
+ * accumulate its way to a drain, and the first sighting announces a ⚠️ card
+ * instead of the 💧 one, so the drain that follows is never a surprise.
  */
 export const DRAIN_CONFIRM_MARK = "liq1";
 /**
- * The 💧 card's keyboard — the one button that can undo a terminal row.
+ * Persistent state of a confirmed LP drain that is still being watched.
  *
- * The drain card is the only card that ENDS tracking, and its evidence is one
- * provider's liquidity number, so the card now carries "🔁 恢復追蹤": the
- * callback re-arms the row (Db.rearmPushWatchAlert, guarded on
+ * A drained pool's mcap is not a reading (the last traded price × supply is
+ * quoted even when the LP is gone), so the rules engine stops judging it —
+ * but the ROW stays active until the normal tracking window closes. This is
+ * what lets a HOGE-shaped coin (mcap fell to ~$12K, then revived inside 30h)
+ * be seen again instead of being a terminal tombstone from the first drain.
+ *
+ * Reviving requires BOTH a real LP reading back at/above LIQ_FLOOR_USD and an
+ * mcap recovery to trough × RESURRECTION_MULT. Requiring the LP half is
+ * deliberate: an mcap quoted off a dry pool is not evidence that the coin
+ * trades again, and it must never produce a 🚀 card.
+ *
+ * `rug` predates this state and remains the legacy terminal tombstone; new
+ * drains write `drained` so old rows keep their existing semantics.
+ */
+export const DRAIN_WATCH_STATE = "drained";
+/**
+ * The legacy 💧 card's keyboard — the one button that can undo a terminal row.
+ *
+ * New drains enter the `drained` silent watch and do NOT end tracking, so their
+ * card is sent without this keyboard. It remains for legacy `rug` cards already
+ * in a chat: the callback re-arms the row (Db.rearmPushWatchAlert, guarded on
  * `last_state = 'rug'` so it can never resurrect a 🔕 tombstone or a
- * window-expired row) and the next pass measures the pool again. At-least-once
- * by design: a pool that really is drained re-announces the ⚠️/💧 pair, which
- * is the honest outcome — the user gets to say "recheck it" without waiting
- * out the 30h window or re-pushing the coin.
+ * window-expired row) and the next pass measures the pool again.
  */
 export function resumeTrackingKeyboard(token: string): {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
@@ -2342,6 +2358,71 @@ export function evaluateWatch(
   };
   /** 現價 vs 推送價, the "how late am I" reading every entry card carries. */
   const pushX = (live.mcap / Math.max(row.mcapAtPush, 1)).toFixed(2);
+
+  // A confirmed drain is SILENT, not terminal. The mcap is fake while the LP
+  // is gone, so no mcap-derived card may fire; the row still gets measured on
+  // every rotation until the 30h window closes. A real LP recovery plus an
+  // mcap recovery from the trough is the only way back into the normal rules.
+  // This branch MUST sit before the liquidity rule: otherwise every later
+  // pass would re-fire 💧 at the same sub-floor pool.
+  if (row.lastState === DRAIN_WATCH_STATE) {
+    const trough = Math.min(row.deadTroughMcap ?? live.mcap, live.mcap);
+    const liveLiquidity = live.liquidity;
+    if (liveLiquidity === null || liveLiquidity < liqFloor) {
+      return {
+        alerts,
+        peakMcap,
+        followupsSent,
+        lastState: DRAIN_WATCH_STATE,
+        lastAlertAt,
+        stopTracking: false,
+        deadTroughMcap: trough,
+        sellDomStreak: row.sellDomStreak ?? 0,
+        // Nothing is announced and the marks are untouched: the row stays in
+        // the same silent state (the drain arm is already stored).
+        announcedUpStages: undefined,
+      };
+    }
+    const troughBase = row.deadTroughMcap ?? live.mcap;
+    const target =
+      (troughBase > 0 ? troughBase : row.mcapAtPush) * RESURRECTION_MULT;
+    if (target > 0 && live.mcap >= target) {
+      // Restart the whole ladder from the revival price. Naming the base is
+      // important: every later card measures +% from THIS number, not from the
+      // pre-drain push baseline.
+      fire(
+        "rising",
+        `🟢 流動性恢復 ${symbol} | LP 回到 ${fmtUsd(liveLiquidity)}（≥ ${fmtUsd(liqFloor)}），市值由低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），以現價 ${fmtUsd(live.mcap)} 為新基準繼續追蹤`,
+        "revive",
+      );
+      rearmedSigs.add("revive");
+      return {
+        alerts,
+        peakMcap: live.mcap,
+        followupsSent,
+        lastState: null,
+        lastAlertAt,
+        stopTracking: false,
+        resetBaselineMcap: live.mcap,
+        deadTroughMcap: null,
+        sellDomStreak: 0,
+        announcedUpStages: baseMarkFor(live.mcap),
+      };
+    }
+    // LP is back but the mcap has not recovered yet: keep watching silently.
+    return {
+      alerts,
+      peakMcap,
+      followupsSent,
+      lastState: DRAIN_WATCH_STATE,
+      lastAlertAt,
+      stopTracking: false,
+      deadTroughMcap: trough,
+      sellDomStreak: row.sellDomStreak ?? 0,
+      announcedUpStages: undefined,
+    };
+  }
+
   /** The tape side of an entry card: h1 buy:sell ratio. */
   const entryBs =
     live.buysH1 + live.sellsH1 > 0
@@ -2355,7 +2436,7 @@ export function evaluateWatch(
       marks.add(DRAIN_CONFIRM_MARK);
       fire(
         "liquidity",
-        `⚠️ 流動性跌穿地板 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}）— 已記錄第一次讀數，下一次檢查仍低於地板就會停止追蹤（市值數據隨 LP 失真）`,
+        `⚠️ 流動性跌穿地板 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}）— 已記錄第一次讀數，下一次檢查仍低於地板就會轉入靜默監控（市值數據隨 LP 失真）`,
         "liqwarn",
       );
       return {
@@ -2369,22 +2450,25 @@ export function evaluateWatch(
         announcedUpStages: marksChanged(),
       };
     }
-    // Second consecutive sub-floor reading: terminal. The row's stored
-    // measurement already carries the first $0-ish reading, so a lost
+    // Second consecutive sub-floor reading: enter silent monitoring. The row's
+    // stored measurement already carries the first $0-ish reading, so a lost
     // completion write can no longer leave the audit's
-    // `measurement_above_floor` contradiction behind.
+    // `measurement_above_floor` contradiction behind. `stopTracking` stays true
+    // only for THIS transition so the send loop can use the one-way delivery
+    // path; the row itself stays in the active rotation (see activeRows).
     fire(
       "liquidity",
-      `💧 流動性枯竭 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}，連續 2 次檢查），市值數據已失真（LP 被抽乾），停止追蹤`,
+      `💧 流動性枯竭 ${symbol} | LP 僅剩 ${fmtUsd(live.liquidity)}（< ${fmtUsd(liqFloor)}，連續 2 次檢查），市值數據已失真（LP 被抽乾）— 轉入靜默監控至追蹤窗口結束；LP 回到 ${fmtUsd(liqFloor)} 以上且市值由低點反彈 ×${RESURRECTION_MULT} 會再通知`,
       "drain",
     );
     return {
       alerts,
       peakMcap,
       followupsSent,
-      lastState: "rug",
+      lastState: DRAIN_WATCH_STATE,
       lastAlertAt,
       stopTracking: true,
+      deadTroughMcap: Math.min(row.deadTroughMcap ?? live.mcap, live.mcap),
       sellDomStreak: row.sellDomStreak ?? 0,
       announcedUpStages: marksChanged(),
     };
@@ -2875,9 +2959,9 @@ export function evaluateWatch(
 
 /**
  * Final verdict for a coin leaving the tracking window — one line for the
- * 🏁 recap card. Aligned with the rule engine's semantics: rug beats
- * everything (LP data is fake), a -55%+ finish is 走死 regardless of peak,
- * then the peak multiple grades the ride.
+ * 🏁 recap card. Aligned with the rule engine's semantics: a drained LP
+ * beats everything while it lasts (the mcap is fake), then a -55%+ finish is
+ * 走死 regardless of peak, then the peak multiple grades the ride.
  */
 export function recapVerdict(
   mcapAtPush: number,
@@ -2885,6 +2969,9 @@ export function recapVerdict(
   finalMcap: number | null,
   lastState: string | null,
 ): string {
+  if (lastState === DRAIN_WATCH_STATE) {
+    return "💧 LP 枯竭（靜默監控至窗口結束）";
+  }
   if (lastState === "rug") return "💧 rug（LP 枯竭，數據已失真）";
   const finalRatio =
     mcapAtPush > 0 && finalMcap !== null ? finalMcap / mcapAtPush : 1;
@@ -3257,7 +3344,7 @@ export class PushWatcher {
    * Is this card type MUTED for now (PUSH_WATCH_MUTE — see
    * AppConfig.pushWatch.mutedSigs)? Asked at the SEND sites, never inside
    * evaluateWatch: a muted card is still derived and its transition still
-   * LANDS — a muted 💧 drain still terminalizes its row, a muted ⚠️ liqwarn
+   * LANDS — a muted 💧 drain still enters its silent watch, a muted ⚠️ liqwarn
    * still arms the two-reading count, a muted 🏁 recap is still superseded by
    * the prune — so the mute withholds the message and nothing else. Counted
    * per pass as `muted N` in the note, and reversible by redeploying without
@@ -4212,9 +4299,10 @@ export class PushWatcher {
     //   - `!baselineRepairDone`: once per isolate, and that is the only way to
     //     reach a row the listing cannot SHOW. It is capped at cfg.maxTracked
     //     with active rows first, and the other shape a 0 baseline takes is a
-    //     row in the 💧 drain path, which ends up terminal — and terminal rows
-    //     sort last. The rotation below cannot see it either: it evaluates
-    //     activeRows only.
+    //     row in the 💧 drain path, which now stays in the silent watch instead
+    //     of sorting last as a terminal tombstone. The rotation below still
+    //     sees only activeRows, and a listing cut can hide the row, so the
+    //     repair still has to run here.
     //   - `rows`: a 0-baseline row that IS in the listing and carries a real
     //     peak right now. This is what the one-shot alone misses — the
     //     statement's own `peak_mcap > 0` guard needs the reading to exist at
@@ -4249,9 +4337,10 @@ export class PushWatcher {
       }
       spent.repair.ms += Date.now() - repairStarted;
     }
-    // Only rug (drained LP) rows are terminal: kept so the self-heal does
-    // not re-enroll them, and skipped here. Dead rows stay ACTIVE but the
-    // rules engine keeps them silent until a resurrection.
+    // Legacy rug rows are terminal tombstones, and unwatched/expired rows are
+    // closed for their own reasons. A `drained` row is DIFFERENT: it stays in
+    // the rotation so a HOGE-style revival inside the 30h window is still seen.
+    // Its evaluateWatch branch keeps it silent until the LP and mcap recover.
     const activeRows = rows.filter(
       (r) =>
         r.lastState !== "rug" &&
@@ -5316,8 +5405,8 @@ export class PushWatcher {
         }
         // MUTED CARD (PUSH_WATCH_MUTE): the operator asked not to receive
         // this card type for now. The transition still lands exactly as if
-        // the card had gone out — a muted 💧 drain still terminalizes its row
-        // (lastState rug) and a muted ⚠️ liqwarn still arms the two-reading
+        // the card had gone out — a muted 💧 drain still enters silent watch
+        // (lastState drained) and a muted ⚠️ liqwarn still arms the two-reading
         // count — so un-muting later starts with the NEXT transition and can
         // never resurrect this one. Counted like a deduped card (announced,
         // not delivered) and NOT attempted: nothing is in flight, so there is
@@ -5338,13 +5427,14 @@ export class PushWatcher {
           break;
         }
         try {
-          // The 💧 drain card is TERMINAL: evaluateWatch sets stopTracking on
-          // that branch alone, and that branch returns exactly this one alert
-          // (the "liq" crash card shares the kind but never stops tracking), so
-          // `terminalAlert` identifies it exactly. It takes the initial-card
-          // path's THREE-STATE send; every other alert keeps the two-state one,
-          // where a rollback is harmless — the same card is re-derived and
-          // re-sent on the next pass, which is the point of at-least-once.
+          // The 💧 drain card is the one transition alert: evaluateWatch sets
+          // stopTracking on that branch alone, and that branch returns exactly
+          // this one alert (the "liq" crash card shares the kind but never is
+          // one-way), so `terminalAlert` identifies it exactly. The row now
+          // continues in silent monitoring, but the card itself still takes
+          // the initial-card path's THREE-STATE send; every other alert keeps
+          // the two-state one, where a rollback is harmless — the same card is
+          // re-derived and re-sent on the next pass.
           const terminalAlert =
             evalResult.stopTracking && a.kind === "liquidity";
           let sent: { message_id?: unknown } | null = null;
@@ -5362,13 +5452,16 @@ export class PushWatcher {
               sendLeft,
               now,
               a.sig,
+              // A drained row keeps its silent watch; there is nothing to
+              // "resume", so the one-way card carries no keyboard.
+              false,
             );
             if (outcome.outcome === "abandoned") {
               // We stopped WAITING, which is not a failure: the card may
               // already be in the chat. The initial card's rule applies
               // verbatim (deferrallog.cardSendDisposition): KEEP the claim, so
-              // the terminal transition lands and the card's 停止追蹤 becomes
-              // TRUE. Rolling it back here was the live bug (2026-09-20,
+              // the one-way drain transition lands and the card's silent-watch
+              // state becomes TRUE. Rolling it back here was the live bug (2026-09-20,
               // Lobby): the 💧 card arrived, the row stayed ACTIVE with its
               // cooldown unarmed, and the same card could fire again — a card
               // claiming tracking stopped while the DB said it had not. The
@@ -5735,7 +5828,7 @@ export class PushWatcher {
    * failed    → the caller throws: a rejection proves nothing reached the chat,
    *             so the row is rolled back and the card re-announced.
    * abandoned → we stopped waiting on a request that is still in flight. The
-   *             caller KEEPS the terminal transition and the unknown delivery is
+   *             caller KEEPS the drain transition and the unknown delivery is
    *             recorded durably in the tracker's own ring
    *             (UNCONFIRMED_TERMINAL_STATE_KEY) for the pass-level settle to
    *             resolve: the chain below clears the record the moment the
@@ -5756,19 +5849,23 @@ export class PushWatcher {
      * NEIGHBOUR's delivery can satisfy — the silent-miss shape §7.1 names.
      */
     sig: string,
+    /**
+     * The legacy 💧 card ended tracking and offered "🔁 恢復追蹤". A `drained`
+     * card does not end it, so it passes false: the silent row has nothing to
+     * resume, and a button that cannot change anything is worse than none.
+     */
+    withResumeKeyboard: boolean,
   ): Promise<TerminalSendOutcome> {
-    // The keyboard rides the terminal card only (see resumeTrackingKeyboard):
-    // every other follow-up card re-derives itself on the next pass, so the
-    // user has nothing to undo.
     const inFlight = this.bot.api.sendMessage(
       row.chatId,
       withCopyableTicker(text, row.symbol),
       {
         // HTML is what carries the <code> span around the ticker (see
-        // withCopyableTicker) — every follow-up send asks for it, and this
-        // card's 🔁 恢復追蹤 row is untouched by it.
+        // withCopyableTicker) — every follow-up send asks for it.
         parse_mode: "HTML",
-        reply_markup: resumeTrackingKeyboard(row.token),
+        ...(withResumeKeyboard
+          ? { reply_markup: resumeTrackingKeyboard(row.token), }
+          : {}),
       },
     );
     // `settled` never rejects: a rejection is a FACT ("Telegram said no") while
@@ -5831,10 +5928,11 @@ export class PushWatcher {
   /**
    * Write (or refresh) one row's unconfirmed terminal-card record.
    *
-   * Best-effort on purpose: the caller ALREADY kept the terminal transition
+   * Best-effort on purpose: the caller ALREADY kept the drain transition
    * (that is the fix), so a failed write costs only the deferred re-announce —
-   * the row stays rug, which is the correct state for a drained pool, and the
-   * 🏁 recap card reports the verdict when the window closes.
+   * the row stays drained and silent, which is the correct state for a pool
+   * with no LP, and the 🏁 recap card reports the verdict when the window
+   * closes.
    *
    * Read through a seam rather than by adding a method to the Db interface: the
    * Db doubles the tracker tests drive implement only the reader they need, so
