@@ -1116,6 +1116,8 @@ PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
 # Tracker card types to SILENCE for now, comma-separated card sigs (empty = none):
 #   liqwarn = ⚠️ 流動性跌穿地板 (first sub-floor reading)
 #   drain   = 💧 流動性枯竭 (second reading — the row stays active in silent monitoring)
+#   liqrevive = 🟢 流動性恢復 (drained row recovers LP + mcap; the 💀 row's
+#               separate `revive` card is NOT muted by this sig)
 #   recap   = 🏁 結案報告 (window close — the row is still pruned)
 #   hold    = 📈 持倉增長 (baseline still rolls forward — see isMuted)
 #   div     = ⚡ 籌碼集中 (the div mark still lands)
@@ -1138,7 +1140,7 @@ PUSH_WATCH_HOLDER_MIN_GAP_MIN = "60"
 # the pass note counts them as `muted N`. Lifting a mute = delete its sig here
 # (or the whole line) and redeploy: the NEXT transition is delivered, nothing
 # is replayed. See PushWatcher.isMuted.
-PUSH_WATCH_MUTE = "liqwarn,drain,recap,hold,div,sell,w35,w45,pullback"
+PUSH_WATCH_MUTE = "liqwarn,drain,liqrevive,recap,hold,div,sell,w35,w45,pullback"
 # Birdeye CU allowance per calendar month (code default 30_000 = the free
 # tier). REPORTING ONLY: the client charges every request attempt (per-endpoint
 # prices live in src/birdeye.ts BIRDEYE_CU_PRICES) and a durable day ledger sums

@@ -1669,6 +1669,58 @@ async function main() {
     assert.equal(out3.muted, 0);
   });
 
+  await test("PushWatcher: PUSH_WATCH_MUTE=liqrevive withholds 🟢 流動性恢復 but not 🟢 死而復生", async () => {
+    // The two recovery cards share the concept but not the sig: the drained
+    // row's LP recovery uses `liqrevive`, while a 💀 row's resurrection stays
+    // `revive`. Muting the former must not silence the latter.
+    const texts = [];
+    const bot = { api: { sendMessage: async (_c, text) => { texts.push(text); return { message_id: 4 }; } } };
+    const make = (db, cfg) =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        cfg,
+        async (addrs) => new Map(addrs.map((a) => [a, termPair(a, 20_000)])),
+        null,
+      );
+    const drained = () => termRow({
+      lastState: DRAIN_WATCH_STATE,
+      deadTroughMcap: 12_000,
+      lastLiquidity: 0,
+      upStages: DRAIN_CONFIRM_MARK,
+    });
+    const muted = loadConfig({ PUSH_WATCH_MUTE: "liqrevive" });
+
+    // MUTED: no card, but the revival transition still lands — the row leaves
+    // silent monitoring and rebases on the observed recovery price.
+    const db = termDb([drained()]);
+    const out = await make(db, muted).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 0, "the 🟢 流動性恢復 card is withheld");
+    assert.equal(out.muted, 1);
+    assert.match(String(out.note), / muted 1/);
+    const [, w] = db.updated[0];
+    assert.equal(w.lastState, null, "the row still leaves drained");
+    assert.equal(w.deadTroughMcap, null);
+    assert.equal(w.mcapAtPush, 100_000, "the recovery price still becomes the new baseline");
+
+    // CONTROL: unmuted, the same row delivers the card.
+    const outLive = await make(termDb([drained()]), loadConfig({})).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "without the mute the recovery card goes out");
+    assert.match(String(texts[0]), /🟢 流動性恢復/);
+    assert.equal(outLive.muted, 0);
+
+    // SEPARATE SIG: the 💀 revival card still sends under `liqrevive`.
+    texts.length = 0;
+    const outDead = await make(
+      termDb([termRow({ lastState: "dead", deadTroughMcap: 12_000, upStages: "" })]),
+      muted,
+    ).runTick(Date.now() + 1_500);
+    assert.equal(texts.length, 1, "the 💀 revival is not muted by liqrevive");
+    assert.match(String(texts[0]), /🟢 死而復生/);
+    assert.equal(outDead.muted, 0);
+  });
+
   await test("PushWatcher: PUSH_WATCH_MUTE=recap withholds the 🏁 card without keeping the row", async () => {
     const expiringRow = () =>
       termRow({ pushedAt: Date.now() - 48 * 3_600_000, upStages: null, lastMcap: 100_000 });
@@ -5644,9 +5696,9 @@ async function main() {
     assert.deepEqual(loadConfig({}).pushWatch.mutedSigs, []);
     assert.deepEqual(
       loadConfig({
-        PUSH_WATCH_MUTE: "liqwarn,drain,recap,hold,div,sell,w35,w45,pullback",
+        PUSH_WATCH_MUTE: "liqwarn,drain,liqrevive,recap,hold,div,sell,w35,w45,pullback",
       }).pushWatch.mutedSigs,
-      ["liqwarn", "drain", "recap", "hold", "div", "sell", "w35", "w45", "pullback"],
+      ["liqwarn", "drain", "liqrevive", "recap", "hold", "div", "sell", "w35", "w45", "pullback"],
     );
     // Normalized (case/space) and deduped. An UNKNOWN sig stays in the list
     // but matches no card — a typo can only leave a card visible, never

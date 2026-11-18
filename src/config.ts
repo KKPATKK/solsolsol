@@ -79,8 +79,9 @@ export function parseAdminIds(raw: string | undefined): number[] {
  * Parse PUSH_WATCH_MUTE (comma-separated tracker card sigs to silence) into a
  * lower-cased, deduped list (pure — unit-tested). Empty/missing → [] (nothing
  * muted). The sigs are the delivery audit's own: `liqwarn` = the ⚠️ 流動性跌穿
- * 地板 warning, `drain` = the 💧 流動性枯竭 terminal card, `recap` = the 🏁
- * 結案報告 window summary, `hold` = the 📈 持倉增長 card, `div` = the ⚡
+ * 地板 warning, `drain` = the 💧 流動性枯竭 card, `liqrevive` = the 🟢
+ * 流動性恢復 card (LP recovers after a drain; the 💀 row's `revive` card is
+ * separate), `recap` = the 🏁 結案報告 window summary, `hold` = the 📈 持倉增長 card, `div` = the ⚡
  * 籌碼集中 card, `sell` = the 🩸 賣壓主導 distribution card, and `w35`/`w45` =
  * the two DEPTH STAGES of the ⚠️ 動能轉弱 card (the rule fires it with
  * `weakMark`, so the audit sig is `w45` at ≤ -45% off the peak and `w35`
@@ -609,8 +610,10 @@ export interface AppConfig {
     /**
      * Tracker card types to SILENCE for now without stopping the tracker
      * (PUSH_WATCH_MUTE, a comma-separated list of card sigs; empty = nothing
-     * muted): `liqwarn` ⚠️ 流動性跌穿地板, `drain` 💧 流動性枯竭, `recap` 🏁
-     * 結案報告. A muted card is still DERIVED and its transition still LANDS —
+     * muted): `liqwarn` ⚠️ 流動性跌穿地板, `drain` 💧 流動性枯竭, `liqrevive`
+     * 🟢 流動性恢復 (the drained row's LP recovery; `revive` is the separate
+     * 💀 死而復生 card), `recap` 🏁 結案報告. A muted card is still DERIVED and
+     * its transition still LANDS —
      * a muted drain still terminalizes its row, a muted recap still closes the
      * window — so un-muting starts with the NEXT transition instead of
      * replaying a backlog, and muting can never stall the rotation (see

@@ -1978,6 +1978,7 @@ export const CARRIED_ATTEMPT_SIGS: ReadonlySet<string> = new Set([
   "sell", // re-armed when the sell streak breaks
   "dead", // 💀 : the revival clears the column
   "revive", // re-armed by the next 💀 card
+  "liqrevive", // the 🟢 LP-recovery card; re-armed by the next 💧 drain
   "strongbuy", // re-armed by the 🚀 runup card that ends its episode
   "liqwarn",
   "drain", // re-armed by the drain disarm
@@ -2393,9 +2394,12 @@ export function evaluateWatch(
       fire(
         "rising",
         `🟢 流動性恢復 ${symbol} | LP 回到 ${fmtUsd(liveLiquidity)}（≥ ${fmtUsd(liqFloor)}），市值由低點 ${fmtUsd(row.deadTroughMcap ?? live.mcap)} 反彈越過 ${fmtUsd(target)}（×${RESURRECTION_MULT}），以現價 ${fmtUsd(live.mcap)} 為新基準繼續追蹤`,
-        "revive",
+        "liqrevive",
       );
-      rearmedSigs.add("revive");
+      // A separate sig from the 💀 row's `revive`: muting the LP-recovery
+      // card must not also silence 🟢 死而復生. It is re-armed here because
+      // this card clears the drained state.
+      rearmedSigs.add("liqrevive");
       return {
         alerts,
         peakMcap: live.mcap,
