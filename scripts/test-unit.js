@@ -1851,6 +1851,135 @@ async function main() {
     assert.equal(sends, 1, "the same death is never re-sent");
   });
 
+  await test("PushWatcher: a timed-out revive with a 💪 sibling is sent LAST and KEPT — no re-announce", async () => {
+    // Live 2026-11-19 Buncoin: six 🟢 死而復生 cards (Telegram ids 19676-19681)
+    // but ONE audit entry. The revival carried a 💪 strongbuy sibling, so the
+    // old `alerts.length === 1` guard did not apply: the revival went out
+    // first, timed out, and the whole row rolled back — re-deriving the same
+    // revival on later passes. The send order now puts the sibling first and
+    // the transition last, so the transition may be KEPT once the sibling has
+    // landed.
+    let reviveSends = 0;
+    let strongbuySends = 0;
+    const bot = {
+      api: {
+        sendMessage: (_chatId, text) => {
+          if (text.includes("強烈買入訊號")) {
+            strongbuySends += 1;
+            return Promise.resolve({ message_id: 2 });
+          }
+          if (text.includes("死而復生")) {
+            reviveSends += 1;
+            // Cut, not rejected: the card may already be in the chat.
+            return new Promise(() => {});
+          }
+          return Promise.resolve({ message_id: 3 });
+        },
+      },
+    };
+    const rows = [termRow({
+      token: "BUNCOIN",
+      lastState: "dead",
+      deadTroughMcap: 48_079,
+      mcapAtPush: 50_000,
+      peakMcap: 80_000,
+      lastAlertAt: 1,
+      followupsSent: 1,
+      revivesSinceUp: 1,
+      upStages: "base:50000",
+    })];
+    const db = termDb(rows);
+    const make = () =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        loadConfig({}),
+        async (addrs) => new Map(addrs.map((a) => [a, {
+          ...termPair(a, 31_245),
+          marketCap: 75_680,
+        }])),
+        null,
+      );
+
+    const first = await make().runTick(Date.now() + 1_500);
+    assert.equal(strongbuySends, 1, "the 💪 sibling goes out first");
+    assert.equal(reviveSends, 1, "then the revival is attempted once");
+    assert.equal(first.undelivered, 0, "the ambiguous revival is kept, not rolled back");
+    const [, written] = db.updated[0];
+    assert.equal(written.lastState, null, "the row leaves dead");
+    assert.equal(written.mcapAtPush, 75_680, "and rebases on the revival price");
+    assert.equal(written.deadTroughMcap, null);
+    assert.equal(written.followupsSent, 3, "both cards are counted as announced");
+    assert.equal(written.revivesSinceUp, 0, "the 💪 episode is consumed by the same transition");
+
+    // The persisted row cannot derive that revival again — no later pass may
+    // re-send it, even though its audit proof never arrived.
+    Object.assign(rows[0], {
+      lastState: written.lastState,
+      lastAlertAt: written.lastAlertAt,
+      lastChecked: Date.now(),
+      mcapAtPush: written.mcapAtPush,
+      deadTroughMcap: written.deadTroughMcap,
+      followupsSent: written.followupsSent,
+      revivesSinceUp: written.revivesSinceUp,
+      upStages: written.upStages,
+      peakMcap: written.peakMcap,
+    });
+    for (let i = 0; i < 4; i++) {
+      await make().runTick(Date.now() + 1_500);
+    }
+    assert.equal(reviveSends, 1, "the revival is never re-announced");
+    assert.equal(strongbuySends, 1);
+  });
+
+  await test("PushWatcher: a failed 💪 sibling cannot send the revival that follows it", async () => {
+    // The sibling failure rolls the row back as a unit. The revival is queued
+    // LAST, so the pass must stop here instead of delivering it first and then
+    // rolling it back — which is how the Buncoin revival repeated.
+    let reviveSends = 0;
+    const bot = {
+      api: {
+        sendMessage: (_chatId, text) => {
+          if (text.includes("強烈買入訊號")) {
+            return Promise.reject(new Error("telegram rejected the sibling"));
+          }
+          if (text.includes("死而復生")) reviveSends += 1;
+          return Promise.resolve({ message_id: 2 });
+        },
+      },
+    };
+    const rows = [termRow({
+      token: "BUNCOIN",
+      lastState: "dead",
+      deadTroughMcap: 48_079,
+      mcapAtPush: 50_000,
+      peakMcap: 80_000,
+      lastAlertAt: 1,
+      followupsSent: 1,
+      revivesSinceUp: 1,
+      upStages: "base:50000",
+    })];
+    const db = termDb(rows);
+    const out = await new PushWatcher(
+      db,
+      bot,
+      null,
+      loadConfig({}),
+      async (addrs) => new Map(addrs.map((a) => [a, {
+        ...termPair(a, 31_245),
+        marketCap: 75_680,
+      }])),
+      null,
+    ).runTick(Date.now() + 1_500);
+
+    assert.equal(reviveSends, 0, "the revival is not sent after its sibling failed");
+    assert.equal(out.undelivered, 1);
+    const [, written] = db.updated[0];
+    assert.equal(written.lastState, "dead", "the row stays dead for the retry");
+    assert.ok(!String(written.upStages).includes("base:75680"));
+  });
+
   await test("PushWatcher: a REJECTED revival still rolls back and retries", async () => {
     // The keep rule is for the ambiguous timeout only. A Telegram rejection
     // proves the card did not reach the chat, so the row must stay dead and

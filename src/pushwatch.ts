@@ -1849,6 +1849,19 @@ function pct(n: number): string {
 }
 
 /**
+ * The cards that MOVE the row into (or out of) a persistent tracking state.
+ * An ambiguous timeout on one of these must KEEP the transition instead of
+ * rolling it back, because rolling it back re-derives the same card and is how
+ * one send became six (see the send loop). `strongbuy` is deliberately absent:
+ * it rides WITH a revival but is not the state change itself.
+ */
+const STATE_TRANSITION_SIGS: ReadonlySet<string> = new Set([
+  "dead",
+  "revive",
+  "liqrevive",
+]);
+
+/**
  * CUT-CARD MARK — "an attempt for THIS transition is in flight".
  *
  * The duplicate the operator reports (💀 REK twice 23 minutes apart, 🚀 POPEYE
@@ -5383,7 +5396,29 @@ export class PushWatcher {
       for (const m of parseCutMarks(row.upStages)) {
         priorMarks.set(m.sig, Math.max(priorMarks.get(m.sig) ?? 0, m.at));
       }
-      for (const a of evalResult.alerts) {
+      /**
+       * SEND ORDER: every ordinary card first, the state transition LAST.
+       *
+       * A state transition can only be kept safely once its siblings are
+       * already announced: keeping it lands the row's new state, and the next
+       * pass cannot re-derive a sibling that only exists on the old side of
+       * that transition (the 💪 card lives on the revival itself). Sending the
+       * transition first therefore forced the whole row to roll back when the
+       * sibling failed — and re-sending the transition is the Buncoin duplicate
+       * (2026-11-19: six 🟢 死而復生 cards, message IDs 19676-19681, one audit
+       * entry). Ordinary-first makes a sibling failure stop the pass BEFORE the
+       * transition goes out, so a rollback can never duplicate it; a state-card
+       * timeout after the siblings landed can then KEEP the transition without
+       * dropping anything. Sort is stable, so cards of the same rank keep the
+       * engine's order.
+       */
+      const sendOrder = [...evalResult.alerts].sort(
+        (a, b) =>
+          Number(STATE_TRANSITION_SIGS.has(a.sig)) -
+          Number(STATE_TRANSITION_SIGS.has(b.sig)),
+      );
+      for (let cardIndex = 0; cardIndex < sendOrder.length; cardIndex++) {
+        const a = sendOrder[cardIndex];
         if (backfill) break;
         // DEDUPE FIRST: a card the audit already proves delivered needs no send
         // slice, and skipping it here keeps it out of the held-back count (so
@@ -5442,8 +5477,8 @@ export class PushWatcher {
           const terminalAlert =
             evalResult.stopTracking && a.kind === "liquidity";
           /**
-           * A SOLO STATE TRANSITION whose send exceeded its slice is NOT safe
-           * to roll back.
+           * A STATE TRANSITION whose send exceeded its slice is NOT safe to
+           * roll back.
            *
            * The send is cut, not rejected: Telegram may already have accepted
            * the card. Rolling the row back re-derives the SAME transition on
@@ -5454,22 +5489,25 @@ export class PushWatcher {
            * identical 💀 走死 cards, one audit entry and one `followups_sent`.
            * Both were retries of one transition, not three/six transitions.
            *
-           * `dead`, `revive` and `liqrevive` all move the row's state (or are
-           * the only card for that state change), so keeping the transition is
-           * correct even when delivery is unknown. The card may be missing
-           * (one notification, never six), but the row lands in the state the
-           * card describes, so it cannot be re-derived and re-sent. A Telegram
-           * REJECTION is still a failure and is rolled back below; only the
-           * ambiguous timeout is kept.
+           * `dead`, `revive` and `liqrevive` all move the row's state, so
+           * keeping the transition is correct even when delivery is unknown.
+           * The card may be missing (one notification, never six), but the row
+           * lands in the state the card describes, so it cannot be re-derived
+           * and re-sent. A Telegram REJECTION is still a failure and is rolled
+           * back below; only the ambiguous timeout is kept.
            *
-           * Limited to a solo card: if a sibling card (💪 strongbuy) is also
-           * due, a failed sibling must still roll the row back as a unit,
-           * because committing that pair with one card missing would silently
-           * drop the sibling.
+           * LAST CARD ONLY: the send order puts siblings first (see
+           * `sendOrder`), so reaching this card means they all landed. That is
+           * what makes keeping the transition safe — committing it also
+           * consumes the episode a sibling like 💪 exists on. A sibling's own
+           * timeout/failure breaks the loop before this card, rolling the row
+           * back with the transition still unsent; that retry can duplicate
+           * the sibling (the general at-least-once trade-off) but never the
+           * transition the operator reported.
            */
           const keepStateTransitionOnTimeout =
-            evalResult.alerts.length === 1 &&
-            (a.sig === "dead" || a.sig === "revive" || a.sig === "liqrevive");
+            cardIndex === sendOrder.length - 1 &&
+            STATE_TRANSITION_SIGS.has(a.sig);
           let sent: { message_id?: unknown } | null = null;
           // The attempt's OWN clock read, taken BEFORE the request goes out —
           // the terminal card below included: the audit entry this send writes
@@ -5631,6 +5669,18 @@ export class PushWatcher {
             `[push-watch] alert send failed for ${row.symbol ?? row.token} (held back for the next tick):`,
             err instanceof Error ? err.message : err,
           );
+          // A failure while a state transition is still queued (it is always
+          // LAST — see sendOrder) must stop the row here. Continuing would
+          // deliver the transition and then roll the whole row back for this
+          // failed sibling, and the next pass would announce the transition
+          // again: exactly the duplicate the keep rule above exists to stop.
+          if (
+            sendOrder
+              .slice(cardIndex + 1)
+              .some((next) => STATE_TRANSITION_SIGS.has(next.sig))
+          ) {
+            break;
+          }
         }
       }
 
