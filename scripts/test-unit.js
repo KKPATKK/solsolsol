@@ -1790,6 +1790,67 @@ async function main() {
     assert.equal(sends, 1, "the same revival is never re-sent");
   });
 
+  await test("PushWatcher: a timed-out death KEEPS its transition — three passes send ONE card", async () => {
+    // Live 2026-11-19 AI: three 💀 走死 cards, but ONE audit entry and
+    // followups_sent 1. The row still carried a `p:dead` mark from a cut send:
+    // the same timeout → rollback → re-derive loop as Founder's revival.
+    let sends = 0;
+    const bot = {
+      api: {
+        sendMessage: () => {
+          sends += 1;
+          return new Promise(() => {});
+        },
+      },
+    };
+    const rows = [termRow({
+      token: "AI",
+      lastState: null,
+      deadTroughMcap: null,
+      mcapAtPush: 204_253,
+      peakMcap: 204_253,
+      lastAlertAt: 0,
+      upStages: null,
+    })];
+    const db = termDb(rows);
+    const make = () =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        loadConfig({}),
+        async (addrs) => new Map(addrs.map((a) => [a, {
+          ...termPair(a, 50_000),
+          marketCap: 105_420,
+        }])),
+        null,
+      );
+
+    const first = await make().runTick(Date.now() + 1_500);
+    assert.equal(sends, 1, "the first pass attempts the 💀 once");
+    assert.equal(first.undelivered, 0, "an unknown delivery is not a rollback");
+    assert.equal(first.alerted, 1);
+    const [, written] = db.updated[0];
+    assert.equal(written.lastState, "dead", "the row enters silent watch");
+    assert.equal(written.deadTroughMcap, 105_420, "with the death reading as its trough");
+    assert.equal(written.followupsSent, 1);
+
+    Object.assign(rows[0], {
+      lastState: written.lastState,
+      lastAlertAt: written.lastAlertAt,
+      lastChecked: Date.now(),
+      mcapAtPush: written.mcapAtPush,
+      deadTroughMcap: written.deadTroughMcap,
+      followupsSent: written.followupsSent,
+      upStages: written.upStages,
+      peakMcap: written.peakMcap,
+    });
+    for (let i = 0; i < 2; i++) {
+      await make().runTick(Date.now() + 1_500);
+    }
+    assert.equal(sends, 1, "the same death is never re-sent");
+  });
+
   await test("PushWatcher: a REJECTED revival still rolls back and retries", async () => {
     // The keep rule is for the ambiguous timeout only. A Telegram rejection
     // proves the card did not reach the chat, so the row must stay dead and
@@ -2978,16 +3039,19 @@ async function main() {
   });
 
   await test("PushWatcher: a CUT card leaves a mark, a late send proves itself, and the next pass refuses the duplicate", async () => {
-    const deadRow = (over = {}) =>
-      termRow({ peakMcap: 240_000, mcapAtPush: 170_000, upStages: null, lastLiquidity: 32_000, ...over });
-    const deadPair = (token) => ({ ...termPair(token, 32_000), marketCap: 59_000 });
+    // A non-state card (🚀 up50) is the right fixture for the generic cut-proof
+    // path: `dead`/`revive` deliberately KEEP their transition on an unknown
+    // timeout now, and are covered by their own tests below.
+    const riseRow = (over = {}) =>
+      termRow({ peakMcap: 100_000, mcapAtPush: 100_000, upStages: null, lastLiquidity: 32_000, ...over });
+    const risePair = (token) => ({ ...termPair(token, 32_000), marketCap: 160_000 });
     const makeWatcher = (db, bot) =>
-      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, deadPair(a)])), null);
+      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, risePair(a)])), null);
 
     // Pass 1 — the send never answers inside its slice, so it is CUT: the
     // rollback keeps the marks AND records the attempt, and the request's own
     // settlement writes the proof afterwards.
-    const db = termDb([deadRow()]);
+    const db = termDb([riseRow()]);
     const delivered = [];
     db.recordPushDelivery = async (e) => { delivered.push(e); };
     let settle;
@@ -2995,18 +3059,19 @@ async function main() {
     const out1 = await pw.runTick(Date.now() + 1_500);
     assert.equal(out1.undelivered, 1, "a cut card is held back, so the transition is re-derived");
     const [, w1] = db.updated[0];
-    assert.match(String(w1.upStages), /(^|,)p:dead:/, `the attempt rides the row's marks: ${w1.upStages}`);
+    assert.match(String(w1.upStages), /(^|,)p:up50:/, `the attempt rides the row's marks: ${w1.upStages}`);
     assert.equal(w1.lastState, null, "the rollback leaves the transition to the next pass");
     assert.equal(delivered.length, 0, "a request still in flight proves nothing");
     settle({ message_id: 4242 });
     await new Promise((r) => setTimeout(r, 0));
     assert.equal(delivered.length, 1, "the late success writes the audit proof");
     assert.equal(delivered[0].kind, "followup");
+    assert.equal(delivered[0].sig, "up50");
 
     // Pass 2 — the same row is re-derived and the audit now proves the card is
-    // already in the chat: announced, not sent. This is the 💀 REK duplicate.
-    const db2 = termDb([deadRow({ upStages: w1.upStages })], {
-      audit: [{ chatId: "c", token: "LOBBY", kind: "followup", at: Date.now() }],
+    // already in the chat: announced, not sent.
+    const db2 = termDb([riseRow({ upStages: w1.upStages })], {
+      audit: [{ chatId: "c", token: "LOBBY", kind: "followup", sig: "up50", at: Date.now() }],
     });
     let sends2 = 0;
     const out2 = await makeWatcher(db2, { api: { sendMessage: async () => { sends2 += 1; return { message_id: 7 }; } } }).runTick(Date.now() + 1_500);
@@ -3014,11 +3079,11 @@ async function main() {
     assert.equal(out2.deduped, 1);
     assert.match(String(out2.note), /dup-skip 1/);
     const [, w2] = db2.updated[0];
-    assert.equal(w2.lastState, "dead", "the transition lands anyway");
+    assert.equal(w2.lastState, "up50", "the transition lands anyway");
     assert.ok(!String(w2.upStages ?? "").includes("p:"), `and the mark is consumed: ${w2.upStages}`);
 
     // Pass 3 — the same cut mark with NO proof still sends (never-miss).
-    const db3 = termDb([deadRow({ upStages: w1.upStages })]);
+    const db3 = termDb([riseRow({ upStages: w1.upStages })]);
     let sends3 = 0;
     const out3 = await makeWatcher(db3, { api: { sendMessage: async () => { sends3 += 1; return { message_id: 8 }; } } }).runTick(Date.now() + 1_500);
     assert.equal(sends3, 1, "an unproven card is re-sent");
@@ -3033,13 +3098,13 @@ async function main() {
     // the dedupe could never fire (`dup-skip` unreachable) and the duplicate
     // went out on the next check instead. The hook has to receive the EXACT
     // promise whose settlement writes that audit entry.
-    const deadRow = (over = {}) =>
-      termRow({ peakMcap: 240_000, mcapAtPush: 170_000, upStages: null, lastLiquidity: 32_000, ...over });
-    const deadPair = (token) => ({ ...termPair(token, 32_000), marketCap: 59_000 });
+    const riseRow = (over = {}) =>
+      termRow({ peakMcap: 100_000, mcapAtPush: 100_000, upStages: null, lastLiquidity: 32_000, ...over });
+    const risePair = (token) => ({ ...termPair(token, 32_000), marketCap: 160_000 });
     const makeWatcher = (db, bot) =>
-      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, deadPair(a)])), null);
+      new PushWatcher(db, bot, null, loadConfig({}), async (addrs) => new Map(addrs.map((a) => [a, risePair(a)])), null);
 
-    const db = termDb([deadRow()]);
+    const db = termDb([riseRow()]);
     const delivered = [];
     db.recordPushDelivery = async (e) => { delivered.push(e); };
     let settle;
@@ -3061,11 +3126,11 @@ async function main() {
     await Promise.all(held);
     assert.equal(delivered.length, 1, "awaiting the HELD promise is what lands the proof");
     assert.equal(delivered[0].kind, "followup");
-    assert.equal(delivered[0].sig, "dead", "stamped with the cut card's own transition");
+    assert.equal(delivered[0].sig, "up50", "stamped with the cut card's own transition");
 
     // No hook → the old fire-and-forget behaviour, unchanged: a request that
     // settles in time still writes its proof (tests, and any non-worker caller).
-    const db2 = termDb([deadRow()]);
+    const db2 = termDb([riseRow()]);
     const delivered2 = [];
     db2.recordPushDelivery = async (e) => { delivered2.push(e); };
     let settle2;
