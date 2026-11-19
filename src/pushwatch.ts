@@ -5441,6 +5441,32 @@ export class PushWatcher {
           // re-derived and re-sent on the next pass.
           const terminalAlert =
             evalResult.stopTracking && a.kind === "liquidity";
+          /**
+           * A REVIVAL whose send exceeded its slice is NOT safe to roll back.
+           *
+           * The send is cut, not rejected: Telegram may already have accepted
+           * the card. Rolling the row back to `dead` re-derives the SAME
+           * revival on the next pass, and if the late proof is missing (the
+           * 1s slice is routinely shorter than a Telegram round trip) every
+           * pass sends it again. Live 2026-11-18 Founder: six identical 🟢
+           * 死而復生 cards while the audit held ONE entry and `followups_sent`
+           * matched it exactly — six retries of one transition, not six
+           * transitions.
+           *
+           * A revival is a state transition, not a repeatable alert: keeping
+           * it is correct even when delivery is unknown. The card may be
+           * missing (one notification, never six), but the row leaves `dead`,
+           * rebases on the observed revival price, and every later card works
+           * from that base. A Telegram REJECTION is still a failure and is
+           * rolled back below; only the ambiguous timeout is kept.
+           *
+           * Limited to a solo revival card: if a sibling card (💪 strongbuy)
+           * is also due, a failed sibling must still roll the row back as a
+           * unit, because committing that pair with one card missing would
+           * silently drop the sibling.
+           */
+          const keepRevivalOnTimeout =
+            a.sig === "revive" && evalResult.alerts.length === 1;
           let sent: { message_id?: unknown } | null = null;
           // The attempt's OWN clock read, taken BEFORE the request goes out —
           // the terminal card below included: the audit entry this send writes
@@ -5545,6 +5571,19 @@ export class PushWatcher {
             }
           }
           if (sent === null) {
+            if (keepRevivalOnTimeout) {
+              // The unknown outcome is kept as an ANNOUNCEMENT: the card may
+              // already be in the chat, and re-deriving the revival is how
+              // this one transition became six cards. The late success still
+              // writes its audit proof above; the final write below lands the
+              // revival state and baseline.
+              console.error(
+                `[push-watch] revival send unconfirmed for ${row.symbol ?? row.token} — transition KEPT, not re-announced`,
+              );
+              alerted += 1;
+              sentCount += 1;
+              break;
+            }
             // Timed out: the transition stays reserved for the rest of this
             // pass (a concurrent isolate must not re-send it), but the final
             // write below rolls the row's announcement bookkeeping back, so

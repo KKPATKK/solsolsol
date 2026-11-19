@@ -1721,6 +1721,118 @@ async function main() {
     assert.equal(outDead.muted, 0);
   });
 
+  await test("PushWatcher: a timed-out revival KEEPS its transition — six passes send ONE card", async () => {
+    // Live 2026-11-18 Founder: six identical 🟢 死而復生 cards, but the audit
+    // ring held ONE entry and followups_sent matched that one entry. The send
+    // exceeded the 1s slice, the pass rolled the row back to `dead`, and the
+    // next pass re-derived the SAME revival. A revival is a state transition:
+    // an unknown delivery keeps it, so it can never be announced six times.
+    let sends = 0;
+    const bot = {
+      api: {
+        // Never answers: the send is cut, not rejected. The old rollback path
+        // re-sent this same card on every later pass.
+        sendMessage: () => {
+          sends += 1;
+          return new Promise(() => {});
+        },
+      },
+    };
+    const rows = [termRow({
+      token: "FOUNDER",
+      lastState: "dead",
+      deadTroughMcap: 40_289,
+      mcapAtPush: 97_479,
+      peakMcap: 134_285,
+      lastAlertAt: 1,
+      upStages: "base:97479",
+    })];
+    const db = termDb(rows);
+    const make = () =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        loadConfig({}),
+        async (addrs) => new Map(addrs.map((a) => [a, {
+          ...termPair(a, 31_245),
+          marketCap: 72_550,
+        }])),
+        null,
+      );
+
+    const first = await make().runTick(Date.now() + 1_500);
+    assert.equal(sends, 1, "the first pass attempts the revival once");
+    assert.equal(first.undelivered, 0, "an unknown delivery is not a rollback");
+    assert.equal(first.alerted, 1, "the transition is announced");
+    assert.equal(db.updated.length, 1);
+    const [, written] = db.updated[0];
+    assert.equal(written.lastState, null, "the row leaves dead");
+    assert.equal(written.mcapAtPush, 72_550, "and rebases on the revival price");
+    assert.equal(written.deadTroughMcap, null);
+    assert.equal(written.followupsSent, 1);
+    assert.ok(String(written.upStages).includes("base:72550"));
+
+    // Five more passes on the row the first pass persisted: no further send.
+    Object.assign(rows[0], {
+      lastState: written.lastState,
+      lastAlertAt: written.lastAlertAt,
+      lastChecked: Date.now(),
+      mcapAtPush: written.mcapAtPush,
+      deadTroughMcap: written.deadTroughMcap,
+      followupsSent: written.followupsSent,
+      upStages: written.upStages,
+      peakMcap: written.peakMcap,
+    });
+    for (let i = 0; i < 5; i++) {
+      await make().runTick(Date.now() + 1_500);
+    }
+    assert.equal(sends, 1, "the same revival is never re-sent");
+  });
+
+  await test("PushWatcher: a REJECTED revival still rolls back and retries", async () => {
+    // The keep rule is for the ambiguous timeout only. A Telegram rejection
+    // proves the card did not reach the chat, so the row must stay dead and
+    // the next pass must try again.
+    let sends = 0;
+    const bot = {
+      api: {
+        sendMessage: async () => {
+          sends += 1;
+          throw new Error("telegram rejected");
+        },
+      },
+    };
+    const rows = [termRow({
+      token: "FOUNDER",
+      lastState: "dead",
+      deadTroughMcap: 40_289,
+      mcapAtPush: 97_479,
+      peakMcap: 134_285,
+      lastAlertAt: 1,
+      upStages: "base:97479",
+    })];
+    const db = termDb(rows);
+    const make = () =>
+      new PushWatcher(
+        db,
+        bot,
+        null,
+        loadConfig({}),
+        async (addrs) => new Map(addrs.map((a) => [a, {
+          ...termPair(a, 31_245),
+          marketCap: 72_550,
+        }])),
+        null,
+      );
+    const out = await make().runTick(Date.now() + 1_500);
+    assert.equal(sends, 1);
+    assert.equal(out.undelivered, 1, "a rejection is a failed delivery");
+    const [, written] = db.updated[0];
+    assert.equal(written.lastState, "dead", "so the revival is not recorded as delivered");
+    assert.ok(!String(written.upStages).includes("base:72550"));
+  });
+
   await test("PushWatcher: PUSH_WATCH_MUTE=recap withholds the 🏁 card without keeping the row", async () => {
     const expiringRow = () =>
       termRow({ pushedAt: Date.now() - 48 * 3_600_000, upStages: null, lastMcap: 100_000 });
