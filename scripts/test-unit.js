@@ -1260,6 +1260,11 @@ async function main() {
       assert.equal(before.poolAddress, null, "the row was never pinned");
       assert.equal(before.mcapAtPush, 400_000, "and its denominator is the fallback leg's");
 
+      // The assertion below is STRICT (`>`): the calibration must become the
+      // row's latest check. On a very fast CI runner the setup write and the
+      // calibration can land in the same millisecond, which is not a bug in
+      // the product but does make the strict assertion flaky.
+      await new Promise((r) => setTimeout(r, 5));
       assert.equal(
         await db.calibratePushWatchSeries("JUPROW", before.lastChecked, {
           mcap: 30_000, liquidity: 20_000, vol5m: 1_000, poolAddress: "POOLX",
@@ -11677,7 +11682,10 @@ async function main() {
       assert.equal(ring.length, 1);
       assert.equal(ring[0], at);
 
-      // Accumulates across calls.
+      // Accumulates across calls. The 5ms gap keeps the strict ordering
+      // assertion below meaningful on a runner that can do both writes inside
+      // one millisecond.
+      await new Promise((r) => setTimeout(r, 5));
       await db.bumpScheduledTick();
       row = (await t.client.execute("SELECT value FROM worker_state WHERE key = 'scheduled_tick_total'")).rows[0];
       assert.equal(String(row.value), "2");
