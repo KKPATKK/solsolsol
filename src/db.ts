@@ -1840,6 +1840,19 @@ export interface TickLegInsert {
   /** Pool freshness-mark inputs (see ScanSummary.poolMisses / poolUnreadable). */
   poolMisses: number | null;
   poolUnreadable: number | null;
+  /**
+   * Evaluations that PASSED the age gate this tick (see ScanSummary.agedEval).
+   *
+   * WHY IT IS DURABLE (2026-11-22): the 240-tick check that asked "is the pool
+   * slice starving on eviction or on band population" could read the state
+   * (`pool_lanes` / `pool_served`) but NOT the outcome — agedEval lived only in
+   * the latest /health summary, so every tick before the read had to be
+   * guessed at. With it here, a 240-tick read can answer "how many of the
+   * sliced rows were old enough to be judged" directly: agedEval ≈ 0 beside a
+   * non-empty `poolLanes` is the eviction/prune shape, while a tiny
+   * `poolLanes` itself is a band-population (query/limit/bucket) shape.
+   */
+  agedEval: number | null;
 }
 
 function numOrNull(v: unknown): number | null {
@@ -3141,7 +3154,8 @@ export class Db {
           pool_far_filtered INTEGER,
           pool_far_explored INTEGER,
           pool_misses INTEGER,
-          pool_unreadable INTEGER
+          pool_unreadable INTEGER,
+          aged_eval INTEGER
         );`,
         // The re-eval pool query filters token_stats by first_seen_at and
         // anti-joins seen_tokens every tick; these indexes keep it fast as
@@ -3575,6 +3589,7 @@ export class Db {
     await this.addColumnIfMissing("tick_legs", "pool_far_explored", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_misses", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_unreadable", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "aged_eval", "INTEGER");
     // Freshness OF that reading (2026-10-08): how many consecutive pool sweeps
     // have come back with NO reading for this coin (see DEAD_POOL_MISS_MAX).
     // The column above judges what a reading SAID; this one judges whether the
@@ -4767,7 +4782,7 @@ export class Db {
                    pool_stale, pool_lanes, pool_served, pool_zone_candidates,
                    pool_zone_pushed, feed_candidates, feed_candidates_unique,
                    feed_pushes, candidate_funnel, pool_far_filtered,
-                   pool_far_explored, pool_misses, pool_unreadable
+                   pool_far_explored, pool_misses, pool_unreadable, aged_eval
             FROM tick_legs WHERE at >= ? ORDER BY at DESC LIMIT ?`,
       args: [since, limit],
     });
@@ -4805,6 +4820,7 @@ export class Db {
       poolFarExplored: numOrNull(r.pool_far_explored),
       poolMisses: numOrNull(r.pool_misses),
       poolUnreadable: numOrNull(r.pool_unreadable),
+      agedEval: numOrNull(r.aged_eval),
     }));
   }
 
@@ -4981,8 +4997,8 @@ export class Db {
                  pool_stale, pool_lanes, pool_served, pool_zone_candidates,
                  pool_zone_pushed, feed_candidates, feed_candidates_unique,
                  feed_pushes, candidate_funnel, pool_far_filtered,
-                 pool_far_explored, pool_misses, pool_unreadable)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 pool_far_explored, pool_misses, pool_unreadable, aged_eval)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           leg.at,
           leg.via,
@@ -5030,6 +5046,7 @@ export class Db {
           leg.poolFarExplored,
           leg.poolMisses,
           leg.poolUnreadable,
+          leg.agedEval,
         ],
       });
     }
@@ -7331,16 +7348,28 @@ export class Db {
   /**
    * Diagnostic for /debug/pool: age distribution of token_stats rows
    * (never-pushed vs total) plus how many never-pushed coins sit inside the
-   * re-eval window (launch 3h–43h ago). Tells whether a zero-push stretch is
-   * a cold market (pool covers the whole window but nothing qualifies) or a
-   * coverage gap (the pool's LIMIT starves 12h+ coins in a dense launch
-   * market — see Scanner.getReevalPoolCached).
+   * re-eval window. Tells whether a zero-push stretch is a cold market (pool
+   * covers the whole window but nothing qualifies) or a coverage gap (the
+   * pool's LIMIT starves 12h+ coins in a dense launch market — see
+   * Scanner.getReevalPoolCached).
+   *
+   * The window is the POOL's, not an age rule of this method's own: until
+   * 2026-11 the eligible counts were pinned to `launch_ms BETWEEN now-43h AND
+   * now-3h`, while the scanner's band is `now - (maxAge + 180min)` …
+   * `now - (minAge - 180min)` and, with a 80min min-age (the margin is 180),
+   * the young edge clamps past `now`. So the "0-3h" bin could never hold a
+   * row — every pool row younger than 3h was silently outside the count, and a
+   * live `agedEval` that disagreed with `/debug/pool` had no visible cause.
+   * Callers that pass nothing keep the old 3h–43h reading.
    */
   async getPoolHistogram(
     now: number,
     /** Enabled chat ids — the histogram's eligibleInWindow mirrors the
      * chat-aware pool exclusion (see seenExclusion) when provided. */
     seenChatIds?: string[],
+    /** The launch band the re-eval pool actually reads
+     * (Db.getReevalPool's minLaunchMs/maxLaunchMs) — see the docstring. */
+    window?: { minLaunchMs: number; maxLaunchMs: number },
   ): Promise<{
     total: number;
     neverPushed: number;
@@ -7380,6 +7409,11 @@ export class Db {
     >;
   }> {
     const H = 3600_000;
+    // The pool's own band (see the docstring). The buckets below stay
+    // expressed in absolute age — an operator reads "how many 3-6h coins can
+    // the pool act on" — so only the WHERE bounds follow the window.
+    const winOldestMs = window?.minLaunchMs ?? now - 43 * H;
+    const winYoungestMs = window?.maxLaunchMs ?? now - 3 * H;
     const res = await this.get().execute({
       sql: `SELECT
         COUNT(*) AS total,
@@ -7416,7 +7450,7 @@ export class Db {
             WHERE launch_ms BETWEEN ? AND ?
               AND first_seen_at > ?
               ${seen.clause}`,
-      args: [now - 43 * H, now - 3 * H, now - 42 * H, ...seen.args],
+      args: [winOldestMs, winYoungestMs, now - 42 * H, ...seen.args],
     });
     // The evidence breakdown rides the same window and seen exclusion as
     // eligibleInWindow. Grouping by the age bucket (rather than issuing six
@@ -7430,7 +7464,8 @@ export class Db {
                 WHEN launch_ms > ? THEN '3-6h'
                 WHEN launch_ms > ? THEN '6-12h'
                 WHEN launch_ms > ? THEN '12-24h'
-                ELSE '24-43h'
+                WHEN launch_ms > ? THEN '24-43h'
+                ELSE '>43h'
               END AS bucket,
               COUNT(*) AS n,
               SUM(CASE WHEN max_mcap_observed IS NOT NULL THEN 1 ELSE 0 END) AS mcap_evidenced,
@@ -7449,7 +7484,8 @@ export class Db {
         now - 12 * H,
         now - 24 * H,
         now - 43 * H,
-        now - 3 * H,
+        winOldestMs,
+        winYoungestMs,
         now - 42 * H,
         ...seen.args,
       ],
@@ -7463,7 +7499,7 @@ export class Db {
         recentLiquidity: number;
       }
     > = {};
-    for (const key of ["0-3h", "3-6h", "6-12h", "12-24h", "24-43h"]) {
+    for (const key of ["0-3h", "3-6h", "6-12h", "12-24h", "24-43h", ">43h"]) {
       eligibleByAge[key] = {
         total: 0,
         mcapEvidenced: 0,

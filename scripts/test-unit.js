@@ -5412,19 +5412,33 @@ async function main() {
       const db = new Db(t.p, undefined, t.client);
       await db.init();
       const now = Date.now();
-      const seed = async (token, ageH, mcap, liq, lastLiq, streak = 0) => {
+      // `seenH` defaults to the launch age; the >43h fixture is DISCOVERED
+      // late, because the eligible count also requires first_seen_at inside
+      // 42h (a row first seen 50h ago is outside that bound too).
+      const seed = async (token, ageH, mcap, liq, lastLiq, streak = 0, seenH = ageH) => {
         await t.client.execute({
           sql: `INSERT INTO token_stats
                   (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms,
                    max_mcap_observed, max_liquidity_observed, last_liquidity_usd,
                    sweeps_since_reading)
                 VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)`,
-          args: [token, now - ageH * 3600_000, ageH * 60, now - ageH * 3600_000, mcap, liq, lastLiq, streak],
+          args: [token, now - seenH * 3600_000, ageH * 60, now - ageH * 3600_000, mcap, liq, lastLiq, streak],
         });
       };
       await seed("FULL", 4, 120_000, 40_000, 25_000, 0);
       await seed("MCAP_ONLY", 7, 120_000, null, null, 0);
       await seed("NONE", 13, null, null, null, 0);
+      // The 2026-11 fix, both directions: the eligible counts follow the band
+      // the pool reads (live: now-(1560+180)min … now-(80-180)min, i.e. 29h
+      // back) instead of a hardcoded 3h-43h. YOUNG is inside the band and
+      // was invisible before; TAIL is launched 40h ago — inside the old 43h
+      // rule, outside the band the pool actually sweeps — so the old count
+      // over-reported as well as under-reported.
+      await seed("YOUNG", 1, 120_000, 40_000, 25_000, 0);
+      await seed("TAIL", 40, 120_000, 40_000, 25_000, 0);
+      // Past the 43h bucket edge, discovered late enough to stay inside the
+      // 42h first-seen bound the eligible count also applies.
+      await seed("OLDER", 45, 120_000, 40_000, 25_000, 0, 41);
       const hist = await db.getPoolHistogram(now, ["chat-1"]);
       assert.deepEqual(
         hist.eligibleByAge["3-6h"],
@@ -5438,7 +5452,36 @@ async function main() {
         hist.eligibleByAge["12-24h"],
         { total: 1, mcapEvidenced: 0, liquidityEvidenced: 0, recentLiquidity: 0 },
       );
-      assert.equal(hist.eligibleInWindow, 3, "the headline still counts the whole window");
+      assert.equal(hist.eligibleInWindow, 4, "the headline still counts the whole default window");
+      assert.equal(hist.eligibleByAge["0-3h"].total, 0, "no window passed → the old 3h floor");
+
+      // The pool's own band (see worker's /debug/pool): YOUNG joins, TAIL
+      // leaves, and the young edge is the pool's, not 3h.
+      const pooled = await db.getPoolHistogram(now, ["chat-1"], {
+        minLaunchMs: now - (1560 + 180) * 60_000,
+        maxLaunchMs: now - (80 - 180) * 60_000,
+      });
+      assert.equal(pooled.eligibleInWindow, 4, "the pool band is the count's band");
+      assert.equal(pooled.eligibleByAge["0-3h"].total, 1, "a 1h row is reachable now");
+      assert.equal(
+        pooled.eligibleByAge["3-6h"].total +
+          pooled.eligibleByAge["6-12h"].total +
+          pooled.eligibleByAge["12-24h"].total +
+          pooled.eligibleByAge["24-43h"].total,
+        3,
+        "and the 40h row is gone: the band stops at max age + margin",
+      );
+
+      // A caller that passes a band wider than 43h (a config with maxAge >
+      // 40h) gets an honest bucket for those rows instead of them being
+      // folded into 24-43h.
+      const wide = await db.getPoolHistogram(now, ["chat-1"], {
+        minLaunchMs: now - 60 * 3600_000,
+        maxLaunchMs: now,
+      });
+      assert.equal(wide.eligibleInWindow, 6);
+      assert.equal(wide.eligibleByAge["24-43h"].total, 1, "the 40h row");
+      assert.equal(wide.eligibleByAge[">43h"].total, 1, "and a 45h row is not a 24-43h row");
     } finally {
       await t.cleanup();
     }
@@ -11821,6 +11864,7 @@ async function main() {
         poolFarExplored: 1,
         poolMisses: 0,
         poolUnreadable: 0,
+        agedEval: 7,
         ...over,
       });
       const history = {
@@ -11844,6 +11888,11 @@ async function main() {
       assert.equal(rows[0].pairsReused, 12, "the cache-bridge reading is durable, not only in /health");
       assert.equal(rows[0].pairsMissing, 2);
       assert.equal(rows[0].poolSliced, 140);
+      assert.equal(
+        rows[0].agedEval,
+        7,
+        "agedEval is durable: the slice's outcome, not only its population",
+      );
       assert.deepEqual(
         rows[0].poolLanes,
         { hot: 20, near: 70, far: 40, filler: 10 },

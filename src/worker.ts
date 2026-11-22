@@ -104,6 +104,7 @@ import {
   POOL_MCAP_PRUNE_RATIO,
   POOL_LIQUIDITY_PRUNE_RATIO,
   DRAINED_POOL_LIQUIDITY_USD,
+  RE_EVAL_AGE_MARGIN_MIN,
   poolFarEvidenceOk,
   poolFarExplorationBucket,
 } from "./scanner";
@@ -6346,6 +6347,7 @@ async function runScan(
                 poolFarExplored: summary.poolFarExplored ?? null,
                 poolMisses: summary.poolMisses ?? null,
                 poolUnreadable: summary.poolUnreadable ?? null,
+                agedEval: summary.agedEval ?? null,
               }
             : null,
         ) ?? Promise.resolve();
@@ -10147,7 +10149,31 @@ const worker = {
       // Mirror the scanner's chat-aware seen exclusion so the probe's
       // eligible/returned counts match what production actually evaluates.
       const seenChatIds = chats.map((c) => c.chatId);
-      const hist = await probe.getPoolHistogram(now, seenChatIds);
+      // The re-eval pool's REAL launch band: the chats' age gates plus the
+      // scanner's margin, i.e. the same bounds the pool query below runs with.
+      // The histogram takes them because its eligible counts used to be pinned
+      // to `launch_ms BETWEEN now-43h AND now-3h`, and with a 80min min-age the
+      // pool's young edge reaches `now` — so every row younger than 3h sat
+      // outside the count and the "0-3h" bin could never hold one (see
+      // Db.getPoolHistogram). Empty chat list → no band, rather than a NaN one.
+      const poolMinAgeMin = chats.length
+        ? Math.min(...chats.map((c) => c.minAgeMinutes))
+        : 0;
+      const poolMaxAgeMin = chats.length
+        ? Math.max(...chats.map((c) => c.maxAgeMinutes))
+        : 0;
+      const hist = await probe.getPoolHistogram(
+        now,
+        seenChatIds,
+        chats.length
+          ? {
+              minLaunchMs:
+                now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+              maxLaunchMs:
+                now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+            }
+          : undefined,
+      );
       let poolQueryBuckets: Record<string, number> | null = null;
       let poolQueryCount = 0;
       let poolQueryBreakdown: {
@@ -10181,14 +10207,12 @@ const worker = {
         ? Math.min(...chats.map((c) => c.minLiquidityUsd))
         : 0;
       try {
-        const minAge = Math.min(...chats.map((c) => c.minAgeMinutes));
-        const maxAge = Math.max(...chats.map((c) => c.maxAgeMinutes));
         const minMcap = poolMinMcapUsd;
         const pool = await probe.getReevalPool({
           sinceMs: now - 30 * 3600_000,
-          minLaunchMs: now - (maxAge + 180) * 60_000,
-          maxLaunchMs: now - (minAge - 180) * 60_000,
-          windowEntryLaunchMs: now - minAge * 60_000,
+          minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+          maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+          windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
           // The scanner's OWN budget, from config (2026-09-29). This was a
           // hardcoded 1000, which made the probe count a smaller pool than the
           // tick reads the moment RE_EVAL_POOL_SIZE moved — and the whole point
@@ -10225,7 +10249,7 @@ const worker = {
           ">43h": 0,
         };
         const H = 3600_000;
-        const poolWindowEntryMs = now - minAge * 60_000;
+        const poolWindowEntryMs = now - poolMinAgeMin * 60_000;
         const lane = () => ({
           rows: 0,
           mcapEvidenced: 0,
