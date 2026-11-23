@@ -17,6 +17,7 @@ import {
   DEAD_POOL_MISS_MAX,
   SCAN_TRIGGER_STATE_KEYS,
   parseScanTriggerCounts,
+  poolBandWindows,
   poolZoneOfLaunch,
   parseScheduledTickRing,
   parseTelemetryCounter,
@@ -10206,40 +10207,63 @@ const worker = {
       const poolMinLiquidityUsd = chats.length
         ? Math.min(...chats.map((c) => c.minLiquidityUsd))
         : 0;
+      // ONE options object for the three pool readings below — the sweep query,
+      // the population count and the band-window echo. They described the same
+      // read from three places before (2026-11-23), which is how an echo can
+      // report windows the query no longer used.
+      const poolQueryOpts = {
+        sinceMs: now - 30 * 3600_000,
+        minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+        maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
+        windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
+        // The scanner's OWN budget, from config (2026-09-29). This was a
+        // hardcoded 1000, which made the probe count a smaller pool than the
+        // tick reads the moment RE_EVAL_POOL_SIZE moved — and the whole point
+        // of the endpoint is that its `poolQueryCount` is the tick's reach.
+        limit: cfg?.reevalPoolSize ?? 1000,
+        // Mirror the scanner's configured tiered rotation (near slots swept
+        // every ~10 min, far slots every ~30 min, plus the pre-qualification
+        // filter) so the probe's age histogram matches what production
+        // actually evaluates.
+        nearSlots: cfg?.reevalNearSlots ?? 2,
+        farSlots: cfg?.reevalFarSlots ?? 6,
+        rotationPeriodMs: cfg?.reevalPoolCacheMs,
+        // The scanner's OWN ratio (2026-09-28). This probe used
+        // minMcap / 2 — a LOOSER floor than production's, so its
+        // poolQueryCount over-reported the rows the tick could reach and no
+        // floor change could be read off this endpoint. It mirrors now.
+        minQualifyMcap: poolMinMcapUsd * POOL_MCAP_PRUNE_RATIO,
+        // The scanner's other two pool filters, mirrored so this count is
+        // comparable to the tick's: the ceiling (its literal 2, matching
+        // src/scanner.ts's maxQualifyMcap) drops the pump-and-dump corpses
+        // that rank FIRST under the signal ordering, and the liquidity floor
+        // drops the dead-liquidity ones — both otherwise inflate this count.
+        maxQualifyMcap: poolMaxMcapUsd * 2,
+        minQualifyLiquidity: poolMinLiquidityUsd * POOL_LIQUIDITY_PRUNE_RATIO,
+        seenChatIds,
+      };
+      let poolEligibleByAge: Record<
+        string,
+        { total: number; mcapEvidenced: number }
+      > | null = null;
+      let poolBands: ReturnType<typeof poolBandWindows> | null = null;
       try {
-        const minMcap = poolMinMcapUsd;
-        const pool = await probe.getReevalPool({
-          sinceMs: now - 30 * 3600_000,
-          minLaunchMs: now - (poolMaxAgeMin + RE_EVAL_AGE_MARGIN_MIN) * 60_000,
-          maxLaunchMs: now - (poolMinAgeMin - RE_EVAL_AGE_MARGIN_MIN) * 60_000,
-          windowEntryLaunchMs: now - poolMinAgeMin * 60_000,
-          // The scanner's OWN budget, from config (2026-09-29). This was a
-          // hardcoded 1000, which made the probe count a smaller pool than the
-          // tick reads the moment RE_EVAL_POOL_SIZE moved — and the whole point
-          // of the endpoint is that its `poolQueryCount` is the tick's reach.
-          limit: cfg?.reevalPoolSize ?? 1000,
-          // Mirror the scanner's configured tiered rotation (near slots
-          // swept every ~10 min, far slots every ~30 min, plus the
-          // pre-qualification filter) so the probe's age histogram matches
-          // what production actually evaluates.
-          nearSlots: cfg?.reevalNearSlots ?? 2,
-          farSlots: cfg?.reevalFarSlots ?? 6,
-          rotationPeriodMs: cfg?.reevalPoolCacheMs,
-          // The scanner's OWN ratio (2026-09-28). This probe used
-          // minMcap / 2 — a LOOSER floor than production's, so its
-          // poolQueryCount over-reported the rows the tick could reach and no
-          // floor change could be read off this endpoint. It mirrors now.
-          minQualifyMcap: minMcap * POOL_MCAP_PRUNE_RATIO,
-          // The scanner's other two pool filters, mirrored so this count is
-          // comparable to the tick's: the ceiling (its literal 2, matching
-          // src/scanner.ts's maxQualifyMcap) drops the pump-and-dump corpses
-          // that rank FIRST under the signal ordering, and the liquidity floor
-          // drops the dead-liquidity ones — both otherwise inflate this count.
-          maxQualifyMcap: poolMaxMcapUsd * 2,
-          minQualifyLiquidity: poolMinLiquidityUsd * POOL_LIQUIDITY_PRUNE_RATIO,
-          seenChatIds,
-        });
+        const pool = await probe.getReevalPool(poolQueryOpts);
         poolQueryCount = pool.length;
+        // The two halves of "why is poolQueryCount this small" (2026-11-23):
+        // the POPULATION per age bucket (same predicates as the sweep, minus
+        // its rotation page and LIMITs) and the windows this sweep actually
+        // read. `eligibleByAge` a few lines down stays the gross cohort — it
+        // is the number an operator was comparing against this one.
+        poolBands = poolBandWindows(now, poolQueryOpts);
+        poolEligibleByAge = await probe.getPoolEligibleByAge(
+          now,
+          {
+            minLaunchMs: poolQueryOpts.minLaunchMs,
+            maxLaunchMs: poolQueryOpts.maxLaunchMs,
+          },
+          poolQueryOpts,
+        );
         poolQueryBuckets = {
           "0-3h": 0,
           "3-6h": 0,
@@ -10327,6 +10351,18 @@ const worker = {
         poolQueryCount,
         poolQueryBuckets,
         poolQueryBreakdown,
+        // `eligibleByAge` above is the GROSS cohort (age band + seen only):
+        // live 2026-11-22 that read 18,561 rows for 12-24h while the sweep
+        // returned 24 rows, all under 6h, and looked like a broken query. This
+        // is the same band counted with the pool's own predicates (dead pool,
+        // mcap evidence grace, mcap floor/ceiling, liquidity floor, seen), so
+        // the drop from cohort to population is visible instead of inferred.
+        poolEligibleByAge,
+        // And this is why even the population is not what one sweep returns:
+        // the near/far zones read ONE sub-window of their slots per sweep (the
+        // far zone's tail is ~22h wide cut into `farSlots` slices). Null when
+        // the probe's query failed, like the two readings above.
+        poolBands,
         // Which floors produced poolQueryCount (see the comment above them):
         // a live reading shows the ratios the DEPLOYED code is pruning at.
         mcapPruneRatio: POOL_MCAP_PRUNE_RATIO,

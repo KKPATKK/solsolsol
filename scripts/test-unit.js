@@ -9,7 +9,7 @@ const { createClient } = require("@libsql/client");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS, POOL_SLICE_CURSOR_KEY, poolRotationSlot, poolZoneOfLaunch, SEEN_TOKENS_COUNT_KEY, TOKEN_STATS_COUNT_KEY, TELEMETRY_RECONCILE_INTERVAL_MS, TELEMETRY_RECONCILE_AT_KEY } = require("../dist/db.js");
+const { Db, DEFAULT_SETTINGS, DB_REQUEST_TIMEOUT_MS, SCAN_FRONT_GATE_KEYS, POOL_SLICE_CURSOR_KEY, poolRotationSlot, poolBandWindows, poolZoneOfLaunch, SEEN_TOKENS_COUNT_KEY, TOKEN_STATS_COUNT_KEY, TELEMETRY_RECONCILE_INTERVAL_MS, TELEMETRY_RECONCILE_AT_KEY } = require("../dist/db.js");
 const { DB_LATENCY_PROBE_KEY, DB_LATENCY_PROBE_COUNT_KEY, DB_LATENCY_SAMPLES, DB_LATENCY_SAMPLES_MAX, DB_LATENCY_OPS, clampLatencySamples, summarizeLatency, summarizeLatencyOps, claimShapeSavingMs, dbRegionFromUrl, changesVerdict, DB_LATENCY_EXPECTED_COUNTER_PER_SAMPLE } = require("../dist/dblatency.js");
 const { parseFilterArgs, tradeKeyboard } = require("../dist/bot.js");
 const { parseAdminIds, isAdmin, parseSmartMoneyTypes, parseMutedCardSigs, loadConfig } = require("../dist/config.js");
@@ -5487,6 +5487,136 @@ async function main() {
     }
   });
 
+  // The other half of the same reading (2026-11-23): /debug/pool publishes the
+  // GROSS cohort next to a sweep count, and on live data those disagreed by
+  // orders of magnitude (12-24h: 18,561 rows vs 24 returned, all <6h). This
+  // counter is the pool's own population per bucket, so the gap a sweep still
+  // leaves is the rotation page + slot, not an unexplained 18k.
+  await test("getPoolEligibleByAge: the pool's population, not the gross cohort", async () => {
+    const t = tmpDb();
+    try {
+      const db = new Db(t.p, undefined, t.client);
+      await db.init();
+      const now = Date.now();
+      const H = 3600_000;
+      const seed = async (token, ageH, mcap, liq, lastLiq, streak = 0) => {
+        await t.client.execute({
+          sql: `INSERT INTO token_stats
+                  (token, first_seen_at, first_m5_vol, first_seen_age_min, launch_ms,
+                   max_mcap_observed, max_liquidity_observed, last_liquidity_usd,
+                   sweeps_since_reading)
+                VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)`,
+          args: [token, now - ageH * H, ageH * 60, now - ageH * H, mcap, liq, lastLiq, streak],
+        });
+      };
+      await seed("POOLABLE", 4, 120_000, 40_000, 25_000);
+      await seed("BELOWFLOOR", 5, 20_000, 40_000, 25_000);
+      await seed("ABOVECEIL", 7, 900_000, 40_000, 25_000);
+      await seed("DEAD", 8, 120_000, 40_000, 700);
+      await seed("THIRSTY", 9, 120_000, 6_000, 25_000);
+      await seed("NOEVID", 13, null, null, null);
+      const band = { minLaunchMs: now - 29 * H, maxLaunchMs: now };
+      const opts = {
+        sinceMs: now - 30 * H,
+        minQualifyMcap: 48_000,
+        maxQualifyMcap: 460_000,
+        minQualifyLiquidity: 8_000,
+        seenChatIds: ["chat-1"],
+      };
+      const gross = await db.getPoolHistogram(now, ["chat-1"], band);
+      const eligible = await db.getPoolEligibleByAge(now, band, opts);
+      const totals = (m) =>
+        Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v.total]));
+      assert.equal(gross.eligibleInWindow, 6, "the cohort counter counts every row in the band");
+      assert.deepEqual(
+        totals(eligible),
+        { "0-3h": 0, "3-6h": 1, "6-12h": 0, "12-24h": 0, "24-43h": 0, ">43h": 0 },
+        "only the row the pool would actually carry survives all five predicates",
+      );
+      // The evidenced split is what keeps a NULL-heavy bucket honest: those
+      // rows are carried fail-open but throttled by the rotation page.
+      assert.deepEqual(eligible["3-6h"], { total: 1, mcapEvidenced: 1 });
+      assert.deepEqual(eligible["0-3h"], { total: 0, mcapEvidenced: 0 });
+      // Each exclusion really is one of the pool's own predicates — dropping
+      // one must readmit exactly the row it owns, not a different set.
+      const noMcapFloor = await db.getPoolEligibleByAge(now, band, {
+        ...opts,
+        minQualifyMcap: undefined,
+      });
+      assert.equal(noMcapFloor["3-6h"].total, 2, "the $20K-peak row is the floor's alone");
+      const noCeiling = await db.getPoolEligibleByAge(now, band, {
+        ...opts,
+        maxQualifyMcap: undefined,
+      });
+      assert.equal(noCeiling["6-12h"].total, 1, "the $900K-peak row is the ceiling's alone");
+      const noLiqFloor = await db.getPoolEligibleByAge(now, band, {
+        ...opts,
+        minQualifyLiquidity: undefined,
+      });
+      assert.equal(noLiqFloor["6-12h"].total, 1, "the $6K-peak-liquidity row is the liquidity floor's alone");
+      // ...and the dead-liquidity and no-evidence rows stay out whichever
+      // floor is relaxed: those two are the dead-pool clause and the grace.
+      assert.equal(noMcapFloor["6-12h"].total, 0);
+      assert.equal(noLiqFloor["12-24h"].total, 0);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  // The windows the sweep read, echoed by /debug/pool (2026-11-23). These are
+  // the numbers that explain a small poolQueryCount: the far zone covers ONE
+  // sixth of the tail per sweep, and a reading without the slot bounds looks
+  // like a query that silently dropped rows.
+  await test("poolBandWindows: the windows a sweep reads, and their slots advance", async () => {
+    const H = 3600_000;
+    const period = 180_000;
+    // A slot index whose far slot is not the last one, so "the next slot is
+    // one sixth OLDER" is a real assertion rather than a wrap-around.
+    const now = period * 1_000_003;
+    const entry = now - 80 * 60_000;
+    const opts = {
+      minLaunchMs: now - 29 * H,
+      maxLaunchMs: now,
+      windowEntryLaunchMs: entry,
+      limit: 1000,
+      nearSlots: 2,
+      farSlots: 6,
+      rotationPeriodMs: period,
+    };
+    const w = poolBandWindows(now, opts);
+    assert.equal(w.rotation.slot, poolRotationSlot(now, period));
+    assert.equal(w.hot.lo, entry - 0.5 * H);
+    assert.equal(w.hot.hi, entry + 0.5 * H);
+    assert.equal(w.hot.phase, w.rotation.slot, "the hot band pages on the plain slot");
+    assert.equal(w.near.zoneLo, entry - 6 * H);
+    assert.equal(w.near.zoneHi, w.hot.lo);
+    assert.equal(w.near.slot, w.rotation.slot % 2);
+    assert.equal(w.near.phase, Math.floor(w.rotation.slot / 2));
+    assert.equal(w.far.zoneLo, opts.minLaunchMs, "the far zone reaches the oldest launch in the band");
+    assert.equal(w.far.zoneHi, w.near.zoneLo);
+    assert.equal(w.far.slots, 6);
+    assert.equal(w.far.slot, 1);
+    // Budget split: the hot zone is capped at 460, the rest is 70% near / 30% far.
+    assert.equal(w.hot.limit, 460);
+    assert.equal(w.near.limit, Math.round((1000 - 460) * 0.7));
+    assert.equal(w.far.limit, 1000 - 460 - w.near.limit);
+    // The next slot moves the far window one sixth older, and the two windows
+    // meet exactly (no gap, no overlap) — that is what makes "every coin comes
+    // back within slots × period" true rather than hopeful.
+    const next = poolBandWindows(now + period, opts);
+    assert.equal(next.far.slot, 2);
+    assert.equal(next.far.hi, w.far.lo, "consecutive far slots tile the tail");
+    // A band the hot zone already covers leaves both rotation zones off.
+    const narrow = poolBandWindows(now, {
+      ...opts,
+      minLaunchMs: entry - 60_000,
+      maxLaunchMs: entry + 60_000,
+    });
+    assert.ok(narrow.hot, "the hot zone still reads");
+    assert.equal(narrow.near, null);
+    assert.equal(narrow.far, null);
+  });
+
   // The write itself is EDGE-TRIGGERED (2026-10-14). Re-writing every reading
   // the pair lane answered costs ~204 rows/tick — ~85% of every row this bot
   // writes, ~540k/day against a free plan's whole 10M/month — so the statement
@@ -5958,8 +6088,8 @@ async function main() {
       "both pool builders must carry the dead, no-evidence and page clauses (the drift guard)",
     );
     assert.ok(
-      (dbSrc.match(/POOL_MCAP_EVIDENCE_CLAUSE/g) || []).length === 3,
-      "the no-evidence clause is defined once and carried by both builders",
+      (dbSrc.match(/POOL_MCAP_EVIDENCE_CLAUSE/g) || []).length === 4,
+      "the no-evidence clause is defined once and carried by both builders AND the population counter (getPoolEligibleByAge), so the number /debug/pool prints beside the cohort is the same predicate the sweep applies",
     );
     assert.ok(
       (dbSrc.match(/poolBandPageSql\(\)/g) || []).length === 3,
@@ -23582,7 +23712,7 @@ async function main() {
     );
     const workerSrc = read("src/worker.ts");
     assert.ok(
-      workerSrc.includes("minQualifyMcap:minMcap*POOL_MCAP_PRUNE_RATIO,"),
+      workerSrc.includes("minQualifyMcap:poolMinMcapUsd*POOL_MCAP_PRUNE_RATIO,"),
       "/debug/pool must report the pool the tick reads, not a looser one",
     );
     assert.ok(
@@ -27755,8 +27885,13 @@ async function main() {
       );
       assert.equal(
         dbSrc.split("constslot=poolRotationSlot(now,opts.rotationPeriodMs);").length - 1,
-        2,
-        "both queries use the shared helper",
+        1,
+        "the batched builder uses the shared helper",
+      );
+      assert.equal(
+        dbSrc.split("constslot=poolRotationSlot(now,periodMs);").length - 1,
+        1,
+        "and so does poolBandWindows — the single geometry getReevalPool queries and /debug/pool echoes; no slot is ever computed inline",
       );
 
       // ---- the fingerprint covers the QUERY, not the clock ----

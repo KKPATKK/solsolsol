@@ -1944,6 +1944,133 @@ export function poolRotationSlot(
   return Math.floor(now / rotationPeriodMs);
 }
 
+/** One banded zone of the re-eval pool (see Db.getReevalPool). */
+export interface PoolBandWindow {
+  /** This zone's slice of the band, by launch time. */
+  lo: number;
+  hi: number;
+  /** Rows this zone's query may return (its LIMIT). */
+  limit: number;
+  /** The bucket-paging phase handed to the query (see POOL_BAND_ROTATE_BUCKETS). */
+  phase: number;
+}
+
+/** The near/far zones also carry their whole rotation range and slot. */
+export interface PoolRotatingWindow extends PoolBandWindow {
+  /** The ZONE's full range (all slots) — the near zone's evidenced page
+   * covers it, see getReevalPool's fullLo/fullHi. */
+  zoneLo: number;
+  zoneHi: number;
+  /** How many slots the zone is cut into, and which one this sweep reads. */
+  slots: number;
+  slot: number;
+}
+
+/**
+ * The band geometry of one re-eval pool read (2026-11-23).
+ *
+ * WHY IT IS A FUNCTION. `/debug/pool` has to TELL an operator which windows a
+ * reading covered — the far zone reads one of `farSlots` sub-windows per
+ * sweep, so a pool count of a few dozen rows is unreadable without it (a
+ * 12-24h cohort of 18.5k rows and a far band that returned 0 rows look like a
+ * bug until the slot bounds are visible). Recomputing those bounds in the
+ * endpoint would be a second copy of the same arithmetic, and the copy that
+ * drifts is the one an operator trusts. So the bounds live here, getReevalPool
+ * computes its own queries from this, and the echo cannot disagree with what
+ * was read.
+ *
+ * A zone is null exactly when getReevalPool skips it: the hot zone when the
+ * band is empty, the rotation zones when the hot zone already took the whole
+ * budget or the band holds nothing older than the hot edge, and each rotating
+ * zone when its own range or LIMIT is empty.
+ */
+export function poolBandWindows(
+  now: number,
+  opts: {
+    minLaunchMs: number;
+    maxLaunchMs: number;
+    windowEntryLaunchMs: number;
+    limit: number;
+    nearSlots?: number;
+    farSlots?: number;
+    rotationPeriodMs?: number;
+  },
+): {
+  rotation: { slot: number; periodMs: number };
+  span: { lo: number; hi: number };
+  hot: (PoolBandWindow & { center: number }) | null;
+  near: PoolRotatingWindow | null;
+  far: PoolRotatingWindow | null;
+} {
+  const center = opts.windowEntryLaunchMs;
+  const spanLo = opts.minLaunchMs;
+  const spanHi = opts.maxLaunchMs;
+  const periodMs = opts.rotationPeriodMs ?? POOL_ROTATION_PERIOD_MS;
+  const slot = poolRotationSlot(now, periodMs);
+  const hotLo = Math.max(spanLo, center - POOL_HOT_BELOW_MS);
+  const hotHi = Math.min(spanHi, center + POOL_HOT_ABOVE_MS);
+  const hotLimit = Math.min(opts.limit, POOL_HOT_MAX);
+  // Hot zone: every scan, nearest to the entry first (latency-critical).
+  const hot: (PoolBandWindow & { center: number }) | null =
+    hotHi > hotLo
+      ? { lo: hotLo, hi: hotHi, limit: hotLimit, phase: slot, center }
+      : null;
+  const rotLimit = Math.max(0, opts.limit - hotLimit);
+  let near: PoolRotatingWindow | null = null;
+  let far: PoolRotatingWindow | null = null;
+  const rotLo = spanLo; // oldest launch in the window
+  const rotHi = hotLo; // everything older than the hot zone
+  if (rotLimit > 0 && rotHi > rotLo) {
+    const nearLo = Math.max(rotLo, center - POOL_NEAR_WINDOW_MS);
+    const nearSlots = Math.max(1, Math.floor(opts.nearSlots ?? POOL_NEAR_SLOTS));
+    const farSlots = Math.max(1, Math.floor(opts.farSlots ?? POOL_FAR_SLOTS));
+    const nearLimit = Math.max(
+      0,
+      Math.min(rotLimit, Math.round(rotLimit * POOL_NEAR_LIMIT_SHARE)),
+    );
+    const farLimit = Math.max(0, rotLimit - nearLimit);
+    if (rotHi > nearLo && nearLimit > 0) {
+      const slotW = (rotHi - nearLo) / nearSlots;
+      const s = slot % nearSlots;
+      near = {
+        lo: rotHi - (s + 1) * slotW,
+        hi: rotHi - s * slotW,
+        limit: nearLimit,
+        // One rotation step per RECURRENCE of a given sub-window (see
+        // POOL_BAND_ROTATE_BUCKETS): the near zone's window comes back every
+        // nearSlots slot-periods, and the phase must advance exactly once per
+        // recurrence so the overflow's bucket choice moves on.
+        phase: Math.floor(slot / nearSlots),
+        zoneLo: nearLo,
+        zoneHi: rotHi,
+        slots: nearSlots,
+        slot: s,
+      };
+    }
+    if (nearLo > rotLo && farLimit > 0) {
+      const slotW = (nearLo - rotLo) / farSlots;
+      const s = slot % farSlots;
+      far = {
+        lo: nearLo - (s + 1) * slotW,
+        hi: nearLo - s * slotW,
+        limit: farLimit,
+        phase: Math.floor(slot / farSlots),
+        zoneLo: rotLo,
+        zoneHi: nearLo,
+        slots: farSlots,
+        slot: s,
+      };
+    }
+  }
+  return {
+    rotation: { slot, periodMs },
+    span: { lo: spanLo, hi: spanHi },
+    hot,
+    near,
+    far,
+  };
+}
+
 export class Db {
   /**
    * Entries kept in the shared delivery ring (see recordPushDelivery).
@@ -5967,100 +6094,86 @@ export class Db {
     // THIS call's clock so every band — and the batched builder — cuts at the
     // same instant.
     const mcapEvidenceSinceMs = now - POOL_MCAP_EVIDENCE_GRACE_MS;
-    const center = opts.windowEntryLaunchMs;
-    const spanLo = opts.minLaunchMs;
-    const spanHi = opts.maxLaunchMs;
-    const hotLo = Math.max(spanLo, center - POOL_HOT_BELOW_MS);
-    const hotHi = Math.min(spanHi, center + POOL_HOT_ABOVE_MS);
-    const hotLimit = Math.min(opts.limit, POOL_HOT_MAX);
+    // Every bound below comes from poolBandWindows, which /debug/pool echoes:
+    // one computation, so the windows an operator reads off the endpoint are
+    // the ones this read actually queried.
+    const bands = poolBandWindows(now, opts);
     const out: TokenStats[] = [];
-    const hotPhase = poolRotationSlot(now, opts.rotationPeriodMs);
-    if (hotHi > hotLo) {
+    if (bands.hot) {
       // Hot zone: every scan, nearest to the entry first (latency-critical).
       // Its no-evidence rows are paged too (see POOL_BAND_ROTATE_BUCKETS): the
       // band outgrew its 460-row limit (730 live on 2026-10-21), and without a
       // page the rows beyond the head would never be read.
       out.push(
-        ...(await this.queryReevalBand(hotLo, hotHi, center, {
-          sinceMs: opts.sinceMs,
-          mcapEvidenceSinceMs,
-          limit: hotLimit,
-          minQualifyMcap: opts.minQualifyMcap,
-          maxQualifyMcap: opts.maxQualifyMcap,
-          minQualifyLiquidity: opts.minQualifyLiquidity,
-          seenChatIds: opts.seenChatIds,
-          orderBy: "entry",
-          rotatePhase: hotPhase,
-        })),
+        ...(await this.queryReevalBand(
+          bands.hot.lo,
+          bands.hot.hi,
+          bands.hot.center,
+          {
+            sinceMs: opts.sinceMs,
+            mcapEvidenceSinceMs,
+            limit: bands.hot.limit,
+            minQualifyMcap: opts.minQualifyMcap,
+            maxQualifyMcap: opts.maxQualifyMcap,
+            minQualifyLiquidity: opts.minQualifyLiquidity,
+            seenChatIds: opts.seenChatIds,
+            orderBy: "entry",
+            rotatePhase: bands.hot.phase,
+          },
+        )),
       );
     }
-    const rotLimit = Math.max(0, opts.limit - hotLimit);
-    if (rotLimit <= 0) return out;
-    const rotLo = spanLo; // oldest launch in the window
-    const rotHi = hotLo; // everything older than the hot zone
-    if (rotHi <= rotLo) return out;
-    const nearLo = Math.max(rotLo, center - POOL_NEAR_WINDOW_MS);
-    const nearSlots = Math.max(1, Math.floor(opts.nearSlots ?? POOL_NEAR_SLOTS));
-    const farSlots = Math.max(1, Math.floor(opts.farSlots ?? POOL_FAR_SLOTS));
-    const nearLimit = Math.max(
-      0,
-      Math.min(rotLimit, Math.round(rotLimit * POOL_NEAR_LIMIT_SHARE)),
-    );
-    const farLimit = Math.max(0, rotLimit - nearLimit);
-    const slot = poolRotationSlot(now, opts.rotationPeriodMs);
-    // One rotation step per RECURRENCE of a given sub-window (see
-    // POOL_BAND_ROTATE_BUCKETS): the near zone's window comes back every
-    // nearSlots slot-periods, the far zone's every farSlots, and the phase must
-    // advance exactly once per recurrence so that the overflow's bucket choice
-    // moves on rather than repeating.
-    const nearPhase = Math.floor(slot / nearSlots);
-    const farPhase = Math.floor(slot / farSlots);
-    // Near zone: entry → entry + POOL_NEAR_WINDOW_MS of age — fresh
-    // in-window coins, most likely to cross the gates → frequent sweep.
-    if (rotHi > nearLo && nearLimit > 0) {
-      const slotW = (rotHi - nearLo) / nearSlots;
-      const s = slot % nearSlots;
-      const lo = rotHi - (s + 1) * slotW;
-      const hi = rotHi - s * slotW;
+    // Near zone: entry → entry + POOL_NEAR_WINDOW_MS of age — fresh in-window
+    // coins, most likely to cross the gates → frequent sweep. One rotation
+    // step per RECURRENCE of a given sub-window (see POOL_BAND_ROTATE_BUCKETS).
+    if (bands.near) {
+      const near = bands.near;
       out.push(
-        ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
-          sinceMs: opts.sinceMs,
-          mcapEvidenceSinceMs,
-          limit: nearLimit,
-          minQualifyMcap: opts.minQualifyMcap,
-          maxQualifyMcap: opts.maxQualifyMcap,
-          minQualifyLiquidity: opts.minQualifyLiquidity,
-          seenChatIds: opts.seenChatIds,
-          orderBy: "signal",
-          rotatePhase: nearPhase,
-          // The near page exempts evidenced rows, but the slot range would
-          // still clip them to this half; return the whole near band's
-          // evidenced rows as well (see getReevalPoolBatched's note). The
-          // no-evidence page stays on this slot.
-          fullLo: nearSlots > 1 ? nearLo : undefined,
-          fullHi: nearSlots > 1 ? rotHi : undefined,
-        })),
+        ...(await this.queryReevalBand(
+          near.lo,
+          near.hi,
+          (near.lo + near.hi) / 2,
+          {
+            sinceMs: opts.sinceMs,
+            mcapEvidenceSinceMs,
+            limit: near.limit,
+            minQualifyMcap: opts.minQualifyMcap,
+            maxQualifyMcap: opts.maxQualifyMcap,
+            minQualifyLiquidity: opts.minQualifyLiquidity,
+            seenChatIds: opts.seenChatIds,
+            orderBy: "signal",
+            rotatePhase: near.phase,
+            // The near page exempts evidenced rows, but the slot range would
+            // still clip them to this half; return the whole near band's
+            // evidenced rows as well (see getReevalPoolBatched's note). The
+            // no-evidence page stays on this slot.
+            fullLo: near.slots > 1 ? near.zoneLo : undefined,
+            fullHi: near.slots > 1 ? near.zoneHi : undefined,
+          },
+        )),
       );
     }
     // Far zone: the older tail — qualification is rare this deep, so sweep
     // it slowly; every coin is still re-checked at least once per sweep.
-    if (nearLo > rotLo && farLimit > 0) {
-      const slotW = (nearLo - rotLo) / farSlots;
-      const s = slot % farSlots;
-      const lo = nearLo - (s + 1) * slotW;
-      const hi = nearLo - s * slotW;
+    if (bands.far) {
+      const far = bands.far;
       out.push(
-        ...(await this.queryReevalBand(lo, hi, (lo + hi) / 2, {
-          sinceMs: opts.sinceMs,
-          mcapEvidenceSinceMs,
-          limit: farLimit,
-          minQualifyMcap: opts.minQualifyMcap,
-          maxQualifyMcap: opts.maxQualifyMcap,
-          minQualifyLiquidity: opts.minQualifyLiquidity,
-          seenChatIds: opts.seenChatIds,
-          orderBy: "signal",
-          rotatePhase: farPhase,
-        })),
+        ...(await this.queryReevalBand(
+          far.lo,
+          far.hi,
+          (far.lo + far.hi) / 2,
+          {
+            sinceMs: opts.sinceMs,
+            mcapEvidenceSinceMs,
+            limit: far.limit,
+            minQualifyMcap: opts.minQualifyMcap,
+            maxQualifyMcap: opts.maxQualifyMcap,
+            minQualifyLiquidity: opts.minQualifyLiquidity,
+            seenChatIds: opts.seenChatIds,
+            orderBy: "signal",
+            rotatePhase: far.phase,
+          },
+        )),
       );
     }
     return out;
@@ -7533,6 +7646,121 @@ export class Db {
       deadPending: Number(r.dead_pending ?? 0),
       eligibleByAge,
     };
+  }
+
+  /**
+   * The pool's POPULATION per age bucket (2026-11-23) — the number
+   * `getPoolHistogram`'s `eligibleByAge` deliberately is not.
+   *
+   * WHY IT EXISTS. `/debug/pool` publishes two readings that look like they
+   * describe the same coins and do not: `eligibleByAge` counts rows in the age
+   * band (age + first_seen + seen only), while `poolQueryCount` is one sweep's
+   * reach. Live 2026-11-22 the gap was five orders of magnitude wide enough to
+   * read as a bug — `eligibleByAge["12-24h"].total 18,561` next to a sweep
+   * that returned 24 rows, all under 6h. Nothing was broken: the pool applies
+   * a dead-pool predicate, an mcap-evidence grace and three floors to that
+   * cohort (19,367 → 506 in the mcap band → 40 alive → 16 after the liquidity
+   * floor), and the far zone reads ONE of its six rotation sub-windows per
+   * sweep. This counter is the first of those two steps made visible.
+   *
+   * WHAT IT COUNTS: rows inside the band that pass the pool's population
+   * predicates — DEAD_POOL_CLAUSE, POOL_MCAP_EVIDENCE_CLAUSE, the mcap
+   * floor/ceiling and liquidity floor, and the chat-aware seen exclusion. What
+   * it does NOT apply is the per-sweep machinery: the no-evidence rotation page
+   * (POOL_BAND_ROTATE_BUCKETS) and each zone's LIMIT. So this is "how many
+   * coins the pool can act on in this bucket across a full rotation"; a single
+   * sweep returns less, and the endpoint echoes the zone windows for that half
+   * of the question.
+   *
+   * THE EVIDENCED SPLIT is why this returns two numbers per bucket. Rows with
+   * no mcap reading at all are carried fail-open inside their grace, but the
+   * page throttles THEM (only 1/64 per phase) while evidenced rows are exempt
+   * — so a bucket whose population is mostly NULL is mostly NOT in a sweep
+   * either (live: 0-3h read 723 eligible, of which ~93% had no mcap reading).
+   * Without the split that bucket would look like a 723-row pool that never
+   * gets swept, which is the same kind of misreading this method exists to
+   * end.
+   *
+   * The clauses are the query builders' own constants (DEAD_POOL_CLAUSE, the
+   * evidence clause, mcapFloorLiteral) rather than a restatement, so a floor
+   * change moves both and this cannot quietly count a different population.
+   */
+  async getPoolEligibleByAge(
+    now: number,
+    /** The launch band the pool reads (Db.getReevalPool's min/maxLaunchMs). */
+    band: { minLaunchMs: number; maxLaunchMs: number },
+    opts: {
+      /** Db.getReevalPool's sinceMs (first_seen_at lower bound). */
+      sinceMs: number;
+      minQualifyMcap?: number;
+      maxQualifyMcap?: number;
+      minQualifyLiquidity?: number;
+      seenChatIds?: string[];
+    },
+  ): Promise<Record<string, { total: number; mcapEvidenced: number }>> {
+    const H = 3600_000;
+    const seen = this.seenExclusion(opts.seenChatIds);
+    const clauses: string[] = [DEAD_POOL_CLAUSE, POOL_MCAP_EVIDENCE_CLAUSE];
+    // A LITERAL for the floor, exactly as queryReevalBand renders it — see
+    // mcapFloorLiteral (the partial index depends on that shape).
+    if (opts.minQualifyMcap !== undefined)
+      clauses.push(
+        `(max_mcap_observed IS NULL OR max_mcap_observed >= ${mcapFloorLiteral(opts.minQualifyMcap)})`,
+      );
+    if (opts.maxQualifyMcap !== undefined)
+      clauses.push(`(max_mcap_observed IS NULL OR max_mcap_observed <= ?)`);
+    if (opts.minQualifyLiquidity !== undefined)
+      clauses.push(
+        `(max_liquidity_observed IS NULL OR max_liquidity_observed >= ?)`,
+      );
+    const args: Array<string | number> = [
+      now - 3 * H,
+      now - 6 * H,
+      now - 12 * H,
+      now - 24 * H,
+      now - 43 * H,
+      band.minLaunchMs,
+      band.maxLaunchMs,
+      opts.sinceMs,
+      // The evidence clause's placeholder (see POOL_MCAP_EVIDENCE_CLAUSE).
+      now - POOL_MCAP_EVIDENCE_GRACE_MS,
+    ];
+    if (opts.maxQualifyMcap !== undefined) args.push(opts.maxQualifyMcap);
+    if (opts.minQualifyLiquidity !== undefined)
+      args.push(opts.minQualifyLiquidity);
+    args.push(...seen.args);
+    const res = await this.get().execute({
+      sql: `SELECT
+              CASE
+                WHEN launch_ms > ? THEN '0-3h'
+                WHEN launch_ms > ? THEN '3-6h'
+                WHEN launch_ms > ? THEN '6-12h'
+                WHEN launch_ms > ? THEN '12-24h'
+                WHEN launch_ms > ? THEN '24-43h'
+                ELSE '>43h'
+              END AS bucket,
+              COUNT(*) AS n,
+              SUM(CASE WHEN max_mcap_observed IS NOT NULL THEN 1 ELSE 0 END) AS mcap_evidenced
+            FROM token_stats
+            WHERE launch_ms BETWEEN ? AND ?
+              AND first_seen_at > ?
+              AND ${clauses.join(" AND ")}
+              ${seen.clause}
+            GROUP BY bucket`,
+      args,
+    });
+    const out: Record<string, { total: number; mcapEvidenced: number }> = {};
+    for (const key of ["0-3h", "3-6h", "6-12h", "12-24h", "24-43h", ">43h"])
+      out[key] = { total: 0, mcapEvidenced: 0 };
+    for (const row of res.rows) {
+      const key = String(row.bucket);
+      if (key in out)
+        out[key] = {
+          total: Number(row.n ?? 0),
+          mcapEvidenced: Number(row.mcap_evidenced ?? 0),
+        };
+    }
+    return out;
   }
 
   async recordTokenStats(stats: TokenStats): Promise<void> {
