@@ -1837,6 +1837,9 @@ export interface TickLegInsert {
   /** Far-tier rows the liquidity-evidence gate removed / kept as exploration. */
   poolFarFiltered: number | null;
   poolFarExplored: number | null;
+  /** Hot-tier no-evidence gate (see ScanSummary.poolHotFiltered). */
+  poolHotFiltered: number | null;
+  poolHotExplored: number | null;
   /** Pool freshness-mark inputs (see ScanSummary.poolMisses / poolUnreadable). */
   poolMisses: number | null;
   poolUnreadable: number | null;
@@ -3280,6 +3283,8 @@ export class Db {
           candidate_funnel TEXT,
           pool_far_filtered INTEGER,
           pool_far_explored INTEGER,
+          pool_hot_filtered INTEGER,
+          pool_hot_explored INTEGER,
           pool_misses INTEGER,
           pool_unreadable INTEGER,
           aged_eval INTEGER
@@ -3714,6 +3719,9 @@ export class Db {
     await this.addColumnIfMissing("tick_legs", "candidate_funnel", "TEXT");
     await this.addColumnIfMissing("tick_legs", "pool_far_filtered", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_far_explored", "INTEGER");
+    // Hot-tier no-evidence gate (2026-11-24). Unconditional — idempotent.
+    await this.addColumnIfMissing("tick_legs", "pool_hot_filtered", "INTEGER");
+    await this.addColumnIfMissing("tick_legs", "pool_hot_explored", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_misses", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "pool_unreadable", "INTEGER");
     await this.addColumnIfMissing("tick_legs", "aged_eval", "INTEGER");
@@ -4909,7 +4917,8 @@ export class Db {
                    pool_stale, pool_lanes, pool_served, pool_zone_candidates,
                    pool_zone_pushed, feed_candidates, feed_candidates_unique,
                    feed_pushes, candidate_funnel, pool_far_filtered,
-                   pool_far_explored, pool_misses, pool_unreadable, aged_eval
+                   pool_far_explored, pool_hot_filtered, pool_hot_explored,
+                   pool_misses, pool_unreadable, aged_eval
             FROM tick_legs WHERE at >= ? ORDER BY at DESC LIMIT ?`,
       args: [since, limit],
     });
@@ -4945,6 +4954,8 @@ export class Db {
       candidateFunnel: parseFeedCandidates(r.candidate_funnel),
       poolFarFiltered: numOrNull(r.pool_far_filtered),
       poolFarExplored: numOrNull(r.pool_far_explored),
+      poolHotFiltered: numOrNull(r.pool_hot_filtered),
+      poolHotExplored: numOrNull(r.pool_hot_explored),
       poolMisses: numOrNull(r.pool_misses),
       poolUnreadable: numOrNull(r.pool_unreadable),
       agedEval: numOrNull(r.aged_eval),
@@ -5124,8 +5135,9 @@ export class Db {
                  pool_stale, pool_lanes, pool_served, pool_zone_candidates,
                  pool_zone_pushed, feed_candidates, feed_candidates_unique,
                  feed_pushes, candidate_funnel, pool_far_filtered,
-                 pool_far_explored, pool_misses, pool_unreadable, aged_eval)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 pool_far_explored, pool_hot_filtered, pool_hot_explored,
+                 pool_misses, pool_unreadable, aged_eval)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           leg.at,
           leg.via,
@@ -5171,6 +5183,8 @@ export class Db {
             : JSON.stringify(leg.candidateFunnel),
           leg.poolFarFiltered,
           leg.poolFarExplored,
+          leg.poolHotFiltered,
+          leg.poolHotExplored,
           leg.poolMisses,
           leg.poolUnreadable,
           leg.agedEval,

@@ -3067,6 +3067,9 @@ export interface TickLegRow {
   /** Far-tier gate readings: removed rows and explored no-evidence rows. */
   poolFarFiltered: number | null;
   poolFarExplored: number | null;
+  /** The hot tier's version of the same gate (no-evidence curve launches). */
+  poolHotFiltered: number | null;
+  poolHotExplored: number | null;
   poolMisses: number | null;
   poolUnreadable: number | null;
   /**
@@ -3167,6 +3170,8 @@ export function buildTickLegRow(input: {
     candidateFunnel: s?.candidateFunnel ? { ...s.candidateFunnel } : null,
     poolFarFiltered: s?.poolFarFiltered ?? null,
     poolFarExplored: s?.poolFarExplored ?? null,
+    poolHotFiltered: s?.poolHotFiltered ?? null,
+    poolHotExplored: s?.poolHotExplored ?? null,
     poolMisses: s?.poolMisses ?? null,
     poolUnreadable: s?.poolUnreadable ?? null,
     pushPhase: s?.pushPhase ?? null,
@@ -6346,6 +6351,8 @@ async function runScan(
                 candidateFunnel: summary.candidateFunnel ?? null,
                 poolFarFiltered: summary.poolFarFiltered ?? null,
                 poolFarExplored: summary.poolFarExplored ?? null,
+                poolHotFiltered: summary.poolHotFiltered ?? null,
+                poolHotExplored: summary.poolHotExplored ?? null,
                 poolMisses: summary.poolMisses ?? null,
                 poolUnreadable: summary.poolUnreadable ?? null,
                 agedEval: summary.agedEval ?? null,

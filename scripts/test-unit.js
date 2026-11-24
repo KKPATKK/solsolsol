@@ -11028,6 +11028,41 @@ async function main() {
     );
   });
 
+  // The hot tier's gate (2026-11-24). A no-evidence row belongs to the filler
+  // lane, so the far gate can never see it: the hot gate has to sit on the
+  // filler branch, keyed by the row's own zone, or it filters nothing.
+  await test("the hot tier's no-evidence gate runs on the filler branch before the slice", () => {
+    const strip = (s) =>
+      s
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\s+/g, "");
+    const scannerSrc = strip(
+      fs.readFileSync(path.join(__dirname, "..", "src", "scanner.ts"), "utf8"),
+    );
+    assert.ok(
+      scannerSrc.includes(
+        'if(zoneByToken.get(p.tokenAddress)==="hot"&&poolFarExplorationBucket(p.tokenAddress)!==0){hotGate.filtered+=1;continue;}',
+      ),
+      "the hot gate must keep only the deterministic 1/8 of no-evidence hot rows",
+    );
+    assert.ok(
+      scannerSrc.indexOf("hotGate.filtered+=1") <
+        scannerSrc.indexOf("zoneLists.filler.push(p);"),
+      "the gate must run before the row enters the filler lane (and its pair fetch)",
+    );
+    assert.ok(
+      scannerSrc.indexOf("hotGate.filtered+=1") <
+        scannerSrc.indexOf("slicePoolZones(zoneLists,sliceCursors"),
+      "and before the slice, so the saved fetch is real",
+    );
+    assert.ok(
+      scannerSrc.includes("diag.poolHotFiltered=hotGate.filtered;") &&
+        scannerSrc.includes("diag.poolHotExplored=hotGate.explored;"),
+      "the hot gate's removed/explored counts must be published",
+    );
+  });
+
   await test("countFeedCandidates: only feed rows, grouped by discovery source", () => {
     const out = countFeedCandidates(
       [
@@ -11992,6 +12027,8 @@ async function main() {
         },
         poolFarFiltered: 3,
         poolFarExplored: 1,
+        poolHotFiltered: 5,
+        poolHotExplored: 1,
         poolMisses: 0,
         poolUnreadable: 0,
         agedEval: 7,
@@ -12055,6 +12092,16 @@ async function main() {
       );
       assert.equal(rows[0].poolFarFiltered, 3, "the far gate's removed rows survive the tick");
       assert.equal(rows[0].poolFarExplored, 1, "and so does its exploration lane");
+      assert.equal(
+        rows[0].poolHotFiltered,
+        5,
+        "the hot gate's removed no-evidence rows survive the tick",
+      );
+      assert.equal(
+        rows[0].poolHotExplored,
+        1,
+        "and so does the hot tier's exploration sample",
+      );
       assert.deepEqual(
         rows[0].feedLegs,
         { profiles: 6, jup: 132, pump: 204, meteora: 259, raydium: 343 },

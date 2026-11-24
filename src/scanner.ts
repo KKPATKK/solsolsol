@@ -3598,6 +3598,19 @@ export interface ScanSummary {
   /** Far-tier rows kept by the deterministic exploration lane. */
   poolFarExplored?: number;
   /**
+   * Hot-tier no-evidence rows removed by the same 1/8 exploration gate
+   * (2026-11-24). The hot band of the pool query is 50–110 min after launch,
+   * which at the live size is mostly pump.fun curve launches: measured on
+   * 2026-11-24, 279 of the 282 rows in that band had no market-cap reading at
+   * all, and every one of them costs a pair fetch to be told "liquidity $0" à
+   * the $10K floor. They now enter the filler lane only on their 1/8 turn,
+   * exactly like the far tier's no-evidence tail; `poolFarFiltered`'s
+   * reading pattern applies unchanged, only the tier differs.
+   */
+  poolHotFiltered?: number;
+  /** Hot-tier no-evidence rows kept as the exploration sample. */
+  poolHotExplored?: number;
+  /**
    * Pool coins the sweep asked for and got NO reading back for (2026-10-08 —
    * see poolSweepMisses / db.DEAD_POOL_MISS_MAX). This is the freshness
    * mark's own input, and the reading that separates "the mark is working"
@@ -7894,8 +7907,24 @@ export class Scanner {
       // verdict. It runs BEFORE the slice and pair fetch, which is where the
       // saving is earned.
       const farGate = { filtered: 0, explored: 0 };
+      // The hot tier's version of that gate (2026-11-24). A no-evidence row
+      // never reaches the hot/near/far lists — it belongs to the filler lane —
+      // so the far gate above cannot see it. What the hot band contributes is
+      // instead a steady supply of curve launches: measured 279 of 282 rows in
+      // the 50–110 min band carried no market-cap reading, and serving them is
+      // what the pool's pair budget was going to on DexScreener's raised
+      // spacing. Same deterministic 1/8 bucket, so a late pool is still found.
+      const hotGate = { filtered: 0, explored: 0 };
       for (const p of poolOnly) {
         if (!evidencedTokens.has(p.tokenAddress)) {
+          if (
+            zoneByToken.get(p.tokenAddress) === "hot" &&
+            poolFarExplorationBucket(p.tokenAddress) !== 0
+          ) {
+            hotGate.filtered += 1;
+            continue;
+          }
+          if (zoneByToken.get(p.tokenAddress) === "hot") hotGate.explored += 1;
           zoneLists.filler.push(p);
           continue;
         }
@@ -7912,6 +7941,8 @@ export class Scanner {
         }
         zoneLists[zone].push(p);
       }
+      diag.poolHotFiltered = hotGate.filtered;
+      diag.poolHotExplored = hotGate.explored;
       diag.poolFarFiltered = farGate.filtered;
       diag.poolFarExplored = farGate.explored;
       // The durable cursors (db.POOL_SLICE_CURSOR_KEY) are read off the front's
